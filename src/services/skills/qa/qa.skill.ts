@@ -76,7 +76,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_cases',
       description:
-        'List saved test cases for the project. Use to find tests by name, status, tags, or URL. Returns id, name, url, status, priority, tags, updatedAt.',
+        'List saved test cases for the project. Use to find tests by name, status, tags, or URL. Supports sorting by created_at or updated_at. Use status="all" to search across all statuses. Returns id, name, url, status, priority, tags, createdAt, updatedAt.',
       parameters: {
         type: 'object',
         properties: {
@@ -86,16 +86,26 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           status: {
             type: 'string',
-            enum: ['draft', 'published', 'archived'],
-            description: 'Filter by status. Default: published',
+            enum: ['draft', 'published', 'archived', 'all'],
+            description: 'Filter by status. Use "all" to include every status. Default: all',
           },
           search: {
             type: 'string',
             description: 'Search by name or URL substring',
           },
+          sort_by: {
+            type: 'string',
+            enum: ['created_at', 'updated_at', 'name', 'priority'],
+            description: 'Sort field. Use created_at for "newest/oldest created", updated_at for "recently modified". Default: created_at',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction. "desc" = newest first (default), "asc" = oldest first',
+          },
           limit: {
             type: 'number',
-            description: 'Max results (default 20, max 50)',
+            description: 'Max results (default 20, max 50). Use limit=1 with sort to get the single latest/oldest item',
           },
         },
         required: ['project_id'],
@@ -107,7 +117,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_executions',
       description:
-        'List recent test execution results. Use to check pass/fail history, find failures, or see execution trends. Returns id, testCaseId, testCaseName, status, durationMs, browser, createdAt.',
+        'List recent test execution results. Use to check pass/fail history, find failures, or see execution trends. Returns id, testCaseId, testCaseName, status, durationMs, browser, createdAt, errorMessage.',
       parameters: {
         type: 'object',
         properties: {
@@ -126,11 +136,16 @@ const QA_TOOLS: ChatCompletionTool[] = [
           },
           test_case_id: {
             type: 'string',
-            description: 'Filter by specific test case ID',
+            description: 'Filter by specific test case ID or test case name',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction by created_at. "desc" = newest first (default), "asc" = oldest first',
           },
           limit: {
             type: 'number',
-            description: 'Max results (default 20, max 50)',
+            description: 'Max results (default 20, max 50). Use limit=1 to get only the latest/oldest execution',
           },
         },
         required: ['project_id'],
@@ -448,7 +463,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_modules',
       description:
-        'List test modules (organizational groups) for the project. Each module belongs to a platform (web_ui, api, or mobile). Returns id, name, description, platformKey, tags, priority.',
+        'List test modules (organizational groups) for the project. Each module belongs to a platform (web_ui, api, or mobile). Returns id, name, description, platformKey, tags, priority, createdAt, updatedAt.',
       parameters: {
         type: 'object',
         properties: {
@@ -461,6 +476,20 @@ const QA_TOOLS: ChatCompletionTool[] = [
             enum: ['web_ui', 'api', 'mobile'],
             description: 'Filter by platform type',
           },
+          sort_by: {
+            type: 'string',
+            enum: ['created_at', 'updated_at', 'name'],
+            description: 'Sort field. Default: created_at',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction. Default: desc (newest first)',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default: all). Use limit=1 with sort to get the single latest item',
+          },
         },
         required: ['project_id'],
       },
@@ -471,13 +500,27 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_flows',
       description:
-        'List test flows within a module. Flows represent ordered test scenarios (ui, api, or mixed). Returns id, name, flowType, priority, tags, orderIndex.',
+        'List test flows within a module. Flows represent ordered test scenarios (ui, api, or mixed). Returns id, name, flowType, priority, tags, orderIndex, createdAt, updatedAt.',
       parameters: {
         type: 'object',
         properties: {
           module_id: {
             type: 'string',
-            description: 'Module ID to list flows for',
+            description: 'Module ID (UUID or name) to list flows for',
+          },
+          sort_by: {
+            type: 'string',
+            enum: ['order_index', 'created_at', 'updated_at', 'name'],
+            description: 'Sort field. Default: order_index',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction. Default: asc',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default: all). Use limit=1 with sort to get the single latest item',
           },
         },
         required: ['module_id'],
@@ -693,6 +736,10 @@ const QA_TOOLS: ChatCompletionTool[] = [
             type: 'string',
             enum: ['global', 'project', 'module', 'flow'],
             description: 'Filter by fixture scope',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default: all). Use limit=1 to get single latest fixture',
           },
         },
         required: ['project_id'],

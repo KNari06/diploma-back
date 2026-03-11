@@ -274,6 +274,16 @@ ${buildEditorModeSection(context)}
    - Run reports: "show last run results", "результаты последнего запуска"
    - Plan listing: "how many regression plans?", "list plans"
 
+5d. Temporal/lookup QA queries → general_chat (agent sorts + filters with tools)
+   - "find last/latest/newest created test case" → general_chat (sort by created_at desc, limit 1)
+   - "найди последний тест кейс" → general_chat (same as above, in Russian)
+   - "show me the first test I created" → general_chat (sort by created_at asc, limit 1)
+   - "last failed test" / "последний упавший тест" → general_chat (filter failed, sort desc)
+   - "show all my test cases" / "покажи все тесты" → general_chat (list all statuses)
+   - "which tests have tag X?" → general_chat (search by tag)
+   - "recently updated tests" / "недавно измененные тесты" → general_chat (sort by updated_at)
+   - "last regression run" / "последний прогон" → general_chat (execution listing)
+
 6. Questions about past/status, explanations, discussions → general_chat
 
 7. Missing critical info after checking all above → needs_clarification
@@ -281,6 +291,8 @@ ${buildEditorModeSection(context)}
 CRITICAL anti-hallucination rule:
   "Did you test the API?" → general_chat (ASKING about past, not requesting test!)
   "yes, give whole data from that test" → general_chat (requesting PAST data, not new test!)
+  "найди последний тест кейс" → general_chat (LOOKING UP data, not creating a new test!)
+  "покажи все тесты" → general_chat (LISTING data, not running tests!)
   Keywords alone ("API", "test") do NOT determine intent — always check sentence structure and context first.
 
 --- CREDENTIAL EXTRACTION ---

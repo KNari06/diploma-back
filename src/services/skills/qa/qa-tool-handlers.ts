@@ -178,9 +178,11 @@ export async function handleListTestCases(
   context: SkillContext
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
-  const status = args.status || 'published';
+  const status = args.status || 'all';
   const search = args.search as string | undefined;
   const limit = Math.min(args.limit || 20, 50);
+  const sortBy = (['created_at', 'updated_at', 'name', 'priority'].includes(args.sort_by) ? args.sort_by : 'created_at') as string;
+  const sortOrder = args.sort_order === 'asc' ? true : false; // ascending = true for 'asc'
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -189,11 +191,15 @@ export async function handleListTestCases(
   try {
     let query = supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, url, start_url, status, priority, tags, updated_at')
+      .select('id, name, url, start_url, status, priority, tags, created_at, updated_at')
       .eq('project_id', projectId)
-      .eq('status', status)
-      .order('updated_at', { ascending: false })
+      .order(sortBy, { ascending: sortOrder })
       .limit(limit);
+
+    // Apply status filter only if not "all"
+    if (status !== 'all') {
+      query = query.eq('status', status);
+    }
 
     if (search) {
       // Escape Postgres wildcards and PostgREST special chars to prevent filter injection
@@ -218,13 +224,15 @@ export async function handleListTestCases(
       status: tc.status,
       priority: tc.priority,
       tags: tc.tags || [],
+      createdAt: tc.created_at,
       updatedAt: tc.updated_at,
     }));
 
+    const statusLabel = status === 'all' ? '' : ` ${status}`;
     return {
       success: true,
       data: { testCases, total: testCases.length },
-      message: `Found ${testCases.length} ${status} test cases`,
+      message: `Found ${testCases.length}${statusLabel} test cases (sorted by ${sortBy} ${sortOrder ? 'asc' : 'desc'})`,
       displayToUser: false,
     };
   } catch (error) {
@@ -1177,6 +1185,9 @@ export async function handleListTestModules(
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
   const platformKey = args.platform_key as string | undefined;
+  const sortBy = (['created_at', 'updated_at', 'name'].includes(args.sort_by) ? args.sort_by : 'created_at') as string;
+  const sortOrder = args.sort_order === 'asc' ? true : false;
+  const limit = args.limit ? Math.min(args.limit, 50) : undefined;
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -1187,7 +1198,11 @@ export async function handleListTestModules(
       .from('test_modules')
       .select('id, name, description, platform_id, tags, priority, created_at, updated_at, test_platforms!inner(platform_key)')
       .eq('project_id', projectId)
-      .order('created_at', { ascending: false });
+      .order(sortBy, { ascending: sortOrder });
+
+    if (limit) {
+      query = query.limit(limit);
+    }
 
     if (platformKey) {
       query = query.eq('test_platforms.platform_key', platformKey);
@@ -1270,11 +1285,21 @@ export async function handleListTestFlows(
       }
     }
 
-    const { data, error } = await supabaseAdmin
+    const sortBy = (['order_index', 'created_at', 'updated_at', 'name'].includes(args.sort_by) ? args.sort_by : 'order_index') as string;
+    const sortOrder = args.sort_order === 'desc' ? false : true; // default asc for flows (order_index)
+    const flowLimit = args.limit ? Math.min(args.limit, 50) : undefined;
+
+    let flowQuery = supabaseAdmin
       .from('test_flows')
       .select('id, module_id, name, description, order_index, flow_type, tags, priority, preconditions, expected_result, created_at, updated_at')
       .eq('module_id', moduleId)
-      .order('order_index', { ascending: true });
+      .order(sortBy, { ascending: sortOrder });
+
+    if (flowLimit) {
+      flowQuery = flowQuery.limit(flowLimit);
+    }
+
+    const { data, error } = await flowQuery;
 
     if (error) {
       logger.error('[QA_TOOL] Failed to list flows', { error: error.message, moduleId });
