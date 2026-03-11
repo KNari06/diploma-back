@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { requireAuth } from '@/middleware/auth.middleware';
+import { requireApproved, requireAuth } from '@/middleware/auth.middleware';
 import {
   createIntegration,
   deleteIntegration,
@@ -18,8 +18,8 @@ router.get('/webhook', (req, res) =>
   res.status(405).json({ success: true, message: 'Use POST to deliver webhook events' })
 );
 
-// All CRUD routes require authentication
-router.use(requireAuth);
+// All CRUD routes require authentication and approved status
+router.use(requireAuth, requireApproved);
 
 router.post('/', createIntegration);
 router.get('/', listIntegrations);

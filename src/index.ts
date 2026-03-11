@@ -224,6 +224,8 @@ app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'applicati
 // Body parsing middleware
 // IMPORTANT: GitHub webhook signature requires raw body (Buffer)
 app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
+// Fallback when reverse proxy strips /api (e.g. nginx proxy_pass with trailing slash)
+app.use(`/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -1282,7 +1284,10 @@ app.use(`/api/${env.API_VERSION}/flows`, requireAuth, requireApproved, flowsRout
 app.use(`/api/${env.API_VERSION}/schedules`, requireAuth, requireApproved, schedulesRoutes);
 app.use(`/api/${env.API_VERSION}/fixtures`, requireAuth, requireApproved, fixturesRoutes);
 app.use(`/api/${env.API_VERSION}/regression-plans`, requireAuth, requireApproved, regressionPlansRoutes);
-app.use(`/api/${env.API_VERSION}/git-integrations`, requireAuth, requireApproved, gitIntegrationRoutes);
+// git-integrations: no app-level auth so webhook is public; router applies requireAuth+requireApproved to CRUD only
+app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
+// Fallback when reverse proxy strips /api: accept webhook at /v1/git-integrations/webhook (same handler, no auth on webhook route)
+app.use(`/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
 app.use(`/api/${env.API_VERSION}/integrations`, requireAuth, requireApproved, integrationsRoutes);
 app.use(`/api/${env.API_VERSION}/queue`, requireAuth, requireApproved, queueStatusRoutes);
 app.use(`/api/${env.API_VERSION}/preview`, requireAuth, requireApproved, previewRoutes);
