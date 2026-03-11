@@ -374,23 +374,58 @@ export async function handleGeneralChat(
   // ═══════════════════════════════════════════════════════════════════════
   // QA skill requires projectId to be available. If not provided in context,
   // resolve it from the chat session or workspace's default project.
+  let projectName: string | undefined;
   if (!projectId && workspaceId) {
     try {
       // Try 1: Get projectId from chat session (linked when user ran tests in this session)
       if (chatSessionId) {
         const sessionWithProject = await ChatService.getSessionWithProject(chatSessionId, userId);
         if (sessionWithProject?.project_id) {
-          projectId = sessionWithProject.project_id;
-          logger.debug('[GENERAL_CHAT] Resolved projectId from chat session', { projectId });
+          const sessionProjectId = sessionWithProject.project_id;
+
+          // Validate: does this session-linked project actually have test data?
+          // If not, fall through to Tier 3 (smart default) — the session may be linked
+          // to an auto-created project from a one-off platform_test against a URL.
+          const { count: testCaseCount } = await supabaseAdmin
+            .from('intent_test_cases')
+            .select('id', { count: 'exact', head: true })
+            .eq('project_id', sessionProjectId)
+            .limit(1);
+
+          if (testCaseCount && testCaseCount > 0) {
+            projectId = sessionProjectId;
+            // Resolve project name for AI context
+            const { data: proj } = await supabaseAdmin
+              .from('projects')
+              .select('name')
+              .eq('id', projectId)
+              .maybeSingle();
+            projectName = proj?.name;
+            logger.debug('[GENERAL_CHAT] Resolved projectId from chat session (validated: has test data)', {
+              projectId,
+              projectName,
+              testCaseCount,
+            });
+          } else {
+            // Session-linked project has no test cases — skip it, let Tier 3 find the right one
+            logger.info('[GENERAL_CHAT] Session-linked project has NO test data, skipping to default project', {
+              sessionProjectId,
+              testCaseCount: testCaseCount ?? 0,
+            });
+          }
         }
       }
-      // Try 2: Get default project for workspace (first created project)
+      // Try 2: Get default project for workspace (most active project)
       if (!projectId) {
         const { ProjectContextService } = await import('@/services/utils/project-context.service');
         const defaultProject = await ProjectContextService.getDefaultProject(workspaceId, userId);
         if (defaultProject) {
           projectId = defaultProject.id;
-          logger.debug('[GENERAL_CHAT] Resolved projectId from default workspace project', { projectId });
+          projectName = defaultProject.name;
+          logger.debug('[GENERAL_CHAT] Resolved projectId from default workspace project', {
+            projectId,
+            projectName,
+          });
         }
       }
     } catch (projectError) {
@@ -428,7 +463,7 @@ export async function handleGeneralChat(
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId);
+  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName);
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor' && editorPageContext) {
@@ -612,6 +647,7 @@ You can still help with general questions, saved test cases, and test management
             workspaceId,
             chatSessionId,
             projectId,
+            projectName,
             previewSessionId: parsedContext?.previewSessionId,
             mode: mode as 'lite' | 'pro' | 'editor' | undefined,
           });
@@ -1056,6 +1092,8 @@ You can still help with general questions, saved test cases, and test management
     timestamp: aiReplyTimestamp || new Date().toISOString(), // Use saved timestamp or fallback
     userMessageTimestamp: userMessageTimestamp, // Include user message timestamp
     sessionId: chatSessionId,
+    // Include active project info so frontend can display which project is being queried
+    ...(projectId && { activeProject: { id: projectId, name: projectName || projectId } }),
   };
 
   // Show user's current credit balance and remaining daily/monthly limits

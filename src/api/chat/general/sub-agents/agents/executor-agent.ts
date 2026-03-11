@@ -111,7 +111,7 @@ export async function executeTools(
   }
 
   // Build executor messages
-  const executorPrompt = buildExecutorPrompt(promptPlan, context.projectId, context.mode, userGoal);
+  const executorPrompt = buildExecutorPrompt(promptPlan, context.projectId, context.mode, userGoal, context.projectName);
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: executorPrompt },
     // Include relevant context messages (system prompts with memory/KB/history)

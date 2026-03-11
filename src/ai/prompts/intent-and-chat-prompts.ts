@@ -476,7 +476,7 @@ Ex31: "проверь вход на сайт repetino.kz, телефон: +77011
  * Used for general conversations with users
  * @param skillDescriptions - Optional skill descriptions for integration tools
  */
-export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string): string {
+export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string, projectName?: string): string {
   let prompt = `You are QAIT - an AI QA automation assistant. Have natural conversations about testing like ChatGPT.
 
 MINDSET: Understand CONTEXT, not just keywords.
@@ -623,7 +623,7 @@ QA Tools (31 read-only + 11 write tools for project QA data):
 
 • Compose multiple tools to derive insights (e.g., list test cases + list page visits → coverage gaps)
 • For test artifacts (video, screenshot, logs), first get the test_id from executions, then call qa_get_test_results
-• For failure analysis, first find the failed test_id from qa_get_recent_failures or qa_list_test_executions, then call qa_analyze_failure${projectId ? `\n• **Current project_id: ${projectId}** — ALWAYS use this value for the project_id parameter in QA tools. NEVER ask the user for their project ID.` : ''}`;
+• For failure analysis, first find the failed test_id from qa_get_recent_failures or qa_list_test_executions, then call qa_analyze_failure${projectId ? `\n• **Current project: ${projectName ? `"${projectName}" (${projectId})` : projectId}** — ALWAYS use this project_id for QA tools. NEVER ask the user for their project ID.\n• When a query returns zero results, mention the project name${projectName ? ` ("${projectName}")` : ''} so the user can verify they're in the right project.` : ''}`;
   }
 
   // Add memory instructions

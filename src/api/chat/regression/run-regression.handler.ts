@@ -4,18 +4,24 @@
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Handles the 'run_regression' intent detected by AI intent parser.
- * Executes a saved test case.
+ * Executes a saved test case OR a regression plan.
  *
  * Flow:
  * 1. Extract savedTestCaseId from parsedIntent
  * 2. Validate an ID is provided
- * 3. Call RegressionRunService to execute test
- * 4. Return localized success message with run ID
+ * 3. Try running as intent_test_case first
+ * 4. If not found → check if ID is a regression_plan and run as plan
+ * 5. Return localized success message with run ID
+ *
+ * The intent parser sometimes classifies "run plan X" as run_regression
+ * with savedTestCaseId=X (instead of run_plan with planId=X).
+ * This handler gracefully handles both cases by auto-detecting the entity type.
  *
  * Triggered by commands like:
  * - "run saved test abc123"
  * - "execute the checkout regression"
  * - "запусти сохраненный тест"
+ * - "вот это 60e7beb5-..." (after listing plans)
  */
 
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
@@ -26,7 +32,7 @@ import { getLocalizedMessages } from './localization';
 
 /**
  * Handler for run_regression intent
- * Runs a saved test case
+ * Runs a saved test case or regression plan (auto-detected)
  *
  * @param req - Express request object
  * @param res - Express response object
@@ -80,10 +86,10 @@ export async function handleRunRegressionIntent(
       return;
     }
 
-    let result: { runId: string; testId?: string; testIds?: string[] };
+    let result: { runId: string; testId?: string; testIds?: string[]; totalTests?: number; executionIds?: string[] };
 
-    // Run saved test case
-    if (savedTestCaseId) {
+    // Try running as saved test case first
+    try {
       result = await RegressionRunService.runSavedTestCase({
         savedTestCaseId,
         userId,
@@ -106,6 +112,66 @@ export async function handleRunRegressionIntent(
         timestamp: new Date().toISOString(),
         sessionId: params.chatSessionId,
       });
+      return;
+    } catch (testCaseError) {
+      // If not found as test case → check if it's a regression plan
+      if (testCaseError instanceof NotFoundError) {
+        logger.info('[RUN_REGRESSION_HANDLER] ID not found as test case, trying as regression plan', {
+          id: savedTestCaseId,
+        });
+
+        try {
+          const planResult = await RegressionRunService.runPlan({
+            planId: savedTestCaseId,
+            userId,
+            trigger: 'chat',
+          });
+
+          logger.info('[RUN_REGRESSION_HANDLER] Regression plan started (auto-detected from run_regression intent)', {
+            runId: planResult.runId,
+            totalTests: planResult.totalTests,
+          });
+
+          const planMsg = userLanguage === 'ru'
+            ? `План запущен! Run ID: ${planResult.runId}. Всего тестов: ${planResult.totalTests}`
+            : `Plan execution started! Run ID: ${planResult.runId}. Total tests: ${planResult.totalTests}`;
+
+          res.json({
+            success: true,
+            message: planMsg,
+            data: {
+              runId: planResult.runId,
+              executionIds: planResult.executionIds,
+              totalTests: planResult.totalTests,
+              type: 'plan',
+            },
+            timestamp: new Date().toISOString(),
+            sessionId: params.chatSessionId,
+          });
+          return;
+        } catch (planError) {
+          // If also not found as plan → throw original NotFoundError with helpful message
+          if (planError instanceof NotFoundError) {
+            logger.warn('[RUN_REGRESSION_HANDLER] ID not found as test case or plan', {
+              id: savedTestCaseId,
+            });
+
+            const notFoundMsg = userLanguage === 'ru'
+              ? `Не найден тест-кейс или регрессионный план с ID ${savedTestCaseId}. Проверьте ID и попробуйте снова.`
+              : `No test case or regression plan found with ID ${savedTestCaseId}. Please verify the ID and try again.`;
+
+            res.status(404).json({
+              success: false,
+              error: notFoundMsg,
+            });
+            return;
+          }
+          // Other plan errors — re-throw to outer catch
+          throw planError;
+        }
+      }
+      // Non-NotFoundError from test case attempt — re-throw to outer catch
+      throw testCaseError;
     }
   } catch (error) {
     logger.error('[RUN_REGRESSION_HANDLER] Error running regression', {

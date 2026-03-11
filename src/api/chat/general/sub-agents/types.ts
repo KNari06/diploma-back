@@ -148,6 +148,7 @@ export interface PipelineContext {
   workspaceId: string;
   chatSessionId?: string;
   projectId?: string;
+  projectName?: string; // Human-readable project name for AI responses
   previewSessionId?: string; // Active editor preview session
   mode?: 'lite' | 'pro' | 'editor';
 }

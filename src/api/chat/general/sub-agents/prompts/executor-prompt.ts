@@ -17,7 +17,8 @@ export function buildExecutorPrompt(
   plan?: string | TrackedPlanStep[],
   projectId?: string,
   mode?: 'lite' | 'pro' | 'editor',
-  userGoal?: string
+  userGoal?: string,
+  projectName?: string
 ): string {
   let prompt = `You are a QA tool executor. Your ONLY job is to call the right tools with correct arguments and return results.
 
@@ -66,11 +67,18 @@ RUSSIAN/KAZAKH TEMPORAL KEYWORDS (translate intent, NOT the query):
 - "все / полный список" = all → status="all"
 - "сколько" = how many → list with status="all" and check total
 
+ZERO RESULTS HANDLING (CRITICAL — do NOT just say "not found"):
+- If a tool returns total:0 or an empty array — DO NOT just say "I didn't find anything." That is unhelpful.
+- Instead, relay the tool's message EXACTLY — it contains diagnostic hints (e.g., project_id used, possible causes).
+- If the message mentions "wrong project" or "project has no test cases" — tell the user WHICH project was searched (include the project_id) and suggest they check if they're in the correct project.
+- If the user repeats the same query after a "not found" response — do NOT call the same tool with the same args again. Instead, try a BROADER search: remove filters, increase limit, use status="all", or try a different tool (e.g., qa_get_full_dashboard to see if the project has ANY data at all).
+- Escalation chain for "not found": (1) retry with broader filters → (2) try qa_get_full_dashboard → (3) report to user with project_id and suggest switching project.
+
 CRITICAL — DATA INTEGRITY (ANTI-HALLUCINATION):
 - When the user asks about QA data (test cases, test steps, results, executions, analytics, bugs, coverage, fixtures, modules, flows, schedules, regression plans, reports, deployments, flaky tests, recommendations) — you MUST call the appropriate qa_* tool. NEVER answer from memory or imagination.
 - NEVER invent test case names, IDs, statuses, pass rates, durations, error messages, or any QA metrics.
 - If you are unsure which tool to call — call qa_get_full_dashboard as the safe default.
-- If a tool returns empty results or zero items — that IS the correct answer. Say "no data found." Do NOT fabricate data to fill the gap.
+- If a tool returns empty results or zero items — that IS the correct answer. Report the tool's diagnostic message to the user. Do NOT fabricate data to fill the gap.
 - If no QA tools are available in your tool list — say "I don't have access to QA data tools right now" instead of guessing.
 - You were given tools for a reason — USE THEM. Do not skip tool calls and answer with text when the user is asking for data.`;
 
@@ -81,7 +89,9 @@ CRITICAL — DATA INTEGRITY (ANTI-HALLUCINATION):
   }
 
   if (projectId) {
-    prompt += `\n- ALWAYS use project_id="${projectId}" for QA tools. NEVER ask the user for project ID.`;
+    const nameHint = projectName ? ` (project: "${projectName}")` : '';
+    prompt += `\n- ALWAYS use project_id="${projectId}"${nameHint} for QA tools. NEVER ask the user for project ID.
+- When reporting zero results, mention the project name${projectName ? ` ("${projectName}")` : ''} so the user knows which project was searched.`;
   }
 
   if (mode === 'editor') {

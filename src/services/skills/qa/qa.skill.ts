@@ -370,13 +370,31 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_regression_plans',
       description:
-        'List regression test plans for the project. Returns plan id, name, description, isDefault, testCount, tags.',
+        'List regression test plans for the project. Supports search by name and sorting. Returns plan id, name, description, isDefault, testCount, tags, createdAt, updatedAt.',
       parameters: {
         type: 'object',
         properties: {
           project_id: {
             type: 'string',
             description: 'Project ID to query plans for',
+          },
+          search: {
+            type: 'string',
+            description: 'Search by plan name substring',
+          },
+          sort_by: {
+            type: 'string',
+            enum: ['created_at', 'updated_at', 'name'],
+            description: 'Sort field. Default: created_at',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction. Default: desc',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default: all, max 50)',
           },
         },
         required: ['project_id'],
@@ -418,16 +436,20 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_get_test_results',
       description:
-        'Get test execution artifacts: video URL, trace URL, screenshot, console logs, network logs, errors, and AI analysis summary. Use when user asks about test evidence, screenshots, videos, or AI bug analysis.',
+        'Get test execution artifacts: video URL, trace URL, screenshot, console logs, network logs, errors, and AI analysis summary. Accepts EITHER test_id (execution ID) OR test_case_id (test case name or UUID) — when test_case_id is given, automatically finds the latest execution. Use when user asks about test evidence, screenshots, videos, or AI bug analysis.',
       parameters: {
         type: 'object',
         properties: {
           test_id: {
             type: 'string',
-            description: 'The test ID (from test_executions result field) to get artifacts for',
+            description: 'The execution ID (from test_executions). Use this when you have a specific execution ID.',
+          },
+          test_case_id: {
+            type: 'string',
+            description: 'Test case ID (UUID) or test case name. When provided, automatically finds the latest execution for this test case. Use this when user asks about a test by name.',
           },
         },
-        required: ['test_id'],
+        required: [],
       },
     },
   },
@@ -436,7 +458,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_test_findings',
       description:
-        'List bugs and findings discovered during autonomous/intelligent test sessions. Returns severity, title, description, and when found. Use when user asks "what bugs were found?" or "any issues?".',
+        'List bugs and findings discovered during autonomous/intelligent test sessions. Returns severity, title, description, findingType, and when found. Use when user asks "what bugs were found?", "any issues?", or "findings this week".',
       parameters: {
         type: 'object',
         properties: {
@@ -448,6 +470,14 @@ const QA_TOOLS: ChatCompletionTool[] = [
             type: 'string',
             enum: ['critical', 'high', 'medium', 'low'],
             description: 'Filter by severity level',
+          },
+          search: {
+            type: 'string',
+            description: 'Search by title or description text. Use to find findings related to specific features.',
+          },
+          days: {
+            type: 'number',
+            description: 'Look back N days (max 90). Use to find recent findings, e.g. days=7 for "this week".',
           },
           limit: {
             type: 'number',
@@ -532,7 +562,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_schedules',
       description:
-        'List test schedules for the project. Shows what is configured to run automatically: cron expression, timezone, next run time, active status.',
+        'List test schedules for the project. Shows what is configured to run automatically: cron expression, timezone, next run time, active status. Supports search by name and filtering by plan/module.',
       parameters: {
         type: 'object',
         properties: {
@@ -543,6 +573,32 @@ const QA_TOOLS: ChatCompletionTool[] = [
           active_only: {
             type: 'boolean',
             description: 'Only return active schedules (default: false)',
+          },
+          search: {
+            type: 'string',
+            description: 'Search by schedule name substring',
+          },
+          plan_id: {
+            type: 'string',
+            description: 'Filter by regression plan ID',
+          },
+          module_id: {
+            type: 'string',
+            description: 'Filter by module ID',
+          },
+          sort_by: {
+            type: 'string',
+            enum: ['created_at', 'next_run_at', 'name'],
+            description: 'Sort field. Use next_run_at to see which schedule runs next. Default: created_at',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction. Default: desc',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default: all, max 50)',
           },
         },
         required: ['project_id'],
@@ -599,7 +655,7 @@ const QA_TOOLS: ChatCompletionTool[] = [
     function: {
       name: 'qa_list_api_test_history',
       description:
-        'List recent API test execution results. Returns id, method, url, statusCode, durationMs, success, fuzzingScore, executedAt.',
+        'List recent API test execution results. Returns id, method, url, statusCode, durationMs, success, fuzzingScore, executedAt. Supports filtering by URL, HTTP method, time range, and success status.',
       parameters: {
         type: 'object',
         properties: {
@@ -607,13 +663,31 @@ const QA_TOOLS: ChatCompletionTool[] = [
             type: 'string',
             description: 'Project ID to query API test history for',
           },
-          limit: {
+          url_search: {
+            type: 'string',
+            description: 'Search API tests by URL (partial match). E.g. "/api/users" to find all tests targeting that endpoint.',
+          },
+          method: {
+            type: 'string',
+            enum: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'],
+            description: 'Filter by HTTP method',
+          },
+          days: {
             type: 'number',
-            description: 'Max results (default 20, max 50)',
+            description: 'Time range in days (default 30, max 90). Use days=7 for "last week", days=1 for "today".',
           },
           success: {
             type: 'boolean',
-            description: 'Filter by success status (true/false)',
+            description: 'Filter by success status (true = passed, false = failed)',
+          },
+          sort_order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            description: 'Sort direction by execution date. "desc" = newest first (default), "asc" = oldest first',
+          },
+          limit: {
+            type: 'number',
+            description: 'Max results (default 20, max 50). Use limit=1 with sort_order to get the single latest/oldest test.',
           },
         },
         required: ['project_id'],

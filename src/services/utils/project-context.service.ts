@@ -827,14 +827,19 @@ export class ProjectContextService {
 
   /**
    * Get default project in workspace (if any)
-   * FIX #2: Input validation
+   *
+   * Smart selection strategy (in order of priority):
+   * 1. Project with the most recent test activity (test cases or executions)
+   * 2. Most recently created project (fallback if no test activity)
+   *
+   * This avoids picking an old/empty project when the user has multiple projects.
    */
   static async getDefaultProject(
     workspaceId: string,
     userId: string
   ): Promise<{ id: string; name: string; settings: ProjectSettings } | null> {
     try {
-      // FIX #2: Validate inputs
+      // Validate inputs
       if (!this.isValidUUID(workspaceId)) {
         throw new Error(`Invalid workspaceId format: ${workspaceId}`);
       }
@@ -842,25 +847,78 @@ export class ProjectContextService {
         throw new Error(`Invalid userId format: ${userId}`);
       }
 
-      const { data, error } = await supabaseAdmin
+      // Get all user's projects in this workspace
+      const { data: projects, error: projError } = await supabaseAdmin
         .from('projects')
         .select('id, name, settings')
         .eq('workspace_id', workspaceId)
         .eq('user_id', userId)
-        .order('created_at', { ascending: true })
-        .limit(1)
-        .maybeSingle();
+        .order('created_at', { ascending: false })
+        .limit(10);
 
-      if (error) {
-        logger.error('[PROJECT] Error getting default project', {
-          error: error instanceof Error ? error.message : String(error),
+      if (projError) {
+        logger.error('[PROJECT] Error getting projects', {
+          error: projError.message,
           workspaceId,
           userId,
         });
         return null;
       }
 
-      return data || null;
+      if (!projects || projects.length === 0) return null;
+
+      // Single project — return it immediately (no need for activity check)
+      if (projects.length === 1) return projects[0];
+
+      // Multiple projects — pick the one with the most recent test activity
+      const projectIds = projects.map(p => p.id);
+
+      // Find project with the most recently created test case
+      const { data: latestTestCase } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('project_id')
+        .in('project_id', projectIds)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latestTestCase?.project_id) {
+        const match = projects.find(p => p.id === latestTestCase.project_id);
+        if (match) {
+          logger.debug('[PROJECT] Default project resolved by latest test case activity', {
+            projectId: match.id,
+            projectName: match.name,
+          });
+          return match;
+        }
+      }
+
+      // No test cases in any project — try most recent regression run
+      const { data: latestRun } = await supabaseAdmin
+        .from('regression_runs')
+        .select('project_id')
+        .in('project_id', projectIds)
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (latestRun?.project_id) {
+        const match = projects.find(p => p.id === latestRun.project_id);
+        if (match) {
+          logger.debug('[PROJECT] Default project resolved by latest regression run', {
+            projectId: match.id,
+            projectName: match.name,
+          });
+          return match;
+        }
+      }
+
+      // No activity in any project — return the most recently created one
+      logger.debug('[PROJECT] Default project resolved by most recent creation date', {
+        projectId: projects[0].id,
+        projectName: projects[0].name,
+      });
+      return projects[0];
     } catch (error) {
       logger.error('[PROJECT] Failed to get default project', {
         error: error instanceof Error ? error.message : String(error),
