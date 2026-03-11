@@ -134,21 +134,22 @@ export class GitWebhookJobHandler {
     // Check plan-level triggerTypes filter
     const planTriggerTypes = planAutomationConfig?.gitTriggers?.triggerTypes as string[] | undefined;
     if (planTriggerTypes && planTriggerTypes.length > 0) {
-      // Map webhook event type to plan trigger type
-      // push → 'push_to_branch', pull_request/merge_request → 'merge_to_main', release → 'release'
-      const eventToTriggerMap: Record<string, string> = {
-        pull_request: 'merge_to_main',
-        merge_request: 'merge_to_main',
-        push: 'push_to_branch',
-        release: 'release',
+      // Map webhook event type to plan trigger type(s). Push can match either push_to_branch or merge_to_main.
+      const eventToTriggerMap: Record<string, string[]> = {
+        pull_request: ['merge_to_main'],
+        merge_request: ['merge_to_main'],
+        push: ['push_to_branch', 'merge_to_main'],
+        release: ['release'],
       };
-      const mappedTrigger = eventToTriggerMap[deliveryEventType];
-      if (mappedTrigger && !planTriggerTypes.includes(mappedTrigger)) {
+      const allowedTriggers = eventToTriggerMap[deliveryEventType];
+      const isEnabled =
+        allowedTriggers && allowedTriggers.some((t) => planTriggerTypes.includes(t));
+      if (allowedTriggers && !isEnabled) {
         logger.info('[GIT_WEBHOOK_JOB] Trigger type not enabled in plan', {
           deliveryId,
           planId,
           deliveryEventType,
-          mappedTrigger,
+          allowedTriggers,
           planTriggerTypes,
         });
         await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {

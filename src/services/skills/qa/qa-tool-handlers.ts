@@ -178,9 +178,11 @@ export async function handleListTestCases(
   context: SkillContext
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
-  const status = args.status || 'published';
+  const status = args.status || 'all';
   const search = args.search as string | undefined;
   const limit = Math.min(args.limit || 20, 50);
+  const sortBy = (['created_at', 'updated_at', 'name', 'priority'].includes(args.sort_by) ? args.sort_by : 'created_at') as string;
+  const sortOrder = args.sort_order === 'asc' ? true : false; // ascending = true for 'asc'
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -189,11 +191,15 @@ export async function handleListTestCases(
   try {
     let query = supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, url, start_url, status, priority, tags, updated_at')
+      .select('id, name, url, start_url, status, priority, tags, created_at, updated_at')
       .eq('project_id', projectId)
-      .eq('status', status)
-      .order('updated_at', { ascending: false })
+      .order(sortBy, { ascending: sortOrder })
       .limit(limit);
+
+    // Apply status filter only if not "all"
+    if (status !== 'all') {
+      query = query.eq('status', status);
+    }
 
     if (search) {
       // Escape Postgres wildcards and PostgREST special chars to prevent filter injection
@@ -218,13 +224,37 @@ export async function handleListTestCases(
       status: tc.status,
       priority: tc.priority,
       tags: tc.tags || [],
+      createdAt: tc.created_at,
       updatedAt: tc.updated_at,
     }));
+
+    logger.info('[QA_TOOL] handleListTestCases result', {
+      projectId,
+      projectIdSource: context.projectId ? 'context' : 'args',
+      status,
+      sortBy,
+      sortOrder: sortOrder ? 'asc' : 'desc',
+      limit,
+      search: search || null,
+      resultCount: testCases.length,
+    });
+
+    const statusLabel = status === 'all' ? '' : ` ${status}`;
+
+    // When zero results, include project_id in response so the AI can help the user diagnose
+    if (testCases.length === 0) {
+      return {
+        success: true,
+        data: { testCases: [], total: 0, projectId },
+        message: `No test cases found in project ${projectId} (status filter: ${status || 'all'}, search: ${search || 'none'}). This could mean: (1) the project has no test cases yet, (2) the user might be in the wrong project/chat session. Suggest the user check which project they are working in.`,
+        displayToUser: false,
+      };
+    }
 
     return {
       success: true,
       data: { testCases, total: testCases.length },
-      message: `Found ${testCases.length} ${status} test cases`,
+      message: `Found ${testCases.length}${statusLabel} test cases (sorted by ${sortBy} ${sortOrder ? 'asc' : 'desc'})`,
       displayToUser: false,
     };
   } catch (error) {
@@ -282,10 +312,11 @@ export async function handleListTestExecutions(
     const runIds = (runs || []).map((r) => r.id);
 
     if (runIds.length === 0) {
+      logger.info('[QA_TOOL] handleListTestExecutions: no runs', { projectId, days });
       return {
         success: true,
-        data: { executions: [], total: 0 },
-        message: `No regression runs found in the last ${days} days`,
+        data: { executions: [], total: 0, projectId },
+        message: `No regression runs found in project ${projectId} in the last ${days} days. The user may not have run any tests yet, or the test results might be in a different project.`,
         displayToUser: false,
       };
     }
@@ -293,6 +324,7 @@ export async function handleListTestExecutions(
     // Step 2: Query executions for those runs (batched to avoid URL length limits)
     const batchSize = 100;
     let allExecRows: any[] = [];
+    const ascending = args.sort_order === 'asc';
 
     for (let i = 0; i < runIds.length; i += batchSize) {
       const batch = runIds.slice(i, i + batchSize);
@@ -300,7 +332,7 @@ export async function handleListTestExecutions(
         .from('test_executions')
         .select('id, test_case_id, status, duration_ms, browser, created_at, error_message')
         .in('run_id', batch)
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending });
 
       if (status) {
         query = query.eq('status', status);
@@ -322,7 +354,10 @@ export async function handleListTestExecutions(
     }
 
     // Sort combined results and apply limit
-    allExecRows.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    allExecRows.sort((a, b) => {
+      const diff = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      return ascending ? diff : -diff;
+    });
     const executions = allExecRows.slice(0, limit);
 
     // Step 3: Resolve test case names
@@ -736,17 +771,32 @@ export async function handleListRegressionPlans(
   context: SkillContext
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
+  const search = args.search as string | undefined;
+  const sortBy = (['created_at', 'updated_at', 'name'].includes(args.sort_by) ? args.sort_by : 'created_at') as string;
+  const sortOrder = args.sort_order === 'asc' ? true : false;
+  const limit = args.limit ? Math.min(args.limit, 50) : undefined;
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
   }
 
   try {
-    const { data: plans, error: plansError } = await supabaseAdmin
+    let plansQuery = supabaseAdmin
       .from('regression_plans')
       .select('id, name, description, is_default, tags, created_at, updated_at')
       .eq('project_id', projectId)
-      .order('created_at', { ascending: false });
+      .order(sortBy, { ascending: sortOrder });
+
+    if (search) {
+      const escaped = search.replace(/%/g, '\\%').replace(/_/g, '\\_').replace(/[,.()"]/g, '');
+      plansQuery = plansQuery.ilike('name', `%${escaped}%`);
+    }
+
+    if (limit) {
+      plansQuery = plansQuery.limit(limit);
+    }
+
+    const { data: plans, error: plansError } = await plansQuery;
 
     if (plansError) {
       logger.error('[QA_TOOL] Failed to list plans', { error: plansError.message, projectId });
@@ -972,16 +1022,43 @@ export async function handleGetAnalyticsSummary(
 
 /**
  * qa_get_test_results — Get test artifacts: video, screenshot, logs, errors, AI summary
+ * Accepts test_id (execution ID) directly, OR test_case_id (name or UUID) to auto-resolve the latest execution.
  */
 export async function handleGetTestResults(
   args: Record<string, any>,
   context: SkillContext
 ): Promise<SkillResult> {
-  const testId = args.test_id;
+  let testId = args.test_id as string | undefined;
   const projectId = resolveProjectId(args, context);
 
+  // If test_case_id is provided instead of test_id, find the latest execution for that test case
+  if (!testId && args.test_case_id) {
+    let testCaseId = args.test_case_id as string;
+
+    // Resolve test case by name if not UUID
+    if (!isUUID(testCaseId) && projectId) {
+      const r = await resolveTestCaseByName(testCaseId, projectId);
+      if ('error' in r) return { success: false, message: r.error, displayToUser: true };
+      testCaseId = r.id;
+    }
+
+    // Find the latest execution for this test case
+    const { data: latestExec } = await supabaseAdmin
+      .from('test_executions')
+      .select('id')
+      .eq('test_case_id', testCaseId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!latestExec) {
+      return { success: true, data: { testResult: null }, message: `No executions found for test case: ${args.test_case_id}. The test hasn't been run yet.`, displayToUser: false };
+    }
+    testId = latestExec.id;
+  }
+
   if (!testId) {
-    return { success: false, message: 'Missing required field: test_id', displayToUser: false };
+    return { success: false, message: 'Missing required field: test_id or test_case_id', displayToUser: false };
   }
 
   try {
@@ -1082,6 +1159,8 @@ export async function handleListTestFindings(
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
   const severity = args.severity as string | undefined;
+  const search = args.search as string | undefined;
+  const days = args.days ? Math.min(args.days, 90) : undefined;
   const limit = Math.min(args.limit || 20, 50);
 
   if (!projectId) {
@@ -1090,10 +1169,18 @@ export async function handleListTestFindings(
 
   try {
     // Step 1: Get session IDs for this project
-    const { data: sessions, error: sessionsError } = await supabaseAdmin
+    let sessionsQuery = supabaseAdmin
       .from('intelligent_test_sessions')
       .select('id')
       .eq('project_id', projectId);
+
+    if (days) {
+      const sinceDate = new Date();
+      sinceDate.setDate(sinceDate.getDate() - days);
+      sessionsQuery = sessionsQuery.gte('created_at', sinceDate.toISOString());
+    }
+
+    const { data: sessions, error: sessionsError } = await sessionsQuery;
 
     if (sessionsError) {
       logger.error('[QA_TOOL] Failed to get sessions for findings', { error: sessionsError.message });
@@ -1139,8 +1226,19 @@ export async function handleListTestFindings(
       }
     }
 
-    // Sort and limit
+    // Sort, search-filter, and limit
     allFindings.sort((a, b) => new Date(b.found_at).getTime() - new Date(a.found_at).getTime());
+
+    // Apply text search filter post-fetch (title + description)
+    if (search) {
+      const searchLower = search.toLowerCase();
+      allFindings = allFindings.filter(
+        (f) =>
+          (f.title && f.title.toLowerCase().includes(searchLower)) ||
+          (f.description && f.description.toLowerCase().includes(searchLower))
+      );
+    }
+
     const findings = allFindings.slice(0, limit).map((f) => ({
       id: f.id,
       findingType: f.finding_type,
@@ -1153,7 +1251,7 @@ export async function handleListTestFindings(
     return {
       success: true,
       data: { findings, total: findings.length },
-      message: `Found ${findings.length} test findings${severity ? ` (severity: ${severity})` : ''}`,
+      message: `Found ${findings.length} test findings${severity ? ` (severity: ${severity})` : ''}${search ? ` matching "${search}"` : ''}${days ? ` in the last ${days} days` : ''}`,
       displayToUser: false,
     };
   } catch (error) {
@@ -1177,6 +1275,9 @@ export async function handleListTestModules(
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
   const platformKey = args.platform_key as string | undefined;
+  const sortBy = (['created_at', 'updated_at', 'name'].includes(args.sort_by) ? args.sort_by : 'created_at') as string;
+  const sortOrder = args.sort_order === 'asc' ? true : false;
+  const limit = args.limit ? Math.min(args.limit, 50) : undefined;
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -1187,7 +1288,11 @@ export async function handleListTestModules(
       .from('test_modules')
       .select('id, name, description, platform_id, tags, priority, created_at, updated_at, test_platforms!inner(platform_key)')
       .eq('project_id', projectId)
-      .order('created_at', { ascending: false });
+      .order(sortBy, { ascending: sortOrder });
+
+    if (limit) {
+      query = query.limit(limit);
+    }
 
     if (platformKey) {
       query = query.eq('test_platforms.platform_key', platformKey);
@@ -1270,11 +1375,21 @@ export async function handleListTestFlows(
       }
     }
 
-    const { data, error } = await supabaseAdmin
+    const sortBy = (['order_index', 'created_at', 'updated_at', 'name'].includes(args.sort_by) ? args.sort_by : 'order_index') as string;
+    const sortOrder = args.sort_order === 'desc' ? false : true; // default asc for flows (order_index)
+    const flowLimit = args.limit ? Math.min(args.limit, 50) : undefined;
+
+    let flowQuery = supabaseAdmin
       .from('test_flows')
       .select('id, module_id, name, description, order_index, flow_type, tags, priority, preconditions, expected_result, created_at, updated_at')
       .eq('module_id', moduleId)
-      .order('order_index', { ascending: true });
+      .order(sortBy, { ascending: sortOrder });
+
+    if (flowLimit) {
+      flowQuery = flowQuery.limit(flowLimit);
+    }
+
+    const { data, error } = await flowQuery;
 
     if (error) {
       logger.error('[QA_TOOL] Failed to list flows', { error: error.message, moduleId });
@@ -1323,6 +1438,12 @@ export async function handleListSchedules(
 ): Promise<SkillResult> {
   const projectId = resolveProjectId(args, context);
   const activeOnly = args.active_only === true;
+  const search = args.search as string | undefined;
+  const sortBy = (['created_at', 'next_run_at', 'name'].includes(args.sort_by) ? args.sort_by : 'created_at') as string;
+  const sortOrder = args.sort_order === 'asc' ? true : false;
+  const limit = args.limit ? Math.min(args.limit, 50) : undefined;
+  const planId = args.plan_id as string | undefined;
+  const moduleId = args.module_id as string | undefined;
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -1333,10 +1454,23 @@ export async function handleListSchedules(
       .from('test_schedules')
       .select('id, name, cron_expression, timezone, is_active, module_id, plan_id, last_run_at, next_run_at, created_at')
       .eq('project_id', projectId)
-      .order('created_at', { ascending: false });
+      .order(sortBy, { ascending: sortOrder });
 
     if (activeOnly) {
       query = query.eq('is_active', true);
+    }
+    if (search) {
+      const escaped = search.replace(/%/g, '\\%').replace(/_/g, '\\_').replace(/[,.()"]/g, '');
+      query = query.ilike('name', `%${escaped}%`);
+    }
+    if (planId) {
+      query = query.eq('plan_id', planId);
+    }
+    if (moduleId) {
+      query = query.eq('module_id', moduleId);
+    }
+    if (limit) {
+      query = query.limit(limit);
     }
 
     const { data, error } = await query;
@@ -1592,6 +1726,10 @@ export async function handleListApiTestHistory(
   const projectId = resolveProjectId(args, context);
   const limit = Math.min(args.limit || 20, 50);
   const successFilter = args.success as boolean | undefined;
+  const urlSearch = args.url_search as string | undefined;
+  const methodFilter = args.method as string | undefined;
+  const days = Math.min(args.days || 30, 90);
+  const ascending = args.sort_order === 'asc';
 
   if (!projectId) {
     return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -1599,6 +1737,9 @@ export async function handleListApiTestHistory(
 
   try {
     // Get chat sessions for this project to scope API test executions
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - days);
+
     const { data: sessions, error: sessionsError } = await supabaseAdmin
       .from('chat_sessions')
       .select('id')
@@ -1614,8 +1755,8 @@ export async function handleListApiTestHistory(
     if (sessionIds.length === 0) {
       return {
         success: true,
-        data: { executions: [], total: 0 },
-        message: 'No API test history found for this project',
+        data: { executions: [], total: 0, projectId },
+        message: `No API test history found in project ${projectId}. The user may not have run any API tests yet.`,
         displayToUser: false,
       };
     }
@@ -1630,10 +1771,18 @@ export async function handleListApiTestHistory(
         .from('api_test_executions')
         .select('id, method, url, status_code, duration_ms, success, fuzzing_score, executed_at')
         .in('session_id', batch)
-        .order('executed_at', { ascending: false });
+        .gte('executed_at', sinceDate.toISOString())
+        .order('executed_at', { ascending });
 
       if (successFilter !== undefined) {
         query = query.eq('success', successFilter);
+      }
+      if (methodFilter) {
+        query = query.eq('method', methodFilter.toUpperCase());
+      }
+      if (urlSearch) {
+        const escaped = urlSearch.replace(/%/g, '\\%').replace(/_/g, '\\_').replace(/[,.()"]/g, '');
+        query = query.ilike('url', `%${escaped}%`);
       }
 
       const { data: batchData, error: batchError } = await query;
@@ -1649,7 +1798,10 @@ export async function handleListApiTestHistory(
     }
 
     // Sort and limit
-    allRows.sort((a, b) => new Date(b.executed_at).getTime() - new Date(a.executed_at).getTime());
+    allRows.sort((a, b) => {
+      const diff = new Date(a.executed_at).getTime() - new Date(b.executed_at).getTime();
+      return ascending ? diff : -diff;
+    });
     const executions = allRows.slice(0, limit).map((e) => ({
       id: e.id,
       method: e.method,
@@ -1664,7 +1816,7 @@ export async function handleListApiTestHistory(
     return {
       success: true,
       data: { executions, total: executions.length },
-      message: `Found ${executions.length} API test executions`,
+      message: `Found ${executions.length} API test executions in the last ${days} days`,
       displayToUser: false,
     };
   } catch (error) {

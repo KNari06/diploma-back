@@ -59,9 +59,12 @@ CLASSIFICATION RULES:
    - Must involve DIFFERENT root categories (not just read+write of the same one)
 
 ANTI-RULES (NEVER classify as simple_chat):
-- NEVER simple_chat if user mentions: test case, test step, тест кейс, тест шаг, test result, execution, regression, bug, баг, coverage, analytics, report, fixture, module, flow, dashboard
+- NEVER simple_chat if user mentions: test case, test step, тест кейс, тест шаг, test result, execution, regression, bug, баг, coverage, analytics, report, fixture, module, flow, dashboard, schedule, deployment, flaky
 - NEVER simple_chat if user asks to: get, fetch, list, show, find, search, create, update, change, delete, run, execute, send, notify, connect, integrate (these are ACTION verbs that require tools)
-- NEVER simple_chat if the previous assistant message said "I can't" / "нет доступа" / "не могу" and user is repeating or rephrasing their request — this means the previous classification was WRONG, so use single_tool this time
+- NEVER simple_chat if user uses TEMPORAL queries: "last/latest/first/oldest/recent/newest" + any entity — these ALWAYS require a tool call with sort_by
+- NEVER simple_chat if user asks "how many" / "сколько" + any QA entity — counting always requires a tool call
+- NEVER simple_chat if the previous assistant message said "I can't" / "нет доступа" / "не могу" / "не нашел" / "not found" and user is repeating or rephrasing their request — this means the previous classification was WRONG, so use single_tool this time
+- NEVER simple_chat if user mentions any of these Russian QA terms: тест, прогон, результат, ошибка, отчет, модуль, фикстура, расписание, покрытие, аналитика, тест кейс, тест план
 
 EDGE CASES:
 - "Run tests and show results" → single_tool (qa category handles both run + results)
@@ -72,6 +75,12 @@ EDGE CASES:
 - Quantitative questions about test metrics → single_tool (qa_read) — always requires tool call
 - Ambiguous request with no clear tool target → single_tool with best-guess category (confidence 0.6)
 - NEVER classify integration/setup requests as simple_chat — always use single_tool
+- "найди последний тест кейс" / "find the last test case" → single_tool (qa_read) — temporal queries ALWAYS need tools
+- "покажи все тесты" / "show all tests" → single_tool (qa_read)
+- "сколько у меня тестов?" / "how many tests?" → single_tool (qa_read)
+- "какой тест упал?" / "which test failed?" → single_tool (qa_read)
+- "последний прогон" / "last execution/run" → single_tool (qa_read)
+- "статистика/аналитика/дашборд" → single_tool (qa_read)
 
 CONFIDENCE CALIBRATION:
 - 0.9-1.0: Obvious match (greeting, explicit single tool request)

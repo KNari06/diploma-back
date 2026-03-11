@@ -17,7 +17,8 @@ export function buildExecutorPrompt(
   plan?: string | TrackedPlanStep[],
   projectId?: string,
   mode?: 'lite' | 'pro' | 'editor',
-  userGoal?: string
+  userGoal?: string,
+  projectName?: string
 ): string {
   let prompt = `You are a QA tool executor. Your ONLY job is to call the right tools with correct arguments and return results.
 
@@ -47,11 +48,37 @@ COMMON TOOL CHAINS (call both when the user needs full picture):
 - "Dashboard / overview" → qa_get_full_dashboard (single call covers most data)
 - When qa_get_test_case returns testType: use it (ui/api/mixed) — do NOT guess the test method
 
+TEMPORAL & SORTING QUERIES (CRITICAL — use sort_by + limit for these):
+- "last/latest/newest/most recent created test case" → qa_list_test_cases with sort_by="created_at", sort_order="desc", limit=1, status="all"
+- "first/oldest test case" → qa_list_test_cases with sort_by="created_at", sort_order="asc", limit=1, status="all"
+- "recently modified/updated test cases" → qa_list_test_cases with sort_by="updated_at", sort_order="desc"
+- "last N test cases" → qa_list_test_cases with sort_by="created_at", sort_order="desc", limit=N, status="all"
+- "last execution/run" → qa_list_test_executions with sort_order="desc", limit=1
+- "last failed test" → qa_list_test_executions with status="failed", sort_order="desc", limit=1
+- "all my test cases" / "show all tests" → qa_list_test_cases with status="all" (NOT just "published")
+- "how many tests do I have" → qa_list_test_cases with status="all", limit=50 (count total field)
+- "find test by name X" → qa_list_test_cases with search="X", status="all"
+
+RUSSIAN/KAZAKH TEMPORAL KEYWORDS (translate intent, NOT the query):
+- "последний / крайний / недавний" = last/latest → sort_by="created_at", sort_order="desc", limit=1
+- "первый / самый старый" = first/oldest → sort_by="created_at", sort_order="asc", limit=1
+- "измененный / обновленный" = modified/updated → sort_by="updated_at"
+- "найди / покажи / дай" = find/show/give → search or list
+- "все / полный список" = all → status="all"
+- "сколько" = how many → list with status="all" and check total
+
+ZERO RESULTS HANDLING (CRITICAL — do NOT just say "not found"):
+- If a tool returns total:0 or an empty array — DO NOT just say "I didn't find anything." That is unhelpful.
+- Instead, relay the tool's message EXACTLY — it contains diagnostic hints (e.g., project_id used, possible causes).
+- If the message mentions "wrong project" or "project has no test cases" — tell the user WHICH project was searched (include the project_id) and suggest they check if they're in the correct project.
+- If the user repeats the same query after a "not found" response — do NOT call the same tool with the same args again. Instead, try a BROADER search: remove filters, increase limit, use status="all", or try a different tool (e.g., qa_get_full_dashboard to see if the project has ANY data at all).
+- Escalation chain for "not found": (1) retry with broader filters → (2) try qa_get_full_dashboard → (3) report to user with project_id and suggest switching project.
+
 CRITICAL — DATA INTEGRITY (ANTI-HALLUCINATION):
 - When the user asks about QA data (test cases, test steps, results, executions, analytics, bugs, coverage, fixtures, modules, flows, schedules, regression plans, reports, deployments, flaky tests, recommendations) — you MUST call the appropriate qa_* tool. NEVER answer from memory or imagination.
 - NEVER invent test case names, IDs, statuses, pass rates, durations, error messages, or any QA metrics.
 - If you are unsure which tool to call — call qa_get_full_dashboard as the safe default.
-- If a tool returns empty results or zero items — that IS the correct answer. Say "no data found." Do NOT fabricate data to fill the gap.
+- If a tool returns empty results or zero items — that IS the correct answer. Report the tool's diagnostic message to the user. Do NOT fabricate data to fill the gap.
 - If no QA tools are available in your tool list — say "I don't have access to QA data tools right now" instead of guessing.
 - You were given tools for a reason — USE THEM. Do not skip tool calls and answer with text when the user is asking for data.`;
 
@@ -62,7 +89,9 @@ CRITICAL — DATA INTEGRITY (ANTI-HALLUCINATION):
   }
 
   if (projectId) {
-    prompt += `\n- ALWAYS use project_id="${projectId}" for QA tools. NEVER ask the user for project ID.`;
+    const nameHint = projectName ? ` (project: "${projectName}")` : '';
+    prompt += `\n- ALWAYS use project_id="${projectId}"${nameHint} for QA tools. NEVER ask the user for project ID.
+- When reporting zero results, mention the project name${projectName ? ` ("${projectName}")` : ''} so the user knows which project was searched.`;
   }
 
   if (mode === 'editor') {
