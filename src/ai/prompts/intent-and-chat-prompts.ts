@@ -117,6 +117,12 @@ function buildEditorModeSection(context?: IntentParserContext): string {
 The user is in EDITOR MODE with a live browser preview (previewSessionId: ${context.previewSessionId}).
 The chat is embedded inside the editor — there is NO platform_test flow here.
 
+CRITICAL CONTEXT PRIORITY:
+The user is actively working in the editor RIGHT NOW. Any previous chat history about
+API tests, analytics, test results, or general questions is SECONDARY context.
+Focus ONLY on what the user is asking in their CURRENT message in the context of
+the live browser preview. Do NOT let old conversation topics influence your intent classification.
+
 EDITOR MODE INTENT RULES (override general rules):
 - "platform_test" is NOT AVAILABLE in editor mode. NEVER choose it.
 - Single action on the page (click, type, scroll, press, hover, select, check, uncheck) → "editor_action"
@@ -128,6 +134,11 @@ EDITOR MODE INTENT RULES (override general rules):
 - "run saved test", "запусти регресс" (background headless run) → "run_regression"
 - Questions, conversation, analysis, explanations → "general_chat"
 - Everything else follows normal intent rules (save_test, analyze_failure, etc.)
+
+ANTI-CONFUSION RULES:
+- If chat history mentions API tests but user asks about the page → "editor_action" or "general_chat"
+- If chat history mentions analytics but user asks to click something → "editor_action"
+- The user's CURRENT message + editor mode context ALWAYS wins over chat history.
 
 `;
 }

@@ -240,6 +240,81 @@ export async function handleGeneralChat(
 
     // Inject temporal markers (date prefixes + gap separators) for time-aware AI
     conversationHistory = injectTemporalMarkers(messagesWithTime, CONSTANTS.TEMPORAL_GAP_THRESHOLD_MS);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // EDITOR MODE: Compress old non-editor messages to reduce context noise
+    // ═══════════════════════════════════════════════════════════════════════
+    // In editor mode, old messages about API tests, analytics, etc. can confuse
+    // the AI. Keep last 6 messages verbatim (3 exchanges), compress older non-editor
+    // messages into a brief summary so the AI focuses on the current page context.
+    //
+    // Detection strategy (in priority order):
+    // 1. metadata.mode === 'editor' — authoritative tag set by save calls (Change 4)
+    // 2. metadata.editorAction === true — set by editor_action handler
+    // 3. For old messages without tags: skip compression (keep verbatim) to avoid
+    //    false positives from content heuristics. Over time, tagged messages will dominate.
+    if (mode === 'editor' && conversationHistory.length > 6) {
+      const KEEP_VERBATIM = 6;
+      const recentVerbatim = conversationHistory.slice(-KEEP_VERBATIM);
+      const olderMessages = conversationHistory.slice(0, -KEEP_VERBATIM);
+
+      // Build a set of content strings that belong to editor-mode messages,
+      // using the authoritative metadata from the original DB records.
+      // injectTemporalMarkers may prepend date prefixes like "[12 Mar, 14:30] ",
+      // so we store the ORIGINAL content to match via .endsWith() / .includes().
+      const editorContentSignatures = new Set<string>();
+      for (const msg of recentMessages) {
+        if (msg.metadata?.mode === 'editor' || msg.metadata?.editorAction) {
+          // Store first 200 chars as a signature — enough for unique matching
+          const sig = (msg.content || '').substring(0, 200);
+          if (sig) editorContentSignatures.add(sig);
+        }
+      }
+
+      const keptOlder: ChatCompletionMessageParam[] = [];
+      const compressedParts: string[] = [];
+
+      for (const msg of olderMessages) {
+        // Skip system messages (temporal gap markers like "── 2d later ──")
+        if (msg.role === 'system') {
+          keptOlder.push(msg);
+          continue;
+        }
+
+        const content = typeof msg.content === 'string' ? msg.content : '';
+
+        // Check if this message is editor-related via metadata signatures
+        const isEditorRelated = [...editorContentSignatures].some(sig => content.includes(sig));
+
+        if (isEditorRelated) {
+          keptOlder.push(msg);
+        } else {
+          const role = msg.role === 'user' ? 'User' : 'Assistant';
+          const preview = content.substring(0, 150).replace(/\n/g, ' ').trim();
+          if (preview) {
+            compressedParts.push(`${role}: ${preview}${content.length > 150 ? '...' : ''}`);
+          }
+        }
+      }
+
+      if (compressedParts.length > 0) {
+        const summary: ChatCompletionMessageParam = {
+          role: 'system',
+          content: `--- Earlier conversation (non-editor, compressed) ---\n${compressedParts.join('\n')}\n--- End of earlier context ---\nThe user is now in EDITOR MODE. Focus on the current page and recent editor interactions.`,
+        };
+        conversationHistory = [summary, ...keptOlder, ...recentVerbatim];
+      } else {
+        conversationHistory = [...keptOlder, ...recentVerbatim];
+      }
+
+      logger.info('[GENERAL_CHAT] Editor mode: compressed conversation history', {
+        originalCount: olderMessages.length + KEEP_VERBATIM,
+        compressedNonEditor: compressedParts.length,
+        keptEditorMessages: keptOlder.length,
+        verbatimRecent: recentVerbatim.length,
+        editorSignatures: editorContentSignatures.size,
+      });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -446,7 +521,7 @@ export async function handleGeneralChat(
       const { SkillRegistry } = await import('@/services/skills');
 
       // Get available skill tools (includes MemorySkill — registered in SkillRegistry)
-      const skillContext = { userId, workspaceId, chatSessionId, projectId };
+      const skillContext = { userId, workspaceId, chatSessionId, projectId, mode: mode as 'lite' | 'pro' | 'editor' | undefined };
       availableTools = await SkillRegistry.getAvailableTools(skillContext);
       skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
 
@@ -540,14 +615,6 @@ You can still help with general questions, saved test cases, and test management
     });
   }
 
-  // Add editor page context if available
-  if (editorPageContext) {
-    messages.push({
-      role: 'system',
-      content: formatPageContextForChat(editorPageContext),
-    });
-  }
-
   // Add additional context if provided (legacy support)
   const contextString = typeof context === 'string' ? context : undefined;
   if (contextString) {
@@ -559,6 +626,16 @@ You can still help with general questions, saved test cases, and test management
 
   // Add conversation history
   messages.push(...conversationHistory);
+
+  // Add editor page context AFTER history (closest to user message = highest priority).
+  // LLMs give more weight to recent context (recency bias), so placing the current
+  // page DOM/URL right before the user's message ensures it overrides stale history.
+  if (editorPageContext) {
+    messages.push({
+      role: 'system',
+      content: formatPageContextForChat(editorPageContext),
+    });
+  }
 
   // Add current message (with multimodal content if attachments present)
   const hasAttachments = attachments && attachments.length > 0;
@@ -800,6 +877,7 @@ You can still help with general questions, saved test cases, and test management
           chatSessionId,
           projectId,
           previewSessionId: parsedContext?.previewSessionId,
+          mode: mode as 'lite' | 'pro' | 'editor' | undefined,
         };
 
         const callResult = await executeTool({
@@ -982,9 +1060,11 @@ You can still help with general questions, saved test cases, and test management
       : ChatService.saveChatMessages.bind(ChatService);
 
     // Build user message metadata (include file info if attachments present)
-    const userMessageMetadata = hasAttachments
-      ? { files: attachments.map(f => ({ name: f.name, type: f.type, mimeType: f.mimeType, size: f.size })) }
-      : undefined;
+    const modeTag = mode || 'lite';
+    const userMessageMetadata: Record<string, any> = { mode: modeTag };
+    if (hasAttachments) {
+      userMessageMetadata.files = attachments.map(f => ({ name: f.name, type: f.type, mimeType: f.mimeType, size: f.size }));
+    }
 
     const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: message, metadata: userMessageMetadata },
@@ -994,8 +1074,8 @@ You can still help with general questions, saved test cases, and test management
         // Save clarification metadata so intent parser can detect follow-up context
         // Matches pattern from handleClarificationRequest in shared/clarification.ts
         metadata: pipelineClarification
-          ? { requiresAnswers: true, needsMoreInfo: true, source: 'sub_agent_pipeline' }
-          : undefined,
+          ? { requiresAnswers: true, needsMoreInfo: true, source: 'sub_agent_pipeline', mode: modeTag }
+          : { mode: modeTag },
       },
     ]);
 
