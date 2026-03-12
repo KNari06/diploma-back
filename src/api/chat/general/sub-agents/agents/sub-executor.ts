@@ -26,7 +26,12 @@ import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/reso
 /**
  * Build a focused prompt for a single plan step.
  */
-function buildSubExecutorPrompt(step: TrackedPlanStep, userGoal?: string, projectId?: string): string {
+function buildSubExecutorPrompt(
+  step: TrackedPlanStep,
+  userGoal?: string,
+  projectId?: string,
+  mode?: 'lite' | 'pro' | 'editor'
+): string {
   let prompt = `You are executing a single step of a larger plan. Be focused and efficient.
 
 YOUR STEP: Step ${step.stepNumber} — ${step.description}
@@ -47,6 +52,17 @@ ERROR HANDLING:
 
   if (projectId) {
     prompt += `\n- ALWAYS use project_id="${projectId}" for QA tools. Never ask the user for it.`;
+  }
+
+  if (mode === 'editor') {
+    prompt += `
+
+EDITOR MODE:
+- The page DOM is available in context — use real element ref IDs and values from it.
+- To create test cases: use qa_create_test_case / qa_update_test_case_steps with concrete steps.
+- To run a test case on the live preview: use qa_run_test with run_type="preview".
+- NEVER invent elements that are not in the DOM context.
+- platform_test is NOT available in editor mode.`;
   }
 
   return prompt;
@@ -70,7 +86,7 @@ export async function executeToolsForStep(
   const tracker = new ToolCallTracker(SUB_AGENT_CONFIG.loopDetection);
   let assistantContent = '';
 
-  const prompt = buildSubExecutorPrompt(step, userGoal, context.projectId);
+  const prompt = buildSubExecutorPrompt(step, userGoal, context.projectId, context.mode);
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: prompt },
     ...contextMessages,

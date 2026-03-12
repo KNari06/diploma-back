@@ -90,7 +90,12 @@ export async function getPageContext(previewSessionId: string, userId?: string):
     const MAX_PAGE_TEXT = 5000;
     let pageText = pageState.pageText;
     if (pageText && pageText.length > MAX_PAGE_TEXT) {
-      pageText = pageText.substring(0, MAX_PAGE_TEXT) + '\n[... truncated]';
+      logger.debug('[EDITOR_CONTEXT] Truncating pageText', {
+        previewSessionId,
+        originalLength: pageText.length,
+        truncatedTo: MAX_PAGE_TEXT,
+      });
+      pageText = pageText.substring(0, MAX_PAGE_TEXT) + `\n[... truncated — showing ${MAX_PAGE_TEXT} of ${pageState.pageText!.length} chars]`;
     }
 
     return {
