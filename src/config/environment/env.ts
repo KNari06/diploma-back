@@ -194,6 +194,13 @@ const parsedEnv = parseResult.data;
 parsedEnv.REDIS_HOST = normalizeHostForLocalExecution(parsedEnv.REDIS_HOST);
 parsedEnv.REDIS_URL = normalizeRedisUrlForLocalExecution(parsedEnv.REDIS_URL);
 
+// When running locally (not in Docker), qait-redis-dev does not resolve; use localhost so the same .env works for server and local.
+if (!isRunningInDocker() && parsedEnv.REDIS_HOST === 'qait-redis-dev') {
+  parsedEnv.REDIS_HOST = 'localhost';
+  const redisAuthPart = parsedEnv.REDIS_PASSWORD ? `:${encodeURIComponent(parsedEnv.REDIS_PASSWORD)}@` : '';
+  parsedEnv.REDIS_URL = `redis://${redisAuthPart}${parsedEnv.REDIS_HOST}:${parsedEnv.REDIS_PORT}`;
+}
+
 // If REDIS_URL is not explicitly provided, build it from REDIS_HOST/REDIS_PORT.
 // This avoids accidental localhost fallback in Cloud Run where only host/port are injected.
 if (!process.env.REDIS_URL) {
