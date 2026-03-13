@@ -1269,7 +1269,10 @@ app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/api-config`, requireAuth, requireApproved, apiConfigRoutes);
-app.use(`/api/${env.API_VERSION}/jira`, requireAuth, requireApproved, jiraRoutes);
+// jira: OAuth callback is public (Atlassian redirects with code/state, no Bearer); router applies auth to all other routes
+app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
+// Fallback when reverse proxy strips /api: accept e.g. /v1/jira/callback
+app.use(`/${env.API_VERSION}/jira`, jiraRoutes);
 app.use(`/api/${env.API_VERSION}/kb/skills`, requireAuth, requireApproved, skillsRoutes);
 app.use(`/api/${env.API_VERSION}/kb/patterns`, requireAuth, requireApproved, patternsRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, kbRoutes);

@@ -1,9 +1,15 @@
 import { Router } from 'express';
 import { startJiraAuth, getConnectUrl, handleJiraCallback, getProjects, getBoards, getBoardConfigurationHandler, getIssues, createIssue, updateIssue, updateIssueStatus, getConnectionStatus, disconnectJira, getConnections, getJiraSettings, updateJiraSettings, qaAnalyze, runFromJiraViaChat } from './jira.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
-import { requireAuth } from '@/middleware/auth.middleware';
+import { requireAuth, requireApproved } from '@/middleware/auth.middleware';
 
 const router = Router();
+
+// OAuth callback must be public (Atlassian redirects with code/state, no Bearer token)
+router.get('/callback', asyncHandler(handleJiraCallback));
+
+// All other routes require auth and approved status
+router.use(requireAuth, requireApproved);
 
 /**
  * @swagger
@@ -198,7 +204,6 @@ router.get('/connect', requireAuth, asyncHandler(startJiraAuth));
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/callback', asyncHandler(handleJiraCallback));
 
 /**
  * @swagger
