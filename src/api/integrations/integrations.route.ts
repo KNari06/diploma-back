@@ -1,5 +1,5 @@
 import express from 'express';
-import { requireAuth as authenticateUser } from '@/middleware/auth.middleware';
+import { requireApproved, requireAuth as authenticateUser } from '@/middleware/auth.middleware';
 import {
   listIntegrations,
   getIntegrationStatus,
@@ -15,6 +15,12 @@ import {
 } from './integrations.controller';
 
 const router = express.Router();
+
+// OAuth callback must be public (provider redirects with code/state, no Bearer token)
+router.get('/:provider/callback', handleCallback);
+
+// All other routes require auth and approved status
+router.use(authenticateUser, requireApproved);
 
 /**
  * @swagger
@@ -36,7 +42,7 @@ const router = express.Router();
  *       401:
  *         description: Unauthorized
  */
-router.get('/', authenticateUser, listIntegrations);
+router.get('/', listIntegrations);
 
 /**
  * @swagger
@@ -58,7 +64,7 @@ router.get('/', authenticateUser, listIntegrations);
  *       401:
  *         description: Unauthorized
  */
-router.get('/status', authenticateUser, getIntegrationStatus);
+router.get('/status', getIntegrationStatus);
 
 /**
  * @swagger
@@ -83,7 +89,7 @@ router.get('/status', authenticateUser, getIntegrationStatus);
  *       401:
  *         description: Unauthorized
  */
-router.get('/github/repos', authenticateUser, listGitHubRepos);
+router.get('/github/repos', listGitHubRepos);
 
 /**
  * @swagger
@@ -112,7 +118,7 @@ router.get('/github/repos', authenticateUser, listGitHubRepos);
  *       401:
  *         description: Unauthorized
  */
-router.get('/github/repos/:owner/:repo/branches', authenticateUser, listGitHubBranches);
+router.get('/github/repos/:owner/:repo/branches', listGitHubBranches);
 
 /**
  * @swagger
@@ -137,7 +143,7 @@ router.get('/github/repos/:owner/:repo/branches', authenticateUser, listGitHubBr
  *       401:
  *         description: Unauthorized
  */
-router.get('/gitlab/repos', authenticateUser, listGitLabRepos);
+router.get('/gitlab/repos', listGitLabRepos);
 
 /**
  * @swagger
@@ -162,7 +168,7 @@ router.get('/gitlab/repos', authenticateUser, listGitLabRepos);
  *       401:
  *         description: Unauthorized
  */
-router.get('/gitlab/projects/:projectId/branches', authenticateUser, listGitLabBranches);
+router.get('/gitlab/projects/:projectId/branches', listGitLabBranches);
 
 /**
  * @swagger
@@ -193,7 +199,7 @@ router.get('/gitlab/projects/:projectId/branches', authenticateUser, listGitLabB
  *       401:
  *         description: Unauthorized
  */
-router.get('/:provider/authorize', authenticateUser, startAuthorization);
+router.get('/:provider/authorize', startAuthorization);
 
 /**
  * @swagger
@@ -223,7 +229,6 @@ router.get('/:provider/authorize', authenticateUser, startAuthorization);
  *       302:
  *         description: Redirect to frontend
  */
-router.get('/:provider/callback', handleCallback);
 
 /**
  * @swagger
@@ -251,7 +256,7 @@ router.get('/:provider/callback', handleCallback);
  *       401:
  *         description: Unauthorized
  */
-router.delete('/:provider', authenticateUser, disconnectIntegration);
+router.delete('/:provider', disconnectIntegration);
 
 /**
  * @swagger
@@ -328,7 +333,7 @@ router.delete('/:provider', authenticateUser, disconnectIntegration);
  *       401:
  *         description: Unauthorized
  */
-router.post('/slack/setup', authenticateUser, setupSlack);
-router.post('/telegram/setup', authenticateUser, setupTelegram);
+router.post('/slack/setup', setupSlack);
+router.post('/telegram/setup', setupTelegram);
 
 export default router;

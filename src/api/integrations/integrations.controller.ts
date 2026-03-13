@@ -30,6 +30,18 @@ const ALL_PROVIDERS: IntegrationProvider[] = [
   'telegram',
 ];
 
+/** Frontend base URL without trailing slash (avoids double slash in redirects like //integrations). */
+function getFrontendBaseUrl(): string {
+  const url = env.FRONTEND_URL || 'http://localhost:3000';
+  return url.replace(/\/+$/, '');
+}
+
+/** Backend base URL without path (avoids /api/api/v1 in OAuth callback URLs when BACKEND_URL already contains /api). */
+function getBackendBaseUrl(): string {
+  const url = env.BACKEND_URL || `http://localhost:${env.PORT}`;
+  return url.replace(/\/api\/?$/, '').replace(/\/+$/, '');
+}
+
 /**
  * Get connection status for all providers
  * GET /api/v1/integrations/status?workspace_id=xxx
@@ -314,15 +326,13 @@ export async function handleCallback(req: Request, res: Response): Promise<void>
       logger.error('[INTEGRATIONS] Failed to decode OAuth state', {
         error: decodeError instanceof Error ? decodeError.message : String(decodeError),
       });
-      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
-      res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
+      res.redirect(`${getFrontendBaseUrl()}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
       return;
     }
 
     if (!userId) {
       logger.error('[INTEGRATIONS] Missing userId in decoded OAuth state');
-      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
-      res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
+      res.redirect(`${getFrontendBaseUrl()}/integrations?status=error&message=${encodeURIComponent('Invalid OAuth state')}`);
       return;
     }
 
@@ -355,15 +365,13 @@ export async function handleCallback(req: Request, res: Response): Promise<void>
     }
 
     // Redirect to frontend success page
-    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}/integrations?provider=${provider}&status=success`);
+    res.redirect(`${getFrontendBaseUrl()}/integrations?provider=${provider}&status=success`);
   } catch (error) {
     logger.error('[INTEGRATIONS] OAuth callback error', {
       error: error instanceof Error ? error.message : String(error),
     });
 
-    const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}/integrations?status=error&message=${encodeURIComponent('Failed to connect integration')}`);
+    res.redirect(`${getFrontendBaseUrl()}/integrations?status=error&message=${encodeURIComponent('Failed to connect integration')}`);
   }
 }
 
@@ -642,7 +650,7 @@ function buildGitHubAuthUrl(userId: string, workspaceId?: string): string {
     throw new Error('GITHUB_CLIENT_ID not configured');
   }
 
-  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/github/callback`;
+  const callbackUrl = `${getBackendBaseUrl()}/api/${env.API_VERSION}/integrations/github/callback`;
   const state = encodeState(userId, workspaceId);
 
   const params = new URLSearchParams({
@@ -664,7 +672,7 @@ function buildGitLabAuthUrl(userId: string, workspaceId?: string): string {
     throw new Error('GITLAB_CLIENT_ID not configured');
   }
 
-  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/gitlab/callback`;
+  const callbackUrl = `${getBackendBaseUrl()}/api/${env.API_VERSION}/integrations/gitlab/callback`;
   const state = encodeState(userId, workspaceId);
 
   const params = new URLSearchParams({
@@ -687,7 +695,7 @@ function buildNotionAuthUrl(userId: string, workspaceId?: string): string {
     throw new Error('NOTION_CLIENT_ID not configured');
   }
 
-  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/notion/callback`;
+  const callbackUrl = `${getBackendBaseUrl()}/api/${env.API_VERSION}/integrations/notion/callback`;
   const state = encodeState(userId, workspaceId);
 
   const params = new URLSearchParams({
@@ -712,7 +720,7 @@ async function handleGitHubCallback(userId: string, workspaceId: string | undefi
     throw new Error('GitHub OAuth credentials not configured');
   }
 
-  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/github/callback`;
+  const callbackUrl = `${getBackendBaseUrl()}/api/${env.API_VERSION}/integrations/github/callback`;
 
   // Exchange code for token (redirect_uri must match the one used in authorize request)
   const response = await fetch('https://github.com/login/oauth/access_token', {
@@ -786,7 +794,7 @@ async function handleGitLabCallback(userId: string, workspaceId: string | undefi
     throw new Error('GitLab OAuth credentials not configured');
   }
 
-  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/gitlab/callback`;
+  const callbackUrl = `${getBackendBaseUrl()}/api/${env.API_VERSION}/integrations/gitlab/callback`;
 
   const tokenParams = new URLSearchParams({
     client_id: clientId,
@@ -860,7 +868,7 @@ async function handleNotionCallback(userId: string, workspaceId: string | undefi
     throw new Error('Notion OAuth credentials not configured');
   }
 
-  const callbackUrl = `${env.BACKEND_URL || `http://localhost:${env.PORT}`}/api/${env.API_VERSION}/integrations/notion/callback`;
+  const callbackUrl = `${getBackendBaseUrl()}/api/${env.API_VERSION}/integrations/notion/callback`;
 
   // Exchange code for token
   const response = await fetch('https://api.notion.com/v1/oauth/token', {
