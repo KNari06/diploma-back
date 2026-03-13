@@ -81,106 +81,25 @@ export class GitWebhookJobHandler {
       return;
     }
 
-    // Use linked plan_id or try to auto-link by matching a plan's gitTriggers.repositoryUrl to this integration
-    let planId = integration.plan_id as string | null;
-    if (!planId) {
+    // Find all plans in this project that have this repo as git trigger (so one webhook can run multiple plans)
+    const matchingPlans = await getPlansMatchingIntegration(integration, deliveryEventType, delivery.payload, provider);
+    if (matchingPlans.length === 0) {
+      // Fallback: try to auto-link one plan so next time we have at least one
       const linked = await tryAutoLinkPlanToIntegration(integration);
       if (linked) {
-        planId = linked;
         logger.info('[GIT_WEBHOOK_JOB] Auto-linked plan to integration', {
           integrationId: integration.id,
           planId: linked,
           deliveryId,
         });
       }
-    }
-    if (!planId) {
-      logger.warn('[GIT_WEBHOOK_JOB] No plan linked to git integration, skipping', {
+      logger.warn('[GIT_WEBHOOK_JOB] No plans match this webhook (repo + branch/trigger), skipping', {
         integrationId: integration.id,
         deliveryId,
       });
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
         status: 'ignored',
         error: 'no_plan_linked',
-      });
-      return;
-    }
-
-    // Read plan-level automation config for branch filtering
-    const planAutomationConfig = await (async () => {
-      const { data: planRow } = await supabaseAdmin
-        .from('regression_plans')
-        .select('automation_config')
-        .eq('id', planId)
-        .maybeSingle();
-      return planRow?.automation_config;
-    })();
-
-    // Check if git triggers are enabled in plan config
-    if (planAutomationConfig?.gitTriggers && planAutomationConfig.gitTriggers.enabled === false) {
-      logger.info('[GIT_WEBHOOK_JOB] Git triggers disabled in plan config', { planId, deliveryId });
-      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-        status: 'ignored',
-        error: 'git_triggers_disabled_in_plan',
-      });
-      return;
-    }
-
-    // Determine allowed branches from plan config (falls back to default main/master)
-    const allowedBranches = planAutomationConfig?.gitTriggers?.branch
-      ? [planAutomationConfig.gitTriggers.branch]
-      : undefined;
-
-    // Check plan-level triggerTypes filter
-    const planTriggerTypes = planAutomationConfig?.gitTriggers?.triggerTypes as string[] | undefined;
-    if (planTriggerTypes && planTriggerTypes.length > 0) {
-      // Map webhook event type to plan trigger type(s). Push can match either push_to_branch or merge_to_main.
-      const eventToTriggerMap: Record<string, string[]> = {
-        pull_request: ['merge_to_main'],
-        merge_request: ['merge_to_main'],
-        push: ['push_to_branch', 'merge_to_main'],
-        release: ['release'],
-      };
-      const allowedTriggers = eventToTriggerMap[deliveryEventType];
-      const isEnabled =
-        allowedTriggers && allowedTriggers.some((t) => planTriggerTypes.includes(t));
-      if (allowedTriggers && !isEnabled) {
-        logger.info('[GIT_WEBHOOK_JOB] Trigger type not enabled in plan', {
-          deliveryId,
-          planId,
-          deliveryEventType,
-          allowedTriggers,
-          planTriggerTypes,
-        });
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'ignored',
-          error: 'trigger_type_not_enabled',
-        });
-        return;
-      }
-    }
-
-    // Decide if we should trigger regression based on payload + branch filters
-    const decision = GitWebhookService.shouldTrigger({
-      provider,
-      eventType: deliveryEventType as any,
-      payload: delivery.payload,
-      allowedBranches,
-    });
-
-    if (!decision.trigger) {
-      logger.info('[GIT_WEBHOOK_JOB] Webhook ignored by shouldTrigger', {
-        provider,
-        deliveryId,
-        planId,
-        deliveryEventType,
-        reason: decision.reason,
-        branch: decision.branch,
-        allowedBranches,
-      });
-      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-        status: 'ignored',
-        error: decision.reason,
       });
       return;
     }
@@ -200,33 +119,33 @@ export class GitWebhookJobHandler {
       throw new Error('Project not found for integration');
     }
 
-    logger.info('[GIT_WEBHOOK_JOB] Triggering regression run', {
+    logger.info('[GIT_WEBHOOK_JOB] Triggering regression runs for all matching plans', {
       provider,
       deliveryId,
-      planId,
-      branch: decision.branch,
-      reason: decision.reason,
+      planIds: matchingPlans.map((p) => p.planId),
+      count: matchingPlans.length,
     });
 
     try {
-
-      // Trigger plan execution via webhook
-      const result = await RegressionRunService.runPlan({
-        planId,
-        userId: project.user_id,
-        trigger: 'webhook',
-      });
-
-      logger.info('[GIT_WEBHOOK_JOB] Plan execution triggered', {
-        planId,
-        runId: result.runId,
-        totalTests: result.totalTests,
-        deliveryId,
-      });
+      let firstRunId: string | null = null;
+      for (const { planId, decision } of matchingPlans) {
+        const result = await RegressionRunService.runPlan({
+          planId,
+          userId: project.user_id,
+          trigger: 'webhook',
+        });
+        if (!firstRunId) firstRunId = result.runId;
+        logger.info('[GIT_WEBHOOK_JOB] Plan execution triggered', {
+          planId,
+          runId: result.runId,
+          totalTests: result.totalTests,
+          deliveryId,
+        });
+      }
 
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
         status: 'processed',
-        regressionRunId: result.runId,
+        regressionRunId: firstRunId ?? undefined,
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -284,6 +203,66 @@ export class GitWebhookJobHandler {
 function normalizeRepoUrlForMatch(url: string): string {
   const t = (url || '').trim().replace(/\/+$/, '');
   return t.endsWith('.git') ? t.slice(0, -4) : t;
+}
+
+const EVENT_TO_TRIGGER_MAP: Record<string, string[]> = {
+  pull_request: ['merge_to_main'],
+  merge_request: ['merge_to_main'],
+  push: ['push_to_branch', 'merge_to_main'],
+  release: ['release'],
+};
+
+/**
+ * Find all regression plans in the integration's project that:
+ * - have gitTriggers.repositoryUrl matching the integration's repo,
+ * - have git triggers enabled,
+ * - have triggerTypes matching the delivery event (if configured),
+ * - pass shouldTrigger (branch filter) for this payload.
+ * Returns list of { planId, decision } for each plan that should be run.
+ */
+async function getPlansMatchingIntegration(
+  integration: { id: string; project_id: string; repository_url: string },
+  deliveryEventType: string,
+  payload: unknown,
+  provider: 'github' | 'gitlab'
+): Promise<Array<{ planId: string; decision: { trigger: boolean; reason?: string; branch?: string } }>> {
+  const targetUrl = normalizeRepoUrlForMatch(integration.repository_url);
+  if (!targetUrl) return [];
+
+  const { data: plans, error } = await supabaseAdmin
+    .from('regression_plans')
+    .select('id, automation_config')
+    .eq('project_id', integration.project_id);
+
+  if (error || !plans?.length) return [];
+
+  const out: Array<{ planId: string; decision: { trigger: boolean; reason?: string; branch?: string } }> = [];
+  for (const plan of plans) {
+    const planAutomationConfig = (plan.automation_config as any) ?? {};
+    const gt = planAutomationConfig.gitTriggers;
+    if (!gt || gt.enabled === false) continue;
+    const repoUrl = (gt.repositoryUrl || '').trim();
+    if (!repoUrl || normalizeRepoUrlForMatch(repoUrl) !== targetUrl) continue;
+
+    const planTriggerTypes = (gt.triggerTypes as string[] | undefined) ?? [];
+    if (planTriggerTypes.length > 0) {
+      const allowedTriggers = EVENT_TO_TRIGGER_MAP[deliveryEventType];
+      const isEnabled = allowedTriggers && allowedTriggers.some((t) => planTriggerTypes.includes(t));
+      if (!isEnabled) continue;
+    }
+
+    const allowedBranches = gt.branch ? [gt.branch] : undefined;
+    const decision = GitWebhookService.shouldTrigger({
+      provider,
+      eventType: deliveryEventType as any,
+      payload,
+      allowedBranches,
+    });
+    if (!decision.trigger) continue;
+
+    out.push({ planId: plan.id, decision });
+  }
+  return out;
 }
 
 /**
