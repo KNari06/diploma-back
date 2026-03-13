@@ -1290,6 +1290,8 @@ app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
 app.use(`/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
 // integrations: OAuth callbacks are public (no Bearer on redirect); router applies auth to all other routes
 app.use(`/api/${env.API_VERSION}/integrations`, integrationsRoutes);
+// Fallback when reverse proxy strips /api: accept e.g. /v1/integrations/github/callback (same handlers)
+app.use(`/${env.API_VERSION}/integrations`, integrationsRoutes);
 app.use(`/api/${env.API_VERSION}/queue`, requireAuth, requireApproved, queueStatusRoutes);
 app.use(`/api/${env.API_VERSION}/preview`, requireAuth, requireApproved, previewRoutes);
 app.use(`/api/${env.API_VERSION}/saved-test-cases`, requireAuth, requireApproved, savedTestCasesRoutes);
