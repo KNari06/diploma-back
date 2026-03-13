@@ -36,6 +36,7 @@ function getJiraCallbackUrl(): string {
 export function buildJiraAuthUrl(state: string): string {
   const clientId = env.JIRA_CLIENT_ID;
   const callbackUrl = getJiraCallbackUrl();
+  logger.info('[JIRA] OAuth redirect_uri used for Atlassian', { callbackUrl });
 
   if (!clientId) {
     throw new Error('JIRA_CLIENT_ID is not configured');
