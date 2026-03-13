@@ -176,7 +176,7 @@ export class GitWebhookJobHandler {
               provider,
               deliveryId,
               projectId: integration.project_id,
-              branch: decision.branch,
+              branch: matchingPlans[0]?.decision?.branch,
               error: errorMessage,
               dedupeKey: `git-webhook:${deliveryId}:insufficient`,
             },
