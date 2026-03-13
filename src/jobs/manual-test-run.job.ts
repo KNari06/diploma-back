@@ -131,7 +131,7 @@ export class ManualTestRunJobHandler {
       }
 
       // Emit WebSocket: test started
-      this.emitTestStarted(testId, browser);
+      this.emitTestStarted(testId, browser, chatSessionId);
 
       logger.info(`[TEST-RUN] Executing Playwright test: ${testId}`, {
         browser,
@@ -360,11 +360,13 @@ export class ManualTestRunJobHandler {
   /**
    * Emit test started WebSocket event
    */
-  private static emitTestStarted(testId: string, browser: string) {
+  private static emitTestStarted(testId: string, browser: string, chatSessionId?: string) {
     const payload: TestStartedPayload = {
       testId,
       browser,
       timestamp: new Date().toISOString(),
+      sessionId: chatSessionId,
+      source: chatSessionId ? 'chat' : 'regression',
     };
     webSocketService.emitTestStarted(testId, payload);
   }

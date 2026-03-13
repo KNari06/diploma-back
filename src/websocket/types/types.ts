@@ -204,6 +204,8 @@ export interface TestStartedPayload {
   testId: string;
   browser: string;
   timestamp: string;
+  sessionId?: string;
+  source?: 'chat' | 'regression';
 }
 
 /**
