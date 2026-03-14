@@ -14,6 +14,7 @@ jest.mock('../intent-test-case.service', () => ({
   IntentTestCaseService: {
     getById: jest.fn(),
     updateStepFromPreviewApply: jest.fn(),
+    batchUpdateStepsFromRun: jest.fn(),
   },
 }));
 
@@ -297,14 +298,15 @@ describe('PreviewRunService', () => {
       await firstRun;
     });
 
-    it('should persist appliedStep on success (best-effort)', async () => {
+    it('should batch-persist enriched steps on success (best-effort)', async () => {
+      const enrichedStep = {
+        ...mockSteps[0],
+        compiled: { /* mock compiled plan */ },
+        evidence: { /* mock evidence */ },
+      };
       (PreviewStepApplyService.applyStep as jest.Mock).mockResolvedValue({
         success: true,
-        appliedStep: {
-          ...mockSteps[0],
-          compiled: { /* mock compiled plan */ },
-          evidence: { /* mock evidence */ },
-        },
+        appliedStep: enrichedStep,
       });
 
       await PreviewRunService.runSavedSteps(
@@ -313,17 +315,48 @@ describe('PreviewRunService', () => {
         mockUserId
       );
 
-      // Verify persistence was attempted
-      expect(IntentTestCaseService.updateStepFromPreviewApply).toHaveBeenCalled();
+      // Verify batch persistence was called once (not per-step)
+      expect(IntentTestCaseService.batchUpdateStepsFromRun).toHaveBeenCalledTimes(1);
+      expect(IntentTestCaseService.batchUpdateStepsFromRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          intentTestCaseId: mockIntentTestCaseId,
+          enrichedSteps: expect.any(Map),
+        })
+      );
+      // Per-step persist should NOT be called
+      expect(IntentTestCaseService.updateStepFromPreviewApply).not.toHaveBeenCalled();
     });
 
-    it('should continue on persistence error (best-effort)', async () => {
+    it('should batch-persist even on partial failure (step 2 fails)', async () => {
+      const enrichedStep1 = {
+        ...mockSteps[0],
+        compiled: { /* mock compiled plan */ },
+      };
+      (PreviewStepApplyService.applyStep as jest.Mock)
+        .mockResolvedValueOnce({ success: true, appliedStep: enrichedStep1 })
+        .mockResolvedValueOnce({ success: false, error: 'Element not found' })
+        .mockResolvedValueOnce({ success: true, appliedStep: mockSteps[2] });
+
+      await PreviewRunService.runSavedSteps(
+        mockPreviewSessionId,
+        mockIntentTestCaseId,
+        mockUserId
+      );
+
+      // Batch persist should still be called with step 1's enriched data
+      expect(IntentTestCaseService.batchUpdateStepsFromRun).toHaveBeenCalledTimes(1);
+      const callArgs = (IntentTestCaseService.batchUpdateStepsFromRun as jest.Mock).mock.calls[0][0];
+      expect(callArgs.enrichedSteps.size).toBe(1);
+      expect(callArgs.enrichedSteps.has('step-1')).toBe(true);
+    });
+
+    it('should continue on batch persistence error (best-effort)', async () => {
       (PreviewStepApplyService.applyStep as jest.Mock).mockResolvedValue({
         success: true,
         appliedStep: mockSteps[0],
       });
 
-      (IntentTestCaseService.updateStepFromPreviewApply as jest.Mock).mockRejectedValue(
+      (IntentTestCaseService.batchUpdateStepsFromRun as jest.Mock).mockRejectedValue(
         new Error('Database error')
       );
 

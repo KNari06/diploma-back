@@ -26,6 +26,8 @@ import mobileRoutes from '@/api/mobile/mobile.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
+import { getSharedReport } from '@/api/regression/regression.controller';
+import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import reportsRoutes from '@/api/reports/reports.route';
 import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route';
 import testsRoutes from '@/api/tests/tests.route';
@@ -1280,6 +1282,8 @@ app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, rulesReloadR
 app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);
+// Shared report: public endpoint (no auth) — must be registered before auth-protected regression routes
+app.get(`/api/${env.API_VERSION}/regression/shared/:shareToken`, sharedReportRateLimiter, getSharedReport);
 app.use(`/api/${env.API_VERSION}/regression`, requireAuth, requireApproved, regressionRoutes);
 app.use(`/api/${env.API_VERSION}/platforms`, requireAuth, requireApproved, platformsRoutes);
 app.use(`/api/${env.API_VERSION}/modules`, requireAuth, requireApproved, modulesRoutes);

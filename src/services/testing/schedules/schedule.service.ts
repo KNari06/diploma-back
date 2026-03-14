@@ -308,89 +308,125 @@ export class ScheduleService {
     await this.claimDueSchedule(id);
   }
 
-  /**
-   * Calculate next run time from cron expression.
-   *
-   * Supports the subset of 5-field cron used by the scheduler:
-   *   minute hour day-of-month month day-of-week
-   *
-   * Handles:
-   *  - Specific minute + hour (e.g. "30 9 * * *")
-   *  - Day-of-week lists  (e.g. "0 9 * * 1,3,5" = Mon/Wed/Fri)
-   *  - Timezone via Intl.DateTimeFormat (falls back to UTC on unknown tz)
-   *
-   * Scans up to 8 days ahead to find the next matching slot.
-   */
-  /** Public so RegressionPlanService.syncSchedule can reuse the same logic. */
+  // Calculate next run time from cron expression.
+  //
+  // Supports the full 5-field cron: minute hour day-of-month month day-of-week
+  //
+  // Handles: specific values, step values (star-slash-N), day-of-month, month,
+  // day-of-week lists, ranges, and timezone via Intl.DateTimeFormat.
+  // Scans up to 400 days ahead to cover yearly cron patterns.
+  //
+  // Public so RegressionPlanService.syncSchedule can reuse the same logic.
   static calculateNextRun(cronExpression: string, timezone: string): string {
     const now = new Date();
 
     const parts = cronExpression.split(' ');
     if (parts.length !== 5) {
-      // Invalid cron → fallback 1 hour from now
       return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
     }
 
-    const [minuteStr, hourStr, , , dowStr] = parts;
+    const [minuteStr, hourStr, domStr, monthStr, dowStr] = parts;
 
-    // We only handle specific minute + hour (no wildcards in those fields)
-    const minute = parseInt(minuteStr, 10);
-    const hour = parseInt(hourStr, 10);
-    if (isNaN(minute) || isNaN(hour)) {
-      return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+    // Parse each field into a set of allowed values
+    const allowedMinutes = this.parseCronField(minuteStr, 0, 59);
+    const allowedHours = this.parseCronField(hourStr, 0, 23);
+    const allowedDoms = this.parseCronField(domStr, 1, 31);
+    const allowedMonths = this.parseCronField(monthStr, 1, 12);
+    let allowedDows = this.parseCronField(dowStr, 0, 7);
+
+    // Normalize dow=7 (Sunday) to dow=0
+    if (allowedDows && allowedDows.has(7)) {
+      allowedDows.add(0);
+      allowedDows.delete(7);
     }
 
-    // Parse day-of-week field: "*" → all days, "1,3,5" → Set{1,3,5}
-    let allowedDays: Set<number> | null = null; // null = every day
-    if (dowStr !== '*') {
-      const parsed = dowStr
-        .split(',')
-        .map((d) => parseInt(d.trim(), 10))
-        .filter((n) => n >= 0 && n <= 7);
-      if (parsed.length > 0) {
-        allowedDays = new Set<number>();
-        for (const d of parsed) {
-          // cron: 0 = Sunday, 7 = Sunday (both valid)
-          allowedDays.add(d === 7 ? 0 : d);
-        }
-      }
+    if (!allowedMinutes || !allowedHours) {
+      return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
     }
 
-    // Resolve "now" in the target timezone so we compare correctly.
-    // Intl.DateTimeFormat gives us the local hour/minute/day-of-week in that tz.
     const tz = this.resolveTimezone(timezone);
-    const nowInTz = this.datePartsInTimezone(now, tz);
+    const sortedMinutes = [...allowedMinutes].sort((a, b) => a - b);
+    const sortedHours = [...allowedHours].sort((a, b) => a - b);
 
-    // Build candidate date starting from today-in-tz.
-    // We scan up to 8 days to cover every day-of-week combination.
-    for (let dayOffset = 0; dayOffset <= 7; dayOffset++) {
+    // Scan up to 400 days to cover monthly/yearly patterns
+    for (let dayOffset = 0; dayOffset <= 400; dayOffset++) {
       const candidate = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
       const candidateParts = this.datePartsInTimezone(candidate, tz);
 
-      // Check day-of-week constraint
-      if (allowedDays && !allowedDays.has(candidateParts.dow)) {
+      // Check month constraint
+      if (allowedMonths && !allowedMonths.has(candidateParts.month)) {
         continue;
       }
 
-      // Build the exact Date for this candidate day at the target hour:minute in tz.
-      // We use a trick: start from the candidate date at midnight UTC, then adjust.
-      const targetUtc = this.buildDateInTimezone(
-        candidateParts.year,
-        candidateParts.month,
-        candidateParts.day,
-        hour,
-        minute,
-        tz
-      );
+      // Check day-of-month constraint
+      if (allowedDoms && !allowedDoms.has(candidateParts.day)) {
+        continue;
+      }
 
-      // Must be strictly in the future
-      if (targetUtc > now) {
-        return targetUtc.toISOString();
+      // Check day-of-week constraint
+      if (allowedDows && !allowedDows.has(candidateParts.dow)) {
+        continue;
+      }
+
+      // Try each allowed hour:minute combination on this day
+      for (const hour of sortedHours) {
+        for (const minute of sortedMinutes) {
+          const targetUtc = this.buildDateInTimezone(
+            candidateParts.year,
+            candidateParts.month,
+            candidateParts.day,
+            hour,
+            minute,
+            tz
+          );
+
+          if (targetUtc > now) {
+            return targetUtc.toISOString();
+          }
+        }
       }
     }
 
     // Fallback (should never reach here for valid cron)
     return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  // Parse a single cron field into a Set of allowed integer values.
+  // Supports: "*", specific numbers, comma-separated lists, step values,
+  // and ranges (e.g. "1-5"). Returns null for "*" (all values allowed).
+  private static parseCronField(field: string, min: number, max: number): Set<number> | null {
+    if (field === '*') return null;
+
+    // Step value: */N
+    if (field.startsWith('*/')) {
+      const step = parseInt(field.slice(2), 10);
+      if (isNaN(step) || step <= 0) return null;
+      const set = new Set<number>();
+      for (let i = min; i <= max; i += step) {
+        set.add(i);
+      }
+      return set;
+    }
+
+    // Comma-separated list, possibly with ranges: "1,3,5" or "1-5" or "1-3,5"
+    const set = new Set<number>();
+    for (const part of field.split(',')) {
+      const trimmed = part.trim();
+      if (trimmed.includes('-')) {
+        const [startStr, endStr] = trimmed.split('-');
+        const start = parseInt(startStr, 10);
+        const end = parseInt(endStr, 10);
+        if (!isNaN(start) && !isNaN(end)) {
+          for (let i = start; i <= end; i++) {
+            if (i >= min && i <= max) set.add(i);
+          }
+        }
+      } else {
+        const n = parseInt(trimmed, 10);
+        if (!isNaN(n) && n >= min && n <= max) set.add(n);
+      }
+    }
+    return set.size > 0 ? set : null;
   }
 
   /**

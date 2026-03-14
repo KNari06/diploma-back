@@ -206,10 +206,21 @@ function normalizeRepoUrlForMatch(url: string): string {
 }
 
 const EVENT_TO_TRIGGER_MAP: Record<string, string[]> = {
-  pull_request: ['merge_to_main'],
-  merge_request: ['merge_to_main'],
-  push: ['push_to_branch', 'merge_to_main'],
+  pull_request: ['merge_to_main', 'pr_opened'],
+  merge_request: ['merge_to_main', 'pr_opened'],
+  push: ['push_to_branch'],
   release: ['release'],
+};
+
+/** Map shouldTrigger() reason → frontend trigger type for precise plan matching. */
+const REASON_TO_TRIGGER_TYPE: Record<string, string> = {
+  pr_merged: 'merge_to_main',
+  mr_merged: 'merge_to_main',
+  pr_opened: 'pr_opened',
+  mr_opened: 'pr_opened',
+  push_main: 'push_to_branch',
+  release_published: 'release',
+  release_create: 'release',
 };
 
 /**
@@ -244,13 +255,6 @@ async function getPlansMatchingIntegration(
     const repoUrl = (gt.repositoryUrl || '').trim();
     if (!repoUrl || normalizeRepoUrlForMatch(repoUrl) !== targetUrl) continue;
 
-    const planTriggerTypes = (gt.triggerTypes as string[] | undefined) ?? [];
-    if (planTriggerTypes.length > 0) {
-      const allowedTriggers = EVENT_TO_TRIGGER_MAP[deliveryEventType];
-      const isEnabled = allowedTriggers && allowedTriggers.some((t) => planTriggerTypes.includes(t));
-      if (!isEnabled) continue;
-    }
-
     const allowedBranches = gt.branch ? [gt.branch] : undefined;
     const decision = GitWebhookService.shouldTrigger({
       provider,
@@ -259,6 +263,13 @@ async function getPlansMatchingIntegration(
       allowedBranches,
     });
     if (!decision.trigger) continue;
+
+    // Map the shouldTrigger decision reason to the actual trigger type
+    const actualTriggerType = REASON_TO_TRIGGER_TYPE[decision.reason] || null;
+    const planTriggerTypes = (gt.triggerTypes as string[] | undefined) ?? [];
+    if (planTriggerTypes.length > 0 && actualTriggerType) {
+      if (!planTriggerTypes.includes(actualTriggerType)) continue;
+    }
 
     out.push({ planId: plan.id, decision });
   }

@@ -47,6 +47,8 @@ export interface ProbedElement {
   boundingBox?: ElementBoundingBox;
   /** True if element accepts multi-line text (textarea, contenteditable) */
   isMultiline?: boolean;
+  /** Nearest heading/landmark text — provides container context for multi-page AI lint */
+  containerText?: string;
 }
 
 /** Typing buffer stored on session */
@@ -147,6 +149,18 @@ const PROBE_AT_POINT_FN = `
     || target.getAttribute('contenteditable') === ''
     || (target.getAttribute('role') === 'textbox' && target.getAttribute('aria-multiline') === 'true');
 
+  // V11: Collect nearest heading/landmark for container context (multi-page AI lint)
+  var containerText = undefined;
+  var walk2 = target.parentElement;
+  for (var j = 0; j < 8 && walk2; j++) {
+    var heading = walk2.querySelector('h1,h2,h3,h4,[role="heading"]');
+    if (heading) {
+      containerText = (heading.textContent || '').trim().slice(0, 60) || undefined;
+      break;
+    }
+    walk2 = walk2.parentElement;
+  }
+
   return {
     tag: tag,
     role: target.getAttribute('role') || undefined,
@@ -161,6 +175,7 @@ const PROBE_AT_POINT_FN = `
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
     isMultiline: isMultiline || undefined,
+    containerText: containerText,
     boundingBox: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -200,6 +215,18 @@ const PROBE_FOCUSED_FN = `
     || target.getAttribute('contenteditable') === ''
     || (target.getAttribute('role') === 'textbox' && target.getAttribute('aria-multiline') === 'true');
 
+  // V11: Collect nearest heading/landmark for container context (multi-page AI lint)
+  var containerText = undefined;
+  var walk2 = target.parentElement;
+  for (var j = 0; j < 8 && walk2; j++) {
+    var heading = walk2.querySelector('h1,h2,h3,h4,[role="heading"]');
+    if (heading) {
+      containerText = (heading.textContent || '').trim().slice(0, 60) || undefined;
+      break;
+    }
+    walk2 = walk2.parentElement;
+  }
+
   return {
     tag: tag,
     role: target.getAttribute('role') || undefined,
@@ -214,6 +241,7 @@ const PROBE_FOCUSED_FN = `
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
     isMultiline: isMultiline || undefined,
+    containerText: containerText,
     boundingBox: {
       x: Math.round(rect.x),
       y: Math.round(rect.y),
@@ -451,6 +479,8 @@ export class RecordingCaptureService {
     if (element.labelText) hints.label = element.labelText;
     if (element.placeholder) hints.placeholder = element.placeholder;
     if (element.ariaLabel) hints.nearText = element.ariaLabel;
+    // V11: Use containerText as nearText fallback for multi-page context
+    if (element.containerText && !hints.nearText) hints.nearText = element.containerText;
     if (element.type) hints.type = element.type;
     if (element.name) hints.autocomplete = element.name;
     return hints;
@@ -693,6 +723,27 @@ export class RecordingCaptureService {
       description: `Scroll ${direction} ${absDelta}px`,
       // Store the actual delta as value so replay can use it
       value: String(Math.round(accumulatedDeltaY)),
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // HOVER CAPTURE (V11)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Capture a hover action as an IntentStep.
+   * Used when a hover on a different element precedes a click (e.g., dropdown menus).
+   */
+  static captureHover(element: ProbedElement): PreviewIntentStep {
+    const label = this.getElementLabel(element);
+    return {
+      id: recStepId(),
+      type: 'hover',
+      description: `Hover '${label}'`,
+      bindingHints: this.buildBindingHints(element) as BindingHints | undefined,
+      ...(element.ref && {
+        evidence: { lastSuccessRef: element.ref, confidence: 1.0 },
+      }),
     };
   }
 
