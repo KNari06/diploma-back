@@ -26,6 +26,8 @@ import mobileRoutes from '@/api/mobile/mobile.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
+import { getSharedReport } from '@/api/regression/regression.controller';
+import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import reportsRoutes from '@/api/reports/reports.route';
 import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route';
 import testsRoutes from '@/api/tests/tests.route';
@@ -1269,7 +1271,10 @@ app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/api-config`, requireAuth, requireApproved, apiConfigRoutes);
-app.use(`/api/${env.API_VERSION}/jira`, requireAuth, requireApproved, jiraRoutes);
+// jira: OAuth callback is public (Atlassian redirects with code/state, no Bearer); router applies auth to all other routes
+app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
+// Fallback when reverse proxy strips /api: accept e.g. /v1/jira/callback
+app.use(`/${env.API_VERSION}/jira`, jiraRoutes);
 app.use(`/api/${env.API_VERSION}/kb/skills`, requireAuth, requireApproved, skillsRoutes);
 app.use(`/api/${env.API_VERSION}/kb/patterns`, requireAuth, requireApproved, patternsRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, kbRoutes);
@@ -1277,6 +1282,8 @@ app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, rulesReloadR
 app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);
+// Shared report: public endpoint (no auth) — must be registered before auth-protected regression routes
+app.get(`/api/${env.API_VERSION}/regression/shared/:shareToken`, sharedReportRateLimiter, getSharedReport);
 app.use(`/api/${env.API_VERSION}/regression`, requireAuth, requireApproved, regressionRoutes);
 app.use(`/api/${env.API_VERSION}/platforms`, requireAuth, requireApproved, platformsRoutes);
 app.use(`/api/${env.API_VERSION}/modules`, requireAuth, requireApproved, modulesRoutes);

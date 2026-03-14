@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { IntegrationTokenService, type IntegrationProvider } from '@/services/api/integration-token.service';
 import { getGitHubToken, listUserRepos, listBranches } from '@/services/api/github.service';
 import { getGitLabToken, listUserProjects, listBranches as listGitLabBranchesApi } from '@/services/api/gitlab.service';
+import { createJiraOAuthUrl } from '@/api/jira/jira.controller';
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
 
@@ -241,15 +242,20 @@ export async function startAuthorization(req: Request, res: Response): Promise<v
         break;
       }
 
-      case 'jira':
-        // Jira OAuth is already implemented in jira.service.ts
-        if (wantsJson) {
-          const jiraAuthUrl = `${req.protocol}://${req.get('host')}/api/${env.API_VERSION}/jira/authorize`;
-          res.json({ success: true, redirect_url: jiraAuthUrl, timestamp: new Date().toISOString() });
+      case 'jira': {
+        if (!env.JIRA_CLIENT_ID?.trim()) {
+          res.status(503).json({
+            success: false,
+            error: 'Jira integration not configured',
+            message: 'JIRA_CLIENT_ID is not set on the server. Ask the administrator to configure Jira OAuth.',
+            timestamp: new Date().toISOString(),
+          });
           return;
         }
-        res.redirect(`/api/${env.API_VERSION}/jira/authorize`);
-        return;
+        // Build real Atlassian OAuth URL (state stored in jira.controller); redirect to it so SPA does not hit auth-protected /jira/authorize.
+        authUrl = createJiraOAuthUrl(userId);
+        break;
+      }
 
       default:
         res.status(501).json({
