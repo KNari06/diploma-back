@@ -1,3 +1,4 @@
+import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
@@ -1303,6 +1304,7 @@ app.use(`/api/${env.API_VERSION}/queue`, requireAuth, requireApproved, queueStat
 app.use(`/api/${env.API_VERSION}/preview`, requireAuth, requireApproved, previewRoutes);
 app.use(`/api/${env.API_VERSION}/saved-test-cases`, requireAuth, requireApproved, savedTestCasesRoutes);
 app.use(`/api/${env.API_VERSION}/tests`, requireAuth, requireApproved, testsRoutes);
+app.use(`/api/${env.API_VERSION}/allure-import`, requireAuth, requireApproved, allureImportRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {
