@@ -32,6 +32,13 @@ export const AI_MODELS = {
 
   /** Vision-capable model for screenshot analysis. Default: gpt-4.1 */
   vision: env.OPENAI_MODEL || 'gpt-4.1',
+
+  /**
+   * Classification model — balances quality and cost for bulk processing tasks.
+   * Used by the Allure import pipeline for file classification and KB preprocessing.
+   * Default: gpt-4.1-mini ($0.40/$1.60 per 1M tokens — 80% cheaper than gpt-4.1).
+   */
+  classify: 'gpt-4.1-mini' as const,
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -154,4 +161,16 @@ export const AI_TASK_MODELS = {
   helpers: AI_MODELS.fast,
   /** Credit calculations */
   creditDefault: AI_MODELS.fast,
+
+  // ── Allure Import Pipeline ─────────────────────────────────────────────
+  /**
+   * Classifies ambiguous files inside an Allure ZIP.
+   * Receives up to 2000 chars of file content and returns category + summary.
+   */
+  allureClassify: AI_MODELS.classify,
+  /**
+   * Preprocesses documentation before KB ingestion.
+   * Strips HTML/noise, summarises logs, extracts useful content.
+   */
+  allurePreprocess: AI_MODELS.classify,
 } as const;

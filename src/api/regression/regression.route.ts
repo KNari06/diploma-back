@@ -4,7 +4,10 @@ import { Router } from 'express';
 import {
   cancelRun,
   createShareLink,
+  generateNegatives,
   getExecutionDetail,
+  getNegatives,
+  getNegativesStatus,
   getPlanHealth,
   getRunExecutions,
   getRunReport,
@@ -20,6 +23,7 @@ import {
   runPlan,
   runRegression,
   saveTestCase,
+  toggleNegativeTesting,
 } from './regression.controller';
 
 const router = Router();
@@ -543,5 +547,21 @@ router.post('/runs/:runId/share', requireAuth, createShareLink);
  *         description: Shared report not found
  */
 router.get('/shared/:shareToken', sharedReportRateLimiter, getSharedReport);
+
+// ============================================================================
+// NEGATIVE TESTING
+// ============================================================================
+
+// Toggle negative testing on a plan item
+router.patch('/plans/:planId/items/:itemId/negative-testing', requireAuth, toggleNegativeTesting);
+
+// Generate negative test cases for a plan
+router.post('/plans/:planId/generate-negatives', requireAuth, generateNegatives);
+
+// List negative test cases for a plan
+router.get('/plans/:planId/negatives', requireAuth, getNegatives);
+
+// Get generation status (for reconnecting users)
+router.get('/plans/:planId/negatives/status', requireAuth, getNegativesStatus);
 
 export default router;

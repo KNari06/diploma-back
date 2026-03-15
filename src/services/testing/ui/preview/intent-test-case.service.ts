@@ -293,6 +293,16 @@ export class IntentTestCaseService {
       await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
     }
 
+    // Mark related negative test cases as stale when steps change
+    if (steps !== undefined) {
+      this.markNegativesStale(id).catch((err) => {
+        logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
+          testCaseId: id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
     return this.mapToIntentTestCase(data);
   }
 
@@ -702,6 +712,14 @@ export class IntentTestCaseService {
           totalSteps: stepsWithAutoWaits.length,
         });
 
+        // Mark related negatives as stale (best-effort, non-blocking)
+        this.markNegativesStale(intentTestCaseId).catch((err) => {
+          logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale after batch update', {
+            testCaseId: intentTestCaseId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
         return true;
       } catch (error) {
         logger.error('[INTENT_TEST_CASE] Exception batch-updating steps from run', {
@@ -733,5 +751,36 @@ export class IntentTestCaseService {
     }
 
     return this.mapToIntentTestCase(data);
+  }
+
+  /**
+   * Mark all negative test cases derived from a source test case as stale.
+   * Called when the parent happy-path steps change.
+   */
+  private static async markNegativesStale(sourceTestCaseId: string): Promise<void> {
+    const { error, count } = await supabaseAdmin
+      .from('intent_test_cases')
+      .update({
+        negative_stale_reason: 'parent_steps_changed',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('source_intent_test_case_id', sourceTestCaseId)
+      .eq('is_negative', true)
+      .is('negative_stale_reason', null);
+
+    if (error) {
+      logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
+        sourceTestCaseId,
+        error: error.message,
+      });
+      return;
+    }
+
+    if (count && count > 0) {
+      logger.info('[INTENT_TEST_CASE] Marked negatives as stale', {
+        sourceTestCaseId,
+        staleCount: count,
+      });
+    }
   }
 }

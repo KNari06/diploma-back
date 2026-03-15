@@ -72,6 +72,7 @@ export class ExecutionService {
       flowId?: string;
       browser?: string;
       environment?: string;
+      isNegative?: boolean;
     }>
   ): Promise<TestExecution[]> {
     if (testCases.length === 0) {
@@ -92,6 +93,7 @@ export class ExecutionService {
       browser: tc.browser || null,
       environment: tc.environment || null,
       status: 'pending' as const,
+      ...(tc.isNegative && { is_negative: true }),
     }));
 
     const { data, error } = await supabaseAdmin
@@ -294,6 +296,7 @@ export class ExecutionService {
       browser: row.browser || undefined,
       environment: row.environment || undefined,
       createdAt: row.created_at,
+      isNegative: row.is_negative ?? undefined,
     };
   }
 }

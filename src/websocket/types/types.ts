@@ -127,6 +127,16 @@ export interface ServerToClientEvents {
   'exploration:completed': (data: ExplorationCompletedPayload) => void;
   'exploration:clarification:request': (data: ExplorationClarificationPayload) => void;
 
+  // Negative testing events
+  'negatives:generation:started': (data: any) => void;
+  'negatives:generation:progress': (data: any) => void;
+  'negatives:generation:completed': (data: any) => void;
+
+  // Allure import events
+  'allure:import:progress': (data: AllureImportProgressWSPayload) => void;
+  'allure:import:completed': (data: AllureImportCompletedWSPayload) => void;
+  'allure:import:failed': (data: AllureImportFailedWSPayload) => void;
+
   // System events
   'system:error': (data: SystemErrorPayload) => void;
   'system:maintenance': (data: SystemMaintenancePayload) => void;
@@ -1413,6 +1423,50 @@ export interface SocketData {
   userId?: string;
   isAnonymous: boolean;
   authenticatedAt: string;
+}
+
+// ============================================================================
+// ALLURE IMPORT EVENTS
+// ============================================================================
+
+/** Stats snapshot emitted during import progress. */
+export interface AllureImportStatsWS {
+  totalFiles: number;
+  testsFound: number;
+  testsImported: number;
+  testsSkipped: number;
+  modulesCreated: number;
+  flowsCreated: number;
+  kbDocumentsCreated: number;
+  screenshotsUploaded: number;
+  filesSkipped: number;
+  videosSkipped: number;
+  errors: string[];
+}
+
+export interface AllureImportProgressWSPayload {
+  importId: string;
+  /** Current import phase. */
+  phase: 'scanning' | 'classifying' | 'tests' | 'kb' | 'artifacts' | 'done';
+  current: number;
+  total: number;
+  message: string;
+  stats: AllureImportStatsWS;
+  timestamp: string;
+}
+
+export interface AllureImportCompletedWSPayload {
+  importId: string;
+  success: boolean;
+  stats: AllureImportStatsWS;
+  durationMs: number;
+  timestamp: string;
+}
+
+export interface AllureImportFailedWSPayload {
+  importId: string;
+  error: string;
+  timestamp: string;
 }
 
 // ============================================================================

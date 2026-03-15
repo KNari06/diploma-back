@@ -942,6 +942,24 @@ export class RegressionPlanService {
       return true;
     });
 
+    // Expand negative test cases for enabled items
+    try {
+      const { NegativeToggleResolverService } = await import('./negative-toggle-resolver.service');
+      const negativeCases = await NegativeToggleResolverService.expandNegatives(planId, deduplicated);
+      if (negativeCases.length > 0) {
+        logger.info('[REGRESSION_PLAN_SERVICE] Expanded negative test cases', {
+          planId,
+          negativeCount: negativeCases.length,
+        });
+        deduplicated.push(...negativeCases);
+      }
+    } catch (err) {
+      logger.error('[REGRESSION_PLAN_SERVICE] Failed to expand negatives, continuing without', {
+        planId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     return deduplicated;
   }
 
@@ -1353,6 +1371,7 @@ export class RegressionPlanService {
       testCaseType: row.test_case_type || undefined,
       orderIndex: row.order_index,
       parametersOverride: row.parameters_override || {},
+      negativeTestingEnabled: row.negative_testing_enabled ?? null,
       createdAt: row.created_at,
     };
   }

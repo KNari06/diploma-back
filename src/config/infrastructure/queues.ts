@@ -1,6 +1,7 @@
 import { AgentResponse, TestJobData } from '@/types';
 import type { ExplorationBudget, RateLimitingConfig } from '@/agent/core/lite/exploration/types';
 import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import type { AllureImportJobData } from '@/services/allure-import/allure-import.types';
 import { handleQueueError } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { Queue, QueueEvents } from 'bullmq';
@@ -10,6 +11,12 @@ import { env } from '../environment/env';
 // ═══════════════════════════════════════════════════════════════════════
 // EXPLORATION JOB DATA
 // ═══════════════════════════════════════════════════════════════════════
+
+export interface NegativeGenerationJobData {
+  planId: string;
+  userId: string;
+  testCaseIds: string[];
+}
 
 export interface ExplorationJobData {
   explorationId: string;
@@ -121,6 +128,8 @@ export const QUEUE_NAMES = {
   GIT_WEBHOOK: 'git-webhook',
   EXPLORATION: 'exploration',
   MOBILE_TEST_RUN: 'mobile-test-run',
+  NEGATIVE_GENERATION: 'negative-generation',
+  ALLURE_IMPORT: 'allure-import',
 } as const;
 
 // Test run queue - for executing tests
@@ -251,7 +260,35 @@ export const mobileTestRunQueue = new Queue<MobileTestJobData>(QUEUE_NAMES.MOBIL
   },
 });
 
+// Allure import queue — async processing of large Allure ZIP imports
+export const allureImportQueue = new Queue<AllureImportJobData>(QUEUE_NAMES.ALLURE_IMPORT, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 20,
+    removeOnFail: 10,
+    attempts: 1, // No retry — import is not idempotent; partial state could exist
+  },
+});
+
+// Negative test generation queue — AI generates boundary/negative test cases
+export const negativeGenerationQueue = new Queue<NegativeGenerationJobData>(QUEUE_NAMES.NEGATIVE_GENERATION, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    attempts: 2,
+    backoff: {
+      type: 'fixed',
+      delay: 3000,
+    },
+  },
+});
+
 // Queue events for monitoring
+export const allureImportQueueEvents = new QueueEvents(QUEUE_NAMES.ALLURE_IMPORT, { connection, prefix: env.QUEUE_PREFIX });
+export const negativeGenerationQueueEvents = new QueueEvents(QUEUE_NAMES.NEGATIVE_GENERATION, { connection, prefix: env.QUEUE_PREFIX });
 export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection, prefix: env.QUEUE_PREFIX });
 export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection, prefix: env.QUEUE_PREFIX });
@@ -309,6 +346,22 @@ mobileTestRunQueueEvents.on('failed', (args: { jobId: string; failedReason: stri
 
 mobileTestRunQueueEvents.on('stalled', (args: { jobId: string }) => {
   logQueueEvent('stalled', args.jobId, { queue: QUEUE_NAMES.MOBILE_TEST_RUN });
+});
+
+negativeGenerationQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
+  logQueueEvent('completed', args.jobId, { queue: QUEUE_NAMES.NEGATIVE_GENERATION });
+});
+
+negativeGenerationQueueEvents.on('failed', (args: { jobId: string; failedReason: string; prev?: string }) => {
+  logQueueEvent('failed', args.jobId, { queue: QUEUE_NAMES.NEGATIVE_GENERATION, error: args.failedReason });
+});
+
+allureImportQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
+  logQueueEvent('completed', args.jobId, { queue: QUEUE_NAMES.ALLURE_IMPORT });
+});
+
+allureImportQueueEvents.on('failed', (args: { jobId: string; failedReason: string; prev?: string }) => {
+  logQueueEvent('failed', args.jobId, { queue: QUEUE_NAMES.ALLURE_IMPORT, error: args.failedReason });
 });
 
 // Queue management functions
@@ -520,6 +573,64 @@ export class QueueManager {
   }
 
   /**
+   * Add Allure ZIP import job to queue.
+   * The ZIP is pre-encoded as base64 so it can be serialised into Redis.
+   */
+  static async addAllureImportJob(jobData: AllureImportJobData) {
+    try {
+      if (!redisAvailable) {
+        throw new Error('Redis is not available. Cannot add Allure import job to queue.');
+      }
+
+      const job = await allureImportQueue.add('allure-import', jobData, {
+        jobId: jobData.importId, // Idempotent — re-adding same importId is a no-op
+      });
+
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.ALLURE_IMPORT,
+        importId: jobData.importId,
+        projectId: jobData.projectId,
+      });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add Allure import job', {
+        error: error instanceof Error ? error.message : String(error),
+        importId: jobData.importId,
+      });
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
+   * Add negative generation job to queue
+   */
+  static async addNegativeGenerationJob(jobData: NegativeGenerationJobData) {
+    try {
+      if (!redisAvailable) {
+        throw new Error('Redis is not available. Cannot add negative generation job to queue.');
+      }
+
+      const job = await negativeGenerationQueue.add('negative-generation', jobData, {
+        priority: 10, // Lower priority than test runs
+        jobId: `neg-gen-${jobData.planId}-${Date.now()}`,
+      });
+
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.NEGATIVE_GENERATION,
+        planId: jobData.planId,
+        testCaseCount: jobData.testCaseIds.length,
+      });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add negative generation job', {
+        error: error instanceof Error ? error.message : String(error),
+        planId: jobData.planId,
+      });
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
    * Get queue statistics
    */
   static async getQueueStats() {
@@ -534,17 +645,18 @@ export class QueueManager {
         gitWebhookQueue.getJobCounts(),
         explorationQueue.getJobCounts(),
         mobileTestRunQueue.getJobCounts(),
+        allureImportQueue.getJobCounts(),
       ]);
 
       // Extract successful results, use empty object for failed ones
-      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats, explorationStats, mobileTestRunStats] = results.map(
+      const [testRunStats, testResultStats, aiAnalysisStats, notificationStats, webhookStats, gitWebhookStats, explorationStats, mobileTestRunStats, allureImportStats] = results.map(
         (result) => result.status === 'fulfilled' ? result.value : {}
       );
 
       // Log any failures but don't fail the whole operation
       results.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun', 'allureImport'];
           logger.warn(`Failed to get stats for ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -558,6 +670,7 @@ export class QueueManager {
         gitWebhook: gitWebhookStats,
         exploration: explorationStats,
         mobileTestRun: mobileTestRunStats,
+        allureImport: allureImportStats,
       };
     } catch (error) {
       logger.error('Failed to get queue stats:', error);
@@ -628,6 +741,10 @@ export class QueueManager {
         return explorationQueue;
       case QUEUE_NAMES.MOBILE_TEST_RUN:
         return mobileTestRunQueue;
+      case QUEUE_NAMES.NEGATIVE_GENERATION:
+        return negativeGenerationQueue;
+      case QUEUE_NAMES.ALLURE_IMPORT:
+        return allureImportQueue;
       default:
         throw new Error(`Unknown queue: ${queueName}`);
     }
@@ -700,11 +817,13 @@ export const gracefulShutdown = async () => {
         gitWebhookQueue.close(),
         explorationQueue.close(),
         mobileTestRunQueue.close(),
+        negativeGenerationQueue.close(),
+        allureImportQueue.close(),
       ]);
 
       closeQueueResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun', 'negativeGeneration', 'allureImport'];
           logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -716,11 +835,13 @@ export const gracefulShutdown = async () => {
         aiAnalysisQueueEvents.close(),
         explorationQueueEvents.close(),
         mobileTestRunQueueEvents.close(),
+        negativeGenerationQueueEvents.close(),
+        allureImportQueueEvents.close(),
       ]);
 
       closeQueueEventsResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents'];
+          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents', 'negativeGenerationEvents', 'allureImportEvents'];
           logger.warn(`Failed to close ${eventNames[index]}`, { error: result.reason });
         }
       });

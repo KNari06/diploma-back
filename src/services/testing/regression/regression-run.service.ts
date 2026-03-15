@@ -13,7 +13,10 @@ import type {
   RunReportArtifactsSummary,
   EnrichedBug,
   ExecutableTestCase,
+  ExecutionHealthChecks,
+  NegativeSummary,
 } from '@/types/testing.types';
+import { HealthCheckAggregatorService } from './health-check-aggregator.service';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { topologicalSort } from '@/utils/graph/topological-sort';
@@ -699,6 +702,7 @@ export class RegressionRunService {
           moduleId: tc.moduleId,
           flowId: tc.flowId,
           dependsOn: validDeps,
+          ...(tc.isNegative && { isNegative: true }),
         };
       });
 
@@ -735,6 +739,7 @@ export class RegressionRunService {
             testType: tc.testType,
             moduleId: tc.moduleId,
             flowId: tc.flowId,
+            ...(tc.isNegative && { isNegative: true }),
           }))
         );
       } catch (batchError) {
@@ -1971,6 +1976,21 @@ export class RegressionRunService {
       }
     }
 
+    // Batch-fetch negativeMeta for negative test cases
+    const negativeTestCaseIds = executions.filter((e) => e.isNegative).map((e) => e.testCaseId);
+    const negativeMetaMap = new Map<string, import('@/types/testing.types').NegativeMeta>();
+    if (negativeTestCaseIds.length > 0) {
+      const { data: negRows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, negative_meta')
+        .in('id', negativeTestCaseIds);
+      for (const row of negRows || []) {
+        if (row.negative_meta) {
+          negativeMetaMap.set(row.id, row.negative_meta as import('@/types/testing.types').NegativeMeta);
+        }
+      }
+    }
+
     // Phase 2: Parallel enrichment fetch
     const [testResultsMap, testReports, executedStepsMap] = await Promise.all([
       this.batchGetTestResults(testIds),
@@ -2024,6 +2044,7 @@ export class RegressionRunService {
         networkLogs: [],
       };
       let bugsCount = 0;
+      let execHealthChecks: ExecutionHealthChecks | undefined;
 
       if (testId && exec.testType === 'ui') {
         // Build steps
@@ -2084,6 +2105,9 @@ export class RegressionRunService {
               slowAPIs: Array.isArray(qc.slowAPIs) ? qc.slowAPIs : undefined,
             };
           }
+
+          // Aggregate health checks from existing test result data
+          execHealthChecks = HealthCheckAggregatorService.aggregateFromTestResult(testResult);
 
           // Aggregate into run-level artifacts
           if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
@@ -2189,6 +2213,9 @@ export class RegressionRunService {
         bugsCount,
         steps,
         artifacts: execArtifacts,
+        ...(exec.isNegative && { isNegative: true }),
+        ...(exec.isNegative && negativeMetaMap.has(exec.testCaseId) && { negativeMeta: negativeMetaMap.get(exec.testCaseId) }),
+        ...(execHealthChecks && { healthChecks: execHealthChecks }),
       });
     }
 
@@ -2220,6 +2247,25 @@ export class RegressionRunService {
     // Normalize 'completed' → 'passed' for frontend compatibility
     const normalizedStatus = run.status === 'completed' ? 'passed' : (run.status || null);
 
+    // Build health summary from all execution health checks
+    const healthSummary = HealthCheckAggregatorService.buildHealthSummary(
+      reportExecutions.map((e) => e.healthChecks),
+    );
+
+    // Split executions into positive and negative
+    const positiveExecutions = reportExecutions.filter((e) => !e.isNegative);
+    const negativeExecs = reportExecutions.filter((e) => e.isNegative);
+
+    let negativeSummary: NegativeSummary | undefined;
+    if (negativeExecs.length > 0) {
+      negativeSummary = {
+        total: negativeExecs.length,
+        passed: negativeExecs.filter((e) => e.status === 'passed').length,
+        failed: negativeExecs.filter((e) => e.status === 'failed').length,
+        skipped: negativeExecs.filter((e) => e.status === 'skipped').length,
+      };
+    }
+
     return {
       id: run.id,
       planId: run.plan_id || null,
@@ -2231,10 +2277,13 @@ export class RegressionRunService {
       durationMs,
       aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : null,
       summary,
-      executions: reportExecutions,
+      executions: positiveExecutions,
       bugs: allBugs,
       recommendations: [...allRecommendations],
       artifactsSummary: aggArtifacts,
+      healthSummary,
+      ...(negativeSummary && { negativeSummary }),
+      ...(negativeExecs.length > 0 && { negativeExecutions: negativeExecs }),
     };
   }
 }
