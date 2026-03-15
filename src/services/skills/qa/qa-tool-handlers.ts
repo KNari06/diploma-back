@@ -4043,6 +4043,8 @@ export async function handleManageFlow(
           name,
           description: args.description || undefined,
           flowType: args.flow_type || undefined,
+          // Flows created via QA tools are web UI by default; platform is derived from module tree.
+          platform: undefined,
           tags: args.tags || undefined,
           priority: args.priority || undefined,
           preconditions: args.preconditions || undefined,

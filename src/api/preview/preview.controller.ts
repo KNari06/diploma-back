@@ -4,14 +4,19 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import { dbAdminService } from '@/db/supabase';
+import { env } from '@/config/environment/env';
+import { QueueManager } from '@/config/infrastructure/queues';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-for.utils';
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+import type { MobileIntentStep, MobilePlatform, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
+import { v4 as uuidv4 } from 'uuid';
 
 // ============================================================================
 // PREVIEW SESSION ENDPOINTS
@@ -524,12 +529,13 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
     }
 
     const { id } = req.params;
-    const { browsers = ['chromium'], projectId: overrideProjectId } = req.body;
+    const { browsers = ['chromium'], projectId: overrideProjectId, platform: reqPlatform } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Running intent test case', {
       intentTestCaseId: id,
       userId,
       browsers,
+      platform: reqPlatform,
     });
 
     // 1. Load the intent test case
@@ -542,7 +548,6 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
     // 2. Validate project if override provided
     const projectId = overrideProjectId || testCase.projectId;
     if (overrideProjectId && overrideProjectId !== testCase.projectId) {
-      // Verify user has access to the override project
       const { data: project, error: projectError } = await supabaseAdmin
         .from('projects')
         .select('id')
@@ -562,6 +567,99 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
       return;
     }
 
+    // Detect mobile platform from request body or test case record
+    const platform = reqPlatform || testCase.platform;
+    const isMobile = platform === 'mobile_android' || platform === 'mobile_ios';
+
+    // ── Mobile path: queue a mobile test run job ──────────────────
+    if (isMobile) {
+      if (!env.MOBILE_RUNNER_ENABLED) {
+        res.status(503).json({ error: 'Mobile testing is not enabled' });
+        return;
+      }
+
+      // Resolve workspace + mobile app metadata from project
+      const { data: project } = await supabaseAdmin
+        .from('projects')
+        .select('workspace_id, settings')
+        .eq('id', projectId)
+        .single();
+
+      const mobileApp = project?.settings?.mobileApp;
+      const mobilePlatform: MobilePlatform = platform === 'mobile_ios' ? 'ios' : 'android';
+      const browser = platform === 'mobile_ios' ? 'mobile-ios' : 'mobile-android';
+
+      const intentSteps: MobileIntentStep[] = testCase.stepsJson.map((step: any, index: number) => ({
+        id: step.id || `step_${index}`,
+        type: step.type || 'click',
+        description: step.description || step.text || `Step ${index + 1}`,
+        value: step.value,
+        assertionText: step.assertionText,
+        bindingHints: step.bindingHints,
+        options: step.options,
+      }));
+
+      const testId = uuidv4();
+
+      await dbAdminService.createTest({
+        id: testId,
+        url: `mobile://${mobilePlatform}`,
+        project_id: projectId,
+        user_id: userId,
+        status: 'pending',
+        browsers: [browser as any],
+        options: {
+          mode: 'lite',
+          platform: mobilePlatform,
+          trigger: 'editor',
+          appPackage: mobileApp?.packageName,
+        },
+        intelligent_mode: false,
+        test_goal: `Editor: ${testCase.name} (${mobilePlatform})`,
+        commands: [],
+      });
+
+      const jobData: MobileTestJobData = {
+        testId,
+        userId,
+        workspaceId: project?.workspace_id || '',
+        projectId,
+        platform: mobilePlatform,
+        browser: browser as 'mobile-android' | 'mobile-ios',
+        intentSteps,
+        runnerUrl: env.MOBILE_RUNNER_URL,
+        runnerApiKey: env.MOBILE_RUNNER_API_KEY,
+        appStoragePath: mobileApp?.storagePath,
+        appOriginalName: mobileApp?.originalName,
+        appPackage: mobileApp?.packageName,
+        testCaseId: id,
+        testCaseName: testCase.name,
+      };
+
+      await QueueManager.addMobileTestRunJob(jobData);
+
+      logger.info('[PREVIEW_CONTROLLER] Mobile test run queued', {
+        intentTestCaseId: id,
+        testId,
+        platform: mobilePlatform,
+      });
+
+      res.json({
+        success: true,
+        data: {
+          testId,
+          intentTestCaseId: id,
+          browsers: [browser],
+          stepsCount: intentSteps.length,
+          commandsCount: intentSteps.length,
+        },
+        message: 'Mobile test run started',
+      });
+      return;
+    }
+
+    // ── Web path: existing Playwright-based execution ─────────────
+
     // 3.5. Check if there's a valid URL (prefer url, fallback to startUrl)
     const targetUrl = testCase.url || testCase.startUrl;
     if (!targetUrl) {
@@ -569,38 +667,32 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
       return;
     }
 
-    // 4. Convert IntentSteps to PlaywrightCommands (dumb converter - no resolution)
-    // Pass intentTestCaseId for heal persistence
+    // 4. Convert IntentSteps to PlaywrightCommands
     const commands = IntentStepConverterService.convertToCommands(
       testCase.stepsJson,
       targetUrl,
-      id // intentTestCaseId for heal persistence
+      id
     );
 
     logger.info('[PREVIEW_CONTROLLER] Converted intent steps to commands', {
       intentTestCaseId: id,
       stepsCount: testCase.stepsJson.length,
       commandsCount: commands.length,
-      stepsWithCompiled: testCase.stepsJson.filter(s => !!s.compiled).length,
+      stepsWithCompiled: testCase.stepsJson.filter((s: any) => !!s.compiled).length,
     });
 
     // 5. Build test request for ManualTestService
-    // NOTE: Credits check/deduction should be handled by CreditCostTrackerService
-    // before calling this endpoint (similar to other test run flows)
     const testRequest = {
       url: targetUrl,
       projectId,
       userId,
       browsers,
-      // Pass commands for execution
       commands,
-      // Additional metadata
       testGoal: testCase.description || `Run intent test: ${testCase.name}`,
-      intelligentMode: false, // Intent tests use pre-defined steps, not AI exploration
+      intelligentMode: false,
       options: {
         mode: 'lite' as const,
       },
-      // Link back to intent test case for reporting
       metadata: {
         intentTestCaseId: id,
         intentTestCaseName: testCase.name,

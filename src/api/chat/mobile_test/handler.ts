@@ -146,7 +146,6 @@ export async function handleMobileTest(
     // ── Step 4: Extract test parameters ───────────────────────────
     const platform: MobilePlatform = parsedIntent?.mobilePlatform || 'android';
     const browser = platform === 'ios' ? 'mobile-ios' : 'mobile-android';
-    const appPackage: string | undefined = parsedIntent?.appPackage;
     const intentSteps: MobileIntentStep[] = parsedIntent?.intentSteps || [];
 
     if (intentSteps.length === 0) {
@@ -162,17 +161,48 @@ export async function handleMobileTest(
       return;
     }
 
-    // ── Step 5: Create test record ────────────────────────────────
+    // ── Step 5: Resolve project + app metadata and create test ────
     const testId = uuidv4();
     const testGoal = parsedIntent?.target
       ? `Mobile test: ${parsedIntent.target} (${platform})`
       : `Mobile test on ${platform} (${intentSteps.length} steps)`;
 
+    // Resolve project ID once so we can reuse it
+    const projectId = parsedIntent?.projectId || workspace_id;
+
+    // Project-level mobile app metadata (APK/IPA stored in Supabase)
+    let appStoragePath: string | undefined;
+    let appOriginalName: string | undefined;
+    let projectAppPackage: string | undefined;
+
+    try {
+      const project = (await dbAdminService.getProject(projectId)) as any;
+      const mobileApp = project?.settings?.mobileApp;
+      if (mobileApp?.storagePath) {
+        appStoragePath = mobileApp.storagePath;
+        appOriginalName = mobileApp.originalName;
+        projectAppPackage = mobileApp.packageName;
+        logger.info('[MOBILE_TEST] Found project mobile app', {
+          testId,
+          appStoragePath,
+          appOriginalName,
+          projectAppPackage,
+        });
+      }
+    } catch (err) {
+      logger.warn('[MOBILE_TEST] Failed to lookup project app (will skip install)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Prefer explicit appPackage from intent, fall back to project-level packageName
+    const appPackage: string | undefined = parsedIntent?.appPackage || projectAppPackage;
+
     try {
       await dbAdminService.createTest({
         id: testId,
         url: appPackage || `mobile://${platform}`,
-        project_id: parsedIntent?.projectId || workspace_id,
+        project_id: projectId,
         user_id: userId,
         status: 'pending',
         browsers: [browser as any],
@@ -214,29 +244,6 @@ export async function handleMobileTest(
           error: err instanceof Error ? err.message : String(err),
         });
       }
-    }
-
-    // ── Step 6b: Lookup project's mobile app (APK/IPA) ────────────
-    let appStoragePath: string | undefined;
-    let appOriginalName: string | undefined;
-    const projectId = parsedIntent?.projectId || workspace_id;
-
-    try {
-      const project = (await dbAdminService.getProject(projectId)) as any;
-      const mobileApp = project?.settings?.mobileApp;
-      if (mobileApp?.storagePath) {
-        appStoragePath = mobileApp.storagePath;
-        appOriginalName = mobileApp.originalName;
-        logger.info('[MOBILE_TEST] Found project APK', {
-          testId,
-          appStoragePath,
-          appOriginalName,
-        });
-      }
-    } catch (err) {
-      logger.warn('[MOBILE_TEST] Failed to lookup project app (will skip install)', {
-        error: err instanceof Error ? err.message : String(err),
-      });
     }
 
     // ── Step 7: Queue BullMQ job ──────────────────────────────────

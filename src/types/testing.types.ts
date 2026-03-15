@@ -259,6 +259,7 @@ export interface TestFlow {
   description?: string;
   orderIndex: number;
   flowType: FlowType;
+  platform?: 'web' | 'mobile_android' | 'mobile_ios';
   tags: string[];
   priority?: Priority;
   preconditions: any[];
@@ -277,6 +278,7 @@ export interface CreateTestFlowParams {
   description?: string;
   orderIndex?: number;
   flowType?: FlowType;
+  platform?: 'web' | 'mobile_android' | 'mobile_ios';
   tags?: string[];
   priority?: Priority;
   preconditions?: any[];
@@ -293,6 +295,7 @@ export interface UpdateTestFlowParams {
   description?: string;
   orderIndex?: number;
   flowType?: FlowType;
+  platform?: 'web' | 'mobile_android' | 'mobile_ios';
   tags?: string[];
   priority?: Priority;
   preconditions?: any[];

@@ -14,7 +14,9 @@
 import { env } from '@/config/environment/env';
 import { redisConnection } from '@/config/infrastructure/queues';
 import { MobileRunnerClient, getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
-import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
+import { ProjectService } from '@/services/core/project.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -49,9 +51,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const { projectId, platform: rawPlatform } = req.body as {
+  const { projectId, platform: rawPlatform, appPackage } = req.body as {
     projectId?: string;
     platform?: string;
+    appPackage?: string;
   };
 
   if (!projectId) {
@@ -72,23 +75,56 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     }
 
     // Check if there's already a warmed session for this project+user
-    const existingRaw = await redisConnection.get(`${WARMUP_PREFIX}${projectId}:${userId}`);
+    const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
+    const existingRaw = await redisConnection.get(redisKey);
     if (existingRaw) {
       const existing: WarmupData = JSON.parse(existingRaw);
-      logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
-        projectId,
-        userId,
-        sessionId: existing.sessionId,
-      });
 
-      res.json({
-        success: true,
-        sessionId: existing.sessionId,
-        runnerSocketUrl: existing.runnerSocketUrl,
-        platform: existing.platform,
-        reused: true,
-      });
-      return;
+      if (!existing.sessionId) {
+        // Stale entry without a valid sessionId — discard and create fresh
+        logger.warn('[MOBILE_SESSION] Discarding stale warmed session (missing sessionId)', { projectId, userId });
+        await redisConnection.del(redisKey);
+      } else {
+        // Verify the session still exists on the runner (it may have been
+        // destroyed if the runner restarted or the session TTL expired).
+        const client = getMobileRunnerClient();
+        const stillAlive = await client.sessionExists(existing.sessionId);
+
+        if (!stillAlive) {
+          logger.warn('[MOBILE_SESSION] Cached session no longer exists on runner, creating fresh', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+          });
+          await redisConnection.del(redisKey);
+          // Fall through to create a new session below
+        } else {
+          logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
+            projectId,
+            userId,
+            sessionId: existing.sessionId,
+          });
+
+          res.json({
+            success: true,
+            sessionId: existing.sessionId,
+            runnerSocketUrl: existing.runnerSocketUrl,
+            platform: existing.platform,
+            reused: true,
+          });
+
+          // Retry app install in background (idempotent — runner ignores if already installed)
+          installAppOnSession(client, existing.sessionId, projectId, userId, appPackage).catch((err) => {
+            logger.warn('[MOBILE_SESSION] Background app install on reused session failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              projectId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+
+          return;
+        }
+      }
     }
 
     // Health check
@@ -110,7 +146,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
     // Store mapping in Redis
     const warmupData: WarmupData = {
-      sessionId: session.id,
+      sessionId: session.sessionId,
       runnerUrl: env.MOBILE_RUNNER_URL,
       runnerSocketUrl,
       platform,
@@ -127,16 +163,28 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     logger.info('[MOBILE_SESSION] Emulator warmed up', {
       projectId,
       userId,
-      sessionId: session.id,
+      sessionId: session.sessionId,
       platform,
     });
 
+    // Install the project's mobile app onto the emulator (best-effort, non-blocking).
+    // This runs after we return the response so the frontend can connect to the stream
+    // while the app downloads, uploads, and installs.
     res.status(201).json({
       success: true,
-      sessionId: session.id,
+      sessionId: session.sessionId,
       runnerSocketUrl,
       platform,
       reused: false,
+    });
+
+    // Fire-and-forget: install app in background
+    installAppOnSession(client, session.sessionId, projectId, userId, appPackage).catch((err) => {
+      logger.warn('[MOBILE_SESSION] Background app install failed (non-fatal)', {
+        sessionId: session.sessionId,
+        projectId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   } catch (error) {
     logger.error('[MOBILE_SESSION] Warmup failed', {
@@ -211,6 +259,511 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       message: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TAP (forward click to emulator)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/tap
+ *
+ * Forward a tap at (x, y) device coordinates to the emulator.
+ * Body: { x: number, y: number }
+ */
+export async function tapSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { x, y } = req.body as { x?: number; y?: number };
+
+  if (!sessionId || typeof x !== 'number' || typeof y !== 'number') {
+    res.status(400).json({ success: false, error: 'sessionId, x, and y are required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    await client.executeBatchCommands(sessionId, [
+      { type: 'tap', params: { x: Math.round(x), y: Math.round(y) } },
+    ]);
+    res.json({ success: true });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Tap failed', {
+      sessionId,
+      x,
+      y,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Tap failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/swipe
+ *
+ * Forward a swipe gesture to the emulator.
+ * Body: { startX, startY, endX, endY, durationMs? }
+ */
+export async function swipeSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { startX, startY, endX, endY, durationMs } = req.body as {
+    startX?: number;
+    startY?: number;
+    endX?: number;
+    endY?: number;
+    durationMs?: number;
+  };
+
+  if (
+    !sessionId ||
+    typeof startX !== 'number' ||
+    typeof startY !== 'number' ||
+    typeof endX !== 'number' ||
+    typeof endY !== 'number'
+  ) {
+    res.status(400).json({
+      success: false,
+      error: 'sessionId, startX, startY, endX, and endY are required',
+    });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    await client.executeBatchCommands(sessionId, [
+      {
+        type: 'swipe',
+        params: {
+          startX: Math.round(startX),
+          startY: Math.round(startY),
+          endX: Math.round(endX),
+          endY: Math.round(endY),
+          durationMs: typeof durationMs === 'number' ? durationMs : 300,
+        },
+      },
+    ]);
+    res.json({ success: true });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Swipe failed', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Swipe failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/go-home
+ *
+ * Send Home button to the emulator.
+ */
+export async function goHomeSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  if (!sessionId) {
+    res.status(400).json({ success: false, error: 'sessionId is required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    await client.executeBatchCommands(sessionId, [
+      { type: 'go_home', params: {} },
+    ]);
+    res.json({ success: true });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Go home failed', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Go home failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/go-back
+ *
+ * Send Back button to the emulator.
+ */
+export async function goBackSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  if (!sessionId) {
+    res.status(400).json({ success: false, error: 'sessionId is required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    await client.executeBatchCommands(sessionId, [
+      { type: 'go_back', params: {} },
+    ]);
+    res.json({ success: true });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Go back failed', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Go back failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TYPE TEXT (forward keyboard text to emulator)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/type
+ *
+ * Forward a text string to the emulator (adb shell input text).
+ * Body: { text: string }
+ */
+export async function typeSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { text } = req.body as { text?: string };
+
+  if (!sessionId || typeof text !== 'string' || text.length === 0) {
+    res.status(400).json({ success: false, error: 'sessionId and non-empty text are required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    await client.executeBatchCommands(sessionId, [
+      { type: 'type_text', params: { text } },
+    ]);
+    res.json({ success: true });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Type text failed', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Type text failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRESS KEY (forward keycode to emulator)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/key
+ *
+ * Forward an Android keycode to the emulator (adb shell input keyevent).
+ * Body: { keycode: string }  e.g. "KEYCODE_ENTER", "KEYCODE_DEL"
+ */
+export async function keySession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { keycode } = req.body as { keycode?: string };
+
+  if (!sessionId || typeof keycode !== 'string' || keycode.length === 0) {
+    res.status(400).json({ success: false, error: 'sessionId and keycode are required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    await client.executeBatchCommands(sessionId, [
+      { type: 'press_key', params: { keycode } },
+    ]);
+    res.json({ success: true });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Key press failed', {
+      sessionId,
+      keycode,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Key press failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINT (find element on mobile emulator via description)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/lint
+ *
+ * Resolve an element description against the emulator's current UI.
+ * Uses the runner's smart element resolver (UIAutomator + AI).
+ * Body: { stepDraft: { kind, elementDescription, value?, ... } }
+ */
+export async function lintSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { stepDraft } = req.body as { stepDraft?: any };
+
+  if (!sessionId || !stepDraft) {
+    res.status(400).json({ success: false, error: 'sessionId and stepDraft are required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+
+    const stepType = stepDraft.type || stepDraft.kind || 'click';
+    const description = stepDraft.elementDescription || stepDraft.description || '';
+
+    // Lint must be NON-DESTRUCTIVE: verify element presence without performing
+    // the actual action (type, click, etc.). We use 'assert' with no
+    // assertionText so the runner maps it to assert_visible.
+    // For ai_check / assert steps, keep the original type so the runner
+    // evaluates them properly (observe_page or assert_text).
+    const NON_ELEMENT_TYPES = new Set([
+      'navigate', 'wait', 'wait_for', 'screenshot', 'open_app', 'close_app',
+      'go_back', 'go_home', 'open_notifications', 'biometric', 'otp',
+      'permission', 'clipboard', 'network', 'observe_page',
+    ]);
+
+    let lintType: MobileIntentActionType;
+    let lintValue: string | undefined;
+
+    if (stepType === 'ai_check' || stepType === 'assert') {
+      lintType = stepType;
+      lintValue = stepDraft.assertionText ?? stepDraft.value;
+    } else if (NON_ELEMENT_TYPES.has(stepType)) {
+      lintType = stepType as MobileIntentActionType;
+      lintValue = stepDraft.value;
+    } else {
+      // Element-based action (click, type, etc.) → assert_visible only
+      lintType = 'assert';
+      lintValue = undefined;
+    }
+
+    const intentStep = {
+      id: stepDraft.id || `lint_${Date.now()}`,
+      type: lintType,
+      description,
+      value: lintValue,
+      assertionText: stepDraft.assertionText ?? lintValue,
+      bindingHints: stepDraft.bindingHints || {},
+    };
+
+    // Run with screenshotEachStep to verify element resolution
+    const result = await client.runSteps(sessionId, [intentStep], {
+      screenshotEachStep: true,
+      stopOnFailure: true,
+    });
+
+    const stepResult = result.steps?.[0];
+
+    if (stepResult?.success) {
+      res.json({
+        success: true,
+        status: 'resolved',
+        message: 'Element found on mobile screen',
+        screenshot: stepResult.screenshot,
+      });
+    } else {
+      res.json({
+        success: true,
+        status: 'not_found',
+        message: stepResult?.error || 'Element not found on mobile screen',
+      });
+    }
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Lint failed', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Lint failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// APPLY (execute a step on mobile emulator)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/apply
+ *
+ * Execute a test step on the emulator. Resolves the element and performs the action.
+ * Body: { stepDraft: { kind, elementDescription, value?, ... } }
+ */
+export async function applySession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { stepDraft } = req.body as { stepDraft?: any };
+
+  if (!sessionId || !stepDraft) {
+    res.status(400).json({ success: false, error: 'sessionId and stepDraft are required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+
+    const stepType = stepDraft.type || stepDraft.kind || 'click';
+
+    const intentStep = {
+      id: stepDraft.id || `apply_${Date.now()}`,
+      type: stepType,
+      description: stepDraft.elementDescription || stepDraft.description || '',
+      value: stepDraft.value,
+      assertionText: stepDraft.assertionText,
+      appPackage: stepDraft.appPackage,
+      options: stepDraft.options,
+      bindingHints: stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {},
+    };
+
+    const result = await client.runSteps(sessionId, [intentStep], {
+      screenshotEachStep: true,
+      stopOnFailure: false,
+    });
+
+    const stepResult = result.steps?.[0];
+
+    res.json({
+      success: true,
+      stepResult: {
+        success: stepResult?.success ?? false,
+        error: stepResult?.error,
+        screenshot: stepResult?.screenshot,
+        resolvedVia: stepResult?.resolvedVia,
+        durationMs: stepResult?.durationMs,
+      },
+      status: stepResult?.success ? 'passed' : 'failed',
+    });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Apply failed', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Apply failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: Install app on a freshly created session
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Downloads the project's mobile app from Supabase Storage, uploads it to
+ * the runner, and sends install_app + launch_app commands. Intended to run
+ * in the background after the warmup response has been sent.
+ */
+async function installAppOnSession(
+  client: MobileRunnerClient,
+  sessionId: string,
+  projectId: string,
+  userId: string,
+  appPackageOverride?: string,
+): Promise<void> {
+  const project = await ProjectService.getProject(projectId, userId);
+  const mobileApp = project?.settings?.mobileApp;
+
+  if (!mobileApp?.storagePath) {
+    logger.debug('[MOBILE_SESSION] No mobile app configured for project, skipping install', { projectId });
+    return;
+  }
+
+  logger.info('[MOBILE_SESSION] Installing app on session', {
+    sessionId,
+    projectId,
+    originalName: mobileApp.originalName,
+  });
+
+  const fileBuffer = await MobileAppStorageService.downloadApp(mobileApp.storagePath);
+  const uploaded = await client.uploadApp(fileBuffer, mobileApp.originalName);
+
+  // Prefer explicit package from warmup request or upload metadata
+  const explicitPackage = appPackageOverride || mobileApp.packageName;
+
+  // The runner auto-detects and auto-launches the installed package.
+  // If we have an explicit package, pass it as a hint (and disable auto-launch so we
+  // can launch the specific package ourselves).
+  const installResult = await client.executeBatchCommands(sessionId, [
+    {
+      type: 'install_app',
+      params: {
+        apkPath: uploaded.path,
+        reinstall: true,
+        ...(explicitPackage ? { autoLaunch: false } : {}),
+      },
+    },
+  ]);
+
+  const detected = (installResult?.results?.[0] as any)?.packageName as string | undefined;
+  const packageName = explicitPackage || detected;
+
+  if (explicitPackage) {
+    await client.executeBatchCommands(sessionId, [
+      { type: 'launch_app', params: { packageName: explicitPackage } },
+    ]);
+  }
+
+  logger.info('[MOBILE_SESSION] App installed on session', {
+    sessionId,
+    projectId,
+    packageName: packageName || '(auto-launched by runner)',
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
