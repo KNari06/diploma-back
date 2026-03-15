@@ -7,13 +7,14 @@ import { Request, Response } from 'express';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * CHAT SESSIONS CONTROLLER - Single workspace chat model
+ * CHAT SESSIONS CONTROLLER - Per-user chat model
  * ═══════════════════════════════════════════════════════════════════════════
- * Each workspace has exactly ONE shared chat session used by all members.
- * - Get workspace chat (auto-creates if not exists)
- * - Get session by ID with messages
- * - Update chat session title
- * - Clear chat (delete messages, keep session) — owner only
+ * Each user has their own private chat session within a workspace.
+ * All other workspace resources (projects, tests, reports) remain shared.
+ * - Get user's workspace chat (auto-creates if not exists)
+ * - Get session by ID with messages (owner only)
+ * - Update chat session title (owner only)
+ * - Clear chat (delete messages, keep session) — session owner only
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
@@ -71,17 +72,18 @@ async function getWorkspaceChatInternal(
     return;
   }
 
-  // Find or create the single workspace session
+  // Find or create this user's chat session in the workspace
   let { data: session } = await supabaseAdmin
     .from('chat_sessions')
     .select('id, title, created_at, updated_at, workspace_id')
     .eq('workspace_id', workspaceId)
+    .eq('user_id', userId)
     .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle();
 
   if (!session) {
-    // Auto-create workspace chat session
+    // Auto-create chat session for this user
     const sessionId = await ChatService.createChatSession(userId, workspaceId);
     const { data: newSession } = await supabaseAdmin
       .from('chat_sessions')
@@ -172,11 +174,12 @@ export const listUserChatSessions = async (req: Request, res: Response): Promise
       return;
     }
 
-    // Get the single workspace session
+    // Get this user's session in the workspace
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
       .select('id, title, created_at, updated_at, workspace_id')
       .eq('workspace_id', resolvedWorkspaceId)
+      .eq('user_id', userId)
       .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
@@ -223,10 +226,10 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Get session (no user_id filter — shared session)
+    // Get session and verify ownership
     const { data: session, error: sessionError } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, title, created_at, updated_at, workspace_id')
+      .select('id, title, created_at, updated_at, workspace_id, user_id')
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -235,13 +238,10 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Validate workspace membership instead of user_id ownership
-    if (session.workspace_id) {
-      const isMember = await WorkspaceAccessService.isMember(userId, session.workspace_id);
-      if (!isMember) {
-        res.status(403).json({ success: false, error: 'Not a member of this workspace' });
-        return;
-      }
+    // Per-user chat: verify the session belongs to this user
+    if (session.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Access denied' });
+      return;
     }
 
     // Pagination support (backward compatible)
@@ -335,10 +335,10 @@ export const updateChatSessionTitle = async (req: Request, res: Response): Promi
       return;
     }
 
-    // Validate workspace membership
+    // Validate session ownership
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
-      .select('workspace_id')
+      .select('workspace_id, user_id')
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -347,12 +347,9 @@ export const updateChatSessionTitle = async (req: Request, res: Response): Promi
       return;
     }
 
-    if (session.workspace_id) {
-      const isMember = await WorkspaceAccessService.isMember(userId, session.workspace_id);
-      if (!isMember) {
-        res.status(403).json({ success: false, error: 'Not a member of this workspace' });
-        return;
-      }
+    if (session.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Access denied' });
+      return;
     }
 
     const result = await ChatService.updateChatTitle(sessionId, userId, title);
@@ -388,10 +385,10 @@ export const clearWorkspaceChat = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Get session to find workspace
+    // Get session and verify ownership
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, workspace_id')
+      .select('id, workspace_id, user_id')
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -400,17 +397,13 @@ export const clearWorkspaceChat = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    // Require owner role to clear chat
-    if (session.workspace_id) {
-      try {
-        await WorkspaceAccessService.requireOwner(userId, session.workspace_id);
-      } catch {
-        res.status(403).json({
-          success: false,
-          error: 'Only workspace owner can clear the chat',
-        });
-        return;
-      }
+    // Per-user chat: only session owner can clear their own chat
+    if (session.user_id !== userId) {
+      res.status(403).json({
+        success: false,
+        error: 'You can only clear your own chat',
+      });
+      return;
     }
 
     // Delete all messages (session remains)

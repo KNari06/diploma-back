@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { IntegrationTokenService, type IntegrationProvider } from '@/services/api/integration-token.service';
 import { getGitHubToken, listUserRepos, listBranches } from '@/services/api/github.service';
-import { getGitLabToken, listUserProjects, listBranches as listGitLabBranchesApi } from '@/services/api/gitlab.service';
+import { getGitLabToken, ensureValidGitLabToken, listUserProjects, listBranches as listGitLabBranchesApi } from '@/services/api/gitlab.service';
 import { createJiraOAuthUrl } from '@/api/jira/jira.controller';
 import { logger } from '@/utils/core/logger';
 import { env } from '@/config/environment/env';
@@ -565,8 +565,9 @@ export async function listGitLabRepos(req: Request, res: Response): Promise<void
       return;
     }
 
+    const validAccessToken = await ensureValidGitLabToken(token);
     const perPage = Math.min(Number(req.query.per_page) || 30, 100);
-    const projects = await listUserProjects(token.access_token, perPage);
+    const projects = await listUserProjects(validAccessToken, perPage);
 
     res.json({
       success: true,
@@ -613,6 +614,8 @@ export async function listGitLabBranches(req: Request, res: Response): Promise<v
       return;
     }
 
+    const validAccessToken = await ensureValidGitLabToken(token);
+
     const { projectId } = req.params;
     if (!projectId) {
       res.status(400).json({
@@ -623,7 +626,7 @@ export async function listGitLabBranches(req: Request, res: Response): Promise<v
       return;
     }
 
-    const branches = await listGitLabBranchesApi(token.access_token, projectId);
+    const branches = await listGitLabBranchesApi(validAccessToken, projectId);
 
     res.json({
       success: true,
@@ -855,6 +858,8 @@ async function handleGitLabCallback(userId: string, workspaceId: string | undefi
 
   await IntegrationTokenService.saveToken(userId, workspaceId, 'gitlab', {
     access_token: tokenData.access_token,
+    refresh_token: tokenData.refresh_token,
+    expires_in: tokenData.expires_in,
     scope: tokenData.scope,
     token_type: tokenData.token_type,
     external_id: userData.username,

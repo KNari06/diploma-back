@@ -242,6 +242,7 @@ export class FeedbackAnalyticsService {
         const { data: sessions } = await supabaseAdmin
           .from('chat_sessions')
           .select('id')
+          .eq('user_id', userId)
           .in('workspace_id', workspaceIds);
 
         if (sessions) {

@@ -6,7 +6,7 @@
 
 import { connection } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
-import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
+
 import { logger } from '@/utils/core/logger';
 import Redis from 'ioredis';
 import { Socket } from 'socket.io';
@@ -501,17 +501,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         return;
       }
 
-      // ✅ SECURITY: Verify workspace membership before allowing subscription (fail-closed)
-      // Chat sessions are shared within a workspace — any workspace member can subscribe.
+      // ✅ SECURITY: Verify session ownership before allowing subscription (fail-closed)
+      // Per-user chat: each user can only subscribe to their own session.
       try {
         const { data: chatSession, error: sessionError } = await supabaseAdmin
           .from('chat_sessions')
-          .select('workspace_id')
+          .select('workspace_id, user_id')
           .eq('id', sessionId.trim())
           .maybeSingle();
 
         if (sessionError) {
-          logger.warn('[WebSocket] Failed to verify chat session workspace (denying subscription)', {
+          logger.warn('[WebSocket] Failed to verify chat session ownership (denying subscription)', {
             socketId: socket.id,
             userId,
             sessionId,
@@ -556,12 +556,12 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
           return;
         }
 
-        const isMember = await WorkspaceAccessService.isMember(userId, chatSession.workspace_id);
-        if (!isMember) {
-          logger.warn('[WebSocket] Subscription denied: user is not a workspace member', {
+        // Per-user chat: verify session belongs to this user
+        if (chatSession.user_id !== userId) {
+          logger.warn('[WebSocket] Subscription denied: session belongs to different user', {
             socketId: socket.id,
             userId,
-            workspaceId: chatSession.workspace_id,
+            sessionUserId: chatSession.user_id,
             sessionId,
           });
           socket.emit('error', {

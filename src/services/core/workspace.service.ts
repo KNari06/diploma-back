@@ -57,11 +57,12 @@ export class WorkspaceService {
         return String(memberships[0].workspace_id);
       }
 
-      // Multiple workspaces — pick the one with most recent chat activity
+      // Multiple workspaces — pick the one with most recent chat activity for THIS user
       const workspaceIds = memberships.map(m => m.workspace_id);
       const { data: recentSession } = await supabaseAdmin
         .from('chat_sessions')
         .select('workspace_id, updated_at')
+        .eq('user_id', userId)
         .in('workspace_id', workspaceIds)
         .not('workspace_id', 'is', null)
         .order('updated_at', { ascending: false })

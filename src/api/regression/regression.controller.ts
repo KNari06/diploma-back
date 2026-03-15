@@ -1163,7 +1163,7 @@ function handleControllerError(
  * PATCH /regression/plans/:planId/items/:itemId/negative-testing
  * Toggle negative testing on a plan item.
  */
-export async function toggleNegativeTesting(req: Request, res: Response) {
+export async function toggleNegativeTesting(req: AuthenticatedRequest, res: Response) {
   try {
     const { planId, itemId } = req.params;
     const { enabled } = req.body;
@@ -1177,7 +1177,7 @@ export async function toggleNegativeTesting(req: Request, res: Response) {
     }
 
     // Verify plan ownership
-    const userId = (req as any).userId;
+    const userId = getUserId(req);
     const plan = await RegressionPlanService.getById(planId, userId);
     if (!plan) {
       res.status(404).json({ success: false, error: 'Plan not found' });
@@ -1208,10 +1208,10 @@ export async function toggleNegativeTesting(req: Request, res: Response) {
  * POST /regression/plans/:planId/generate-negatives
  * Dispatch BullMQ job to generate negative test cases for enabled test cases.
  */
-export async function generateNegatives(req: Request, res: Response) {
+export async function generateNegatives(req: AuthenticatedRequest, res: Response) {
   try {
     const { planId } = req.params;
-    const userId = (req as any).userId;
+    const userId = getUserId(req);
 
     // Verify plan ownership
     const plan = await RegressionPlanService.getById(planId, userId);
@@ -1258,10 +1258,10 @@ export async function generateNegatives(req: Request, res: Response) {
  * GET /regression/plans/:planId/negatives
  * List negative test cases for a plan.
  */
-export async function getNegatives(req: Request, res: Response) {
+export async function getNegatives(req: AuthenticatedRequest, res: Response) {
   try {
     const { planId } = req.params;
-    const userId = (req as any).userId;
+    const userId = getUserId(req);
 
     // Verify plan ownership
     const plan = await RegressionPlanService.getById(planId, userId);
@@ -1299,10 +1299,10 @@ export async function getNegatives(req: Request, res: Response) {
  * GET /regression/plans/:planId/negatives/status
  * Get generation status for reconnecting users.
  */
-export async function getNegativesStatus(req: Request, res: Response) {
+export async function getNegativesStatus(req: AuthenticatedRequest, res: Response) {
   try {
     const { planId } = req.params;
-    const userId = (req as any).userId;
+    const userId = getUserId(req);
 
     // Verify plan ownership
     const plan = await RegressionPlanService.getById(planId, userId);
