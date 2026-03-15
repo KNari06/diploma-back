@@ -127,6 +127,11 @@ export interface ServerToClientEvents {
   'exploration:completed': (data: ExplorationCompletedPayload) => void;
   'exploration:clarification:request': (data: ExplorationClarificationPayload) => void;
 
+  // Negative testing events
+  'negatives:generation:started': (data: any) => void;
+  'negatives:generation:progress': (data: any) => void;
+  'negatives:generation:completed': (data: any) => void;
+
   // System events
   'system:error': (data: SystemErrorPayload) => void;
   'system:maintenance': (data: SystemMaintenancePayload) => void;

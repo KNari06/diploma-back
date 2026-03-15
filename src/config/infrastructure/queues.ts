@@ -11,6 +11,12 @@ import { env } from '../environment/env';
 // EXPLORATION JOB DATA
 // ═══════════════════════════════════════════════════════════════════════
 
+export interface NegativeGenerationJobData {
+  planId: string;
+  userId: string;
+  testCaseIds: string[];
+}
+
 export interface ExplorationJobData {
   explorationId: string;
   entryUrl: string;
@@ -121,6 +127,7 @@ export const QUEUE_NAMES = {
   GIT_WEBHOOK: 'git-webhook',
   EXPLORATION: 'exploration',
   MOBILE_TEST_RUN: 'mobile-test-run',
+  NEGATIVE_GENERATION: 'negative-generation',
 } as const;
 
 // Test run queue - for executing tests
@@ -251,7 +258,23 @@ export const mobileTestRunQueue = new Queue<MobileTestJobData>(QUEUE_NAMES.MOBIL
   },
 });
 
+// Negative test generation queue — AI generates boundary/negative test cases
+export const negativeGenerationQueue = new Queue<NegativeGenerationJobData>(QUEUE_NAMES.NEGATIVE_GENERATION, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    attempts: 2,
+    backoff: {
+      type: 'fixed',
+      delay: 3000,
+    },
+  },
+});
+
 // Queue events for monitoring
+export const negativeGenerationQueueEvents = new QueueEvents(QUEUE_NAMES.NEGATIVE_GENERATION, { connection, prefix: env.QUEUE_PREFIX });
 export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection, prefix: env.QUEUE_PREFIX });
 export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection, prefix: env.QUEUE_PREFIX });
@@ -309,6 +332,14 @@ mobileTestRunQueueEvents.on('failed', (args: { jobId: string; failedReason: stri
 
 mobileTestRunQueueEvents.on('stalled', (args: { jobId: string }) => {
   logQueueEvent('stalled', args.jobId, { queue: QUEUE_NAMES.MOBILE_TEST_RUN });
+});
+
+negativeGenerationQueueEvents.on('completed', (args: { jobId: string; returnvalue: string; prev?: string }) => {
+  logQueueEvent('completed', args.jobId, { queue: QUEUE_NAMES.NEGATIVE_GENERATION });
+});
+
+negativeGenerationQueueEvents.on('failed', (args: { jobId: string; failedReason: string; prev?: string }) => {
+  logQueueEvent('failed', args.jobId, { queue: QUEUE_NAMES.NEGATIVE_GENERATION, error: args.failedReason });
 });
 
 // Queue management functions
@@ -520,6 +551,35 @@ export class QueueManager {
   }
 
   /**
+   * Add negative generation job to queue
+   */
+  static async addNegativeGenerationJob(jobData: NegativeGenerationJobData) {
+    try {
+      if (!redisAvailable) {
+        throw new Error('Redis is not available. Cannot add negative generation job to queue.');
+      }
+
+      const job = await negativeGenerationQueue.add('negative-generation', jobData, {
+        priority: 10, // Lower priority than test runs
+        jobId: `neg-gen-${jobData.planId}-${Date.now()}`,
+      });
+
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.NEGATIVE_GENERATION,
+        planId: jobData.planId,
+        testCaseCount: jobData.testCaseIds.length,
+      });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add negative generation job', {
+        error: error instanceof Error ? error.message : String(error),
+        planId: jobData.planId,
+      });
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
    * Get queue statistics
    */
   static async getQueueStats() {
@@ -628,6 +688,8 @@ export class QueueManager {
         return explorationQueue;
       case QUEUE_NAMES.MOBILE_TEST_RUN:
         return mobileTestRunQueue;
+      case QUEUE_NAMES.NEGATIVE_GENERATION:
+        return negativeGenerationQueue;
       default:
         throw new Error(`Unknown queue: ${queueName}`);
     }
@@ -700,11 +762,12 @@ export const gracefulShutdown = async () => {
         gitWebhookQueue.close(),
         explorationQueue.close(),
         mobileTestRunQueue.close(),
+        negativeGenerationQueue.close(),
       ]);
 
       closeQueueResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun', 'negativeGeneration'];
           logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -716,11 +779,12 @@ export const gracefulShutdown = async () => {
         aiAnalysisQueueEvents.close(),
         explorationQueueEvents.close(),
         mobileTestRunQueueEvents.close(),
+        negativeGenerationQueueEvents.close(),
       ]);
 
       closeQueueEventsResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents'];
+          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents', 'negativeGenerationEvents'];
           logger.warn(`Failed to close ${eventNames[index]}`, { error: result.reason });
         }
       });

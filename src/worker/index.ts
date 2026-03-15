@@ -7,6 +7,7 @@ import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from 
 import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
+import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
@@ -318,6 +319,30 @@ const mobileTestRunWorker = new Worker(
   }
 );
 
+// Negative test generation worker
+const negativeGenerationWorker = new Worker(
+  QUEUE_NAMES.NEGATIVE_GENERATION,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[NEGATIVE_GEN_WORKER] Processing job: ${job.id}`, {
+      planId: job.data?.planId,
+      testCaseCount: job.data?.testCaseIds?.length,
+    });
+
+    return await processNegativeGeneration(job);
+  },
+  {
+    ...workerOptions,
+    concurrency: 2, // AI generation — limited by API rate limits
+    lockDuration: 5 * 60 * 1000, // 5 min
+    stalledInterval: 2 * 60 * 1000, // 2 min
+    maxStalledCount: 1,
+  }
+);
+
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
@@ -440,6 +465,7 @@ setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
 setupWorkerEvents(explorationWorker, 'Exploration');
 setupWorkerEvents(mobileTestRunWorker, 'MobileTestRun');
+setupWorkerEvents(negativeGenerationWorker, 'NegativeGeneration');
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -474,6 +500,7 @@ const gracefulShutdown = async (signal: string) => {
       gitWebhookWorker.close(),
       explorationWorker.close(),
       mobileTestRunWorker.close(),
+      negativeGenerationWorker.close(),
       // Abort all active test runs (closes contexts, stops video streams)
       (async () => {
         try {
@@ -583,6 +610,7 @@ export {
   explorationWorker,
   gitWebhookWorker,
   mobileTestRunWorker,
+  negativeGenerationWorker,
   notificationWorker,
   testResultWorker,
   testRunWorker,
