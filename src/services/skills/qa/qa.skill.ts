@@ -40,6 +40,7 @@ import {
   // Write tools — Tier 1
   handleUpdateTestCase,
   handleRunTest,
+  handleRunDraftSteps,
   handleCreateTestCase,
   // Write tools — Tier 2
   handleManageRegressionPlan,
@@ -1207,9 +1208,55 @@ const QA_TOOLS: ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'qa_run_draft_steps',
+      description:
+        '⚠️ WRITE operation — Execute draft test steps on the live editor preview WITHOUT saving to DB. Use this to test-drive generated steps before saving. After the user is satisfied, use qa_create_test_case to persist. Requires an active editor preview session. Describe the steps → get approval → call with confirm=true.',
+      parameters: {
+        type: 'object',
+        properties: {
+          steps: {
+            type: 'array',
+            description: 'Array of steps to execute. Each step: {id: string (UUID), type: string, description: string, value?: string, assertionText?: string}',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', description: 'Unique step ID (UUID)' },
+                type: {
+                  type: 'string',
+                  enum: ['type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover', 'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close', 'ai_check', 'wait_for', 'upload'],
+                  description: 'Action type for this step',
+                },
+                description: { type: 'string', description: 'What this step does' },
+                value: { type: 'string', description: 'Value for type/press/select actions' },
+                assertionText: { type: 'string', description: 'Assertion text for ai_check steps' },
+                expectedOutcome: {
+                  type: 'string',
+                  enum: ['success', 'error'],
+                  description: 'Expected outcome. Use "error" for negative test steps.',
+                },
+              },
+              required: ['id', 'type', 'description'],
+            },
+          },
+          start_url: {
+            type: 'string',
+            description: 'Starting URL for the test. Use the current preview page URL from the page context.',
+          },
+          confirm: {
+            type: 'boolean',
+            description: 'Must be true. Set ONLY after describing the steps to user AND receiving explicit approval.',
+          },
+        },
+        required: ['steps', 'start_url', 'confirm'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'qa_create_test_case',
       description:
-        '⚠️ WRITE operation — Create a new test case with steps. Describe the test case → get approval → call with confirm=true. Each step needs: id (UUID), type, description.',
+        '⚠️ WRITE operation — Create a new test case with steps and SAVE to DB. Use this ONLY when the user explicitly asks to save/persist a test case. Describe the test case → get approval → call with confirm=true. Each step needs: id (UUID), type, description.',
       parameters: {
         type: 'object',
         properties: {
@@ -1788,6 +1835,9 @@ export const QASkill: SkillDefinition = {
 
         case 'qa_run_test':
           return await handleRunTest(args, context);
+
+        case 'qa_run_draft_steps':
+          return await handleRunDraftSteps(args, context);
 
         case 'qa_create_test_case':
           return await handleCreateTestCase(args, context);

@@ -256,7 +256,8 @@ async function waitForDOMStable(
 }
 
 /**
- * Apply page-level settle: networkIdle + DOM stable in parallel.
+ * Apply page-level settle: wait for DOM to stabilize.
+ * We only care about DOM mutations (element availability), NOT images/fonts/analytics.
  * The domStableThresholdMs is dynamically chosen based on prev action profile.
  */
 async function pageSettle(
@@ -265,13 +266,10 @@ async function pageSettle(
   domStableThresholdMs: number
 ): Promise<void> {
   const startTime = Date.now();
-  logger.debug('[STEP_READINESS] Applying page settle', { settleMs, domStableThresholdMs });
+  logger.debug('[STEP_READINESS] Applying page settle (DOM-only)', { settleMs, domStableThresholdMs });
 
   await Promise.race([
-    Promise.all([
-      waitForNetworkIdle(page, settleMs),
-      waitForDOMStable(page, settleMs, domStableThresholdMs),
-    ]),
+    waitForDOMStable(page, settleMs, domStableThresholdMs),
     new Promise(resolve => setTimeout(resolve, settleMs)),
   ]);
 
@@ -509,11 +507,20 @@ export async function waitForStepReadiness(
       navigationDetected = await detectSpaNavigation(page, prevUrl, spaWaitMs);
 
       if (navigationDetected) {
-        // Navigation happened → wait for networkIdle so the new page is ready
+        // Navigation happened → wait for DOM to be ready (not networkIdle — images/fonts irrelevant).
+        // domcontentloaded ensures HTML is parsed, then DOM stability ensures SPA hydration is done.
         const postNavMs = Math.min(settleMs, maxWaitMs - (Date.now() - startTime));
         if (postNavMs > 0) {
-          logger.debug('[STEP_READINESS] Post-navigation networkIdle wait', { postNavMs });
-          await waitForNetworkIdle(page, postNavMs);
+          logger.debug('[STEP_READINESS] Post-navigation DOM settle', { postNavMs });
+          try {
+            await page.waitForLoadState('domcontentloaded', { timeout: postNavMs });
+          } catch {
+            // Timeout acceptable — DOM may still be usable
+          }
+          const remainingAfterDce = Math.min(postNavMs, maxWaitMs - (Date.now() - startTime));
+          if (remainingAfterDce > 0) {
+            await waitForDOMStable(page, remainingAfterDce, domStableThresholdMs);
+          }
         }
       }
     }

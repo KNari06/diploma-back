@@ -11,11 +11,17 @@ services:
       - .env
     environment:
       - QUEUE_PREFIX=${QUEUE_PREFIX:-qait-prod}
+      - LOG_LEVEL=info
     volumes:
       - ./logs:/app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   worker:
     container_name: qait-worker
@@ -28,8 +34,14 @@ services:
       - .env
     environment:
       - QUEUE_PREFIX=${QUEUE_PREFIX:-qait-prod}
+      - LOG_LEVEL=info
     volumes:
       - ./logs:/app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"

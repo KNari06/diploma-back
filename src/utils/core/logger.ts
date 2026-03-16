@@ -156,9 +156,54 @@ export const morganStream = {
   },
 };
 
+// Guard against recursive logging (e.g. write EIO cascade).
+// If logger itself throws (broken stdout pipe), we fall back to stderr only.
+let _isHandlingException = false;
+
+function _safeLog(level: 'error' | 'warn', payload: object | string): void {
+  if (_isHandlingException) {
+    // Already inside a handler — write directly to stderr to avoid infinite loop
+    try {
+      process.stderr.write(`[SAFE_LOG fallback] ${JSON.stringify(payload)}\n`);
+    } catch {
+      // stderr also broken — nothing we can do
+    }
+    return;
+  }
+  _isHandlingException = true;
+  try {
+    logger[level](payload as any);
+  } catch {
+    try {
+      process.stderr.write(`[LOGGER_ERROR] Failed to log: ${JSON.stringify(payload)}\n`);
+    } catch {
+      // completely broken — ignore
+    }
+  } finally {
+    _isHandlingException = false;
+  }
+}
+
+// Suppress broken-pipe / closed-stdout errors from Winston Console transport.
+// These are NOT real app errors — they happen when the terminal is closed while
+// the process keeps running. Without this guard they trigger uncaughtException
+// which tries to log → write EIO again → infinite storm of 70k+ entries.
+process.stdout.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EIO' || err.code === 'EPIPE' || err.code === 'EBADF') {
+    // stdout is gone (terminal closed / pipe broken) — silently ignore
+    return;
+  }
+  // Unexpected stdout error — surface via stderr only
+  try {
+    process.stderr.write(`[STDOUT_ERROR] ${err.message}\n`);
+  } catch {
+    // ignore
+  }
+});
+
 // Log unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error({
+  _safeLog('error', {
     message: 'Unhandled Rejection at',
     promise: String(promise),
     reason: reason instanceof Error ? {
@@ -168,18 +213,14 @@ process.on('unhandledRejection', (reason, promise) => {
     } : String(reason),
   });
 
-  // Don't exit - log and continue
-  // Only exit in production for critical errors
-  // Use env.NODE_ENV for consistency
   if (env.NODE_ENV === 'production' && reason instanceof Error) {
-    // Check if it's a critical error that should crash the app
     const criticalErrors = ['ECONNREFUSED', 'ENOTFOUND', 'EADDRINUSE'];
     const isCritical = criticalErrors.some(code =>
       reason.message.includes(code) || (reason as any).code === code
     );
 
     if (isCritical) {
-      logger.error('Critical unhandled rejection, exiting...');
+      _safeLog('error', 'Critical unhandled rejection, exiting...');
       process.exit(1);
     }
   }
@@ -187,7 +228,15 @@ process.on('unhandledRejection', (reason, promise) => {
 
 // Log uncaught exceptions
 process.on('uncaughtException', (error) => {
-  logger.error({
+  // Ignore write EIO / EPIPE — these are broken-pipe errors from Winston Console
+  // transport when stdout is closed (terminal closed, pipe gone). They are NOT
+  // real application errors and must not re-enter the logger.
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === 'EIO' || code === 'EPIPE' || code === 'EBADF') {
+    return;
+  }
+
+  _safeLog('error', {
     message: 'Uncaught Exception',
     error: {
       message: error.message,
@@ -196,9 +245,6 @@ process.on('uncaughtException', (error) => {
     },
   });
 
-  // Only exit for critical errors in production
-  // In development, log and continue to help debugging
-  // Use env.NODE_ENV for consistency
   if (env.NODE_ENV === 'production') {
     const criticalErrors = ['ECONNREFUSED', 'ENOTFOUND', 'EADDRINUSE', 'EACCES'];
     const isCritical = criticalErrors.some(code =>
@@ -206,13 +252,13 @@ process.on('uncaughtException', (error) => {
     );
 
     if (isCritical) {
-      logger.error('Critical uncaught exception, exiting...');
+      _safeLog('error', 'Critical uncaught exception, exiting...');
       process.exit(1);
     } else {
-      logger.warn('Non-critical uncaught exception, continuing...');
+      _safeLog('warn', 'Non-critical uncaught exception, continuing...');
     }
   } else {
-    logger.warn('Uncaught exception in development, continuing...');
+    _safeLog('warn', 'Uncaught exception in development, continuing...');
   }
 });
 

@@ -11,9 +11,9 @@ export type MobilePlatform = 'android' | 'ios';
 // ── Session ──────────────────────────────────────────────────────
 
 export interface MobileSessionResponse {
-  id: string;
+  sessionId: string;
   platform: MobilePlatform;
-  createdAt: number;
+  device?: Record<string, unknown>;
 }
 
 export interface MobileSessionConfig {

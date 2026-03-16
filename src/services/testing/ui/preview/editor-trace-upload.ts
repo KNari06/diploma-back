@@ -14,7 +14,7 @@ interface UploadEditorTraceParams {
   filePath: string;
   userId: string;
   previewSessionId: string;
-  traceType: 'editor' | 'preview_run';
+  traceType: 'editor' | 'preview_run' | 'draft_run';
   intentTestCaseId?: string;
 }
 

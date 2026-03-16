@@ -19,6 +19,7 @@ import rulesReloadRoutes from '@/api/kb/rules-reload.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import modulesRoutes from '@/api/modules/modules.route';
+import announcementsRoutes from '@/api/announcements/announcements.routes';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
@@ -1257,6 +1258,7 @@ app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications (needed for pending users)
+app.use(`/api/${env.API_VERSION}/announcements`, announcementsRoutes); // What's New announcements
 app.use(`/api/${env.API_VERSION}/user`, userRoutes); // User profile (needed for pending users)
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
 

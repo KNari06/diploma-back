@@ -114,6 +114,7 @@ export class MobileTestRunJobHandler {
     }
 
     let sessionId: string | null = null;
+    let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
 
     try {
       // ── Phase 1: Emit progress ────────────────────────────────
@@ -134,7 +135,7 @@ export class MobileTestRunJobHandler {
       // ── Phase 2: Update test status ───────────────────────────
       await this.updateTestStatus(testId, 'running', browser);
 
-      // ── Phase 3: Create session on runner (or reuse warmed) ───
+      // ── Phase 3: Acquire session — Pool → Warmup → Cold Start ─
       try {
         webSocketService.emitTestProgress(testId, {
           testId,
@@ -149,23 +150,35 @@ export class MobileTestRunJobHandler {
         });
       } catch { /* non-fatal */ }
 
-      // Try to reuse a warmed session (eager start from editor)
-      if (projectId) {
+      // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s)
+      try {
+        const claimed = await client.claimSession(platform);
+        sessionId = claimed.sessionId;
+        sessionSource = 'pool';
+        logger.info('[MOBILE-TEST] Pool session claimed', { testId, sessionId, platform });
+      } catch (poolErr) {
+        // Pool exhausted, disabled, or runner unreachable — try next
+        logger.debug('[MOBILE-TEST] Pool claim failed, trying warmup', {
+          testId,
+          error: poolErr instanceof Error ? poolErr.message : String(poolErr),
+        });
+      }
+
+      // Try 2: Warmed session (editor eager start)
+      if (!sessionId && projectId) {
         const warmed = await claimWarmedSession(projectId, userId);
         if (warmed && warmed.platform === platform) {
           sessionId = warmed.sessionId;
-          logger.info('[MOBILE-TEST] Reusing warmed session', {
-            testId,
-            sessionId,
-            platform,
-          });
+          sessionSource = 'warmup';
+          logger.info('[MOBILE-TEST] Warmed session claimed', { testId, sessionId, platform });
         }
       }
 
-      // Cold start: create a new session
+      // Try 3: Cold start (fallback — creates new emulator/simulator ~60s)
       if (!sessionId) {
         const session = await client.createSession(platform);
-        sessionId = session.id;
+        sessionId = session.sessionId;
+        sessionSource = 'cold';
         logger.info('[MOBILE-TEST] Session created (cold start)', {
           testId,
           sessionId,
@@ -194,41 +207,50 @@ export class MobileTestRunJobHandler {
           appStoragePath,
           appOriginalName,
         });
+        if (!appPackage) {
+          logger.warn('[MOBILE-TEST] Project has mobile app binary but no appPackage (package/bundle ID). Skipping install.', {
+            testId,
+            appStoragePath,
+          });
+        } else {
+          // Download from Supabase Storage
+          const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
 
-        // Download from Supabase Storage
-        const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
+          // Upload to runner
+          const uploadResult = await client.uploadApp(
+            appBuffer,
+            appOriginalName || 'app.apk',
+          );
 
-        // Upload to runner
-        const uploadResult = await client.uploadApp(
-          appBuffer,
-          appOriginalName || 'app.apk',
-        );
+          logger.info('[MOBILE-TEST] App uploaded to runner, installing', {
+            testId,
+            runnerPath: uploadResult.path,
+            size: uploadResult.size,
+          });
 
-        logger.info('[MOBILE-TEST] App uploaded to runner, installing', {
-          testId,
-          runnerPath: uploadResult.path,
-          size: uploadResult.size,
-        });
+          // Install + launch the app on the emulator/simulator via low-level commands
+          await client.executeBatchCommands(sessionId, [
+            {
+              type: 'install_app',
+              params: {
+                apkPath: uploadResult.path,
+                reinstall: true,
+              },
+            },
+            {
+              type: 'launch_app',
+              params: {
+                packageName: appPackage,
+                clearData: true,
+              },
+            },
+          ]);
 
-        // Install via run-steps with a single install_app + open_app step
-        const installSteps = [
-          {
-            id: '__install_app',
-            type: 'open_app' as const,
-            description: appPackage || 'app',
-            value: appPackage,
-            options: { continueOnError: false },
-          },
-        ];
-
-        await client.runSteps(sessionId, installSteps, {
-          screenshotEachStep: false,
-        });
-
-        logger.info('[MOBILE-TEST] App installed and launched', {
-          testId,
-          appPackage,
-        });
+          logger.info('[MOBILE-TEST] App installed and launched', {
+            testId,
+            appPackage,
+          });
+        }
       }
 
       // ── Phase 4: Run steps ────────────────────────────────────
@@ -411,19 +433,30 @@ export class MobileTestRunJobHandler {
 
       throw error;
     } finally {
-      // ── Cleanup: destroy session ────────────────────────────────
+      // ── Cleanup: release pooled session or destroy adhoc/warmed ──
       if (sessionId) {
         try {
-          await client.destroySession(sessionId);
-          logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId });
+          if (sessionSource === 'pool') {
+            await client.releaseSession(sessionId);
+            logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
+          } else {
+            await client.destroySession(sessionId);
+            logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
+          }
         } catch (err) {
-          logger.warn('[MOBILE-TEST] Failed to destroy session (runner has TTL cleanup)', {
+          logger.warn('[MOBILE-TEST] Session cleanup failed (runner TTL will handle)', {
             testId,
             sessionId,
+            sessionSource,
             error: err instanceof Error ? err.message : String(err),
           });
         }
       }
+
+      // Decrement fair-priority pending counter for this user
+      try {
+        await QueueManager.decrementMobilePendingCount(userId);
+      } catch { /* non-fatal — counter has TTL expiry as safety net */ }
     }
   }
 

@@ -180,8 +180,8 @@ export interface ServerToClientEvents {
   'preview:mouse:probe:result': (data: PreviewMouseProbeResultPayload) => void;
   'preview:page:action:result': (data: PreviewPageActionResultPayload) => void;
 
-  // Heartbeat response
-  pong: () => void;
+  // Heartbeat response (echoes client timestamp for RTT measurement)
+  pong: (data: { t?: number }) => void;
 }
 
 // ============================================================================

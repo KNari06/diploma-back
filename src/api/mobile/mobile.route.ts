@@ -17,7 +17,7 @@ import multer from 'multer';
 import { deleteMobileApp, getMobileApp, uploadMobileApp } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
-import { warmupSession, destroySession } from './session.controller';
+import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession } from './session.controller';
 
 // ── Multer config for APK/IPA uploads ────────────────────────────
 
@@ -109,6 +109,98 @@ router.delete(
   '/sessions/:sessionId',
   requireAuth,
   asyncHandler(destroySession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/tap
+ * Forward tap at (x, y) to emulator for interactive preview
+ *
+ * Body: { x: number, y: number }
+ */
+router.post(
+  '/sessions/:sessionId/tap',
+  requireAuth,
+  asyncHandler(tapSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/swipe
+ * Forward swipe gesture to emulator
+ *
+ * Body: { startX, startY, endX, endY, durationMs? }
+ */
+router.post(
+  '/sessions/:sessionId/swipe',
+  requireAuth,
+  asyncHandler(swipeSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/go-home
+ * Send Home button to emulator
+ */
+router.post(
+  '/sessions/:sessionId/go-home',
+  requireAuth,
+  asyncHandler(goHomeSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/go-back
+ * Send Back button to emulator
+ */
+router.post(
+  '/sessions/:sessionId/go-back',
+  requireAuth,
+  asyncHandler(goBackSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/type
+ * Type text into the emulator
+ *
+ * Body: { text: string }
+ */
+router.post(
+  '/sessions/:sessionId/type',
+  requireAuth,
+  asyncHandler(typeSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/key
+ * Send an Android keycode to the emulator
+ *
+ * Body: { keycode: string }  e.g. "KEYCODE_ENTER"
+ */
+router.post(
+  '/sessions/:sessionId/key',
+  requireAuth,
+  asyncHandler(keySession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/lint
+ * Resolve element description on the mobile emulator UI
+ *
+ * Body: { stepDraft: { kind, elementDescription, value? } }
+ */
+router.post(
+  '/sessions/:sessionId/lint',
+  requireAuth,
+  asyncHandler(lintSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/apply
+ * Execute a step on the mobile emulator
+ *
+ * Body: { stepDraft: { kind, elementDescription, value?, ... } }
+ */
+router.post(
+  '/sessions/:sessionId/apply',
+  requireAuth,
+  asyncHandler(applySession),
 );
 
 // ═══════════════════════════════════════════════════════════════════════════

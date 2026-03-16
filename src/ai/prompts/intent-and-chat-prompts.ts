@@ -128,9 +128,11 @@ EDITOR MODE INTENT RULES (override general rules):
 - Single action on the page (click, type, scroll, press, hover, select, check, uncheck) → "editor_action"
   Executed DIRECTLY on the live preview — no test plan needed.
 - "create a test case for this page", "make me a login test", "add steps", "finish test case" → "general_chat"
-  The sub-agent uses QA tools + page DOM context to create/update test cases, then can run them on the live preview.
-- "run this test", "replay", "запусти тест", "run it on the preview" → "general_chat"
-  The sub-agent calls qa_run_test(run_type="preview") to execute steps on the live browser.
+  The sub-agent generates steps in chat (ephemeral), runs them via qa_run_draft_steps, and saves only when explicitly asked.
+- "run it", "run these steps", "выполни", "запусти", "try it on the preview", "прогани" → "general_chat"
+  The sub-agent calls qa_run_draft_steps (for draft steps in chat memory) or qa_run_test (for already-saved test cases).
+- "save it", "сохрани", "persist" → "general_chat"
+  The sub-agent calls qa_create_test_case to persist draft steps to DB.
 - "run saved test", "запусти регресс" (background headless run) → "run_regression"
 - Questions, conversation, analysis, explanations → "general_chat"
 - Everything else follows normal intent rules (save_test, analyze_failure, etc.)

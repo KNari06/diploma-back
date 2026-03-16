@@ -110,8 +110,7 @@ describe('TokenCalculatorService', () => {
     });
 
     it('should fallback to gpt-4o-mini for unknown model', () => {
-      // @ts-expect-error - Testing invalid model
-      const cost = TokenCalculatorService.calculateCostFromTokens(1000, 500, 'unknown-model');
+      const cost = TokenCalculatorService.calculateCostFromTokens(1000, 500, 'unknown-model' as any);
       const expectedCost =
         (1000 / 1000) * MODEL_PRICING['gpt-4o-mini'].input +
         (500 / 1000) * MODEL_PRICING['gpt-4o-mini'].output;

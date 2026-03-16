@@ -28,7 +28,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, description, flowType, tags, priority, preconditions, expectedResult, baseUrl } = req.body;
+    const { moduleId, name, description, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -53,12 +53,15 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     const platformKey = module.platformKey;
     const projectId = module.projectId;
 
+    const isMobilePlatform = platform === 'mobile_android' || platform === 'mobile_ios';
+
     // Create flow
     const flow = await FlowService.create({
       moduleId,
       userId,
       name,
       description,
+      platform,
       flowType,
       tags,
       priority,
@@ -67,13 +70,13 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     });
 
     // Create initial test case
-    // UI test cases are now created in intent_test_cases (unified table)
+    // UI test cases (web + mobile) are created in intent_test_cases (unified table)
     let createdTestCaseId: string | undefined;
 
-    if (platformKey === 'web_ui') {
-        // Sanitize baseUrl if provided
+    if (platformKey === 'web_ui' || isMobilePlatform) {
+        // Sanitize baseUrl if provided (only relevant for web flows)
         let sanitizedBaseUrl: string | null = null;
-        if (baseUrl && typeof baseUrl === 'string' && baseUrl.trim()) {
+        if (!isMobilePlatform && baseUrl && typeof baseUrl === 'string' && baseUrl.trim()) {
           try {
             sanitizedBaseUrl = sanitizeUrl(baseUrl);
           } catch (error) {
@@ -84,33 +87,35 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           }
         }
 
-        // Create empty UI test case in intent_test_cases (unified table)
+        // Build insert payload
+        const insertPayload: Record<string, any> = {
+          project_id: projectId,
+          user_id: userId,
+          name,
+          flow_id: flow.id,
+          start_url: sanitizedBaseUrl,
+          url: sanitizedBaseUrl,
+          status: 'draft',
+          kind: 'regression_member',
+          replay_strategy: 'commands',
+          commands: [],
+          steps_json: [],
+          preconditions: preconditions || [],
+          setup_steps: [],
+          teardown_steps: [],
+          tags: tags || [],
+          priority: priority || null,
+          expected_result: expectedResult || null,
+          depends_on: [],
+        };
+
+        if (isMobilePlatform) {
+          insertPayload.platform = platform; // 'mobile_android' | 'mobile_ios'
+        }
+
         const { data: testCase, error: testCaseError } = await supabaseAdmin
           .from('intent_test_cases')
-          .insert({
-            project_id: projectId,
-            user_id: userId,
-            name: name, // Use flow name as default
-            flow_id: flow.id,
-            // URL fields (from baseUrl if provided)
-            start_url: sanitizedBaseUrl,
-            url: sanitizedBaseUrl,
-            // Lifecycle/classification
-            status: 'draft',
-            kind: 'regression_member',
-            // Replay fields (empty for new flow)
-            replay_strategy: 'commands',
-            commands: [],
-            steps_json: [],
-            // Metadata fields
-            preconditions: preconditions || [],
-            setup_steps: [],
-            teardown_steps: [],
-            tags: tags || [],
-            priority: priority || null,
-            expected_result: expectedResult || null,
-            depends_on: [],
-          })
+          .insert(insertPayload)
           .select('id')
           .single();
 
@@ -119,7 +124,6 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
             error: testCaseError,
             flowId: flow.id,
           });
-          // Rollback: delete the orphaned flow since it's unusable without a test case
           try {
             await FlowService.delete(flow.id, userId);
             logger.info('[FLOWS_API] Rolled back orphaned flow', { flowId: flow.id });
@@ -140,6 +144,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           logger.info('[FLOWS_API] Created initial intent test case', {
             testCaseId: createdTestCaseId,
             flowId: flow.id,
+            platform: isMobilePlatform ? platform : 'web',
             hasBaseUrl: !!sanitizedBaseUrl,
           });
         }

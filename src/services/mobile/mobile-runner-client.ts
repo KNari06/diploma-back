@@ -47,7 +47,7 @@ export class MobileRunnerClient {
   constructor(opts?: { baseUrl?: string; apiKey?: string; geminiApiKey?: string }) {
     this.baseUrl = (opts?.baseUrl || env.MOBILE_RUNNER_URL).replace(/\/$/, '');
     this.apiKey = opts?.apiKey || env.MOBILE_RUNNER_API_KEY;
-    this.geminiApiKey = opts?.geminiApiKey || '';
+    this.geminiApiKey = opts?.geminiApiKey || env.GEMINI_API_KEY || '';
   }
 
   /** Update Gemini API key (passed per-request from user context) */
@@ -85,6 +85,83 @@ export class MobileRunnerClient {
 
   async destroySession(sessionId: string): Promise<void> {
     await this.request('DELETE', `/api/sessions/${sessionId}`);
+  }
+
+  async sessionExists(sessionId: string): Promise<boolean> {
+    try {
+      const sessions = await this.request<{ id: string }[]>('GET', '/api/sessions', {
+        timeoutMs: 5000,
+      });
+      return Array.isArray(sessions) && sessions.some((s) => s.id === sessionId);
+    } catch {
+      return false;
+    }
+  }
+
+  // ── Session Pool operations ──────────────────────────────────────
+
+  /**
+   * Claim an idle pooled session from the runner.
+   * Returns immediately if a session is available, or waits up to
+   * the runner's claimTimeoutMs before returning 503.
+   *
+   * On 503/404 the caller should fall back to createSession() (cold start).
+   */
+  async claimSession(platform: MobilePlatform): Promise<MobileSessionResponse> {
+    return this.request<MobileSessionResponse>('POST', '/api/sessions/claim', {
+      body: { platform },
+      timeoutMs: 20_000, // Pool may wait up to 15s for idle session
+      noRetry: true, // 503 means pool exhausted — don't retry, fall back to cold start
+    });
+  }
+
+  /**
+   * Release a pooled session back to the pool after test completion.
+   * The runner resets device state (app data, network, video) before
+   * marking the session as idle for the next test.
+   */
+  async releaseSession(sessionId: string): Promise<void> {
+    await this.request('POST', '/api/sessions/release', {
+      body: { sessionId },
+      timeoutMs: 15_000, // Reset can take up to 10s
+    });
+  }
+
+  /**
+   * Get pool + adhoc capacity information from the runner.
+   * Used by the job handler to decide claim vs cold start.
+   */
+  async getCapacity(): Promise<{
+    pool: {
+      android: { total: number; idle: number; busy: number } | null;
+      ios: { total: number; idle: number; busy: number } | null;
+    } | null;
+    adhoc: { maxSessions: number; activeSessions: number; available: number };
+    mode: 'pool' | 'classic';
+  }> {
+    return this.request('GET', '/api/sessions/capacity', { timeoutMs: 5000 });
+  }
+
+  // ── Low-level command execution ─────────────────────────────────
+  /**
+   * Execute a batch of low-level MobileCommand objects on a given session.
+   * This is a thin wrapper over qait-mobile-runner's
+   * POST /api/commands/:sessionId/batch endpoint.
+   *
+   * NOTE: Commands are intentionally typed as unknown[] here to avoid
+   * tightly coupling the backend to the runner's internal command union.
+   * Callers must ensure they send shape-compatible objects that satisfy
+   * the runner's zod `mobileCommandSchema`.
+   */
+  async executeBatchCommands(
+    sessionId: string,
+    commands: unknown[],
+  ): Promise<{ results: unknown[] }> {
+    return this.request<{ results: unknown[] }>(
+      'POST',
+      `/api/commands/${sessionId}/batch`,
+      { body: { commands } },
+    );
   }
 
   // ── Step execution ──────────────────────────────────────────────
@@ -127,7 +204,7 @@ export class MobileRunnerClient {
       throw new MobileRunnerError('Mobile testing is not enabled', 503, 'DISABLED');
     }
 
-    const url = `${this.baseUrl}/upload/apk`;
+    const url = `${this.baseUrl}/api/upload/apk`;
     const timeoutMs = 120_000; // 2 min for large APKs
 
     // Build multipart form data
@@ -203,6 +280,8 @@ export class MobileRunnerClient {
     opts?: {
       body?: unknown;
       timeoutMs?: number;
+      /** Skip retries — throw immediately on any error (e.g. pool claim 503) */
+      noRetry?: boolean;
     },
   ): Promise<T> {
     if (!env.MOBILE_RUNNER_ENABLED) {
@@ -211,6 +290,7 @@ export class MobileRunnerClient {
 
     const url = `${this.baseUrl}${path}`;
     const timeoutMs = opts?.timeoutMs || CLIENT_CONFIG.defaultTimeoutMs;
+    const maxRetries = opts?.noRetry ? 0 : CLIENT_CONFIG.maxRetries;
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -225,7 +305,7 @@ export class MobileRunnerClient {
 
     // Retry loop for 5xx errors
     let lastError: Error | null = null;
-    for (let attempt = 0; attempt <= CLIENT_CONFIG.maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
         const delay = CLIENT_CONFIG.retryBaseDelayMs * Math.pow(2, attempt - 1);
         logger.debug('[MOBILE_CLIENT] Retrying request', {
@@ -253,7 +333,7 @@ export class MobileRunnerClient {
           const errorBody = await response.text().catch(() => '');
 
           // Retry on 5xx
-          if (response.status >= 500 && attempt < CLIENT_CONFIG.maxRetries) {
+          if (response.status >= 500 && attempt < maxRetries) {
             lastError = new MobileRunnerError(
               `Runner returned ${response.status}: ${errorBody}`,
               response.status,
@@ -293,7 +373,7 @@ export class MobileRunnerClient {
         // Network error — retry
         lastError = error instanceof Error ? error : new Error(String(error));
 
-        if (attempt < CLIENT_CONFIG.maxRetries) {
+        if (attempt < maxRetries) {
           logger.warn('[MOBILE_CLIENT] Network error, will retry', {
             url,
             attempt,

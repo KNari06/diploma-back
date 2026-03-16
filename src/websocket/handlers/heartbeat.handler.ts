@@ -31,9 +31,15 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
   let lastPingAt = 0;
   const MIN_PING_INTERVAL_MS = 5000; // 5s hard floor
 
-  socket.on('ping', () => {
+  socket.on('ping', (clientTimestamp?: number) => {
     try {
-      // Check if socket is still connected
+      // Validate timestamp — must be a positive number (epoch ms from client)
+      const ts: number | undefined =
+        typeof clientTimestamp === 'number' && clientTimestamp > 0
+          ? clientTimestamp
+          : undefined;
+
+      // Check if socket is still connected — still send pong so client clears pending state
       if (!socket.connected) {
         logger.debug('[WebSocket] Socket disconnected, ignoring ping', {
           socketId: socket.id,
@@ -44,16 +50,14 @@ export const handleHeartbeat = (socket: TypedSocket): void => {
 
       const now = Date.now();
       if (now - lastPingAt < MIN_PING_INTERVAL_MS) {
+        // Still respond with pong for latency measurement (just skip logging)
+        socket.emit('pong', { t: ts });
         return;
       }
       lastPingAt = now;
 
-      socket.emit('pong');
-
-      // logger.debug('[WebSocket] Heartbeat', {
-      //   socketId: socket.id,
-      //   userId: userId || 'anonymous',
-      // });
+      // Echo back client timestamp so client can calculate RTT
+      socket.emit('pong', { t: ts });
     } catch (error) {
       logger.error('[WebSocket] Error in ping handler', {
         socketId: socket.id,

@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "worker",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "worker"],
+      "port": 0
+    },
+    {
+      "name": "scheduler",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "scheduler"],
+      "port": 0
+    }
+  ]
+}

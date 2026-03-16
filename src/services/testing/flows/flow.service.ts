@@ -30,6 +30,7 @@ export class FlowService {
       description,
       orderIndex,
       flowType,
+      platform,
       tags,
       priority,
       preconditions,
@@ -65,6 +66,7 @@ export class FlowService {
         description: description || null,
         order_index: finalOrderIndex,
         flow_type: flowType || 'ui',
+        platform: platform || null,
         tags: tags || [],
         priority: priority || null,
         preconditions: preconditions || [],
@@ -147,6 +149,7 @@ export class FlowService {
       description,
       orderIndex,
       flowType,
+      platform,
       tags,
       priority,
       preconditions,
@@ -158,6 +161,7 @@ export class FlowService {
     if (description !== undefined) updates.description = description;
     if (orderIndex !== undefined) updates.order_index = orderIndex;
     if (flowType !== undefined) updates.flow_type = flowType;
+    if (platform !== undefined) updates.platform = platform;
     if (tags !== undefined) updates.tags = tags;
     if (priority !== undefined) updates.priority = priority;
     if (preconditions !== undefined) updates.preconditions = preconditions;
@@ -336,6 +340,7 @@ export class FlowService {
       description: row.description || undefined,
       orderIndex: row.order_index,
       flowType: row.flow_type,
+      platform: row.platform || undefined,
       tags: row.tags || [],
       priority: row.priority || undefined,
       preconditions: row.preconditions || [],

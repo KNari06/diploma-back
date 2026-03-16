@@ -2162,7 +2162,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'refresh', true);
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // Snapshot is already kicked off inside refreshPage() via setImmediate —
+        // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
         // Inject a fresh screenshot frame so frontend doesn't show stale/white frame
         // while CDP screencast catches up after page reload
@@ -2270,7 +2271,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'back', true);
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // Snapshot is already kicked off inside goBack() via setImmediate —
+        // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
         // Inject a fresh frame so frontend doesn't show stale content
         setImmediate(async () => {
@@ -2333,7 +2335,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'forward', true);
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // Snapshot is already kicked off inside goForward() via setImmediate —
+        // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
         setImmediate(async () => {
           try {
