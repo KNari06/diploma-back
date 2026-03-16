@@ -101,6 +101,13 @@ interface InternalSession extends PreviewSession {
     totalDelta: number;
     emittedAt: number;
   } | null;
+  /** V11: Last hover position — for recording hover steps before click on different element */
+  recordingLastHover: {
+    x: number;
+    y: number;
+    ref?: string;
+    timestamp: number;
+  } | null;
 
   /** V11: Callback invoked when session switches to a new page (popup/navigation) */
   onPageSwitch?: (newPage: Page, previousUrl: string) => void;
@@ -360,6 +367,7 @@ export class PreviewSessionService {
           recordingDragState: null,
           recordingLastTypeStep: null,
           recordingLastScrollStep: null,
+          recordingLastHover: null,
         };
 
         // Store session
@@ -1366,6 +1374,7 @@ export class PreviewSessionService {
       session.recordingDragState = null;
       session.recordingLastTypeStep = null;
       session.recordingLastScrollStep = null;
+      session.recordingLastHover = null;
     }
     return true;
   }
@@ -1456,6 +1465,22 @@ export class PreviewSessionService {
   setRecordingLastScrollStep(sessionId: string, userId: string, step: InternalSession['recordingLastScrollStep']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastScrollStep = step;
+  }
+
+  /**
+   * V11: Get last hover state (for recording hover steps before click)
+   */
+  getRecordingLastHover(sessionId: string, userId?: string): InternalSession['recordingLastHover'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastHover ?? null;
+  }
+
+  /**
+   * V11: Set last hover state
+   */
+  setRecordingLastHover(sessionId: string, userId: string, state: InternalSession['recordingLastHover']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastHover = state;
   }
 
   /**

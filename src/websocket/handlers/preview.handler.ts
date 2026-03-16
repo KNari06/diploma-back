@@ -940,6 +940,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { previewSessionId, stepDraft, pageRef, intentTestCaseId } = data;
 
+      // V9: Guard — cannot manually apply steps while a run is active
+      {
+        const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+        if (PreviewRunService.isRunning(previewSessionId)) {
+          socket.emit('preview:step:apply:result', {
+            success: false,
+            error: 'Cannot apply steps while a run is in progress',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      }
+
       if (!previewSessionId || !stepDraft) {
         socket.emit('preview:step:apply:result', {
           success: false,
@@ -1021,11 +1034,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
 
-      // V6: Optional auto-persist to DB if intentTestCaseId provided and apply succeeded
+      // V8: Auto-persist to DB if intentTestCaseId provided and apply succeeded.
+      // Skip if a run is active (the run will batch-persist at the end).
+      // Awaited instead of setImmediate to prevent race with run:start.
       if (result.success && intentTestCaseId && result.appliedStep) {
-        // Don't wait for DB update - fire and forget (don't block response)
-        setImmediate(async () => {
-          try {
+        try {
+          const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+          if (!PreviewRunService.isRunning(previewSessionId)) {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
             const updated = await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
@@ -1038,21 +1053,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 intentTestCaseId,
                 stepId: result.appliedStep!.id,
               });
-            } else {
-              logger.warn('[WebSocket] Failed to auto-persist appliedStep to DB', {
-                socketId: socket.id,
-                intentTestCaseId,
-                stepId: result.appliedStep!.id,
-              });
             }
-          } catch (persistError) {
-            logger.error('[WebSocket] Error auto-persisting appliedStep to DB', {
-              socketId: socket.id,
-              intentTestCaseId,
-              error: persistError instanceof Error ? persistError.message : String(persistError),
-            });
           }
-        });
+        } catch (persistError) {
+          logger.error('[WebSocket] Error auto-persisting appliedStep to DB', {
+            socketId: socket.id,
+            intentTestCaseId,
+            error: persistError instanceof Error ? persistError.message : String(persistError),
+          });
+        }
       }
 
       // If successful, emit updated page state to all subscribers
@@ -1167,6 +1176,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result.success) {
         emitInputSuccess(socket, previewSessionId, 'move');
+
+        // V11: Track last hover position for recording (used to emit hover step before click)
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, {
+            x, y, timestamp: Date.now(),
+          });
+        }
       } else {
         emitInputError(socket, previewSessionId, 'move', result.error || 'Move failed');
       }
@@ -1289,6 +1305,32 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const timer = recordingTypingTimers.get(previewSessionId);
                 if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
               }
+
+              // V11: Emit hover step before click if user hovered a different element (dropdown/menu pattern)
+              const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
+              if (lastHover && preClickElement!.ref) {
+                const timeSinceHover = Date.now() - lastHover.timestamp;
+                const hoverOnDifferentElement = !lastHover.ref || lastHover.ref !== preClickElement!.ref;
+                if (hoverOnDifferentElement && timeSinceHover > 200 && timeSinceHover < 5000) {
+                  // Probe the hover target to get element info
+                  try {
+                    const page = sessionService.getPage(previewSessionId, ensuredUserId);
+                    if (page) {
+                      const hoverElement = await RecordingCaptureService.probeForRecording(page, lastHover.x, lastHover.y);
+                      if (hoverElement && hoverElement.ref !== preClickElement!.ref) {
+                        const hoverStep = RecordingCaptureService.captureHover(hoverElement);
+                        socket.nsp.to(room).emit('preview:recording:step', {
+                          previewSessionId, step: hoverStep, timestamp: new Date().toISOString(),
+                        });
+                        if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                      }
+                    }
+                  } catch {
+                    // Non-critical — hover step is best-effort
+                  }
+                }
+              }
+              sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
 
               // V10: Pass button and clickCount to inferClickActionType for dblclick/right-click support
               const safeButton = (data.button === 'right' || data.button === 'middle') ? data.button : 'left';
@@ -2171,9 +2213,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
               }
 
-              // Update URL baseline (URL may change after redirect)
+              // V11: Record a navigate step for refresh
               const page = sessionService.getPage(previewSessionId, ensuredUserId);
               if (page) {
+                const refreshStep: PreviewIntentStep = {
+                  id: `rec_${Date.now().toString(36)}`,
+                  type: 'navigate',
+                  description: 'Refresh page',
+                  value: page.url(),
+                };
+                socket.nsp.to(room).emit('preview:recording:step', {
+                  previewSessionId, step: refreshStep, timestamp: new Date().toISOString(),
+                });
+
+                // Update URL baseline (URL may change after redirect)
                 sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
               }
             } catch (e) {
@@ -2228,6 +2281,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             // Non-critical
           }
         });
+
+        // V11: Recording hook — record navigate step for back
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          const page = sessionService.getPage(previewSessionId, ensuredUserId);
+          if (page) {
+            const room = createRoomName('preview', previewSessionId);
+            const step: PreviewIntentStep = {
+              id: `rec_${Date.now().toString(36)}`,
+              type: 'navigate',
+              description: 'Navigate back',
+              value: page.url(),
+            };
+            socket.nsp.to(room).emit('preview:recording:step', {
+              previewSessionId, step, timestamp: new Date().toISOString(),
+            });
+            sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
+          }
+        }
       } else {
         emitPageActionResult(socket, previewSessionId, 'back', false, 'No history to go back or session not found');
       }
@@ -2272,6 +2343,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             // Non-critical
           }
         });
+
+        // V11: Recording hook — record navigate step for forward
+        if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+          const page = sessionService.getPage(previewSessionId, ensuredUserId);
+          if (page) {
+            const room = createRoomName('preview', previewSessionId);
+            const step: PreviewIntentStep = {
+              id: `rec_${Date.now().toString(36)}`,
+              type: 'navigate',
+              description: 'Navigate forward',
+              value: page.url(),
+            };
+            socket.nsp.to(room).emit('preview:recording:step', {
+              previewSessionId, step, timestamp: new Date().toISOString(),
+            });
+            sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
+          }
+        }
       } else {
         emitPageActionResult(socket, previewSessionId, 'forward', false, 'No history to go forward or session not found');
       }
@@ -2897,6 +2986,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           timestamp: new Date().toISOString(),
         });
         return;
+      }
+
+      // V9: Guard — cannot start recording while a run is active
+      {
+        const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+        if (PreviewRunService.isRunning(previewSessionId)) {
+          socket.emit('error', {
+            code: 'RUN_IN_PROGRESS',
+            message: 'Cannot start recording while a run is in progress',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
       }
 
       // Already recording? Ignore silently

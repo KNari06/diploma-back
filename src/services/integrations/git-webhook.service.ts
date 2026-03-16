@@ -61,9 +61,16 @@ export class GitWebhookService {
         const action = payload?.action;
         const merged = !!payload?.pull_request?.merged;
         const baseRef = payload?.pull_request?.base?.ref;
-        if (action !== 'closed' || !merged) return { trigger: false, reason: 'pr_not_merged' };
-        if (!allowedBranches.has(String(baseRef))) return { trigger: false, reason: 'branch_not_allowed', branch: baseRef };
-        return { trigger: true, reason: 'pr_merged', branch: baseRef };
+        // Determine the trigger reason based on the PR action
+        if (action === 'closed' && merged) {
+          if (!allowedBranches.has(String(baseRef))) return { trigger: false, reason: 'branch_not_allowed', branch: baseRef };
+          return { trigger: true, reason: 'pr_merged', branch: baseRef };
+        }
+        if (action === 'opened' || action === 'synchronize' || action === 'reopened') {
+          if (!allowedBranches.has(String(baseRef))) return { trigger: false, reason: 'branch_not_allowed', branch: baseRef };
+          return { trigger: true, reason: 'pr_opened', branch: baseRef };
+        }
+        return { trigger: false, reason: 'pr_action_ignored' };
       }
 
       if (eventType === 'push') {
@@ -83,12 +90,21 @@ export class GitWebhookService {
     // GitLab.com
     if (eventType === 'merge_request') {
       const state = payload?.object_attributes?.state;
+      const action = payload?.object_attributes?.action;
       const targetBranch = payload?.object_attributes?.target_branch;
-      if (state !== 'merged') return { trigger: false, reason: 'mr_not_merged' };
-      if (!allowedBranches.has(String(targetBranch))) {
-        return { trigger: false, reason: 'branch_not_allowed', branch: targetBranch };
+      if (state === 'merged') {
+        if (!allowedBranches.has(String(targetBranch))) {
+          return { trigger: false, reason: 'branch_not_allowed', branch: targetBranch };
+        }
+        return { trigger: true, reason: 'mr_merged', branch: targetBranch };
       }
-      return { trigger: true, reason: 'mr_merged', branch: targetBranch };
+      if (action === 'open' || action === 'reopen' || action === 'update') {
+        if (!allowedBranches.has(String(targetBranch))) {
+          return { trigger: false, reason: 'branch_not_allowed', branch: targetBranch };
+        }
+        return { trigger: true, reason: 'mr_opened', branch: targetBranch };
+      }
+      return { trigger: false, reason: 'mr_action_ignored' };
     }
 
     if (eventType === 'push') {

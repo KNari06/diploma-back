@@ -3,6 +3,13 @@
  * All events and payloads for client-server communication
  */
 
+import type {
+  IntentActionType,
+  StepOptions,
+  BindingHints,
+  StepEvidence,
+} from '@/services/testing/ui/preview/preview.types';
+
 // ============================================================================
 // CLIENT → SERVER EVENTS
 // ============================================================================
@@ -120,6 +127,16 @@ export interface ServerToClientEvents {
   'exploration:completed': (data: ExplorationCompletedPayload) => void;
   'exploration:clarification:request': (data: ExplorationClarificationPayload) => void;
 
+  // Negative testing events
+  'negatives:generation:started': (data: any) => void;
+  'negatives:generation:progress': (data: any) => void;
+  'negatives:generation:completed': (data: any) => void;
+
+  // Allure import events
+  'allure:import:progress': (data: AllureImportProgressWSPayload) => void;
+  'allure:import:completed': (data: AllureImportCompletedWSPayload) => void;
+  'allure:import:failed': (data: AllureImportFailedWSPayload) => void;
+
   // System events
   'system:error': (data: SystemErrorPayload) => void;
   'system:maintenance': (data: SystemMaintenancePayload) => void;
@@ -197,6 +214,8 @@ export interface TestStartedPayload {
   testId: string;
   browser: string;
   timestamp: string;
+  sessionId?: string;
+  source?: 'chat' | 'regression';
 }
 
 /**
@@ -833,11 +852,12 @@ export interface PreviewInteractiveNode {
 }
 
 /**
- * Intent step draft for linting (V3: added ai_check support)
+ * Intent step draft for linting
+ * Uses shared types from preview.types.ts to stay in sync with backend IntentStep
  */
 export interface PreviewIntentStep {
   id: string;
-  type: 'type' | 'click' | 'wait' | 'assert' | 'navigate' | 'select' | 'hover' | 'scroll' | 'press' | 'check' | 'uncheck' | 'toggle' | 'open' | 'close' | 'ai_check' | 'wait_for' | 'upload' | 'dblclick' | 'contextmenu' | 'drag_and_drop';
+  type: IntentActionType;
   description: string;
   value?: string;
   /**
@@ -847,71 +867,12 @@ export interface PreviewIntentStep {
    * Required when type === 'ai_check'
    */
   assertionText?: string;
-  bindingHints?: {
-    role?: string;
-    label?: string;
-    placeholder?: string;
-    nearText?: string;
-    autocomplete?: string;
-    type?: string;
-  };
-  /** Step execution options */
-  options?: {
-    /** Timeout in ms (for wait / wait_for actions) */
-    timeout?: number;
-    /**
-     * Human-like execution mode for UI actions.
-     * When enabled, the backend tries to emulate real user behavior:
-     * - type: gradual typing (per-character delays) instead of instant fill
-     * - click: hover + small pause before clicking; sometimes clicks at a random point inside the element
-     */
-    humanLike?: boolean;
-    /** If false, append instead of replacing (for type action) */
-    replaceContent?: boolean;
-    /** Press Enter after typing */
-    pressEnter?: boolean;
-    /** Delay between keystrokes in ms (for human-like typing) */
-    keyPressDelay?: number;
-    /**
-     * URL matcher for wait_for step (V5)
-     * Supports Momentic-like matchers + internal changedFrom (used by backend auto-insert)
-     */
-    urlMatcher?: {
-      substring?: string;
-      glob?: string;
-      regex?: string;
-      domain?: string;
-      /** Internal: wait until URL changes from this value (auto-insert) */
-      changedFrom?: string;
-      caseSensitive?: boolean;
-      negate?: boolean;
-      /** Timeout in ms (default on backend: 15000) */
-      timeoutMs?: number;
-    };
-    /**
-     * AI context mode for ai_check assertions (V3)
-     * Specifies what context to provide to the LLM for evaluation
-     * - 'html': HTML content only
-     * - 'screenshot': Screenshot only
-     * - 'html+a11y': HTML + accessibility tree (no screenshot)
-     * - 'html+screenshot': HTML + screenshot
-     * - 'html+a11y+screenshot': HTML + accessibility tree + screenshot (default, most comprehensive)
-     */
-    aiContextMode?: 'html' | 'screenshot' | 'html+a11y' | 'html+screenshot' | 'html+a11y+screenshot';
-    /**
-     * Advanced: Disable lookahead wait before this step (V6)
-     * Use when intentionally running on not-yet-ready element (rare).
-     * Default: false (lookahead wait is enabled)
-     */
-    disableLookaheadWait?: boolean;
-  };
+  /** Hints for element resolution */
+  bindingHints?: BindingHints;
+  /** Step execution options (shared with IntentStep) */
+  options?: StepOptions;
   /** Cached evidence from recording or prior execution (used as evidence shortcut during apply/run) */
-  evidence?: {
-    lastSuccessRef?: string;
-    confidence?: number;
-    /** URL where this evidence was captured (guards against cross-page ref collision in SPAs) */
-    pageUrl?: string;
-  };
+  evidence?: StepEvidence;
 }
 
 /**
@@ -1462,6 +1423,50 @@ export interface SocketData {
   userId?: string;
   isAnonymous: boolean;
   authenticatedAt: string;
+}
+
+// ============================================================================
+// ALLURE IMPORT EVENTS
+// ============================================================================
+
+/** Stats snapshot emitted during import progress. */
+export interface AllureImportStatsWS {
+  totalFiles: number;
+  testsFound: number;
+  testsImported: number;
+  testsSkipped: number;
+  modulesCreated: number;
+  flowsCreated: number;
+  kbDocumentsCreated: number;
+  screenshotsUploaded: number;
+  filesSkipped: number;
+  videosSkipped: number;
+  errors: string[];
+}
+
+export interface AllureImportProgressWSPayload {
+  importId: string;
+  /** Current import phase. */
+  phase: 'scanning' | 'classifying' | 'tests' | 'kb' | 'artifacts' | 'done';
+  current: number;
+  total: number;
+  message: string;
+  stats: AllureImportStatsWS;
+  timestamp: string;
+}
+
+export interface AllureImportCompletedWSPayload {
+  importId: string;
+  success: boolean;
+  stats: AllureImportStatsWS;
+  durationMs: number;
+  timestamp: string;
+}
+
+export interface AllureImportFailedWSPayload {
+  importId: string;
+  error: string;
+  timestamp: string;
 }
 
 // ============================================================================

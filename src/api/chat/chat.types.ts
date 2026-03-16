@@ -54,6 +54,10 @@ export interface ChatResponse {
   questions?: any[]; // Clarifying questions
   conversationId?: string; // For tracking multi-turn conversations
   testPlan?: any; // Test plan awaiting confirmation
+  activeProject?: { // Active project context (for frontend display)
+    id: string;
+    name: string;
+  };
 }
 
 // Message with timestamp for display

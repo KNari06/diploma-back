@@ -18,16 +18,19 @@ import { emitProcessingStep } from './utils';
 export async function getChatHistoryForIntent(
   chatSessionId: string | undefined,
   userId?: string, // SECURITY: Optional userId for verification
-  functionLogger?: FunctionLogger
+  functionLogger?: FunctionLogger,
+  mode?: 'lite' | 'pro' | 'editor'
 ): Promise<Array<{ role: string; content: string }>> {
   if (!chatSessionId) {
     return [];
   }
 
   try {
-    // We want the model to reason over a small, stable context window
-    // (at least last 4 messages: user+ai). Fetch more, but slice down after formatting.
-    const CONTEXT_WINDOW_MESSAGES = 4;
+    // We want the model to reason over a small, stable context window.
+    // In editor mode, use a smaller window (2 messages = 1 exchange) to reduce noise
+    // from non-editor conversations. Editor actions ("click X", "type Y") rarely need
+    // more context. In normal mode, use 4 messages (2 exchanges) for multi-turn continuity.
+    const CONTEXT_WINDOW_MESSAGES = mode === 'editor' ? 2 : 4;
     const getRecentMessagesWithLogging = functionLogger
       ? withFunctionLogging(ChatService.getRecentMessages.bind(ChatService), 'ChatService.getRecentMessages', functionLogger)
       : ChatService.getRecentMessages.bind(ChatService);
@@ -325,7 +328,7 @@ export async function parseIntent(
     const getChatHistoryForIntentWithLogging = functionLogger
       ? withFunctionLogging(getChatHistoryForIntent, 'getChatHistoryForIntent', functionLogger)
       : getChatHistoryForIntent;
-    const chatHistory = await getChatHistoryForIntentWithLogging(chatSessionId, userId, functionLogger); // SECURITY: Pass userId for verification
+    const chatHistory = await getChatHistoryForIntentWithLogging(chatSessionId, userId, functionLogger, mode); // SECURITY: Pass userId for verification
 
     // Check if request was cancelled after async operation
     if (abortSignal) {

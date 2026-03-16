@@ -117,6 +117,12 @@ function buildEditorModeSection(context?: IntentParserContext): string {
 The user is in EDITOR MODE with a live browser preview (previewSessionId: ${context.previewSessionId}).
 The chat is embedded inside the editor — there is NO platform_test flow here.
 
+CRITICAL CONTEXT PRIORITY:
+The user is actively working in the editor RIGHT NOW. Any previous chat history about
+API tests, analytics, test results, or general questions is SECONDARY context.
+Focus ONLY on what the user is asking in their CURRENT message in the context of
+the live browser preview. Do NOT let old conversation topics influence your intent classification.
+
 EDITOR MODE INTENT RULES (override general rules):
 - "platform_test" is NOT AVAILABLE in editor mode. NEVER choose it.
 - Single action on the page (click, type, scroll, press, hover, select, check, uncheck) → "editor_action"
@@ -130,6 +136,12 @@ EDITOR MODE INTENT RULES (override general rules):
 - "run saved test", "запусти регресс" (background headless run) → "run_regression"
 - Questions, conversation, analysis, explanations → "general_chat"
 - Everything else follows normal intent rules (save_test, analyze_failure, etc.)
+
+ANTI-CONFUSION RULES:
+- If chat history mentions API tests but user asks about the page → "editor_action" or "general_chat"
+- If chat history mentions analytics but user asks to click something → "editor_action"
+- The user's CURRENT message + editor mode context ALWAYS wins over chat history.
+
 `;
 }
 
@@ -275,6 +287,16 @@ ${buildEditorModeSection(context)}
    - Run reports: "show last run results", "результаты последнего запуска"
    - Plan listing: "how many regression plans?", "list plans"
 
+5d. Temporal/lookup QA queries → general_chat (agent sorts + filters with tools)
+   - "find last/latest/newest created test case" → general_chat (sort by created_at desc, limit 1)
+   - "найди последний тест кейс" → general_chat (same as above, in Russian)
+   - "show me the first test I created" → general_chat (sort by created_at asc, limit 1)
+   - "last failed test" / "последний упавший тест" → general_chat (filter failed, sort desc)
+   - "show all my test cases" / "покажи все тесты" → general_chat (list all statuses)
+   - "which tests have tag X?" → general_chat (search by tag)
+   - "recently updated tests" / "недавно измененные тесты" → general_chat (sort by updated_at)
+   - "last regression run" / "последний прогон" → general_chat (execution listing)
+
 6. Questions about past/status, explanations, discussions → general_chat
 
 7. Missing critical info after checking all above → needs_clarification
@@ -282,6 +304,8 @@ ${buildEditorModeSection(context)}
 CRITICAL anti-hallucination rule:
   "Did you test the API?" → general_chat (ASKING about past, not requesting test!)
   "yes, give whole data from that test" → general_chat (requesting PAST data, not new test!)
+  "найди последний тест кейс" → general_chat (LOOKING UP data, not creating a new test!)
+  "покажи все тесты" → general_chat (LISTING data, not running tests!)
   Keywords alone ("API", "test") do NOT determine intent — always check sentence structure and context first.
 
 --- CREDENTIAL EXTRACTION ---
@@ -465,7 +489,7 @@ Ex31: "проверь вход на сайт repetino.kz, телефон: +77011
  * Used for general conversations with users
  * @param skillDescriptions - Optional skill descriptions for integration tools
  */
-export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string): string {
+export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string, projectName?: string): string {
   let prompt = `You are QAIT - an AI QA automation assistant. Have natural conversations about testing like ChatGPT.
 
 MINDSET: Understand CONTEXT, not just keywords.
@@ -612,7 +636,7 @@ QA Tools (31 read-only + 11 write tools for project QA data):
 
 • Compose multiple tools to derive insights (e.g., list test cases + list page visits → coverage gaps)
 • For test artifacts (video, screenshot, logs), first get the test_id from executions, then call qa_get_test_results
-• For failure analysis, first find the failed test_id from qa_get_recent_failures or qa_list_test_executions, then call qa_analyze_failure${projectId ? `\n• **Current project_id: ${projectId}** — ALWAYS use this value for the project_id parameter in QA tools. NEVER ask the user for their project ID.` : ''}`;
+• For failure analysis, first find the failed test_id from qa_get_recent_failures or qa_list_test_executions, then call qa_analyze_failure${projectId ? `\n• **Current project: ${projectName ? `"${projectName}" (${projectId})` : projectId}** — ALWAYS use this project_id for QA tools. NEVER ask the user for their project ID.\n• When a query returns zero results, mention the project name${projectName ? ` ("${projectName}")` : ''} so the user can verify they're in the right project.` : ''}`;
   }
 
   // Add memory instructions

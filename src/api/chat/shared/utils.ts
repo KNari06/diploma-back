@@ -89,8 +89,8 @@ export function compressMessageContent(content: string, metadata?: Record<string
 }
 
 /**
- * Get or create the single workspace chat session.
- * Each workspace has exactly ONE shared chat session used by all members.
+ * Get or create the user's chat session within a workspace.
+ * Each user has their own private chat session per workspace.
  *
  * @param userId - User ID (must be a workspace member)
  * @param workspaceId - Workspace ID
@@ -113,47 +113,51 @@ export async function getOrCreateWorkspaceChat(
     throw new Error('Not a member of this workspace');
   }
 
-  // If providedSessionId given, validate it belongs to this workspace
+  // If providedSessionId given, validate it belongs to this user AND workspace
   if (providedSessionId) {
     const { data: existing } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, workspace_id')
+      .select('id, workspace_id, user_id')
       .eq('id', providedSessionId)
       .maybeSingle();
 
-    if (existing && existing.workspace_id === workspaceId) {
-      logger.info('[CHAT_SESSION] Using provided workspace session', { sessionId: existing.id, workspaceId });
+    if (existing && existing.workspace_id === workspaceId && existing.user_id === userId) {
+      logger.info('[CHAT_SESSION] Using provided user session', { sessionId: existing.id, workspaceId, userId });
       return existing.id;
     }
-    // If session doesn't match workspace, fall through to find/create the correct one
+    // If session doesn't match user/workspace, fall through to find/create the correct one
     if (existing) {
-      logger.warn('[CHAT_SESSION] Provided session belongs to different workspace, ignoring', {
+      logger.warn('[CHAT_SESSION] Provided session belongs to different user/workspace, ignoring', {
         providedSessionId,
+        sessionUserId: existing.user_id,
         sessionWorkspace: existing.workspace_id,
+        requestedUserId: userId,
         requestedWorkspace: workspaceId,
       });
     }
   }
 
-  // Find the single workspace chat session (no user_id filter — shared)
-  const { data: workspaceSession } = await supabaseAdmin
+  // Find this user's chat session in the workspace
+  const { data: userSession } = await supabaseAdmin
     .from('chat_sessions')
     .select('id')
     .eq('workspace_id', workspaceId)
-    .order('created_at', { ascending: true }) // Use the first (oldest) session
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true })
     .limit(1)
     .maybeSingle();
 
-  if (workspaceSession) {
-    logger.info('[CHAT_SESSION] Using existing workspace session', {
-      sessionId: workspaceSession.id,
+  if (userSession) {
+    logger.info('[CHAT_SESSION] Using existing user session', {
+      sessionId: userSession.id,
       workspaceId,
+      userId,
     });
-    return workspaceSession.id;
+    return userSession.id;
   }
 
-  // No session exists — create the workspace's single chat session
-  logger.info('[CHAT_SESSION] Creating workspace chat session', { userId, workspaceId });
+  // No session exists — create a new chat session for this user
+  logger.info('[CHAT_SESSION] Creating user chat session', { userId, workspaceId });
   return await ChatService.createChatSession(userId, workspaceId);
 }
 

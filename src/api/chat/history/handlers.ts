@@ -1,6 +1,5 @@
 import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
-import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { logger } from '@/utils/core/logger';
 
@@ -28,11 +27,12 @@ export const getCurrentChatHistory = async (req: Request, res: Response): Promis
       return;
     }
 
-    // Get workspace chat session
+    // Get this user's chat session in the workspace
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
       .select('id, title, created_at')
       .eq('workspace_id', workspaceId)
+      .eq('user_id', userId)
       .order('created_at', { ascending: true })
       .limit(1)
       .maybeSingle();
@@ -127,6 +127,7 @@ export const getChatSessions = async (req: Request, res: Response): Promise<void
         )
       `)
       .eq('workspace_id', workspaceId)
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
@@ -174,10 +175,10 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
     const limit = usePagination ? Math.min(Number(limitParam) || 50, 100) : undefined;
     const offset = usePagination ? Math.max(Number(offsetParam) || 0, 0) : undefined;
 
-    // Verify user has access via workspace membership
+    // Verify user owns this session
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
-      .select('id, title, created_at, workspace_id')
+      .select('id, title, created_at, workspace_id, user_id')
       .eq('id', sessionId)
       .maybeSingle();
 
@@ -186,7 +187,7 @@ export const getChatHistory = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    if (!session.workspace_id || !(await WorkspaceAccessService.isMember(userId, session.workspace_id))) {
+    if (session.user_id !== userId) {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -269,6 +270,7 @@ export const debugChatData = async (req: Request, res: Response): Promise<void> 
           .from('chat_sessions')
           .select('*')
           .eq('workspace_id', workspaceId)
+          .eq('user_id', userId)
       : { data: [], error: null };
 
     const sessionIds = sessions?.map(s => s.id) || [];

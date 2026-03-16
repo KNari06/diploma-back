@@ -34,6 +34,7 @@ export interface SkillContext {
   chatSessionId?: string;
   projectId?: string;
   previewSessionId?: string; // Active editor preview session (for live preview execution)
+  mode?: 'lite' | 'pro' | 'editor'; // Chat execution mode — skills may behave differently in editor mode
 }
 
 /**

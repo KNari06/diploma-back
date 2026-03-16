@@ -211,12 +211,11 @@ export async function checkWorkspace(
   // ═══════════════════════════════════════════════════════════════════════
 
   try {
-    // 1) If sessionId is provided, treat chat_sessions.workspace_id as the source of truth
-    // NOTE: No user_id filter — session is shared across workspace members
+    // 1) If sessionId is provided, verify ownership and use workspace_id from session
     if (sessionId) {
       const { data: session, error: sessionError } = await supabaseAdmin
         .from('chat_sessions')
-        .select('id, workspace_id')
+        .select('id, workspace_id, user_id')
         .eq('id', sessionId)
         .maybeSingle();
 
@@ -229,11 +228,21 @@ export async function checkWorkspace(
           details: (sessionError as any)?.details,
         });
       } else if (session?.workspace_id) {
-        return String(session.workspace_id);
+        // Per-user chat: verify session belongs to this user
+        if (session.user_id && session.user_id !== userId) {
+          logger.warn('[CHAT] Session belongs to different user, ignoring provided sessionId', {
+            userId,
+            sessionId,
+            sessionUserId: session.user_id,
+          });
+          // Fall through to resolve workspace from active workspace
+        } else {
+          return String(session.workspace_id);
+        }
       }
 
       // If the session exists but has no workspace_id (legacy/bad data), attach it once and keep it fixed
-      if (session?.id && !session.workspace_id) {
+      if (session?.id && !session.workspace_id && session.user_id === userId) {
         const activeWorkspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
         const fallbackWorkspaceId = activeWorkspaceId
           ? activeWorkspaceId

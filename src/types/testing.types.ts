@@ -667,6 +667,7 @@ export interface RegressionPlanItem {
   testCaseType?: TestType;
   orderIndex: number;
   parametersOverride: Record<string, any>;
+  negativeTestingEnabled: boolean | null;
   createdAt: string;
 }
 
@@ -708,6 +709,7 @@ export interface TestExecution {
   traceUrl?: string;
   browser?: string;
   environment?: string;
+  isNegative?: boolean;
   createdAt: string;
 }
 
@@ -722,6 +724,7 @@ export interface CreateTestExecutionParams {
   flowId?: string;
   browser?: string;
   environment?: string;
+  isNegative?: boolean;
 }
 
 /**
@@ -754,6 +757,67 @@ export interface ExecutionStats {
   cancelled: number;
   passRate: number;
   avgDurationMs?: number;
+}
+
+// ============================================================================
+// NEGATIVE TESTING TYPES
+// ============================================================================
+
+export type NegativeMutationType =
+  | 'empty_field'
+  | 'invalid_format'
+  | 'xss'
+  | 'overflow'
+  | 'double_submit'
+  | 'skip_step'
+  | 'wrong_credentials';
+
+export interface NegativeMeta {
+  mutationType: NegativeMutationType;
+  mutatedStepIndex: number;
+  originalValue: string;
+  mutatedValue: string;
+  expectedBehavior: string;
+}
+
+export interface NegativeSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+}
+
+// ============================================================================
+// HEALTH CHECK TYPES
+// ============================================================================
+
+export type HealthCheckCategory =
+  | 'console_errors'
+  | 'network_errors'
+  | 'js_exceptions'
+  | 'broken_images'
+  | 'page_responsive';
+
+export type HealthCheckSeverity = 'pass' | 'warning' | 'fail';
+
+export interface HealthCheckFinding {
+  category: HealthCheckCategory;
+  severity: HealthCheckSeverity;
+  message: string;
+  details?: Array<{ url?: string; status?: number; count?: number; text?: string }>;
+}
+
+export interface ExecutionHealthChecks {
+  findings: HealthCheckFinding[];
+  checkedAt: string;
+}
+
+export interface HealthSummary {
+  totalChecks: number;
+  passed: number;
+  warnings: number;
+  failures: number;
+  findings: HealthCheckFinding[];
 }
 
 // ============================================================================
@@ -823,6 +887,9 @@ export interface RunReportExecution {
   bugsCount: number;
   steps: RunReportStep[];
   artifacts: RunReportExecArtifacts;
+  isNegative?: boolean;
+  negativeMeta?: NegativeMeta;
+  healthChecks?: ExecutionHealthChecks;
 }
 
 /**
@@ -893,6 +960,9 @@ export interface RunReport {
   bugs: EnrichedBug[];
   recommendations: string[];
   artifactsSummary: RunReportArtifactsSummary;
+  healthSummary?: HealthSummary;
+  negativeSummary?: NegativeSummary;
+  negativeExecutions?: RunReportExecution[];
 }
 
 /**
@@ -936,6 +1006,9 @@ export interface ExpandedTestCase {
   flowId?: string;
   name: string;
   parameters?: Record<string, any>;
+  isNegative?: boolean;
+  sourceTestCaseId?: string;
+  negativeMeta?: NegativeMeta;
 }
 
 /**
@@ -948,6 +1021,7 @@ export interface ExecutableTestCase {
   moduleId?: string;
   flowId?: string;
   dependsOn: string[];
+  isNegative?: boolean;
 }
 
 /**

@@ -21,9 +21,10 @@ export async function handleClarificationRequest(
     userId: string;
     chatSessionId?: string;
     abortSignal?: AbortSignal;
+    mode?: 'lite' | 'pro' | 'editor';
   }
 ): Promise<void> {
-  const { parsedIntent, userId, chatSessionId, abortSignal } = params;
+  const { parsedIntent, userId, chatSessionId, abortSignal, mode } = params;
 
   if (abortSignal) checkRequestAborted(abortSignal);
 
@@ -40,11 +41,12 @@ export async function handleClarificationRequest(
   const aiMessageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   if (chatSessionId) {
     await ChatService.saveChatMessages(chatSessionId, [
-      { role: 'user', content: parsedIntent.rawText || 'No message' },
+      { role: 'user', content: parsedIntent.rawText || 'No message', metadata: { mode: mode || 'lite' } },
       {
         role: 'ai',
         content: clarificationMessage,
         metadata: {
+          mode: mode || 'lite',
           requiresAnswers: true, // Key flag for intent parser detection
           needsMoreInfo: true,
           clarificationReason: parsedIntent.clarificationReason,

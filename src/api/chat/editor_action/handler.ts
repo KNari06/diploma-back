@@ -153,11 +153,12 @@ export async function handleEditorAction(
     if (chatSessionId) {
       try {
         await ChatService.saveChatMessages(chatSessionId, [
-          { role: 'user', content: message },
+          { role: 'user', content: message, metadata: { mode: 'editor' } },
           {
             role: 'ai',
             content: responseMessage,
             metadata: {
+              mode: 'editor',
               editorAction: true,
               actionType,
               actionDescription,

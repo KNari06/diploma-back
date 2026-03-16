@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { handlePlatformTest } from '@/api/chat/ai_test/handler';
@@ -46,6 +47,18 @@ setInterval(() => {
     logger.error('Error cleaning up OAuth states', { error });
   }
 }, 60 * 60 * 1000);
+
+/**
+ * Create Jira OAuth URL and store state for callback (used by integrations controller so SPA redirect works without hitting auth-protected /jira/authorize).
+ */
+export function createJiraOAuthUrl(userId: string): string {
+  const state = generateOAuthState();
+  oauthStates.set(state, {
+    userId,
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  });
+  return buildJiraAuthUrl(state);
+}
 
 /**
  * Start Jira OAuth flow
@@ -108,39 +121,31 @@ export const handleJiraCallback = async (req: Request, res: Response): Promise<v
   try {
     const { code, state, error } = req.query;
 
+    const frontendUrl = (env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    const redirectError = (message: string) =>
+      res.redirect(`${frontendUrl}/integrations?provider=jira&status=error&message=${encodeURIComponent(message)}`);
+
     if (error) {
       logger.error('Jira OAuth error', { error });
-      res.status(400).json({
-        success: false,
-        error: `OAuth error: ${error}`,
-      });
+      redirectError(`OAuth error: ${error}`);
       return;
     }
 
     if (!code || !state) {
-      res.status(400).json({
-        success: false,
-        error: 'Missing code or state parameter',
-      });
+      redirectError('Missing code or state parameter');
       return;
     }
 
     // Validate state
     const stateData = oauthStates.get(state as string);
     if (!stateData || stateData.expiresAt < Date.now()) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid or expired state parameter',
-      });
+      redirectError('Invalid or expired state parameter');
       return;
     }
 
     const userId = stateData.userId;
     if (!userId) {
-      res.status(400).json({
-        success: false,
-        error: 'User ID not found in state',
-      });
+      redirectError('User ID not found in state');
       return;
     }
 
@@ -154,10 +159,7 @@ export const handleJiraCallback = async (req: Request, res: Response): Promise<v
     const resources = await getAccessibleResources(tokenData.access_token);
 
     if (resources.length === 0) {
-      res.status(400).json({
-        success: false,
-        error: 'No accessible Jira resources found',
-      });
+      redirectError('No accessible Jira resources found');
       return;
     }
 
@@ -188,23 +190,12 @@ export const handleJiraCallback = async (req: Request, res: Response): Promise<v
       resourcesCount: resources.length,
     });
 
-    // Redirect to success page or return JSON
-    res.json({
-      success: true,
-      message: 'Jira authorization successful',
-      resources: resources.map((r) => ({
-        id: r.id,
-        name: r.name,
-        url: r.url,
-      })),
-      tokensSaved: savedTokens.length,
-    });
-  } catch (error) {
-    logger.error('Jira OAuth callback error:', error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to process OAuth callback',
-    });
+    res.redirect(`${frontendUrl}/integrations?provider=jira&status=success`);
+  } catch (err) {
+    logger.error('Jira OAuth callback error:', err);
+    const frontendUrl = (env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    const message = err instanceof Error ? err.message : 'Failed to process OAuth callback';
+    res.redirect(`${frontendUrl}/integrations?provider=jira&status=error&message=${encodeURIComponent(message)}`);
   }
 };
 

@@ -214,7 +214,7 @@ class SkillRegistryClass {
 
       if (args.confirm === true) {
         // Exception: qa_run_test in editor mode — user explicitly runs from editor
-        const isEditorPreview = toolName === 'qa_run_test' && !!context.previewSessionId;
+        const isEditorPreview = toolName === 'qa_run_test' && context.mode === 'editor' && !!context.previewSessionId;
 
         if (!isEditorPreview && sessionId) {
           const previewKey = `${sessionId}:${toolName}`;

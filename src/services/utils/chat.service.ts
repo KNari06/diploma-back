@@ -7,7 +7,8 @@ import { logger } from '@/utils/core/logger';
  */
 export class ChatService {
   /**
-   * Verify that a user has access to a chat session via workspace membership.
+   * Verify that a user has access to a chat session.
+   * Per-user model: user must own the session (user_id match).
    * Returns the session's workspace_id if access is granted, null otherwise.
    */
   private static async verifySessionAccess(
@@ -16,14 +17,16 @@ export class ChatService {
   ): Promise<string | null> {
     const { data: session } = await supabaseAdmin
       .from('chat_sessions')
-      .select('workspace_id')
+      .select('workspace_id, user_id')
       .eq('id', sessionId)
       .maybeSingle();
 
     if (!session?.workspace_id) return null;
 
-    const isMember = await WorkspaceAccessService.isMember(userId, session.workspace_id);
-    return isMember ? session.workspace_id : null;
+    // Per-user chat: verify the session belongs to this user
+    if (session.user_id !== userId) return null;
+
+    return session.workspace_id;
   }
 
   /**
@@ -304,38 +307,70 @@ export class ChatService {
     }
 
     try {
-      const { data, error } = await supabaseAdmin
+      // UPSERT to handle race condition: if two concurrent requests try to create
+      // a session for the same (user_id, workspace_id), only one will win.
+      // ignoreDuplicates: true = ON CONFLICT DO NOTHING, then we query afterward.
+      const { error: insertError } = await supabaseAdmin
         .from('chat_sessions')
-        .insert({
-          user_id: userId,
-          workspace_id: workspaceId,
-          created_at: new Date().toISOString(),
-        })
-        .select('id')
-        .maybeSingle();
+        .upsert(
+          {
+            user_id: userId,
+            workspace_id: workspaceId,
+            created_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id, workspace_id', ignoreDuplicates: true }
+        );
 
-      if (error) {
+      if (insertError) {
         logger.error('[CHAT_SERVICE] Failed to create chat session', {
-          error: error instanceof Error ? error.message : String(error),
-          code: error.code,
+          error: insertError instanceof Error ? insertError.message : String(insertError),
+          code: insertError.code,
           userId,
           workspaceId,
         });
-        throw error;
+        throw insertError;
+      }
+
+      // Fetch the session (either just created or already existed due to race)
+      const { data, error: fetchError } = await supabaseAdmin
+        .from('chat_sessions')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId)
+        .order('created_at', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (fetchError) {
+        logger.error('[CHAT_SERVICE] Failed to fetch chat session after upsert', {
+          error: fetchError instanceof Error ? fetchError.message : String(fetchError),
+          userId,
+          workspaceId,
+        });
+        throw fetchError;
       }
 
       if (!data || !data.id) {
-        logger.error('[CHAT_SERVICE] No data returned from session creation', { userId, workspaceId });
+        logger.error('[CHAT_SERVICE] No session found after upsert', { userId, workspaceId });
         throw new Error('Failed to create chat session: no data returned');
       }
 
-      logger.info('[CHAT_SERVICE] Chat session created', {
+      logger.info('[CHAT_SERVICE] Chat session ready', {
         sessionId: data.id,
         userId,
         workspaceId,
       });
 
-      await ChatService.insertWelcomeMessage(data.id, workspaceId);
+      // Insert welcome message only if this is a newly created session
+      // (check by seeing if there are any messages yet)
+      const { count } = await supabaseAdmin
+        .from('chat_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('session_id', data.id);
+
+      if ((count ?? 0) === 0) {
+        await ChatService.insertWelcomeMessage(data.id, workspaceId);
+      }
 
       return data.id;
 
@@ -601,8 +636,7 @@ export class ChatService {
     const validOffset = Math.max(0, Math.floor(offset || 0));
 
     try {
-      // Build query — workspace-based model: filter by workspace membership
-      // If workspaceId is provided, use it directly; otherwise we still need a workspace context
+      // Per-user model: filter by user_id AND workspace_id
       if (!workspaceId) {
         logger.warn('[CHAT_SERVICE] getUserChatSessions called without workspaceId', { userId });
         return { sessions: [], total: 0 };
@@ -618,7 +652,8 @@ export class ChatService {
       let countQuery = supabaseAdmin
         .from('chat_sessions')
         .select('id', { count: 'exact', head: true })
-        .eq('workspace_id', workspaceId);
+        .eq('workspace_id', workspaceId)
+        .eq('user_id', userId);
 
       let sessionsQuery = supabaseAdmin
         .from('chat_sessions')
@@ -634,7 +669,8 @@ export class ChatService {
             created_at
           )
         `)
-        .eq('workspace_id', workspaceId);
+        .eq('workspace_id', workspaceId)
+        .eq('user_id', userId);
 
       // Get total count
       const { count } = await countQuery;

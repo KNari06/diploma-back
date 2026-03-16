@@ -10,6 +10,26 @@ import { cache } from '@/utils/core/redis-cache';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Per-testCase in-memory mutex (prevents concurrent read-modify-write races)
+// Pattern from flow-queue.ts / budget-tracker.ts
+// ═══════════════════════════════════════════════════════════════════════════
+const testCaseMutexes = new Map<string, Promise<void>>();
+
+function withTestCaseMutex<T>(testCaseId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = testCaseMutexes.get(testCaseId) || Promise.resolve();
+  let resolve: () => void;
+  const next = new Promise<void>((r) => { resolve = r; });
+  testCaseMutexes.set(testCaseId, next);
+  return prev.then(fn).finally(() => {
+    resolve!();
+    // Clean up if this is the last waiter
+    if (testCaseMutexes.get(testCaseId) === next) {
+      testCaseMutexes.delete(testCaseId);
+    }
+  });
+}
+
 /**
  * Service for managing intent test cases
  */
@@ -273,6 +293,16 @@ export class IntentTestCaseService {
       await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
     }
 
+    // Mark related negative test cases as stale when steps change
+    if (steps !== undefined) {
+      this.markNegativesStale(id).catch((err) => {
+        logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
+          testCaseId: id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+
     return this.mapToIntentTestCase(data);
   }
 
@@ -415,6 +445,7 @@ export class IntentTestCaseService {
     compiled: CompiledStepPlan;
     evidence: StepEvidence;
   }): Promise<boolean> {
+    return withTestCaseMutex(params.intentTestCaseId, async () => {
     const { intentTestCaseId, stepId, compiled, evidence } = params;
 
     logger.info('[INTENT_TEST_CASE] Updating step after successful heal', {
@@ -508,6 +539,7 @@ export class IntentTestCaseService {
       });
       return false;
     }
+    }); // withTestCaseMutex
   }
 
   /**
@@ -521,83 +553,182 @@ export class IntentTestCaseService {
     intentTestCaseId: string;
     appliedStep: IntentStep;
   }): Promise<boolean> {
-    const { intentTestCaseId, appliedStep } = params;
+    return withTestCaseMutex(params.intentTestCaseId, async () => {
+      const { intentTestCaseId, appliedStep } = params;
 
-    logger.info('[INTENT_TEST_CASE] Updating step from preview apply', {
-      intentTestCaseId,
-      stepId: appliedStep.id,
-      hasCompiled: !!appliedStep.compiled,
-      hasEvidence: !!appliedStep.evidence,
-      hasBindingHints: !!appliedStep.bindingHints,
+      logger.info('[INTENT_TEST_CASE] Updating step from preview apply', {
+        intentTestCaseId,
+        stepId: appliedStep.id,
+        hasCompiled: !!appliedStep.compiled,
+        hasEvidence: !!appliedStep.evidence,
+        hasBindingHints: !!appliedStep.bindingHints,
+      });
+
+      try {
+        // Get current test case (without userId check - this is internal call from preview)
+        const { data: row, error: fetchError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('steps_json')
+          .eq('id', intentTestCaseId)
+          .single();
+
+        if (fetchError || !row) {
+          logger.warn('[INTENT_TEST_CASE] Test case not found for preview apply update', {
+            intentTestCaseId,
+            error: fetchError?.message,
+          });
+          return false;
+        }
+
+        const steps: IntentStep[] = row.steps_json || [];
+        const stepIndex = steps.findIndex(s => s.id === appliedStep.id);
+
+        if (stepIndex === -1) {
+          logger.warn('[INTENT_TEST_CASE] Step not found for preview apply update', {
+            intentTestCaseId,
+            stepId: appliedStep.id,
+          });
+          return false;
+        }
+
+        // Replace the step entirely with appliedStep
+        steps[stepIndex] = appliedStep;
+
+        // Note: auto-wait injection removed here (V8). Auto-waits are now injected:
+        // 1. In batchUpdateStepsFromRun() — once after run completes
+        // 2. In preview.controller.ts PATCH — when user saves via REST API
+        // 3. In IntentTestCaseService.update() — when fully updating test case
+
+        // Save back to DB
+        const { error: updateError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .update({
+            steps_json: steps,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', intentTestCaseId);
+
+        if (updateError) {
+          logger.error('[INTENT_TEST_CASE] Failed to update step from preview apply', {
+            intentTestCaseId,
+            stepId: appliedStep.id,
+            error: updateError.message,
+          });
+          return false;
+        }
+
+        logger.info('[INTENT_TEST_CASE] Step updated from preview apply', {
+          intentTestCaseId,
+          stepId: appliedStep.id,
+          locatorCount: appliedStep.compiled?.locatorPlan?.length,
+        });
+
+        return true;
+      } catch (error) {
+        logger.error('[INTENT_TEST_CASE] Exception updating step from preview apply', {
+          intentTestCaseId,
+          stepId: appliedStep.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
     });
+  }
 
-    try {
-      // Get current test case (without userId check - this is internal call from preview)
-      const { data: row, error: fetchError } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('steps_json')
-        .eq('id', intentTestCaseId)
-        .single();
+  /**
+   * Batch-update multiple steps after a preview run completes.
+   * Single read-modify-write cycle instead of N individual updates.
+   * Auto-wait injection runs once on the final merged array.
+   *
+   * @param intentTestCaseId The test case ID
+   * @param enrichedSteps Map of stepId → enriched IntentStep (with compiled/evidence/bindingHints)
+   */
+  static async batchUpdateStepsFromRun(params: {
+    intentTestCaseId: string;
+    enrichedSteps: Map<string, IntentStep>;
+  }): Promise<boolean> {
+    return withTestCaseMutex(params.intentTestCaseId, async () => {
+      const { intentTestCaseId, enrichedSteps } = params;
 
-      if (fetchError || !row) {
-        logger.warn('[INTENT_TEST_CASE] Test case not found for preview apply update', {
-          intentTestCaseId,
-          error: fetchError?.message,
-        });
-        return false;
-      }
-
-      const steps: IntentStep[] = row.steps_json || [];
-      const stepIndex = steps.findIndex(s => s.id === appliedStep.id);
-
-      if (stepIndex === -1) {
-        logger.warn('[INTENT_TEST_CASE] Step not found for preview apply update', {
-          intentTestCaseId,
-          stepId: appliedStep.id,
-        });
-        return false;
-      }
-
-      // Replace the step entirely with appliedStep
-      steps[stepIndex] = appliedStep;
-
-      // V5: Auto-inject wait_for steps where navigation occurred
-      // This ensures stability during background runs without requiring user to add waits manually
-      const stepsWithAutoWaits = injectAutoWaitForSteps(steps);
-
-      // Save back to DB
-      const { error: updateError } = await supabaseAdmin
-        .from('intent_test_cases')
-        .update({
-          steps_json: stepsWithAutoWaits,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', intentTestCaseId);
-
-      if (updateError) {
-        logger.error('[INTENT_TEST_CASE] Failed to update step from preview apply', {
-          intentTestCaseId,
-          stepId: appliedStep.id,
-          error: updateError.message,
-        });
-        return false;
-      }
-
-      logger.info('[INTENT_TEST_CASE] Step updated from preview apply', {
+      logger.info('[INTENT_TEST_CASE] Batch-updating steps from run', {
         intentTestCaseId,
-        stepId: appliedStep.id,
-        locatorCount: appliedStep.compiled?.locatorPlan?.length,
+        enrichedCount: enrichedSteps.size,
       });
 
-      return true;
-    } catch (error) {
-      logger.error('[INTENT_TEST_CASE] Exception updating step from preview apply', {
-        intentTestCaseId,
-        stepId: appliedStep.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return false;
-    }
+      try {
+        const { data: row, error: fetchError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('steps_json')
+          .eq('id', intentTestCaseId)
+          .single();
+
+        if (fetchError || !row) {
+          logger.warn('[INTENT_TEST_CASE] Test case not found for batch update', {
+            intentTestCaseId,
+            error: fetchError?.message,
+          });
+          return false;
+        }
+
+        const steps: IntentStep[] = row.steps_json || [];
+        let updated = 0;
+
+        // Merge all enriched steps into the array
+        for (let i = 0; i < steps.length; i++) {
+          const enriched = enrichedSteps.get(steps[i].id);
+          if (enriched) {
+            steps[i] = enriched;
+            updated++;
+          }
+        }
+
+        if (updated === 0) {
+          logger.debug('[INTENT_TEST_CASE] No steps to batch-update', { intentTestCaseId });
+          return false;
+        }
+
+        // Single auto-wait injection pass on the final merged array
+        const stepsWithAutoWaits = injectAutoWaitForSteps(steps);
+
+        const { error: updateError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .update({
+            steps_json: stepsWithAutoWaits,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', intentTestCaseId);
+
+        if (updateError) {
+          logger.error('[INTENT_TEST_CASE] Failed to batch-update steps from run', {
+            intentTestCaseId,
+            error: updateError.message,
+          });
+          return false;
+        }
+
+        logger.info('[INTENT_TEST_CASE] Batch-updated steps from run', {
+          intentTestCaseId,
+          updatedCount: updated,
+          totalSteps: stepsWithAutoWaits.length,
+        });
+
+        // Mark related negatives as stale (best-effort, non-blocking)
+        this.markNegativesStale(intentTestCaseId).catch((err) => {
+          logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale after batch update', {
+            testCaseId: intentTestCaseId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+        return true;
+      } catch (error) {
+        logger.error('[INTENT_TEST_CASE] Exception batch-updating steps from run', {
+          intentTestCaseId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      }
+    });
   }
 
   /**
@@ -620,5 +751,36 @@ export class IntentTestCaseService {
     }
 
     return this.mapToIntentTestCase(data);
+  }
+
+  /**
+   * Mark all negative test cases derived from a source test case as stale.
+   * Called when the parent happy-path steps change.
+   */
+  private static async markNegativesStale(sourceTestCaseId: string): Promise<void> {
+    const { error, count } = await supabaseAdmin
+      .from('intent_test_cases')
+      .update({
+        negative_stale_reason: 'parent_steps_changed',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('source_intent_test_case_id', sourceTestCaseId)
+      .eq('is_negative', true)
+      .is('negative_stale_reason', null);
+
+    if (error) {
+      logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
+        sourceTestCaseId,
+        error: error.message,
+      });
+      return;
+    }
+
+    if (count && count > 0) {
+      logger.info('[INTENT_TEST_CASE] Marked negatives as stale', {
+        sourceTestCaseId,
+        staleCount: count,
+      });
+    }
   }
 }

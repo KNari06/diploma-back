@@ -19,6 +19,9 @@ import {
   ChatMessagePayload,
   ChatTestUpdatePayload,
   createRoomName,
+  AllureImportProgressWSPayload,
+  AllureImportCompletedWSPayload,
+  AllureImportFailedWSPayload,
   ExplorationClarificationPayload,
   ExplorationCompletedPayload,
   ExplorationProgressPayload,
@@ -909,6 +912,47 @@ class WebSocketService {
         }
       },
       { sessionId: payload.chatSessionId }
+    );
+  }
+
+  // ============================================================================
+  // ALLURE IMPORT EVENTS
+  // ============================================================================
+
+  /**
+   * Emit Allure import progress event to the user's room.
+   * All import events are routed to the user who initiated the import.
+   */
+  public emitAllureImportProgress(userId: string, payload: AllureImportProgressWSPayload): void {
+    this.emitWithFallback(
+      'allure:import:progress',
+      payload,
+      () => {
+        this.emitToUser(userId, 'allure:import:progress', payload);
+      },
+      { userId }
+    );
+  }
+
+  public emitAllureImportCompleted(userId: string, payload: AllureImportCompletedWSPayload): void {
+    this.emitWithFallback(
+      'allure:import:completed',
+      payload,
+      () => {
+        this.emitToUser(userId, 'allure:import:completed', payload);
+      },
+      { userId }
+    );
+  }
+
+  public emitAllureImportFailed(userId: string, payload: AllureImportFailedWSPayload): void {
+    this.emitWithFallback(
+      'allure:import:failed',
+      payload,
+      () => {
+        this.emitToUser(userId, 'allure:import:failed', payload);
+      },
+      { userId }
     );
   }
 

@@ -4,9 +4,11 @@ import { env } from '@/config/environment/env';
 import { connection, QUEUE_NAMES, testRunQueue } from '@/config/infrastructure/queues';
 import { GitWebhookJobHandler } from '@/jobs/git-webhook.job';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
+import { AllureImportJobHandler } from '@/jobs/allure-import.job';
 import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
+import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
@@ -318,6 +320,58 @@ const mobileTestRunWorker = new Worker(
   }
 );
 
+// Allure import worker — one at a time (idempotency concern) with a long lock
+const allureImportWorker = new Worker(
+  QUEUE_NAMES.ALLURE_IMPORT,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[ALLURE_IMPORT_WORKER] Processing job: ${job.id}`, {
+      importId: job.data?.importId,
+      projectId: job.data?.projectId,
+    });
+
+    if (!AllureImportJobHandler || typeof AllureImportJobHandler.process !== 'function') {
+      throw new Error('AllureImportJobHandler.process is not a function');
+    }
+
+    return await AllureImportJobHandler.process(job);
+  },
+  {
+    ...workerOptions,
+    concurrency: 1,                    // One import at a time — avoids DB overload
+    lockDuration: 10 * 60 * 1000,     // 10 min lock (large imports can take time)
+    stalledInterval: 5 * 60 * 1000,   // 5 min stall check
+    maxStalledCount: 1,
+  }
+);
+
+// Negative test generation worker
+const negativeGenerationWorker = new Worker(
+  QUEUE_NAMES.NEGATIVE_GENERATION,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[NEGATIVE_GEN_WORKER] Processing job: ${job.id}`, {
+      planId: job.data?.planId,
+      testCaseCount: job.data?.testCaseIds?.length,
+    });
+
+    return await processNegativeGeneration(job);
+  },
+  {
+    ...workerOptions,
+    concurrency: 2, // AI generation — limited by API rate limits
+    lockDuration: 5 * 60 * 1000, // 5 min
+    stalledInterval: 2 * 60 * 1000, // 2 min
+    maxStalledCount: 1,
+  }
+);
+
 // Worker event listeners
 const setupWorkerEvents = (worker: Worker, workerName: string) => {
   worker.on('ready', () => {
@@ -440,6 +494,8 @@ setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
 setupWorkerEvents(explorationWorker, 'Exploration');
 setupWorkerEvents(mobileTestRunWorker, 'MobileTestRun');
+setupWorkerEvents(negativeGenerationWorker, 'NegativeGeneration');
+setupWorkerEvents(allureImportWorker, 'AllureImport');
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -474,6 +530,8 @@ const gracefulShutdown = async (signal: string) => {
       gitWebhookWorker.close(),
       explorationWorker.close(),
       mobileTestRunWorker.close(),
+      negativeGenerationWorker.close(),
+      allureImportWorker.close(),
       // Abort all active test runs (closes contexts, stops video streams)
       (async () => {
         try {
@@ -519,7 +577,7 @@ const gracefulShutdown = async (signal: string) => {
     // Log any failures but continue shutdown
     closeResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'testRunRegistry', 'videoStreams', 'browserPool'];
+        const workerNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun', 'negativeGeneration', 'allureImport', 'testRunRegistry', 'videoStreams', 'browserPool'];
         logger.warn(`[WORKER] Failed to close ${workerNames[index]}`, {
           error: result.reason instanceof Error ? result.reason.message : String(result.reason),
         });
@@ -580,9 +638,11 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
 
 export {
   aiAnalysisWorker,
+  allureImportWorker,
   explorationWorker,
   gitWebhookWorker,
   mobileTestRunWorker,
+  negativeGenerationWorker,
   notificationWorker,
   testResultWorker,
   testRunWorker,

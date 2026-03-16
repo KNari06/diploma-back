@@ -185,6 +185,9 @@ export class PreviewRunService {
     let failedSteps = 0;
     let skippedSteps = 0;
 
+    // Batch accumulator: collect enriched steps in-memory, persist once at end
+    const enrichedSteps = new Map<string, IntentStep>();
+
     // Initialize trace writer for JSONL logging
     const traceId = intentTestCaseId
       ? `preview_run_${previewSessionId}`
@@ -486,26 +489,9 @@ export class PreviewRunService {
               }
             }
 
-            // Best-effort: persist appliedStep if result has it (only for saved runs)
-            if (persistAppliedSteps && intentTestCaseId && result.appliedStep) {
-              try {
-                await IntentTestCaseService.updateStepFromPreviewApply({
-                  intentTestCaseId,
-                  appliedStep: result.appliedStep,
-                });
-
-                logger.debug('[PreviewRun] Persisted appliedStep', {
-                  previewSessionId,
-                  stepId: step.id,
-                });
-              } catch (persistError) {
-                logger.warn('[PreviewRun] Failed to persist appliedStep (best-effort)', {
-                  previewSessionId,
-                  stepId: step.id,
-                  error: persistError instanceof Error ? persistError.message : String(persistError),
-                });
-                // Don't fail the run, continue
-              }
+            // Accumulate enriched step for batch persist at end of run
+            if (result.appliedStep) {
+              enrichedSteps.set(result.appliedStep.id, result.appliedStep);
             }
 
             // If cancellation was requested during/after this step, stop before next step.
@@ -694,7 +680,28 @@ export class PreviewRunService {
         });
       }
 
-      // 8. Close trace writer (flushes pending writes)
+      // 8b. Batch-persist all enriched steps (single DB round-trip)
+      if (enrichedSteps.size > 0) {
+        try {
+          await IntentTestCaseService.batchUpdateStepsFromRun({
+            intentTestCaseId,
+            enrichedSteps,
+          });
+          logger.info('[PreviewRun] Batch-persisted enriched steps', {
+            previewSessionId,
+            intentTestCaseId,
+            count: enrichedSteps.size,
+          });
+        } catch (batchError) {
+          logger.warn('[PreviewRun] Failed to batch-persist enriched steps (best-effort)', {
+            previewSessionId,
+            intentTestCaseId,
+            error: batchError instanceof Error ? batchError.message : String(batchError),
+          });
+        }
+      }
+
+      // 9. Close trace writer (flushes pending writes)
       const traceFilePath = traceWriter.getFilePath();
       try {
         await traceWriter.close();

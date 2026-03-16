@@ -411,13 +411,12 @@ router.post('/cancel',
         return;
       }
     } else {
-      // ✅ FIX #2: Verify user is a member of the session's workspace (security check)
+      // ✅ FIX #2: Verify user owns this chat session (per-user chat model)
       try {
         const { supabaseAdmin } = await import('@/db/supabase');
-        const { WorkspaceAccessService } = await import('@/services/core/workspace-access.service');
         const { data: session, error: sessionError } = await supabaseAdmin
           .from('chat_sessions')
-          .select('id, workspace_id')
+          .select('id, workspace_id, user_id')
           .eq('id', chatSessionId)
           .maybeSingle();
 
@@ -429,7 +428,7 @@ router.post('/cancel',
           return;
         }
 
-        if (!session.workspace_id || !(await WorkspaceAccessService.isMember(userId, session.workspace_id))) {
+        if (session.user_id !== userId) {
           res.status(403).json({
             success: false,
             error: 'Access denied to this chat session',

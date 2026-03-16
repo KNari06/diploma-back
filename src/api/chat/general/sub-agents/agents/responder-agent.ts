@@ -78,10 +78,12 @@ export async function formatResponse(
   const truncateLimit = SUB_AGENT_CONFIG.responderResultTruncateChars;
   const resultsSummary = toolResults.map(r => {
     const status = r.result.success ? 'SUCCESS' : 'FAILED';
-    const data = r.result.data
+    const dataStr = r.result.data
       ? JSON.stringify(r.result.data).substring(0, truncateLimit)
-      : r.result.message;
-    return `[${status}] ${r.toolName}: ${data}`;
+      : '(no data)';
+    // ALWAYS include the message — it contains diagnostic hints for zero-result cases
+    const msg = r.result.message ? `\nNote: ${r.result.message}` : '';
+    return `[${status}] ${r.toolName}: ${dataStr}${msg}`;
   }).join('\n\n');
 
   // Build enriched context from blackboard (goal, plan, reviewer guidance)

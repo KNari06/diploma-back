@@ -27,9 +27,16 @@ export function generateOAuthState(): string {
  * @param state - Random state for security
  * @returns Authorization URL
  */
+function getJiraCallbackUrl(): string {
+  if (env.JIRA_CALLBACK_URL) return env.JIRA_CALLBACK_URL;
+  const base = (env.BACKEND_URL || `http://localhost:${env.PORT}`).replace(/\/api\/?$/, '').replace(/\/+$/, '');
+  return `${base}/api/${env.API_VERSION}/jira/callback`;
+}
+
 export function buildJiraAuthUrl(state: string): string {
   const clientId = env.JIRA_CLIENT_ID;
-  const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/v1/jira/callback`;
+  const callbackUrl = getJiraCallbackUrl();
+  logger.info('[JIRA] OAuth redirect_uri used for Atlassian', { callbackUrl });
 
   if (!clientId) {
     throw new Error('JIRA_CLIENT_ID is not configured');
@@ -58,7 +65,7 @@ export async function exchangeCodeForToken(
 ): Promise<JiraTokenResponse> {
   const clientId = env.JIRA_CLIENT_ID;
   const clientSecret = env.JIRA_CLIENT_SECRET;
-  const callbackUrl = env.JIRA_CALLBACK_URL || `http://localhost:${env.PORT}/api/v1/jira/callback`;
+  const callbackUrl = getJiraCallbackUrl();
 
   if (!clientId || !clientSecret) {
     throw new Error('JIRA_CLIENT_ID and JIRA_CLIENT_SECRET must be configured');

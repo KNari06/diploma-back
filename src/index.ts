@@ -1,3 +1,4 @@
+import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
@@ -18,6 +19,7 @@ import rulesReloadRoutes from '@/api/kb/rules-reload.route';
 import manualTestRoutes from '@/api/manualTest/manualTest.route';
 import queueStatusRoutes from '@/api/manualTest/queue-status.route';
 import modulesRoutes from '@/api/modules/modules.route';
+import announcementsRoutes from '@/api/announcements/announcements.routes';
 import notificationsRoutes from '@/api/notifications/notifications.routes';
 import platformsRoutes from '@/api/platforms/platforms.route';
 import playwrightRoutes from '@/api/playwright/playwright.route';
@@ -26,6 +28,8 @@ import mobileRoutes from '@/api/mobile/mobile.route';
 import projectRoutes from '@/api/project/project.routes';
 import regressionPlansRoutes from '@/api/regression-plans/plans.route';
 import regressionRoutes from '@/api/regression/regression.route';
+import { getSharedReport } from '@/api/regression/regression.controller';
+import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import reportsRoutes from '@/api/reports/reports.route';
 import savedTestCasesRoutes from '@/api/saved-test-cases/saved-test-cases.route';
 import testsRoutes from '@/api/tests/tests.route';
@@ -224,6 +228,8 @@ app.use(`/api/${env.API_VERSION}/stripe/webhook`, express.raw({ type: 'applicati
 // Body parsing middleware
 // IMPORTANT: GitHub webhook signature requires raw body (Buffer)
 app.use(`/api/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
+// Fallback when reverse proxy strips /api (e.g. nginx proxy_pass with trailing slash)
+app.use(`/${env.API_VERSION}/git-integrations/webhook`, express.raw({ type: 'application/json', limit: '10mb' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -1252,6 +1258,7 @@ app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications (needed for pending users)
+app.use(`/api/${env.API_VERSION}/announcements`, announcementsRoutes); // What's New announcements
 app.use(`/api/${env.API_VERSION}/user`, userRoutes); // User profile (needed for pending users)
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
 
@@ -1267,7 +1274,10 @@ app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
 app.use(`/api/${env.API_VERSION}/api-config`, requireAuth, requireApproved, apiConfigRoutes);
-app.use(`/api/${env.API_VERSION}/jira`, requireAuth, requireApproved, jiraRoutes);
+// jira: OAuth callback is public (Atlassian redirects with code/state, no Bearer); router applies auth to all other routes
+app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);
+// Fallback when reverse proxy strips /api: accept e.g. /v1/jira/callback
+app.use(`/${env.API_VERSION}/jira`, jiraRoutes);
 app.use(`/api/${env.API_VERSION}/kb/skills`, requireAuth, requireApproved, skillsRoutes);
 app.use(`/api/${env.API_VERSION}/kb/patterns`, requireAuth, requireApproved, patternsRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, kbRoutes);
@@ -1275,6 +1285,8 @@ app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, rulesReloadR
 app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);
+// Shared report: public endpoint (no auth) — must be registered before auth-protected regression routes
+app.get(`/api/${env.API_VERSION}/regression/shared/:shareToken`, sharedReportRateLimiter, getSharedReport);
 app.use(`/api/${env.API_VERSION}/regression`, requireAuth, requireApproved, regressionRoutes);
 app.use(`/api/${env.API_VERSION}/platforms`, requireAuth, requireApproved, platformsRoutes);
 app.use(`/api/${env.API_VERSION}/modules`, requireAuth, requireApproved, modulesRoutes);
@@ -1282,12 +1294,19 @@ app.use(`/api/${env.API_VERSION}/flows`, requireAuth, requireApproved, flowsRout
 app.use(`/api/${env.API_VERSION}/schedules`, requireAuth, requireApproved, schedulesRoutes);
 app.use(`/api/${env.API_VERSION}/fixtures`, requireAuth, requireApproved, fixturesRoutes);
 app.use(`/api/${env.API_VERSION}/regression-plans`, requireAuth, requireApproved, regressionPlansRoutes);
-app.use(`/api/${env.API_VERSION}/git-integrations`, requireAuth, requireApproved, gitIntegrationRoutes);
-app.use(`/api/${env.API_VERSION}/integrations`, requireAuth, requireApproved, integrationsRoutes);
+// git-integrations: no app-level auth so webhook is public; router applies requireAuth+requireApproved to CRUD only
+app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
+// Fallback when reverse proxy strips /api: accept webhook at /v1/git-integrations/webhook (same handler, no auth on webhook route)
+app.use(`/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
+// integrations: OAuth callbacks are public (no Bearer on redirect); router applies auth to all other routes
+app.use(`/api/${env.API_VERSION}/integrations`, integrationsRoutes);
+// Fallback when reverse proxy strips /api: accept e.g. /v1/integrations/github/callback (same handlers)
+app.use(`/${env.API_VERSION}/integrations`, integrationsRoutes);
 app.use(`/api/${env.API_VERSION}/queue`, requireAuth, requireApproved, queueStatusRoutes);
 app.use(`/api/${env.API_VERSION}/preview`, requireAuth, requireApproved, previewRoutes);
 app.use(`/api/${env.API_VERSION}/saved-test-cases`, requireAuth, requireApproved, savedTestCasesRoutes);
 app.use(`/api/${env.API_VERSION}/tests`, requireAuth, requireApproved, testsRoutes);
+app.use(`/api/${env.API_VERSION}/allure-import`, requireAuth, requireApproved, allureImportRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {

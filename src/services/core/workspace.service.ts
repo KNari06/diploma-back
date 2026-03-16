@@ -57,11 +57,12 @@ export class WorkspaceService {
         return String(memberships[0].workspace_id);
       }
 
-      // Multiple workspaces — pick the one with most recent chat activity
+      // Multiple workspaces — pick the one with most recent chat activity for THIS user
       const workspaceIds = memberships.map(m => m.workspace_id);
       const { data: recentSession } = await supabaseAdmin
         .from('chat_sessions')
         .select('workspace_id, updated_at')
+        .eq('user_id', userId)
         .in('workspace_id', workspaceIds)
         .not('workspace_id', 'is', null)
         .order('updated_at', { ascending: false })
@@ -300,11 +301,33 @@ export class WorkspaceService {
     }
   }
 
+  /** Columns that may be updated via the public API. */
+  private static readonly UPDATABLE_COLUMNS = new Set([
+    'name',
+    'platforms',
+    'api_testing',
+    'settings',
+  ]);
+
   static async updateWorkspace(workspaceId: string, updates: any): Promise<any> {
     try {
+      // Only keep fields that map to actual DB columns to prevent
+      // Supabase "column not found" errors (e.g. frontend sending `description`).
+      const sanitised: Record<string, any> = {};
+      for (const key of Object.keys(updates)) {
+        if (WorkspaceService.UPDATABLE_COLUMNS.has(key)) {
+          sanitised[key] = updates[key];
+        }
+      }
+
+      if (Object.keys(sanitised).length === 0) {
+        logger.warn('[WORKSPACE] No valid columns to update, skipping', { workspaceId, receivedKeys: Object.keys(updates) });
+        return await this.getWorkspace(workspaceId);
+      }
+
       const { data, error } = await supabaseAdmin
         .from('workspaces')
-        .update(updates)
+        .update(sanitised)
         .eq('id', workspaceId)
         .select()
         .single();
