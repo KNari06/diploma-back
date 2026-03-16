@@ -1280,8 +1280,9 @@ export class PreviewStepApplyService {
     pageRef?: string;
     userId: string;
     selectedRef?: string; // V3: User-confirmed element ref from clarification
+    skipPostActionWait?: boolean; // V12: Skip post-action settle when caller uses lookahead (e.g. Run mode)
   }): Promise<ApplyResult> {
-    const { previewSessionId, stepDraft, userId, selectedRef } = params;
+    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait } = params;
 
     logger.info('[PREVIEW_APPLY] Applying step', {
       previewSessionId,
@@ -1601,8 +1602,10 @@ export class PreviewStepApplyService {
         const result = await executeAction(page, stepDraft, confirmedCandidate);
 
         if (result.success) {
-          // Wait for page to settle
-          await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+          // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          if (!skipPostActionWait) {
+            await page.waitForLoadState('load', { timeout: 2000 }).catch(() => { });
+          }
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
           if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
@@ -1732,8 +1735,10 @@ export class PreviewStepApplyService {
             const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator);
 
             if (result.success) {
-              // Wait for page to settle
-              await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+              // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+              if (!skipPostActionWait) {
+                await page.waitForLoadState('load', { timeout: 2000 }).catch(() => { });
+              }
 
               // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
               if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
@@ -1901,8 +1906,10 @@ export class PreviewStepApplyService {
         const result = await executeAction(page, stepDraft, candidate);
 
         if (result.success) {
-          // Wait for page to settle
-          await page.waitForLoadState('networkidle', { timeout: POST_ACTION_SETTLE_TIMEOUT }).catch(() => { });
+          // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          if (!skipPostActionWait) {
+            await page.waitForLoadState('load', { timeout: 2000 }).catch(() => { });
+          }
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
           if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {

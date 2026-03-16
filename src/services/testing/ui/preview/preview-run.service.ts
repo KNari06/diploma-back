@@ -1,11 +1,13 @@
 /**
- * Preview Run Service V9
+ * Preview Run Service V10
  * Orchestrates "Run from start" feature in AI editor
  * Executes steps sequentially in existing preview browser session
  * Features: cancel support, per-step progress tracking, stop-on-fail, best-effort persistence
  *
  * V9: Extracted runStepsOnPreview() for ephemeral (DB-free) draft step execution.
  *     runSavedSteps() is now a thin wrapper that resolves steps from DB then delegates.
+ * V10: Global run timeout (5 min), always emit completion (even pre-started failures),
+ *      timeout guards on finally-block cleanup to prevent hanging.
  */
 
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
@@ -16,6 +18,23 @@ import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness } from './step-readiness.service';
+
+/** Maximum wall-clock time for an entire run (all steps). Prevents infinite hangs. */
+const GLOBAL_RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Maximum time for cleanup operations (batch persist, trace close) in finally block. */
+const CLEANUP_TIMEOUT_MS = 10_000; // 10 seconds
+
+/** Wrap a promise with a timeout. Rejects with TimeoutError if exceeded. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`[TimeoutError] ${label} exceeded ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 /**
  * Internal state for active runs
@@ -180,6 +199,7 @@ export class PreviewRunService {
     activeRuns.set(previewSessionId, runState);
 
     let startedEmitted = false;
+    let timedOut = false;
 
     let passedSteps = 0;
     let failedSteps = 0;
@@ -199,6 +219,17 @@ export class PreviewRunService {
       maxPayloadChars: 10_000,
     });
     const rootSpanId = traceWriter.getRootSpanId();
+
+    // Global run timeout — cancels run if total wall-clock exceeds limit
+    const globalTimeout = setTimeout(() => {
+      timedOut = true;
+      runState.cancelled = true;
+      logger.error('[PreviewRun] Global timeout exceeded, forcing cancellation', {
+        previewSessionId,
+        timeoutMs: GLOBAL_RUN_TIMEOUT_MS,
+        currentStepIndex: runState.currentStepIndex,
+      });
+    }, GLOBAL_RUN_TIMEOUT_MS);
 
     try {
       // 4. Get session page
@@ -253,8 +284,8 @@ export class PreviewRunService {
           timeout: 30000,
         });
 
-        // Wait for network idle after initial navigation
-        await session.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
+        // Wait for network idle after initial navigation (5s is sufficient — lookahead handles step readiness)
+        await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
           logger.debug('[PreviewRun] Network idle timeout after initial navigation, continuing');
         });
 
@@ -403,11 +434,28 @@ export class PreviewRunService {
             },
           };
 
+          const stepStartMs = Date.now();
           const result = await PreviewStepApplyService.applyStep({
             previewSessionId,
             stepDraft: stepWithCachePolicy,
             userId,
+            skipPostActionWait: true, // V12: Lookahead handles inter-step timing
           });
+          const stepDurationMs = Date.now() - stepStartMs;
+
+          // Log slow steps for production diagnosis
+          if (stepDurationMs > 3000) {
+            logger.warn('[PreviewRun] Slow step execution', {
+              previewSessionId,
+              stepIndex: i,
+              stepId: step.id,
+              stepType: step.type,
+              durationMs: stepDurationMs,
+              success: result.success,
+              hasCompiled: !!step.compiled,
+              disableCaching,
+            });
+          }
 
           if (result.success) {
             logger.info('[PreviewRun] Step passed', {
@@ -458,9 +506,9 @@ export class PreviewRunService {
               const nextStep = steps[i + 1];
               try {
                 const lookahead = await waitForStepReadiness(session.page, nextStep, {
-                  maxWaitMs: 10000,
-                  settleMs: 3000,
-                  autoWaitThresholdMs: 2000,
+                  maxWaitMs: 5000,
+                  settleMs: 1500,
+                  autoWaitThresholdMs: 1000,
                 });
 
                 if (lookahead.autoWaitApplied) {
@@ -632,61 +680,81 @@ export class PreviewRunService {
         }
       }
     } finally {
-      // 7. Emit completed event (only if we emitted started)
-      if (startedEmitted) {
-        const duration = Date.now() - runState.startTime;
-        const cancelled = activeRuns.get(previewSessionId)?.cancelled || false;
+      // Clear global timeout
+      clearTimeout(globalTimeout);
 
-        logger.info('[PreviewRun] Run completed', {
-          previewSessionId,
-          intentTestCaseId: intentTestCaseId ?? '(ephemeral)',
-          success: failedSteps === 0 && !cancelled,
-          passedSteps,
-          failedSteps,
-          skippedSteps,
-          cancelled,
-          duration,
-        });
+      // 7. ALWAYS emit completed event — even if run failed before 'started' was emitted.
+      //    This guarantees the frontend never stays stuck in 'running' state.
+      const duration = Date.now() - runState.startTime;
+      const cancelled = activeRuns.get(previewSessionId)?.cancelled || false;
 
-        // Trace run_end
-        traceWriter.write({
-          stage: 'completion',
-          eventType: 'run_end',
-          spanId: traceWriter.generateSpanId(),
-          parentSpanId: rootSpanId,
-          payload: {
-            success: failedSteps === 0 && !cancelled,
-            totalSteps: steps.length,
-            passedSteps,
-            failedSteps,
-            skippedSteps,
-            cancelled,
-            duration,
-            durationSeconds: Math.round(duration / 1000),
-            endTime: new Date().toISOString(),
-          },
-        });
+      logger.info('[PreviewRun] Run completed', {
+        previewSessionId,
+        intentTestCaseId: intentTestCaseId ?? '(ephemeral)',
+        success: failedSteps === 0 && !cancelled && !timedOut,
+        passedSteps,
+        failedSteps,
+        skippedSteps,
+        cancelled,
+        timedOut,
+        startedEmitted,
+        duration,
+      });
 
-        webSocketService.emitToUser(userId, 'preview:run:completed', {
-          previewSessionId,
-          success: failedSteps === 0 && !cancelled,
+      // Trace run_end
+      traceWriter.write({
+        stage: 'completion',
+        eventType: 'run_end',
+        spanId: traceWriter.generateSpanId(),
+        parentSpanId: rootSpanId,
+        payload: {
+          success: failedSteps === 0 && !cancelled && !timedOut,
           totalSteps: steps.length,
           passedSteps,
           failedSteps,
           skippedSteps,
           cancelled,
+          timedOut,
           duration,
+          durationSeconds: Math.round(duration / 1000),
+          endTime: new Date().toISOString(),
+        },
+      });
+
+      // Emit started if we never did (so frontend can transition properly)
+      if (!startedEmitted) {
+        webSocketService.emitToUser(userId, 'preview:run:started', {
+          previewSessionId,
+          totalSteps: steps.length,
+          startUrl,
           timestamp: new Date().toISOString(),
         });
       }
 
-      // 8b. Batch-persist all enriched steps (single DB round-trip)
-      if (enrichedSteps.size > 0) {
+      webSocketService.emitToUser(userId, 'preview:run:completed', {
+        previewSessionId,
+        success: failedSteps === 0 && !cancelled && !timedOut,
+        totalSteps: steps.length,
+        passedSteps,
+        failedSteps,
+        skippedSteps,
+        cancelled,
+        timedOut,
+        duration,
+        timestamp: new Date().toISOString(),
+      });
+
+      // 8b. Batch-persist all enriched steps (single DB round-trip) — with timeout guard
+      if (enrichedSteps.size > 0 && intentTestCaseId) {
         try {
-          await IntentTestCaseService.batchUpdateStepsFromRun({
-            intentTestCaseId,
-            enrichedSteps,
-          });
+          await withTimeout(
+            IntentTestCaseService.batchUpdateStepsFromRun({
+              intentTestCaseId,
+              enrichedSteps,
+            }),
+            CLEANUP_TIMEOUT_MS,
+            'batchUpdateStepsFromRun',
+          );
           logger.info('[PreviewRun] Batch-persisted enriched steps', {
             previewSessionId,
             intentTestCaseId,
@@ -701,10 +769,10 @@ export class PreviewRunService {
         }
       }
 
-      // 9. Close trace writer (flushes pending writes)
+      // 9. Close trace writer (flushes pending writes) — with timeout guard
       const traceFilePath = traceWriter.getFilePath();
       try {
-        await traceWriter.close();
+        await withTimeout(traceWriter.close(), CLEANUP_TIMEOUT_MS, 'traceWriter.close');
       } catch (closeError) {
         logger.warn('[PreviewRun] Failed to close trace writer', {
           previewSessionId,
@@ -723,7 +791,7 @@ export class PreviewRunService {
         }).catch(() => {});
       }).catch(() => {});
 
-      // 9. Cleanup run state
+      // 10. Cleanup run state
       activeRuns.delete(previewSessionId);
     }
   }
