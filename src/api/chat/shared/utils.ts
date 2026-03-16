@@ -57,7 +57,13 @@ export function normalizeUrl(url: string): string {
 /**
  * Compress long test plans in message content
  */
-export function compressMessageContent(content: string): string {
+export function compressMessageContent(content: string, metadata?: Record<string, any>): string {
+  // Draft step messages must never be compressed — they contain structured
+  // step data that the AI needs to reconstruct on the next turn
+  if (metadata?.hasDraftSteps === true) {
+    return content;
+  }
+
   // If content contains a test plan (detected by length and keywords)
   if (content.length > 1000 && (
     content.includes('Test Plan') ||

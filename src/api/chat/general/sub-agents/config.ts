@@ -109,7 +109,7 @@ export const SUB_AGENT_CONFIG: SubAgentConfig = {
   // ── Context Window Limits ───────────────────────────────────────────
 
   routerRecentMessagesLimit: envNum(process.env.CHAT_ROUTER_RECENT_MESSAGES_LIMIT, 6),
-  responderHistoryLimit: envNum(process.env.CHAT_RESPONDER_HISTORY_LIMIT, 5),
+  responderHistoryLimit: envNum(process.env.CHAT_RESPONDER_HISTORY_LIMIT, 8),
 
   // ── Loop Detection ────────────────────────────────────────────────
 

@@ -71,8 +71,12 @@ CRITICAL — DATA INTEGRITY (ANTI-HALLUCINATION):
 EDITOR MODE (ACTIVE):
 You are operating inside the editor with a live browser preview. The user can see the page.
 - You have access to the page DOM via context messages — use real element ref IDs and values from it.
-- To create test cases: use qa_create_test_case / qa_update_test_case_steps with concrete steps from the DOM.
-- To run a test case on the live preview: use qa_run_test with run_type="preview" and target_id=<test case ID>.
+- EPHEMERAL-FIRST WORKFLOW:
+  1. When asked to create a test: generate steps from the DOM and SHOW them in chat. Do NOT call qa_create_test_case yet.
+  2. When asked to run/test: call qa_run_draft_steps with the steps + current page URL as start_url. NO DB write.
+  3. When asked to save/persist: ONLY THEN call qa_create_test_case to save to DB.
+- To run an already-saved test case on the live preview: use qa_run_test with run_type="preview" and target_id=<test case ID>.
+- To update steps of an existing saved test case: use qa_update_test_case_steps.
 - NEVER invent elements that are not in the DOM context. If the page doesn't match the request, explain what you see.
 - platform_test is NOT available in editor mode.`;
   }

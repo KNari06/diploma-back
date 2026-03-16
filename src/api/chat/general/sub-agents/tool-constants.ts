@@ -38,6 +38,7 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   qa_analyze_failure: 25000,
   qa_get_recommendations: 25000,
   qa_run_test: 60000,
+  qa_run_draft_steps: 60000,
   qa_create_test_case: 15000,
   qa_screenshot: 10000,
   qa_manage_regression_plan: 10000,

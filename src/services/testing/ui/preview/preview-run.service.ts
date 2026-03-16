@@ -1,8 +1,11 @@
 /**
- * Preview Run Service V8
+ * Preview Run Service V9
  * Orchestrates "Run from start" feature in AI editor
- * Executes all saved steps sequentially in existing preview browser session
+ * Executes steps sequentially in existing preview browser session
  * Features: cancel support, per-step progress tracking, stop-on-fail, best-effort persistence
+ *
+ * V9: Extracted runStepsOnPreview() for ephemeral (DB-free) draft step execution.
+ *     runSavedSteps() is now a thin wrapper that resolves steps from DB then delegates.
  */
 
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
@@ -31,11 +34,13 @@ interface RunState {
 const activeRuns = new Map<string, RunState>();
 
 /**
- * Service for running all saved steps in preview session
+ * Service for running steps in preview session
  */
 export class PreviewRunService {
   /**
-   * Start "Run from start" - execute all saved steps sequentially
+   * Start "Run from start" - load saved steps from DB and execute sequentially.
+   * This is a thin wrapper: resolves steps/startUrl from DB, then delegates to runStepsOnPreview().
+   *
    * @param previewSessionId - Preview session ID (must be active)
    * @param intentTestCaseId - Test case ID to load steps from
    * @param userId - User ID for ownership verification
@@ -53,14 +58,115 @@ export class PreviewRunService {
       startUrl?: string;
     },
   ): Promise<void> {
+    // ─── Early guards (fail-fast before any DB work) ───────────────────
+    if (activeRuns.has(previewSessionId)) {
+      throw new Error('Run already in progress for this session');
+    }
+
+    const sessionService = getPreviewSessionService();
+    if (!sessionService.isSessionOwned(previewSessionId, userId)) {
+      throw new Error('Session not owned by user');
+    }
+
+    // ─── Resolve steps and startUrl from DB ──────────────────────────────
+
+    let savedSteps: IntentStep[] | null = null;
+    let startUrl: string | undefined;
+
+    if (options?.inlineSteps && options.inlineSteps.length > 0) {
+      // "Apply All" path: save inline steps to DB first, then use them directly.
+      // This avoids a double round-trip (save → load) and keeps the flow atomic.
+      const patch: Record<string, unknown> = { steps: options.inlineSteps };
+      if (options.startUrl) {
+        patch.url = options.startUrl;
+        patch.startUrl = options.startUrl;
+      }
+      await IntentTestCaseService.update({
+        id: intentTestCaseId,
+        userId,
+        ...patch,
+      });
+      savedSteps = options.inlineSteps;
+      startUrl = options.startUrl;
+      logger.info('[PreviewRun] Saved inline steps to DB before run', {
+        previewSessionId, intentTestCaseId, stepCount: savedSteps.length,
+      });
+    }
+
+    // Standard path (or inline without startUrl): load from DB
+    if (!savedSteps || !startUrl) {
+      const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
+      if (!savedSteps) {
+        if (!testCase || !testCase.stepsJson) {
+          throw new Error('Test case not found or has no saved steps');
+        }
+        savedSteps = testCase.stepsJson;
+      }
+      if (!startUrl) {
+        startUrl = testCase?.startUrl || testCase?.url || undefined;
+      }
+    }
+
+    if (savedSteps.length === 0) {
+      throw new Error('No steps to run');
+    }
+    if (!startUrl) {
+      throw new Error('Test case has no startUrl or url');
+    }
+
+    // ─── Delegate to core execution loop with persistence enabled ────────
+    return PreviewRunService.runStepsOnPreview(
+      previewSessionId,
+      savedSteps,
+      startUrl,
+      userId,
+      {
+        intentTestCaseId,
+        persistAppliedSteps: true,
+        _skipOwnershipCheck: true, // Already verified above
+      },
+    );
+  }
+
+  /**
+   * Execute steps directly on preview session — core execution loop.
+   *
+   * When persistAppliedSteps is false (default), this method performs ZERO DB reads or writes.
+   * Used for ephemeral "draft" runs triggered from the AI chat, as well as internally by runSavedSteps().
+   *
+   * Emits standard WebSocket events (preview:run:started/step/completed) — frontend works unchanged.
+   * Uses the same activeRuns map for concurrency/cancellation — both ephemeral and saved runs are mutually exclusive.
+   *
+   * @param previewSessionId - Active preview session
+   * @param steps - IntentStep array to execute
+   * @param startUrl - URL to navigate to before execution
+   * @param userId - User ID (for session ownership + WebSocket)
+   * @param options.intentTestCaseId - Optional test case ID (for trace metadata only when persistAppliedSteps is false)
+   * @param options.persistAppliedSteps - If true, persist appliedStep to DB per step (default: false)
+   */
+  static async runStepsOnPreview(
+    previewSessionId: string,
+    steps: IntentStep[],
+    startUrl: string,
+    userId: string,
+    options?: {
+      intentTestCaseId?: string;
+      persistAppliedSteps?: boolean;
+      /** @internal Skip ownership check when caller (runSavedSteps) already verified */
+      _skipOwnershipCheck?: boolean;
+    },
+  ): Promise<void> {
+    const intentTestCaseId = options?.intentTestCaseId;
+    const persistAppliedSteps = options?.persistAppliedSteps ?? false;
+
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
       throw new Error('Run already in progress for this session');
     }
 
-    // 2. Verify session ownership
+    // 2. Verify session ownership (skipped when called from runSavedSteps which already verified)
     const sessionService = getPreviewSessionService();
-    if (!sessionService.isSessionOwned(previewSessionId, userId)) {
+    if (!options?._skipOwnershipCheck && !sessionService.isSessionOwned(previewSessionId, userId)) {
       throw new Error('Session not owned by user');
     }
 
@@ -73,17 +179,18 @@ export class PreviewRunService {
     };
     activeRuns.set(previewSessionId, runState);
 
-    let savedSteps: IntentStep[] | null = null;
     let startedEmitted = false;
 
-    // 7. Execute steps sequentially
     let passedSteps = 0;
     let failedSteps = 0;
     let skippedSteps = 0;
 
     // Initialize trace writer for JSONL logging
+    const traceId = intentTestCaseId
+      ? `preview_run_${previewSessionId}`
+      : `draft_run_${previewSessionId}`;
     const traceWriter = new LiteTraceWriter({
-      testId: `preview_run_${previewSessionId}`,
+      testId: traceId,
       logsDir: undefined, // Use default test_logs/
       maxFileSizeBytes: 50 * 1024 * 1024, // 50MB for preview runs
       maxPayloadChars: 10_000,
@@ -91,51 +198,7 @@ export class PreviewRunService {
     const rootSpanId = traceWriter.getRootSpanId();
 
     try {
-      // 4. Load or save+use inline steps
-      let startUrl: string | undefined;
-
-      if (options?.inlineSteps && options.inlineSteps.length > 0) {
-        // "Apply All" path: save inline steps to DB first, then use them directly.
-        // This avoids a double round-trip (save → load) and keeps the flow atomic.
-        const patch: Record<string, unknown> = { steps: options.inlineSteps };
-        if (options.startUrl) {
-          patch.url = options.startUrl;
-          patch.startUrl = options.startUrl;
-        }
-        await IntentTestCaseService.update({
-          id: intentTestCaseId,
-          userId,
-          ...patch,
-        });
-        savedSteps = options.inlineSteps;
-        startUrl = options.startUrl;
-        logger.info('[PreviewRun] Saved inline steps to DB before run', {
-          previewSessionId, intentTestCaseId, stepCount: savedSteps.length,
-        });
-      }
-
-      // Standard path (or inline without startUrl): load from DB
-      if (!savedSteps || !startUrl) {
-        const testCase = await IntentTestCaseService.getById(intentTestCaseId, userId);
-        if (!savedSteps) {
-          if (!testCase || !testCase.stepsJson) {
-            throw new Error('Test case not found or has no saved steps');
-          }
-          savedSteps = testCase.stepsJson;
-        }
-        if (!startUrl) {
-          startUrl = testCase?.startUrl || testCase?.url || undefined;
-        }
-      }
-
-      if (savedSteps.length === 0) {
-        throw new Error('No steps to run');
-      }
-      if (!startUrl) {
-        throw new Error('Test case has no startUrl or url');
-      }
-
-      // 5. Get session page
+      // 4. Get session page
       const session = sessionService.getSession(previewSessionId);
       if (!session?.page) {
         throw new Error('Session has no active page');
@@ -143,10 +206,11 @@ export class PreviewRunService {
 
       logger.info('[PreviewRun] Starting run', {
         previewSessionId,
-        intentTestCaseId,
+        intentTestCaseId: intentTestCaseId ?? '(ephemeral)',
         userId,
-        totalSteps: savedSteps.length,
+        totalSteps: steps.length,
         startUrl,
+        ephemeral: !persistAppliedSteps,
       });
 
       // Trace run_start
@@ -156,26 +220,25 @@ export class PreviewRunService {
         spanId: rootSpanId,
         payload: {
           previewSessionId,
-          intentTestCaseId,
+          intentTestCaseId: intentTestCaseId ?? undefined,
           userId,
-          totalSteps: savedSteps.length,
+          totalSteps: steps.length,
           startUrl,
-          mode: 'preview_run',
+          mode: persistAppliedSteps ? 'preview_run' : 'draft_run',
           startTime: new Date(runState.startTime).toISOString(),
         },
       });
 
-      // 7. Emit started event
+      // 5. Emit started event
       webSocketService.emitToUser(userId, 'preview:run:started', {
         previewSessionId,
-        totalSteps: savedSteps.length,
+        totalSteps: steps.length,
         startUrl,
         timestamp: new Date().toISOString(),
       });
       startedEmitted = true;
 
-      // 8. Navigate to startUrl before executing steps
-      // This ensures we start from the correct page regardless of current browser state
+      // 6. Navigate to startUrl before executing steps
       logger.info('[PreviewRun] Navigating to startUrl', {
         previewSessionId,
         startUrl,
@@ -206,8 +269,6 @@ export class PreviewRunService {
       }
 
       // Allow other events (cancel/isRunning) to observe activeRuns state.
-      // This is effectively a no-op in real runs (applyStep is async anyway),
-      // but makes cancellation and concurrency behavior deterministic.
       await new Promise<void>((resolve) => setImmediate(resolve));
 
       // Track URL for evidence shortcut policy (V7)
@@ -217,19 +278,20 @@ export class PreviewRunService {
         initialUrl: trackedUrl,
       });
 
-      for (let i = 0; i < savedSteps.length; i++) {
+      // ─── Step execution loop ───────────────────────────────────────────
+      for (let i = 0; i < steps.length; i++) {
         // Check cancellation
         const currentRunState = activeRuns.get(previewSessionId);
         if (!currentRunState || runState.cancelled || currentRunState.cancelled) {
           logger.info('[PreviewRun] Run cancelled, skipping remaining steps', {
             previewSessionId,
             currentStep: i,
-            remainingSteps: savedSteps.length - i,
+            remainingSteps: steps.length - i,
           });
 
           // Emit remaining steps as skipped
-          for (let j = i; j < savedSteps.length; j++) {
-            const step = savedSteps[j];
+          for (let j = i; j < steps.length; j++) {
+            const step = steps[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: j,
@@ -245,7 +307,7 @@ export class PreviewRunService {
         }
 
         runState.currentStepIndex = i;
-        const step = savedSteps[i];
+        const step = steps[i];
 
         logger.info('[PreviewRun] Executing step', {
           previewSessionId,
@@ -292,12 +354,12 @@ export class PreviewRunService {
           logger.info('[PreviewRun] Cancel detected before step execute, skipping remaining steps', {
             previewSessionId,
             currentStep: i,
-            remainingSteps: savedSteps.length - i,
+            remainingSteps: steps.length - i,
           });
 
           // Mark this step and remaining as skipped
-          for (let j = i; j < savedSteps.length; j++) {
-            const remaining = savedSteps[j];
+          for (let j = i; j < steps.length; j++) {
+            const remaining = steps[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: j,
@@ -385,12 +447,12 @@ export class PreviewRunService {
             // Update tracked URL after successful step execution
             trackedUrl = session.page.url();
 
-            // ─────────────────────────────────────────────────────────────────────
+            // ─────────────────────────────────────────────────────────────────
             // Lookahead wait: check next step readiness before executing it
             // Uses fast Playwright checks only (no AI/LLM)
-            // ─────────────────────────────────────────────────────────────────────
-            if (i < savedSteps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
-              const nextStep = savedSteps[i + 1];
+            // ─────────────────────────────────────────────────────────────────
+            if (i < steps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+              const nextStep = steps[i + 1];
               try {
                 const lookahead = await waitForStepReadiness(session.page, nextStep, {
                   maxWaitMs: 10000,
@@ -424,8 +486,8 @@ export class PreviewRunService {
               }
             }
 
-            // Best-effort: persist appliedStep if result has it
-            if (result.appliedStep) {
+            // Best-effort: persist appliedStep if result has it (only for saved runs)
+            if (persistAppliedSteps && intentTestCaseId && result.appliedStep) {
               try {
                 await IntentTestCaseService.updateStepFromPreviewApply({
                   intentTestCaseId,
@@ -453,11 +515,11 @@ export class PreviewRunService {
               logger.info('[PreviewRun] Cancellation detected after step completion, skipping remaining steps', {
                 previewSessionId,
                 completedStep: i,
-                remainingSteps: savedSteps.length - i - 1,
+                remainingSteps: steps.length - i - 1,
               });
 
-              for (let j = i + 1; j < savedSteps.length; j++) {
-                const remainingStep = savedSteps[j];
+              for (let j = i + 1; j < steps.length; j++) {
+                const remainingStep = steps[j];
                 webSocketService.emitToUser(userId, 'preview:run:step', {
                   previewSessionId,
                   stepIndex: j,
@@ -512,11 +574,11 @@ export class PreviewRunService {
             logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
               previewSessionId,
               failedStep: i,
-              remainingSteps: savedSteps.length - i - 1,
+              remainingSteps: steps.length - i - 1,
             });
 
-            for (let j = i + 1; j < savedSteps.length; j++) {
-              const remainingStep = savedSteps[j];
+            for (let j = i + 1; j < steps.length; j++) {
+              const remainingStep = steps[j];
               webSocketService.emitToUser(userId, 'preview:run:step', {
                 previewSessionId,
                 stepIndex: j,
@@ -567,8 +629,8 @@ export class PreviewRunService {
           failedSteps++;
 
           // Stop and skip remaining
-          for (let j = i + 1; j < savedSteps.length; j++) {
-            const remainingStep = savedSteps[j];
+          for (let j = i + 1; j < steps.length; j++) {
+            const remainingStep = steps[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: j,
@@ -584,14 +646,14 @@ export class PreviewRunService {
         }
       }
     } finally {
-      // 8. Emit completed event (only if we emitted started)
-      if (startedEmitted && savedSteps) {
+      // 7. Emit completed event (only if we emitted started)
+      if (startedEmitted) {
         const duration = Date.now() - runState.startTime;
         const cancelled = activeRuns.get(previewSessionId)?.cancelled || false;
 
         logger.info('[PreviewRun] Run completed', {
           previewSessionId,
-          intentTestCaseId,
+          intentTestCaseId: intentTestCaseId ?? '(ephemeral)',
           success: failedSteps === 0 && !cancelled,
           passedSteps,
           failedSteps,
@@ -608,7 +670,7 @@ export class PreviewRunService {
           parentSpanId: rootSpanId,
           payload: {
             success: failedSteps === 0 && !cancelled,
-            totalSteps: savedSteps.length,
+            totalSteps: steps.length,
             passedSteps,
             failedSteps,
             skippedSteps,
@@ -622,7 +684,7 @@ export class PreviewRunService {
         webSocketService.emitToUser(userId, 'preview:run:completed', {
           previewSessionId,
           success: failedSteps === 0 && !cancelled,
-          totalSteps: savedSteps.length,
+          totalSteps: steps.length,
           passedSteps,
           failedSteps,
           skippedSteps,
@@ -632,7 +694,7 @@ export class PreviewRunService {
         });
       }
 
-      // 9. Close trace writer (flushes pending writes)
+      // 8. Close trace writer (flushes pending writes)
       const traceFilePath = traceWriter.getFilePath();
       try {
         await traceWriter.close();
@@ -649,12 +711,12 @@ export class PreviewRunService {
           filePath: traceFilePath,
           userId,
           previewSessionId,
-          traceType: 'preview_run',
+          traceType: intentTestCaseId ? 'preview_run' : 'draft_run',
           intentTestCaseId,
         }).catch(() => {});
       }).catch(() => {});
 
-      // 10. Cleanup run state
+      // 9. Cleanup run state
       activeRuns.delete(previewSessionId);
     }
   }
