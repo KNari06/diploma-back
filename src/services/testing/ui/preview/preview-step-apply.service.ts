@@ -1604,7 +1604,7 @@ export class PreviewStepApplyService {
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
           if (!skipPostActionWait) {
-            await page.waitForLoadState('load', { timeout: 2000 }).catch(() => { });
+            await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
           }
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -1737,7 +1737,7 @@ export class PreviewStepApplyService {
             if (result.success) {
               // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
               if (!skipPostActionWait) {
-                await page.waitForLoadState('load', { timeout: 2000 }).catch(() => { });
+                await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
               }
 
               // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -1908,7 +1908,7 @@ export class PreviewStepApplyService {
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
           if (!skipPostActionWait) {
-            await page.waitForLoadState('load', { timeout: 2000 }).catch(() => { });
+            await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
           }
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes

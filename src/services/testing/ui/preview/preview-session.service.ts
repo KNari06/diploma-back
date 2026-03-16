@@ -26,6 +26,52 @@ const KEYBOARD_TYPE_THROTTLE_MS = PREVIEW_SESSION_CONFIG.inputThrottle.keyboardT
 const KEYBOARD_PRESS_THROTTLE_MS = PREVIEW_SESSION_CONFIG.inputThrottle.keyboardPressMs;
 
 /**
+ * Wait for DOM to stabilize after navigation.
+ * Uses MutationObserver to detect when DOM mutations stop (SPA hydration complete).
+ * Unlike networkidle, this does NOT wait for images, fonts, or analytics —
+ * only actual DOM changes that affect element availability.
+ *
+ * @param page - Playwright page
+ * @param maxWaitMs - Hard cap: give up after this many ms (default 3000)
+ * @param stabilityMs - Declare stable when no mutations for this many ms (default 800)
+ */
+async function waitForDOMStability(page: Page, maxWaitMs = 3000, stabilityMs = 800): Promise<void> {
+  try {
+    await page.evaluate(
+      ({ maxWait, stability }: { maxWait: number; stability: number }) => {
+        return new Promise<void>((resolve) => {
+          // @ts-expect-error - document exists in browser context
+          const root = document.body || document.documentElement;
+          if (!root) { resolve(); return; }
+
+          let lastMutation = Date.now();
+
+          // @ts-expect-error - MutationObserver exists in browser context
+          const observer = new MutationObserver(() => { lastMutation = Date.now(); });
+          observer.observe(root, { childList: true, subtree: true, attributes: true });
+
+          const check = () => {
+            if (Date.now() - lastMutation >= stability) {
+              observer.disconnect();
+              resolve();
+              return;
+            }
+            setTimeout(check, 100);
+          };
+          setTimeout(check, 100);
+
+          // Hard cap — don't wait forever
+          setTimeout(() => { observer.disconnect(); resolve(); }, maxWait);
+        });
+      },
+      { maxWait: maxWaitMs, stability: stabilityMs }
+    );
+  } catch {
+    // Page in weird state (navigating, crashed) — continue anyway
+  }
+}
+
+/**
  * Sanitize Playwright close errors.
  * Playwright sometimes appends huge Chromium "Browser logs" to the error message.
  * Those logs are rarely actionable for our backend cleanup logic and can spam logs.
@@ -316,10 +362,11 @@ export class PreviewSessionService {
           timeout: 30000,
         });
 
-        // Wait for network idle
-        await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
-          // Ignore timeout - page might have long-polling
-        });
+        // Wait for DOM to stabilize (SPA hydration / API-driven renders).
+        // domcontentloaded fires when HTML is parsed, but SPAs render async.
+        // Instead of networkidle (waits for images/fonts/analytics — irrelevant for element finding),
+        // use a DOM stability check: no mutations for 800ms → DOM is ready for snapshot.
+        await waitForDOMStability(page, 3000, 800);
 
         // Collect initial snapshot
         const snapshot = await SnapshotCollector.collect(page);
@@ -477,8 +524,8 @@ export class PreviewSessionService {
         timeout: 30000,
       });
 
-      // Best-effort: some apps keep long-polling, so avoid long waits
-      await newPage.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+      // Wait for DOM to stabilize (SPA hydration) — no need for networkidle (images/fonts/analytics irrelevant)
+      await waitForDOMStability(newPage, 3000, 800);
 
       // Save old resources (close after swap)
       const oldContext = session.context;

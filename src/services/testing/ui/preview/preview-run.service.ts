@@ -37,6 +37,37 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 /**
+ * Wait for DOM to stabilize after navigation (SPA hydration).
+ * Uses MutationObserver — does NOT wait for images/fonts/analytics.
+ */
+async function waitForDOMStability(page: import('playwright').Page, maxWaitMs = 3000, stabilityMs = 800): Promise<void> {
+  try {
+    await page.evaluate(
+      ({ maxWait, stability }: { maxWait: number; stability: number }) => {
+        return new Promise<void>((resolve) => {
+          // @ts-expect-error - document exists in browser context
+          const root = document.body || document.documentElement;
+          if (!root) { resolve(); return; }
+          let lastMutation = Date.now();
+          // @ts-expect-error - MutationObserver exists in browser context
+          const observer = new MutationObserver(() => { lastMutation = Date.now(); });
+          observer.observe(root, { childList: true, subtree: true, attributes: true });
+          const check = () => {
+            if (Date.now() - lastMutation >= stability) { observer.disconnect(); resolve(); return; }
+            setTimeout(check, 100);
+          };
+          setTimeout(check, 100);
+          setTimeout(() => { observer.disconnect(); resolve(); }, maxWait);
+        });
+      },
+      { maxWait: maxWaitMs, stability: stabilityMs }
+    );
+  } catch {
+    // Page navigating/crashed — continue
+  }
+}
+
+/**
  * Internal state for active runs
  */
 interface RunState {
@@ -284,10 +315,10 @@ export class PreviewRunService {
           timeout: 30000,
         });
 
-        // Wait for network idle after initial navigation (5s is sufficient — lookahead handles step readiness)
-        await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {
-          logger.debug('[PreviewRun] Network idle timeout after initial navigation, continuing');
-        });
+        // Wait for DOM to stabilize after initial navigation (SPA hydration).
+        // networkidle waits for images/fonts/analytics — irrelevant for element resolution.
+        // DOM stability (no mutations for 800ms) is what we actually need.
+        await waitForDOMStability(session.page, 3000, 800);
 
         logger.info('[PreviewRun] Navigation to startUrl complete', {
           previewSessionId,
