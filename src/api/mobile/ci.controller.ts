@@ -85,6 +85,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     // ── Step 3: APK from URL (optional) ────────────────────────────
     let appStoragePath: string | undefined;
     let appOriginalName: string | undefined;
+    let appPackage: string | undefined;
 
     if (appUrl) {
       // Rate limit: 1 APK upload per project per 5 min
@@ -170,6 +171,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
 
         appStoragePath = metadata.storagePath;
         appOriginalName = metadata.originalName;
+        appPackage = metadata.packageName;
 
         logger.info('[CI] APK uploaded from URL', {
           projectId,
@@ -206,6 +208,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       if (mobileApp?.storagePath) {
         appStoragePath = mobileApp.storagePath;
         appOriginalName = mobileApp.originalName;
+        appPackage = mobileApp.packageName;
       }
     }
 
@@ -269,6 +272,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
           platform,
           trigger: 'ci',
           ciRunId: runId,
+          appPackage,
         },
         intelligent_mode: false,
         test_goal: `CI: ${tc.name} (${platform})`,
@@ -291,6 +295,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         runnerApiKey: env.MOBILE_RUNNER_API_KEY,
         appStoragePath,
         appOriginalName,
+        appPackage,
         ciRunId: runId,
         callbackUrl,
         testCaseId: tc.id,

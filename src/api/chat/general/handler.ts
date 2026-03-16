@@ -159,7 +159,7 @@ export async function handleGeneralChat(
     // ✅ FIX: Include test results from metadata so AI can see them
     // Build messages with timestamps preserved for temporal marker injection
     const messagesWithTime = recentMessages.map(msg => {
-      let content = compressMessageContent(msg.content);
+      let content = compressMessageContent(msg.content, msg.metadata);
 
       // ✅ FIX: If message has test results in metadata, append them to content
       if (msg.metadata?.testResult) {
@@ -551,15 +551,28 @@ When the user asks about elements on the page, ALWAYS refer to the page context 
 When referencing page elements, use their ref IDs (e.g., ref=b1, ref=i3).
 
 EDITOR MODE CAPABILITIES:
-1. **Create/complete test cases from live page**: You can SEE the current page DOM. When the user asks to create a test case or add steps, analyze the page elements (forms, buttons, inputs) and generate concrete test steps with real values based on what you see. Use qa_create_test_case or qa_update_test_case_steps to save them.
-2. **Run test cases on the live preview**: After creating/finding a test case, you can run its steps on the live preview browser using qa_run_test with run_type="preview" and target_id=<test case ID>. Steps execute on the browser the user is looking at. Progress appears in real-time.
-3. **Single actions**: When the user asks to perform a SINGLE action (click, type, scroll, press, hover), this is an editor_action — execute it directly on the live preview.
-4. **Run/replay saved tests**: When the user asks to run or replay a saved test, this is run_regression. There is no platform_test in editor mode.
+1. **Generate test steps from live page (EPHEMERAL)**: You can SEE the current page DOM. When the user asks to create a test case or add steps, analyze the page elements (forms, buttons, inputs) and generate concrete test steps with real values based on what you see. SHOW the steps in chat — do NOT save to DB yet.
+2. **Run draft steps on preview (EPHEMERAL)**: Use qa_run_draft_steps to execute generated steps on the live preview browser WITHOUT saving to DB. Steps execute in real-time. Use this to test-drive steps before saving.
+3. **Save test case to DB**: Use qa_create_test_case ONLY when the user explicitly asks to save/persist (e.g., "save it", "сохрани", "looks good, save"). Pass the same steps you generated earlier.
+4. **Run saved test on preview**: Use qa_run_test with run_type="preview" and target_id=<test case ID> to run an already-saved test case on the live preview.
+5. **Single actions**: When the user asks to perform a SINGLE action (click, type, scroll, press, hover), this is an editor_action — execute it directly on the live preview.
+6. **Run/replay saved tests**: When the user asks to run or replay a saved test by name, this is run_regression. There is no platform_test in editor mode.
 
-TYPICAL EDITOR WORKFLOW:
-- User: "create a login test for this page" → You analyze DOM, generate steps, call qa_create_test_case → return the created test case ID
-- User: "run it" / "прогани" / "запусти" → You call qa_run_test(run_type="preview", target_id=<ID from previous response>, confirm=true) → steps execute on live browser
-- Short follow-ups like "прогани", "go", "давай" after test case creation = run on preview. Look at your last response for the test case ID.
+EPHEMERAL-FIRST RULE (CRITICAL):
+- When the user asks to "create a test" or "make me a test case", generate the steps and PRESENT them in chat. Do NOT call qa_create_test_case immediately.
+- Only call qa_create_test_case when the user explicitly asks to SAVE ("save it", "сохрани", "persist", "looks good, save").
+- If the user says "create and run" or "make a test and run it", generate steps + run them via qa_run_draft_steps. Do NOT save to DB.
+
+TYPICAL EDITOR WORKFLOW (EPHEMERAL-FIRST):
+- User: "create a login test for this page" → You analyze DOM, generate steps, SHOW them in chat. Ask: "Want me to run these on the preview?"
+- User: "run it" / "прогани" / "запусти" / "давай" → You call qa_run_draft_steps(steps=[...from your previous message...], start_url="<current page URL>", confirm=true) → steps execute on live browser, NO DB write
+- User: "save it" / "сохрани" / "looks good" → You call qa_create_test_case with the same steps → saved to DB
+- User: "tweak step 3" / "change the email" → You modify the steps in memory and offer to re-run via qa_run_draft_steps
+- After a successful ephemeral run, remind the user: "The test ran successfully. Say 'save it' to persist this test case."
+
+RUNNING ALREADY-SAVED TESTS:
+- If the user refers to a saved test by name or ID → use qa_run_test(run_type="preview", target_id=<ID>)
+- Short follow-ups like "прогани saved test" after listing tests = run on preview with qa_run_test
 
 WHEN THE PAGE DOESN'T MATCH THE REQUEST:
 - If the user asks to test something NOT visible in the current DOM (e.g., "test booking" but page shows a landing page), tell them:
@@ -613,6 +626,42 @@ You can still help with general questions, saved test cases, and test management
       role: 'system',
       content: `--- Knowledge Base ---\n${kbContext}\nUse this documentation for accurate, product-specific answers.`,
     });
+  }
+
+  // Add editor page context if available
+  if (editorPageContext) {
+    messages.push({
+      role: 'system',
+      content: formatPageContextForChat(editorPageContext),
+    });
+  }
+
+  // Inject cached draft steps for cross-turn persistence (editor mode only)
+  // Ensures the AI can retrieve structured steps when user says "run it" or "save it"
+  // in a subsequent turn, without re-parsing from compressed message history
+  if (mode === 'editor' && chatSessionId) {
+    try {
+      const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
+      const cached = DraftStepsCache.get(chatSessionId);
+      if (cached) {
+        const stepsJson = JSON.stringify(cached.steps, null, 2);
+        messages.push({
+          role: 'system',
+          content: `--- DRAFT TEST STEPS (generated earlier in this conversation) ---\nUse these when the user asks to "run it", "save it", or modify steps.\nStart URL: ${cached.startUrl}\nSteps (${cached.steps.length} total):\n${stepsJson}\n--- END DRAFT STEPS ---`,
+        });
+
+        logger.debug('[GENERAL_CHAT] Injected cached draft steps into context', {
+          chatSessionId,
+          stepCount: cached.steps.length,
+          startUrl: cached.startUrl,
+          ageMs: Date.now() - cached.createdAt,
+        });
+      }
+    } catch (cacheError) {
+      logger.warn('[GENERAL_CHAT] Failed to load draft steps cache', {
+        error: cacheError instanceof Error ? cacheError.message : String(cacheError),
+      });
+    }
   }
 
   // Add additional context if provided (legacy support)
@@ -1066,16 +1115,29 @@ You can still help with general questions, saved test cases, and test management
       userMessageMetadata.files = attachments.map(f => ({ name: f.name, type: f.type, mimeType: f.mimeType, size: f.size }));
     }
 
+    // Build AI message metadata
+    const aiMessageMetadata: Record<string, any> = {};
+    if (pipelineClarification) {
+      aiMessageMetadata.requiresAnswers = true;
+      aiMessageMetadata.needsMoreInfo = true;
+      aiMessageMetadata.source = 'sub_agent_pipeline';
+    }
+    // Tag messages with draft steps so they won't be compressed on future history loads
+    if (mode === 'editor' && chatSessionId) {
+      try {
+        const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
+        if (DraftStepsCache.get(chatSessionId)) {
+          aiMessageMetadata.hasDraftSteps = true;
+        }
+      } catch { /* non-critical */ }
+    }
+
     const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
       { role: 'user', content: message, metadata: userMessageMetadata },
       {
         role: 'ai',
         content: gptResponse.content,
-        // Save clarification metadata so intent parser can detect follow-up context
-        // Matches pattern from handleClarificationRequest in shared/clarification.ts
-        metadata: pipelineClarification
-          ? { requiresAnswers: true, needsMoreInfo: true, source: 'sub_agent_pipeline', mode: modeTag }
-          : { mode: modeTag },
+        metadata: Object.keys(aiMessageMetadata).length > 0 ? aiMessageMetadata : undefined,
       },
     ]);
 

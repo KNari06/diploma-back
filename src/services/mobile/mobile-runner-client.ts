@@ -47,7 +47,7 @@ export class MobileRunnerClient {
   constructor(opts?: { baseUrl?: string; apiKey?: string; geminiApiKey?: string }) {
     this.baseUrl = (opts?.baseUrl || env.MOBILE_RUNNER_URL).replace(/\/$/, '');
     this.apiKey = opts?.apiKey || env.MOBILE_RUNNER_API_KEY;
-    this.geminiApiKey = opts?.geminiApiKey || '';
+    this.geminiApiKey = opts?.geminiApiKey || env.GEMINI_API_KEY || '';
   }
 
   /** Update Gemini API key (passed per-request from user context) */
@@ -85,6 +85,39 @@ export class MobileRunnerClient {
 
   async destroySession(sessionId: string): Promise<void> {
     await this.request('DELETE', `/api/sessions/${sessionId}`);
+  }
+
+  async sessionExists(sessionId: string): Promise<boolean> {
+    try {
+      const sessions = await this.request<{ id: string }[]>('GET', '/api/sessions', {
+        timeoutMs: 5000,
+      });
+      return Array.isArray(sessions) && sessions.some((s) => s.id === sessionId);
+    } catch {
+      return false;
+    }
+  }
+
+  // ── Low-level command execution ─────────────────────────────────
+  /**
+   * Execute a batch of low-level MobileCommand objects on a given session.
+   * This is a thin wrapper over qait-mobile-runner's
+   * POST /api/commands/:sessionId/batch endpoint.
+   *
+   * NOTE: Commands are intentionally typed as unknown[] here to avoid
+   * tightly coupling the backend to the runner's internal command union.
+   * Callers must ensure they send shape-compatible objects that satisfy
+   * the runner's zod `mobileCommandSchema`.
+   */
+  async executeBatchCommands(
+    sessionId: string,
+    commands: unknown[],
+  ): Promise<{ results: unknown[] }> {
+    return this.request<{ results: unknown[] }>(
+      'POST',
+      `/api/commands/${sessionId}/batch`,
+      { body: { commands } },
+    );
   }
 
   // ── Step execution ──────────────────────────────────────────────
@@ -127,7 +160,7 @@ export class MobileRunnerClient {
       throw new MobileRunnerError('Mobile testing is not enabled', 503, 'DISABLED');
     }
 
-    const url = `${this.baseUrl}/upload/apk`;
+    const url = `${this.baseUrl}/api/upload/apk`;
     const timeoutMs = 120_000; // 2 min for large APKs
 
     // Build multipart form data

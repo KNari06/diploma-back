@@ -376,6 +376,9 @@ describe('PreviewRunService', () => {
         mockUserId
       );
 
+      // Wait for run to register in activeRuns (DB call is async before runStepsOnPreview)
+      await new Promise<void>((r) => setImmediate(r));
+
       // Cancel immediately
       expect(() => {
         PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId);
@@ -398,6 +401,9 @@ describe('PreviewRunService', () => {
         mockUserId
       );
 
+      // Wait for run to register in activeRuns
+      await new Promise<void>((r) => setImmediate(r));
+
       // Try to cancel with different user
       mockSessionService.isSessionOwned.mockReturnValue(false);
 
@@ -405,6 +411,8 @@ describe('PreviewRunService', () => {
         PreviewRunService.cancelRun(mockPreviewSessionId, 'other-user');
       }).toThrow('Session not owned by user');
 
+      // Restore mock so run can complete cleanly
+      mockSessionService.isSessionOwned.mockReturnValue(true);
       await runPromise;
     });
   });
@@ -417,6 +425,9 @@ describe('PreviewRunService', () => {
         mockIntentTestCaseId,
         mockUserId
       );
+
+      // Wait for run to register in activeRuns (DB call is async before runStepsOnPreview)
+      await new Promise<void>((r) => setImmediate(r));
 
       // Should be running
       expect(PreviewRunService.isRunning(mockPreviewSessionId)).toBe(true);
@@ -438,6 +449,9 @@ describe('PreviewRunService', () => {
         mockIntentTestCaseId,
         mockUserId
       );
+
+      // Wait for run to register in activeRuns
+      await new Promise<void>((r) => setImmediate(r));
 
       // Cancel
       PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId);

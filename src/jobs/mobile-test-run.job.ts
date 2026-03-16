@@ -165,7 +165,7 @@ export class MobileTestRunJobHandler {
       // Cold start: create a new session
       if (!sessionId) {
         const session = await client.createSession(platform);
-        sessionId = session.id;
+        sessionId = session.sessionId;
         logger.info('[MOBILE-TEST] Session created (cold start)', {
           testId,
           sessionId,
@@ -194,41 +194,50 @@ export class MobileTestRunJobHandler {
           appStoragePath,
           appOriginalName,
         });
+        if (!appPackage) {
+          logger.warn('[MOBILE-TEST] Project has mobile app binary but no appPackage (package/bundle ID). Skipping install.', {
+            testId,
+            appStoragePath,
+          });
+        } else {
+          // Download from Supabase Storage
+          const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
 
-        // Download from Supabase Storage
-        const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
+          // Upload to runner
+          const uploadResult = await client.uploadApp(
+            appBuffer,
+            appOriginalName || 'app.apk',
+          );
 
-        // Upload to runner
-        const uploadResult = await client.uploadApp(
-          appBuffer,
-          appOriginalName || 'app.apk',
-        );
+          logger.info('[MOBILE-TEST] App uploaded to runner, installing', {
+            testId,
+            runnerPath: uploadResult.path,
+            size: uploadResult.size,
+          });
 
-        logger.info('[MOBILE-TEST] App uploaded to runner, installing', {
-          testId,
-          runnerPath: uploadResult.path,
-          size: uploadResult.size,
-        });
+          // Install + launch the app on the emulator/simulator via low-level commands
+          await client.executeBatchCommands(sessionId, [
+            {
+              type: 'install_app',
+              params: {
+                apkPath: uploadResult.path,
+                reinstall: true,
+              },
+            },
+            {
+              type: 'launch_app',
+              params: {
+                packageName: appPackage,
+                clearData: true,
+              },
+            },
+          ]);
 
-        // Install via run-steps with a single install_app + open_app step
-        const installSteps = [
-          {
-            id: '__install_app',
-            type: 'open_app' as const,
-            description: appPackage || 'app',
-            value: appPackage,
-            options: { continueOnError: false },
-          },
-        ];
-
-        await client.runSteps(sessionId, installSteps, {
-          screenshotEachStep: false,
-        });
-
-        logger.info('[MOBILE-TEST] App installed and launched', {
-          testId,
-          appPackage,
-        });
+          logger.info('[MOBILE-TEST] App installed and launched', {
+            testId,
+            appPackage,
+          });
+        }
       }
 
       // ── Phase 4: Run steps ────────────────────────────────────

@@ -3258,6 +3258,136 @@ export async function handleRunTest(
 }
 
 /**
+ * qa_run_draft_steps — Execute draft steps on live preview without DB persistence
+ *
+ * Safety:
+ * - Requires `confirm: true`
+ * - Steps validated against VALID_STEP_TYPES
+ * - Requires active preview session (editor mode only)
+ * - Fire-and-forget: progress streamed via WebSocket (same events as runSavedSteps)
+ */
+export async function handleRunDraftSteps(
+  args: Record<string, any>,
+  context: SkillContext
+): Promise<SkillResult> {
+  const steps = args.steps as IntentStep[] | undefined;
+  const startUrl = args.start_url as string | undefined;
+  const confirm = args.confirm === true;
+
+  // 1. Confirm gate
+  if (!confirm) {
+    return {
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe the steps you will run to the user, wait for their explicit approval ("yes", "go ahead", etc.), and then call this tool again with confirm=true. Do NOT set confirm=true without user approval.',
+      displayToUser: false,
+    };
+  }
+
+  // 2. Validate steps array
+  if (!steps || !Array.isArray(steps) || steps.length === 0) {
+    return { success: false, message: 'Missing or empty required field: steps (array of step objects)', displayToUser: false };
+  }
+
+  // 3. Validate start_url
+  if (!startUrl) {
+    return { success: false, message: 'Missing required field: start_url', displayToUser: false };
+  }
+
+  // 4. Validate preview session
+  if (!context.previewSessionId) {
+    return {
+      success: false,
+      message: 'Draft step execution requires an active editor preview session. This tool is only available in editor mode.',
+      displayToUser: false,
+    };
+  }
+
+  // 5. Validate step structure (same validation as handleCreateTestCase)
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (!step.id || typeof step.id !== 'string') {
+      return { success: false, message: `Step ${i}: missing or invalid "id" (must be a string UUID)`, displayToUser: false };
+    }
+    if (!step.type || !VALID_STEP_TYPES.has(step.type)) {
+      return {
+        success: false,
+        message: `Step ${i}: invalid "type" "${step.type}". Allowed: ${[...VALID_STEP_TYPES].join(', ')}`,
+        displayToUser: false,
+      };
+    }
+    if (!step.description || typeof step.description !== 'string') {
+      return { success: false, message: `Step ${i}: missing or invalid "description" (must be a non-empty string)`, displayToUser: false };
+    }
+  }
+
+  // 6. Check no run already in progress
+  const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+  if (PreviewRunService.isRunning(context.previewSessionId)) {
+    return {
+      success: false,
+      message: 'A run is already in progress on this preview session. Wait for it to finish or cancel it first.',
+      displayToUser: false,
+    };
+  }
+
+  // 6.5 Pre-flight: log if preview page differs from start_url (informational only)
+  if (context.previewSessionId) {
+    try {
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      const page = sessionService.getPage(context.previewSessionId, context.userId);
+      if (page) {
+        const currentUrl = page.url();
+        try {
+          const currentPath = new URL(currentUrl).pathname;
+          const startPath = new URL(startUrl).pathname;
+          if (currentPath !== startPath) {
+            logger.info('[QA_TOOL] Draft steps: preview page differs from start_url, will navigate', {
+              currentUrl: currentUrl.substring(0, 200),
+              startUrl: startUrl.substring(0, 200),
+              previewSessionId: context.previewSessionId,
+            });
+          }
+        } catch { /* URL parse — non-blocking */ }
+      }
+    } catch { /* non-blocking */ }
+  }
+
+  // 7. Cache draft steps for cross-turn retrieval
+  if (context.chatSessionId) {
+    const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
+    DraftStepsCache.set(context.chatSessionId, { steps, startUrl, userId: context.userId });
+  }
+
+  // 8. Fire-and-forget: progress is streamed via WebSocket events
+  PreviewRunService.runStepsOnPreview(
+    context.previewSessionId,
+    steps,
+    startUrl,
+    context.userId,
+    { persistAppliedSteps: false }, // ephemeral — no DB writes
+  ).catch(err => {
+    logger.error('[QA_TOOL] Draft steps run failed', {
+      error: err instanceof Error ? err.message : String(err),
+      previewSessionId: context.previewSessionId,
+      stepCount: steps.length,
+    });
+  });
+
+  return {
+    success: true,
+    data: {
+      previewSessionId: context.previewSessionId,
+      stepCount: steps.length,
+      startUrl,
+      ephemeral: true,
+    },
+    message: `Started ephemeral run with ${steps.length} steps on the live preview. Steps are NOT saved — watch the browser for progress. Use qa_create_test_case to persist when satisfied.`,
+    displayToUser: true,
+  };
+}
+
+/**
  * qa_create_test_case — Create a new test case with steps
  *
  * Safety:
@@ -3335,6 +3465,14 @@ export async function handleCreateTestCase(
       userId: context.userId,
       stepCount: steps.length,
     });
+
+    // Clear draft steps cache — steps have been persisted to DB
+    if (context.chatSessionId) {
+      try {
+        const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
+        DraftStepsCache.delete(context.chatSessionId);
+      } catch { /* non-critical */ }
+    }
 
     return {
       success: true,
@@ -4195,6 +4333,8 @@ export async function handleManageFlow(
           name,
           description: args.description || undefined,
           flowType: args.flow_type || undefined,
+          // Flows created via QA tools are web UI by default; platform is derived from module tree.
+          platform: undefined,
           tags: args.tags || undefined,
           priority: args.priority || undefined,
           preconditions: args.preconditions || undefined,
