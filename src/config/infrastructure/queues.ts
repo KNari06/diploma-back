@@ -543,7 +543,12 @@ export class QueueManager {
   }
 
   /**
-   * Add mobile test run job to queue
+   * Add mobile test run job to queue with fair priority.
+   *
+   * Priority 1 (highest) → 10 (lowest).
+   * Users with fewer pending jobs get higher priority — prevents
+   * one user's 200-job regression from starving everyone else.
+   * Uses Redis INCR/DECR counter (O(1)) instead of scanning the wait list.
    */
   static async addMobileTestRunJob(jobData: MobileTestJobData) {
     try {
@@ -551,15 +556,26 @@ export class QueueManager {
         throw new Error('Redis is not available. Cannot add mobile test job to queue.');
       }
 
+      const priority = await this.calculateMobileFairPriority(jobData.userId);
+
       const job = await mobileTestRunQueue.add('mobile-test-run', jobData, {
-        priority: 5,
+        priority,
         jobId: `${jobData.testId}-${jobData.browser}`,
       });
+
+      // Increment pending counter for this user (non-fatal if fails)
+      try {
+        const redis = await mobileTestRunQueue.client;
+        const key = `${env.QUEUE_PREFIX}mobile:pending:${jobData.userId}`;
+        await redis.incr(key);
+        await redis.expire(key, 3600); // 1 hour TTL safety net
+      } catch { /* non-fatal */ }
 
       logQueueEvent('added', job.id!, {
         queue: QUEUE_NAMES.MOBILE_TEST_RUN,
         testId: jobData.testId,
         platform: jobData.platform,
+        priority,
       });
       return job;
     } catch (error) {
@@ -569,6 +585,45 @@ export class QueueManager {
         platform: jobData.platform,
       });
       throw handleQueueError(error);
+    }
+  }
+
+  /**
+   * Decrement the mobile pending counter for a user.
+   * Call this after a mobile test job completes or fails.
+   */
+  static async decrementMobilePendingCount(userId: string): Promise<void> {
+    try {
+      if (!redisAvailable) return;
+      const redis = await mobileTestRunQueue.client;
+      const key = `${env.QUEUE_PREFIX}mobile:pending:${userId}`;
+      const val = await redis.decr(key);
+      if (val <= 0) await redis.del(key); // Clean up zero/negative
+    } catch { /* non-fatal */ }
+  }
+
+  /**
+   * Fair priority for mobile test jobs.
+   * O(1) Redis lookup — reads user's pending job counter.
+   */
+  private static async calculateMobileFairPriority(userId: string): Promise<number> {
+    try {
+      const redis = await mobileTestRunQueue.client;
+      const key = `${env.QUEUE_PREFIX}mobile:pending:${userId}`;
+      const count = parseInt(await redis.get(key) || '0', 10);
+
+      // 0 pending → priority 1 (highest)
+      // 1-2 pending → priority 3
+      // 3-5 pending → priority 5
+      // 6-9 pending → priority 7
+      // 10+ pending → priority 10 (lowest)
+      if (count === 0) return 1;
+      if (count <= 2) return 3;
+      if (count <= 5) return 5;
+      if (count <= 9) return 7;
+      return 10;
+    } catch {
+      return 5; // Fallback to neutral priority
     }
   }
 

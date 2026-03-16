@@ -5,7 +5,7 @@
  */
 
 import { SnapshotCollector } from '@/agent/core/lite/collectors/snapshot-collector';
-import { logger } from '@/utils/core/logger';
+import { logger, logPerformance } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { randomUUID } from 'crypto';
 import { Browser, BrowserContext, Page, chromium } from 'playwright';
@@ -551,21 +551,43 @@ export class PreviewSessionService {
     if (!session) return null;
 
     try {
-      logger.info('[PREVIEW_SESSION] Refreshing page', { sessionId, url: session.page.url() });
+      const startMs = Date.now();
+      const currentUrl = session.page.url();
+      logger.info('[PREVIEW_SESSION] Refreshing page', { sessionId, url: currentUrl });
 
+      // Use domcontentloaded — networkidle can hang 5-10s on sites with analytics/WS
       await session.page.reload({
         waitUntil: 'domcontentloaded',
         timeout: 30000,
       });
 
-      // Optional: wait for network idle
-      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+      logPerformance('preview.refreshPage.reload', Date.now() - startMs, { sessionId, url: currentUrl });
 
-      return this.getSnapshot(sessionId, userId, {
-        force: true,
-        includeDomNodes: true,
-        onlyIfChanged: false
+      // Snapshot is collected asynchronously after returning to the caller so the
+      // WebSocket handler can emit pageActionResult immediately without blocking.
+      setImmediate(() => {
+        this.getSnapshot(sessionId, userId, {
+          force: true,
+          includeDomNodes: true,
+          onlyIfChanged: false,
+        }).catch((err) => {
+          logger.warn('[PREVIEW_SESSION] refreshPage snapshot failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       });
+
+      // Return a lightweight result so the handler can emit success right away.
+      // The full DOM update arrives via the DOM-update interval (500ms) once the
+      // snapshot is ready.
+      const url = session.page.url();
+      return {
+        url,
+        domVersion: session.domVersion,
+        pageSignature: session.lastPageSignature,
+        changed: url !== currentUrl,
+      };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Page refresh failed', {
         sessionId,
@@ -589,6 +611,7 @@ export class PreviewSessionService {
     if (!session) return null;
 
     try {
+      const startMs = Date.now();
       const previousUrl = session.page.url();
       logger.info('[PREVIEW_SESSION] Navigating back', { sessionId, currentUrl: previousUrl });
 
@@ -603,13 +626,29 @@ export class PreviewSessionService {
         return null;
       }
 
-      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+      const newUrl = session.page.url();
+      logPerformance('preview.goBack', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl });
 
-      return this.getSnapshot(sessionId, userId, {
-        force: true,
-        includeDomNodes: true,
-        onlyIfChanged: false,
+      // Kick off snapshot collection without blocking — caller gets result immediately
+      setImmediate(() => {
+        this.getSnapshot(sessionId, userId, {
+          force: true,
+          includeDomNodes: true,
+          onlyIfChanged: false,
+        }).catch((err) => {
+          logger.warn('[PREVIEW_SESSION] goBack snapshot failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       });
+
+      return {
+        url: newUrl,
+        domVersion: session.domVersion,
+        pageSignature: session.lastPageSignature,
+        changed: newUrl !== previousUrl,
+      };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] goBack failed', {
         sessionId,
@@ -633,6 +672,7 @@ export class PreviewSessionService {
     if (!session) return null;
 
     try {
+      const startMs = Date.now();
       const previousUrl = session.page.url();
       logger.info('[PREVIEW_SESSION] Navigating forward', { sessionId, currentUrl: previousUrl });
 
@@ -646,13 +686,29 @@ export class PreviewSessionService {
         return null;
       }
 
-      await session.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+      const newUrl = session.page.url();
+      logPerformance('preview.goForward', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl });
 
-      return this.getSnapshot(sessionId, userId, {
-        force: true,
-        includeDomNodes: true,
-        onlyIfChanged: false,
+      // Kick off snapshot collection without blocking — caller gets result immediately
+      setImmediate(() => {
+        this.getSnapshot(sessionId, userId, {
+          force: true,
+          includeDomNodes: true,
+          onlyIfChanged: false,
+        }).catch((err) => {
+          logger.warn('[PREVIEW_SESSION] goForward snapshot failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
       });
+
+      return {
+        url: newUrl,
+        domVersion: session.domVersion,
+        pageSignature: session.lastPageSignature,
+        changed: newUrl !== previousUrl,
+      };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] goForward failed', {
         sessionId,
@@ -1602,12 +1658,14 @@ export class PreviewSessionService {
         this.attachCrashHandler(newPage, previewSessionId);
         this.attachPageDownloadHandler(newPage, previewSessionId);
 
-        // V11: Wait for new page to be fully loaded before allowing snapshot collection.
-        // This prevents race conditions where DOM tick collects empty/partial DOM.
+        // Wait for new page DOM to be ready before allowing snapshot collection.
+        // domcontentloaded is sufficient — 'load' waits for all subresources (images,
+        // fonts, iframes) and can hang 8s+ on media-heavy pages. Halved timeout from
+        // 8s → 4s: timeout is acceptable, DOM is still usable for element resolution.
         try {
-          await newPage.waitForLoadState('load', { timeout: 8000 });
+          await newPage.waitForLoadState('domcontentloaded', { timeout: 4000 });
         } catch {
-          // Timeout is acceptable — page may have slow resources. DOM should still be ready.
+          // Timeout is acceptable — DOM should still be ready enough for snapshots.
         }
 
         // Reset snapshot state so next getSnapshot() forces a fresh collect
@@ -1766,15 +1824,34 @@ export class PreviewSessionService {
     if (!session) return null;
 
     try {
+      const startMs = Date.now();
       const safeUrl = sanitizeUrl(url);
+      logger.info('[PREVIEW_SESSION] Navigating to URL', { sessionId, url: safeUrl });
+
       await session.page.goto(safeUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
       });
 
-      await session.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => { });
+      const landedUrl = session.page.url();
+      logPerformance('preview.navigate', Date.now() - startMs, { sessionId, url: safeUrl, landed: landedUrl });
 
-      return this.getSnapshot(sessionId, userId, { force: true, includeDomNodes: true });
+      // Kick off snapshot collection without blocking
+      setImmediate(() => {
+        this.getSnapshot(sessionId, userId, { force: true, includeDomNodes: true }).catch((err) => {
+          logger.warn('[PREVIEW_SESSION] navigate snapshot failed', {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      });
+
+      return {
+        url: landedUrl,
+        domVersion: session.domVersion,
+        pageSignature: session.lastPageSignature,
+        changed: true,
+      };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Navigation failed', {
         sessionId,

@@ -313,7 +313,7 @@ const mobileTestRunWorker = new Worker(
   },
   {
     ...workerOptions,
-    concurrency: 2, // Mobile tests — limited by emulator/device count
+    concurrency: parseInt(process.env.MOBILE_WORKER_CONCURRENCY || '5', 10),
     lockDuration: 10 * 60 * 1000, // 10 min — mobile tests can be slow
     stalledInterval: 3 * 60 * 1000, // 3 min
     maxStalledCount: 1,
