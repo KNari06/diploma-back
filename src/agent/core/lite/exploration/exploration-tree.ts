@@ -220,19 +220,25 @@ export class ExplorationTree {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Normalize URL: remove query params, fragments, trailing slashes.
+   * Normalize URL: remove query params, trailing slashes.
+   * Preserves hash for hash-routed SPAs (e.g. /#/dashboard, /#/settings).
    * Groups same-origin paths together.
    */
   private normalizeUrl(url: string): string {
     try {
       const parsed = new URL(url);
-      // Keep origin + pathname, remove query + hash
       let pathname = parsed.pathname;
       // Remove trailing slash (except root)
       if (pathname.length > 1 && pathname.endsWith('/')) {
         pathname = pathname.slice(0, -1);
       }
-      return `${parsed.origin}${pathname}`;
+      // Preserve hash if it looks like a hash route (starts with #/ or #!)
+      // This enables proper dedup for hash-routed SPAs
+      const hash = parsed.hash;
+      const isHashRoute = hash && (/^#[/!]/.test(hash) || /^#\w+$/.test(hash));
+      return isHashRoute
+        ? `${parsed.origin}${pathname}${hash}`
+        : `${parsed.origin}${pathname}`;
     } catch {
       return url;
     }

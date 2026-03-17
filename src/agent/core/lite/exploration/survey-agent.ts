@@ -22,6 +22,7 @@ import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { VisualStability } from '../collectors/visual-stability';
 
 import type { LiteSnapshot, LiteElement } from '../lite-types';
 import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory, FlowPriority } from './types';
@@ -66,6 +67,23 @@ export class SurveyAgent {
     private readonly rateLimiter: RateLimiter,
   ) {
     this.tree = new ExplorationTree();
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // HELPERS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get full URL including hash fragment.
+   * Playwright's page.url() strips hash — we need window.location.href
+   * for hash-routed SPAs (e.g. /#/dashboard, /#/settings).
+   */
+  private async getFullUrl(): Promise<string> {
+    try {
+      return await this.page.evaluate(() => (globalThis as any).window.location.href);
+    } catch {
+      return this.page.url(); // Fallback
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -446,7 +464,7 @@ export class SurveyAgent {
           const w = (globalThis as any).window;
           w.scrollBy(0, w.innerHeight * 0.8);
         });
-        await this.page.waitForTimeout(800); // Wait for lazy load
+        await VisualStability.waitForStable(this.page, { checkInterval: 150, maxAttempts: 5 }); // Smart wait for lazy-loaded content
       } catch {
         break;
       }
@@ -467,6 +485,33 @@ export class SurveyAgent {
             allElements.set(el.ref, el);
           }
         }
+
+        // Check for scroll-triggered overlays (exit-intent, newsletter popups)
+        try {
+          const scrollObstacles = scrollSnapshot.obstacleFacts ?? [];
+          const hasBlockingOverlay = scrollObstacles.some(f =>
+            f.coverage > 0.2 || f.hintType === 'modal' || f.hintType === 'cookie_consent',
+          );
+          if (hasBlockingOverlay) {
+            logger.debug('[SURVEY] Scroll-triggered overlay detected, dismissing', {
+              obstacleCount: scrollObstacles.length,
+            });
+            await OverlayDismisser.dismissOverlays(this.page, {
+              maxPasses: 1,
+              maxTimeMs: 2000,
+              mode: 'survey',
+            });
+            // Re-collect after dismissal to get clean elements
+            const cleanScrollSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+            for (const el of cleanScrollSnapshot.elements) {
+              if (!allElements.has(el.ref)) {
+                allElements.set(el.ref, el);
+              }
+            }
+          }
+        } catch {
+          // Non-fatal: continue scrolling even if overlay handling fails
+        }
       } catch {
         break;
       }
@@ -476,10 +521,77 @@ export class SurveyAgent {
       prevElementCount = allElements.size;
     }
 
+    // Click "Load More" / "Show More" buttons to reveal additional content (max 2 clicks)
+    const LOAD_MORE_MAX_CLICKS = 2;
+    for (let lmClick = 0; lmClick < LOAD_MORE_MAX_CLICKS; lmClick++) {
+      try {
+        // Find a visible "Load More" button in the DOM
+        const loadMoreRef = await this.page.evaluate(() => {
+          const doc = (globalThis as any).document;
+          const win = (globalThis as any).window;
+          const candidates = doc.querySelectorAll('button, a, [role="button"]');
+          for (const el of candidates) {
+            const text = ((el as any).textContent || '').trim();
+            if (
+              /^(load\s*more|show\s*more|see\s*more|view\s*all|view\s*more|загрузить\s*ещ[её]|показать\s*ещ[её]|көбірек)$/i.test(text) &&
+              text.length < 30
+            ) {
+              const style = win.getComputedStyle(el);
+              if (style.display !== 'none' && style.visibility !== 'hidden') {
+                return (el as any).getAttribute('data-agent-ref') || null;
+              }
+            }
+          }
+          return null;
+        });
+
+        if (!loadMoreRef) break;
+
+        logger.debug('[SURVEY] Clicking "Load More" button', { ref: loadMoreRef, click: lmClick + 1 });
+        await this.page.locator(`[data-agent-ref="${loadMoreRef}"]`).click({ timeout: 2000 });
+        await VisualStability.waitForStable(this.page); // Smart wait for loaded content to render
+
+        // Navigation guard: if URL changed (including hash), go back and stop
+        if (await this.getFullUrl() !== initialSnapshot.url) {
+          await this.page.goBack({ timeout: 5000 }).catch(() => {});
+          await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 3 });
+          break;
+        }
+
+        // Collect new elements after Load More
+        const lmSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        let addedNew = false;
+        for (const el of lmSnapshot.elements) {
+          if (!allElements.has(el.ref)) {
+            allElements.set(el.ref, el);
+            addedNew = true;
+          }
+        }
+        if (!addedNew) break; // No new content → stop
+
+        // Dismiss overlays that may have appeared after loading more content
+        try {
+          const lmObstacles = lmSnapshot.obstacleFacts ?? [];
+          if (lmObstacles.some(f => f.coverage > 0.2 || f.hintType === 'modal')) {
+            await OverlayDismisser.dismissOverlays(this.page, {
+              maxPasses: 1,
+              maxTimeMs: 2000,
+              mode: 'survey',
+            });
+          }
+        } catch {
+          // Non-fatal
+        }
+      } catch {
+        // Non-fatal: stop Load More attempts on any error
+        break;
+      }
+    }
+
     // Scroll back to top
     try {
       await this.page.evaluate(() => (globalThis as any).window.scrollTo(0, 0));
-      await this.page.waitForTimeout(300);
+      await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 3 });
     } catch { /* ignore */ }
 
     // Return merged snapshot
@@ -765,16 +877,16 @@ export class SurveyAgent {
       const canProceed = await this.rateLimiter.acquireSlot('navigation');
       if (!canProceed) break;
 
-      const urlBefore = this.page.url();
+      const urlBefore = await this.getFullUrl(); // Use full URL to detect hash changes
       const contentHashBefore = this.tree.computeContentHashPublic(snapshot);
 
       try {
         await this.page.locator(`[data-agent-ref="${el.ref}"]`).click({ timeout: 3000 });
-        await this.page.waitForTimeout(1000); // Wait for SPA transition
+        await VisualStability.waitForStable(this.page); // Smart wait for SPA transition
 
-        const urlAfter = this.page.url();
+        const urlAfter = await this.getFullUrl(); // Use full URL to detect hash changes
 
-        // Case 1: URL changed → standard BFS will handle, go back
+        // Case 1: URL changed (including hash changes like #/route) → queue for BFS, go back
         if (urlAfter !== urlBefore) {
           this.rateLimiter.recordSuccess('target_site');
           if (!this.tree.isVisited(urlAfter) && this.isSameOrigin(urlAfter)) {
@@ -786,7 +898,7 @@ export class SurveyAgent {
             });
           }
           await this.page.goBack({ timeout: 5000 }).catch(() => {});
-          await this.page.waitForTimeout(500);
+          await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 4 });
           continue;
         }
 
@@ -853,7 +965,7 @@ export class SurveyAgent {
 
         // Navigate back (goBack or reload the original page)
         await this.page.goBack({ timeout: 5000 }).catch(() => {});
-        await this.page.waitForTimeout(500);
+        await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 4 });
       } catch {
         await this.page.keyboard.press('Escape').catch(() => {});
       }
@@ -935,12 +1047,10 @@ export class SurveyAgent {
       !el.disabled,
     );
 
-    if (triggers.length === 0) return [];
-
     const candidates = triggers.slice(0, SurveyAgent.MAX_HIDDEN_TRIGGERS);
     const results: Array<{ url: string; label: string }> = [];
     const seen = new Set<string>();
-    const urlBefore = this.page.url();
+    const urlBefore = await this.getFullUrl(); // Full URL with hash for hash-routed SPAs
 
     for (const trigger of candidates) {
       try {
@@ -948,12 +1058,12 @@ export class SurveyAgent {
 
         // Click the trigger
         await locator.click({ timeout: SurveyAgent.TRIGGER_INTERACTION_TIMEOUT_MS });
-        await this.page.waitForTimeout(500);
+        await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 4 });
 
-        // Navigation guard: if URL changed, go back and skip
-        if (this.page.url() !== urlBefore) {
+        // Navigation guard: if URL changed (including hash), go back and skip
+        if (await this.getFullUrl() !== urlBefore) {
           await this.page.goBack({ timeout: 5000 }).catch(() => {});
-          await this.page.waitForTimeout(300);
+          await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 3 });
           continue;
         }
 
@@ -1019,7 +1129,7 @@ export class SurveyAgent {
         } catch {
           await this.page.keyboard.press('Escape');
         }
-        await this.page.waitForTimeout(300);
+        await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 3 });
       } catch (error) {
         logger.debug('[SURVEY] discoverHiddenNavigation trigger failed', {
           ref: trigger.ref,
@@ -1027,7 +1137,185 @@ export class SurveyAgent {
         });
         // Try Escape to clean up any partial state
         await this.page.keyboard.press('Escape').catch(() => {});
-        await this.page.waitForTimeout(200);
+        await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 2 });
+      }
+    }
+
+    // ── Pass 2: Heuristic hamburger detection (non-ARIA) ──────────────────
+    // Only run if ARIA triggers yielded fewer than 2 links — avoids redundant
+    // work on well-structured sites that already expose menus via aria-expanded.
+    if (results.length < 2) {
+      try {
+        // Find hamburger-like buttons by class/aria-label/icon patterns (browser-side)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const heuristicTriggers: string[] = await this.page.evaluate(() => {
+          const doc = (globalThis as any).document;
+          const win = (globalThis as any).window;
+          const refs: string[] = [];
+
+          const allClickable = doc.querySelectorAll('button, [role="button"], a, div[tabindex], span[tabindex]');
+          for (const el of allClickable) {
+            const htmlEl = el as any;
+            const style = win.getComputedStyle(htmlEl);
+
+            // Must be visible
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+            const className = (htmlEl.className && typeof htmlEl.className === 'string') ? htmlEl.className.toLowerCase() : '';
+            const ariaLabel = (htmlEl.getAttribute('aria-label') || '').toLowerCase();
+            const ariaExpanded = htmlEl.getAttribute('aria-expanded');
+
+            // Skip elements already handled by ARIA pass
+            if (ariaExpanded !== null) continue;
+            // Skip form elements
+            const tag = htmlEl.tagName.toLowerCase();
+            if (['input', 'select', 'textarea'].includes(tag)) continue;
+
+            let isHamburger = false;
+
+            // Layer 1: CSS class detection
+            if (/burger|hamburger|menu[-_]?toggle|nav[-_]?toggle|mobile[-_]?menu|menu[-_]?btn|menu[-_]?button|nav[-_]?btn|toggle[-_]?nav/.test(className)) {
+              isHamburger = true;
+            }
+
+            // Layer 2: aria-label detection
+            if (!isHamburger && /\b(menu|navigation|hamburger|toggle\s*menu|open\s*menu|main\s*menu)\b/.test(ariaLabel)) {
+              isHamburger = true;
+            }
+
+            // Layer 3: Icon-only button heuristic (small button with SVG in header area)
+            if (!isHamburger) {
+              const text = ((htmlEl as any).textContent || '').trim();
+              const hasSvg = htmlEl.querySelector('svg') !== null;
+              const rect = htmlEl.getBoundingClientRect();
+              if (hasSvg && text.length <= 2 && rect.width < 80 && rect.width > 20 && rect.top < 100) {
+                isHamburger = true;
+              }
+            }
+
+            if (isHamburger) {
+              const ref = htmlEl.getAttribute('data-agent-ref');
+              if (ref) refs.push(ref);
+            }
+
+            if (refs.length >= 3) break; // Max 3 heuristic triggers
+          }
+
+          return refs;
+        });
+
+        if (heuristicTriggers.length > 0) {
+          logger.debug('[SURVEY] Found heuristic hamburger triggers', {
+            count: heuristicTriggers.length,
+          });
+        }
+
+        for (const triggerRef of heuristicTriggers) {
+          try {
+            const locator = this.page.locator(`[data-agent-ref="${triggerRef}"]`);
+
+            // Click to open
+            await locator.click({ timeout: SurveyAgent.TRIGGER_INTERACTION_TIMEOUT_MS });
+            await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 4 });
+
+            // Navigation guard (hash-aware)
+            if (await this.getFullUrl() !== urlBefore) {
+              await this.page.goBack({ timeout: 5000 }).catch(() => {});
+              await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 3 });
+              continue;
+            }
+
+            // Collect revealed links (4-strategy container cascade)
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const revealedLinks = await this.page.evaluate((ref: string) => {
+              const doc = (globalThis as any).document;
+              const win = globalThis as any;
+              const triggerEl = doc.querySelector(`[data-agent-ref="${ref}"]`);
+              if (!triggerEl) return [];
+
+              let container: any = null;
+
+              // Strategy 1: aria-controls
+              const controlsId = triggerEl.getAttribute('aria-controls');
+              if (controlsId) {
+                container = doc.getElementById(controlsId);
+              }
+
+              // Strategy 2: sibling element
+              if (!container) {
+                container = triggerEl.nextElementSibling;
+              }
+
+              // Strategy 3: parent nav
+              if (!container) {
+                container = triggerEl.closest('nav');
+              }
+
+              // Strategy 4: any nearby visible <nav> or [role="navigation"]
+              if (!container) {
+                const allNavs = doc.querySelectorAll('nav, [role="navigation"]');
+                for (const nav of allNavs) {
+                  const navStyle = win.getComputedStyle(nav);
+                  if (
+                    navStyle.display !== 'none' &&
+                    navStyle.visibility !== 'hidden' &&
+                    parseFloat(navStyle.opacity) > 0.5
+                  ) {
+                    container = nav;
+                    break;
+                  }
+                }
+              }
+
+              if (!container) return [];
+
+              const anchors = container.querySelectorAll('a[href]');
+              const links: Array<{ url: string; label: string }> = [];
+
+              for (const a of anchors) {
+                const href = a.href;
+                if (!href || href.startsWith('javascript:') || href === '#' || href.endsWith('#')) continue;
+                const aStyle = win.getComputedStyle(a);
+                if (aStyle.display === 'none' || aStyle.visibility === 'hidden') continue;
+
+                try {
+                  links.push({
+                    url: new URL(href).href,
+                    label: (a.textContent || '').trim().slice(0, 80) || a.getAttribute('aria-label') || '',
+                  });
+                } catch { /* invalid URL */ }
+              }
+
+              return links;
+            }, triggerRef);
+
+            for (const link of revealedLinks) {
+              if (!seen.has(link.url)) {
+                seen.add(link.url);
+                results.push(link);
+              }
+            }
+
+            // Close: click again to toggle off, fallback to Escape
+            try {
+              await locator.click({ timeout: SurveyAgent.TRIGGER_INTERACTION_TIMEOUT_MS });
+            } catch {
+              await this.page.keyboard.press('Escape');
+            }
+            await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 3 });
+          } catch (error) {
+            logger.debug('[SURVEY] Heuristic hamburger trigger failed', {
+              ref: triggerRef,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            await this.page.keyboard.press('Escape').catch(() => {});
+            await VisualStability.waitForStable(this.page, { checkInterval: 100, maxAttempts: 2 });
+          }
+        }
+      } catch (error) {
+        logger.debug('[SURVEY] Heuristic hamburger pass failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 

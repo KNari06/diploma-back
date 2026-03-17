@@ -2,17 +2,27 @@
  * VisualStability
  * Waits for DOM to stop mutating before taking snapshots
  * CRITICAL: Prevents snapshots during animations/transitions
+ *
+ * V6: Streaming/SSE awareness — detects monotonic low-rate growth
+ * and treats it as "stable enough" (e.g. chat feeds, live dashboards).
  */
 
 // @ts-nocheck - DOM types in page.evaluate() are available in browser context
 import { logger } from '@/utils/core/logger';
 import type { Page } from 'playwright';
 
+/** Max element delta per check to be considered "streaming stable" (not a bulk DOM mutation) */
+const STREAMING_DELTA_THRESHOLD = 20;
+
+/** How many consecutive monotonic-growth checks needed to declare "streaming stable" */
+const STREAMING_CONSECUTIVE_CHECKS = 2;
+
 export class VisualStability {
   /**
    * Wait for page to become visually stable
    * Checks element count at intervals - if unchanged, page is stable
    * ✅ FIX: Hard timeout (3 seconds max) to prevent hanging on infinite animations
+   * ✅ V6: Streaming/SSE awareness — monotonic low-rate growth = "streaming stable"
    *
    * @param page - Playwright page instance
    * @param options - Configuration options
@@ -44,6 +54,9 @@ export class VisualStability {
           return 'navigating';
         }
 
+        // V6: Track consecutive monotonic growth for streaming detection
+        let consecutiveMonotonicGrowth = 0;
+
         for (let i = 0; i < maxAttempts; i++) {
           await page.waitForTimeout(interval);
           const currCount = await this.getElementCount(page);
@@ -54,18 +67,26 @@ export class VisualStability {
           }
 
           if (currCount === prevCount) {
-            // logger.debug('[VISUAL_STABILITY] Page stable', {
-              // elementCount: currCount,
-            //   attempts: i + 1,
-            // });
             return 'stable'; // Stable - element count unchanged
           }
 
-          // logger.debug('[VISUAL_STABILITY] Page still mutating', {
-          //   prevCount,
-          //   currCount,
-          //   attempt: i + 1,
-          // });
+          // V6: Streaming/SSE detection — small monotonic growth pattern
+          const delta = currCount - prevCount;
+          if (delta > 0 && delta <= STREAMING_DELTA_THRESHOLD) {
+            consecutiveMonotonicGrowth++;
+            if (consecutiveMonotonicGrowth >= STREAMING_CONSECUTIVE_CHECKS) {
+              // Consistent small growth → streaming page, proceed with snapshot
+              logger.debug('[VISUAL_STABILITY] Streaming pattern detected, considering stable', {
+                consecutiveGrowth: consecutiveMonotonicGrowth,
+                lastDelta: delta,
+                elementCount: currCount,
+              });
+              return 'streaming-stable';
+            }
+          } else {
+            // Large jump or count decreased — not streaming, reset counter
+            consecutiveMonotonicGrowth = 0;
+          }
 
           prevCount = currCount;
         }
@@ -97,7 +118,7 @@ export class VisualStability {
   /**
    * Get current element count on page
    * Used as a simple proxy for DOM stability
-   * 
+   *
    * V5: Handle "Execution context was destroyed" gracefully during navigation
    * This error is expected when page navigates and is not a real failure.
    */

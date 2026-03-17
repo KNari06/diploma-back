@@ -970,6 +970,12 @@ export class PreviewSessionService {
 
     try {
       await session.page.setViewportSize({ width, height });
+
+      // Wait for CSS media queries and responsive reflow to complete before returning.
+      // Without this, emitSnapshotAlways() would collect DOM before layout has settled,
+      // returning stale boundingBox values and wrong element visibility flags.
+      await waitForDOMStability(session.page, 1500, 300);
+
       session.lastSeenAt = Date.now();
 
       logger.info('[PREVIEW_SESSION] Viewport changed', {

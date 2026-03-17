@@ -127,6 +127,7 @@ export function buildBranchDetectionPrompt(params: {
   completedFlowName: string;
   completedFlowGoal: string;
   existingFlowNames: string[];
+  overlaySummary?: string;
 }): string {
   const sections: string[] = [];
 
@@ -137,6 +138,10 @@ export function buildBranchDetectionPrompt(params: {
 
   if (params.existingFlowNames.length > 0) {
     sections.push(`ALREADY DISCOVERED FLOWS (do NOT duplicate these):\n${params.existingFlowNames.map((n) => `- ${n}`).join('\n')}`);
+  }
+
+  if (params.overlaySummary) {
+    sections.push(`OVERLAY STATUS:\n${params.overlaySummary}\nNote: Overlays listed above were auto-dismissed after flow completion. Do NOT create branch points from overlay elements (modals, toasts, banners).`);
   }
 
   sections.push(`CURRENT PAGE STATE:\n${params.formattedSnapshot}`);
@@ -156,6 +161,8 @@ RULES:
 - Do NOT list destructive flows (delete, cancel, remove)
 - Max 5 new entry points
 - Each must have a unique, descriptive name
+- IGNORE overlay/popup elements: Do NOT list "Close Modal", "Dismiss", "OK", "Got it" as testable flows — these are UI noise
+- Success confirmations, toasts, and post-action popups are NOT new testable flows
 
 RESPONSE FORMAT (JSON):
 {

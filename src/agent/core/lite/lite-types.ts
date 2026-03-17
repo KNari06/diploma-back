@@ -103,8 +103,8 @@ export interface LiteElement {
   // ═══════════════════════════════════════════════════════════════════════════
   // PHASE 4: Custom component interactivity signals
   // ═══════════════════════════════════════════════════════════════════════════
-  /** Framework event binding detected (React/Vue/Angular synthetic events) */
-  frameworkClickable?: 'react' | 'vue' | 'angular';
+  /** Framework event binding detected (React/Vue/Angular/Alpine/HTMX/Stimulus/Knockout/Qwik/jQuery/Svelte synthetic events) */
+  frameworkClickable?: 'react' | 'vue' | 'angular' | 'alpine' | 'htmx' | 'stimulus' | 'knockout' | 'qwik' | 'jquery' | 'svelte';
   /** Element has contenteditable="true" (rich text editor, inline text field) */
   isContentEditable?: boolean;
   /** Element has tabindex >= 0 (explicitly keyboard-focusable) */

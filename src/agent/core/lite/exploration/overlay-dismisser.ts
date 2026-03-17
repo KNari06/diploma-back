@@ -20,6 +20,7 @@
 import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { VisualStability } from '../collectors/visual-stability';
 import type { LiteSnapshot, ObstacleFact, ObstacleType } from '../lite-types';
 import {
   IRON_CLAD_MODAL_SELECTORS,
@@ -79,8 +80,14 @@ const MAX_LOADING_WAIT_ITERATIONS = 5;
 /** Delay per loading wait iteration (ms) */
 const LOADING_WAIT_DELAY_MS = 1000;
 
-/** Delay after dismiss action for UI to settle (ms) */
-const POST_DISMISS_SETTLE_MS = 300;
+/**
+ * Smart DOM settle after dismiss actions.
+ * Uses VisualStability (element count polling) instead of fixed delays.
+ * Fast config: 100ms interval × 3 attempts = 300ms typical, exits early when stable.
+ */
+async function waitForDomSettle(page: Page): Promise<void> {
+  await VisualStability.waitForStable(page, { checkInterval: 100, maxAttempts: 3 });
+}
 
 /**
  * Destructive action patterns — NEVER click buttons whose text matches these.
@@ -232,7 +239,7 @@ export class OverlayDismisser {
 
         // Re-collect snapshot for next pass (catches stacked modals)
         if (pass < maxPasses - 1) {
-          await page.waitForTimeout(POST_DISMISS_SETTLE_MS);
+          await waitForDomSettle(page);
           lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
         }
       }
@@ -241,7 +248,7 @@ export class OverlayDismisser {
       // Re-collect final snapshot if any dismissals happened
       const anyDismissed = attempts.some((a) => a.dismissed);
       if (anyDismissed) {
-        await page.waitForTimeout(POST_DISMISS_SETTLE_MS);
+        await waitForDomSettle(page);
         lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
       }
 
@@ -409,7 +416,7 @@ export class OverlayDismisser {
         case 'wait': {
           // Transient overlays (toast, loading) — already handled in Phase 0
           // Just wait a bit more if still present
-          await page.waitForTimeout(POST_DISMISS_SETTLE_MS);
+          await waitForDomSettle(page);
           const stillPresent = await this.isModalPresent(page);
           return { ...base, dismissed: !stillPresent, method: 'wait' };
         }
@@ -443,7 +450,7 @@ export class OverlayDismisser {
    */
   private static async tryEscape(page: Page): Promise<boolean> {
     await page.keyboard.press('Escape');
-    await page.waitForTimeout(POST_DISMISS_SETTLE_MS);
+    await waitForDomSettle(page);
     return !(await this.isModalPresent(page));
   }
 
@@ -555,7 +562,7 @@ export class OverlayDismisser {
       );
 
       if (clicked) {
-        await page.waitForTimeout(POST_DISMISS_SETTLE_MS);
+        await waitForDomSettle(page);
         return !(await this.isModalPresent(page));
       }
 
@@ -574,7 +581,7 @@ export class OverlayDismisser {
       const viewportHeight = await page.evaluate(() => (globalThis as any).window.innerHeight);
       // Click at the left edge, vertically centered — usually safe empty space
       await page.mouse.click(10, viewportHeight / 2);
-      await page.waitForTimeout(POST_DISMISS_SETTLE_MS);
+      await waitForDomSettle(page);
       return !(await this.isModalPresent(page));
     } catch {
       return false;

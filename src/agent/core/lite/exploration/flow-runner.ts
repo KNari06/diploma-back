@@ -988,6 +988,26 @@ export class FlowRunner {
     }
 
     try {
+      // Dismiss post-flow overlays (success modals, toasts) before branch detection snapshot
+      let branchOverlaySummary: string | null = null;
+      try {
+        const overlayResult = await OverlayDismisser.dismissOverlays(page, {
+          maxPasses: 2,
+          maxTimeMs: 3000,
+          mode: 'flow',
+        });
+        branchOverlaySummary = overlayResult.overlaySummary;
+        if (overlayResult.overlaysDetected > 0) {
+          logger.debug('[FLOW_RUNNER] Pre-branch-detection overlay cleanup', {
+            flow: completedEntry.name,
+            detected: overlayResult.overlaysDetected,
+            dismissed: overlayResult.attempts.filter(a => a.dismissed).length,
+          });
+        }
+      } catch {
+        // Non-fatal: proceed with snapshot even if overlay cleanup fails
+      }
+
       const snapshot = await SnapshotCollector.collect(page);
       const formattedSnapshot = SnapshotCollector.format(snapshot);
 
@@ -997,6 +1017,7 @@ export class FlowRunner {
         completedFlowName: completedEntry.name,
         completedFlowGoal: completedEntry.goal,
         existingFlowNames,
+        overlaySummary: branchOverlaySummary ?? undefined,
       });
 
       if (this.rateLimiter) await this.rateLimiter.acquireSlot('ai');

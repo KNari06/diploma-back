@@ -2177,25 +2177,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      // Emit updated viewport metadata
-      socket.emit('preview:viewport', {
-        previewSessionId: normalizedPreviewSessionId,
-        viewport: { width, height },
-        devicePixelRatio: 1,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Also broadcast to the preview room so all subscribers get the update
-      const room = createRoomName('preview', normalizedPreviewSessionId);
-      socket.to(room).emit('preview:viewport', {
-        previewSessionId: normalizedPreviewSessionId,
-        viewport: { width, height },
-        devicePixelRatio: 1,
-        timestamp: new Date().toISOString(),
-      });
-
-      // Force snapshot re-collect so frontend gets fresh domNodes/coordinates
+      // First: force snapshot re-collect with the new viewport already reflowed.
+      // This ensures domNodes/boundingBox are correct BEFORE the client rescales.
       await emitSnapshotAlways(socket, normalizedPreviewSessionId, ensuredUserId);
+
+      // Then: emit viewport metadata so client updates coordinate mapping
+      // with coordinates that match the freshly-collected snapshot.
+      const room = createRoomName('preview', normalizedPreviewSessionId);
+      const viewportPayload = {
+        previewSessionId: normalizedPreviewSessionId,
+        viewport: { width, height },
+        devicePixelRatio: 1,
+        timestamp: new Date().toISOString(),
+      };
+      socket.emit('preview:viewport', viewportPayload);
+      socket.to(room).emit('preview:viewport', viewportPayload);
     } catch (error) {
       logger.error('[WebSocket] Error in preview:viewport:set', {
         socketId: socket.id,

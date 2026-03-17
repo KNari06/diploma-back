@@ -745,6 +745,19 @@ export class SnapshotCollector {
           'dialog[open]', // Native <dialog> elements
           // ✅ FIX: Native accordion/disclosure (details/summary)
           'summary',
+
+          // ── Framework-specific selectors (Alpine.js, HTMX, Stimulus, Knockout, Qwik) ──
+          // Alpine.js: x-on:click, @click, x-data bound interactive elements
+          '[x-on\\:click]', '[@click]',
+          // HTMX: hx-get, hx-post, hx-put, hx-delete, hx-patch triggers
+          '[hx-get]', '[hx-post]', '[hx-put]', '[hx-delete]', '[hx-patch]',
+          '[data-hx-get]', '[data-hx-post]', // HTMX data-* variant
+          // Stimulus: data-action targets
+          '[data-action]',
+          // Knockout: data-bind with click/event handlers
+          '[data-bind]',
+          // Qwik: on:click / onClick$ event attributes
+          '[on\\:click]',
         ];
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -876,6 +889,82 @@ export class SnapshotCollector {
                     hasFrameworkBinding = true;
                   }
                 }
+              }
+              // ── Tier 1.5: Additional frameworks (Alpine.js, HTMX, Stimulus, Knockout, Qwik, jQuery, Svelte) ──
+              if (!hasFrameworkBinding) {
+                // Alpine.js: x-data, x-on:*, @click, @submit, x-model
+                if (el.hasAttribute('x-data') || el.hasAttribute('x-on:click') || el.hasAttribute('@click') ||
+                    el.hasAttribute('x-on:submit') || el.hasAttribute('@submit') || el.hasAttribute('x-model')) {
+                  hasFrameworkBinding = true;
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // HTMX: hx-get, hx-post, hx-put, hx-delete, hx-patch, hx-trigger (or data-hx-* variant)
+                if (el.hasAttribute('hx-get') || el.hasAttribute('hx-post') || el.hasAttribute('hx-put') ||
+                    el.hasAttribute('hx-delete') || el.hasAttribute('hx-patch') || el.hasAttribute('hx-trigger') ||
+                    el.hasAttribute('data-hx-get') || el.hasAttribute('data-hx-post')) {
+                  hasFrameworkBinding = true;
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // Stimulus: data-action contains event->controller#method pattern
+                const dataAction = el.getAttribute('data-action');
+                if (dataAction && /\w+->\w+#\w+/.test(dataAction)) {
+                  hasFrameworkBinding = true;
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // Knockout: data-bind with click/event/submit/value handlers
+                const dataBind = el.getAttribute('data-bind');
+                if (dataBind && /click\s*:|event\s*:|submit\s*:|value\s*:|checked\s*:/.test(dataBind)) {
+                  hasFrameworkBinding = true;
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // Qwik: on:click, onClick$, on:input, on:submit (QRL event handlers)
+                const attrs = el.attributes;
+                for (let a = 0; a < attrs.length; a++) {
+                  const attrName = attrs[a].name;
+                  if (/^on[:$]/.test(attrName) || /^on[A-Z]\w+\$/.test(attrName)) {
+                    hasFrameworkBinding = true;
+                    break;
+                  }
+                }
+              }
+              if (!hasFrameworkBinding) {
+                // jQuery: check jQuery._data(el, 'events') for direct handlers
+                // Also check ancestor delegation: jQuery events on parent with delegated selectors
+                try {
+                  // @ts-expect-error - jQuery available in browser context
+                  const jq = window.jQuery || window.$;
+                  if (jq && jq._data) {
+                    const events = jq._data(el, 'events');
+                    if (events && (events.click || events.mousedown || events.change || events.submit)) {
+                      hasFrameworkBinding = true;
+                    }
+                    // Check delegation: traverse up to 3 ancestors for delegated click handlers targeting this element
+                    if (!hasFrameworkBinding) {
+                      let ancestor = el.parentElement;
+                      for (let lvl = 0; lvl < 3 && ancestor; lvl++) {
+                        const parentEvents = jq._data(ancestor, 'events');
+                        if (parentEvents && parentEvents.click) {
+                          // Has delegated click on ancestor — include this element if it's interactive-looking
+                          const tag = el.tagName.toLowerCase();
+                          const role = (el.getAttribute('role') || '').toLowerCase();
+                          const cls = (el.getAttribute('class') || '').toLowerCase();
+                          if (tag === 'a' || tag === 'button' || tag === 'li' ||
+                              role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab' ||
+                              /btn|button|click|link|item|card/.test(cls) ||
+                              style.cursor === 'pointer') {
+                            hasFrameworkBinding = true;
+                            break;
+                          }
+                        }
+                        ancestor = ancestor.parentElement;
+                      }
+                    }
+                  }
+                } catch { /* jQuery not present — skip */ }
               }
             } catch { /* ignore */ }
 
@@ -1374,18 +1463,51 @@ export class SnapshotCollector {
               containerTitles: containerTitles.length > 0 ? containerTitles : undefined,
 
               // Phase 4: Custom component interactivity signals
-              // Detect framework event bindings (React/Vue/Angular synthetic events)
+              // Detect framework event bindings (React/Vue/Angular/Alpine/HTMX/Stimulus/Knockout/Qwik/jQuery/Svelte)
               frameworkClickable: (() => {
                 try {
+                  // React
                   const keys = Object.keys(el);
                   for (let k = 0; k < keys.length; k++) {
                     const key = keys[k];
                     if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$') || key.startsWith('__reactEvents$')) return 'react' as const;
                   }
+                  // Vue
                   // @ts-expect-error - Vue internals
                   if ((el as any).__vue__ || (el as any).__vueParentComponent) return 'vue' as const;
+                  // Angular
                   // @ts-expect-error - Angular internals
                   if ((el as any).__ngContext__ || (el as any)._ngHost) return 'angular' as const;
+                  // Alpine.js
+                  if (el.hasAttribute('x-data') || el.hasAttribute('x-on:click') || el.hasAttribute('@click')) return 'alpine' as const;
+                  // HTMX
+                  if (el.hasAttribute('hx-get') || el.hasAttribute('hx-post') || el.hasAttribute('hx-put') ||
+                      el.hasAttribute('hx-delete') || el.hasAttribute('hx-patch') ||
+                      el.hasAttribute('data-hx-get') || el.hasAttribute('data-hx-post')) return 'htmx' as const;
+                  // Stimulus
+                  const dataAction = el.getAttribute('data-action');
+                  if (dataAction && /\w+->\w+#\w+/.test(dataAction)) return 'stimulus' as const;
+                  // Knockout
+                  const dataBind = el.getAttribute('data-bind');
+                  if (dataBind && /click\s*:|event\s*:|submit\s*:|value\s*:/.test(dataBind)) return 'knockout' as const;
+                  // Qwik
+                  const attrs = el.attributes;
+                  for (let a = 0; a < attrs.length; a++) {
+                    const attrName = attrs[a].name;
+                    if (/^on[:$]/.test(attrName) || /^on[A-Z]\w+\$/.test(attrName)) return 'qwik' as const;
+                  }
+                  // jQuery
+                  try {
+                    // @ts-expect-error - jQuery available in browser context
+                    const jq = window.jQuery || window.$;
+                    if (jq && jq._data) {
+                      const events = jq._data(el, 'events');
+                      if (events && (events.click || events.mousedown || events.change || events.submit)) return 'jquery' as const;
+                    }
+                  } catch { /* jQuery not present */ }
+                  // Svelte: compiled away, check for __svelte_meta or class-based heuristic
+                  // @ts-expect-error - Svelte internals
+                  if ((el as any).__svelte_meta || (el as any).__s) return 'svelte' as const;
                 } catch { /* ignore */ }
                 return undefined;
               })(),
