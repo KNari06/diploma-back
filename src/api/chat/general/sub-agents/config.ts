@@ -118,4 +118,15 @@ export const SUB_AGENT_CONFIG: SubAgentConfig = {
     exactRepeatBlock: envNum(process.env.CHAT_LOOP_EXACT_REPEAT_BLOCK, 3),
     oscillationWindow: envNum(process.env.CHAT_LOOP_OSCILLATION_WINDOW, 6),
   },
+
+  // ── Step Validator (Editor Mode) ────────────────────────────────
+
+  /** Enable step validator. Set CHAT_STEP_VALIDATOR_ENABLED=false to disable. Opt-in by default. */
+  enableStepValidator: process.env.CHAT_STEP_VALIDATOR_ENABLED !== 'false',
+  /** Step validator timeout — fast model, should complete in <5s */
+  stepValidatorTimeoutMs: envNum(process.env.CHAT_STEP_VALIDATOR_TIMEOUT_MS, 8000),
+  /** Low temperature for consistent validation judgments */
+  stepValidatorTemperature: envNum(process.env.CHAT_STEP_VALIDATOR_TEMPERATURE, 0.1),
+  /** Step validator max output tokens — compact JSON response */
+  stepValidatorMaxTokens: envNum(process.env.CHAT_STEP_VALIDATOR_MAX_TOKENS, 600),
 };

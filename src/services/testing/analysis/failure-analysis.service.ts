@@ -97,29 +97,39 @@ export class FailureAnalysisService {
       errorDetails = errorDetails.substring(0, MAX_ERROR_SUMMARY_LENGTH) + '\n\n[... truncated]';
     }
 
-    // 6. Search workspace memory for similar past failures
-    const workspaceId = (test.projects as any)?.workspace_id;
+    // 6. Search intelligent_test_findings for similar past failures in same project
     let memoryContext = '';
-    if (workspaceId) {
-      try {
-        const { WorkspaceMemoryService } = await import('@/services/ai/memory/workspace-memory.service');
-        const similar = await WorkspaceMemoryService.searchMemory(
-          workspaceId,
-          errorDetails.slice(0, 200),
-          'bug_pattern',
-          3,
-          0.6
-        );
-        if (similar.length > 0) {
-          memoryContext = '\n\nPreviously seen similar issues in this workspace:\n' +
-            similar.map(m => `- ${m.content}`).join('\n');
-          logger.info('[FAILURE_ANALYSIS] Found similar past failures', {
-            testId, matchCount: similar.length,
+    try {
+      // Get all session IDs for this project (excluding current session)
+      const { data: projectSessions } = await supabaseAdmin
+        .from('intelligent_test_sessions')
+        .select('id')
+        .eq('project_id', test.project_id)
+        .limit(50);
+
+      const sessionIds = (projectSessions || [])
+        .map(s => s.id)
+        .filter(id => !session || id !== session.id);
+
+      if (sessionIds.length > 0) {
+        const { data: pastFindings } = await supabaseAdmin
+          .from('intelligent_test_findings')
+          .select('title, description, severity, finding_type')
+          .in('session_id', sessionIds)
+          .eq('finding_type', 'bug')
+          .order('found_at', { ascending: false })
+          .limit(5);
+
+        if (pastFindings && pastFindings.length > 0) {
+          memoryContext = '\n\nPreviously seen similar issues in this project:\n' +
+            pastFindings.map(f => `- [${f.severity}] ${f.title}: ${(f.description || '').slice(0, 150)}`).join('\n');
+          logger.info('[FAILURE_ANALYSIS] Found similar past failures in findings', {
+            testId, matchCount: pastFindings.length,
           });
         }
-      } catch {
-        // Non-fatal — continue analysis without memory context
       }
+    } catch {
+      // Non-fatal — continue analysis without memory context
     }
 
     // 7. Call LLM for analysis (with memory context if available)
@@ -140,7 +150,7 @@ export class FailureAnalysisService {
   private static async fetchTest(testId: string, userId: string): Promise<any> {
     const { data: test, error } = await supabaseAdmin
       .from('tests')
-      .select('id, status, url, goal, browsers, metadata, created_at, projects!inner(user_id, workspace_id)')
+      .select('id, project_id, status, url, goal, browsers, metadata, created_at, projects!inner(user_id, workspace_id)')
       .eq('id', testId)
       .single();
 

@@ -37,7 +37,7 @@ interface SkillSuggestion {
   category: string;
 }
 
-const VALID_CATEGORIES = ['fact', 'preference', 'test_pattern', 'bug_pattern', 'integration_context'];
+const VALID_CATEGORIES = ['fact', 'preference', 'test_pattern', 'integration_context'];
 
 export class SkillSuggestionService {
   /**
@@ -165,7 +165,7 @@ Return a JSON object:
   "isSkillWorthy": boolean,
   "key": "snake_case_key (max 50 chars, descriptive)",
   "content": "concise description of the knowledge (max 300 chars)",
-  "category": "fact | preference | test_pattern | bug_pattern | integration_context"
+  "category": "fact | preference | test_pattern | integration_context"
 }
 
 If NOT skill-worthy: { "isSkillWorthy": false, "key": "", "content": "", "category": "" }`,
@@ -257,7 +257,7 @@ Return a JSON object with a "suggestions" array (max 3 items):
     {
       "key": "snake_case_key (max 50 chars)",
       "content": "concise reusable knowledge (max 300 chars)",
-      "category": "test_pattern | bug_pattern | fact"
+      "category": "test_pattern | fact"
     }
   ]
 }

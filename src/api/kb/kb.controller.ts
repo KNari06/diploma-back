@@ -378,7 +378,7 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
       projectStats = await kbService.getKBStats(projectId);
     }
 
-    // Get skills count from workspace memory
+    // Get skills count from workspace memory (excluding bug_pattern — those belong in Patterns)
     let skillsTotal = 0;
     try {
       const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
@@ -386,7 +386,8 @@ export async function getKBStats(req: Request, res: Response): Promise<void> {
         const { count, error: countError } = await supabaseAdmin
           .from('workspace_memory')
           .select('id', { count: 'exact', head: true })
-          .eq('workspace_id', workspaceId);
+          .eq('workspace_id', workspaceId)
+          .neq('category', 'bug_pattern');
         if (!countError && count !== null) {
           skillsTotal = count;
         }
