@@ -7,7 +7,7 @@ import { Request, Response } from 'express';
 import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { logger } from '@/utils/core/logger';
-import type { HeatmapMetric, HeatmapRange, TimeSeriesInterval } from '@/services/analytics/analytics.types';
+import type { HeatmapMetric, HeatmapRange, TimeSeriesInterval, BugInsightsRange } from '@/services/analytics/analytics.types';
 
 /**
  * GET /api/v1/analytics/summary
@@ -495,6 +495,80 @@ export async function getTimeSeries(req: Request, res: Response): Promise<void> 
       success: false,
       error: 'Internal server error',
       message: 'Failed to retrieve time series data',
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+
+/**
+ * GET /api/v1/analytics/bug-insights
+ * Get bug insights (summary, trend, top recurring bugs)
+ */
+export async function getBugInsights(req: Request, res: Response): Promise<void> {
+  try {
+    const workspaceId = req.query.workspaceId as string;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId) {
+      res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'workspaceId is required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const role = await WorkspaceAccessService.getRole(userId, workspaceId);
+    if (!role) {
+      res.status(403).json({
+        success: false,
+        error: 'Access denied',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const range = (req.query.range as BugInsightsRange) || '30d';
+    const projectId = req.query.projectId as string | undefined;
+
+    if (!['7d', '30d', '90d'].includes(range)) {
+      res.status(400).json({
+        success: false,
+        error: 'Bad request',
+        message: 'range must be one of: 7d, 30d, 90d',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const data = await AnalyticsQueryService.getBugInsights(workspaceId, range, projectId);
+
+    res.json({
+      success: true,
+      data,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[ANALYTICS_API] Failed to get bug insights', {
+      error: error instanceof Error ? error.message : String(error),
+      workspaceId: req.query.workspaceId,
+      userId: req.user?.id,
+    });
+
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: 'Failed to retrieve bug insights',
       timestamp: new Date().toISOString(),
     });
   }

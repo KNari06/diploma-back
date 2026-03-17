@@ -1,5 +1,5 @@
 /**
- * Preview Run Service V10
+ * Preview Run Service V11
  * Orchestrates "Run from start" feature in AI editor
  * Executes steps sequentially in existing preview browser session
  * Features: cancel support, per-step progress tracking, stop-on-fail, best-effort persistence
@@ -8,6 +8,8 @@
  *     runSavedSteps() is now a thin wrapper that resolves steps from DB then delegates.
  * V10: Global run timeout (5 min), always emit completion (even pre-started failures),
  *      timeout guards on finally-block cleanup to prevent hanging.
+ * V11: Post-navigate page summary for better error context, step-level retry (1 attempt)
+ *      for transient failures (element not visible, click intercepted, DOM re-rendering).
  */
 
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
@@ -66,6 +68,68 @@ async function waitForDOMStability(page: import('playwright').Page, maxWaitMs = 
     // Page navigating/crashed — continue
   }
 }
+
+// ── Post-Navigate Page Summary (diagnostic context for better error messages) ──
+
+interface PageSummary {
+  url: string;
+  title: string;
+  headings: string[];   // Up to 5 h1/h2 headings
+  landmarks: string[];  // Up to 5 aria landmarks
+}
+
+/**
+ * Collect a lightweight page summary after navigation.
+ * Fast (~20-50ms): one page.title() + one page.evaluate(). Non-fatal on failure.
+ */
+async function collectLightPageSummary(page: import('playwright').Page): Promise<PageSummary> {
+  try {
+    const [title, summary] = await Promise.all([
+      page.title().catch(() => ''),
+      page.evaluate(() => {
+        // @ts-expect-error - document exists in browser context
+        const headingEls = document.querySelectorAll('h1, h2');
+        const headings = Array.from(headingEls)
+          .slice(0, 5)
+          .map((el: any) => el.textContent?.trim() || '')
+          .filter(Boolean);
+        // @ts-expect-error - document exists in browser context
+        const landmarkEls = document.querySelectorAll('nav, main, aside, header, footer, [role="navigation"], [role="main"]');
+        const landmarks = Array.from(landmarkEls)
+          .slice(0, 5)
+          .map((el: any) => {
+            const role = el.getAttribute('role') || el.tagName.toLowerCase();
+            const label = el.getAttribute('aria-label') || '';
+            return label ? `${role}(${label})` : role;
+          });
+        return { headings, landmarks };
+      }).catch(() => ({ headings: [] as string[], landmarks: [] as string[] })),
+    ]);
+    return { url: page.url(), title, headings: summary.headings, landmarks: summary.landmarks };
+  } catch {
+    return { url: page.url(), title: '', headings: [], landmarks: [] };
+  }
+}
+
+/**
+ * Augment a step error message with navigation page context.
+ * Gives the user actionable info: what page they're on and what content is visible.
+ */
+function augmentErrorWithPageContext(error: string, pageSummary: PageSummary | null): string {
+  if (!pageSummary) return error;
+  const parts = [`Page: ${pageSummary.url}`];
+  if (pageSummary.title) parts.push(`Title: "${pageSummary.title}"`);
+  if (pageSummary.headings.length > 0) parts.push(`Headings: ${pageSummary.headings.join(', ')}`);
+  return `${error}\n\n[Page context after last navigation]\n${parts.join('\n')}`;
+}
+
+// ── Step-Level Retry ───────────────────────────────────────────────────────
+
+/** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
+const NO_RETRY_STEP_TYPES = new Set(['navigate', 'ai_check', 'wait']);
+
+/** Wait time (ms) for DOM stability before retry attempt */
+const RETRY_SETTLE_MS = 1500;
 
 /**
  * Internal state for active runs
@@ -193,6 +257,7 @@ export class PreviewRunService {
    * @param userId - User ID (for session ownership + WebSocket)
    * @param options.intentTestCaseId - Optional test case ID (for trace metadata only when persistAppliedSteps is false)
    * @param options.persistAppliedSteps - If true, persist appliedStep to DB per step (default: false)
+   * @param options.chatSessionId - If provided, emit chat:processing:step events so Chat UI can show inline progress
    */
   static async runStepsOnPreview(
     previewSessionId: string,
@@ -202,12 +267,14 @@ export class PreviewRunService {
     options?: {
       intentTestCaseId?: string;
       persistAppliedSteps?: boolean;
+      chatSessionId?: string;
       /** @internal Skip ownership check when caller (runSavedSteps) already verified */
       _skipOwnershipCheck?: boolean;
     },
   ): Promise<void> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
+    const chatSessionId = options?.chatSessionId;
 
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
@@ -338,6 +405,8 @@ export class PreviewRunService {
 
       // Track URL for evidence shortcut policy (V7)
       let trackedUrl = session.page.url();
+      // Track page summary after navigation for better error context
+      let lastNavigationSummary: PageSummary | null = null;
       logger.debug('[PreviewRun] Starting run with URL tracking', {
         previewSessionId,
         initialUrl: trackedUrl,
@@ -411,6 +480,18 @@ export class PreviewRunService {
           timestamp: new Date().toISOString(),
         });
 
+        // Chat inline progress: emit processing step so Chat UI can show live step list
+        if (chatSessionId) {
+          webSocketService.emitChatProcessingStep(chatSessionId, {
+            sessionId: chatSessionId,
+            step: 'executing_test',
+            message: `Step ${i + 1}/${steps.length}: ${step.description}`,
+            progress: Math.round(((i) / steps.length) * 90), // 0–90% during execution
+            metadata: { stepIndex: i, stepId: step.id, stepType: step.type, totalSteps: steps.length },
+            timestamp: new Date().toISOString(),
+          });
+        }
+
         // Give a chance for a cancellation request to land before executing the step.
         await new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -422,8 +503,18 @@ export class PreviewRunService {
             remainingSteps: steps.length - i,
           });
 
-          // Mark this step and remaining as skipped
-          for (let j = i; j < steps.length; j++) {
+          // Current step already received 'running' — emit it as cancelled, then skip the rest
+          webSocketService.emitToUser(userId, 'preview:run:step', {
+            previewSessionId,
+            stepIndex: i,
+            stepId: step.id,
+            status: 'skipped',
+            action: step.type,
+            description: step.description,
+            timestamp: new Date().toISOString(),
+          });
+          skippedSteps++;
+          for (let j = i + 1; j < steps.length; j++) {
             const remaining = steps[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
@@ -439,39 +530,98 @@ export class PreviewRunService {
           break;
         }
 
+        // V7: URL-based evidence policy instead of blanket disableCaching
+        // If URL hasn't changed since last step, allow evidence shortcut
+        const currentUrl = session.page.url();
+        const urlChanged = currentUrl !== trackedUrl;
+        const disableCaching = urlChanged;
+
+        logger.debug('[PreviewRun] Evidence policy check', {
+          previewSessionId,
+          stepIndex: i,
+          stepId: step.id,
+          urlChanged,
+          disableCaching,
+          trackedUrl: trackedUrl.slice(0, 80),
+          currentUrl: currentUrl.slice(0, 80),
+        });
+
+        // Execute step via PreviewStepApplyService
+        const stepWithCachePolicy: IntentStep = {
+          ...step,
+          options: {
+            ...step.options,
+            disableCaching, // URL-based: true if URL changed, false if same page
+          },
+        };
+
         try {
-          // V7: URL-based evidence policy instead of blanket disableCaching
-          // If URL hasn't changed since last step, allow evidence shortcut
-          const currentUrl = session.page.url();
-          const urlChanged = currentUrl !== trackedUrl;
-          const disableCaching = urlChanged;
-
-          logger.debug('[PreviewRun] Evidence policy check', {
-            previewSessionId,
-            stepIndex: i,
-            stepId: step.id,
-            urlChanged,
-            disableCaching,
-            trackedUrl: trackedUrl.slice(0, 80),
-            currentUrl: currentUrl.slice(0, 80),
-          });
-
-          // Execute step via PreviewStepApplyService
-          const stepWithCachePolicy: IntentStep = {
-            ...step,
-            options: {
-              ...step.options,
-              disableCaching, // URL-based: true if URL changed, false if same page
-            },
-          };
-
           const stepStartMs = Date.now();
-          const result = await PreviewStepApplyService.applyStep({
+          let result = await PreviewStepApplyService.applyStep({
             previewSessionId,
             stepDraft: stepWithCachePolicy,
             userId,
             skipPostActionWait: true, // V12: Lookahead handles inter-step timing
           });
+          let retried = false;
+
+          // ── Step-level retry: one attempt with relaxed params on failure ──
+          if (
+            !result.success &&
+            !NO_RETRY_STEP_TYPES.has(step.type) &&
+            !runState.cancelled &&
+            !(result.error?.includes('session') || result.error?.includes('expired'))
+          ) {
+            logger.info('[PreviewRun] Attempting retry after failure', {
+              previewSessionId,
+              stepIndex: i,
+              stepId: step.id,
+              stepType: step.type,
+              originalError: result.error,
+            });
+
+            try {
+              await waitForDOMStability(session.page, RETRY_SETTLE_MS, 500);
+              result = await PreviewStepApplyService.applyStep({
+                previewSessionId,
+                stepDraft: {
+                  ...stepWithCachePolicy,
+                  options: {
+                    ...stepWithCachePolicy.options,
+                    disableCaching: true, // Force fresh element resolution
+                    timeout: Math.max(stepWithCachePolicy.options?.timeout || 10000, 15000),
+                  },
+                },
+                userId,
+                skipPostActionWait: true,
+              });
+              retried = true;
+
+              if (result.success) {
+                logger.info('[PreviewRun] Retry succeeded', {
+                  previewSessionId,
+                  stepIndex: i,
+                  stepId: step.id,
+                });
+              } else {
+                logger.warn('[PreviewRun] Retry also failed', {
+                  previewSessionId,
+                  stepIndex: i,
+                  stepId: step.id,
+                  retryError: result.error,
+                });
+              }
+            } catch (retryError) {
+              // Retry threw — fall through to original failure handling
+              retried = true;
+              logger.warn('[PreviewRun] Retry threw exception, using original failure', {
+                previewSessionId,
+                stepIndex: i,
+                error: retryError instanceof Error ? retryError.message : String(retryError),
+              });
+            }
+          }
+
           const stepDurationMs = Date.now() - stepStartMs;
 
           // Log slow steps for production diagnosis
@@ -510,6 +660,7 @@ export class PreviewRunService {
                 url: result.url,
                 attempts: result.attempts,
                 verified: result.verified,
+                retried,
               },
             });
 
@@ -523,11 +674,27 @@ export class PreviewRunService {
               description: step.description,
               timestamp: new Date().toISOString(),
               ...(result.appliedStep ? { appliedStep: result.appliedStep } : {}),
+              ...(retried ? { retried: true } : {}),
             });
             passedSteps++;
 
             // Update tracked URL after successful step execution
             trackedUrl = session.page.url();
+
+            // Collect page summary after navigation for better error context on subsequent failures
+            if (step.type === 'navigate' || result.urlChanged) {
+              try {
+                lastNavigationSummary = await collectLightPageSummary(session.page);
+                logger.debug('[PreviewRun] Post-navigation page summary collected', {
+                  previewSessionId,
+                  url: lastNavigationSummary.url,
+                  title: lastNavigationSummary.title,
+                  headingCount: lastNavigationSummary.headings.length,
+                });
+              } catch {
+                // Non-fatal — continue without summary
+              }
+            }
 
             // ─────────────────────────────────────────────────────────────────
             // Lookahead wait: check next step readiness before executing it
@@ -599,11 +766,19 @@ export class PreviewRunService {
               break;
             }
           } else {
+            // Augment error with page context if we navigated earlier
+            const errorWithContext = augmentErrorWithPageContext(
+              result.error || 'Step failed',
+              lastNavigationSummary,
+            );
+
             logger.warn('[PreviewRun] Step failed', {
               previewSessionId,
               stepIndex: i,
               stepId: step.id,
               error: result.error,
+              retried,
+              hasPageContext: !!lastNavigationSummary,
             });
 
             // Trace step_result (fail)
@@ -619,10 +794,12 @@ export class PreviewRunService {
                 status: 'fail',
                 error: result.error,
                 attempts: result.attempts,
+                retried,
+                pageContext: lastNavigationSummary || undefined,
               },
             });
 
-            // Emit fail
+            // Emit fail (with augmented error for better UX)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: i,
@@ -630,8 +807,9 @@ export class PreviewRunService {
               status: 'fail',
               action: step.type,
               description: step.description,
-              error: result.error,
+              error: errorWithContext,
               timestamp: new Date().toISOString(),
+              ...(retried ? { retried: true } : {}),
             });
             failedSteps++;
 
@@ -658,11 +836,115 @@ export class PreviewRunService {
             break; // Stop execution
           }
         } catch (stepError) {
+          const originalError = stepError instanceof Error ? stepError.message : String(stepError);
+          let exceptionRetried = false;
+
+          // ── Retry on exception (same logic as result.success === false) ──
+          if (
+            !NO_RETRY_STEP_TYPES.has(step.type) &&
+            !runState.cancelled &&
+            !originalError.includes('session') &&
+            !originalError.includes('expired')
+          ) {
+            logger.info('[PreviewRun] Exception during step, attempting retry', {
+              previewSessionId,
+              stepIndex: i,
+              stepId: step.id,
+              error: originalError,
+            });
+
+            try {
+              await waitForDOMStability(session.page, RETRY_SETTLE_MS, 500);
+              const retryResult = await PreviewStepApplyService.applyStep({
+                previewSessionId,
+                stepDraft: {
+                  ...stepWithCachePolicy,
+                  options: {
+                    ...stepWithCachePolicy.options,
+                    disableCaching: true,
+                    timeout: Math.max(stepWithCachePolicy.options?.timeout || 10000, 15000),
+                  },
+                },
+                userId,
+                skipPostActionWait: true,
+              });
+              exceptionRetried = true;
+
+              if (retryResult.success) {
+                logger.info('[PreviewRun] Exception retry succeeded', {
+                  previewSessionId,
+                  stepIndex: i,
+                  stepId: step.id,
+                });
+
+                // Trace step_result (pass after exception retry)
+                traceWriter.write({
+                  iteration: i,
+                  stage: 'step_execution',
+                  eventType: 'step_result',
+                  spanId: traceWriter.generateSpanId(),
+                  parentSpanId: stepSpanId,
+                  payload: {
+                    stepIndex: i,
+                    stepId: step.id,
+                    status: 'pass',
+                    urlChanged: retryResult.urlChanged,
+                    url: retryResult.url,
+                    retried: true,
+                  },
+                });
+
+                webSocketService.emitToUser(userId, 'preview:run:step', {
+                  previewSessionId,
+                  stepIndex: i,
+                  stepId: step.id,
+                  status: 'pass',
+                  action: step.type,
+                  description: step.description,
+                  timestamp: new Date().toISOString(),
+                  ...(retryResult.appliedStep ? { appliedStep: retryResult.appliedStep } : {}),
+                  retried: true,
+                });
+                passedSteps++;
+
+                trackedUrl = session.page.url();
+                if (step.type === 'navigate' || retryResult.urlChanged) {
+                  try { lastNavigationSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
+                }
+                if (retryResult.appliedStep) {
+                  enrichedSteps.set(retryResult.appliedStep.id, retryResult.appliedStep);
+                }
+
+                // Lookahead before next step (same as main success path)
+                if (i < steps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+                  const nextStep = steps[i + 1];
+                  try {
+                    await waitForStepReadiness(session.page, nextStep, {
+                      maxWaitMs: 5000,
+                      settleMs: 1500,
+                      autoWaitThresholdMs: 1000,
+                    });
+                  } catch {
+                    // Lookahead failure is non-fatal
+                  }
+                }
+
+                continue; // Skip to next step — recovered!
+              }
+            } catch {
+              // Retry also threw — fall through to original error handling
+              exceptionRetried = true;
+            }
+          }
+
+          const errorWithContext = augmentErrorWithPageContext(originalError, lastNavigationSummary);
+
           logger.error('[PreviewRun] Step exception', {
             previewSessionId,
             stepIndex: i,
             stepId: step.id,
-            error: stepError instanceof Error ? stepError.message : String(stepError),
+            error: originalError,
+            retried: exceptionRetried,
           });
 
           // Trace step_result (exception)
@@ -676,7 +958,9 @@ export class PreviewRunService {
               stepIndex: i,
               stepId: step.id,
               status: 'exception',
-              error: stepError instanceof Error ? stepError.message : String(stepError),
+              error: originalError,
+              retried: exceptionRetried,
+              pageContext: lastNavigationSummary || undefined,
             },
           });
 
@@ -688,8 +972,9 @@ export class PreviewRunService {
             status: 'fail',
             action: step.type,
             description: step.description,
-            error: stepError instanceof Error ? stepError.message : 'Unexpected error',
+            error: errorWithContext,
             timestamp: new Date().toISOString(),
+            ...(exceptionRetried ? { retried: true } : {}),
           });
           failedSteps++;
 
@@ -762,9 +1047,11 @@ export class PreviewRunService {
         });
       }
 
+      const runSuccess = failedSteps === 0 && !cancelled && !timedOut;
+
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
-        success: failedSteps === 0 && !cancelled && !timedOut,
+        success: runSuccess,
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
@@ -774,6 +1061,33 @@ export class PreviewRunService {
         duration,
         timestamp: new Date().toISOString(),
       });
+
+      // Chat inline progress: signal completion so Chat UI can render summary + Save button
+      if (chatSessionId) {
+        const summary = cancelled
+          ? `Run cancelled — ${passedSteps}/${steps.length} passed`
+          : runSuccess
+            ? `All ${steps.length} steps passed ✓`
+            : `${failedSteps} step(s) failed — ${passedSteps}/${steps.length} passed`;
+        webSocketService.emitChatProcessingStep(chatSessionId, {
+          sessionId: chatSessionId,
+          step: 'executing_test',
+          message: summary,
+          progress: 100,
+          metadata: {
+            draftRunCompleted: true,
+            success: runSuccess,
+            passedSteps,
+            failedSteps,
+            skippedSteps,
+            totalSteps: steps.length,
+            cancelled,
+            duration,
+            previewSessionId,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       // 8b. Batch-persist all enriched steps (single DB round-trip) — with timeout guard
       if (enrichedSteps.size > 0 && intentTestCaseId) {

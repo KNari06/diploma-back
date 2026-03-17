@@ -38,8 +38,8 @@ export const MEMORY_TOOLS: ChatCompletionTool[] = [
           },
           category: {
             type: 'string',
-            enum: ['fact', 'preference', 'test_pattern', 'bug_pattern', 'integration_context'],
-            description: 'Category: fact (general info), preference (user settings), test_pattern (common scenarios), bug_pattern (recurring issues), integration_context (Jira/GitHub context).',
+            enum: ['fact', 'preference', 'test_pattern', 'integration_context'],
+            description: 'Category: fact (general info), preference (user settings), test_pattern (common scenarios), integration_context (Jira/GitHub context).',
           },
         },
         required: ['key', 'content', 'category'],
@@ -60,7 +60,7 @@ export const MEMORY_TOOLS: ChatCompletionTool[] = [
           },
           category: {
             type: 'string',
-            enum: ['fact', 'preference', 'test_pattern', 'bug_pattern', 'integration_context'],
+            enum: ['fact', 'preference', 'test_pattern', 'integration_context'],
             description: 'Optional category filter to narrow search.',
           },
         },

@@ -8,6 +8,7 @@ import { createPlan, identifyParallelGroups } from './agents/planner-agent';
 import { executeTools } from './agents/executor-agent';
 import { formatResponse, generateSimpleResponse } from './agents/responder-agent';
 import { reviewExecution } from './agents/reviewer-agent';
+import { validateEditorSteps, extractStepsFromContent, formatValidationWarnings } from './agents/step-validator-agent';
 import { SubAgentSpawner } from './spawner';
 import type {
   ExecutorResult,
@@ -130,6 +131,7 @@ export class SubAgentPipeline {
       executorMs: 0,
       responderMs: 0,
       reviewerMs: 0,
+      stepValidatorMs: 0,
       totalMs: 0,
       routerClassification: '',
       routerConfidence: 0,
@@ -139,6 +141,7 @@ export class SubAgentPipeline {
       toolsExecuted: [],
       subExecutorsSpawned: 0,
       reviewerVerdict: '',
+      stepValidatorVerdict: '',
       retryCount: 0,
     };
 
@@ -357,6 +360,54 @@ export class SubAgentPipeline {
           totalToolRounds: executorResult.toolRounds,
           subExecutorIds: [],
         });
+
+        // ═══ STEP VALIDATOR (Editor Mode Only) ═══
+        // Validates AI-generated IntentSteps against DOM + user goal BEFORE showing to user.
+        // Only runs when: editor mode + executor produced steps as text + validator enabled.
+        if (
+          this.context.mode === 'editor' &&
+          SUB_AGENT_CONFIG.enableStepValidator &&
+          executorResult.assistantContent &&
+          extractStepsFromContent(executorResult.assistantContent) &&
+          !input.abortSignal?.aborted
+        ) {
+          this.emitStep('agent_reviewing', 'Validating generated steps...', PROGRESS.PIPELINE_REVIEWING);
+          const validatorStart = Date.now();
+          const validationResult = await validateEditorSteps(
+            input.userMessage,
+            executorResult.assistantContent,
+            contextMessages,
+            input.abortSignal
+          );
+          metrics.stepValidatorMs = Date.now() - validatorStart;
+
+          if (validationResult) {
+            metrics.stepValidatorVerdict = validationResult.verdict;
+
+            // Append validation warnings/suggestions to the assistant content
+            // so the responder includes them in the final message
+            const warnings = formatValidationWarnings(validationResult);
+            if (warnings) {
+              executorResult.assistantContent += '\n\n' + warnings;
+              // Update blackboard with enriched content
+              blackboard.setExecutionResults({
+                stepResults: new Map(),
+                ungroupedResults: executorResult.toolResults,
+                assistantContent: executorResult.assistantContent,
+                totalToolRounds: executorResult.toolRounds,
+                subExecutorIds: [],
+              });
+            }
+
+            logger.info('[SUB_AGENT_PIPELINE] Step validation complete', {
+              verdict: validationResult.verdict,
+              goalCoverage: validationResult.goalCoverage,
+              issueCount: validationResult.issues.length,
+              missingStepCount: validationResult.missingSteps.length,
+              durationMs: validationResult.durationMs,
+            });
+          }
+        }
 
         // Lightweight reviewer for single_tool: run if enabled and not aborted.
         // Uses the same reviewer — deterministic fast-paths handle most cases (0 tokens).

@@ -396,9 +396,30 @@ export async function handleGeneralChat(
     ? context as Record<string, any>
     : undefined;
 
+  // Resolve the correct previewSessionId for this user (client may send stale ID).
+  // Used for both page context and SkillContext downstream.
+  let resolvedPreviewSessionId = parsedContext?.previewSessionId as string | undefined;
+
   if (mode === 'editor' && parsedContext?.previewSessionId) {
+    // Pre-resolve: if client sessionId is not owned, find user's actual session
     try {
-      editorPageContext = await getPageContext(parsedContext.previewSessionId, userId);
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const previewService = getPreviewSessionService();
+      if (!previewService.isSessionOwned(parsedContext.previewSessionId, userId)) {
+        const userSession = previewService.getSessionForUser(userId);
+        if (userSession) {
+          logger.info('[GENERAL_CHAT] Client previewSessionId mismatch, resolved to user\'s active session', {
+            clientSessionId: parsedContext.previewSessionId,
+            resolvedSessionId: userSession.id,
+            userId: userId.substring(0, 8) + '...',
+          });
+          resolvedPreviewSessionId = userSession.id;
+        }
+      }
+    } catch { /* non-critical — getPageContext has its own fallback */ }
+
+    try {
+      editorPageContext = await getPageContext(resolvedPreviewSessionId!, userId);
 
       // Merge frontend-provided pageContext (test steps, title) if available
       if (editorPageContext && parsedContext.pageContext) {
@@ -414,21 +435,39 @@ export async function handleGeneralChat(
         });
       } else {
         logger.warn('[GENERAL_CHAT] Editor mode: getPageContext returned null', {
-          previewSessionId: parsedContext.previewSessionId,
+          previewSessionId: resolvedPreviewSessionId,
           userId: userId.substring(0, 8) + '...',
         });
       }
     } catch (editorError) {
       logger.warn('[GENERAL_CHAT] Editor mode: failed to get page context', {
         error: editorError instanceof Error ? editorError.message : String(editorError),
-        previewSessionId: parsedContext.previewSessionId,
+        previewSessionId: resolvedPreviewSessionId,
       });
     }
   } else if (mode === 'editor' && !parsedContext?.previewSessionId) {
-    logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
-      hasContext: !!parsedContext,
-      contextKeys: parsedContext ? Object.keys(parsedContext) : [],
-    });
+    // No previewSessionId from client — try to find user's active session
+    try {
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const userSession = getPreviewSessionService().getSessionForUser(userId);
+      if (userSession) {
+        resolvedPreviewSessionId = userSession.id;
+        logger.info('[GENERAL_CHAT] Editor mode: no client previewSessionId, resolved from user session', {
+          resolvedSessionId: userSession.id,
+        });
+        editorPageContext = await getPageContext(resolvedPreviewSessionId, userId);
+      } else {
+        logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context and no active session', {
+          hasContext: !!parsedContext,
+          contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+        });
+      }
+    } catch {
+      logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
+        hasContext: !!parsedContext,
+        contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+      });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -550,37 +589,60 @@ NEVER say "I can't view the page" or "I don't have the ability to view web pages
 When the user asks about elements on the page, ALWAYS refer to the page context provided to you.
 When referencing page elements, use their ref IDs (e.g., ref=b1, ref=i3).
 
-EDITOR MODE CAPABILITIES:
-1. **Generate test steps from live page (EPHEMERAL)**: You can SEE the current page DOM. When the user asks to create a test case or add steps, analyze the page elements (forms, buttons, inputs) and generate concrete test steps with real values based on what you see. SHOW the steps in chat — do NOT save to DB yet.
-2. **Run draft steps on preview (EPHEMERAL)**: Use qa_run_draft_steps to execute generated steps on the live preview browser WITHOUT saving to DB. Steps execute in real-time. Use this to test-drive steps before saving.
-3. **Save test case to DB**: Use qa_create_test_case ONLY when the user explicitly asks to save/persist (e.g., "save it", "сохрани", "looks good, save"). Pass the same steps you generated earlier.
-4. **Run saved test on preview**: Use qa_run_test with run_type="preview" and target_id=<test case ID> to run an already-saved test case on the live preview.
-5. **Single actions**: When the user asks to perform a SINGLE action (click, type, scroll, press, hover), this is an editor_action — execute it directly on the live preview.
-6. **Run/replay saved tests**: When the user asks to run or replay a saved test by name, this is run_regression. There is no platform_test in editor mode.
+YOU ARE A TEST AUTOMATION AGENT — NOT A TEXT ASSISTANT.
+When the user asks to "create a test", "make a test case", "test X flow" — your job is to:
+1. Analyze the page DOM and generate STRUCTURED IntentStep objects (not abstract text descriptions)
+2. Show the steps in chat in a clear numbered list
+3. Ask: "Shall I run these steps on the preview?" (or similar)
+4. When user confirms ("да", "запусти", "run it", "давай", "go") → call qa_run_draft_steps
 
-EPHEMERAL-FIRST RULE (CRITICAL):
-- When the user asks to "create a test" or "make me a test case", generate the steps and PRESENT them in chat. Do NOT call qa_create_test_case immediately.
-- Only call qa_create_test_case when the user explicitly asks to SAVE ("save it", "сохрани", "persist", "looks good, save").
-- If the user says "create and run" or "make a test and run it", generate steps + run them via qa_run_draft_steps. Do NOT save to DB.
+DO NOT just list abstract steps as text. Generate REAL structured steps with specific element references.
+DO NOT run steps without user confirmation — always ask first.
 
-TYPICAL EDITOR WORKFLOW (EPHEMERAL-FIRST):
-- User: "create a login test for this page" → You analyze DOM, generate steps, SHOW them in chat. Ask: "Want me to run these on the preview?"
-- User: "run it" / "прогани" / "запусти" / "давай" → You call qa_run_draft_steps(steps=[...from your previous message...], start_url="<current page URL>", confirm=true) → steps execute on live browser, NO DB write
-- User: "save it" / "сохрани" / "looks good" → You call qa_create_test_case with the same steps → saved to DB
-- User: "tweak step 3" / "change the email" → You modify the steps in memory and offer to re-run via qa_run_draft_steps
-- After a successful ephemeral run, remind the user: "The test ran successfully. Say 'save it' to persist this test case."
+STEP GENERATION FORMAT (CRITICAL):
+Every step MUST be a valid IntentStep object with these fields:
+- id: UUID string (generate with crypto.randomUUID() format, e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+- type: one of: navigate, click, type, select, hover, scroll, press, wait, ai_check, wait_for, upload, check, uncheck
+- description: SPECIFIC description using real element labels/text from the DOM (e.g., "Click the 'Войти' button", NOT "Click login button")
+- value: (for type/press/select) the actual value to enter
+- assertionText: (for ai_check) natural language assertion
 
-RUNNING ALREADY-SAVED TESTS:
-- If the user refers to a saved test by name or ID → use qa_run_test(run_type="preview", target_id=<ID>)
-- Short follow-ups like "прогани saved test" after listing tests = run on preview with qa_run_test
+EXAMPLE — user says "create a login test":
+You should generate steps like:
+[
+  {"id": "...", "type": "navigate", "description": "Navigate to login page", "value": "https://example.com/login"},
+  {"id": "...", "type": "type", "description": "Type username into the 'Email' input field", "value": "test@example.com"},
+  {"id": "...", "type": "type", "description": "Type password into the 'Password' input field", "value": "password123"},
+  {"id": "...", "type": "click", "description": "Click the 'Sign In' button"},
+  {"id": "...", "type": "ai_check", "description": "Verify successful login", "assertionText": "The user is logged in and can see the dashboard"}
+]
+Then ask the user: "Ready to run these on the preview?"
+When user says yes → call qa_run_draft_steps(steps=<above>, start_url="<current URL>", confirm=true).
 
-WHEN THE PAGE DOESN'T MATCH THE REQUEST:
-- If the user asks to test something NOT visible in the current DOM (e.g., "test booking" but page shows a landing page), tell them:
-  "I can see [what's actually on the page]. The booking form isn't on this page. Navigate to the booking page first, or I can add a 'navigate' step to get there."
-- NEVER invent elements that aren't in the page context. Only reference elements you can actually see.
-- You CAN include a "navigate" step as the first step to go to the right URL, then describe the remaining steps generically (they'll be resolved at runtime by the element resolver).
+EDITOR WORKFLOW:
+1. User asks to create/test something → Generate IntentSteps from DOM, show them in chat, ask "Shall I run these?"
+2. User confirms ("да" / "запусти" / "run it" / "давай") → call qa_run_draft_steps → steps execute on live browser
+3. User says "save it" / "сохрани" → call qa_create_test_case with the same steps → saved to DB
+4. User says "tweak step 3" → modify steps, show updated list, ask to re-run
+5. User refers to saved test → qa_run_test with run_type="preview"
+- EXCEPTION: If user explicitly says "create AND run" / "сделай и запусти" → generate + run immediately without asking
 
-When generating test steps, be SPECIFIC — use actual element labels, placeholders, and ref IDs from the page context. Don't generate generic steps like "enter username" — generate "type 'student' into input ref=i1 (Username field)".`;
+IMPORTANT RULES:
+- Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
+- After a successful run, tell the user: "Test ran successfully on the preview. Say 'save' to persist."
+- For SINGLE actions (one click, one type) → this is editor_action, handled automatically
+- For MULTI-STEP flows (login, checkout, search+filter) → generate IntentSteps, ask to run, then qa_run_draft_steps
+
+WHEN THE PAGE DOESN'T MATCH:
+- If the requested test target isn't on the current page, add a "navigate" step first to go to the right URL
+- The element resolver will resolve descriptions at runtime — you don't need exact selectors, just accurate descriptions
+- NEVER invent elements not visible in the DOM context
+
+STEP DESCRIPTIONS — BE SPECIFIC:
+- Use REAL element labels, placeholder text, and ref IDs from the page context
+- GOOD: "Click the 'Физика' subject filter button" / "Type 'test@mail.com' into the email input (ref=i3)"
+- BAD: "Click the subject button" / "Enter email address"
+- For elements not in the viewport, describe them by their text/label — the resolver will find them`;
   } else if (mode === 'editor' && !editorPageContext) {
     // Limited editor prompt — page context is NOT available (session expired, snapshot failed, etc.)
     systemPrompt += `\n\n--- EDITOR MODE (LIMITED) ---
@@ -774,7 +836,7 @@ You can still help with general questions, saved test cases, and test management
             chatSessionId,
             projectId,
             projectName,
-            previewSessionId: parsedContext?.previewSessionId,
+            previewSessionId: resolvedPreviewSessionId,
             mode: mode as 'lite' | 'pro' | 'editor' | undefined,
           });
 
@@ -925,7 +987,7 @@ You can still help with general questions, saved test cases, and test management
           workspaceId: workspaceId!,
           chatSessionId,
           projectId,
-          previewSessionId: parsedContext?.previewSessionId,
+          previewSessionId: resolvedPreviewSessionId,
           mode: mode as 'lite' | 'pro' | 'editor' | undefined,
         };
 

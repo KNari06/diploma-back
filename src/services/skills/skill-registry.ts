@@ -213,10 +213,13 @@ class SkillRegistryClass {
       const sessionId = context.chatSessionId;
 
       if (args.confirm === true) {
-        // Exception: qa_run_test in editor mode — user explicitly runs from editor
-        const isEditorPreview = toolName === 'qa_run_test' && context.mode === 'editor' && !!context.previewSessionId;
+        // Exception: editor mode tools — user explicitly runs from editor, skip confirm roundtrip
+        const isEditorBypass =
+          (toolName === 'qa_run_test' || toolName === 'qa_run_draft_steps')
+          && context.mode === 'editor'
+          && !!context.previewSessionId;
 
-        if (!isEditorPreview && sessionId) {
+        if (!isEditorBypass && sessionId) {
           const previewKey = `${sessionId}:${toolName}`;
           const previewTs = this.confirmPreviews.get(previewKey);
 

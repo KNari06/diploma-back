@@ -172,6 +172,7 @@ export async function executeToolsForStep(
         chatSessionId: context.chatSessionId,
         projectId: context.projectId,
         previewSessionId: context.previewSessionId,
+        mode: context.mode,
       };
 
       const callResult = await executeTool({

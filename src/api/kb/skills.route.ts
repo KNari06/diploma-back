@@ -26,7 +26,7 @@ router.use(requireAuth);
  *         name: category
  *         schema:
  *           type: string
- *           enum: [fact, preference, test_pattern, bug_pattern, integration_context]
+ *           enum: [fact, preference, test_pattern, integration_context]
  *       - in: query
  *         name: source
  *         schema:
@@ -73,7 +73,7 @@ router.get('/', skillsController.listSkills);
  *                 maxLength: 5000
  *               category:
  *                 type: string
- *                 enum: [fact, preference, test_pattern, bug_pattern, integration_context]
+ *                 enum: [fact, preference, test_pattern, integration_context]
  *               workspaceId:
  *                 type: string
  *                 format: uuid
@@ -112,7 +112,7 @@ router.post('/', skillsController.createSkill);
  *                       type: string
  *                     category:
  *                       type: string
- *                       enum: [fact, preference, test_pattern, bug_pattern, integration_context]
+ *                       enum: [fact, preference, test_pattern, integration_context]
  *               workspaceId:
  *                 type: string
  *                 format: uuid
@@ -198,7 +198,7 @@ router.get('/:id', skillsController.getSkill);
  *                 type: string
  *               category:
  *                 type: string
- *                 enum: [fact, preference, test_pattern, bug_pattern, integration_context]
+ *                 enum: [fact, preference, test_pattern, integration_context]
  *     responses:
  *       200:
  *         description: Skill updated

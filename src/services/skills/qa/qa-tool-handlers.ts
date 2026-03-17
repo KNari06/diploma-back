@@ -2717,8 +2717,9 @@ export async function handleGetAgentHealth(
 // WRITE TOOLS (require confirm=true from agent after user approval)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Allowed IntentStep action types — reject anything else */
-const VALID_STEP_TYPES = new Set([
+/** Allowed IntentStep action types — reject anything else.
+ *  Exported so step-validator-agent can reuse instead of hardcoding. */
+export const VALID_STEP_TYPES = new Set([
   'type', 'click', 'wait', 'assert', 'navigate', 'select', 'hover',
   'scroll', 'press', 'check', 'uncheck', 'toggle', 'open', 'close',
   'ai_check', 'wait_for', 'upload',
@@ -3365,7 +3366,7 @@ export async function handleRunDraftSteps(
     steps,
     startUrl,
     context.userId,
-    { persistAppliedSteps: false }, // ephemeral — no DB writes
+    { persistAppliedSteps: false, chatSessionId: context.chatSessionId ?? undefined }, // ephemeral — no DB writes
   ).catch(err => {
     logger.error('[QA_TOOL] Draft steps run failed', {
       error: err instanceof Error ? err.message : String(err),

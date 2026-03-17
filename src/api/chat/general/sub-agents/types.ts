@@ -90,6 +90,7 @@ export interface PipelineMetrics {
   executorMs: number;
   responderMs: number;
   reviewerMs: number;
+  stepValidatorMs: number;
   totalMs: number;
   routerClassification: string;
   routerConfidence: number;
@@ -99,6 +100,7 @@ export interface PipelineMetrics {
   toolsExecuted: string[];
   subExecutorsSpawned: number;
   reviewerVerdict: string;
+  stepValidatorVerdict: string;
   retryCount: number;
 }
 
@@ -248,6 +250,17 @@ export interface SubAgentConfig {
     /** Window size for A→B→A→B oscillation detection */
     oscillationWindow: number;
   };
+
+  // ── Step Validator (Editor Mode) ────────────────────────────────
+
+  /** Enable step validator for editor mode (validates generated IntentSteps before showing to user) */
+  enableStepValidator: boolean;
+  /** Step validator timeout (ms) */
+  stepValidatorTimeoutMs: number;
+  /** Step validator temperature (low for consistent validation) */
+  stepValidatorTemperature: number;
+  /** Step validator max output tokens */
+  stepValidatorMaxTokens: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -356,4 +369,53 @@ export interface SubExecutorResult extends ExecutorResult {
   stepNumber: number;
   /** Unique sub-executor ID */
   executorId: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP VALIDATOR TYPES — Editor mode pre-validation of generated IntentSteps
+// Validates AI-generated steps against DOM + user goal BEFORE showing to user.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Issue found in a specific generated step
+ */
+export interface StepValidationIssue {
+  /** 0-based index of the step with the issue */
+  stepIndex: number;
+  /** Severity: error = must fix, warning = acceptable but suboptimal */
+  severity: 'error' | 'warning';
+  /** Brief description of the problem */
+  issue: string;
+  /** How to fix it */
+  suggestion: string;
+}
+
+/**
+ * A step that the validator suggests adding
+ */
+export interface MissingStep {
+  /** IntentStep type (navigate, click, type, ai_check, etc.) */
+  type: string;
+  /** Description of what the step should do */
+  description: string;
+  /** Insert after this step index (-1 for beginning) */
+  insertAfter: number;
+}
+
+/**
+ * Step validator output — validates generated IntentSteps before showing to user
+ */
+export interface StepValidationResult {
+  /** Verdict: valid = show to user as-is, needs_fix = executor should regenerate or fix */
+  verdict: 'valid' | 'needs_fix';
+  /** How well the steps cover the user's goal (0-1) */
+  goalCoverage: number;
+  /** Per-step issues found */
+  issues: StepValidationIssue[];
+  /** Steps that should be added */
+  missingSteps: MissingStep[];
+  /** Brief overall assessment */
+  reasoning: string;
+  /** Duration of validation in ms */
+  durationMs: number;
 }

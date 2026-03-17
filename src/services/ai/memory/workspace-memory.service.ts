@@ -382,11 +382,11 @@ export class WorkspaceMemoryService {
         return '';
       }
 
-      // Combine, deduplicate, and filter out disabled memories
+      // Combine, deduplicate, filter out disabled memories and bug_pattern (moved to Patterns)
       const allMemories = [...(topAccessed || []), ...(recent || [])];
       const uniqueMemories = (Array.from(
         new Map(allMemories.map(m => [m.id, m])).values()
-      ) as WorkspaceMemory[]).filter(m => m.metadata?.enabled !== false);
+      ) as WorkspaceMemory[]).filter(m => m.metadata?.enabled !== false && m.category !== 'bug_pattern');
 
       // Sort by relevance (access_count + recency bonus)
       // Recency: newer memories get a higher score (created_at timestamp as bonus)

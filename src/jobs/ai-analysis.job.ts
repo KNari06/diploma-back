@@ -575,8 +575,9 @@ export class AIAnalysisJobHandler {
   }
 
   /**
-   * Auto-extract bug patterns from AI analysis into workspace memory.
-   * Non-fatal: if memory write fails, analysis still completes.
+   * Auto-extract bug patterns from AI analysis into intelligent_test_findings.
+   * Stored as patterns (not skills) so they appear in the Patterns tab of KB.
+   * Non-fatal: if write fails, analysis still completes.
    */
   private static async extractBugPatterns(
     testId: string,
@@ -587,32 +588,49 @@ export class AIAnalysisJobHandler {
       const bugs = aiSummary?.bugs;
       if (!bugs || !Array.isArray(bugs) || bugs.length === 0) return;
 
-      const workspaceId = testResult?.tests?.projects?.workspace_id;
-      const userId = testResult?.tests?.user_id;
-      if (!workspaceId || !userId) return;
+      const projectId = testResult?.tests?.project_id;
+      if (!projectId) return;
 
-      const { WorkspaceMemoryService } = await import('@/services/ai/memory/workspace-memory.service');
+      // Find the intelligent_test_session for this test to link findings
+      const { data: session } = await dbAdminService.supabaseAdmin
+        .from('intelligent_test_sessions')
+        .select('id')
+        .eq('test_id', testId)
+        .order('started_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
 
-      for (const bug of bugs.slice(0, 3)) {
-        const severity = bug.severity || 'medium';
-        const title = bug.title || bug.description?.slice(0, 80) || 'Unknown bug';
-        const key = `bug_${testId.slice(0, 8)}_${title.replace(/\W+/g, '_').slice(0, 30).toLowerCase()}`;
-
-        await WorkspaceMemoryService.writeMemory(
-          workspaceId,
-          userId,
-          key,
-          `[${severity}] ${title}: ${(bug.description || '').slice(0, 200)}`,
-          'bug_pattern',
-          'auto_extracted',
-          { testId, severity, confidence: aiSummary.confidence || 0.7 }
-        );
+      if (!session) {
+        logger.debug('[AI-ANALYSIS] No intelligent session found for bug pattern extraction', { testId });
+        return;
       }
 
-      logger.info('[AI-ANALYSIS] Bug patterns extracted to workspace memory', {
+      const findings = bugs.slice(0, 3).map((bug: any) => ({
+        session_id: session.id,
+        finding_type: 'bug' as const,
+        severity: bug.severity || 'medium',
+        title: (bug.title || bug.description?.slice(0, 80) || 'Unknown bug').slice(0, 255),
+        description: (bug.description || '').slice(0, 2000),
+        ai_confidence: aiSummary.confidence || 0.7,
+        status: 'new' as const,
+      }));
+
+      const { error: insertError } = await dbAdminService.supabaseAdmin
+        .from('intelligent_test_findings')
+        .insert(findings);
+
+      if (insertError) {
+        logger.warn('[AI-ANALYSIS] Failed to insert bug pattern findings', {
+          testId,
+          error: insertError.message,
+        });
+        return;
+      }
+
+      logger.info('[AI-ANALYSIS] Bug patterns extracted to intelligent_test_findings', {
         testId,
-        patternsCount: Math.min(bugs.length, 3),
-        workspaceId,
+        patternsCount: findings.length,
+        sessionId: session.id,
       });
     } catch (error) {
       logger.warn('[AI-ANALYSIS] Failed to extract bug patterns (non-fatal)', {

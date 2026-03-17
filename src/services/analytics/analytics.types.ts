@@ -180,3 +180,44 @@ export type HeatmapRange = '30d' | '90d' | '365d';
  * Time series interval
  */
 export type TimeSeriesInterval = '1m' | '5m' | '15m' | '1h' | '1d';
+
+/**
+ * Bug insights time range
+ */
+export type BugInsightsRange = '7d' | '30d' | '90d';
+
+/**
+ * Single bug trend data point (daily bucket)
+ */
+export interface BugTrendPoint {
+  date: string; // YYYY-MM-DD
+  count: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
+
+/**
+ * Top recurring bug entry
+ */
+export interface RecurringBug {
+  title: string;
+  count: number;
+  severity: string;
+  lastSeen: string;
+}
+
+/**
+ * Bug insights response
+ */
+export interface BugInsightsData {
+  summary: {
+    totalBugs: number;
+    bySeverity: { critical: number; high: number; medium: number; low: number };
+    newBugs: number;
+    fixedBugs: number;
+  };
+  trend: BugTrendPoint[];
+  topRecurring: RecurringBug[];
+}

@@ -643,7 +643,7 @@ QA Tools (31 read-only + 11 write tools for project QA data):
   prompt += `\n\n--- MEMORY TOOLS ---
 
 Persistent workspace memory (use naturally during conversation):
-• **remember_fact**: Save facts/preferences ("My Jira project is PROJ"). Categories: fact, preference, test_pattern, bug_pattern, integration_context
+• **remember_fact**: Save facts/preferences ("My Jira project is PROJ"). Categories: fact, preference, test_pattern, integration_context
 • **search_memory**: Recall saved facts ("What was the default Jira project?")
 • **forget_fact**: Remove outdated info ("Forget the old API URL")`;
 

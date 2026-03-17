@@ -25,7 +25,7 @@ import { logger } from '@/utils/core/logger';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const VALID_CATEGORIES: MemoryCategory[] = ['fact', 'preference', 'test_pattern', 'bug_pattern', 'integration_context'];
+const VALID_CATEGORIES: MemoryCategory[] = ['fact', 'preference', 'test_pattern', 'integration_context'];
 
 /**
  * Resolve workspaceId — use provided value or fall back to user's active workspace
@@ -93,6 +93,9 @@ export async function listSkills(req: Request, res: Response): Promise<void> {
     const workspaceId = await resolveWorkspaceId(userId, req.query.workspaceId as string);
 
     let skills = await WorkspaceMemoryService.listMemories(workspaceId, category, limit);
+
+    // Exclude bug_pattern — these belong in Patterns tab (intelligent_test_findings), not Skills
+    skills = skills.filter(s => s.category !== 'bug_pattern');
 
     // Post-filter by source
     if (source) {
