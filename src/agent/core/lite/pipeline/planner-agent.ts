@@ -15,7 +15,7 @@
  * Writes to Blackboard:
  * - plan — ordered steps for Executor
  *
- * Single LLM call: ~500 tokens output, gpt-4.1, temperature 0.15
+ * Single LLM call: ~500 tokens output, gpt-5.4-mini, temperature 0.15
  *
  * ═══════════════════════════════════════════════════════════════════════════
  */

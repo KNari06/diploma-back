@@ -6,7 +6,7 @@
  * Performs breadth-first traversal of the web application:
  *   1. Navigate to entry URL
  *   2. Collect DOM snapshot + screenshot
- *   3. Call AI (GPT-4o vision) to classify page and discover entry points
+ *   3. Call AI (GPT-4.1 vision) to classify page and discover entry points
  *   4. Navigate to each main navigation link (BFS)
  *   5. Build ExplorationTree with all discovered flows
  *
@@ -32,6 +32,7 @@ import {
   buildPageClassificationPrompt,
   parsePageClassificationResponse,
 } from './prompts';
+import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser';
 
 /** Max navigation links to follow per page */
 const MAX_NAV_LINKS_PER_PAGE = 8;
@@ -252,7 +253,31 @@ export class SurveyAgent {
         // Ignore timeout
       }
 
+      // Dismiss overlays (cookie consent, promo modals, etc.) BEFORE snapshot
+      let overlayCleanupResult: OverlayCleanupResult | null = null;
+      try {
+        overlayCleanupResult = await OverlayDismisser.dismissOverlays(this.page, {
+          maxPasses: 3,
+          maxTimeMs: 8000,
+          mode: 'survey',
+        });
+        if (overlayCleanupResult.overlaysDetected > 0) {
+          logger.info('[SURVEY] Overlay cleanup completed', {
+            url: item.url,
+            detected: overlayCleanupResult.overlaysDetected,
+            dismissed: overlayCleanupResult.attempts.filter(a => a.dismissed).length,
+            durationMs: overlayCleanupResult.durationMs,
+          });
+        }
+      } catch (error) {
+        logger.warn('[SURVEY] Overlay cleanup failed (non-fatal)', {
+          url: item.url,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+
       // Collect snapshot (with scroll to trigger lazy-loaded content)
+      // If overlay dismisser returned a clean snapshot, use it as base to avoid double collection
       let snapshot;
       try {
         snapshot = await this.collectFullSnapshot();
@@ -300,6 +325,7 @@ export class SurveyAgent {
         await this.page.title(),
         item.depth,
         snapshot,
+        overlayCleanupResult?.overlaySummary ?? undefined,
       );
 
       // Create entry points with unique IDs
@@ -474,6 +500,7 @@ export class SurveyAgent {
     title: string,
     depth: number,
     snapshot?: LiteSnapshot,
+    overlaySummary?: string,
   ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
     // Early exit if AI is degraded — use heuristic fallback
     if (this.rateLimiter.isDegraded('openai')) {
@@ -495,6 +522,7 @@ export class SurveyAgent {
       hasCredentials: !!this.config.credentials,
       depth,
       structureSummary,
+      overlaySummary,
     });
 
     try {
@@ -1038,6 +1066,14 @@ export class SurveyAgent {
     if (forms.length > 0) {
       sections.push(`FORMS (${forms.length}): ${forms.slice(0, 5).map(f =>
         `[${f.ref}] "${f.name}"`).join(', ')}`);
+    }
+
+    // Overlay/obstacle info from snapshot (feeds AI even when overlay cleanup is skipped)
+    if (snapshot.obstacleFacts && snapshot.obstacleFacts.length > 0) {
+      const overlayLines = snapshot.obstacleFacts.slice(0, 8).map(f =>
+        `[${f.ref}] ${f.hintType || 'unknown'} z=${f.zIndex} coverage=${(f.coverage * 100).toFixed(1)}% "${(f.textPreview || '').slice(0, 60)}"`,
+      );
+      sections.push(`POSITIONED OVERLAYS (${snapshot.obstacleFacts.length}):\n  ${overlayLines.join('\n  ')}`);
     }
 
     return sections.join('\n');

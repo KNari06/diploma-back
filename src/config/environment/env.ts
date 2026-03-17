@@ -80,7 +80,7 @@ const envSchema = z.object({
 
   // OpenAI
   OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
-  OPENAI_MODEL: z.string().default('gpt-4.1'),
+  OPENAI_MODEL: z.string().default('gpt-5.4-mini'),
   OPENAI_MODEL_FAST: z.string().default('gpt-4.1-mini'),
   OPENAI_MAX_TOKENS: z.string().transform(Number).default('4000'),
 

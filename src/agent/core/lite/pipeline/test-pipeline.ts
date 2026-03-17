@@ -349,7 +349,7 @@ export class TestPipeline {
         // Reads: Blackboard (goal, plan, rounds, snapshot)
         // Writes: Blackboard (review, insights)
         // When Executor says mark_done → Reviewer calls auditDone()
-        // via GoalDetector (gpt-4.1) before accepting.
+        // via GoalDetector (gpt-5.4-mini) before accepting.
         // ════════════════════════════════════════════════════════════
 
         // IMPORTANT: Only set phase to 'reviewing' if NOT 'done'.

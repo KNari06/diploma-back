@@ -99,7 +99,7 @@ export class LiteEngine {
   private readonly MAX_RATE_LIMIT_BACKOFF_MS = 30000; // 30s max
   private readonly MAX_CONSECUTIVE_RATE_LIMITS = 3; // After 3 → blockedInfo
 
-  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-4.1 calls)
+  // ✅ NEW: Audit cooldown tracking (prevents expensive repeated gpt-5.4-mini calls)
   // Cooldown: 3 iterations after auditor returns isDone=false
   // Bypass: if state hash or URL changes significantly
   private auditCooldownRemaining = 0;
@@ -2005,7 +2005,7 @@ export class LiteEngine {
         // POST-CREDENTIAL-FILL GOAL CHECK
         // When auto-fill completed (state='done') and URL redirected away from auth page,
         // the heuristic often fails because URL/form signals no longer match.
-        // In this case, proactively call auditor (gpt-4.1) to verify login success.
+        // In this case, proactively call auditor (gpt-5.4-mini) to verify login success.
         // ═══════════════════════════════════════════════════════════════════════
         if (
           this.credentialFillState === 'done' &&
@@ -2188,7 +2188,7 @@ export class LiteEngine {
             });
             // Continue to next iteration without completing
           } else {
-            // Call auditor (gpt-4.1) for final validation
+            // Call auditor (gpt-5.4-mini) for final validation
             logger.info('[LITE_ENGINE] Heuristic claims done, calling auditor for validation', {
               testId: this.config.testId,
               progressScore: Math.round(goalCheck.progressScore * 100) + '%',
@@ -2707,7 +2707,7 @@ export class LiteEngine {
 
         // Check terminal states
         if (decision.done) {
-          // ✅ NEW: Validate AI's done claim with auditor (gpt-4.1) with cooldown
+          // ✅ NEW: Validate AI's done claim with auditor (gpt-5.4-mini) with cooldown
           const shouldCallAuditorForAIDone = this.auditCooldownRemaining === 0;
 
           if (!shouldCallAuditorForAIDone) {

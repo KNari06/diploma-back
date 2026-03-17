@@ -11,7 +11,7 @@ import { logger } from '@/utils/core/logger';
 // ═══════════════════════════════════════════════════════════════════════════
 
 export const AI_PRICING = {
-  'gpt-4.1': {
+  'gpt-5.4-mini': {
     input: 0.002 / 1000,   // $0.002 per 1K input tokens
     output: 0.008 / 1000,   // $0.008 per 1K output tokens
   },
@@ -27,8 +27,8 @@ export const AI_PRICING = {
     input: 0.0001 / 1000,  // $0.10 per 1M input tokens
     output: 0.0004 / 1000, // $0.40 per 1M output tokens
   },
-  'gpt-4.1-vision': {
-    input: 0.002 / 1000,   // Same as gpt-4.1
+  'gpt-5.4-mini-vision': {
+    input: 0.002 / 1000,   // Same as gpt-5.4-mini
     output: 0.008 / 1000,
     imageBase: 0.00425,     // Base cost per image
     imagePerTile: 0.00085,  // Cost per 512x512 tile
@@ -52,7 +52,7 @@ export const DEFAULT_BUDGET: BudgetConfig = {
   maxCostPerTest: 1.0,          // $1 per test
   warningThreshold: 0.7,        // Warning at 70%
   adaptiveMode: true,           // Enable adaptive mode
-  fallbackModel: 'gpt-4.1-mini', // Fallback to cheap model
+  fallbackModel: 'gpt-4.1-mini', // Fallback to cheapest model
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -180,10 +180,10 @@ export class AICostManager {
     cost += outputTokens * pricing.output;
 
     // Image costs (for vision models)
-    if (model === 'gpt-4.1-vision' && imageCount > 0) {
+    if (model === 'gpt-5.4-mini-vision' && imageCount > 0) {
       // Estimate tiles (assume 1024x1024 images = 4 tiles)
       const tilesPerImage = 4;
-      const visionPricing = AI_PRICING['gpt-4.1-vision'];
+      const visionPricing = AI_PRICING['gpt-5.4-mini-vision'];
       cost += imageCount * (visionPricing.imageBase + tilesPerImage * visionPricing.imagePerTile);
     }
 

@@ -88,7 +88,7 @@ const MIN_HEURISTIC_CONFIDENCE = 0.5;
 
 /**
  * Result of final auditor validation (Phase 2)
- * Uses gpt-4.1 for high-accuracy "is done" check
+ * Uses gpt-5.4-mini for high-accuracy "is done" check
  */
 export interface AuditorResult {
   isDone: boolean;
@@ -1575,11 +1575,11 @@ Respond with JSON ONLY.`;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // FINAL AUDITOR (Phase 2: gpt-4.1 for high-accuracy "is done" validation)
+  // FINAL AUDITOR (Phase 2: gpt-5.4-mini for high-accuracy "is done" validation)
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Final auditor validation using gpt-4.1
+   * Final auditor validation using gpt-5.4-mini
    * Called when heuristic claims goal is done to confirm or reject
    * Uses stronger model for higher accuracy ("decides fate of the test")
    *
@@ -1662,7 +1662,7 @@ Respond with JSON ONLY:
 Be STRICT - only set isDone=true if there is clear success evidence.
 Set isBlocked=true ONLY for hard blocks (captcha, 2FA, phone verification).`;
 
-    logger.info('[GOAL_DETECTOR] Calling auditor (gpt-4.1)', {
+    logger.info('[GOAL_DETECTOR] Calling auditor (gpt-5.4-mini)', {
       testId: this.testId,
       goal: context.goal.slice(0, 50),
       url: context.page.url,

@@ -2137,6 +2137,73 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // Handle viewport change (live resize)
+  socket.on('preview:viewport:set', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, width, height } = data;
+
+      if (!previewSessionId || !Number.isFinite(width) || !Number.isFinite(height)) {
+        socket.emit('error', {
+          code: 'INVALID_INPUT',
+          message: 'Missing previewSessionId or invalid dimensions',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const normalizedPreviewSessionId = String(previewSessionId).trim();
+
+      logger.info('[WebSocket] Viewport change requested', {
+        socketId: socket.id,
+        previewSessionId: normalizedPreviewSessionId,
+        width,
+        height,
+      });
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.setViewport(normalizedPreviewSessionId, ensuredUserId, width, height);
+
+      if (!result.success) {
+        socket.emit('error', {
+          code: 'VIEWPORT_CHANGE_FAILED',
+          message: result.error || 'Failed to change viewport',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Emit updated viewport metadata
+      socket.emit('preview:viewport', {
+        previewSessionId: normalizedPreviewSessionId,
+        viewport: { width, height },
+        devicePixelRatio: 1,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Also broadcast to the preview room so all subscribers get the update
+      const room = createRoomName('preview', normalizedPreviewSessionId);
+      socket.to(room).emit('preview:viewport', {
+        previewSessionId: normalizedPreviewSessionId,
+        viewport: { width, height },
+        devicePixelRatio: 1,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Force snapshot re-collect so frontend gets fresh domNodes/coordinates
+      await emitSnapshotAlways(socket, normalizedPreviewSessionId, ensuredUserId);
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:viewport:set', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Handle page refresh
   socket.on('preview:page:refresh', async (data) => {
     try {

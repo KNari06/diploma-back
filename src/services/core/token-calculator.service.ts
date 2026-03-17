@@ -28,7 +28,7 @@ export const TOKENS_PER_CREDIT = 562.5;
  * OpenAI API pricing (November 2024)
  */
 export const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  'gpt-4.1': {
+  'gpt-5.4-mini': {
     input: 0.002, // $ per 1K tokens
     output: 0.008, // $ per 1K tokens
   },

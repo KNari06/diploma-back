@@ -742,6 +742,10 @@ export interface PreviewSession {
 export interface StartPreviewRequest {
   projectId: string;
   startUrl: string;
+  viewport?: {
+    width: number;
+    height: number;
+  };
 }
 
 /**

@@ -26,6 +26,7 @@ import { ActionExecutor } from '../execution/action-executor';
 import { NetworkTracker } from '../collectors/network-tracker';
 import { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { OverlayDismisser } from './overlay-dismisser';
 
 import type {
   ExplorationConfig,
@@ -369,6 +370,24 @@ export class FlowRunner {
         }
       }
 
+      // 2.5. Dismiss overlays before pipeline starts (cookie consent, promo modals)
+      try {
+        const overlayResult = await OverlayDismisser.dismissOverlays(page, {
+          maxPasses: 2,
+          maxTimeMs: 5000,
+          mode: 'flow',
+        });
+        if (overlayResult.overlaysDetected > 0) {
+          logger.info('[FLOW_RUNNER] Pre-pipeline overlay cleanup', {
+            flow: entryPoint.name,
+            detected: overlayResult.overlaysDetected,
+            dismissed: overlayResult.attempts.filter(a => a.dismissed).length,
+          });
+        }
+      } catch {
+        // Non-fatal: pipeline's ActionExecutor has its own reactive modal handling
+      }
+
       // 3. Create pipeline integrations
       const actionExecutor = new ActionExecutor(page);
       const networkTracker = new NetworkTracker(page);
@@ -606,6 +625,15 @@ export class FlowRunner {
           throw navError;
         }
       }
+
+      // Dismiss overlays before login attempt (cookie consent may block login form)
+      try {
+        await OverlayDismisser.dismissOverlays(page, {
+          maxPasses: 2,
+          maxTimeMs: 5000,
+          mode: 'flow',
+        });
+      } catch { /* non-fatal */ }
 
       const actionExecutor = new ActionExecutor(page);
       const networkTracker = new NetworkTracker(page);

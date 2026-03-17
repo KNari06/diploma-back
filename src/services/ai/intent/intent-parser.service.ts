@@ -874,7 +874,7 @@ function logContextUsage(context?: IntentParserContext): void {
 function getModelConfiguration(): { model: string; supportsJsonMode: boolean } {
     const model = AI_MODELS.fast;
 
-    // JSON mode supported by: gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, o1, o3, gemini-2.5-flash, gemini-2.5-flash-lite
+    // JSON mode supported by: gpt-5.4-mini, gpt-4.1-mini, gpt-4.1-nano, o1, o3, gemini-2.5-flash, gemini-2.5-flash-lite
     // Since we always use supported models (from env or default), JSON mode is always supported
     const supportsJsonMode = true;
 
