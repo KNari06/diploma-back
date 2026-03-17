@@ -24,6 +24,10 @@ import type {
   TimeSeriesData,
   TimeSeriesPoint,
   TimeSeriesInterval,
+  BugInsightsData,
+  BugInsightsRange,
+  BugTrendPoint,
+  RecurringBug,
 } from './analytics.types';
 
 // Analytics results change at most once per regression run, so 2 minutes is plenty.
@@ -1043,5 +1047,162 @@ export class AnalyticsQueryService {
       default:
         return 60000;
     }
+  }
+
+  /**
+   * Get bug insights data (summary, trend, top recurring)
+   */
+  static async getBugInsights(
+    workspaceId: string,
+    range: BugInsightsRange = '30d',
+    projectId?: string
+  ): Promise<BugInsightsData> {
+    const cKey = `qait:cache:analytics:bug-insights:${workspaceId}:${projectId ?? '*'}:${range}`;
+    const cached = await cache.get<BugInsightsData>(cKey);
+    if (cached) return cached;
+
+    try {
+      const projectIds = await this.getWorkspaceProjectIds(workspaceId, projectId);
+
+      if (projectIds.length === 0) {
+        return this.getEmptyBugInsights();
+      }
+
+      // Calculate date range
+      const rangeDays = range === '7d' ? 7 : range === '30d' ? 30 : 90;
+      const since = new Date();
+      since.setDate(since.getDate() - rangeDays);
+
+      // Get session IDs for these projects
+      const { data: sessions } = await supabaseAdmin
+        .from('intelligent_test_sessions')
+        .select('id, started_at')
+        .in('project_id', projectIds)
+        .gte('started_at', since.toISOString());
+
+      const sessionIds = (sessions || []).map(s => s.id);
+
+      if (sessionIds.length === 0) {
+        return this.getEmptyBugInsights();
+      }
+
+      // Fetch all bug findings for these sessions
+      const { data: findings } = await supabaseAdmin
+        .from('intelligent_test_findings')
+        .select('id, title, severity, status, found_at')
+        .in('session_id', sessionIds)
+        .eq('finding_type', 'bug');
+
+      const bugs = findings || [];
+
+      if (bugs.length === 0) {
+        return this.getEmptyBugInsights();
+      }
+
+      // --- Summary ---
+      const totalBugs = bugs.length;
+      const bySeverity = { critical: 0, high: 0, medium: 0, low: 0 };
+      let newBugs = 0;
+      let fixedBugs = 0;
+
+      for (const bug of bugs) {
+        const sev = bug.severity as keyof typeof bySeverity;
+        if (sev in bySeverity) bySeverity[sev]++;
+        if (bug.status === 'new') newBugs++;
+        if (bug.status === 'fixed' || bug.status === 'resolved') fixedBugs++;
+      }
+
+      // --- Trend (daily buckets with zero-fill) ---
+      const dailyBuckets = new Map<string, { count: number; critical: number; high: number; medium: number; low: number }>();
+
+      for (const bug of bugs) {
+        const dateKey = bug.found_at ? bug.found_at.split('T')[0] : null;
+        if (!dateKey) continue;
+
+        if (!dailyBuckets.has(dateKey)) {
+          dailyBuckets.set(dateKey, { count: 0, critical: 0, high: 0, medium: 0, low: 0 });
+        }
+        const bucket = dailyBuckets.get(dateKey)!;
+        bucket.count++;
+        const sev = bug.severity as 'critical' | 'high' | 'medium' | 'low';
+        if (sev in bucket) bucket[sev]++;
+      }
+
+      // Zero-fill all days in range
+      const trend: BugTrendPoint[] = [];
+      const now = new Date();
+      for (let i = rangeDays; i >= 0; i--) {
+        const d = new Date(now);
+        d.setDate(d.getDate() - i);
+        const dateKey = d.toISOString().split('T')[0];
+        const bucket = dailyBuckets.get(dateKey);
+        trend.push({
+          date: dateKey,
+          count: bucket?.count || 0,
+          critical: bucket?.critical || 0,
+          high: bucket?.high || 0,
+          medium: bucket?.medium || 0,
+          low: bucket?.low || 0,
+        });
+      }
+
+      // --- Top recurring (group by normalized title) ---
+      const titleMap = new Map<string, { count: number; severity: string; lastSeen: string }>();
+      for (const bug of bugs) {
+        const normalized = (bug.title || '').toLowerCase().trim();
+        if (!normalized) continue;
+
+        const existing = titleMap.get(normalized);
+        if (existing) {
+          existing.count++;
+          if (bug.found_at && bug.found_at > existing.lastSeen) {
+            existing.lastSeen = bug.found_at;
+            existing.severity = bug.severity;
+          }
+        } else {
+          titleMap.set(normalized, {
+            count: 1,
+            severity: bug.severity,
+            lastSeen: bug.found_at || '',
+          });
+        }
+      }
+
+      const topRecurring: RecurringBug[] = Array.from(titleMap.entries())
+        .map(([title, data]) => ({ title, ...data }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 10);
+
+      const result: BugInsightsData = {
+        summary: { totalBugs, bySeverity, newBugs, fixedBugs },
+        trend,
+        topRecurring,
+      };
+
+      cache.set(cKey, result, ANALYTICS_CACHE_TTL).catch((err) =>
+        logger.warn('[ANALYTICS] Failed to cache bug insights', { err })
+      );
+
+      return result;
+    } catch (error) {
+      logger.error('[ANALYTICS] Failed to get bug insights', { error, workspaceId, range });
+      throw error;
+    }
+  }
+
+  /**
+   * Get empty bug insights (when no data)
+   */
+  private static getEmptyBugInsights(): BugInsightsData {
+    return {
+      summary: {
+        totalBugs: 0,
+        bySeverity: { critical: 0, high: 0, medium: 0, low: 0 },
+        newBugs: 0,
+        fixedBugs: 0,
+      },
+      trend: [],
+      topRecurring: [],
+    };
   }
 }

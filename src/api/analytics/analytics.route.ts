@@ -14,6 +14,7 @@ import {
   getHeatmap,
   getDeployments,
   getTimeSeries,
+  getBugInsights,
 } from './analytics.controller';
 
 const router = Router();
@@ -272,5 +273,38 @@ router.get('/deployments', requireAuth, asyncHandler(getDeployments));
  *         description: Time series data points
  */
 router.get('/time-series', requireAuth, asyncHandler(getTimeSeries));
+
+/**
+ * @swagger
+ * /api/v1/analytics/bug-insights:
+ *   get:
+ *     summary: Get bug insights
+ *     description: Returns bug summary, daily trend, and top recurring bugs from intelligent test findings
+ *     tags: [Analytics]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: workspaceId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *       - in: query
+ *         name: range
+ *         schema:
+ *           type: string
+ *           enum: [7d, 30d, 90d]
+ *           default: 30d
+ *       - in: query
+ *         name: projectId
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Bug insights data
+ */
+router.get('/bug-insights', requireAuth, asyncHandler(getBugInsights));
 
 export default router;

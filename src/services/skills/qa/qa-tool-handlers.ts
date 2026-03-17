@@ -3366,7 +3366,7 @@ export async function handleRunDraftSteps(
     steps,
     startUrl,
     context.userId,
-    { persistAppliedSteps: false }, // ephemeral — no DB writes
+    { persistAppliedSteps: false, chatSessionId: context.chatSessionId ?? undefined }, // ephemeral — no DB writes
   ).catch(err => {
     logger.error('[QA_TOOL] Draft steps run failed', {
       error: err instanceof Error ? err.message : String(err),

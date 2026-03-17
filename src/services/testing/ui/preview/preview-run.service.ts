@@ -257,6 +257,7 @@ export class PreviewRunService {
    * @param userId - User ID (for session ownership + WebSocket)
    * @param options.intentTestCaseId - Optional test case ID (for trace metadata only when persistAppliedSteps is false)
    * @param options.persistAppliedSteps - If true, persist appliedStep to DB per step (default: false)
+   * @param options.chatSessionId - If provided, emit chat:processing:step events so Chat UI can show inline progress
    */
   static async runStepsOnPreview(
     previewSessionId: string,
@@ -266,12 +267,14 @@ export class PreviewRunService {
     options?: {
       intentTestCaseId?: string;
       persistAppliedSteps?: boolean;
+      chatSessionId?: string;
       /** @internal Skip ownership check when caller (runSavedSteps) already verified */
       _skipOwnershipCheck?: boolean;
     },
   ): Promise<void> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
+    const chatSessionId = options?.chatSessionId;
 
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
@@ -476,6 +479,18 @@ export class PreviewRunService {
           description: step.description,
           timestamp: new Date().toISOString(),
         });
+
+        // Chat inline progress: emit processing step so Chat UI can show live step list
+        if (chatSessionId) {
+          webSocketService.emitChatProcessingStep(chatSessionId, {
+            sessionId: chatSessionId,
+            step: 'executing_test',
+            message: `Step ${i + 1}/${steps.length}: ${step.description}`,
+            progress: Math.round(((i) / steps.length) * 90), // 0–90% during execution
+            metadata: { stepIndex: i, stepId: step.id, stepType: step.type, totalSteps: steps.length },
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         // Give a chance for a cancellation request to land before executing the step.
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1032,9 +1047,11 @@ export class PreviewRunService {
         });
       }
 
+      const runSuccess = failedSteps === 0 && !cancelled && !timedOut;
+
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
-        success: failedSteps === 0 && !cancelled && !timedOut,
+        success: runSuccess,
         totalSteps: steps.length,
         passedSteps,
         failedSteps,
@@ -1044,6 +1061,33 @@ export class PreviewRunService {
         duration,
         timestamp: new Date().toISOString(),
       });
+
+      // Chat inline progress: signal completion so Chat UI can render summary + Save button
+      if (chatSessionId) {
+        const summary = cancelled
+          ? `Run cancelled — ${passedSteps}/${steps.length} passed`
+          : runSuccess
+            ? `All ${steps.length} steps passed ✓`
+            : `${failedSteps} step(s) failed — ${passedSteps}/${steps.length} passed`;
+        webSocketService.emitChatProcessingStep(chatSessionId, {
+          sessionId: chatSessionId,
+          step: 'executing_test',
+          message: summary,
+          progress: 100,
+          metadata: {
+            draftRunCompleted: true,
+            success: runSuccess,
+            passedSteps,
+            failedSteps,
+            skippedSteps,
+            totalSteps: steps.length,
+            cancelled,
+            duration,
+            previewSessionId,
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
 
       // 8b. Batch-persist all enriched steps (single DB round-trip) — with timeout guard
       if (enrichedSteps.size > 0 && intentTestCaseId) {
