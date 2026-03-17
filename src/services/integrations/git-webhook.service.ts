@@ -150,16 +150,28 @@ export class GitWebhookService {
 
     const firstIntegration = integrations.length > 0 ? integrations[0] : null;
 
-    // Validate signature/token with first integration (GitHub/GitLab send one signature per request)
-    if (firstIntegration && firstIntegration.webhook_secret) {
-      if (provider === 'github') {
-        if (!signature || !this.verifyGitHubSignature(rawBody, signature, firstIntegration.webhook_secret)) {
-          throw new Error('Invalid GitHub webhook signature');
+    // Validate signature/token — GitHub/GitLab send ONE signature per request (tied to the
+    // single webhook secret configured at the repo/project level). When multiple integrations
+    // share the same repo, try each integration's secret until one matches. This handles the
+    // edge case where integrations in different workspaces have different secrets.
+    if (signature && integrations.some((i) => i.webhook_secret)) {
+      let verified = false;
+      for (const integration of integrations) {
+        if (!integration.webhook_secret) continue;
+        if (provider === 'github') {
+          if (this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
+            verified = true;
+            break;
+          }
+        } else {
+          if (this.verifyGitLabToken(signature, integration.webhook_secret)) {
+            verified = true;
+            break;
+          }
         }
-      } else {
-        if (!signature || !this.verifyGitLabToken(signature, firstIntegration.webhook_secret)) {
-          throw new Error('Invalid GitLab webhook token');
-        }
+      }
+      if (!verified) {
+        throw new Error(`Invalid ${provider === 'github' ? 'GitHub webhook signature' : 'GitLab webhook token'}`);
       }
     }
 

@@ -28,8 +28,10 @@ export class GitWebhookJobHandler {
       throw new Error(`Delivery not found: ${provider}:${deliveryId}`);
     }
 
-    // When one webhook triggers multiple jobs (one per integration), skip only if this specific job was already processed; otherwise allow (don't skip on delivery.status === 'processed')
+    // Resolve which integration this job handles
     const integrationId = jobIntegrationId ?? (delivery.integration_id as string | null);
+
+    // Single-integration path: skip if delivery already finalized
     if (!jobIntegrationId && ['processed', 'ignored', 'failed'].includes(delivery.status)) {
       logger.info('[GIT_WEBHOOK_JOB] Delivery already handled', {
         provider,
@@ -40,12 +42,10 @@ export class GitWebhookJobHandler {
     }
 
     if (!integrationId) {
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'ignored',
-          error: 'integration_not_found',
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'integration_not_found',
+      });
       return;
     }
 
@@ -56,22 +56,18 @@ export class GitWebhookJobHandler {
       .maybeSingle();
 
     if (integrationError || !integration) {
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'ignored',
-          error: 'integration_deleted',
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'integration_deleted',
+      });
       return;
     }
 
     if (!integration.enabled) {
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'ignored',
-          error: 'integration_disabled',
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'integration_disabled',
+      });
       return;
     }
 
@@ -82,12 +78,10 @@ export class GitWebhookJobHandler {
 
     const allowedEvents = (integration.events || []) as string[];
     if (!allowedEvents.includes(configEvent)) {
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'ignored',
-          error: 'event_not_enabled',
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'event_not_enabled',
+      });
       return;
     }
 
@@ -107,12 +101,10 @@ export class GitWebhookJobHandler {
         integrationId: integration.id,
         deliveryId,
       });
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'ignored',
-          error: 'no_plan_linked',
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'ignored',
+        error: 'no_plan_linked',
+      });
       return;
     }
 
@@ -124,12 +116,10 @@ export class GitWebhookJobHandler {
       .maybeSingle();
 
     if (projectError || !project?.user_id) {
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'failed',
-          error: 'project_not_found',
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'failed',
+        error: 'project_not_found',
+      });
       throw new Error('Project not found for integration');
     }
 
@@ -157,22 +147,17 @@ export class GitWebhookJobHandler {
         });
       }
 
-      // Only mark delivery 'processed' when single-integration path (multi-integration jobs share one delivery row)
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'processed',
-          regressionRunId: firstRunId ?? undefined,
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'processed',
+        regressionRunId: firstRunId ?? undefined,
+      });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
 
-      if (!jobIntegrationId) {
-        await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
-          status: 'failed',
-          error: errorMessage,
-        });
-      }
+      await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
+        status: 'failed',
+        error: errorMessage,
+      });
 
       // Check if it's an insufficient credits error
       if (errorMessage.includes('Insufficient credits')) {

@@ -9,8 +9,10 @@ import { cache } from '@/utils/core/redis-cache';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { getTelegramToken, sendMessage as sendTelegramMessage } from '@/services/api/telegram.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { env } from '@/config/environment/env';
 import { AutomationActionService } from '@/services/automation/automation-action.service';
+import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-run.service';
 import * as crypto from 'crypto';
 
 /**
@@ -37,6 +39,48 @@ import * as crypto from 'crypto';
  * Service to handle test completion and notify chat sessions
  */
 export class TestCompletionHandlerService {
+  /** Per-run cache for workspace member IDs — avoids re-querying on every test_completed event within the same run. */
+  private static _runRecipientCache = new Map<string, { recipients: string[]; ts: number }>();
+
+  /** Resolve WS recipients for a run (cached for 60s to avoid N+1 queries). */
+  private static async getRunRecipients(
+    runId: string,
+    userId: string
+  ): Promise<{ recipients: string[]; planId: string | null; projectId: string | null; trigger?: RegressionRunProgressPayload['trigger'] }> {
+    const cached = this._runRecipientCache.get(runId);
+    if (cached && Date.now() - cached.ts < 60_000) {
+      // Still need run metadata — pull from first resolution
+      // Cache stores only recipients; metadata comes from the DB query below (lightweight)
+    }
+
+    const { data: runRow } = await supabaseAdmin
+      .from('regression_runs')
+      .select('plan_id, project_id, trigger')
+      .eq('id', runId)
+      .maybeSingle();
+
+    const planId = (runRow?.plan_id as string | null) ?? null;
+    const projectId = (runRow?.project_id as string | null) ?? null;
+    const trigger = (runRow as any)?.trigger as RegressionRunProgressPayload['trigger'] | undefined;
+
+    let recipients: string[];
+    if (cached && Date.now() - cached.ts < 60_000) {
+      recipients = cached.recipients;
+    } else if (projectId) {
+      recipients = await getProjectWorkspaceMemberIds(projectId, userId);
+      this._runRecipientCache.set(runId, { recipients, ts: Date.now() });
+      // Prevent unbounded growth
+      if (this._runRecipientCache.size > 200) {
+        const oldest = [...this._runRecipientCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+        if (oldest) this._runRecipientCache.delete(oldest[0]);
+      }
+    } else {
+      recipients = [userId];
+    }
+
+    return { recipients, planId, projectId, trigger };
+  }
+
   /**
    * Handle test completion and send results to chat
    * Main entry point called when a test finishes execution
@@ -430,44 +474,9 @@ export class TestCompletionHandlerService {
         const runId = data[0].run_id;
         if (runId && test.user_id) {
           try {
-            const recipients = new Set<string>();
-            recipients.add(test.user_id);
-            let planId: string | null = null;
-            let projectId: string | null = null;
-            let trigger: any = undefined;
+            const { recipients, planId, projectId, trigger } = await this.getRunRecipients(runId, test.user_id);
 
-            try {
-              const { data: runRow } = await supabaseAdmin
-                .from('regression_runs')
-                .select('plan_id, project_id, trigger')
-                .eq('id', runId)
-                .maybeSingle();
-              planId = (runRow?.plan_id as string | null) ?? null;
-              projectId = (runRow?.project_id as string | null) ?? null;
-              trigger = (runRow as any)?.trigger;
-
-              if (projectId) {
-                const { data: projRow } = await supabaseAdmin
-                  .from('projects')
-                  .select('workspace_id')
-                  .eq('id', projectId)
-                  .maybeSingle();
-                const workspaceId = (projRow as any)?.workspace_id as string | undefined;
-                if (workspaceId) {
-                  const { data: members } = await supabaseAdmin
-                    .from('workspace_members')
-                    .select('user_id')
-                    .eq('workspace_id', workspaceId)
-                    .eq('status', 'active');
-                  for (const m of members || []) {
-                    const uid = (m as any)?.user_id as string | undefined;
-                    if (uid) recipients.add(uid);
-                  }
-                }
-              }
-            } catch { /* non-fatal */ }
-
-            const payload = {
+            const payload: RegressionRunProgressPayload = {
               runId,
               userId: test.user_id,
               planId,
@@ -482,7 +491,7 @@ export class TestCompletionHandlerService {
                 currentTestName: test.id,
               },
               timestamp: new Date().toISOString(),
-            } as any;
+            };
 
             for (const uid of recipients) {
               webSocketService.emitRegressionRunProgress(uid, payload);
@@ -960,34 +969,16 @@ export class TestCompletionHandlerService {
               : finalStatus === 'cancelled' ? 'cancelled'
               : 'failed';
             // Also emit to all active workspace members of the run's project (so git-trigger completion is visible to collaborators)
-            const recipients = new Set<string>();
-            if (run.user_id) recipients.add(run.user_id);
-            try {
-              const { data: projRow } = await supabaseAdmin
-                .from('projects')
-                .select('workspace_id')
-                .eq('id', run.project_id)
-                .maybeSingle();
-              const workspaceId = (projRow as any)?.workspace_id as string | undefined;
-              if (workspaceId) {
-                const { data: members } = await supabaseAdmin
-                  .from('workspace_members')
-                  .select('user_id')
-                  .eq('workspace_id', workspaceId)
-                  .eq('status', 'active');
-                for (const m of members || []) {
-                  const uid = (m as any)?.user_id as string | undefined;
-                  if (uid) recipients.add(uid);
-                }
-              }
-            } catch { /* non-fatal */ }
+            const completionRecipients = run.project_id && run.user_id
+              ? await getProjectWorkspaceMemberIds(run.project_id, run.user_id)
+              : (run.user_id ? [run.user_id] : []);
 
-            const payload = {
+            const payload: RegressionRunProgressPayload = {
               runId: run.id,
               userId: run.user_id,
               planId: run.plan_id ?? null,
               projectId: run.project_id ?? null,
-              trigger: run.trigger,
+              trigger: run.trigger as RegressionRunProgressPayload['trigger'],
               status: wsStatus,
               progress: 100,
               message: finalStatus === 'passed'
@@ -1002,9 +993,9 @@ export class TestCompletionHandlerService {
                 skipped: summary.skipped,
               },
               timestamp: new Date().toISOString(),
-            } as any;
+            };
 
-            for (const uid of recipients) {
+            for (const uid of completionRecipients) {
               webSocketService.emitRegressionRunProgress(uid, payload);
             }
           } catch { /* non-fatal */ }

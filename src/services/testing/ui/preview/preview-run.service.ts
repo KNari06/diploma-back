@@ -257,7 +257,8 @@ export class PreviewRunService {
    * @param userId - User ID (for session ownership + WebSocket)
    * @param options.intentTestCaseId - Optional test case ID (for trace metadata only when persistAppliedSteps is false)
    * @param options.persistAppliedSteps - If true, persist appliedStep to DB per step (default: false)
-   * @param options.chatSessionId - If provided, emit chat:processing:step events so Chat UI can show inline progress
+   * @param options.chatSessionId - Reserved for future use (chat:processing:step was removed due to
+   *   conflict with fire-and-forget pattern — frontend subscribes to preview:run:* directly)
    */
   static async runStepsOnPreview(
     previewSessionId: string,
@@ -274,7 +275,6 @@ export class PreviewRunService {
   ): Promise<void> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
-    const chatSessionId = options?.chatSessionId;
 
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
@@ -366,6 +366,7 @@ export class PreviewRunService {
         previewSessionId,
         totalSteps: steps.length,
         startUrl,
+        ephemeral: !persistAppliedSteps, // true for draft runs (from chat), false for saved test runs
         timestamp: new Date().toISOString(),
       });
       startedEmitted = true;
@@ -480,17 +481,9 @@ export class PreviewRunService {
           timestamp: new Date().toISOString(),
         });
 
-        // Chat inline progress: emit processing step so Chat UI can show live step list
-        if (chatSessionId) {
-          webSocketService.emitChatProcessingStep(chatSessionId, {
-            sessionId: chatSessionId,
-            step: 'executing_test',
-            message: `Step ${i + 1}/${steps.length}: ${step.description}`,
-            progress: Math.round(((i) / steps.length) * 90), // 0–90% during execution
-            metadata: { stepIndex: i, stepId: step.id, stepType: step.type, totalSteps: steps.length },
-            timestamp: new Date().toISOString(),
-          });
-        }
+        // NOTE: We do NOT emit chat:processing:step here. The draft run is fire-and-forget
+        // so clientRequestInFlightRef is already false on the frontend, and processing steps
+        // would be silently discarded. Frontend subscribes to preview:run:* directly instead.
 
         // Give a chance for a cancellation request to land before executing the step.
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1062,32 +1055,10 @@ export class PreviewRunService {
         timestamp: new Date().toISOString(),
       });
 
-      // Chat inline progress: signal completion so Chat UI can render summary + Save button
-      if (chatSessionId) {
-        const summary = cancelled
-          ? `Run cancelled — ${passedSteps}/${steps.length} passed`
-          : runSuccess
-            ? `All ${steps.length} steps passed ✓`
-            : `${failedSteps} step(s) failed — ${passedSteps}/${steps.length} passed`;
-        webSocketService.emitChatProcessingStep(chatSessionId, {
-          sessionId: chatSessionId,
-          step: 'executing_test',
-          message: summary,
-          progress: 100,
-          metadata: {
-            draftRunCompleted: true,
-            success: runSuccess,
-            passedSteps,
-            failedSteps,
-            skippedSteps,
-            totalSteps: steps.length,
-            cancelled,
-            duration,
-            previewSessionId,
-          },
-          timestamp: new Date().toISOString(),
-        });
-      }
+      // NOTE: We do NOT emit chat:processing:step on completion.
+      // The progress:100 signal would trigger the frontend's "API agent finished" handler
+      // (which clears processingSteps, resets isTyping, etc.) — destructive side-effect.
+      // Frontend uses preview:run:completed directly via WebSocket subscription in Chat.jsx.
 
       // 8b. Batch-persist all enriched steps (single DB round-trip) — with timeout guard
       if (enrichedSteps.size > 0 && intentTestCaseId) {

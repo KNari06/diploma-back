@@ -4,6 +4,7 @@ import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.se
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { NotFoundError, ValidationError } from '@/types';
+import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import type {
   Priority,
   RunResult,
@@ -1359,26 +1360,7 @@ export class RegressionRunService {
       projectIdForWs = (runRow?.project_id as string | null) ?? null;
 
       if (projectIdForWs) {
-        const { data: projRow } = await supabaseAdmin
-          .from('projects')
-          .select('workspace_id')
-          .eq('id', projectIdForWs)
-          .maybeSingle();
-        const workspaceId = (projRow as any)?.workspace_id as string | undefined;
-        if (workspaceId) {
-          const { data: members } = await supabaseAdmin
-            .from('workspace_members')
-            .select('user_id')
-            .eq('workspace_id', workspaceId)
-            .eq('status', 'active');
-          const ids = new Set<string>();
-          ids.add(userId);
-          for (const m of members || []) {
-            const uid = (m as any)?.user_id as string | undefined;
-            if (uid) ids.add(uid);
-          }
-          progressRecipients = Array.from(ids);
-        }
+        progressRecipients = await getProjectWorkspaceMemberIds(projectIdForWs, userId);
       }
     } catch {
       // non-fatal: fall back to owner-only
@@ -1439,7 +1421,7 @@ export class RegressionRunService {
     ) => {
       try {
         const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
-        const payload = {
+        const payload: RegressionRunProgressPayload = {
           runId,
           userId,
           planId: planIdForWs,
@@ -1460,7 +1442,7 @@ export class RegressionRunService {
             skipped: skippedCount,
           },
           timestamp: new Date().toISOString(),
-        } as any;
+        };
 
         for (const recipientId of progressRecipients) {
           webSocketService.emitRegressionRunProgress(recipientId, payload);
@@ -2339,5 +2321,43 @@ export class RegressionRunService {
       ...(negativeSummary && { negativeSummary }),
       ...(negativeExecs.length > 0 && { negativeExecutions: negativeExecs }),
     };
+  }
+}
+
+// ============================================================================
+// WORKSPACE MEMBER RESOLUTION HELPER
+// ============================================================================
+
+/**
+ * Resolve all active workspace member user IDs for a project.
+ * Returns at least the given ownerId, plus all workspace members if the project belongs to a workspace.
+ * Non-fatal: falls back to [ownerId] on any error.
+ */
+export async function getProjectWorkspaceMemberIds(projectId: string, ownerId: string): Promise<string[]> {
+  try {
+    const { data: projRow } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+    if (!workspaceId) return [ownerId];
+
+    const { data: members } = await supabaseAdmin
+      .from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', workspaceId)
+      .eq('status', 'active');
+
+    const ids = new Set<string>();
+    ids.add(ownerId);
+    for (const m of members || []) {
+      const uid = (m as any)?.user_id as string | undefined;
+      if (uid) ids.add(uid);
+    }
+    return Array.from(ids);
+  } catch {
+    return [ownerId];
   }
 }
