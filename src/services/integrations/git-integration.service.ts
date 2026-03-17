@@ -190,6 +190,15 @@ export class GitIntegrationService {
     provider: GitProvider,
     repositoryUrl: string
   ): Promise<GitIntegrationRow | null> {
+    const all = await this.findAllByProviderAndRepositoryUrl(provider, repositoryUrl);
+    return all.length > 0 ? all[0] : null;
+  }
+
+  /** All integrations for this provider+repo (e.g. same repo in multiple accounts/projects). */
+  static async findAllByProviderAndRepositoryUrl(
+    provider: GitProvider,
+    repositoryUrl: string
+  ): Promise<GitIntegrationRow[]> {
     const normalizedRepositoryUrl = this.normalizeRepositoryUrl(repositoryUrl, provider);
     this.validateRepositoryUrl(normalizedRepositoryUrl, provider);
 
@@ -199,20 +208,18 @@ export class GitIntegrationService {
       .eq('provider', provider)
       .eq('repository_url', normalizedRepositoryUrl)
       .eq('enabled', true)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+      .order('created_at', { ascending: false });
 
     if (error) {
-      logger.error('[GIT_INTEGRATION] Failed to find integration', {
+      logger.error('[GIT_INTEGRATION] Failed to find integrations', {
         provider,
         repositoryUrl: normalizedRepositoryUrl,
         error: error.message,
       });
-      return null;
+      return [];
     }
 
-    return (data || null) as GitIntegrationRow | null;
+    return (data || []) as GitIntegrationRow[];
   }
 
   /**
