@@ -239,8 +239,8 @@ export const GitHubSkill: SkillDefinition = {
         return {
           success: false,
           message: hasDisabled
-            ? 'GitHub was previously connected but is now disabled. Use github_connect to reconnect.'
-            : 'GitHub is not connected. Use github_connect to start the OAuth flow and guide the user through authorization.',
+            ? 'GitHub was previously connected but is now disabled. Call github_connect to generate a new OAuth authorization URL for reconnection.'
+            : 'GitHub is not connected. Call github_connect immediately — it will generate an OAuth authorization URL for the user to complete the connection.',
           displayToUser: true,
         };
       }
@@ -359,7 +359,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
       return {
         success: true,
         data: { connected: false, disabled: true },
-        message: 'GitHub was previously connected but is now disabled. Use github_connect to reconnect.',
+        message: 'GitHub was previously connected but is now disabled. Call github_connect to generate a new OAuth authorization URL for reconnection.',
         displayToUser: true,
       };
     }
@@ -367,7 +367,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
     return {
       success: true,
       data: { connected: false },
-      message: 'GitHub is not connected. Use github_connect to start the OAuth flow.',
+      message: 'GitHub is not connected. Call github_connect immediately — it will generate an OAuth authorization URL for the user to complete the connection.',
       displayToUser: true,
     };
   }

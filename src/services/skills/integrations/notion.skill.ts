@@ -242,7 +242,7 @@ export const NotionSkill: SkillDefinition = {
         return {
           success: false,
           message:
-            'Notion is not connected. Use notion_connect to get the authorization URL and guide the user through the OAuth flow.',
+            'Notion is not connected. Call notion_connect immediately — it will generate an OAuth authorization URL for the user to complete the connection.',
           displayToUser: true,
         };
       }
@@ -301,7 +301,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
     return {
       success: true,
       data: { connected: false },
-      message: 'Notion is not connected. Use notion_connect to start the OAuth flow.',
+      message: 'Notion is not connected. Call notion_connect immediately — it will generate an OAuth authorization URL for the user to complete the connection.',
       displayToUser: true,
     };
   }

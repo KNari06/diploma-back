@@ -113,8 +113,8 @@ export async function reviewExecution(
     };
   }
 
-  // FAST APPROVE: No plan (single_tool path) + all tools succeeded → skip AI
-  if (allSteps.length === 0 && uniqueToolResults.every(r => r.result.success)) {
+  // FAST APPROVE: No plan (single_tool path) + at least one tool executed + all succeeded → skip AI
+  if (allSteps.length === 0 && uniqueToolResults.length > 0 && uniqueToolResults.every(r => r.result.success)) {
     logger.info('[REVIEWER_AGENT] All tools succeeded (no plan) — fast approve', {
       toolCount: uniqueToolResults.length,
       durationMs: Date.now() - startMs,
@@ -125,6 +125,22 @@ export async function reviewExecution(
       failedSteps: [],
       goalAlignment: SUB_AGENT_CONFIG.reviewerFastApproveAlignment,
       reasoning: 'All tools executed successfully (deterministic fast-path)',
+    };
+  }
+
+  // NO TOOLS EXECUTED: Executor returned text without calling any tools.
+  // Approve with lower alignment — responder will format the executor's text response.
+  if (allSteps.length === 0 && uniqueToolResults.length === 0) {
+    logger.info('[REVIEWER_AGENT] No tools executed (text-only response) — approve with low alignment', {
+      durationMs: Date.now() - startMs,
+    });
+    return {
+      verdict: 'approved',
+      planCompletionRate: 1,
+      failedSteps: [],
+      goalAlignment: 0.7,
+      responseGuidance: 'Executor provided guidance text without calling tools. Present the guidance directly to the user.',
+      reasoning: 'No tools were called — executor chose to provide guidance text (e.g., setup instructions)',
     };
   }
 

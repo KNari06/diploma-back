@@ -238,8 +238,8 @@ export const TelegramSkill: SkillDefinition = {
         return {
           success: false,
           message: hasDisabled
-            ? 'Telegram was previously connected but is now disabled. Ask the user to reconnect with telegram_connect.'
-            : 'Telegram not connected. Ask the user to provide their bot token from @BotFather, then call telegram_connect.',
+            ? 'Telegram was previously connected but is now disabled. Ask the user for their bot token from @BotFather (format: 123456789:ABCdef...) to reconnect, then call telegram_connect.'
+            : 'Telegram is not connected. Ask the user for their bot token from @BotFather in Telegram (format: 123456789:ABCdef...). Once they provide it, call telegram_connect with bot_token parameter.',
           displayToUser: true,
         };
       }
@@ -445,7 +445,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
       return {
         success: true,
         data: { connected: false, disabled: true },
-        message: 'Telegram was previously connected but is now disabled. Use telegram_connect with a new bot token to reconnect.',
+        message: 'Telegram was previously connected but is now disabled. Ask the user for their bot token from @BotFather (format: 123456789:ABCdef...) to reconnect, then call telegram_connect with bot_token parameter.',
         displayToUser: true,
       };
     }
@@ -453,7 +453,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
     return {
       success: true,
       data: { connected: false },
-      message: 'Telegram is not connected. Use telegram_connect to set it up.',
+      message: 'Telegram is not connected. To connect: ask the user for their bot token from @BotFather in Telegram (format: 123456789:ABCdef...). Once they provide it, call telegram_connect with bot_token parameter.',
       displayToUser: true,
     };
   }
