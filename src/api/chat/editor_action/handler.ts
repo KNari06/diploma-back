@@ -54,22 +54,43 @@ export async function handleEditorAction(
     contextObj = context;
   }
 
-  const previewSessionId = contextObj?.previewSessionId;
+  let previewSessionId: string | undefined = contextObj?.previewSessionId;
 
   // Guard: must have a preview session to execute editor actions
+  const sessionService = getPreviewSessionService();
+
   if (!previewSessionId) {
-    logger.warn('[EDITOR_ACTION] No previewSessionId found, falling back to general_chat', { userId });
-    return fallbackToGeneralChat(req, res, params);
+    // No client-provided sessionId — try to find user's active session
+    const userSession = sessionService.getSessionForUser(userId);
+    if (userSession) {
+      previewSessionId = userSession.id;
+      logger.info('[EDITOR_ACTION] No client previewSessionId, resolved from user session', {
+        resolvedSessionId: previewSessionId,
+        userId,
+      });
+    } else {
+      logger.warn('[EDITOR_ACTION] No previewSessionId found, falling back to general_chat', { userId });
+      return fallbackToGeneralChat(req, res, params);
+    }
   }
 
-  // Verify session exists and is owned by user
-  const sessionService = getPreviewSessionService();
+  // Verify session exists and is owned by user; fall back to user's actual session if mismatch
   if (!sessionService.isSessionOwned(previewSessionId, userId)) {
-    logger.warn('[EDITOR_ACTION] Session not owned by user, falling back to general_chat', {
-      previewSessionId,
-      userId,
-    });
-    return fallbackToGeneralChat(req, res, params);
+    const userSession = sessionService.getSessionForUser(userId);
+    if (userSession) {
+      logger.info('[EDITOR_ACTION] Client previewSessionId mismatch, resolved to user\'s active session', {
+        clientSessionId: previewSessionId,
+        resolvedSessionId: userSession.id,
+        userId,
+      });
+      previewSessionId = userSession.id;
+    } else {
+      logger.warn('[EDITOR_ACTION] Session not owned by user and no active session found, falling back to general_chat', {
+        previewSessionId,
+        userId,
+      });
+      return fallbackToGeneralChat(req, res, params);
+    }
   }
 
   logger.info('[EDITOR_ACTION] Processing editor action', {

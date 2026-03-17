@@ -368,8 +368,8 @@ export class PreviewSessionService {
         // use a DOM stability check: no mutations for 800ms → DOM is ready for snapshot.
         await waitForDOMStability(page, 3000, 800);
 
-        // Collect initial snapshot
-        const snapshot = await SnapshotCollector.collect(page);
+        // Collect initial snapshot (skip stability wait — already done above via waitForDOMStability)
+        const snapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
         const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
 
         // Generate session ID

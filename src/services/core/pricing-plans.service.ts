@@ -130,7 +130,7 @@ export class PricingPlansService {
       }
 
       if (!data || !data.pricing_plans) {
-        logger.warn('[PRICING_PLANS] User has no plan assigned', {
+        logger.debug('[PRICING_PLANS] User has no plan assigned (free tier)', {
           userId: userId.substring(0, 8) + '...',
         });
         return null;

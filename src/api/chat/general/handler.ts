@@ -396,9 +396,30 @@ export async function handleGeneralChat(
     ? context as Record<string, any>
     : undefined;
 
+  // Resolve the correct previewSessionId for this user (client may send stale ID).
+  // Used for both page context and SkillContext downstream.
+  let resolvedPreviewSessionId = parsedContext?.previewSessionId as string | undefined;
+
   if (mode === 'editor' && parsedContext?.previewSessionId) {
+    // Pre-resolve: if client sessionId is not owned, find user's actual session
     try {
-      editorPageContext = await getPageContext(parsedContext.previewSessionId, userId);
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const previewService = getPreviewSessionService();
+      if (!previewService.isSessionOwned(parsedContext.previewSessionId, userId)) {
+        const userSession = previewService.getSessionForUser(userId);
+        if (userSession) {
+          logger.info('[GENERAL_CHAT] Client previewSessionId mismatch, resolved to user\'s active session', {
+            clientSessionId: parsedContext.previewSessionId,
+            resolvedSessionId: userSession.id,
+            userId: userId.substring(0, 8) + '...',
+          });
+          resolvedPreviewSessionId = userSession.id;
+        }
+      }
+    } catch { /* non-critical — getPageContext has its own fallback */ }
+
+    try {
+      editorPageContext = await getPageContext(resolvedPreviewSessionId!, userId);
 
       // Merge frontend-provided pageContext (test steps, title) if available
       if (editorPageContext && parsedContext.pageContext) {
@@ -414,21 +435,39 @@ export async function handleGeneralChat(
         });
       } else {
         logger.warn('[GENERAL_CHAT] Editor mode: getPageContext returned null', {
-          previewSessionId: parsedContext.previewSessionId,
+          previewSessionId: resolvedPreviewSessionId,
           userId: userId.substring(0, 8) + '...',
         });
       }
     } catch (editorError) {
       logger.warn('[GENERAL_CHAT] Editor mode: failed to get page context', {
         error: editorError instanceof Error ? editorError.message : String(editorError),
-        previewSessionId: parsedContext.previewSessionId,
+        previewSessionId: resolvedPreviewSessionId,
       });
     }
   } else if (mode === 'editor' && !parsedContext?.previewSessionId) {
-    logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
-      hasContext: !!parsedContext,
-      contextKeys: parsedContext ? Object.keys(parsedContext) : [],
-    });
+    // No previewSessionId from client — try to find user's active session
+    try {
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const userSession = getPreviewSessionService().getSessionForUser(userId);
+      if (userSession) {
+        resolvedPreviewSessionId = userSession.id;
+        logger.info('[GENERAL_CHAT] Editor mode: no client previewSessionId, resolved from user session', {
+          resolvedSessionId: userSession.id,
+        });
+        editorPageContext = await getPageContext(resolvedPreviewSessionId, userId);
+      } else {
+        logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context and no active session', {
+          hasContext: !!parsedContext,
+          contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+        });
+      }
+    } catch {
+      logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
+        hasContext: !!parsedContext,
+        contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+      });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -774,7 +813,7 @@ You can still help with general questions, saved test cases, and test management
             chatSessionId,
             projectId,
             projectName,
-            previewSessionId: parsedContext?.previewSessionId,
+            previewSessionId: resolvedPreviewSessionId,
             mode: mode as 'lite' | 'pro' | 'editor' | undefined,
           });
 
@@ -925,7 +964,7 @@ You can still help with general questions, saved test cases, and test management
           workspaceId: workspaceId!,
           chatSessionId,
           projectId,
-          previewSessionId: parsedContext?.previewSessionId,
+          previewSessionId: resolvedPreviewSessionId,
           mode: mode as 'lite' | 'pro' | 'editor' | undefined,
         };
 

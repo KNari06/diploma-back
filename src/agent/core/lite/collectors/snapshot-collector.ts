@@ -27,10 +27,12 @@ export class SnapshotCollector {
    * @param page - Playwright page instance
    * @returns Snapshot with elements including parent context
    */
-  static async collect(page: Page, options?: { fullPage?: boolean }): Promise<LiteSnapshot> {
+  static async collect(page: Page, options?: { fullPage?: boolean; skipStabilityWait?: boolean }): Promise<LiteSnapshot> {
     try {
-      // Wait for visual stability first
-      await VisualStability.waitForStable(page);
+      // Wait for visual stability first (skip if caller already did its own stability check)
+      if (!options?.skipStabilityWait) {
+        await VisualStability.waitForStable(page);
+      }
 
       // ✅ P1: Inject Shadow DOM flags into page context before evaluation
       await page.evaluate(() => {

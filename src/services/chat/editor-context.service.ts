@@ -33,15 +33,30 @@ export async function getPageContext(previewSessionId: string, userId?: string):
   try {
     const service = getPreviewSessionService();
 
-    // Verify session ownership if userId provided
+    // Verify session ownership if userId provided.
+    // If the client-provided sessionId is stale/wrong, fall back to the user's actual active session.
+    let resolvedSessionId = previewSessionId;
     if (userId && !service.isSessionOwned(previewSessionId, userId)) {
-      logger.warn('[EDITOR_CONTEXT] Preview session not owned by user', { previewSessionId, userId });
-      return null;
+      const userSession = service.getSessionForUser(userId);
+      if (userSession) {
+        logger.info('[EDITOR_CONTEXT] Client previewSessionId mismatch, resolved to user\'s active session', {
+          clientSessionId: previewSessionId,
+          resolvedSessionId: userSession.id,
+          userId,
+        });
+        resolvedSessionId = userSession.id;
+      } else {
+        logger.warn('[EDITOR_CONTEXT] Preview session not owned by user and no active session found', {
+          previewSessionId,
+          userId,
+        });
+        return null;
+      }
     }
 
-    const session = service.getSession(previewSessionId);
+    const session = service.getSession(resolvedSessionId);
     if (!session) {
-      logger.warn('[EDITOR_CONTEXT] Preview session not found', { previewSessionId });
+      logger.warn('[EDITOR_CONTEXT] Preview session not found', { previewSessionId: resolvedSessionId });
       return null;
     }
 
@@ -50,17 +65,17 @@ export async function getPageContext(previewSessionId: string, userId?: string):
     //    (If DevTools is collected first and user navigates during the 100-500ms snapshot,
     //    we'd have console/network from URL A + DOM from URL B.)
     try {
-      await service.getSnapshot(previewSessionId, userId, { force: true, includeDomNodes: true });
+      await service.getSnapshot(resolvedSessionId, userId, { force: true, includeDomNodes: true });
     } catch (snapshotError) {
       logger.warn('[EDITOR_CONTEXT] Fresh snapshot failed, using cached pageState', {
         error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
-        previewSessionId,
+        previewSessionId: resolvedSessionId,
       });
     }
 
     const pageState = session.pageState;
     if (!pageState) {
-      logger.warn('[EDITOR_CONTEXT] No page state in session', { previewSessionId });
+      logger.warn('[EDITOR_CONTEXT] No page state in session', { previewSessionId: resolvedSessionId });
       return null;
     }
 
@@ -68,7 +83,7 @@ export async function getPageContext(previewSessionId: string, userId?: string):
     let consoleErrors: string | undefined;
     let networkSummary: string | undefined;
     try {
-      const devtools = getPreviewDevToolsRegistry().get(previewSessionId);
+      const devtools = getPreviewDevToolsRegistry().get(resolvedSessionId);
       if (devtools) {
         consoleErrors = compressConsoleForChat(devtools.getConsoleEntries());
         networkSummary = compressNetworkForChat(devtools.getNetworkItems());
@@ -84,14 +99,14 @@ export async function getPageContext(previewSessionId: string, userId?: string):
 
     // Extract non-interactive content summary (headings, images, tables)
     // Called after snapshot so page is fresh and loaded
-    const contentSummary = await extractContentSummary(previewSessionId, userId);
+    const contentSummary = await extractContentSummary(resolvedSessionId, userId);
 
     // 4. Truncate pageText to prevent token budget overrun (~5000 chars ≈ 1250 tokens)
     const MAX_PAGE_TEXT = 5000;
     let pageText = pageState.pageText;
     if (pageText && pageText.length > MAX_PAGE_TEXT) {
       logger.debug('[EDITOR_CONTEXT] Truncating pageText', {
-        previewSessionId,
+        previewSessionId: resolvedSessionId,
         originalLength: pageText.length,
         truncatedTo: MAX_PAGE_TEXT,
       });
