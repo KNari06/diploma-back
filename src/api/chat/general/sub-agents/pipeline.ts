@@ -26,18 +26,7 @@ import type { ChatProcessingStepPayload } from '@/websocket/types/types';
 // ── Smart Simple-Chat Guardrail ───────────────────────────────────────────
 // If the router says "simple_chat" but tools are available, we check whether
 // the message is truly a no-tool conversation (greeting, thanks, opinion).
-// If it doesn't match a known no-tool pattern → we reclassify to single_tool
-// so the executor gets tools and can decide whether to call them.
-//
-// This is the inverse of hardcoding QA patterns: instead of listing every
-// entity that NEEDS tools, we list the short set that DOESN'T.
-// Any new skill or language is automatically covered.
-
-/**
- * Messages that genuinely need NO tools — greetings, thanks, social.
- * Everything else should go to the executor with tools.
- */
-const GENUINE_SIMPLE_CHAT = /^(?:привет|здравствуй|салем|hi|hello|hey|thanks|спасибо|рахмет|пока|bye|ок|ok|да$|нет$|yes$|no$|cancel|отмена|что ты умеешь|what can you do|help$|помощь$)/i;
+// Uses message length + router confidence instead of hardcoded keyword lists.
 
 /**
  * Noise: emoji-only, punctuation-only, repeated characters, very short gibberish.
@@ -47,6 +36,9 @@ const NOISE_MESSAGE = /^[\p{Emoji}\p{Emoji_Component}\s]+$|^[.!?,;:…\-—_*#@^
 
 /** Confidence above which we trust the router's simple_chat verdict. */
 const SIMPLE_CHAT_TRUST_THRESHOLD = 0.85;
+
+/** Short messages (≤3 words) with high router confidence are likely greetings/thanks — trust the router. */
+const MAX_SIMPLE_CHAT_WORDS = 3;
 
 function shouldOverrideSimpleChat(
   userMessage: string,
@@ -62,20 +54,21 @@ function shouldOverrideSimpleChat(
     return false;
   }
 
-  // High confidence + matches known simple-chat → trust the router
-  if (routerConfidence >= SIMPLE_CHAT_TRUST_THRESHOLD && GENUINE_SIMPLE_CHAT.test(trimmed)) {
+  const wordCount = trimmed.split(/\s+/).length;
+
+  // Short message + high confidence → trust the router (greetings, thanks, yes/no, etc.)
+  if (routerConfidence >= SIMPLE_CHAT_TRUST_THRESHOLD && wordCount <= MAX_SIMPLE_CHAT_WORDS) {
     return false;
   }
 
-  // Low confidence simple_chat with tools available → override
+  // Low confidence simple_chat with tools available → override to single_tool
   if (routerConfidence < SIMPLE_CHAT_TRUST_THRESHOLD) {
     return true;
   }
 
-  // High confidence but message is longer than a greeting → still override
+  // High confidence but message is longer than a greeting → override
   // (genuine simple_chat messages are almost always short)
-  const wordCount = trimmed.split(/\s+/).length;
-  if (wordCount > 5 && !GENUINE_SIMPLE_CHAT.test(trimmed)) {
+  if (wordCount > MAX_SIMPLE_CHAT_WORDS) {
     return true;
   }
 
