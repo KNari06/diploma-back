@@ -15,9 +15,17 @@ export const AI_PRICING = {
     input: 0.002 / 1000,   // $0.002 per 1K input tokens
     output: 0.008 / 1000,   // $0.008 per 1K output tokens
   },
+  'gpt-4.1-mini': {
+    input: 0.0002 / 1000,  // $0.20 per 1M input tokens
+    output: 0.0008 / 1000, // $0.80 per 1M output tokens
+  },
+  'gemini-2.5-flash': {
+    input: 0.0003 / 1000, // $0.30 per 1M input tokens
+    output: 0.0025 / 1000, // $2.50 per 1M output tokens
+  },
   'gemini-2.5-flash-lite': {
-    input: 0.000075 / 1000, // $0.075 per 1M input tokens
-    output: 0.0003 / 1000,  // $0.30 per 1M output tokens
+    input: 0.0001 / 1000,  // $0.10 per 1M input tokens
+    output: 0.0004 / 1000, // $0.40 per 1M output tokens
   },
   'gpt-4.1-vision': {
     input: 0.002 / 1000,   // Same as gpt-4.1
@@ -44,7 +52,7 @@ export const DEFAULT_BUDGET: BudgetConfig = {
   maxCostPerTest: 1.0,          // $1 per test
   warningThreshold: 0.7,        // Warning at 70%
   adaptiveMode: true,           // Enable adaptive mode
-  fallbackModel: 'gemini-2.5-flash-lite', // Fallback to flash-lite
+  fallbackModel: 'gpt-4.1-mini', // Fallback to cheap model
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -241,10 +241,13 @@ export const getProjects = async (req: Request, res: Response): Promise<void> =>
       count: projects.length,
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to get projects';
+    const isConfigError = /not configured|must be configured|not set/i.test(message);
+    const isAuthError = /expired|reconnect|refresh/i.test(message);
     logger.error('Get Jira projects error:', error);
-    res.status(500).json({
+    res.status(isConfigError ? 503 : isAuthError ? 401 : 500).json({
       success: false,
-      error: error instanceof Error ? error.message : 'Failed to get projects',
+      error: isConfigError ? 'Jira integration not configured on server' : message,
     });
   }
 };

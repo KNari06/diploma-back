@@ -32,9 +32,17 @@ export const MODEL_PRICING: Record<string, { input: number; output: number }> = 
     input: 0.002, // $ per 1K tokens
     output: 0.008, // $ per 1K tokens
   },
+  'gpt-4.1-mini': {
+    input: 0.0002, // $ per 1K tokens
+    output: 0.0008, // $ per 1K tokens
+  },
+  'gemini-2.5-flash': {
+    input: 0.0003, // $ per 1K tokens
+    output: 0.0025, // $ per 1K tokens
+  },
   'gemini-2.5-flash-lite': {
-    input: 0.000075, // $ per 1K tokens
-    output: 0.0003, // $ per 1K tokens
+    input: 0.0001, // $ per 1K tokens
+    output: 0.0004, // $ per 1K tokens
   },
 };
 
@@ -115,8 +123,8 @@ export class TokenCalculatorService {
     }
 
     if (!MODEL_PRICING[model]) {
-      logger.warn('[TOKEN_CALCULATOR] Unknown model, using gemini-2.5-flash-lite', { model });
-      model = 'gemini-2.5-flash-lite';
+      logger.warn('[TOKEN_CALCULATOR] Unknown model, using gpt-4.1-mini', { model });
+      model = 'gpt-4.1-mini';
     }
 
     const pricing = MODEL_PRICING[model];

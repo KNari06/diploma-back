@@ -529,7 +529,7 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
     }
 
     const { id } = req.params;
-    const { browsers = ['chromium'], projectId: overrideProjectId, platform: reqPlatform } = req.body;
+    const { browsers = ['chrome'], projectId: overrideProjectId, platform: reqPlatform } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Running intent test case', {
       intentTestCaseId: id,
@@ -768,7 +768,7 @@ export async function batchRunIntentTestCases(req: Request, res: Response): Prom
 
     const { 
       testCaseIds, 
-      browsers = ['chromium'], 
+      browsers = ['chrome'],
       concurrency = 3 
     } = req.body;
 

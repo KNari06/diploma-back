@@ -185,7 +185,7 @@ export class CreditCostTrackerService {
             const cost = TokenCalculatorService.calculateCostFromTokens(
               call.inputTokens,
               call.outputTokens,
-              call.model || 'gemini-2.5-flash-lite'
+              call.model || 'gpt-4.1-mini'
             );
             totalCost += cost;
           }
