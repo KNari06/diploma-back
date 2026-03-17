@@ -430,9 +430,49 @@ export class TestCompletionHandlerService {
         const runId = data[0].run_id;
         if (runId && test.user_id) {
           try {
-            webSocketService.emitRegressionRunProgress(test.user_id, {
+            const recipients = new Set<string>();
+            recipients.add(test.user_id);
+            let planId: string | null = null;
+            let projectId: string | null = null;
+            let trigger: any = undefined;
+
+            try {
+              const { data: runRow } = await supabaseAdmin
+                .from('regression_runs')
+                .select('plan_id, project_id, trigger')
+                .eq('id', runId)
+                .maybeSingle();
+              planId = (runRow?.plan_id as string | null) ?? null;
+              projectId = (runRow?.project_id as string | null) ?? null;
+              trigger = (runRow as any)?.trigger;
+
+              if (projectId) {
+                const { data: projRow } = await supabaseAdmin
+                  .from('projects')
+                  .select('workspace_id')
+                  .eq('id', projectId)
+                  .maybeSingle();
+                const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+                if (workspaceId) {
+                  const { data: members } = await supabaseAdmin
+                    .from('workspace_members')
+                    .select('user_id')
+                    .eq('workspace_id', workspaceId)
+                    .eq('status', 'active');
+                  for (const m of members || []) {
+                    const uid = (m as any)?.user_id as string | undefined;
+                    if (uid) recipients.add(uid);
+                  }
+                }
+              }
+            } catch { /* non-fatal */ }
+
+            const payload = {
               runId,
               userId: test.user_id,
+              planId,
+              projectId,
+              trigger,
               status: 'test_completed',
               progress: -1, // Frontend should compute from execution statuses
               message: `Test ${mappedStatus}: ${test.id}`,
@@ -442,7 +482,11 @@ export class TestCompletionHandlerService {
                 currentTestName: test.id,
               },
               timestamp: new Date().toISOString(),
-            });
+            } as any;
+
+            for (const uid of recipients) {
+              webSocketService.emitRegressionRunProgress(uid, payload);
+            }
           } catch { /* non-fatal */ }
         }
       } else {
@@ -915,9 +959,35 @@ export class TestCompletionHandlerService {
             const wsStatus = finalStatus === 'passed' ? 'completed'
               : finalStatus === 'cancelled' ? 'cancelled'
               : 'failed';
-            webSocketService.emitRegressionRunProgress(run.user_id, {
+            // Also emit to all active workspace members of the run's project (so git-trigger completion is visible to collaborators)
+            const recipients = new Set<string>();
+            if (run.user_id) recipients.add(run.user_id);
+            try {
+              const { data: projRow } = await supabaseAdmin
+                .from('projects')
+                .select('workspace_id')
+                .eq('id', run.project_id)
+                .maybeSingle();
+              const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+              if (workspaceId) {
+                const { data: members } = await supabaseAdmin
+                  .from('workspace_members')
+                  .select('user_id')
+                  .eq('workspace_id', workspaceId)
+                  .eq('status', 'active');
+                for (const m of members || []) {
+                  const uid = (m as any)?.user_id as string | undefined;
+                  if (uid) recipients.add(uid);
+                }
+              }
+            } catch { /* non-fatal */ }
+
+            const payload = {
               runId: run.id,
               userId: run.user_id,
+              planId: run.plan_id ?? null,
+              projectId: run.project_id ?? null,
+              trigger: run.trigger,
               status: wsStatus,
               progress: 100,
               message: finalStatus === 'passed'
@@ -932,7 +1002,11 @@ export class TestCompletionHandlerService {
                 skipped: summary.skipped,
               },
               timestamp: new Date().toISOString(),
-            });
+            } as any;
+
+            for (const uid of recipients) {
+              webSocketService.emitRegressionRunProgress(uid, payload);
+            }
           } catch { /* non-fatal */ }
 
           // Create notification for regression run

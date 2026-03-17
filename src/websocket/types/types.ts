@@ -768,6 +768,10 @@ export interface SystemMaintenancePayload {
 export interface RegressionRunProgressPayload {
   runId: string;
   userId: string;
+  /** Helpful for UI routing without extra GET /regression/runs */
+  planId?: string | null;
+  projectId?: string | null;
+  trigger?: 'manual' | 'chat' | 'scheduled' | 'webhook';
   status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed' | 'cancelled';
   progress: number; // 0-100
   message: string;
