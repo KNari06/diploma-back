@@ -47,6 +47,9 @@ export interface ClientToServerEvents {
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
+  // Preview viewport
+  'preview:viewport:set': (data: PreviewViewportSetRequest) => void;
+
   // Preview recording
   'preview:recording:start': (data: PreviewRecordingRequest) => void;
   'preview:recording:stop': (data: PreviewRecordingRequest) => void;
@@ -1187,6 +1190,15 @@ export interface PreviewKeyboardPressRequest {
   previewSessionId: string;
   key: string; // 'Enter', 'Escape', 'ArrowDown', etc.
   modifiers?: ('Control' | 'Shift' | 'Alt' | 'Meta')[];
+}
+
+/**
+ * Viewport change request (client → server)
+ */
+export interface PreviewViewportSetRequest {
+  previewSessionId: string;
+  width: number;
+  height: number;
 }
 
 /**

@@ -15,7 +15,7 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
  * ═══════════════════════════════════════════════════════════════════════════
  *
  * Formats tool results or plain chat into user-friendly response.
- * Uses gemini-2.5-flash-lite for cost efficiency — prose generation doesn't need gpt-4.1.
+ * Uses gemini-2.5-flash-lite for cost efficiency — prose generation doesn't need gpt-5.4-mini.
  *
  * When a Blackboard is provided, reads full pipeline context (goal, plan summary,
  * reviewer guidance, insights) to produce more accurate and goal-aligned responses.

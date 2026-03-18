@@ -912,7 +912,7 @@ What should the agent do next? Respond with JSON:
 
   /**
    * Generic JSON prompt helper
-   * Supports strategy prompts (gemini-2.5-flash-lite) and auditor prompts (gpt-4.1)
+   * Supports strategy prompts (gemini-2.5-flash-lite) and auditor prompts (gpt-5.4-mini)
    * Includes markdown cleanup and strict JSON response format
    *
    * @param prompt - Complete prompt string (must request JSON response)

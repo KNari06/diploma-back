@@ -78,7 +78,7 @@ export async function startPreview(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const { projectId, startUrl } = req.body;
+    const { projectId, startUrl, viewport } = req.body;
 
     if (!projectId || !startUrl) {
       res.status(400).json({ error: 'Missing required fields: projectId, startUrl' });
@@ -87,11 +87,18 @@ export async function startPreview(req: Request, res: Response): Promise<void> {
 
     const safeStartUrl = sanitizeUrl(String(startUrl));
 
+    // Validate optional viewport
+    const parsedViewport = viewport && typeof viewport === 'object'
+      && Number.isFinite(viewport.width) && Number.isFinite(viewport.height)
+      ? { width: Number(viewport.width), height: Number(viewport.height) }
+      : undefined;
+
     const sessionService = getPreviewSessionService();
     const result = await sessionService.startSession({
       userId,
       projectId,
       startUrl: safeStartUrl,
+      viewport: parsedViewport,
     });
 
     // Get viewport metadata for coordinate mapping

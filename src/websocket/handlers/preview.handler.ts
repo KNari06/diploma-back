@@ -2137,6 +2137,69 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // Handle viewport change (live resize)
+  socket.on('preview:viewport:set', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, width, height } = data;
+
+      if (!previewSessionId || !Number.isFinite(width) || !Number.isFinite(height)) {
+        socket.emit('error', {
+          code: 'INVALID_INPUT',
+          message: 'Missing previewSessionId or invalid dimensions',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const normalizedPreviewSessionId = String(previewSessionId).trim();
+
+      logger.info('[WebSocket] Viewport change requested', {
+        socketId: socket.id,
+        previewSessionId: normalizedPreviewSessionId,
+        width,
+        height,
+      });
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      const result = await sessionService.setViewport(normalizedPreviewSessionId, ensuredUserId, width, height);
+
+      if (!result.success) {
+        socket.emit('error', {
+          code: 'VIEWPORT_CHANGE_FAILED',
+          message: result.error || 'Failed to change viewport',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // First: force snapshot re-collect with the new viewport already reflowed.
+      // This ensures domNodes/boundingBox are correct BEFORE the client rescales.
+      await emitSnapshotAlways(socket, normalizedPreviewSessionId, ensuredUserId);
+
+      // Then: emit viewport metadata so client updates coordinate mapping
+      // with coordinates that match the freshly-collected snapshot.
+      const room = createRoomName('preview', normalizedPreviewSessionId);
+      const viewportPayload = {
+        previewSessionId: normalizedPreviewSessionId,
+        viewport: { width, height },
+        devicePixelRatio: 1,
+        timestamp: new Date().toISOString(),
+      };
+      socket.emit('preview:viewport', viewportPayload);
+      socket.to(room).emit('preview:viewport', viewportPayload);
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:viewport:set', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Handle page refresh
   socket.on('preview:page:refresh', async (data) => {
     try {

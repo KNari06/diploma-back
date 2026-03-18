@@ -362,7 +362,7 @@ export class SupervisorAgent {
 
   /**
    * AI diagnosis — called ONLY when Tier 1 is exhausted (5+ interventions).
-   * Uses gpt-4.1 for a diagnostic call.
+   * Uses gpt-5.4-mini for a diagnostic call.
    * Returns actionable hint + optional mandatory action override.
    */
   async diagnoseBlocker(

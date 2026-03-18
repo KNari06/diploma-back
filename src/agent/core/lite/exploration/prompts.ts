@@ -7,7 +7,7 @@
  * 1. Page Classification — Survey phase: analyze page → discover entry points
  * 2. Branch Detection — Flow phase: after flow completion, find new entry points
  *
- * Both use GPT-4o vision (DOM snapshot + screenshot).
+ * Both use GPT-4.1 vision (DOM snapshot + screenshot).
  */
 
 import type { TestFlowCategory, FlowPriority, FlowComplexity, RelatedElement } from './types';
@@ -28,6 +28,7 @@ export function buildPageClassificationPrompt(params: {
   hasCredentials: boolean;
   depth: number;
   structureSummary?: string;
+  overlaySummary?: string;
 }): string {
   const sections: string[] = [];
 
@@ -46,6 +47,10 @@ export function buildPageClassificationPrompt(params: {
 
   if (params.structureSummary) {
     sections.push(`PAGE STRUCTURE SUMMARY:\n${params.structureSummary}`);
+  }
+
+  if (params.overlaySummary) {
+    sections.push(`OVERLAY STATUS:\n${params.overlaySummary}\nNote: Overlays listed above were auto-dismissed before this snapshot was taken. Some overlays (sticky headers/footers) are permanent page elements — they are NOT testable flows.`);
   }
 
   sections.push(`PAGE STATE (DOM elements):\n${params.formattedSnapshot}`);
@@ -80,7 +85,10 @@ RULES:
 - Max 15 entry points per page
 - For navigation links, focus on main navigation (header, sidebar, footer main links)
 - Do NOT list navigation links that go to external sites
-- Each entry point must have a unique, descriptive name`);
+- Each entry point must have a unique, descriptive name
+- IGNORE overlay/popup elements: Do NOT list "Accept Cookies", "Close Modal", "Dismiss Banner", "Subscribe to Newsletter" as testable flows — these are UI noise
+- Elements inside permanent overlays (sticky headers, sticky footers) are navigation elements, not separate test flows
+- If the screenshot shows an overlay but the DOM snapshot does not contain it, the overlay was auto-dismissed — ignore it`);
 
   sections.push(`RESPONSE FORMAT (JSON):
 {
@@ -119,6 +127,7 @@ export function buildBranchDetectionPrompt(params: {
   completedFlowName: string;
   completedFlowGoal: string;
   existingFlowNames: string[];
+  overlaySummary?: string;
 }): string {
   const sections: string[] = [];
 
@@ -129,6 +138,10 @@ export function buildBranchDetectionPrompt(params: {
 
   if (params.existingFlowNames.length > 0) {
     sections.push(`ALREADY DISCOVERED FLOWS (do NOT duplicate these):\n${params.existingFlowNames.map((n) => `- ${n}`).join('\n')}`);
+  }
+
+  if (params.overlaySummary) {
+    sections.push(`OVERLAY STATUS:\n${params.overlaySummary}\nNote: Overlays listed above were auto-dismissed after flow completion. Do NOT create branch points from overlay elements (modals, toasts, banners).`);
   }
 
   sections.push(`CURRENT PAGE STATE:\n${params.formattedSnapshot}`);
@@ -148,6 +161,8 @@ RULES:
 - Do NOT list destructive flows (delete, cancel, remove)
 - Max 5 new entry points
 - Each must have a unique, descriptive name
+- IGNORE overlay/popup elements: Do NOT list "Close Modal", "Dismiss", "OK", "Got it" as testable flows — these are UI noise
+- Success confirmations, toasts, and post-action popups are NOT new testable flows
 
 RESPONSE FORMAT (JSON):
 {
