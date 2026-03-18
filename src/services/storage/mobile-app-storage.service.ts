@@ -10,6 +10,7 @@
 
 import { supabaseAdmin } from '@/db/supabase';
 import { env } from '@/config/environment/env';
+import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
 
@@ -22,7 +23,7 @@ const BUCKET = env.SUPABASE_BUCKET_NAME; // 'qai-assets'
 // ── Types ──────────────────────────────────────────────────────────
 
 export interface MobileAppMetadata {
-  platform: 'android' | 'ios';
+  platform: MobilePlatform;
   packageName?: string;
   storagePath: string;
   publicUrl: string;
@@ -43,7 +44,7 @@ export class MobileAppStorageService {
     params: {
       workspaceId: string;
       projectId: string;
-      platform: 'android' | 'ios';
+      platform: MobilePlatform;
       packageName?: string;
     },
   ): Promise<MobileAppMetadata> {
