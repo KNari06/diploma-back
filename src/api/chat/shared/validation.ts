@@ -18,6 +18,7 @@ export interface Step0Result {
   conversationId?: string;
   answers?: Record<string, any>;
   mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+  executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
   attachments?: ChatAttachment[]; // Processed file attachments (images + documents)
 }
 
@@ -63,7 +64,7 @@ export async function validateInput(
   // Check connection after validation
   checkConnection();
 
-  const { message, context, sessionId, conversationId, answers, mode } = req.body as ChatRequest;
+  const { message, context, sessionId, conversationId, answers, mode, executionStrategy } = req.body as ChatRequest;
 
   // Validate message (FIX #1) — allow empty message when files are attached
   const files = req.files as Express.Multer.File[] | undefined;
@@ -99,6 +100,7 @@ export async function validateInput(
     conversationId,
     answers,
     mode: (mode as 'lite' | 'pro' | 'editor') || 'lite', // Default to 'lite' mode
+    executionStrategy: executionStrategy === 'exploration' ? 'exploration' : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
   };
 }
