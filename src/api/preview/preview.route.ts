@@ -9,6 +9,7 @@ import multer from 'multer';
 import { uploadTestFile } from './upload.controller';
 import {
   batchRunIntentTestCases,
+  cancelIntentTestCase,
   createIntentTestCase,
   deleteIntentTestCase,
   getIntentTestCase,
@@ -846,6 +847,46 @@ router.delete('/intent-test-cases/:id', requireAuth, deleteIntentTestCase);
 router.post('/intent-test-cases/batch-run', requireAuth, batchRunIntentTestCases);
 
 router.post('/intent-test-cases/:id/run', requireAuth, runIntentTestCase);
+
+/**
+ * @swagger
+ * /api/v1/preview/intent-test-cases/{id}/cancel:
+ *   post:
+ *     summary: Cancel a running intent test case
+ *     tags: [Intent Test Cases]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Intent test case ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [testId]
+ *             properties:
+ *               testId:
+ *                 type: string
+ *                 format: uuid
+ *                 description: Test run ID returned by the run endpoint
+ *     responses:
+ *       200:
+ *         description: Test cancelled successfully
+ *       400:
+ *         description: Test already completed or testId missing
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Test not found
+ */
+router.post('/intent-test-cases/:id/cancel', requireAuth, cancelIntentTestCase);
 
 // ============================================================================
 // FILE UPLOAD FOR UPLOAD STEPS (V6)

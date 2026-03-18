@@ -13,6 +13,7 @@ import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import { cancelTest } from '@/services/testing/ui/manual/test-cancellation';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
@@ -746,6 +747,73 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
     const message = error instanceof Error ? error.message : 'Failed to run test case';
     const statusCode = (error as any)?.name === 'ValidationError' ? 400 : 500;
     res.status(statusCode).json({ error: message });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CANCEL INTENT TEST CASE RUN
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Cancel a running intent test case
+ * POST /api/v1/preview/intent-test-cases/:id/cancel
+ *
+ * Body: { testId: string }  – the test run ID returned by the run endpoint
+ *
+ * Delegates to the shared cancelTest() which:
+ * 1. Updates test status to 'cancelled' in DB
+ * 2. Removes queue jobs
+ * 3. Aborts active browser context via TestRunRegistry
+ * 4. Emits test:cancelled WebSocket event
+ */
+export async function cancelIntentTestCase(req: Request, res: Response): Promise<void> {
+  try {
+    const userId = (req as any).user?.id;
+    if (!userId) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { id } = req.params;
+    const { testId } = req.body;
+
+    if (!testId) {
+      res.status(400).json({ error: 'testId is required in request body' });
+      return;
+    }
+
+    logger.info('[PREVIEW_CONTROLLER] Cancelling intent test case run', {
+      intentTestCaseId: id,
+      testId,
+      userId,
+    });
+
+    const result = await cancelTest(testId, userId);
+
+    logger.info('[PREVIEW_CONTROLLER] Intent test case run cancelled', {
+      intentTestCaseId: id,
+      testId,
+      success: result.success,
+    });
+
+    res.json(result);
+  } catch (error) {
+    logger.error('[PREVIEW_CONTROLLER] Failed to cancel intent test case run', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    if ((error as any)?.name === 'NotFoundError') {
+      res.status(404).json({ error: (error as Error).message || 'Test not found' });
+      return;
+    }
+    if ((error as any)?.name === 'ValidationError') {
+      res.status(400).json({ error: (error as Error).message });
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : 'Failed to cancel test';
+    res.status(500).json({ error: message });
   }
 }
 
