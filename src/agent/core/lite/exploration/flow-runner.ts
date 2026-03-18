@@ -528,7 +528,19 @@ export class FlowRunner {
       // 9. Detect branch points on final page (also for partially-successful flows)
       let branchPoints: EntryPoint[] = [];
       if (pipelineResult.success || pipelineResult.progressScore > 30) {
-        branchPoints = await this.detectBranchPoints(page, entryPoint, this.knownFlowNames);
+        // Build flow outcome summary for branch detection AI context
+        const outcomeParts: string[] = [];
+        outcomeParts.push(pipelineResult.success ? 'Completed successfully' : `Partial (${pipelineResult.progressScore}% progress)`);
+        if (entryPoint.sourcePageUrl && page.url() !== entryPoint.sourcePageUrl) {
+          outcomeParts.push(`URL changed: ${entryPoint.sourcePageUrl} → ${page.url()}`);
+        }
+        if (pipelineResult.blockedReason) {
+          outcomeParts.push(`Blocked: ${pipelineResult.blockedReason}`);
+        }
+        outcomeParts.push(`${pipelineResult.commandsExecuted} commands in ${pipelineResult.roundsExecuted} rounds`);
+        const flowOutcome = outcomeParts.join('. ');
+
+        branchPoints = await this.detectBranchPoints(page, entryPoint, this.knownFlowNames, flowOutcome);
       }
 
       // 10. Determine status + extract blocker metadata
@@ -1106,6 +1118,7 @@ export class FlowRunner {
     page: Page,
     completedEntry: EntryPoint,
     existingFlowNames: string[] = [],
+    flowOutcome?: string,
   ): Promise<EntryPoint[]> {
     // Skip if OpenAI is degraded — branch detection is optional enrichment
     if (this.rateLimiter?.isDegraded('openai')) {
@@ -1150,6 +1163,8 @@ export class FlowRunner {
         completedFlowGoal: completedEntry.goal,
         existingFlowNames,
         overlaySummary: branchOverlaySummary ?? undefined,
+        hasCredentials: !!this.config.credentials,
+        flowOutcome,
       });
 
       if (this.rateLimiter) await this.rateLimiter.acquireSlot('ai');

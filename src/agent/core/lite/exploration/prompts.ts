@@ -7,7 +7,8 @@
  * 1. Page Classification — Survey phase: analyze page → discover entry points
  * 2. Branch Detection — Flow phase: after flow completion, find new entry points
  *
- * Both use GPT-4.1 vision (DOM snapshot + screenshot).
+ * Page Classification uses GPT-5.4-mini vision (DOM snapshot + screenshot).
+ * Branch Detection uses GPT-4.1-mini (text-only, DOM snapshot).
  */
 
 import type { TestFlowCategory, FlowPriority, FlowComplexity, RelatedElement } from './types';
@@ -29,6 +30,7 @@ export function buildPageClassificationPrompt(params: {
   depth: number;
   structureSummary?: string;
   overlaySummary?: string;
+  pageHealth?: string;
 }): string {
   const sections: string[] = [];
 
@@ -51,6 +53,10 @@ export function buildPageClassificationPrompt(params: {
 
   if (params.overlaySummary) {
     sections.push(`OVERLAY STATUS:\n${params.overlaySummary}\nNote: Overlays listed above were auto-dismissed before this snapshot was taken. Some overlays (sticky headers/footers) are permanent page elements — they are NOT testable flows.`);
+  }
+
+  if (params.pageHealth) {
+    sections.push(`PAGE HEALTH:\n${params.pageHealth}`);
   }
 
   sections.push(`PAGE STATE (DOM elements):\n${params.formattedSnapshot}`);
@@ -86,9 +92,11 @@ RULES:
 - For navigation links, focus on main navigation (header, sidebar, footer main links)
 - Do NOT list navigation links that go to external sites
 - Each entry point must have a unique, descriptive name
+- Goals must be specific and actionable for automated execution. BAD: "Test the search". GOOD: "Enter a search query in the search bar, submit, and verify results appear". Include the concrete steps the agent should take.
 - IGNORE overlay/popup elements: Do NOT list "Accept Cookies", "Close Modal", "Dismiss Banner", "Subscribe to Newsletter" as testable flows — these are UI noise
 - Elements inside permanent overlays (sticky headers, sticky footers) are navigation elements, not separate test flows
-- If the screenshot shows an overlay but the DOM snapshot does not contain it, the overlay was auto-dismissed — ignore it`);
+- If the screenshot shows an overlay but the DOM snapshot does not contain it, the overlay was auto-dismissed — ignore it
+- If PAGE HEALTH shows JS errors or failed network requests, lower priority for flows that depend on affected functionality — they may not work`);
 
   sections.push(`RESPONSE FORMAT (JSON):
 {
@@ -128,13 +136,24 @@ export function buildBranchDetectionPrompt(params: {
   completedFlowGoal: string;
   existingFlowNames: string[];
   overlaySummary?: string;
+  hasCredentials?: boolean;
+  flowOutcome?: string;
 }): string {
   const sections: string[] = [];
 
-  sections.push(`You are a QA test discovery agent. A test flow just completed successfully.`);
+  sections.push(`You are a QA test discovery agent. A test flow just completed.`);
 
   sections.push(`COMPLETED FLOW: "${params.completedFlowName}" — ${params.completedFlowGoal}`);
+
+  if (params.flowOutcome) {
+    sections.push(`FLOW OUTCOME: ${params.flowOutcome}`);
+  }
+
   sections.push(`CURRENT PAGE URL: ${params.url}`);
+
+  if (params.hasCredentials) {
+    sections.push(`CREDENTIALS: Available. Mark requiresAuth=true for flows that need authentication.`);
+  }
 
   if (params.existingFlowNames.length > 0) {
     sections.push(`ALREADY DISCOVERED FLOWS (do NOT duplicate these):\n${params.existingFlowNames.map((n) => `- ${n}`).join('\n')}`);
