@@ -682,7 +682,9 @@ export interface ChatProcessingStepPayload {
   // Sub-agent pipeline thinking steps
   'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting' |
   // Cooperative multi-agent pipeline steps
-  'agent_reviewing' | 'agent_spawning';
+  'agent_reviewing' | 'agent_spawning' |
+  // Live thinking — shows what the AI agent is currently doing/thinking
+  'agent_thinking';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

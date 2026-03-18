@@ -48,7 +48,7 @@ export class IntentTestCaseService {
     flowId?: string;
     status?: 'draft' | 'published' | 'archived';
     kind?: 'standalone' | 'regression_member';
-    platform?: 'web' | 'mobile_android' | 'mobile_ios';
+    platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
   }): Promise<IntentTestCase> {
     const { projectId, userId, name, description, startUrl, steps, flowId, status = 'draft', kind = 'standalone', platform = 'web' } = params;
 

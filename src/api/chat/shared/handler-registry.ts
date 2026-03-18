@@ -115,6 +115,8 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     abortSignal: params.abortSignal,
     mode: params.mode,
     attachments: params.attachments,
+    // Strict boolean guard: LLM may return "false" (string), 0, or null — only trust actual boolean
+    needsTools: params.parsedIntent?.needsTools === false ? false : undefined,
   });
 };
 

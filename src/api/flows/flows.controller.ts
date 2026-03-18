@@ -53,7 +53,7 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
     const platformKey = module.platformKey;
     const projectId = module.projectId;
 
-    const isMobilePlatform = platform === 'mobile_android' || platform === 'mobile_ios';
+    const isMobilePlatform = typeof platform === 'string' && platform.startsWith('mobile_');
 
     // Create flow
     const flow = await FlowService.create({

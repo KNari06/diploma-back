@@ -577,7 +577,7 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
 
     // Detect mobile platform from request body or test case record
     const platform = reqPlatform || testCase.platform;
-    const isMobile = platform === 'mobile_android' || platform === 'mobile_ios';
+    const isMobile = typeof platform === 'string' && platform.startsWith('mobile_');
 
     // ── Mobile path: queue a mobile test run job ──────────────────
     if (isMobile) {
@@ -594,8 +594,10 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         .single();
 
       const mobileApp = project?.settings?.mobileApp;
-      const mobilePlatform: MobilePlatform = platform === 'mobile_ios' ? 'ios' : 'android';
-      const browser = platform === 'mobile_ios' ? 'mobile-ios' : 'mobile-android';
+      const PLATFORM_MAP: Record<string, MobilePlatform> = { mobile_ios: 'ios', mobile_flutter: 'flutter' };
+      const mobilePlatform: MobilePlatform = PLATFORM_MAP[platform ?? ''] ?? 'android';
+      const BROWSER_MAP: Record<string, string> = { mobile_ios: 'mobile-ios', mobile_flutter: 'mobile-flutter' };
+      const browser = BROWSER_MAP[platform ?? ''] ?? 'mobile-android';
 
       const intentSteps: MobileIntentStep[] = testCase.stepsJson.map((step: any, index: number) => ({
         id: step.id || `step_${index}`,
@@ -633,7 +635,7 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         workspaceId: project?.workspace_id || '',
         projectId,
         platform: mobilePlatform,
-        browser: browser as 'mobile-android' | 'mobile-ios',
+        browser: browser as 'mobile-android' | 'mobile-ios' | 'mobile-flutter',
         intentSteps,
         runnerUrl: env.MOBILE_RUNNER_URL,
         runnerApiKey: env.MOBILE_RUNNER_API_KEY,

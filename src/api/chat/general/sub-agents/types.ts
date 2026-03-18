@@ -140,6 +140,12 @@ export interface PipelineInput {
   availableTools: ChatCompletionTool[];
   skillDescriptions: string;
   abortSignal?: AbortSignal;
+  /**
+   * Signal from Intent Parser: does this message need tool execution?
+   * - false → skip Router, go directly to Responder (saves ~600ms)
+   * - true / undefined → normal Router flow (backward compatible)
+   */
+  needsTools?: boolean;
 }
 
 /**

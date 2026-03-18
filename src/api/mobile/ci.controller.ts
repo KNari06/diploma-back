@@ -56,8 +56,10 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     platform?: string;
   };
 
-  const platform: MobilePlatform = (rawPlatform === 'ios' ? 'ios' : 'android');
-  const browser = platform === 'ios' ? 'mobile-ios' : 'mobile-android';
+  const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  const BROWSER_MAP: Record<MobilePlatform, string> = { android: 'mobile-android', ios: 'mobile-ios', flutter: 'mobile-flutter' };
+  const browser = BROWSER_MAP[platform];
 
   try {
     // ── Step 1: Feature flag ───────────────────────────────────────
@@ -235,9 +237,9 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         success: false,
         error: 'No mobile test cases found',
         message: savedTestCaseIds
-          ? 'None of the provided savedTestCaseIds were found or have steps. Make sure the test cases have platform set to "mobile_android" or "mobile_ios".'
+          ? 'None of the provided savedTestCaseIds were found or have steps. Make sure the test cases have platform set to "mobile_android", "mobile_ios", or "mobile_flutter".'
           : planId
-            ? 'The regression plan contains no mobile test cases with steps. Make sure test cases have platform set to "mobile_android" or "mobile_ios".'
+            ? 'The regression plan contains no mobile test cases with steps. Make sure test cases have platform set to "mobile_android", "mobile_ios", or "mobile_flutter".'
             : 'This project has no saved mobile test cases. Create test cases with platform "mobile_android" or "mobile_ios" in the editor.',
       });
       return;
@@ -396,7 +398,7 @@ async function fetchTestCaseSteps(
     .select('id, name, platform, steps_json, commands, graph_ref, replay_strategy')
     .in('id', testCaseIds)
     .eq('project_id', projectId)
-    .in('platform', ['mobile_android', 'mobile_ios']);
+    .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter']);
 
   if (error) {
     logger.error('[CI] Failed to fetch test cases', { error, testCaseIds });
@@ -422,7 +424,7 @@ async function fetchAllProjectTestCases(
     .from('intent_test_cases')
     .select('id, name, platform, steps_json, commands, graph_ref, replay_strategy')
     .eq('project_id', projectId)
-    .in('platform', ['mobile_android', 'mobile_ios'])
+    .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter'])
     .neq('status', 'archived')
     .limit(50);
 

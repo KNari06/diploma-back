@@ -776,7 +776,7 @@ export type IntentTestCaseKind = 'standalone' | 'regression_member';
 /**
  * Testing platform for test cases
  */
-export type IntentTestCasePlatform = 'web' | 'mobile_android' | 'mobile_ios';
+export type IntentTestCasePlatform = 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
 
 /**
  * Replay strategy for test execution

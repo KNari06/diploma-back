@@ -69,7 +69,7 @@ export interface TestOptions {
   mode?: 'lite' | 'pro'; // Persisted execution mode (used by retry logic)
 }
 
-export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari' | 'mobile-android' | 'mobile-ios';
+export type BrowserType = 'chrome' | 'firefox' | 'safari' | 'edge' | 'mobile-chrome' | 'mobile-safari' | 'mobile-android' | 'mobile-ios' | 'mobile-flutter';
 
 export interface TestResult {
   id: string;
@@ -897,6 +897,12 @@ export interface IntentResult {
   // Execution strategy for platform_test: 'standard' runs a single goal via LiteEngine,
   // 'exploration' runs autonomous BFS discovery + multi-flow execution via ExplorationEngine.
   executionStrategy?: 'standard' | 'exploration';
+
+  // Pipeline optimization: does this general_chat message need tools to answer?
+  // Set by Intent Parser LLM when intent=general_chat.
+  // false → pipeline skips Router agent (~600ms saved), goes directly to Responder.
+  // true/undefined → normal Router flow (backward compatible).
+  needsTools?: boolean;
 }
 
 // Playwright Command types
