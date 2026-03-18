@@ -15,7 +15,7 @@ import type {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const ENGINE_VERSION = '1.0.0'; // Selector engine version
-const MODEL_VERSION = 'gpt-4.1'; // AI model version
+const MODEL_VERSION = 'gpt-5.4-mini'; // AI model version (GPT-5.4 Mini)
 const CACHE_TTL = 3600; // 1 hour in seconds
 
 // TODO: Cache temporarily disabled (per project request)

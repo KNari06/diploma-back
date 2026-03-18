@@ -2,7 +2,9 @@ import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { NotFoundError, ValidationError } from '@/types';
+import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import type {
   Priority,
   RunResult,
@@ -597,7 +599,8 @@ export class RegressionRunService {
   }
 
   /**
-   * Verify user has access to project
+   * Verify user has access to project (owner or any workspace member with read access).
+   * So webhook-triggered runs are visible to all workspace members, not only project owner.
    *
    * @throws {NotFoundError} If project not found
    * @throws {ValidationError} If access denied
@@ -608,7 +611,7 @@ export class RegressionRunService {
   ): Promise<void> {
     const { data: project, error } = await supabaseAdmin
       .from('projects')
-      .select('user_id')
+      .select('user_id, workspace_id')
       .eq('id', projectId)
       .maybeSingle();
 
@@ -616,9 +619,15 @@ export class RegressionRunService {
       throw new NotFoundError('Project', projectId);
     }
 
-    if (project.user_id !== userId) {
-      throw new ValidationError('Access denied to this project');
+    if (project.user_id === userId) return;
+
+    const workspaceId = (project as any).workspace_id as string | undefined;
+    if (workspaceId) {
+      const role = await WorkspaceAccessService.getRole(userId, workspaceId);
+      if (role != null) return;
     }
+
+    throw new ValidationError('Access denied to this project');
   }
 
   // =========================================================================
@@ -1337,6 +1346,26 @@ export class RegressionRunService {
   ): Promise<void> {
     const startedAt = new Date().toISOString();
 
+    // Resolve recipients + plan/project for progress payload once (so git-trigger progress is visible to workspace members, not only owner)
+    let planIdForWs: string | null = null;
+    let projectIdForWs: string | null = null;
+    let progressRecipients: string[] = [userId];
+    try {
+      const { data: runRow } = await supabaseAdmin
+        .from('regression_runs')
+        .select('plan_id, project_id, user_id')
+        .eq('id', runId)
+        .maybeSingle();
+      planIdForWs = (runRow?.plan_id as string | null) ?? null;
+      projectIdForWs = (runRow?.project_id as string | null) ?? null;
+
+      if (projectIdForWs) {
+        progressRecipients = await getProjectWorkspaceMemberIds(projectIdForWs, userId);
+      }
+    } catch {
+      // non-fatal: fall back to owner-only
+    }
+
     // Preload executions to avoid per-test lookups
     const { data: executions, error: execError } = await supabaseAdmin
       .from('test_executions')
@@ -1392,9 +1421,12 @@ export class RegressionRunService {
     ) => {
       try {
         const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
-        webSocketService.emitRegressionRunProgress(userId, {
+        const payload: RegressionRunProgressPayload = {
           runId,
           userId,
+          planId: planIdForWs,
+          projectId: projectIdForWs,
+          trigger,
           status,
           progress,
           message,
@@ -1410,7 +1442,11 @@ export class RegressionRunService {
             skipped: skippedCount,
           },
           timestamp: new Date().toISOString(),
-        });
+        };
+
+        for (const recipientId of progressRecipients) {
+          webSocketService.emitRegressionRunProgress(recipientId, payload);
+        }
       } catch { /* non-fatal */ }
     };
 
@@ -2285,5 +2321,43 @@ export class RegressionRunService {
       ...(negativeSummary && { negativeSummary }),
       ...(negativeExecs.length > 0 && { negativeExecutions: negativeExecs }),
     };
+  }
+}
+
+// ============================================================================
+// WORKSPACE MEMBER RESOLUTION HELPER
+// ============================================================================
+
+/**
+ * Resolve all active workspace member user IDs for a project.
+ * Returns at least the given ownerId, plus all workspace members if the project belongs to a workspace.
+ * Non-fatal: falls back to [ownerId] on any error.
+ */
+export async function getProjectWorkspaceMemberIds(projectId: string, ownerId: string): Promise<string[]> {
+  try {
+    const { data: projRow } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+    if (!workspaceId) return [ownerId];
+
+    const { data: members } = await supabaseAdmin
+      .from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', workspaceId)
+      .eq('status', 'active');
+
+    const ids = new Set<string>();
+    ids.add(ownerId);
+    for (const m of members || []) {
+      const uid = (m as any)?.user_id as string | undefined;
+      if (uid) ids.add(uid);
+    }
+    return Array.from(ids);
+  } catch {
+    return [ownerId];
   }
 }

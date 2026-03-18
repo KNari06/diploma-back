@@ -118,7 +118,7 @@ export class CreditCostTrackerService {
     const credits = TokenCalculatorService.tokensToCredits(totalTokens);
 
     // Cost: 700 input + 200 output
-    const costPerScreenshot = TokenCalculatorService.calculateCostFromTokens(700, 200, 'gpt-4.1');
+    const costPerScreenshot = TokenCalculatorService.calculateCostFromTokens(700, 200, 'gpt-5.4-mini'); // GPT-5.4 Mini for vision
     const costUSD = costPerScreenshot * count;
 
     logger.info('[CREDIT_COST_TRACKER] Screenshot analysis', {
@@ -185,7 +185,7 @@ export class CreditCostTrackerService {
             const cost = TokenCalculatorService.calculateCostFromTokens(
               call.inputTokens,
               call.outputTokens,
-              call.model || 'gemini-2.5-flash-lite'
+              call.model || 'gpt-4.1-mini'
             );
             totalCost += cost;
           }

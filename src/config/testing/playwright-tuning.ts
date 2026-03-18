@@ -26,6 +26,16 @@ function envNum(envVar: string | undefined, defaultValue: number): number {
   return Number.isNaN(parsed) ? defaultValue : parsed;
 }
 
+// ─── Viewport Presets ────────────────────────────────────────────────────────
+
+export const VIEWPORT_PRESETS = {
+  desktop: { width: 1280, height: 720 },
+  tablet:  { width: 768,  height: 1024 },
+  mobile:  { width: 375,  height: 812 },
+} as const;
+
+export type ViewportPresetName = keyof typeof VIEWPORT_PRESETS;
+
 // ─── Preview Session ─────────────────────────────────────────────────────────
 
 export const PREVIEW_SESSION_CONFIG = {

@@ -60,6 +60,7 @@ const chatRequestSchema = z.object({
   answers: z.record(z.any()).optional(),
   userId: z.string().optional(),
   mode: z.enum(['lite', 'pro', 'editor']).optional().default('lite'), // Test execution mode
+  executionStrategy: z.enum(['standard', 'exploration']).optional(), // Execution strategy from frontend
 });
 
 /**

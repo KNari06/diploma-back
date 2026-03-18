@@ -16,7 +16,7 @@ import type { ChatCompletionTool, ChatCompletionMessageParam } from 'openai/reso
  * Lightweight single-step executor spawned for parallel plan execution.
  * Slimmed-down version of the main executor with:
  * - Configurable tool rounds (default 2 vs main executor's 3)
- * - Uses gemini-2.5-flash-lite (vs gpt-4.1)
+ * - Uses gemini-2.5-flash-lite (vs gpt-5.4-mini)
  * - Focused prompt: one step only
  * - Smaller token budget
  *

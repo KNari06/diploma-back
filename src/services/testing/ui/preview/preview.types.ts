@@ -109,8 +109,8 @@ export interface InteractiveNode {
   containerTitles?: string[];
   /** Nearest ARIA landmark role (banner, navigation, main, complementary, search, etc.) */
   nearestLandmark?: string;
-  /** Phase 4: Framework event binding detected (React/Vue/Angular) */
-  frameworkClickable?: 'react' | 'vue' | 'angular';
+  /** Phase 4: Framework event binding detected (React/Vue/Angular/Alpine/HTMX/Stimulus/Knockout/Qwik/jQuery/Svelte) */
+  frameworkClickable?: 'react' | 'vue' | 'angular' | 'alpine' | 'htmx' | 'stimulus' | 'knockout' | 'qwik' | 'jquery' | 'svelte';
   /** Phase 4: Element has contenteditable="true" (rich text editor, inline text field) */
   isContentEditable?: boolean;
   /** Phase 4: Element has tabindex >= 0 (explicitly keyboard-focusable) */
@@ -742,6 +742,10 @@ export interface PreviewSession {
 export interface StartPreviewRequest {
   projectId: string;
   startUrl: string;
+  viewport?: {
+    width: number;
+    height: number;
+  };
 }
 
 /**

@@ -14,7 +14,7 @@ import type { PlannerResult, PlanStep, ToolCategory } from '../types';
  *
  * Creates execution plan for multi-tool tasks.
  * Only called when Router classifies as multi_tool.
- * Uses gpt-4.1 for complex reasoning about tool orchestration.
+ * Uses gpt-5.4-mini for complex reasoning about tool orchestration.
  *
  * Also provides identifyParallelGroups() for topological grouping of steps
  * by dependency level — used by the spawner for parallel execution.

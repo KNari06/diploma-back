@@ -1,7 +1,6 @@
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { buildIntentPrompt, IntentParserContext } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
-import { extractUrlWithGPT } from '@/services/ai/helpers/ai-helpers.service';
 import { searchKB } from '@/services/kb/kb.service';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { IntentResult, IntentType, VALID_SCOPES } from '@/types';
@@ -831,11 +830,10 @@ async function parseIntentWithGPT(
     // Step 2: Setup model configuration
     const { model, supportsJsonMode } = getModelConfiguration();
 
-    // Step 3: Smart history parsing for approval messages (async now!)
-    const historyData = await extractUrlFromChatHistory(message, context);
-
-    // Step 4: Build messages array for GPT
-    const messages = buildGPTMessages(message, prompt, context, historyData);
+    // Step 3: Build messages array for GPT
+    // Chat history is included directly — LLM can find URLs from previous messages
+    // without a separate extraction step.
+    const messages = buildGPTMessages(message, prompt, context);
 
     // Step 5: Make OpenAI API call
     const response = await makeOpenAICall(model, messages, supportsJsonMode);
@@ -876,7 +874,7 @@ function logContextUsage(context?: IntentParserContext): void {
 function getModelConfiguration(): { model: string; supportsJsonMode: boolean } {
     const model = AI_MODELS.fast;
 
-    // JSON mode supported by: gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, o1, o3, gemini-2.5-flash, gemini-2.5-flash-lite
+    // JSON mode supported by: gpt-5.4-mini, gpt-4.1-mini, gpt-4.1-nano, o1, o3, gemini-2.5-flash, gemini-2.5-flash-lite
     // Since we always use supported models (from env or default), JSON mode is always supported
     const supportsJsonMode = true;
 
@@ -884,116 +882,19 @@ function getModelConfiguration(): { model: string; supportsJsonMode: boolean } {
 }
 
 /**
- * Extract URL and method from chat history for approval messages
- * FIX #1: Parallel GPT calls for 2x speed improvement (~200ms saved)
- */
-async function extractUrlFromChatHistory(
-  message: string,
-  context?: IntentParserContext
-): Promise<{ extractedUrl: string | null; extractedMethod: string | null }> {
-  try {
-    // Early return: No chat history available
-    if (!context?.chatHistory || context.chatHistory.length === 0) {
-      logger.info('[INTENT_PARSER] No chat history available for URL extraction');
-      return { extractedUrl: null, extractedMethod: null };
-    }
-
-    // Filter ONLY user messages from history
-    const userMessages = context.chatHistory
-      .filter(msg => msg.role === 'user')
-      .slice(-10); // Last 10 USER messages
-
-    if (userMessages.length === 0) {
-      logger.info('[INTENT_PARSER] No user messages in history');
-      return { extractedUrl: null, extractedMethod: null };
-    }
-
-    // OPTIMIZATION: Skip extraction for absolute first message (no context to extract from)
-    // Safe: Only skips when userMessages.length === 1 (first user message)
-    // Covers approval scenarios: approval always comes AFTER test plan (at least 2+ messages)
-    if (userMessages.length === 1 && context.chatHistory.length <= 2) {
-      logger.info('[INTENT_PARSER] ⚡ Fast path: First user message, no previous context to extract');
-      return { extractedUrl: null, extractedMethod: null };
-    }
-
-    // OPTIMIZATION: Use simple heuristic to detect potential approval-like messages
-    // and skip URL extraction for them (they never contain URLs).
-    const approvalKeywords = /^(да|yes|ок|ok|go|run|запусти|подтвер|approve|confirm|давай|start|lgtm|выполн)/i;
-    const isLikelyApproval = approvalKeywords.test(message.trim());
-
-    if (!isLikelyApproval) {
-      logger.info('[INTENT_PARSER] ⚡ Fast path: Message is not approval, skipping URL extraction', {
-        message: message.substring(0, 30),
-      });
-      return { extractedUrl: null, extractedMethod: null };
-    }
-
-    logger.info('[INTENT_PARSER] Possible approval detected, extracting URL from history', {
-      message: message.substring(0, 30),
-    });
-
-    const extractionResult = await extractUrlWithGPT(userMessages, message);
-
-    // Check if URL was extracted
-    if (!extractionResult.url) {
-      logger.warn('[INTENT_PARSER] No URL found in recent history despite approval', {
-        message,
-        userMessagesCount: userMessages.length,
-        extractionConfidence: extractionResult.confidence,
-      });
-      return { extractedUrl: null, extractedMethod: null };
-    }
-
-    // Success: Approval detected AND URL extracted
-    logger.info('[INTENT_PARSER] ✅ Successfully extracted URL from history!', {
-      url: extractionResult.url,
-      method: extractionResult.method,
-      extractionConfidence: extractionResult.confidence,
-      reasoning: extractionResult.reasoning,
-    });
-
-    return {
-      extractedUrl: extractionResult.url,
-      extractedMethod: extractionResult.method,
-    };
-
-  } catch (error) {
-    logger.error('[INTENT_PARSER] Error extracting URL from history', {
-      error: error instanceof Error ? error.message : String(error),
-      message,
-    });
-    return { extractedUrl: null, extractedMethod: null };
-  }
-}
-
-/**
- * Build messages array for GPT API call
+ * Build messages array for GPT API call.
+ * Chat history is passed directly — LLM finds URLs from previous messages
+ * when the user sends an approval message (no separate extraction step needed).
  */
 function buildGPTMessages(
   message: string,
   prompt: string,
-  context?: IntentParserContext,
-  historyData?: { extractedUrl: string | null; extractedMethod: string | null }
+  context?: IntentParserContext
 ): any[] {
-  // Build system prompt: combine full intent prompt + URL context (if found)
-  let systemPrompt = prompt; // Full intent parsing instructions from buildIntentPrompt
-
-  // If URL was extracted from history, add it as important context
-  // (The prompt already contains rules for handling "URL FOUND IN HISTORY")
-  if (historyData?.extractedUrl) {
-    systemPrompt = `${prompt}
-
-⚠️ URL FOUND IN HISTORY:
-URL: ${historyData.extractedUrl}
-Method: ${historyData.extractedMethod || 'Not specified'}
-
-Use the rules above for "URL FOUND IN HISTORY" to determine the intent.`;
-  }
-
   const messages: any[] = [
     {
       role: 'system',
-      content: systemPrompt,
+      content: prompt,
     },
   ];
 
@@ -1955,18 +1856,8 @@ function logKnownBugPatterns(
   context?: IntentParserContext,
   errorMessage?: string
 ): void {
-  // Pattern 1: Short approval message without URL (our main bug!)
-  const approvalKeywords = ['да', 'yes', 'go', 'ok', 'ок', 'давай', 'run', 'execute', 'start'];
-  const isApprovalLike = approvalKeywords.some(keyword => message.toLowerCase().includes(keyword));
-
-  if (isApprovalLike && message.length < 20) {
-    logger.warn('[INTENT_PARSER] 🔍 PATTERN DETECTED: Approval-like short message', {
-      message,
-      hasHistory: !!(context?.chatHistory && context.chatHistory.length > 0),
-      historyLength: context?.chatHistory?.length || 0,
-      suggestion: 'This might be an approval message. Check if URL exists in chat history.',
-    });
-  }
+  // Pattern 1: Short messages — LLM handles approval detection via chat history context.
+  // No hardcoded keyword matching needed.
 
   // Pattern 2: Message with URL but parsing failed
   if (message.match(/https?:\/\//)) {

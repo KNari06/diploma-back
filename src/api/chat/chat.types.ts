@@ -43,6 +43,7 @@ export interface ChatRequest {
   answers?: Record<string, any>; // Answers to clarifying questions
   userId?: string; // Optional userId for testing/dev (when no auth token)
   mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+  executionStrategy?: 'standard' | 'exploration'; // Execution strategy (default: 'standard')
 }
 
 export interface ChatResponse {

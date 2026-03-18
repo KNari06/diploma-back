@@ -122,9 +122,10 @@ export async function handlePlatformTest(
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+    executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger, mode } = params;
+  const { message, parsedIntent, userId, workspace_id, chatSessionId, conversationId, answers, abortSignal, logger: functionLogger, mode, executionStrategy } = params;
 
   // Wrap entire test plan flow with AI tracking context
   const executePlatformTest = async () => {
@@ -639,14 +640,100 @@ export async function handlePlatformTest(
       checkRequestAbortedWithLogging(abortSignal);
     }
 
-    const executionStrategy = parsedIntent?.executionStrategy || 'standard';
+    // If frontend explicitly set executionStrategy, use it; otherwise rely on AI parsing
+    const effectiveStrategy = executionStrategy === 'exploration'
+      ? 'exploration'
+      : (parsedIntent?.executionStrategy || 'standard');
 
     // ═══════════════════════════════════════════════════════════════════════
     // EXPLORATION BRANCH — autonomous BFS discovery + multi-flow execution
-    // Requires explicit user confirmation before starting (expensive operation)
     // ═══════════════════════════════════════════════════════════════════════
-    if (executionStrategy === 'exploration') {
-      // Store pending exploration in Redis for confirmation flow
+    if (effectiveStrategy === 'exploration') {
+      const isExplicitExploration = executionStrategy === 'exploration'; // from frontend UI
+
+      if (isExplicitExploration) {
+        // ─────────────────────────────────────────────────────────────────
+        // EXPLICIT EXPLORATION — user chose exploration in UI, skip confirmation
+        // ─────────────────────────────────────────────────────────────────
+        const explorationId = `expl-${Date.now()}-${userId.slice(0, 8)}`;
+
+        logger.info('[PLATFORM_TEST] Explicit exploration mode — skipping confirmation', {
+          explorationId,
+          url: extractedUrl,
+          userId,
+        });
+
+        try {
+          await QueueManager.addExplorationJob({
+            explorationId,
+            entryUrl: extractedUrl.trim(),
+            projectId: project_id,
+            userId,
+            chatSessionId,
+            workspaceId: workspace_id,
+            scopeHint: parsedIntent?.target || parsedIntent?.scope || undefined,
+            credentials: finalCredentials || undefined,
+            maxConcurrency: 5,
+          });
+
+          const replyMessage = `Exploration started for **${extractedUrl}**. I'll notify you when test cases are discovered.`;
+
+          if (chatSessionId) {
+            ChatService.saveChatMessages(chatSessionId, [
+              { role: 'user', content: message },
+              {
+                role: 'ai',
+                content: replyMessage,
+                metadata: { explorationId, mode: 'exploration', url: extractedUrl },
+              },
+            ]).catch(() => {});
+          }
+
+          if (lockAcquired && chatSessionId) {
+            await releaseChatTestLock(chatSessionId);
+            lockAcquired = false;
+          }
+
+          res.json({
+            success: true,
+            reply: replyMessage,
+            mode: 'exploration',
+            explorationId,
+            timestamp: new Date().toISOString(),
+            sessionId: chatSessionId,
+          });
+          return;
+        } catch (error) {
+          logger.error('[PLATFORM_TEST] Failed to queue explicit exploration', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+
+          const errorReply = 'Failed to start exploration. Please try again.';
+          if (chatSessionId) {
+            ChatService.saveChatMessages(chatSessionId, [
+              { role: 'user', content: message },
+              { role: 'ai', content: errorReply },
+            ]).catch(() => {});
+          }
+
+          if (lockAcquired && chatSessionId) {
+            await releaseChatTestLock(chatSessionId);
+            lockAcquired = false;
+          }
+
+          res.json({
+            success: false,
+            reply: errorReply,
+            timestamp: new Date().toISOString(),
+            sessionId: chatSessionId,
+          });
+          return;
+        }
+      }
+
+      // ─────────────────────────────────────────────────────────────────
+      // AI-DETECTED EXPLORATION — requires user confirmation (existing flow)
+      // ─────────────────────────────────────────────────────────────────
       const pendingKey = `pending_exploration:${chatSessionId || userId}`;
       const pendingData = JSON.stringify({
         entryUrl: extractedUrl.trim(),
@@ -668,7 +755,6 @@ export async function handlePlatformTest(
         `- Explores up to 10 pages and 20 flows\n\n` +
         `Do you want to proceed? Reply **yes** to start or **no** to cancel.`;
 
-      // Save messages
       if (chatSessionId) {
         ChatService.saveChatMessages(chatSessionId, [
           { role: 'user', content: message },
@@ -680,7 +766,6 @@ export async function handlePlatformTest(
         ]).catch(() => {});
       }
 
-      // Release lock
       if (lockAcquired && chatSessionId) {
         await releaseChatTestLock(chatSessionId);
         lockAcquired = false;

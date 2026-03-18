@@ -208,7 +208,7 @@ export class TestPipeline {
         // Wrap Planner LLM call with cancellation support
         const plan = await withCancellation(
           config.testId,
-          PlannerAgent.plan(this.blackboard),
+          PlannerAgent.plan(this.blackboard, this.integrations.traceWriter),
           'planner_agent',
         );
         this.blackboard.setPlan(plan);
@@ -255,7 +255,7 @@ export class TestPipeline {
         // Pass abortSignal so executor can cancel in-flight LLM calls on abort.
         await withCancellation(
           config.testId,
-          executor.execute(this.blackboard, this.commandExecutor, this.abortController?.signal),
+          executor.execute(this.blackboard, this.commandExecutor, this.abortController?.signal, this.integrations.traceWriter),
           'executor_agent',
         );
 
@@ -349,7 +349,7 @@ export class TestPipeline {
         // Reads: Blackboard (goal, plan, rounds, snapshot)
         // Writes: Blackboard (review, insights)
         // When Executor says mark_done → Reviewer calls auditDone()
-        // via GoalDetector (gpt-4.1) before accepting.
+        // via GoalDetector (gpt-5.4-mini) before accepting.
         // ════════════════════════════════════════════════════════════
 
         // IMPORTANT: Only set phase to 'reviewing' if NOT 'done'.
@@ -365,7 +365,7 @@ export class TestPipeline {
 
         const review = await withCancellation(
           config.testId,
-          ReviewerAgent.review(this.blackboard, this.integrations.goalDetector),
+          ReviewerAgent.review(this.blackboard, this.integrations.goalDetector, this.integrations.traceWriter),
           'reviewer_agent',
         );
         this.blackboard.setReview(review);

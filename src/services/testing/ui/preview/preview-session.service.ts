@@ -295,13 +295,14 @@ export class PreviewSessionService {
     userId: string;
     projectId: string;
     startUrl: string;
+    viewport?: { width: number; height: number };
   }): Promise<{
     previewSessionId: string;
     url: string;
     domNodes: InteractiveNode[];
     screenshot?: string;
   }> {
-    const { userId, projectId, startUrl } = params;
+    const { userId, projectId, startUrl, viewport } = params;
     const safeStartUrl = sanitizeUrl(startUrl);
 
     // Acquire per-user lock to prevent race conditions
@@ -343,7 +344,7 @@ export class PreviewSessionService {
         });
 
         context = await browser.newContext({
-          viewport: PREVIEW_SESSION_CONFIG.viewport,
+          viewport: viewport ?? PREVIEW_SESSION_CONFIG.viewport,
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         });
 
@@ -941,6 +942,58 @@ export class PreviewSessionService {
       height: viewport.height,
       devicePixelRatio: 1, // Always 1 for headless (no deviceScaleFactor)
     };
+  }
+
+  /**
+   * Change viewport size on an active session (live resize).
+   * Triggers CSS media queries / responsive reflow. Next snapshot will reflect new layout.
+   */
+  async setViewport(
+    sessionId: string,
+    userId: string,
+    width: number,
+    height: number,
+  ): Promise<{ success: boolean; error?: string }> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) {
+      return { success: false, error: 'Session not found or unauthorized' };
+    }
+
+    // Validate dimensions
+    if (
+      !Number.isFinite(width) || !Number.isFinite(height) ||
+      width < 320 || height < 320 ||
+      width > 1920 || height > 1200
+    ) {
+      return { success: false, error: 'Invalid viewport dimensions (320-1920 x 320-1200)' };
+    }
+
+    try {
+      await session.page.setViewportSize({ width, height });
+
+      // Wait for CSS media queries and responsive reflow to complete before returning.
+      // Without this, emitSnapshotAlways() would collect DOM before layout has settled,
+      // returning stale boundingBox values and wrong element visibility flags.
+      await waitForDOMStability(session.page, 1500, 300);
+
+      session.lastSeenAt = Date.now();
+
+      logger.info('[PREVIEW_SESSION] Viewport changed', {
+        sessionId,
+        width,
+        height,
+      });
+
+      return { success: true };
+    } catch (error) {
+      logger.error('[PREVIEW_SESSION] Failed to set viewport', {
+        sessionId,
+        width,
+        height,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: 'Failed to set viewport' };
+    }
   }
 
   /**

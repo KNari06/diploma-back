@@ -26,6 +26,7 @@ export async function routeToHandler(
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+    executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
     attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ): Promise<void> {
@@ -84,6 +85,7 @@ export async function routeToHandler(
     context: params.context,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    executionStrategy: params.executionStrategy,
     attachments: params.attachments,
   });
 }

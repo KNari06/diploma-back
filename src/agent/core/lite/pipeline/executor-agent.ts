@@ -34,6 +34,7 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import type { ChatCompletionMessageParam } from 'openai/resources';
+import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { TestBlackboard } from './blackboard';
 import { CommandExecutor } from './command-executor';
 import { PLAYWRIGHT_COMMANDS } from './commands';
@@ -55,6 +56,7 @@ const EXECUTOR_CONFIG = {
 
 export class ExecutorAgent {
   private messages: ChatCompletionMessageParam[] = [];
+  private traceWriter?: LiteTraceWriter;
 
   /**
    * Execute the plan by calling Playwright commands in a tool-calling loop.
@@ -66,12 +68,28 @@ export class ExecutorAgent {
     blackboard: TestBlackboard,
     commandExecutor: CommandExecutor,
     abortSignal?: AbortSignal,
+    traceWriter?: LiteTraceWriter,
   ): Promise<void> {
+    this.traceWriter = traceWriter;
+    const pipelineRound = blackboard.getRounds().length + 1;
+
     // Build initial messages from Blackboard context
+    const systemPrompt = buildExecutorSystemPrompt(blackboard);
+    const userMessage = buildExecutorUserMessage(blackboard);
     this.messages = [
-      { role: 'system', content: buildExecutorSystemPrompt(blackboard) },
-      { role: 'user', content: buildExecutorUserMessage(blackboard) },
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage },
     ];
+
+    // Trace: full prompts sent to executor
+    this.trace('executor_prompt', {
+      pipelineRound,
+      model: AI_TASK_MODELS.chatExecutor,
+      systemPrompt,
+      userMessage,
+      planSummary: blackboard.getPlan()?.summary,
+      planSteps: blackboard.getPlan()?.steps.map(s => s.description),
+    });
 
     let round = 0;
 
@@ -86,6 +104,8 @@ export class ExecutorAgent {
 
       // Smart context compression if approaching token limit
       ContextManager.compressIfNeeded(this.messages);
+
+      const llmStart = Date.now();
 
       try {
         // Single LLM call with Playwright commands available
@@ -108,8 +128,27 @@ export class ExecutorAgent {
             });
             blackboard.addInsight(response.content.slice(0, 200));
           }
+          this.trace('executor_no_tools', {
+            pipelineRound,
+            executorRound: round,
+            modelContent: response.content?.slice(0, 500),
+            latencyMs: Date.now() - llmStart,
+          });
           break;
         }
+
+        // Trace: tool calls chosen by AI
+        this.trace('executor_tool_calls', {
+          pipelineRound,
+          executorRound: round,
+          toolCalls: toolCalls.map(tc => ({
+            name: tc.function.name,
+            args: tc.function.arguments?.slice(0, 500),
+          })),
+          modelContent: response.content?.slice(0, 200),
+          latencyMs: Date.now() - llmStart,
+          tokensUsed: response.usage?.totalTokens,
+        });
 
         // Push assistant message with tool calls (preserves context)
         this.messages.push({
@@ -141,6 +180,20 @@ export class ExecutorAgent {
           const cmdStart = Date.now();
           const result = await commandExecutor.execute(commandName, commandArgs);
           const cmdDuration = Date.now() - cmdStart;
+
+          // Trace: per-command execution result
+          this.trace('executor_command_result', {
+            pipelineRound,
+            executorRound: round,
+            command: commandName,
+            args: commandArgs,
+            success: result.success,
+            output: result.output?.slice(0, 500),
+            error: result.error?.slice(0, 300),
+            done: result.done,
+            blocked: result.blocked,
+            durationMs: cmdDuration,
+          });
 
           // Track executed command
           executedCommands.push({
@@ -193,10 +246,29 @@ export class ExecutorAgent {
         logger.warn('[EXECUTOR] LLM call error', { round, error: errorMsg });
         blackboard.addInsight(`Executor error in round ${round}: ${errorMsg}`);
 
+        this.trace('executor_error', {
+          pipelineRound,
+          executorRound: round,
+          error: errorMsg,
+          latencyMs: Date.now() - llmStart,
+        });
+
         // On error, break out of loop — Reviewer will decide what to do
         break;
       }
     }
+  }
+
+  /** Write trace entry (fire-and-forget) */
+  private trace(eventType: string, payload: Record<string, any>): void {
+    try {
+      this.traceWriter?.write({
+        stage: 'pipeline',
+        eventType,
+        spanId: this.traceWriter.generateSpanId(),
+        payload,
+      });
+    } catch { /* never break agent for trace failures */ }
   }
 
   /**

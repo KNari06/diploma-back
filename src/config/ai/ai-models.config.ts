@@ -24,19 +24,19 @@ import { env } from '@/config/environment/env';
  * Every AI call should use one of these instead of a hardcoded string.
  */
 export const AI_MODELS = {
-  /** High-quality model for complex reasoning, auditing, vision. Default: gpt-4.1 */
-  smart: env.OPENAI_MODEL || 'gpt-4.1',
+  /** High-quality model for complex reasoning, auditing, vision. Default: gpt-5.4-mini */
+  smart: env.OPENAI_MODEL || 'gpt-5.4-mini',
 
-  /** Fast/cheap model for classification, extraction, disambiguation. Default: gemini-2.5-flash-lite */
-  fast: env.OPENAI_MODEL_FAST || 'gemini-2.5-flash-lite',
+  /** Fast/cheap model for classification, extraction, disambiguation. Default: gpt-4.1-mini */
+  fast: env.OPENAI_MODEL_FAST || 'gpt-4.1-mini',
 
-  /** Vision-capable model for screenshot analysis. Default: gpt-4.1 */
-  vision: env.OPENAI_MODEL || 'gpt-4.1',
+  /** Vision-capable model for screenshot analysis. Default: gpt-5.4-mini */
+  vision: env.OPENAI_MODEL || 'gpt-5.4-mini',
 
   /**
    * Classification model — balances quality and cost for bulk processing tasks.
    * Used by the Allure import pipeline for file classification and KB preprocessing.
-   * Default: gpt-4.1-mini ($0.40/$1.60 per 1M tokens — 80% cheaper than gpt-4.1).
+   * Default: gpt-4.1-mini ($0.40/$1.60 per 1M tokens — 80% cheaper than gpt-5.4-mini).
    */
   classify: 'gpt-4.1-mini' as const,
 } as const;

@@ -250,6 +250,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       abortSignal, // Pass abort signal for cancellation checks
       logger: functionLogger,
       mode: inputResult.mode || 'lite', // Pass mode from request
+      executionStrategy: inputResult.executionStrategy, // Explicit exploration from frontend
       attachments, // File attachments (images + documents)
     });
 

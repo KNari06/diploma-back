@@ -261,11 +261,10 @@ ${regressionContextStr}
 ${buildEditorModeSection(context)}
 --- DECISION TREE ---
 
-1. System-provided context ("URL FOUND IN HISTORY" / "extractedUrl"):
-   • System URL + user approves ("yes", "go", "давай") → apply URL CLASSIFICATION → api_test or platform_test
-   • System URL + user asks question → general_chat
-   • System URL + user modifies request → use new request with system URL as base
-   • NO system URL + short approval word → needs_clarification
+1. Short approval message ("yes", "go", "давай", "запусти", "ok", etc.) — look at CONVERSATION HISTORY:
+   • If previous messages contain a URL or test plan → extract URL from history → apply URL CLASSIFICATION → api_test or platform_test
+   • If previous AI message asked a clarification question → answer the question in context → general_chat
+   • If no URL or test plan in history → needs_clarification
 
 2. User provides URL/domain + action request → apply URL CLASSIFICATION → api_test or platform_test
 
@@ -366,10 +365,10 @@ Ex1: "Test registration form on https://mysite.com/register"
 Ex2: "repetino.kz try to register"
 → {"intent": "platform_test", "intent_confidence": 0.88, "scope": "form", "target": "registration", "page": "repetino.kz", "rawText": "..."}
 
-Ex3: System: "URL FOUND IN HISTORY: https://api.example.com, Method: GET", User: "yes, execute it now"
+Ex3: History contains "test GET https://api.example.com", User: "yes, execute it now"
 → {"intent": "api_test", "intent_confidence": 0.90, "apiMethod": "GET", "apiUrl": "https://api.example.com", "rawText": "..."}
 
-Ex3b: System: "URL FOUND IN HISTORY: https://example.com", User: "давай"
+Ex3b: History contains AI proposing a test plan for "https://example.com", User: "давай"
 → {"intent": "platform_test", "intent_confidence": 0.90, "page": "https://example.com", "rawText": "..."}
 
 Ex4: "test this api /test in light mode"

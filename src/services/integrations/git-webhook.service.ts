@@ -139,36 +139,51 @@ export class GitWebhookService {
       throw new Error('Repository URL not found in webhook payload');
     }
 
-    let integration = await GitIntegrationService.findByProviderAndRepositoryUrl(provider, repositoryUrlRaw);
+    // Find all integrations for this repo (multiple accounts/projects can have the same repo)
+    let integrations = await GitIntegrationService.findAllByProviderAndRepositoryUrl(provider, repositoryUrlRaw);
 
-    // If no integration, try to create one from a matching regression plan (same repo URL in gitTriggers)
-    if (!integration) {
+    // If none, try to create one from a matching regression plan (same repo URL in gitTriggers)
+    if (integrations.length === 0) {
       const created = await this.tryCreateIntegrationFromMatchingPlan(provider, repositoryUrlRaw);
-      if (created) integration = created;
+      if (created) integrations = [created];
     }
 
-    // Validate signature/token when secret is configured (skip when empty — no verification)
-    if (integration && integration.webhook_secret) {
-      if (provider === 'github') {
-        if (!signature || !this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
-          throw new Error('Invalid GitHub webhook signature');
+    const firstIntegration = integrations.length > 0 ? integrations[0] : null;
+
+    // Validate signature/token — GitHub/GitLab send ONE signature per request (tied to the
+    // single webhook secret configured at the repo/project level). When multiple integrations
+    // share the same repo, try each integration's secret until one matches. This handles the
+    // edge case where integrations in different workspaces have different secrets.
+    if (signature && integrations.some((i) => i.webhook_secret)) {
+      let verified = false;
+      for (const integration of integrations) {
+        if (!integration.webhook_secret) continue;
+        if (provider === 'github') {
+          if (this.verifyGitHubSignature(rawBody, signature, integration.webhook_secret)) {
+            verified = true;
+            break;
+          }
+        } else {
+          if (this.verifyGitLabToken(signature, integration.webhook_secret)) {
+            verified = true;
+            break;
+          }
         }
-      } else {
-        if (!signature || !this.verifyGitLabToken(signature, integration.webhook_secret)) {
-          throw new Error('Invalid GitLab webhook token');
-        }
+      }
+      if (!verified) {
+        throw new Error(`Invalid ${provider === 'github' ? 'GitHub webhook signature' : 'GitLab webhook token'}`);
       }
     }
 
-    // Persist delivery (even if integration not found) for audit
-    const repositoryUrlNormalized = integration?.repository_url || this.normalizeRepositoryUrl(repositoryUrlRaw, provider);
+    // Persist delivery once (integration_id = first for audit/duplicate detection)
+    const repositoryUrlNormalized = firstIntegration?.repository_url || this.normalizeRepositoryUrl(repositoryUrlRaw, provider);
 
     const persisted = await this.persistDelivery({
       provider,
       deliveryId,
       eventType,
       repositoryUrl: repositoryUrlNormalized,
-      integrationId: integration?.id || null,
+      integrationId: firstIntegration?.id || null,
       payload,
       signature,
     });
@@ -177,7 +192,7 @@ export class GitWebhookService {
       return { queued: false, ignored: true, reason: 'duplicate_delivery' };
     }
 
-    if (!integration) {
+    if (integrations.length === 0) {
       const normalizedForLog = this.normalizeRepositoryUrl(repositoryUrlRaw, provider);
       logger.warn('[GIT_WEBHOOK] No git integration found for repo', {
         provider,
@@ -190,8 +205,10 @@ export class GitWebhookService {
       return { queued: false, ignored: true, reason: 'integration_not_found' };
     }
 
-    // Enqueue for async processing
-    await QueueManager.addGitWebhookJob({ provider, deliveryId });
+    // Enqueue one job per integration so every account/project with this repo gets runs
+    for (const integration of integrations) {
+      await QueueManager.addGitWebhookJob({ provider, deliveryId, integrationId: integration.id });
+    }
     await this.updateDeliveryStatus(provider, deliveryId, { status: 'queued' });
 
     return { queued: true, ignored: false };

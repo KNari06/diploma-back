@@ -575,13 +575,14 @@ export async function listGitLabRepos(req: Request, res: Response): Promise<void
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    logger.error('[INTEGRATIONS] List GitLab repos error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    res.status(500).json({
+    const message = error instanceof Error ? error.message : String(error);
+    const isConfigError = /not configured|not set/i.test(message);
+    const isAuthError = /expired|reconnect|refresh/i.test(message);
+    logger.error('[INTEGRATIONS] List GitLab repos error', { error: message });
+    res.status(isConfigError ? 503 : isAuthError ? 401 : 500).json({
       success: false,
-      error: 'Internal server error',
-      message: error instanceof Error ? error.message : 'Failed to list GitLab repos',
+      error: isConfigError ? 'GitLab integration not configured' : isAuthError ? 'GitLab token expired' : 'Internal server error',
+      message: isConfigError ? 'GITLAB_CLIENT_ID/SECRET not set. Ask the administrator to configure GitLab OAuth.' : message,
       timestamp: new Date().toISOString(),
     });
   }
@@ -634,13 +635,14 @@ export async function listGitLabBranches(req: Request, res: Response): Promise<v
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    logger.error('[INTEGRATIONS] List GitLab branches error', {
-      error: error instanceof Error ? error.message : String(error),
-    });
-    res.status(500).json({
+    const message = error instanceof Error ? error.message : String(error);
+    const isConfigError = /not configured|not set/i.test(message);
+    const isAuthError = /expired|reconnect|refresh/i.test(message);
+    logger.error('[INTEGRATIONS] List GitLab branches error', { error: message });
+    res.status(isConfigError ? 503 : isAuthError ? 401 : 500).json({
       success: false,
-      error: 'Internal server error',
-      message: error instanceof Error ? error.message : 'Failed to list GitLab branches',
+      error: isConfigError ? 'GitLab integration not configured' : isAuthError ? 'GitLab token expired' : 'Internal server error',
+      message: isConfigError ? 'GITLAB_CLIENT_ID/SECRET not set. Ask the administrator to configure GitLab OAuth.' : message,
       timestamp: new Date().toISOString(),
     });
   }

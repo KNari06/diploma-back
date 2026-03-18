@@ -496,16 +496,23 @@ export class QueueManager {
   }
 
   /**
-   * Add git webhook processing job
+   * Add git webhook processing job (optional integrationId: when set, one delivery can trigger multiple jobs, one per integration).
    */
-  static async addGitWebhookJob(jobData: { provider: 'github' | 'gitlab'; deliveryId: string }) {
+  static async addGitWebhookJob(jobData: {
+    provider: 'github' | 'gitlab';
+    deliveryId: string;
+    integrationId?: string;
+  }) {
     try {
+      const jobId = jobData.integrationId
+        ? `${jobData.provider}:${jobData.deliveryId}:${jobData.integrationId}`
+        : `${jobData.provider}:${jobData.deliveryId}`;
       const job = await gitWebhookQueue.add('git-webhook', jobData, {
         priority: 1,
-        jobId: `${jobData.provider}:${jobData.deliveryId}`,
+        jobId,
       });
 
-      logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.GIT_WEBHOOK, deliveryId: jobData.deliveryId });
+      logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.GIT_WEBHOOK, deliveryId: jobData.deliveryId, integrationId: jobData.integrationId });
       return job;
     } catch (error) {
       logger.error('Failed to add git webhook job:', error);

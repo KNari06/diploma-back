@@ -150,13 +150,30 @@ export class ChatService {
 
       logger.debug('[CHAT_SERVICE] Fetching recent messages', { sessionId, limit: validLimit });
 
-      const { data, error } = await supabaseAdmin
+      const QUERY_TIMEOUT_MS = 10_000; // 10s — query should complete in <1s normally
+      const queryPromise = supabaseAdmin
         .from('chat_messages')
         .select('id, role, content, created_at, metadata')
         .eq('session_id', sessionId)
         .order('created_at', { ascending: false })
         .order('id', { ascending: false }) // Secondary sort for messages with same timestamp
         .limit(validLimit);
+
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Chat messages query timed out')), QUERY_TIMEOUT_MS)
+      );
+
+      let data: any[] | null;
+      let error: any;
+      try {
+        ({ data, error } = await Promise.race([queryPromise, timeoutPromise]));
+      } catch (timeoutError) {
+        logger.error('[CHAT_SERVICE] Query timed out fetching recent messages', {
+          sessionId,
+          timeoutMs: QUERY_TIMEOUT_MS,
+        });
+        return []; // Graceful degradation — chat continues without history
+      }
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to get recent messages', {

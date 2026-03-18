@@ -11,11 +11,12 @@ export class GitWebhookJobHandler {
     job: Job<{
       provider: 'github' | 'gitlab';
       deliveryId: string;
+      integrationId?: string;
     }>
   ): Promise<void> {
-    const { provider, deliveryId } = job.data;
+    const { provider, deliveryId, integrationId: jobIntegrationId } = job.data;
 
-    // Load delivery record
+    // Load delivery record (for payload, event_type, etc.)
     const { data: delivery, error: deliveryError } = await supabaseAdmin
       .from('git_webhook_deliveries')
       .select('*')
@@ -27,7 +28,11 @@ export class GitWebhookJobHandler {
       throw new Error(`Delivery not found: ${provider}:${deliveryId}`);
     }
 
-    if (['processed', 'ignored', 'failed'].includes(delivery.status)) {
+    // Resolve which integration this job handles
+    const integrationId = jobIntegrationId ?? (delivery.integration_id as string | null);
+
+    // Single-integration path: skip if delivery already finalized
+    if (!jobIntegrationId && ['processed', 'ignored', 'failed'].includes(delivery.status)) {
       logger.info('[GIT_WEBHOOK_JOB] Delivery already handled', {
         provider,
         deliveryId,
@@ -36,7 +41,6 @@ export class GitWebhookJobHandler {
       return;
     }
 
-    const integrationId = delivery.integration_id as string | null;
     if (!integrationId) {
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
         status: 'ignored',
@@ -149,7 +153,7 @@ export class GitWebhookJobHandler {
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      
+
       await GitWebhookService.updateDeliveryStatus(provider, deliveryId, {
         status: 'failed',
         error: errorMessage,

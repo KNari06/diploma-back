@@ -47,6 +47,9 @@ export interface ClientToServerEvents {
   'preview:keyboard:type': (data: PreviewKeyboardTypeRequest) => void;
   'preview:keyboard:press': (data: PreviewKeyboardPressRequest) => void;
 
+  // Preview viewport
+  'preview:viewport:set': (data: PreviewViewportSetRequest) => void;
+
   // Preview recording
   'preview:recording:start': (data: PreviewRecordingRequest) => void;
   'preview:recording:stop': (data: PreviewRecordingRequest) => void;
@@ -768,6 +771,10 @@ export interface SystemMaintenancePayload {
 export interface RegressionRunProgressPayload {
   runId: string;
   userId: string;
+  /** Helpful for UI routing without extra GET /regression/runs */
+  planId?: string | null;
+  projectId?: string | null;
+  trigger?: 'manual' | 'chat' | 'scheduled' | 'webhook';
   status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed' | 'cancelled';
   progress: number; // 0-100
   message: string;
@@ -1183,6 +1190,15 @@ export interface PreviewKeyboardPressRequest {
   previewSessionId: string;
   key: string; // 'Enter', 'Escape', 'ArrowDown', etc.
   modifiers?: ('Control' | 'Shift' | 'Alt' | 'Meta')[];
+}
+
+/**
+ * Viewport change request (client → server)
+ */
+export interface PreviewViewportSetRequest {
+  previewSessionId: string;
+  width: number;
+  height: number;
 }
 
 /**

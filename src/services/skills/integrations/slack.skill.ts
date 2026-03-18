@@ -226,8 +226,8 @@ export const SlackSkill: SkillDefinition = {
         return {
           success: false,
           message: hasDisabled
-            ? 'Slack was previously connected but is now disabled. Ask the user to reconnect with slack_connect.'
-            : 'Slack is not connected. Ask the user to provide their Incoming Webhook URL from Slack App settings, then call slack_connect.',
+            ? 'Slack was previously connected but is now disabled. Ask the user for a new Incoming Webhook URL (format: https://hooks.slack.com/services/...), then call slack_connect.'
+            : 'Slack is not connected. Ask the user for their Incoming Webhook URL (format: https://hooks.slack.com/services/...). They can get it from: Slack workspace → Apps → Incoming Webhooks → Add New Webhook. Then call slack_connect with webhook_url parameter.',
           displayToUser: true,
         };
       }
@@ -341,7 +341,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
       return {
         success: true,
         data: { connected: false, disabled: true },
-        message: 'Slack was previously connected but is now disabled. Use slack_connect with a new webhook URL to reconnect.',
+        message: 'Slack was previously connected but is now disabled. Ask the user for a new Incoming Webhook URL (format: https://hooks.slack.com/services/...) to reconnect, then call slack_connect with webhook_url parameter.',
         displayToUser: true,
       };
     }
@@ -349,7 +349,7 @@ async function handleStatus(context: SkillContext): Promise<SkillResult> {
     return {
       success: true,
       data: { connected: false },
-      message: 'Slack is not connected. Use slack_connect to set it up.',
+      message: 'Slack is not connected. To connect: ask the user for their Incoming Webhook URL from Slack App settings (format: https://hooks.slack.com/services/...). Once they provide it, call slack_connect with webhook_url parameter.',
       displayToUser: true,
     };
   }
@@ -384,7 +384,7 @@ async function handleConnect(
     return {
       success: false,
       message:
-        'webhook_url is required. Ask user to get it from Slack App settings → Incoming Webhooks.',
+        'webhook_url is required. Ask the user to get it from: Slack workspace → Apps → Incoming Webhooks → Add New Webhook → copy URL (format: https://hooks.slack.com/services/...).',
       displayToUser: true,
     };
   }

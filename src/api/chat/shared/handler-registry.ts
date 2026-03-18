@@ -50,6 +50,7 @@ export type IntentHandler = (
     context?: any;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
+    executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
     attachments?: ChatAttachment[]; // File attachments (images + documents)
   }
 ) => Promise<void>;
@@ -73,6 +74,7 @@ const handlePlatformTest: IntentHandler = async (req, res, params) => {
     answers: params.answers,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    executionStrategy: params.executionStrategy,
   });
 };
 

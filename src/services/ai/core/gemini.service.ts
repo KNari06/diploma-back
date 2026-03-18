@@ -172,17 +172,24 @@ export async function getChatCompletionWithGemini(params: {
       }
     }
 
-    // Start chat with history
-    const chat = genModel.startChat({
-      history: chatHistory.slice(0, -1), // All except last message
-      systemInstruction,
-    });
-
-    // Get last user message
+    // Get last user message to send via sendMessage()
     const lastMessage = chatHistory[chatHistory.length - 1];
     if (!lastMessage || lastMessage.role !== 'user') {
       throw new Error('Last message must be from user');
     }
+
+    // Build history (all except last message), ensuring it starts with 'user' role
+    // Gemini requires history to begin with a user message
+    let history = chatHistory.slice(0, -1);
+    while (history.length > 0 && history[0].role !== 'user') {
+      history = history.slice(1);
+    }
+
+    // Start chat with sanitized history
+    const chat = genModel.startChat({
+      history,
+      systemInstruction,
+    });
 
     // Create timeout promise
     const timeoutPromise = new Promise<never>((_, reject) => {
