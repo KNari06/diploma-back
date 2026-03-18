@@ -123,6 +123,8 @@ export interface PlanStep {
   status: PlanStepStatus;
   /** Error message if step failed */
   error?: string;
+  /** Grounded element ref from page snapshot (e.g. "e1"). Optional — Executor falls back to description-based inference. */
+  targetRef?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

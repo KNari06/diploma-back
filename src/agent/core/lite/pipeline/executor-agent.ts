@@ -45,7 +45,7 @@ import type { CommandName, CommandResult, ExecutedCommand, ExecutionRound, Playw
 /** Executor configuration */
 const EXECUTOR_CONFIG = {
   /** Max tool-calling rounds per executor invocation */
-  maxCommandRounds: 3,
+  maxCommandRounds: 5,
   /** LLM temperature (low for deterministic execution) */
   temperature: 0.1,
   /** Max tokens for executor response */
@@ -92,6 +92,8 @@ export class ExecutorAgent {
     });
 
     let round = 0;
+    /** Track previous round's tool call signature for repetition detection */
+    let previousRoundSignature = '';
 
     while (round < EXECUTOR_CONFIG.maxCommandRounds) {
       round++;
@@ -149,6 +151,25 @@ export class ExecutorAgent {
           latencyMs: Date.now() - llmStart,
           tokensUsed: response.usage?.totalTokens,
         });
+
+        // ── Repetition detection: break if LLM calls exact same commands as last round ──
+        const currentSignature = toolCalls
+          .map(tc => `${tc.function.name}(${tc.function.arguments || ''})`)
+          .join('|');
+        if (currentSignature === previousRoundSignature) {
+          logger.warn('[EXECUTOR] Repetition detected — same commands as previous round, breaking', {
+            round,
+            signature: currentSignature.slice(0, 200),
+          });
+          blackboard.addInsight('Executor stuck: repeated same commands — handing to Reviewer');
+          this.trace('executor_repetition_break', {
+            pipelineRound,
+            executorRound: round,
+            signature: currentSignature.slice(0, 500),
+          });
+          break;
+        }
+        previousRoundSignature = currentSignature;
 
         // Push assistant message with tool calls (preserves context)
         this.messages.push({
