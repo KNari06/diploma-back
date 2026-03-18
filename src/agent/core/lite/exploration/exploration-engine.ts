@@ -312,12 +312,15 @@ export class ExplorationEngine {
     checkpoint: ExplorationCheckpoint,
   ): Promise<ExplorationResult> {
     const engine = new ExplorationEngine(browser, config);
+    const trace = new ExplorationTraceService(config.explorationId);
 
     logger.info('[EXPLORATION] Resuming from checkpoint', {
       explorationId: config.explorationId,
       phase: checkpoint.phase,
       checkpointAge: Date.now() - checkpoint.timestamp,
     });
+
+    trace.writeExplorationStart(config);
 
     // Restore tree and budget from checkpoint
     const tree = ExplorationTree.fromCheckpoint(checkpoint.tree);
@@ -327,6 +330,13 @@ export class ExplorationEngine {
     // Check if budget is already exhausted (stale checkpoint)
     if (budget.isExhausted()) {
       logger.warn('[EXPLORATION] Budget exhausted from checkpoint, building result from partial data');
+      trace.writeExplorationEnd({
+        status: 'completed',
+        durationMs: 0,
+        testCasesCount: 0,
+        summary: { reason: 'budget_exhausted_from_checkpoint' },
+      });
+      await trace.close();
       const builder = new TestCaseBuilder();
       const tasks = checkpoint.flowRunner?.completedTasks || [];
       return builder.build(tree, tasks, budget, config, checkpoint.budget.startTime, []);
@@ -337,18 +347,27 @@ export class ExplorationEngine {
     if (checkpoint.phase === 'survey') {
       // Survey completed, need to run Phase 2 from scratch
       if (allEntryPoints.length === 0) {
+        trace.writeExplorationEnd({
+          status: 'completed',
+          durationMs: 0,
+          testCasesCount: 0,
+          summary: { reason: 'no_entry_points' },
+        });
+        await trace.close();
         const builder = new TestCaseBuilder();
         await ExplorationStorageService.clearCheckpoint(config.explorationId);
         return builder.build(tree, [], budget, config, checkpoint.budget.startTime, []);
       }
 
       const queue = FlowQueue.fromEntryPoints(allEntryPoints);
-      const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter);
+      trace.writePhaseStart('flow');
+      const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
 
       let lastCheckpointFlows = 0;
       flowRunner.setCheckpointCallback(async (completedTasks) => {
         if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
           lastCheckpointFlows = completedTasks.length;
+          trace.writeCheckpointSaved({ phase: 'flow', flowsCompleted: completedTasks.length });
           await engine.saveCheckpoint({
             version: 1,
             phase: 'flow',
@@ -373,9 +392,18 @@ export class ExplorationEngine {
         await flowRunner.cleanup();
       }
 
+      trace.writePhaseEnd('flow', { flowsExplored: flowTasks.length });
+
       const builder = new TestCaseBuilder();
       const result = builder.build(tree, flowTasks, budget, config, checkpoint.budget.startTime, queue.remaining());
       await ExplorationStorageService.clearCheckpoint(config.explorationId);
+      trace.writeExplorationEnd({
+        status: 'completed',
+        durationMs: result.durationMs,
+        testCasesCount: result.testCases.length,
+        summary: result.summary,
+      });
+      await trace.close();
       return result;
     }
 
@@ -385,7 +413,8 @@ export class ExplorationEngine {
       : FlowQueue.fromEntryPoints(allEntryPoints);
 
     const previousTasks = checkpoint.flowRunner?.completedTasks || [];
-    const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter);
+    trace.writePhaseStart('flow');
+    const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
 
     // Restore FlowRunner state
     if (checkpoint.flowRunner) {
@@ -396,6 +425,7 @@ export class ExplorationEngine {
     flowRunner.setCheckpointCallback(async (completedTasks) => {
       if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
         lastCheckpointFlows = completedTasks.length;
+        trace.writeCheckpointSaved({ phase: 'flow', flowsCompleted: completedTasks.length });
         await engine.saveCheckpoint({
           version: 1,
           phase: 'flow',
@@ -423,9 +453,18 @@ export class ExplorationEngine {
     // Merge previous tasks with new ones
     const allFlowTasks = [...previousTasks, ...flowTasks];
 
+    trace.writePhaseEnd('flow', { flowsExplored: allFlowTasks.length });
+
     const builder = new TestCaseBuilder();
     const result = builder.build(tree, allFlowTasks, budget, config, checkpoint.budget.startTime, queue.remaining());
     await ExplorationStorageService.clearCheckpoint(config.explorationId);
+    trace.writeExplorationEnd({
+      status: 'completed',
+      durationMs: result.durationMs,
+      testCasesCount: result.testCases.length,
+      summary: result.summary,
+    });
+    await trace.close();
     return result;
   }
 

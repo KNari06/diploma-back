@@ -176,11 +176,9 @@ export class OverlayDismisser {
         waitedForLoading = true;
 
         // Wait for API requests to finish (loading UI often persists until API responds)
-        // Uses waitForPageReady which only tracks fetch/xhr — ignores images/fonts/analytics
+        // Use waitForStable only (NOT waitForPageReady — Phase 0 already handles loading polling below)
         try {
-          await VisualStability.waitForPageReady(page, {
-            timeout: Math.min(3000, maxTimeMs - (Date.now() - startTime)),
-          });
+          await VisualStability.waitForStable(page, { checkInterval: 150, maxAttempts: 5 });
         } catch {
           // Non-fatal — proceed to polling
         }

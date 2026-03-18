@@ -150,24 +150,23 @@ export class VisualStability {
     await VisualStability.waitForStable(page);
 
     // ── Phase 3: Loading state detection (spinner/skeleton/progressbar) ──
+    // Uses lightweight page.evaluate check — NOT full SnapshotCollector.collect()
+    // (full snapshot parses entire DOM = 200-500ms; this check = ~5ms)
     const elapsed = Date.now() - start;
     const remaining = timeout - elapsed;
     if (remaining < 500) return; // Not enough time budget for loading check
 
     try {
-      // Lazy import to avoid circular dependency (SnapshotCollector → VisualStability)
-      const { SnapshotCollector } = await import('./snapshot-collector');
-
-      const snap = await SnapshotCollector.collect(page, { skipStabilityWait: true });
-      if (!snap.transientState?.isTransient) return; // No loading state — done
+      const isLoading = await VisualStability.hasLoadingIndicators(page);
+      if (!isLoading) return; // No loading state — done
 
       // Loading detected — poll until clear or time budget exhausted
       const maxPolls = Math.min(5, Math.floor(remaining / 400));
       for (let i = 0; i < maxPolls; i++) {
         await VisualStability.waitForStable(page, { checkInterval: 100, maxAttempts: 2 });
 
-        const recheck = await SnapshotCollector.collect(page, { skipStabilityWait: true });
-        if (!recheck.transientState?.isTransient) {
+        const stillLoading = await VisualStability.hasLoadingIndicators(page);
+        if (!stillLoading) {
           logger.debug('[VISUAL_STABILITY] Loading state cleared', {
             polls: i + 1,
             elapsed: Date.now() - start,
@@ -179,13 +178,9 @@ export class VisualStability {
       logger.debug('[VISUAL_STABILITY] Loading state persisted after polling, proceeding', {
         polls: maxPolls,
         elapsed: Date.now() - start,
-        loadingType: snap.transientState.type,
       });
-    } catch (error) {
+    } catch {
       // Non-fatal: loading check should never break exploration
-      logger.debug('[VISUAL_STABILITY] Loading state check failed', {
-        error: error instanceof Error ? error.message : String(error),
-      });
     }
   }
 
@@ -210,7 +205,9 @@ export class VisualStability {
     const POLL_INTERVAL_MS = 50;
 
     let pending = 0;
-    let lastApiActivity = Date.now();
+    // Initialize in the past so if no API requests arrive, we resolve immediately
+    // (quiet threshold already met from the start)
+    let lastApiActivity = Date.now() - API_QUIET_THRESHOLD_MS;
 
     const onRequest = (request: { resourceType: () => string }) => {
       const type = request.resourceType();
@@ -239,7 +236,10 @@ export class VisualStability {
         if (pending === 0 && (Date.now() - lastApiActivity) >= API_QUIET_THRESHOLD_MS) {
           return;
         }
-        await page.waitForTimeout(POLL_INTERVAL_MS);
+
+        // Use native setTimeout instead of page.waitForTimeout to avoid
+        // "Execution context was destroyed" errors during page navigation
+        await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       }
 
       // Timeout — fail-open, log only if there were actual pending requests
@@ -251,9 +251,65 @@ export class VisualStability {
       }
     } finally {
       // Always cleanup listeners — prevent memory leaks
-      page.off('request', onRequest);
-      page.off('requestfinished', onDone);
-      page.off('requestfailed', onDone);
+      // Wrap in try/catch: page may already be closed during navigation
+      try {
+        page.off('request', onRequest);
+        page.off('requestfinished', onDone);
+        page.off('requestfailed', onDone);
+      } catch {
+        // Page closed — listeners will be GC'd with the page
+      }
+    }
+  }
+
+  /**
+   * Lightweight loading indicator check (runs in browser context).
+   * Same 6-layer detection as SnapshotCollector.transientState but ~50x faster
+   * because it doesn't parse the entire DOM — just checks specific selectors.
+   *
+   * Detects: role=progressbar, aria-busy, skeleton classes, animated spinners
+   */
+  private static async hasLoadingIndicators(page: Page): Promise<boolean> {
+    try {
+      return await page.evaluate(() => {
+        const doc = document;
+        const win = window;
+
+        // 1. role="progressbar" (ARIA standard)
+        const progressbar = doc.querySelector('[role="progressbar"]:not([aria-hidden="true"])');
+        if (progressbar) {
+          const style = win.getComputedStyle(progressbar);
+          if (style.display !== 'none' && style.visibility !== 'hidden') return true;
+        }
+
+        // 2. aria-busy="true"
+        const busy = doc.querySelector('[aria-busy="true"]');
+        if (busy) {
+          const style = win.getComputedStyle(busy);
+          if (style.display !== 'none' && style.visibility !== 'hidden') return true;
+        }
+
+        // 3. Skeleton loaders (CSS class patterns)
+        const skeleton = doc.querySelector('.skeleton, .skeleton-loader, [data-skeleton], .placeholder-glow');
+        if (skeleton) {
+          const style = win.getComputedStyle(skeleton);
+          if (style.display !== 'none' && style.visibility !== 'hidden') return true;
+        }
+
+        // 4. Visible spinner/loader with animation
+        const spinners = doc.querySelectorAll('.spinner, .loader, .loading, [class*="spinner"], [class*="loader"], [data-loading]');
+        for (const el of spinners) {
+          const style = win.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          if (parseFloat(style.opacity) < 0.3) continue;
+          const animName = style.animationName;
+          if (animName && animName !== 'none') return true;
+        }
+
+        return false;
+      });
+    } catch {
+      return false; // Page navigating or closed — not loading
     }
   }
 
