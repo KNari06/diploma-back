@@ -13,6 +13,7 @@ import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import { cancelTest } from '@/services/testing/ui/manual/test-cancellation';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { Request, Response } from 'express';
@@ -780,7 +781,6 @@ export async function cancelIntentTestCase(req: Request, res: Response): Promise
       userId,
     });
 
-    const { cancelTest } = await import('@/services/testing/ui/manual/test-cancellation');
     const result = await cancelTest(testId, userId);
 
     logger.info('[PREVIEW_CONTROLLER] Intent test case run cancelled', {
