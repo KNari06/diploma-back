@@ -43,6 +43,7 @@ import { FlowQueue } from './flow-queue';
 import { FlowRunner } from './flow-runner';
 import { TestCaseBuilder } from './test-case-builder';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
+import { ExplorationTraceService } from './exploration-trace.service';
 
 /** Save checkpoint every N completed flows */
 const CHECKPOINT_EVERY_N_FLOWS = 3;
@@ -94,6 +95,9 @@ export class ExplorationEngine {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
     const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
+    const trace = new ExplorationTraceService(this.config.explorationId);
+
+    trace.writeExplorationStart(this.config);
 
     logger.info('[EXPLORATION] Starting autonomous exploration', {
       explorationId: this.config.explorationId,
@@ -109,6 +113,7 @@ export class ExplorationEngine {
     // ════════════════════════════════════════════════════════════════════
 
     logger.info('[EXPLORATION] Phase 1: Starting page survey');
+    trace.writePhaseStart('survey');
 
     const surveyContext = await this.browser.newContext({
       viewport: { width: 1280, height: 720 },
@@ -126,7 +131,7 @@ export class ExplorationEngine {
         await setupThirdPartyBlocker(surveyPage);
       } catch { /* non-fatal */ }
 
-      const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter);
+      const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter, trace);
       tree = await surveyAgent.survey();
       await surveyPage.close();
     } finally {
@@ -139,6 +144,12 @@ export class ExplorationEngine {
       pagesVisited: tree.getNodeCount(),
       entryPointsFound: allEntryPoints.length,
     }, 30);
+
+    trace.writePhaseEnd('survey', {
+      pagesVisited: tree.getNodeCount(),
+      entryPointsFound: allEntryPoints.length,
+      timeUsedMs: Date.now() - startTime,
+    });
 
     logger.info('[EXPLORATION] Phase 1 complete', {
       pagesVisited: tree.getNodeCount(),
@@ -158,6 +169,13 @@ export class ExplorationEngine {
     // If no entry points found, return early
     if (allEntryPoints.length === 0) {
       logger.warn('[EXPLORATION] No entry points discovered, returning empty result');
+      trace.writeExplorationEnd({
+        status: 'completed',
+        durationMs: Date.now() - startTime,
+        testCasesCount: 0,
+        summary: { reason: 'no_entry_points' },
+      });
+      await trace.close();
       const builder = new TestCaseBuilder();
       await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
       return builder.build(tree, [], budget, this.config, startTime, []);
@@ -180,14 +198,21 @@ export class ExplorationEngine {
     // ════════════════════════════════════════════════════════════════════
 
     logger.info('[EXPLORATION] Phase 2: Starting flow exploration');
+    trace.writePhaseStart('flow');
+    trace.writeQueueState({
+      pendingCount: queue.size(),
+      completedCount: 0,
+      totalEnqueued: queue.size(),
+    });
 
-    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter);
+    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace);
 
     // Periodic checkpoint callback: save every N flows
     let lastCheckpointFlows = 0;
     flowRunner.setCheckpointCallback(async (completedTasks) => {
       if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
         lastCheckpointFlows = completedTasks.length;
+        trace.writeCheckpointSaved({ phase: 'flow', flowsCompleted: completedTasks.length });
         await this.saveCheckpoint({
           version: 1,
           phase: 'flow',
@@ -212,6 +237,14 @@ export class ExplorationEngine {
     } finally {
       await flowRunner.cleanup();
     }
+
+    trace.writePhaseEnd('flow', {
+      flowsExplored: flowTasks.length,
+      passed: flowTasks.filter((t) => t.goalAchieved).length,
+      failed: flowTasks.filter((t) => t.status === 'failed').length,
+      blocked: flowTasks.filter((t) => t.status === 'blocked').length,
+      timeUsedMs: Date.now() - startTime,
+    });
 
     logger.info('[EXPLORATION] Phase 2 complete', {
       flowsExplored: flowTasks.length,
@@ -241,6 +274,14 @@ export class ExplorationEngine {
       flowsBlocked: result.summary.flowsBlocked,
       totalSteps: result.summary.totalStepsDiscovered,
     }, 100);
+
+    trace.writeExplorationEnd({
+      status: 'completed',
+      durationMs: result.durationMs,
+      testCasesCount: result.testCases.length,
+      summary: result.summary,
+    });
+    await trace.close();
 
     logger.info('[EXPLORATION] Exploration complete', {
       explorationId: this.config.explorationId,

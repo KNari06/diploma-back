@@ -34,6 +34,7 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { buildSnapshotSummary } from '../analysis/ai-goal-evaluator';
 import type { GoalDetector } from '../analysis/goal-detector';
 import type { GoalContext, StuckCheck } from '../lite-types';
+import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { TestBlackboard } from './blackboard';
 import { buildReviewerPrompt } from './prompts';
 import type { ReviewResult } from './types';
@@ -81,23 +82,33 @@ export class ReviewerAgent {
   static async review(
     blackboard: TestBlackboard,
     goalDetector?: GoalDetector,
+    traceWriter?: LiteTraceWriter,
   ): Promise<ReviewResult> {
+    const round = blackboard.getRounds().length;
+
     // ═══════════════════════════════════════════════════════════════════
     // Phase 0: auditDone() — validate "done" claims with gpt-4o
     // This is the CRITICAL check that prevents false completions.
     // ═══════════════════════════════════════════════════════════════════
 
     if (blackboard.getPhase() === 'done') {
-      return ReviewerAgent.validateDoneClaim(blackboard, goalDetector);
+      return ReviewerAgent.validateDoneClaim(blackboard, goalDetector, traceWriter);
     }
 
     if (blackboard.getPhase() === 'blocked') {
       logger.debug('[REVIEWER] Fast-path: blocked (executor reported blocker)');
-      return {
+      const result: ReviewResult = {
         verdict: 'blocked',
         reason: 'Executor reported test blocked',
         goalAlignment: 0,
       };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round,
+        path: 'blocked_by_executor',
+        verdict: result.verdict,
+        reason: result.reason,
+      });
+      return result;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -107,11 +118,17 @@ export class ReviewerAgent {
     const lastRound = blackboard.getLastRound();
     if (!lastRound || lastRound.commands.length === 0) {
       logger.debug('[REVIEWER] Fast-path: continue (no execution yet)');
-      return {
+      const result: ReviewResult = {
         verdict: 'continue',
         reason: 'No commands executed yet',
         goalAlignment: 0,
       };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round,
+        path: 'no_commands',
+        verdict: result.verdict,
+      });
+      return result;
     }
 
     const allCommands = lastRound.commands;
@@ -138,13 +155,22 @@ export class ReviewerAgent {
       // Find which plan steps failed
       const failedStepNumbers = blackboard.getStepsByStatus('failed').map(s => s.stepNumber);
 
-      return {
+      const result: ReviewResult = {
         verdict: 'replan',
         reason: `All commands failed: ${errors}`,
         goalAlignment: 0,
         failedSteps: failedStepNumbers.length > 0 ? failedStepNumbers : undefined,
         guidance: 'Try a different approach — the current page state may have changed.',
       };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round,
+        path: 'all_failed_replan',
+        verdict: result.verdict,
+        errors,
+        failedSteps: failedStepNumbers,
+        commandCount: allCommands.length,
+      });
+      return result;
     }
 
     // All succeeded + very high progress → signal Executor should verify and mark_done
@@ -153,38 +179,67 @@ export class ReviewerAgent {
     // NOTE: Skip if stuck on same page — high progress might be stale/wrong.
     if (allSucceeded && progressScore >= REVIEWER_CONFIG.progressThresholdDone && !isStuckOnSamePage) {
       logger.debug('[REVIEWER] Fast-path: continue (high progress, need mark_done)', { progressScore });
-      return {
+      const result: ReviewResult = {
         verdict: 'continue',
         reason: `High progress (${progressScore}%), executor should verify goal and mark_done`,
         goalAlignment: progressScore / 100,
       };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round,
+        path: 'high_progress_continue',
+        verdict: result.verdict,
+        progressScore,
+      });
+      return result;
     }
 
     // All commands succeeded + moderate progress → continue execution
     // NOTE: Skip if stuck on same page — let AI review assess the situation.
     if (allSucceeded && progressScore >= REVIEWER_CONFIG.progressThresholdContinue && !isStuckOnSamePage) {
       logger.debug('[REVIEWER] Fast-path: continue (all succeeded, good progress)', { progressScore });
-      return {
+      const result: ReviewResult = {
         verdict: 'continue',
         reason: `All ${allCommands.length} commands succeeded, progress at ${progressScore}%`,
         goalAlignment: progressScore / 100,
       };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round,
+        path: 'moderate_progress_continue',
+        verdict: result.verdict,
+        progressScore,
+        commandCount: allCommands.length,
+      });
+      return result;
     }
 
     // If stuck on same page, log that we're escalating to AI review
     if (isStuckOnSamePage) {
       logger.debug('[REVIEWER] Skipping fast-path: page state unchanged, escalating to AI review');
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path_skipped', {
+        round,
+        reason: 'stuck_on_same_page',
+        progressScore,
+        allSucceeded,
+      });
     }
 
     // Mixed results with low progress and few rounds → continue to see what happens
     const totalRounds = blackboard.getRounds().length;
     if (totalRounds <= 2 && progressScore < REVIEWER_CONFIG.progressThresholdContinue) {
       logger.debug('[REVIEWER] Fast-path: continue (early rounds, low progress)');
-      return {
+      const result: ReviewResult = {
         verdict: 'continue',
         reason: 'Still in early rounds, continuing execution',
         goalAlignment: progressScore / 100,
       };
+      ReviewerAgent.trace(traceWriter, 'reviewer_fast_path', {
+        round,
+        path: 'early_rounds_continue',
+        verdict: result.verdict,
+        progressScore,
+        totalRounds,
+      });
+      return result;
     }
 
     // Decrement audit cooldown each review cycle
@@ -197,7 +252,18 @@ export class ReviewerAgent {
     // Phase 2: AI assessment (only for ambiguous cases)
     // ═══════════════════════════════════════════════════════════════════
 
-    return ReviewerAgent.aiReview(blackboard);
+    ReviewerAgent.trace(traceWriter, 'reviewer_escalate_to_ai', {
+      round,
+      reason: 'ambiguous_case',
+      progressScore,
+      allSucceeded,
+      allFailed,
+      commandCount: allCommands.length,
+      totalRounds,
+      isStuckOnSamePage,
+    });
+
+    return ReviewerAgent.aiReview(blackboard, traceWriter);
   }
 
   /**
@@ -211,6 +277,7 @@ export class ReviewerAgent {
   private static async validateDoneClaim(
     blackboard: TestBlackboard,
     goalDetector?: GoalDetector,
+    traceWriter?: LiteTraceWriter,
   ): Promise<ReviewResult> {
     // If no GoalDetector, trust Executor's claim (same as before)
     if (!goalDetector) {
@@ -271,7 +338,21 @@ export class ReviewerAgent {
         progressScore: blackboard.getProgressScore(),
       });
 
+      const auditStart = Date.now();
       const auditResult = await goalDetector.auditDone(goalContext, lastAction);
+
+      // Trace: auditDone result (critical decision point)
+      ReviewerAgent.trace(traceWriter, 'reviewer_audit_done', {
+        round: blackboard.getRounds().length,
+        isDone: auditResult.isDone,
+        isBlocked: auditResult.isBlocked,
+        confidence: auditResult.confidence,
+        reason: auditResult.reason,
+        nextStepIfMissing: auditResult.nextStepIfMissing,
+        blockedReason: auditResult.blockedReason,
+        lastAction,
+        latencyMs: Date.now() - auditStart,
+      });
 
       if (auditResult.isDone) {
         // ✅ CONFIRMED: goal is really done
@@ -330,6 +411,11 @@ export class ReviewerAgent {
       const errorMsg = error instanceof Error ? error.message : String(error);
       logger.warn('[REVIEWER] auditDone failed, NOT trusting executor claim (conservative)', { error: errorMsg });
 
+      ReviewerAgent.trace(traceWriter, 'reviewer_audit_error', {
+        round: blackboard.getRounds().length,
+        error: errorMsg,
+      });
+
       // ✅ FIX: On auditor failure, do NOT trust Executor — conservative means "don't complete"
       // Previously returned verdict: 'done' which was the OPPOSITE of conservative
       return {
@@ -344,8 +430,19 @@ export class ReviewerAgent {
    * AI-powered review for ambiguous cases.
    * Uses gemini-2.5-flash-lite for cost efficiency.
    */
-  private static async aiReview(blackboard: TestBlackboard): Promise<ReviewResult> {
+  private static async aiReview(blackboard: TestBlackboard, traceWriter?: LiteTraceWriter): Promise<ReviewResult> {
     const prompt = buildReviewerPrompt(blackboard);
+    const round = blackboard.getRounds().length;
+
+    // Trace: full prompt sent to reviewer AI
+    ReviewerAgent.trace(traceWriter, 'reviewer_ai_prompt', {
+      round,
+      model: AI_TASK_MODELS.chatReviewer,
+      prompt,
+      progressScore: blackboard.getProgressScore(),
+    });
+
+    const llmStart = Date.now();
 
     try {
       const aiPromise = getChatCompletionWithMessages(
@@ -366,6 +463,10 @@ export class ReviewerAgent {
 
       if (!result) {
         logger.warn('[REVIEWER] AI timeout — defaulting to continue');
+        ReviewerAgent.trace(traceWriter, 'reviewer_ai_timeout', {
+          round,
+          timeoutMs: REVIEWER_CONFIG.timeoutMs,
+        });
         return ReviewerAgent.safeDefault(blackboard);
       }
 
@@ -391,6 +492,20 @@ export class ReviewerAgent {
         guidance: parsed.guidance,
       };
 
+      // Trace: full raw response from reviewer AI
+      ReviewerAgent.trace(traceWriter, 'reviewer_ai_response', {
+        round,
+        model: AI_TASK_MODELS.chatReviewer,
+        rawResponse: content,
+        parsedVerdict: verdict,
+        parsedReason: review.reason,
+        goalAlignment: review.goalAlignment,
+        guidance: review.guidance,
+        failedSteps: review.failedSteps,
+        latencyMs: Date.now() - llmStart,
+        tokensUsed: result.usage?.totalTokens,
+      });
+
       logger.debug('[REVIEWER] AI review completed', {
         verdict: review.verdict,
         goalAlignment: review.goalAlignment,
@@ -401,6 +516,11 @@ export class ReviewerAgent {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       logger.warn('[REVIEWER] AI review error — defaulting to continue', { error: errorMsg });
+      ReviewerAgent.trace(traceWriter, 'reviewer_ai_error', {
+        round,
+        error: errorMsg,
+        latencyMs: Date.now() - llmStart,
+      });
       return ReviewerAgent.safeDefault(blackboard);
     }
   }
@@ -415,5 +535,17 @@ export class ReviewerAgent {
       reason: 'Reviewer defaulted to continue',
       goalAlignment: blackboard.getProgressScore() / 100,
     };
+  }
+
+  /** Write trace entry (fire-and-forget) */
+  private static trace(traceWriter: LiteTraceWriter | undefined, eventType: string, payload: Record<string, any>): void {
+    try {
+      traceWriter?.write({
+        stage: 'pipeline',
+        eventType,
+        spanId: traceWriter.generateSpanId(),
+        payload,
+      });
+    } catch { /* never break agent for trace failures */ }
   }
 }

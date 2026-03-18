@@ -116,6 +116,148 @@ export class VisualStability {
   }
 
   /**
+   * Wait for page to be fully ready for snapshotting.
+   * Combines three signals in sequence:
+   *   1. API idle — wait for pending fetch/xhr to finish (IGNORES images, fonts, CSS, analytics)
+   *   2. DOM stability — element count stabilization via waitForStable
+   *   3. Loading state clearance — spinner/skeleton/progressbar via transientState
+   *
+   * Used by Exploration Agent (SurveyAgent, FlowRunner) at critical points
+   * where snapshots are taken after navigation or clicks.
+   *
+   * Phase 1 uses a lightweight inline request tracker (same approach as NetworkTracker)
+   * that only counts fetch/xhr resource types. This means:
+   *   ✅ API calls — waited for
+   *   ❌ Images, fonts, CSS — NOT waited for (zero delay)
+   *   ❌ Analytics (GA, FB) — NOT waited for
+   *   ❌ WebSocket/SSE — NOT waited for
+   */
+  static async waitForPageReady(
+    page: Page,
+    options?: { timeout?: number },
+  ): Promise<void> {
+    const timeout = options?.timeout ?? 5000;
+    const start = Date.now();
+
+    // ── Phase 1: API idle (fetch/xhr ONLY — ignores images, fonts, analytics) ──
+    try {
+      await VisualStability.waitForApiIdle(page, Math.min(timeout, 3000));
+    } catch {
+      // Non-fatal — proceed to DOM stability
+    }
+
+    // ── Phase 2: DOM stability (element count unchanged) ──
+    await VisualStability.waitForStable(page);
+
+    // ── Phase 3: Loading state detection (spinner/skeleton/progressbar) ──
+    const elapsed = Date.now() - start;
+    const remaining = timeout - elapsed;
+    if (remaining < 500) return; // Not enough time budget for loading check
+
+    try {
+      // Lazy import to avoid circular dependency (SnapshotCollector → VisualStability)
+      const { SnapshotCollector } = await import('./snapshot-collector');
+
+      const snap = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+      if (!snap.transientState?.isTransient) return; // No loading state — done
+
+      // Loading detected — poll until clear or time budget exhausted
+      const maxPolls = Math.min(5, Math.floor(remaining / 400));
+      for (let i = 0; i < maxPolls; i++) {
+        await VisualStability.waitForStable(page, { checkInterval: 100, maxAttempts: 2 });
+
+        const recheck = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+        if (!recheck.transientState?.isTransient) {
+          logger.debug('[VISUAL_STABILITY] Loading state cleared', {
+            polls: i + 1,
+            elapsed: Date.now() - start,
+          });
+          return;
+        }
+      }
+
+      logger.debug('[VISUAL_STABILITY] Loading state persisted after polling, proceeding', {
+        polls: maxPolls,
+        elapsed: Date.now() - start,
+        loadingType: snap.transientState.type,
+      });
+    } catch (error) {
+      // Non-fatal: loading check should never break exploration
+      logger.debug('[VISUAL_STABILITY] Loading state check failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Lightweight API-only network idle wait.
+   * Tracks only fetch/xhr requests — ignores images, fonts, CSS, WebSocket, SSE.
+   *
+   * Same approach as NetworkTracker.RELEVANT_RESOURCE_TYPES = ['fetch', 'xhr']
+   * but without the heavy data collection (response parsing, error tracking, etc.)
+   *
+   * Resolves when:
+   *   - Zero pending fetch/xhr requests AND 200ms of quiet
+   *   - OR timeout reached (fail-open)
+   *
+   * Typical timing:
+   *   - No API calls: resolves in ~0ms
+   *   - API responds in 200ms: resolves in ~400ms (200ms response + 200ms quiet)
+   *   - Slow API / long poll: resolves at timeout cap (fail-open)
+   */
+  private static async waitForApiIdle(page: Page, timeout: number): Promise<void> {
+    const API_QUIET_THRESHOLD_MS = 200; // 200ms without new API requests = idle
+    const POLL_INTERVAL_MS = 50;
+
+    let pending = 0;
+    let lastApiActivity = Date.now();
+
+    const onRequest = (request: { resourceType: () => string }) => {
+      const type = request.resourceType();
+      if (type === 'fetch' || type === 'xhr') {
+        pending++;
+        lastApiActivity = Date.now();
+      }
+    };
+    const onDone = (request: { resourceType: () => string }) => {
+      const type = request.resourceType();
+      if (type === 'fetch' || type === 'xhr') {
+        pending = Math.max(0, pending - 1);
+        lastApiActivity = Date.now();
+      }
+    };
+
+    page.on('request', onRequest);
+    page.on('requestfinished', onDone);
+    page.on('requestfailed', onDone);
+
+    try {
+      const deadline = Date.now() + timeout;
+
+      while (Date.now() < deadline) {
+        // Idle: zero pending + quiet threshold passed
+        if (pending === 0 && (Date.now() - lastApiActivity) >= API_QUIET_THRESHOLD_MS) {
+          return;
+        }
+        await page.waitForTimeout(POLL_INTERVAL_MS);
+      }
+
+      // Timeout — fail-open, log only if there were actual pending requests
+      if (pending > 0) {
+        logger.debug('[VISUAL_STABILITY] API idle timeout, proceeding with pending requests', {
+          pending,
+          timeout,
+        });
+      }
+    } finally {
+      // Always cleanup listeners — prevent memory leaks
+      page.off('request', onRequest);
+      page.off('requestfinished', onDone);
+      page.off('requestfailed', onDone);
+    }
+  }
+
+  /**
    * Get current element count on page
    * Used as a simple proxy for DOM stability
    *

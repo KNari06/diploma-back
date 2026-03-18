@@ -34,6 +34,7 @@ import {
   parsePageClassificationResponse,
 } from './prompts';
 import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser';
+import type { ExplorationTraceService } from './exploration-trace.service';
 
 /** Max navigation links to follow per page */
 const MAX_NAV_LINKS_PER_PAGE = 8;
@@ -65,6 +66,7 @@ export class SurveyAgent {
     private readonly config: ExplorationConfig,
     private readonly budget: BudgetTracker,
     private readonly rateLimiter: RateLimiter,
+    private readonly trace?: ExplorationTraceService,
   ) {
     this.tree = new ExplorationTree();
   }
@@ -198,7 +200,12 @@ export class SurveyAgent {
       const item = queue.shift()!;
 
       // Skip if already visited
-      if (this.tree.isVisited(item.url)) continue;
+      if (this.tree.isVisited(item.url)) {
+        this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_url' });
+        continue;
+      }
+
+      this.trace?.writePageNavigate({ url: item.url, depth: item.depth, fromUrl: item.parentNodeId ? this.page.url() : undefined });
 
       // Navigate to the page (unless we're already there)
       if (this.page.url() !== item.url) {
@@ -264,11 +271,11 @@ export class SurveyAgent {
         }
       }
 
-      // Wait a moment for page to stabilize
+      // Wait for network + DOM + loading state before snapshot
       try {
-        await this.page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+        await VisualStability.waitForPageReady(this.page, { timeout: 5000 });
       } catch {
-        // Ignore timeout
+        // Non-fatal
       }
 
       // Dismiss overlays (cookie consent, promo modals, etc.) BEFORE snapshot
@@ -280,6 +287,20 @@ export class SurveyAgent {
           mode: 'survey',
         });
         if (overlayCleanupResult.overlaysDetected > 0) {
+          this.trace?.writeOverlayDetected({
+            url: item.url,
+            mode: 'survey',
+            obstacles: overlayCleanupResult.attempts.map(a => ({ ref: a.ref, type: a.obstacleType, zIndex: 0 })),
+            count: overlayCleanupResult.overlaysDetected,
+          });
+          this.trace?.writeOverlayDismissed({
+            url: item.url,
+            attempts: overlayCleanupResult.attempts,
+            durationMs: overlayCleanupResult.durationMs,
+          });
+          if (overlayCleanupResult.overlaySummary) {
+            this.trace?.writeOverlaySummary({ url: item.url, summary: overlayCleanupResult.overlaySummary });
+          }
           logger.info('[SURVEY] Overlay cleanup completed', {
             url: item.url,
             detected: overlayCleanupResult.overlaysDetected,
@@ -310,18 +331,27 @@ export class SurveyAgent {
 
       // Check for same-template page (pagination/lists)
       if (item.parentNodeId && this.tree.registerAndCheckSameTemplate(item.parentNodeId, snapshot)) {
+        this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_template' });
         logger.debug('[SURVEY] Skipping same-template page', { url: item.url });
         continue;
       }
 
       // Check for SPA content dedup
       if (this.tree.isContentVisited(snapshot)) {
+        this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_content' });
         logger.debug('[SURVEY] Skipping duplicate content page', { url: item.url });
         continue;
       }
 
       // Format snapshot for AI
       const formattedSnapshot = SnapshotCollector.format(snapshot);
+
+      this.trace?.writePageSnapshot({
+        url: item.url,
+        elementCount: snapshot.elements.length,
+        interactiveCount: snapshot.elements.filter(e => ['textbox', 'button', 'link', 'checkbox', 'combobox'].includes(e.role)).length,
+        hasScreenshot: false, // updated below
+      });
 
       // Take screenshot for vision
       let screenshotBase64: string | undefined;
@@ -345,6 +375,26 @@ export class SurveyAgent {
         snapshot,
         overlayCleanupResult?.overlaySummary ?? undefined,
       );
+
+      // Log discovered entry points & nav links
+      if (classification.entryPoints.length > 0) {
+        this.trace?.writeEntryPointsDiscovered({
+          url: this.page.url(),
+          entryPoints: classification.entryPoints.map(ep => ({
+            name: ep.name, category: ep.category, priority: ep.priority,
+          })),
+          count: classification.entryPoints.length,
+        });
+      }
+      if (classification.navigationLinks.length > 0) {
+        this.trace?.writeNavLinksDiscovered({
+          url: this.page.url(),
+          links: classification.navigationLinks.map(l => ({
+            ref: l.ref, label: l.label,
+          })),
+          count: classification.navigationLinks.length,
+        });
+      }
 
       // Create entry points with unique IDs
       const entryPoints: EntryPoint[] = classification.entryPoints.map((ep) => ({
@@ -402,6 +452,17 @@ export class SurveyAgent {
         // Hidden content discovery (exploration-only)
         const hiddenDomLinks = await this.harvestHiddenLinks();
         const hiddenNavLinks = await this.discoverHiddenNavigation(snapshot);
+
+        if (hiddenDomLinks.length > 0) {
+          this.trace?.writeHiddenNavDiscovered({
+            url: this.page.url(), source: 'dom_harvest', linksFound: hiddenDomLinks.length,
+          });
+        }
+        if (hiddenNavLinks.length > 0) {
+          this.trace?.writeHiddenNavDiscovered({
+            url: this.page.url(), source: 'menu_click', linksFound: hiddenNavLinks.length,
+          });
+        }
 
         const allHiddenLinks = [...hiddenDomLinks, ...hiddenNavLinks].slice(0, MAX_NAV_LINKS_PER_PAGE);
         for (const link of allHiddenLinks) {
@@ -549,7 +610,7 @@ export class SurveyAgent {
 
         logger.debug('[SURVEY] Clicking "Load More" button', { ref: loadMoreRef, click: lmClick + 1 });
         await this.page.locator(`[data-agent-ref="${loadMoreRef}"]`).click({ timeout: 2000 });
-        await VisualStability.waitForStable(this.page); // Smart wait for loaded content to render
+        await VisualStability.waitForPageReady(this.page, { timeout: 3000 }); // Network + DOM + loading
 
         // Navigation guard: if URL changed (including hash), go back and stop
         if (await this.getFullUrl() !== initialSnapshot.url) {
@@ -617,9 +678,15 @@ export class SurveyAgent {
     // Early exit if AI is degraded — use heuristic fallback
     if (this.rateLimiter.isDegraded('openai')) {
       logger.info('[SURVEY] AI degraded, using heuristic fallback', { url });
+      const fallbackEntryPoints = snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [];
+      this.trace?.writePageClassificationFallback({
+        url,
+        reason: 'ai_degraded',
+        entryPointCount: fallbackEntryPoints.length,
+      });
       return {
         pageType: this.inferPageTypeFromUrl(url),
-        entryPoints: snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [],
+        entryPoints: fallbackEntryPoints,
         navigationLinks: [],
       };
     }
@@ -653,17 +720,23 @@ export class SurveyAgent {
 
       await this.rateLimiter.acquireSlot('ai');
 
+      const systemPrompt = 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.';
+
+      this.trace?.writePageClassificationPrompt({
+        url,
+        model: AI_MODELS.vision,
+        systemPrompt,
+        userPrompt: typeof prompt === 'string' ? prompt : '[multimodal content with screenshot]',
+        hasScreenshot: !!screenshotBase64,
+      });
+
+      const aiStartTime = Date.now();
+
       const response = await Promise.race([
         getChatCompletionWithMessages(
           [
-            {
-              role: 'system',
-              content: 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.',
-            },
-            {
-              role: 'user',
-              content: userContent,
-            },
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent },
           ],
           {
             model: AI_MODELS.vision,
@@ -680,10 +753,28 @@ export class SurveyAgent {
       this.rateLimiter.recordSuccess('openai');
       const classification = parsePageClassificationResponse(response.content);
 
+      this.trace?.writePageClassificationResponse({
+        url,
+        model: AI_MODELS.vision,
+        rawResponse: response.content,
+        parsed: {
+          pageType: classification.pageType,
+          entryPointCount: classification.entryPoints.length,
+          navLinkCount: classification.navigationLinks.length,
+        },
+        latencyMs: Date.now() - aiStartTime,
+        tokensUsed: response.usage?.totalTokens,
+      });
+
       // Fallback: if AI returned 0 entry points, use heuristic discovery
       if (classification.entryPoints.length === 0 && snapshot) {
         classification.entryPoints = this.buildFallbackEntryPoints(snapshot, url);
         if (classification.entryPoints.length > 0) {
+          this.trace?.writePageClassificationFallback({
+            url,
+            reason: 'ai_returned_zero_entry_points',
+            entryPointCount: classification.entryPoints.length,
+          });
           logger.info('[SURVEY] AI returned 0 entry points, using heuristic fallback', {
             url,
             fallbackCount: classification.entryPoints.length,
@@ -743,9 +834,15 @@ export class SurveyAgent {
       });
 
       // Fallback: return page type + heuristic entry points
+      const fallbackEntryPoints = snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [];
+      this.trace?.writePageClassificationFallback({
+        url,
+        reason: `ai_error: ${error instanceof Error ? error.message : String(error)}`,
+        entryPointCount: fallbackEntryPoints.length,
+      });
       return {
         pageType: this.inferPageTypeFromUrl(url),
-        entryPoints: snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [],
+        entryPoints: fallbackEntryPoints,
         navigationLinks: [],
       };
     }
@@ -882,7 +979,7 @@ export class SurveyAgent {
 
       try {
         await this.page.locator(`[data-agent-ref="${el.ref}"]`).click({ timeout: 3000 });
-        await VisualStability.waitForStable(this.page); // Smart wait for SPA transition
+        await VisualStability.waitForPageReady(this.page, { timeout: 3000 }); // Network + DOM + loading
 
         const urlAfter = await this.getFullUrl(); // Use full URL to detect hash changes
 

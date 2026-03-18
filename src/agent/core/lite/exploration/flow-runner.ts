@@ -27,6 +27,7 @@ import { NetworkTracker } from '../collectors/network-tracker';
 import { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
 import { OverlayDismisser } from './overlay-dismisser';
+import { VisualStability } from '../collectors/visual-stability';
 
 import type {
   ExplorationConfig,
@@ -49,6 +50,7 @@ import {
   parseBranchDetectionResponse,
 } from './prompts';
 import { ClarificationService } from '@/agent/utils/context/clarification.service';
+import type { ExplorationTraceService } from './exploration-trace.service';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -95,6 +97,7 @@ export class FlowRunner {
     private readonly budget: BudgetTracker,
     private readonly onProgress?: ExplorationProgressCallback,
     private readonly rateLimiter?: RateLimiter,
+    private readonly trace?: ExplorationTraceService,
   ) {
     this.stateManager = new StateManager(browser);
   }
@@ -173,11 +176,22 @@ export class FlowRunner {
         const entryPoint = queue.dequeue();
         if (!entryPoint) break;
 
+        this.trace?.writeQueueDequeue({
+          entryPointId: entryPoint.id,
+          name: entryPoint.name,
+          category: entryPoint.category,
+          priority: entryPoint.priority,
+        });
+
         // Acquire semaphore before starting (blocks when at max concurrency)
         const release = await semaphore.acquire();
 
         // Re-check budget after acquiring semaphore
         if (this.budget.isExhausted()) {
+          this.trace?.writeBudgetExhausted({
+            reason: 'exhausted_after_semaphore_acquire',
+            remaining: { flows: 0 },
+          });
           results.push(this.createSkippedTask(entryPoint, 'Budget exhausted'));
           release();
           break;
@@ -253,6 +267,12 @@ export class FlowRunner {
       }
 
       if (task.branchPoints.length > 0) {
+        this.trace?.writeBranchEnqueued({
+          sourceFlowId: entryPoint.id,
+          sourceFlowName: entryPoint.name,
+          branches: task.branchPoints.map(b => ({ name: b.name, category: b.category, priority: b.priority })),
+          count: task.branchPoints.length,
+        });
         this.emitProgress('branch_found', {
           flow: entryPoint.name,
           branchCount: task.branchPoints.length,
@@ -281,6 +301,18 @@ export class FlowRunner {
         steps: task.discoveredSteps.length,
         branches: task.branchPoints.length,
         goalAchieved: task.goalAchieved,
+      });
+
+      this.trace?.writeFlowEnd({
+        entryPointId: entryPoint.id,
+        name: entryPoint.name,
+        status: task.status,
+        durationMs: task.durationMs,
+        goalAchieved: task.goalAchieved,
+        progressScore: task.progressScore,
+        stepsCount: task.discoveredSteps.length,
+        branchCount: task.branchPoints.length,
+        roundsUsed: task.roundsUsed,
       });
 
       logger.info('[FLOW_RUNNER] Flow completed', {
@@ -317,6 +349,17 @@ export class FlowRunner {
     const flowTimeoutMs = this.budget.effectiveFlowTimeoutMs();
     const allocatedRounds = this.budget.roundsPerFlow();
     let context: BrowserContext | null = null;
+
+    this.trace?.writeFlowStart({
+      entryPointId: entryPoint.id,
+      name: entryPoint.name,
+      goal: entryPoint.goal,
+      category: entryPoint.category,
+      priority: entryPoint.priority,
+      contextType: (entryPoint.requiresAuth && this.config.credentials) ? 'authenticated' : 'clean',
+      allocatedRounds,
+      flowTimeoutMs,
+    });
 
     try {
       // 1. Create browser context (with auth if needed)
@@ -378,6 +421,17 @@ export class FlowRunner {
           mode: 'flow',
         });
         if (overlayResult.overlaysDetected > 0) {
+          this.trace?.writeOverlayDetected({
+            url: page.url(),
+            mode: 'flow',
+            obstacles: overlayResult.attempts.map(a => ({ ref: a.ref, type: a.obstacleType, zIndex: 0 })),
+            count: overlayResult.overlaysDetected,
+          });
+          this.trace?.writeOverlayDismissed({
+            url: page.url(),
+            attempts: overlayResult.attempts,
+            durationMs: overlayResult.durationMs,
+          });
           logger.info('[FLOW_RUNNER] Pre-pipeline overlay cleanup', {
             flow: entryPoint.name,
             detected: overlayResult.overlaysDetected,
@@ -399,6 +453,7 @@ export class FlowRunner {
         networkTracker,
         goalDetector,
         browserContext: context,
+        traceWriter: this.trace?.getWriter(),
       };
 
       // 4. Create and run pipeline
@@ -413,14 +468,49 @@ export class FlowRunner {
         timeoutMs: Math.max(5_000, flowTimeoutMs),
       };
 
+      this.trace?.writeFlowPipelineStart({
+        entryPointId: entryPoint.id,
+        goal: entryPoint.goal,
+        url: page.url(),
+        maxRounds: pipelineConfig.maxRounds,
+        timeoutMs: pipelineConfig.timeoutMs,
+      });
+
+      const pipelineStartTime = Date.now();
       const pipelineResult = await pipeline.run(entryPoint.goal, pipelineConfig);
 
       // 5. Extract steps from pipeline rounds
       const discoveredSteps = this.extractSteps(pipelineResult);
 
+      this.trace?.writeFlowPipelineEnd({
+        entryPointId: entryPoint.id,
+        success: pipelineResult.success,
+        roundsUsed: pipelineResult.roundsExecuted,
+        progressScore: pipelineResult.progressScore,
+        blockedReason: pipelineResult.blockedReason,
+        stepsExtracted: discoveredSteps.length,
+        durationMs: Date.now() - pipelineStartTime,
+      });
+
+      if (discoveredSteps.length > 0) {
+        this.trace?.writeFlowStepsExtracted({
+          entryPointId: entryPoint.id,
+          steps: discoveredSteps,
+          count: discoveredSteps.length,
+        });
+      }
+
       // 6. Extract errors from pipeline result
       const errors = this.extractErrors(pipelineResult);
       const errorClassification = this.classifyErrors(pipelineResult, errors);
+
+      if (errors.length > 0) {
+        this.trace?.writeFlowErrors({
+          entryPointId: entryPoint.id,
+          errors,
+          classification: errorClassification,
+        });
+      }
 
       // 7. Save auth state if this was a login flow and it succeeded
       if (
@@ -454,6 +544,13 @@ export class FlowRunner {
         blockerType = blockerInfo.type;
         canUserHelp = blockerInfo.canUserHelp;
 
+        this.trace?.writeFlowBlockerDetected({
+          entryPointId: entryPoint.id,
+          blockerType,
+          canUserHelp,
+          reason: pipelineResult.blockedReason,
+        });
+
         // 10a. Request user help for captcha/2FA if possible
         if (
           canUserHelp &&
@@ -464,12 +561,24 @@ export class FlowRunner {
             ? 'A CAPTCHA was encountered during exploration. Please solve it in the browser and click "Done".'
             : 'A 2FA verification code is required. Please enter the code.';
 
+          this.trace?.writeFlowUserHelpRequested({
+            entryPointId: entryPoint.id,
+            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            timeoutMs: 120_000,
+          });
+
           const answer = await ClarificationService.requestClarificationViaRedis({
             explorationId: this.config.explorationId,
             chatSessionId: this.config.chatSessionId,
             question: clarificationQuestion,
             type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
             timeout: 120_000,
+          });
+
+          this.trace?.writeFlowUserHelpReceived({
+            entryPointId: entryPoint.id,
+            type: blockerType === 'captcha' ? 'captcha_solve' : '2fa_code',
+            received: !!answer,
           });
 
           if (answer) {
@@ -500,6 +609,7 @@ export class FlowRunner {
                 networkTracker: new NetworkTracker(page),
                 goalDetector: new GoalDetector(entryPoint.goal, entryPoint.id),
                 browserContext: context,
+                traceWriter: this.trace?.getWriter(),
               };
               const retryPipeline = new TestPipeline(retryIntegrations);
               const retryConfig: PipelineConfig = {
@@ -575,11 +685,25 @@ export class FlowRunner {
     ];
 
     for (let attempt = 0; attempt < goals.length; attempt++) {
+      const loginStartTime = Date.now();
       try {
         const success = await this.tryLoginWithGoal(context, goals[attempt]);
+        this.trace?.writeFlowLoginAttempt({
+          goal: goals[attempt],
+          attempt,
+          success,
+          durationMs: Date.now() - loginStartTime,
+        });
         if (success) return;
         logger.warn('[FLOW_RUNNER] Login attempt failed', { attempt, goal: goals[attempt] });
       } catch (error) {
+        this.trace?.writeFlowLoginAttempt({
+          goal: goals[attempt],
+          attempt,
+          success: false,
+          durationMs: Date.now() - loginStartTime,
+          error: error instanceof Error ? error.message : String(error),
+        });
         logger.warn('[FLOW_RUNNER] Login attempt error', { attempt, error: String(error) });
       }
     }
@@ -643,6 +767,7 @@ export class FlowRunner {
         actionExecutor,
         networkTracker,
         browserContext: context,
+        traceWriter: this.trace?.getWriter(),
       };
 
       const pipeline = new TestPipeline(integrations);
@@ -1008,6 +1133,13 @@ export class FlowRunner {
         // Non-fatal: proceed with snapshot even if overlay cleanup fails
       }
 
+      // Wait for network + DOM + loading state before branch detection snapshot
+      try {
+        await VisualStability.waitForPageReady(page, { timeout: 3000 });
+      } catch {
+        // Non-fatal
+      }
+
       const snapshot = await SnapshotCollector.collect(page);
       const formattedSnapshot = SnapshotCollector.format(snapshot);
 
@@ -1022,17 +1154,25 @@ export class FlowRunner {
 
       if (this.rateLimiter) await this.rateLimiter.acquireSlot('ai');
 
+      const branchSystemPrompt = 'You are a QA test discovery agent. Identify new testable flows on the current page. Respond with valid JSON only.';
+
+      this.trace?.writeBranchDetectionPrompt({
+        entryPointId: completedEntry.id,
+        model: AI_MODELS.fast,
+        systemPrompt: branchSystemPrompt,
+        userPrompt: prompt,
+      });
+
+      const branchAiStartTime = Date.now();
+
       const response = await Promise.race([
         getChatCompletionWithMessages(
           [
-            {
-              role: 'system',
-              content: 'You are a QA test discovery agent. Identify new testable flows on the current page. Respond with valid JSON only.',
-            },
+            { role: 'system', content: branchSystemPrompt },
             { role: 'user', content: prompt },
           ],
           {
-            model: AI_MODELS.fast, // Use fast model for branch detection
+            model: AI_MODELS.fast,
             temperature: 0.2,
             max_tokens: 1000,
             response_format: { type: 'json_object' },
@@ -1045,6 +1185,14 @@ export class FlowRunner {
 
       this.rateLimiter?.recordSuccess('openai');
       const branches = parseBranchDetectionResponse(response.content);
+
+      this.trace?.writeBranchDetectionResponse({
+        entryPointId: completedEntry.id,
+        model: AI_MODELS.fast,
+        rawResponse: response.content,
+        parsedBranches: branches.map(b => ({ name: b.name, category: b.category, priority: b.priority })),
+        latencyMs: Date.now() - branchAiStartTime,
+      });
 
       return branches.map((bp, index) => ({
         ...bp,

@@ -77,8 +77,7 @@ export interface OverlayCleanupResult {
 /** Max iterations for loading wait loop */
 const MAX_LOADING_WAIT_ITERATIONS = 5;
 
-/** Delay per loading wait iteration (ms) */
-const LOADING_WAIT_DELAY_MS = 1000;
+// Loading delay replaced by network idle + VisualStability smart wait
 
 /**
  * Smart DOM settle after dismiss actions.
@@ -175,10 +174,21 @@ export class OverlayDismisser {
 
       if (lastSnapshot.transientState?.isTransient) {
         waitedForLoading = true;
+
+        // Wait for API requests to finish (loading UI often persists until API responds)
+        // Uses waitForPageReady which only tracks fetch/xhr — ignores images/fonts/analytics
+        try {
+          await VisualStability.waitForPageReady(page, {
+            timeout: Math.min(3000, maxTimeMs - (Date.now() - startTime)),
+          });
+        } catch {
+          // Non-fatal — proceed to polling
+        }
+
         for (let i = 0; i < MAX_LOADING_WAIT_ITERATIONS; i++) {
           if (Date.now() - startTime > maxTimeMs) break;
 
-          await page.waitForTimeout(LOADING_WAIT_DELAY_MS);
+          await VisualStability.waitForStable(page, { checkInterval: 150, maxAttempts: 4 });
           lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
 
           if (!lastSnapshot.transientState?.isTransient) break;

@@ -23,6 +23,7 @@
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { TestBlackboard } from './blackboard';
 import { buildPlannerPrompt } from './prompts';
 import type { TestPlan, PlanStep } from './types';
@@ -41,8 +42,22 @@ export class PlannerAgent {
    * Reads Blackboard: currentSnapshot, rounds, review, insights
    * Returns: TestPlan to be written to Blackboard by pipeline
    */
-  static async plan(blackboard: TestBlackboard): Promise<TestPlan> {
+  static async plan(blackboard: TestBlackboard, traceWriter?: LiteTraceWriter): Promise<TestPlan> {
     const prompt = buildPlannerPrompt(blackboard);
+    const round = blackboard.getRounds().length + 1;
+
+    // Trace: full prompt sent to AI
+    PlannerAgent.trace(traceWriter, 'planner_prompt', {
+      round,
+      model: AI_TASK_MODELS.chatPlanner,
+      prompt,
+      goal: blackboard.getGoal(),
+      hasSnapshot: !!blackboard.getCurrentSnapshot(),
+      hasReview: !!blackboard.getReview(),
+      previousRounds: blackboard.getRounds().length,
+    });
+
+    const llmStart = Date.now();
 
     try {
       const aiPromise = getChatCompletionWithMessages(
@@ -64,17 +79,36 @@ export class PlannerAgent {
 
       if (!result) {
         logger.warn('[PLANNER] Timeout — returning default plan');
+        PlannerAgent.trace(traceWriter, 'planner_timeout', {
+          round,
+          timeoutMs: PLANNER_CONFIG.timeoutMs,
+        });
         return PlannerAgent.buildDefaultPlan(blackboard);
       }
 
       // Parse JSON response
       const content = result.content?.trim() || '';
       const cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '');
+
+      // Trace: full raw response from AI
+      PlannerAgent.trace(traceWriter, 'planner_response', {
+        round,
+        model: AI_TASK_MODELS.chatPlanner,
+        rawResponse: content,
+        latencyMs: Date.now() - llmStart,
+        tokensUsed: result.usage?.totalTokens,
+      });
+
       const parsed = JSON.parse(cleaned);
 
       // Validate plan structure
       if (!parsed.summary || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
         logger.warn('[PLANNER] Invalid plan structure, using default');
+        PlannerAgent.trace(traceWriter, 'planner_fallback', {
+          round,
+          reason: 'invalid_plan_structure',
+          rawResponse: content,
+        });
         return PlannerAgent.buildDefaultPlan(blackboard);
       }
 
@@ -102,8 +136,25 @@ export class PlannerAgent {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       logger.warn('[PLANNER] Error creating plan', { error: errorMsg });
+      PlannerAgent.trace(traceWriter, 'planner_error', {
+        round,
+        error: errorMsg,
+        latencyMs: Date.now() - llmStart,
+      });
       return PlannerAgent.buildDefaultPlan(blackboard);
     }
+  }
+
+  /** Write trace entry (fire-and-forget) */
+  private static trace(traceWriter: LiteTraceWriter | undefined, eventType: string, payload: Record<string, any>): void {
+    try {
+      traceWriter?.write({
+        stage: 'pipeline',
+        eventType,
+        spanId: traceWriter.generateSpanId(),
+        payload,
+      });
+    } catch { /* never break agent for trace failures */ }
   }
 
   /**
