@@ -548,6 +548,24 @@ export interface LintResult {
   similarityDelta?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** @internal Rule trace from buildAllowedSets */
+  _ruleTrace?: Array<{ ruleId: string; version: string; action: 'exclude' | 'boost' | 'penalize' | 'shortcircuit'; evidence: string; affectedRefs: string[] }>;
+  /** @internal Hard allowed count */
+  _hardAllowedCount?: number;
+  /** @internal Soft allowed count */
+  _softAllowedCount?: number;
+  /** @internal LLM call trace (prompt + response) for debugging */
+  _llmTrace?: {
+    model: string;
+    prompt: string;
+    response: string;
+    latencyMs: number;
+    path: 'selectElementWithLLM' | 'rescueWithGeminiFlash';
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

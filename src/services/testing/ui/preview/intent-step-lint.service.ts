@@ -18,6 +18,7 @@ import {
     resolveElement,
     sanitizeIntent,
 } from './element-resolver.service';
+import { EditorTraceService } from './editor-trace.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
     IntentStep,
@@ -800,7 +801,7 @@ export class IntentStepLintService {
             nodeRole: cachedNode.role,
           });
 
-          return {
+          const evidenceResult: LintResult = {
             status: 'resolved',
             message: 'Element resolved from evidence cache',
             confidence: 0.95,
@@ -819,6 +820,26 @@ export class IntentStepLintService {
             }],
             cacheHit: true,
           };
+
+          // ── TRACE: evidence shortcut hit ──
+          try {
+            const trace = EditorTraceService.get(previewSessionId);
+            if (trace) {
+              trace.writeElementResolution({
+                description: stepDraft.description,
+                actionType: stepDraft.type,
+                pageUrl: snapshot.url,
+                result: evidenceResult,
+                domNodesTotal: domNodes.length,
+                domNodes,
+                evidenceShortcut: true,
+                evidenceRef: cachedRef,
+                latencyMs: 0,
+              });
+            }
+          } catch { /* trace logging must never break resolution */ }
+
+          return evidenceResult;
         }
 
         // Evidence ref found but incompatible with action type - bypass cache
@@ -842,6 +863,7 @@ export class IntentStepLintService {
     }
 
     // Step 1: Try LLM-based resolver (PRIMARY) with includeAlternatives flag
+    const resolveStartMs = Date.now();
     const resolverResult = await resolveElement({
       previewSessionId,
       stepDraft,
@@ -849,6 +871,26 @@ export class IntentStepLintService {
       pageUrl: snapshot.url,
       includeAlternatives,
     });
+    const resolveLatencyMs = Date.now() - resolveStartMs;
+
+    // ── TRACE: Write full element resolution diagnostic to editor JSONL ──
+    try {
+      const trace = EditorTraceService.get(previewSessionId);
+      if (trace) {
+        trace.writeElementResolution({
+          description: stepDraft.description,
+          actionType: stepDraft.type,
+          pageUrl: snapshot.url,
+          result: resolverResult,
+          domNodesTotal: domNodes.length,
+          domNodes,
+          ruleTrace: resolverResult._ruleTrace,
+          hardAllowedCount: resolverResult._hardAllowedCount,
+          softAllowedCount: resolverResult._softAllowedCount,
+          latencyMs: resolveLatencyMs,
+        });
+      }
+    } catch { /* trace logging must never break resolution */ }
 
     // Step 2: If LLM resolver failed, fall back to rule-based
     if (resolverResult.degradedMode) {

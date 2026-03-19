@@ -1009,9 +1009,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // Import apply service dynamically to avoid circular deps
       const { PreviewStepApplyService } = await import('@/services/testing/ui/preview/preview-step-apply.service');
 
-      // Editor trace: log step apply request
-      const applyTrace = EditorTraceService.get(previewSessionId);
-      if (applyTrace) applyTrace.writeStepApplyRequest(stepDraft);
+      // Editor trace: log step apply request (getOrCreate ensures trace file exists even without recording)
+      const applyTrace = EditorTraceService.getOrCreate(previewSessionId, ensuredUserId);
+      applyTrace.writeStepApplyRequest(stepDraft);
 
       const result = await PreviewStepApplyService.applyStep({
         previewSessionId,
@@ -1022,7 +1022,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       // Editor trace: log step apply result
-      if (applyTrace) applyTrace.writeStepApplyResult(result);
+      applyTrace.writeStepApplyResult(result);
 
       // V3: Clean up confirmed selection only after successful apply
       if (result.success && confirmedSelection) {

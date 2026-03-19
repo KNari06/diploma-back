@@ -1308,7 +1308,7 @@ export class PreActionAnalyzer {
               const label = input.getAttribute('aria-label') ||
                            input.getAttribute('placeholder') ||
                            // @ts-expect-error - browser context
-                           document.querySelector(`label[for="${input.id}"]`)?.textContent?.trim() ||
+                           document.querySelector(`label[for="${CSS.escape(input.id)}"]`)?.textContent?.trim() ||
                            input.getAttribute('name') ||
                            (isContentEditable ? 'Editable field' : 'Unknown field');
 
@@ -1354,7 +1354,8 @@ export class PreActionAnalyzer {
             const inputEl = input;
             const isContentEditable = input.hasAttribute('contenteditable');
 
-            const labelEl = form.querySelector(`label[for="${input.id}"]`) ||
+            // @ts-expect-error - CSS.escape is available in browser context
+            const labelEl = form.querySelector(`label[for="${CSS.escape(input.id)}"]`) ||
                            input.closest('label');
 
             const label = labelEl?.textContent?.trim() ||
@@ -1686,13 +1687,14 @@ Answer only "yes" or "no".`,
           const inputEl = cb;
           if (inputEl.required && !inputEl.checked) {
             // @ts-ignore - browser context
-            const label = document.querySelector(`label[for="${cb.id}"]`)?.textContent?.trim() ||
+            const label = document.querySelector(`label[for="${CSS.escape(cb.id)}"]`)?.textContent?.trim() ||
                          cb.closest('label')?.textContent?.trim() ||
                          cb.getAttribute('aria-label') ||
                          'Agreement checkbox';
 
             unchecked.push({
-              selector: cb.id ? `#${cb.id}` : `input[type="checkbox"][name="${cb.getAttribute('name')}"]`,
+              // @ts-expect-error - CSS.escape is available in browser context
+              selector: cb.id ? `#${CSS.escape(cb.id)}` : `input[type="checkbox"][name="${CSS.escape(cb.getAttribute('name') || '')}"]`,
               label,
             });
           }
@@ -1884,11 +1886,12 @@ Respond with only the field type, nothing else.`,
         const parent = el.closest('.collapse, .accordion-collapse, [aria-expanded="false"]');
         if (parent) {
           // @ts-expect-error - browser context
-          const trigger = document.querySelector(`[aria-controls="${parent.id}"]`) ||
+          const trigger = document.querySelector(`[aria-controls="${CSS.escape(parent.id)}"]`) ||
                          // @ts-expect-error - browser context
-                         document.querySelector(`[data-target="#${parent.id}"]`);
+                         document.querySelector(`[data-target="#${CSS.escape(parent.id)}"]`);
           if (trigger) {
-            return (trigger as any).id ? `#${(trigger as any).id}` : null;
+            // @ts-expect-error - CSS.escape is available in browser context
+            return (trigger as any).id ? `#${CSS.escape((trigger as any).id)}` : null;
           }
         }
 
@@ -1896,9 +1899,10 @@ Respond with only the field type, nothing else.`,
         const tabContent = el.closest('.tab-pane, [role="tabpanel"]');
         if (tabContent && (tabContent as any).id) {
           // @ts-expect-error - browser context
-          const tab = document.querySelector(`[aria-controls="${(tabContent as any).id}"], [href="#${(tabContent as any).id}"]`);
+          const tab = document.querySelector(`[aria-controls="${CSS.escape((tabContent as any).id)}"], [href="#${CSS.escape((tabContent as any).id)}"]`);
           if (tab) {
-            return (tab as any).id ? `#${(tab as any).id}` : `[aria-controls="${(tabContent as any).id}"]`;
+            // @ts-expect-error - CSS.escape is available in browser context
+            return (tab as any).id ? `#${CSS.escape((tab as any).id)}` : `[aria-controls="${CSS.escape((tabContent as any).id)}"]`;
           }
         }
 

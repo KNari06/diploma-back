@@ -345,43 +345,43 @@ export function buildAllowedSets(
       });
     }
     
-    // Rule 2: Disabled check
+    // Rule 2: Disabled check → soft penalty (LLM decides)
     if (!excluded && node.isDisabled) {
-      excluded = true;
+      isSoft = true;
       nodeRules.push({
         ruleId: 'state.disabled',
-        version: 'v1',
-        action: 'exclude',
-        evidence: 'isDisabled=true',
-        affectedRefs: [node.ref],
-      });
-    }
-    
-    // Rule 3: Readonly for writable actions
-    if (!excluded && WRITABLE_ACTIONS.has(actionType) && node.readOnly) {
-      excluded = true;
-      nodeRules.push({
-        ruleId: 'state.readonly',
-        version: 'v1',
-        action: 'exclude',
-        evidence: `readOnly=true for action=${actionType}`,
+        version: 'v3',
+        action: 'penalize',
+        evidence: 'isDisabled=true — soft penalty, LLM decides',
         affectedRefs: [node.ref],
       });
     }
 
-    // Rule 3b: Type must target text-like editable fields only
-    if (!excluded && actionType === 'type' && !isFillCompatibleTextField(node)) {
-      excluded = true;
+    // Rule 3: Readonly for writable actions → soft penalty (LLM decides)
+    if (!excluded && WRITABLE_ACTIONS.has(actionType) && node.readOnly) {
+      isSoft = true;
       nodeRules.push({
-        ruleId: 'type.incompatible_field_type',
-        version: 'v1',
-        action: 'exclude',
-        evidence: `tag=${node.tag}, type=${node.type || node.inputType || 'unknown'}`,
+        ruleId: 'state.readonly',
+        version: 'v3',
+        action: 'penalize',
+        evidence: `readOnly=true for action=${actionType} — soft penalty, LLM decides`,
         affectedRefs: [node.ref],
       });
     }
-    
-    // Rule 4: State-aware action checks
+
+    // Rule 3b: Type must target text-like editable fields only → soft penalty (LLM decides)
+    if (!excluded && actionType === 'type' && !isFillCompatibleTextField(node)) {
+      isSoft = true;
+      nodeRules.push({
+        ruleId: 'type.incompatible_field_type',
+        version: 'v3',
+        action: 'penalize',
+        evidence: `tag=${node.tag}, type=${node.type || node.inputType || 'unknown'} — soft penalty, LLM decides`,
+        affectedRefs: [node.ref],
+      });
+    }
+
+    // Rule 4: State-aware action checks → soft penalty (LLM decides)
     if (!excluded) {
       const stateCheck = STATE_AWARE_ACTIONS[actionType];
       if (stateCheck) {
@@ -392,14 +392,14 @@ export function buildAllowedSets(
             (stateCheck.requiredState === 'checked' && currentState === true) ||
             (stateCheck.requiredState === 'closed' && currentState === false) ||
             (stateCheck.requiredState === 'open' && currentState === true);
-          
+
           if (!isCorrectState) {
-            excluded = true;
+            isSoft = true;
             nodeRules.push({
               ruleId: 'state.mismatch',
-              version: 'v1',
-              action: 'exclude',
-              evidence: `${stateCheck.field}=${currentState}, required=${stateCheck.requiredState}`,
+              version: 'v3',
+              action: 'penalize',
+              evidence: `${stateCheck.field}=${currentState}, required=${stateCheck.requiredState} — soft penalty, LLM decides`,
               affectedRefs: [node.ref],
             });
           }
@@ -458,12 +458,12 @@ export function buildAllowedSets(
 
         // Exception: allow non-standard textbox components for type as SoftAllowed.
         if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag && !hasClickSignal && !isContentEditable) {
-          excluded = true;
+          isSoft = true;
           nodeRules.push({
             ruleId: 'tag.incompatible',
-            version: 'v1',
-            action: 'exclude',
-            evidence: `tag=${node.tag}, role=${node.role || 'none'} not in allowed [${allowedTags.join(',')}] for action=${actionType}`,
+            version: 'v3',
+            action: 'penalize',
+            evidence: `tag=${node.tag}, role=${node.role || 'none'} not in allowed [${allowedTags.join(',')}] for action=${actionType} — soft penalty, LLM decides`,
             affectedRefs: [node.ref],
           });
         } else if (isNonStandardTextbox) {
@@ -545,13 +545,13 @@ export function buildAllowedSets(
           // Popup backdrops can cause false negatives in elementFromPoint.
           // No penalty: this is the active layer the user sees.
         } else if (hasVisibleModal) {
-          // HARD exclude: element is behind modal layer (not inside it)
-          excluded = true;
+          // Soft penalty: likely behind modal layer — LLM decides
+          isSoft = true;
           nodeRules.push({
-            ruleId: 'modal.background_element',
-            version: 'v2',
-            action: 'exclude',
-            evidence: 'isTopMostAtCenter=false, not inside modal, modal present',
+            ruleId: 'modal.likely_background',
+            version: 'v3',
+            action: 'penalize',
+            evidence: 'isTopMostAtCenter=false, not inside modal, modal present — soft penalty, LLM decides',
             affectedRefs: [node.ref],
           });
         } else {
@@ -1066,6 +1066,12 @@ interface LlmSelectResult {
   alternativeRefs?: string[];
   latencyMs: number;
   cacheHit: boolean;
+  /** @internal LLM prompt sent (for trace) */
+  _prompt?: string;
+  /** @internal LLM response received (for trace) */
+  _response?: string;
+  /** @internal Model used */
+  _model?: string;
 }
 
 const LLM_SELECT_SYSTEM_PROMPT = `You are an AI element selector for a browser testing tool.
@@ -1270,6 +1276,11 @@ Select the single best matching element.`;
 
     recordLlmSelectSuccess();
 
+    // Attach LLM trace for diagnostics (not cached, only on fresh calls)
+    result._prompt = userPrompt;
+    result._response = content;
+    result._model = AI_TASK_MODELS.disambiguation;
+
     logger.info('[LLM_SELECT] Element selection complete', {
       event: 'llm_select_complete',
       status: result.status,
@@ -1360,6 +1371,9 @@ export async function resolveElement(params: {
       candidates: [],
       highlight: [],
       needsAiFallback: true,
+      _ruleTrace: [],
+      _hardAllowedCount: 0,
+      _softAllowedCount: 0,
     };
   }
 
@@ -1370,6 +1384,13 @@ export async function resolveElement(params: {
   const allowedResult = buildAllowedSets(domNodes, stepDraft.type, intentText);
   const { hardAllowed, softAllowed, ruleTrace, shortCircuitRef } = allowedResult;
   
+  // Diagnostic fields for trace logging
+  const _diag = {
+    _ruleTrace: ruleTrace,
+    _hardAllowedCount: hardAllowed.length,
+    _softAllowedCount: softAllowed.length,
+  };
+
   // Combine allowed sets (hardAllowed first, then softAllowed)
   const allAllowed = [...hardAllowed, ...softAllowed];
   const allowedCount = allAllowed.length;
@@ -1416,6 +1437,7 @@ export async function resolveElement(params: {
         }],
         cacheHit: false,
         degradedMode: false,
+        ..._diag,
       };
     }
   }
@@ -1462,6 +1484,7 @@ export async function resolveElement(params: {
           highlight: [{ ref: rescuedNode.ref, boundingBox: rescuedNode.boundingBox, type: 'success' }],
           cacheHit: false,
           degradedMode: false,
+          ..._diag,
         };
       }
     }
@@ -1483,6 +1506,7 @@ export async function resolveElement(params: {
       highlight: [],
       needsAiFallback: true,
       degradedMode: false,
+      ..._diag,
     };
   }
 
@@ -1519,6 +1543,7 @@ export async function resolveElement(params: {
       }],
       cacheHit: false,
       degradedMode: false,
+      ..._diag,
     };
   }
 
@@ -1548,6 +1573,15 @@ export async function resolveElement(params: {
       });
 
       cacheHit = llmResult.cacheHit;
+
+      // Build LLM trace for diagnostics
+      const llmTrace = llmResult._prompt ? {
+        model: llmResult._model || 'unknown',
+        prompt: llmResult._prompt,
+        response: llmResult._response || '',
+        latencyMs: llmResult.latencyMs,
+        path: 'selectElementWithLLM' as const,
+      } : undefined;
 
       if (llmResult.status === 'resolved' && llmResult.selectedRef) {
         // LLM selected a single element
@@ -1588,6 +1622,8 @@ export async function resolveElement(params: {
             }],
             cacheHit,
             degradedMode: false,
+            ..._diag,
+            _llmTrace: llmTrace,
           };
         }
       } else if (llmResult.status === 'needs_clarification' && llmResult.alternativeRefs?.length) {
@@ -1635,6 +1671,8 @@ export async function resolveElement(params: {
             highlight,
             cacheHit,
             degradedMode: false,
+            ..._diag,
+            _llmTrace: llmTrace,
           };
         }
       }
@@ -1661,6 +1699,8 @@ export async function resolveElement(params: {
           cacheHit,
           degradedMode: false,
           needsAiFallback: true,
+          ..._diag,
+          _llmTrace: llmTrace,
         };
       }
 
@@ -1682,6 +1722,7 @@ export async function resolveElement(params: {
         degradedMode: true,
         degradedReason: 'llm_error',
         needsAiFallback: true,
+        ..._diag,
       };
     }
   } else {
@@ -1701,6 +1742,7 @@ export async function resolveElement(params: {
       degradedMode: true,
       degradedReason: 'circuit_breaker_open',
       needsAiFallback: true,
+      ..._diag,
     };
   }
 
@@ -1711,5 +1753,6 @@ export async function resolveElement(params: {
     confidence: 0,
     candidates: [],
     highlight: [],
+    ..._diag,
   };
 }

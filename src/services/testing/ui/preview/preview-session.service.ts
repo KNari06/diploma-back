@@ -1413,6 +1413,22 @@ export class PreviewSessionService {
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();
 
+      // ── DEBUG: Log when snapshot returns 0 elements to diagnose drawer/popup issues ──
+      if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length === 0) {
+        logger.warn('[PREVIEW_SESSION] Snapshot returned 0 elements', {
+          sessionId,
+          url: currentUrl,
+          pageIsClosed: session.page.isClosed(),
+          snapshotElementCount: snapshot.elements?.length ?? -1,
+        });
+      } else if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length > 0) {
+        logger.warn('[PREVIEW_SESSION] Snapshot has elements but extractor returned 0 nodes', {
+          sessionId,
+          url: currentUrl,
+          rawElementCount: snapshot.elements.length,
+        });
+      }
+
       const currentTitle = await session.page.title().catch(() => undefined);
 
       session.pageState = {
