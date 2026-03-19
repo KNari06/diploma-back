@@ -76,6 +76,7 @@ const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
   'wait',
   'wait_for',
   'ai_check',
+  'wait_for_email',  // V12: Email inbox polling (no element target)
 ]);
 
 /**

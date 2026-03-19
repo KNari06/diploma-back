@@ -558,6 +558,33 @@ export class SnapshotCollector {
           ? document.querySelector(`[data-agent-ref="${activeModalRef}"]`)
           : null;
 
+        // ✅ FIX: Fallback modal detection via aria-hidden "inert background" signal.
+        // When React/Vue apps open a modal, they set aria-hidden="true" on #root to hide
+        // background from screen readers. The modal portal renders as a SIBLING of #root
+        // (or inside it). Use this signal to find the modal when detectActiveModal() fails.
+        let fallbackModalElement: Element | null = null;
+        if (!activeModalElement) {
+          const ariaHiddenRoot =
+            document.querySelector(':scope > [aria-hidden="true"]') ||
+            document.querySelector('body > [aria-hidden="true"]');
+          if (ariaHiddenRoot && ariaHiddenRoot.parentElement) {
+            const siblings = ariaHiddenRoot.parentElement.children;
+            for (let si = 0; si < siblings.length; si++) {
+              const sib = siblings[si];
+              if (sib === ariaHiddenRoot) continue;
+              // Skip hidden siblings
+              const sibStyle = window.getComputedStyle(sib);
+              if (sibStyle.display === 'none' || sibStyle.visibility === 'hidden') continue;
+              if (parseFloat(sibStyle.opacity) < 0.1) continue;
+              // Check if sibling has interactive children — it's likely the modal portal
+              if (sib.querySelector(__mc.interactiveSelector)) {
+                fallbackModalElement = sib;
+                break;
+              }
+            }
+          }
+        }
+
         /**
          * Helper: get parent context for an element
          * Looks for semantic parent containers and extracts identifying info
@@ -625,7 +652,7 @@ export class SnapshotCollector {
           // 2. Try <label for="id">
           const elId = el.getAttribute('id');
           if (elId) {
-            const labelFor = document.querySelector(`label[for="${elId}"]`);
+            const labelFor = document.querySelector(`label[for="${CSS.escape(elId)}"]`);
             if (labelFor?.textContent?.trim()) {
               return labelFor.textContent.trim().slice(0, 100);
             }
@@ -747,8 +774,11 @@ export class SnapshotCollector {
           'summary',
 
           // ── Framework-specific selectors (Alpine.js, HTMX, Stimulus, Knockout, Qwik) ──
-          // Alpine.js: x-on:click, @click, x-data bound interactive elements
-          '[x-on\\:click]', '[@click]',
+          // Alpine.js: x-on:click, x-data bound interactive elements
+          // NOTE: Alpine's @click shorthand compiles to x-on:click in DOM, so [x-on\:click] catches both.
+          // ⚠️ [@click] is an INVALID CSS selector (@-prefix is not valid in attribute names)
+          // and causes querySelectorAll to throw, killing the entire primary pass.
+          '[x-on\\:click]',
           // HTMX: hx-get, hx-post, hx-put, hx-delete, hx-patch triggers
           '[hx-get]', '[hx-post]', '[hx-put]', '[hx-delete]', '[hx-patch]',
           '[data-hx-get]', '[data-hx-post]', // HTMX data-* variant
@@ -1108,8 +1138,31 @@ export class SnapshotCollector {
             const style = window.getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden') return;
             if (parseFloat(style.opacity) < 0.01) return; // 0.01 instead of 0.1: catch fade-in animations
-            // Skip elements inside aria-hidden containers (not accessible to users)
-            if (el.closest('[aria-hidden="true"]')) return;
+            // Skip elements inside aria-hidden containers (not accessible to users).
+            // ✅ FIX: Many React/Vue apps set aria-hidden="true" on #root when a modal opens.
+            // Elements inside active modal, visible dialog, or fallback modal are always kept.
+            // Root-level aria-hidden = "inert background" pattern → keep all visible elements
+            // (downstream soft-penalty in buildAllowedSets lets LLM decide).
+            const ariaHiddenAncestor = el.closest('[aria-hidden="true"]');
+            if (ariaHiddenAncestor) {
+              const isInsideActiveLayer = activeModalElement && activeModalElement.contains(el);
+              const isInsideFallbackModal = fallbackModalElement && fallbackModalElement.contains(el);
+              const isInsideVisibleDialog = el.closest('[role="dialog"], [role="alertdialog"], dialog[open]') !== null;
+              const isRootLevel =
+                ariaHiddenAncestor === document.body ||
+                ariaHiddenAncestor === document.documentElement ||
+                ariaHiddenAncestor.parentElement === document.body;
+
+              if (isInsideActiveLayer || isInsideFallbackModal || isInsideVisibleDialog) {
+                /* keep — inside active/fallback modal or visible dialog */
+              } else if (isRootLevel) {
+                /* keep — root-level aria-hidden = "inert background" pattern.
+                   Element passed visibility checks above (not display:none, not visibility:hidden).
+                   Let it through — downstream buildAllowedSets soft-penalty + LLM will handle. */
+              } else {
+                return; // Lower-level aria-hidden — genuinely hidden block
+              }
+            }
             // Skip non-interactive elements (pointer-events:none = can't be clicked)
             if (style.pointerEvents === 'none') return;
 
@@ -1142,7 +1195,7 @@ export class SnapshotCollector {
             // as "inside modal" even when NO modal exists on the page (e.g. jobescape.me).
             const isInsideModal = activeModalElement
               ? activeModalElement.contains(el)
-              : false;
+              : (fallbackModalElement ? fallbackModalElement.contains(el) : false);
 
             // Universal visibility check via elementFromPoint.
             // The browser tells us exactly what the user sees at the element's center pixel.
@@ -1515,6 +1568,37 @@ export class SnapshotCollector {
               tabIndex: el.getAttribute('tabindex') !== null ? parseInt(el.getAttribute('tabindex') as string, 10) : undefined,
               hasOnclick: el.hasAttribute('onclick') || undefined,
               hasAriaHaspopup: el.hasAttribute('aria-haspopup') || undefined,
+
+              // Near text: collect text from sibling/row elements for disambiguation
+              // When multiple identical buttons exist (e.g. "Delete" in each table row),
+              // nearText provides row context so LLM can match "delete Anna Lee"
+              nearText: (() => {
+                try {
+                  // Strategy: walk up to nearest row-like container (tr, li, [role=row], article,
+                  // or parent with multiple similar children), then extract its text minus our element's text
+                  const ownText = (getReadableElementText(el) || '').slice(0, 30);
+                  let container: Element | null = el.parentElement;
+                  // Walk up max 4 levels to find a row-like container
+                  for (let depth = 0; depth < 4 && container; depth++) {
+                    const tag = container.tagName.toLowerCase();
+                    const role = container.getAttribute('role') || '';
+                    // Row-like containers: table row, list item, card, article, grid row
+                    if (tag === 'tr' || tag === 'li' || tag === 'article' || tag === 'section' ||
+                        role === 'row' || role === 'listitem' || role === 'article' ||
+                        container.classList.contains('card') || container.classList.contains('item') ||
+                        container.classList.contains('row')) {
+                      break;
+                    }
+                    container = container.parentElement;
+                  }
+                  if (!container) return undefined;
+                  const containerText = getReadableElementText(container).slice(0, 120);
+                  if (!containerText || containerText === ownText) return undefined;
+                  // Remove own text from container text to get sibling context
+                  const context = containerText.replace(ownText, '').replace(/\s+/g, ' ').trim();
+                  return context.length > 3 ? context.slice(0, 80) : undefined;
+                } catch { return undefined; }
+              })(),
             });
           } catch (err) {
             // Skip element if any error
@@ -1646,8 +1730,11 @@ export class SnapshotCollector {
 
         const metadata = detectVisualContentMetadata();
 
-        // ✅ TASK 10: Cleanup stale fingerprint map entries (>1000 entries)
-        if (win.__agentFingerprintMap.size > 1000) {
+        // ✅ TASK 10: Cleanup stale fingerprint map entries
+        // Trigger at 300 entries (reduced from 1000) to prevent memory growth on long sessions.
+        // Removing stale entries only causes a one-time ref reassignment — no data loss,
+        // just a single LLM call instead of evidence cache hit for affected elements.
+        if (win.__agentFingerprintMap.size > 300) {
           const currentRefs = new Set();
           for (const el of elements) {
             currentRefs.add(el.ref);
@@ -1663,6 +1750,12 @@ export class SnapshotCollector {
 
           for (const fingerprint of fingerprintsToDelete) {
             win.__agentFingerprintMap.delete(fingerprint);
+          }
+
+          // Hard cap: if still over 500 after cleanup (many elements in DOM), clear entirely
+          // This prevents O(n) map lookups from slowing snapshots on complex pages
+          if (win.__agentFingerprintMap.size > 500) {
+            win.__agentFingerprintMap.clear();
           }
         }
 
@@ -1826,6 +1919,18 @@ export class SnapshotCollector {
           // Page alert collection is non-critical — never break snapshot
         }
 
+        // DEBUG: Attach collection stats for diagnosing 0-element issues
+        const __debugStats = {
+          allElementsCount: allElements.length,
+          uniqueElementsCount: uniqueElements.length,
+          secondaryPassCount: secondaryPassElements.size,
+          elementsAfterFilter: elements.length,
+          // @ts-expect-error
+          documentBodyChildCount: document.body ? document.body.children.length : -1,
+          // @ts-expect-error
+          totalDomElements: document.querySelectorAll('*').length,
+        };
+
         return {
           // @ts-expect-error - window and document available in browser context
           url: window.location.href,
@@ -1840,16 +1945,21 @@ export class SnapshotCollector {
           metadata, // P0: Visual content metadata for proactive vision detection
           pageStructure, // Manus: Tables, lists, pagination detection
           pageAlerts: pageAlerts.length > 0 ? pageAlerts.slice(0, 5) : undefined, // Max 5 alerts
+          __debugStats, // DEBUG: collection stats
         };
       }, __modalConsts);
 
-      // logger.debug('[SNAPSHOT_COLLECTOR] Collected snapshot', {
-      //   url: snapshot.url,
-      //   elementCount: snapshot.elements.length,
-      //   hasActiveModal: !!snapshot.activeModalRef,
-      //   isTransient: snapshot.transientState?.isTransient || false,
-      //   transientType: snapshot.transientState?.type,
-      // });
+      // DEBUG: Always log when snapshot returns 0 elements
+      if (snapshot.elements.length === 0) {
+        logger.warn('[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements', {
+          url: snapshot.url?.slice(0, 100),
+          title: snapshot.title?.slice(0, 50),
+          debugStats: (snapshot as any).__debugStats,
+          hasActiveModal: !!snapshot.activeModalRef,
+          isTransient: snapshot.transientState?.isTransient || false,
+          transientType: snapshot.transientState?.type,
+        });
+      }
 
       // ═══════════════════════════════════════════════════════════════════════
       // IFRAME ELEMENT COLLECTION (same-origin only)

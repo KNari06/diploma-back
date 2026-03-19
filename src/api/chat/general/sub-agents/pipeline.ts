@@ -23,16 +23,16 @@ import { emitProcessingStep } from '@/api/chat/shared/utils';
 import { PROGRESS } from '@/api/chat/shared/constants';
 import type { ChatProcessingStepPayload } from '@/websocket/types/types';
 
-// ── Smart Simple-Chat Guardrail ───────────────────────────────────────────
-// If the router says "simple_chat" but tools are available, we check whether
-// the message is truly a no-tool conversation (greeting, thanks, opinion).
-// Uses message length + router confidence instead of hardcoded keyword lists.
-
 /**
  * Noise: emoji-only, punctuation-only, repeated characters, very short gibberish.
  * These are NOT tool requests — sending them to executor wastes an LLM call.
  */
 const NOISE_MESSAGE = /^[\p{Emoji}\p{Emoji_Component}\s]+$|^[.!?,;:…\-—_*#@^&()+=~`'"<>{}[\]\\/|]+$|^(.)\1{2,}$/u;
+
+// ── Smart Simple-Chat Guardrail ───────────────────────────────────────────
+// If the router says "simple_chat" but tools are available, we check whether
+// the message is truly a no-tool conversation (greeting, thanks, opinion).
+// Uses message length + router confidence instead of hardcoded keyword lists.
 
 /** Confidence above which we trust the router's simple_chat verdict. */
 const SIMPLE_CHAT_TRUST_THRESHOLD = 0.85;
@@ -148,8 +148,62 @@ export class SubAgentPipeline {
         return this.fallbackResult(metrics, pipelineStart);
       }
 
+      // ═══ FAST PATH: Skip Router when Intent Parser already classified as no-tools ═══
+      // The Intent Parser (LLM) already runs before the pipeline. When it returns
+      // needsTools=false, we trust its classification and skip the Router LLM call (~600ms).
+      // This is NOT a hardcoded regex — it's the AI's own decision from intent parsing.
+      // Falls through to normal Router flow if needsTools is undefined (backward compat).
+      if (input.needsTools === false) {
+        logger.info('[SUB_AGENT_PIPELINE] Fast path: Intent Parser said needsTools=false, skipping Router', {
+          userMessage: input.userMessage.substring(0, 50),
+        });
+        this.emitStep('agent_thinking', 'Composing response...', PROGRESS.PIPELINE_FORMATTING);
+
+        try {
+          // Extract context messages (skip first system message + current user message)
+          const lastIndex = input.messages.length - 1;
+          let skippedFirst = false;
+          const fastPathContext = input.messages.filter((m, idx) => {
+            if (idx === lastIndex) return false;
+            if (m.role === 'system' && !skippedFirst) { skippedFirst = true; return false; }
+            return true;
+          }) as ChatCompletionMessageParam[];
+
+          const responderStart = Date.now();
+          const response = await generateSimpleResponse(
+            input.userMessage,
+            fastPathContext,
+            input.skillDescriptions,
+            input.abortSignal,
+            input.userContent
+          );
+          metrics.responderMs = Date.now() - responderStart;
+          metrics.totalMs = Date.now() - pipelineStart;
+          metrics.routerClassification = 'simple_chat (intent_fast_path)';
+          metrics.routerConfidence = 1.0;
+
+          chatCircuitBreaker.recordResult(true);
+
+          logger.info('[SUB_AGENT_PIPELINE] Intent fast path complete', {
+            durationMs: metrics.totalMs,
+            savedRouterMs: 'skipped',
+          });
+          return {
+            success: true,
+            content: response.content,
+            path: 'simple_chat',
+            metrics,
+          };
+        } catch (fastPathError) {
+          logger.warn('[SUB_AGENT_PIPELINE] Intent fast path failed — falling through to Router', {
+            error: fastPathError instanceof Error ? fastPathError.message : String(fastPathError),
+          });
+          // Fall through to normal Router flow
+        }
+      }
+
       // ═══ PHASE 1: ROUTER ═══
-      this.emitStep('agent_routing', 'Analyzing your request...', PROGRESS.PIPELINE_ROUTING);
+      this.emitStep('agent_thinking', 'Classifying your request...', PROGRESS.PIPELINE_ROUTING);
       const routerStart = Date.now();
       const recentMessages = input.messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -180,12 +234,13 @@ export class SubAgentPipeline {
       blackboard.setRouterResult(routerResult);
 
       const routeDescription = routerResult.classification === 'simple_chat'
-        ? 'Preparing a direct answer'
+        ? 'Preparing a direct answer...'
         : routerResult.classification === 'single_tool'
-        ? 'Found the right tool to help'
-        : 'Planning a multi-step approach';
-      this.emitStep('agent_routing', routeDescription, PROGRESS.PIPELINE_ROUTING_DONE, {
+        ? `Looking up the right tool (${routerResult.toolCategories[0] || 'data'})...`
+        : `Planning a multi-step approach (${routerResult.toolCategories.length} tool groups)...`;
+      this.emitStep('agent_thinking', routeDescription, PROGRESS.PIPELINE_ROUTING_DONE, {
         classification: routerResult.classification,
+        reasoning: routerResult.reasoning,
       });
 
       // Low confidence → clarification or fallback
@@ -323,7 +378,8 @@ export class SubAgentPipeline {
       // ═══ PATH B: SINGLE TOOL ═══
       if (routerResult.classification === 'single_tool') {
         // Execute directly (with blackboard)
-        this.emitStep('agent_executing_tool', 'Running tool...', PROGRESS.PIPELINE_TOOL_BASE);
+        const toolHint = routerResult.toolCategories[0]?.replace(/_/g, ' ') || 'data';
+        this.emitStep('agent_thinking', `Querying ${toolHint}...`, PROGRESS.PIPELINE_TOOL_BASE);
         const executorStart = Date.now();
         const executorResult = await executeTools(
           input.userMessage,
@@ -494,7 +550,9 @@ export class SubAgentPipeline {
         }
 
         // Format response (with blackboard context)
-        this.emitStep('agent_formatting', 'Formatting results...', PROGRESS.PIPELINE_FORMATTING);
+        const toolNames = executorResult.toolResults.map(r => r.toolName.replace(/^qa_/, '').replace(/_/g, ' '));
+        const formatHint = toolNames.length > 0 ? `Formatting ${toolNames[0]} results...` : 'Composing response...';
+        this.emitStep('agent_thinking', formatHint, PROGRESS.PIPELINE_FORMATTING);
         const responderStart = Date.now();
         const response = await formatResponse(
           input.userMessage,
@@ -532,7 +590,8 @@ export class SubAgentPipeline {
       // ═══ PATH C: MULTI TOOL ═══
 
       // Phase 1: Plan
-      this.emitStep('agent_planning', 'Creating an execution plan...', PROGRESS.PIPELINE_PLANNING, {
+      const catList = routerResult.toolCategories.map(c => c.replace(/_/g, ' ')).join(', ');
+      this.emitStep('agent_thinking', `Planning steps across ${catList}...`, PROGRESS.PIPELINE_PLANNING, {
         toolCategories: routerResult.toolCategories,
       });
       const plannerStart = Date.now();
@@ -615,7 +674,7 @@ export class SubAgentPipeline {
 
       // Phase 3: REVIEWER (feature-flagged, skip if aborted)
       if (SUB_AGENT_CONFIG.enableReviewer && !input.abortSignal?.aborted) {
-        this.emitStep('agent_reviewing', 'Verifying results...', PROGRESS.PIPELINE_REVIEWING);
+        this.emitStep('agent_thinking', 'Double-checking the results...', PROGRESS.PIPELINE_REVIEWING);
         const reviewerStart = Date.now();
         const reviewResult = await reviewExecution(blackboard, input.abortSignal);
         metrics.reviewerMs = Date.now() - reviewerStart;
@@ -719,7 +778,7 @@ export class SubAgentPipeline {
       }
 
       // Phase 4: Format response (with full blackboard context)
-      this.emitStep('agent_formatting', 'Formatting results...', PROGRESS.PIPELINE_FORMATTING);
+      this.emitStep('agent_thinking', 'Putting it all together...', PROGRESS.PIPELINE_FORMATTING);
       const responderStart = Date.now();
       const response = await formatResponse(
         input.userMessage,

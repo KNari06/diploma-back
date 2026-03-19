@@ -795,7 +795,7 @@ Or if element not in list:
             var overflowY = style.overflowY;
             if ((overflowY === 'auto' || overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 50) {
               var sel = el.tagName.toLowerCase();
-              if (el.id) sel += '#' + el.id;
+              if (el.id) sel += '#' + CSS.escape(el.id);
               else if (el.className && typeof el.className === 'string') {
                 sel += '.' + el.className.split(/\\s+/).slice(0, 2).join('.');
               }

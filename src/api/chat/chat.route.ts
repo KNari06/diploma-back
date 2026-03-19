@@ -6,6 +6,7 @@ import multer from 'multer';
 import { z } from 'zod';
 import {
   clearWorkspaceChat,
+  createNewChatSession,
   deleteChatSession,
   getChatSessionById,
   getWorkspaceChat,
@@ -933,8 +934,7 @@ router.get('/debug', requireAuth, asyncHandler(debugChatData));
  *       500:
  *         description: Ошибка сервера
  */
-// POST /sessions/new removed — workspace chat is auto-created
-// Replaced by GET /workspace-chat which auto-creates the single workspace session
+router.post('/sessions/new', requireAuth, asyncHandler(createNewChatSession));
 router.get('/workspace-chat', requireAuth, asyncHandler(getWorkspaceChat));
 
 

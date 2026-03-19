@@ -3,6 +3,7 @@ import { redisConnection } from '@/config/infrastructure/queues';
 import { supabase, supabaseAdmin } from '@/db/supabase';
 import { AuthTokens, AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { cache } from '@/utils/core/redis-cache';
 import * as crypto from 'crypto';
 
 // Supabase JWT expiry is configured in Supabase Dashboard (Auth settings).
@@ -693,6 +694,28 @@ export async function refreshAccessToken(
   }
 }
 
+// ── Auth token cache ─────────────────────────────────────────────────────
+// Caches verifyToken() result in Redis to avoid 2 Supabase calls per request.
+// TTL 60s; invalidated on logout, profile update, avatar change, admin status change.
+const AUTH_CACHE_TTL = 60; // seconds
+const AUTH_CACHE_PREFIX = 'auth:user:';
+
+function authCacheKey(token: string): string {
+  return AUTH_CACHE_PREFIX + crypto.createHash('sha256').update(token).digest('hex');
+}
+
+/** Invalidate cached auth for a specific token (e.g. on logout, profile update). */
+export async function invalidateAuthCache(token: string): Promise<void> {
+  await cache.del(authCacheKey(token));
+}
+
+/** Invalidate all cached auth entries (e.g. on admin status change, avatar change). */
+export async function invalidateAuthCacheForUser(_userId: string): Promise<void> {
+  // Can't reverse-map userId → tokenHash; scan all auth keys.
+  // With 60s TTL the key population is small (~tens). delByPattern uses SCAN (production-safe).
+  await cache.delByPattern(`${AUTH_CACHE_PREFIX}*`);
+}
+
 /**
  * Verify JWT token and get user
  * @param accessToken - Access token
@@ -708,6 +731,11 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       });
       return null;
     }
+
+    // Check Redis cache first (avoids 2 Supabase calls on cache hit)
+    const cKey = authCacheKey(accessToken);
+    const cached = await cache.get<AuthUser>(cKey);
+    if (cached) return cached;
 
     const { data, error } = await supabase.auth.getUser(accessToken);
 
@@ -754,7 +782,7 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
     }
 
     // Return user even if not in public.users yet (trigger will sync later)
-    return {
+    const authUser: AuthUser = {
       id: data.user.id,
       email: data.user.email || '',
       name: userData?.name || data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
@@ -762,6 +790,11 @@ export async function verifyToken(accessToken: string): Promise<AuthUser | null>
       status: userData?.status || 'pending_approval',
       avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
     };
+
+    // Cache result (fire-and-forget; cache is fail-safe)
+    cache.set(cKey, authUser, AUTH_CACHE_TTL);
+
+    return authUser;
   } catch (error) {
     // Log error but don't throw - return null to indicate invalid token
     logger.debug('[AUTH] Token verification error', {
@@ -1163,6 +1196,9 @@ export async function updateUserProfile(
 
         logger.info('[AUTH] User profile updated successfully', { userId });
 
+        // Invalidate auth cache so next request picks up the new name
+        await invalidateAuthCache(accessToken);
+
         // Get credits from user_credits table
         const { UserCreditsService } = await import('@/services/core/user-credits.service');
         const userCredits = await UserCreditsService.getUserCredits(userId);
@@ -1195,6 +1231,9 @@ export async function updateUserProfile(
     }
 
     logger.info('[AUTH] User profile updated successfully', { userId });
+
+    // Invalidate auth cache so next request picks up the new name
+    await invalidateAuthCache(accessToken);
 
     // Get credits from user_credits table
     const { UserCreditsService } = await import('@/services/core/user-credits.service');

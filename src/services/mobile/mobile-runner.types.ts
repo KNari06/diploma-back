@@ -6,7 +6,7 @@
 
 // ── Platform ─────────────────────────────────────────────────────
 
-export type MobilePlatform = 'android' | 'ios';
+export type MobilePlatform = 'android' | 'ios' | 'flutter';
 
 // ── Session ──────────────────────────────────────────────────────
 
@@ -173,7 +173,7 @@ export interface MobileTestJobData {
   projectId?: string;
   chatSessionId?: string;
   platform: MobilePlatform;
-  browser: 'mobile-android' | 'mobile-ios';
+  browser: 'mobile-android' | 'mobile-ios' | 'mobile-flutter';
   appPackage?: string;
   intentSteps: MobileIntentStep[];
   geminiApiKey?: string;

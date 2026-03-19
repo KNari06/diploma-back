@@ -142,10 +142,10 @@ export async function listSavedTestCases(req: AuthenticatedRequest, res: Respons
       query = query.eq('flow_id', flowId);
     }
 
-    // Filter by platform: 'web', 'mobile_android', 'mobile_ios', or 'mobile' (both android + ios)
+    // Filter by platform: 'web', 'mobile_android', 'mobile_ios', 'mobile_flutter', or 'mobile' (all mobile)
     if (platform && typeof platform === 'string') {
       if (platform === 'mobile') {
-        query = query.in('platform', ['mobile_android', 'mobile_ios']);
+        query = query.in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter']);
       } else {
         query = query.eq('platform', platform);
       }

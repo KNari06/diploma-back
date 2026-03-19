@@ -367,7 +367,8 @@ export class CommandExecutor {
 
     if (result.success) {
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
-      return { success: true, output: `Clicked ${elementDesc}` };
+      const postAction = await this.collectPostActionContext(ref);
+      return { success: true, output: `Clicked ${elementDesc}${postAction}` };
     }
 
     return { success: false, output: '', error: result.error || `Failed to click ${ref}` };
@@ -398,7 +399,8 @@ export class CommandExecutor {
     const result = await this.actionExecutor.execute(command, snapshot);
 
     if (result.success) {
-      return { success: true, output: `Selected "${value}" from dropdown ${ref}` };
+      const postAction = await this.collectPostActionContext(ref);
+      return { success: true, output: `Selected "${value}" from dropdown ${ref}${postAction}` };
     }
 
     return { success: false, output: '', error: result.error || `Failed to select "${value}" in ${ref}` };
@@ -455,7 +457,11 @@ export class CommandExecutor {
     const result = await this.actionExecutor.execute(command, safeSnapshot);
 
     if (result.success) {
-      return { success: true, output: `Pressed key "${key}"` };
+      // Enter key often submits forms — collect post-action context
+      const postAction = key.toLowerCase() === 'enter'
+        ? await this.collectPostActionContext()
+        : '';
+      return { success: true, output: `Pressed key "${key}"${postAction}` };
     }
 
     return { success: false, output: '', error: result.error || `Failed to press "${key}"` };
@@ -538,7 +544,8 @@ export class CommandExecutor {
     const result = await this.actionExecutor.execute(command, safeSnapshot);
 
     if (result.success) {
-      return { success: true, output: `Navigated to ${url}` };
+      const postAction = await this.collectPostActionContext();
+      return { success: true, output: `Navigated to ${url}${postAction}` };
     }
 
     return { success: false, output: '', error: result.error || `Failed to navigate to ${url}` };
@@ -600,7 +607,8 @@ export class CommandExecutor {
     if (result.success) {
       const element = snapshot.elements.find(el => el.ref === ref);
       const elementDesc = element ? `"${element.name || element.role}" (${element.tag})` : ref;
-      return { success: true, output: `Toggled ${elementDesc}` };
+      const postAction = await this.collectPostActionContext(ref);
+      return { success: true, output: `Toggled ${elementDesc}${postAction}` };
     }
 
     return { success: false, output: '', error: result.error || `Failed to toggle ${ref}` };
@@ -730,6 +738,63 @@ export class CommandExecutor {
       output: `Test blocked: ${reason} [type: ${blockerType}, user_help: ${canUserHelp}]`,
       blocked: true,
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // POST-ACTION CONTEXT (lightweight signals for AI self-verification)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Collect lightweight post-action context after state-changing commands.
+   * Gives the Executor LLM raw signals (page alerts, URL change, element removal)
+   * so IT can decide whether to observe_page, retry, or continue.
+   *
+   * NOT a full snapshot — just fast DOM queries (~20-50ms).
+   * The AI agent reads these signals and decides the next action.
+   */
+  private async collectPostActionContext(ref?: string): Promise<string> {
+    const parts: string[] = [];
+    try {
+      // 1. URL change detection (instant — no DOM query)
+      const currentUrl = this.page.url();
+      const bbUrl = this.blackboard.getCurrentUrl();
+      if (bbUrl && currentUrl !== bbUrl) {
+        parts.push(`URL changed: ${currentUrl}`);
+      }
+
+      // 2. Page alerts — validation errors, auth failures, toast messages
+      //    Fast inline evaluate, NOT full SnapshotCollector
+      const alerts = await this.page.evaluate(`
+        (() => {
+          const alertEls = document.querySelectorAll(
+            '[role="alert"], [aria-live="assertive"], [aria-live="polite"], ' +
+            '.error, .alert, .validation-error, .form-error, .field-error, ' +
+            '[class*="error-message"], [class*="validation"], [data-error]'
+          );
+          const texts = [];
+          alertEls.forEach(el => {
+            const text = el.innerText && el.innerText.trim();
+            if (text && text.length > 0 && text.length < 200) texts.push(text);
+          });
+          return [...new Set(texts)].slice(0, 3);
+        })()
+      `).catch(() => []) as string[];
+
+      if (alerts.length > 0) {
+        parts.push(`PAGE ALERTS: ${alerts.map(a => `"${a}"`).join(', ')}`);
+      }
+
+      // 3. Check if target element still exists (form submit may remove it)
+      if (ref) {
+        const exists = await this.page.locator(`[data-agent-ref="${ref}"]`).count().catch(() => 0);
+        if (exists === 0) {
+          parts.push(`Target element ${ref} removed from page`);
+        }
+      }
+    } catch {
+      // Non-critical — return whatever we collected
+    }
+    return parts.length > 0 ? `\n[POST-ACTION: ${parts.join(' | ')}]` : '';
   }
 
   // ═══════════════════════════════════════════════════════════════════════

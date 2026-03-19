@@ -93,15 +93,17 @@ Respond with JSON:
 {
   "summary": "Brief plan description",
   "steps": [
-    { "stepNumber": 1, "description": "Fill email field with credentials", "status": "pending" },
-    { "stepNumber": 2, "description": "Fill password field with credentials", "status": "pending" },
-    { "stepNumber": 3, "description": "Click Sign In button", "status": "pending" }
+    { "stepNumber": 1, "description": "Fill email field with credentials", "targetRef": "e1" },
+    { "stepNumber": 2, "description": "Fill password field with credentials", "targetRef": "e2" },
+    { "stepNumber": 3, "description": "Click Sign In button", "targetRef": "e3" }
   ]
 }
 
 RULES:
 - Steps MUST be in execution order (form fields top-to-bottom)
 - Each step should be a single atomic action
+- Include "targetRef" with the element ref from CURRENT PAGE STATE when a step targets a specific element (e.g. "e1", "e5")
+- Omit targetRef for non-element steps (observe_page, scroll_page, wait_for_page, mark_done, report_blocked)
 - For credential fields, mention "with credentials" in the description
 - If the page has obstacles (modals, cookie banners), plan to dismiss them first
 - If content is below the fold, plan to scroll_page or scroll_to_element first
@@ -168,16 +170,18 @@ COMMANDS AVAILABLE:
 EXECUTION RULES:
 1. Start with observe_page to see the current page
 2. Follow the plan steps in order
-3. You CAN call MULTIPLE commands in one response (batch fill + click together)
-4. After submit/navigation: call wait_for_page then observe_page
-5. If a command fails, try a different approach
-6. For credential fields: set is_sensitive=true, use any placeholder value
-7. Call mark_done ONLY after verifying goal with observe_page
-8. If modal/popup blocks content, dismiss it first (click X or press Escape)
-9. Use hover_element to reveal tooltips or dropdown menus before interacting
-10. Use scroll_to_element(ref) to bring off-screen elements into view
-11. report_blocked should include blocker_type and can_user_help when possible
-12. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.`;
+3. Plan steps may include element refs like [e1]. Use these refs directly when available. If a ref is stale (element not found), infer from the description and call observe_page to get fresh refs.
+4. You CAN call MULTIPLE commands in one response (batch fill + click together)
+5. After submit/navigation: call wait_for_page then observe_page
+6. If a command fails, try a different approach
+7. For credential fields: set is_sensitive=true, use any placeholder value
+8. Call mark_done ONLY after verifying goal with observe_page
+9. If modal/popup blocks content, dismiss it first (click X or press Escape)
+10. Use hover_element to reveal tooltips or dropdown menus before interacting
+11. Use scroll_to_element(ref) to bring off-screen elements into view
+12. report_blocked should include blocker_type and can_user_help when possible
+13. If [POST-ACTION] shows PAGE ALERTS with errors — call observe_page to get full page state before deciding next action
+14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.`;
 }
 
 /**

@@ -6,6 +6,7 @@
  */
 
 import { ProjectService } from '@/services/core/project.service';
+import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService, MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -28,7 +29,9 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
   }
 
   const { projectId } = req.params;
-  const platform = (req.body.platform as 'android' | 'ios') || 'android';
+  const raw = req.body.platform as string | undefined;
+  const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  const platform: MobilePlatform = raw && VALID[raw] ? VALID[raw] : 'android';
   const packageName = req.body.packageName as string | undefined;
 
   if (!req.file) {

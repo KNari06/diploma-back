@@ -236,6 +236,7 @@ export class AIService {
       ],
       max_tokens: MAX_TOKENS_ANALYSIS,
       temperature: ANALYSIS_TEMPERATURE,
+      response_format: { type: 'json_object' },
     });
 
     const content = response.choices[0]?.message?.content;
@@ -255,79 +256,69 @@ export class AIService {
    * Get system prompt for AI analysis
    */
   private getSystemPrompt(): string {
-    return `You are an expert QA engineer with 10+ years of experience in web application testing.
-Your task is to analyze test results and provide comprehensive bug reports and recommendations.
+    return `You are a senior QA engineer analyzing automated test results. Your goal is to produce an accurate, actionable bug report with zero false positives.
 
-You will receive:
-- Test execution details (browser, status, errors)
-- Console logs and network logs
-- Performance metrics
-- DOM structure (truncated if too large)
-- Screenshot availability
-- Accessibility warnings (WCAG violations detected automatically — these are separate from errors)
+INPUT: You receive test execution data (browser, status, errors, console logs, network logs, DOM, performance metrics, accessibility warnings).
 
-IMPORTANT RULES FOR SEVERITY CLASSIFICATION:
-- "errors" array contains REAL bugs: console errors, network failures, UI errors. These are high/critical.
-- "accessibilityWarnings" array contains WCAG compliance findings (automated scan). These are informational:
-  - Classify accessibility warnings as "low" severity by default.
-  - Only classify as "medium" if the violation directly impacts usability (e.g., form inputs without labels).
-  - NEVER classify accessibility warnings as "high" or "critical" unless they completely block a user with disabilities.
-- If test status is "completed" with zero real errors, the overall severity should be "low" regardless of accessibility warnings.
-- Do NOT inflate bug counts — if a warning is minor, it can go into recommendations instead of bugs.
+OUTPUT: JSON object with this exact schema:
+{
+  "summary": "2-3 sentence summary: what was tested, what happened, key finding",
+  "bugs": [{ "title": "...", "description": "...", "severity": "low|medium|high|critical", "category": "functional|visual|performance|accessibility|security", "steps": ["..."], "expectedResult": "...", "actualResult": "...", "domSelector": "CSS selector if applicable" }],
+  "recommendations": ["actionable recommendation"],
+  "severity": "low|medium|high|critical",
+  "confidence": 0-100
+}
 
-Your analysis should include:
-1. A concise summary of the test results
-2. Detailed bug reports for real issues found (from errors array)
-3. Accessibility findings (from accessibilityWarnings, classified appropriately)
-4. Actionable recommendations for improvements
-5. Severity assessment (low, medium, high, critical) — based on REAL errors, not accessibility warnings
-6. Confidence level (0-100)
+SEVERITY RULES (strict):
+- critical: app crash, data loss, security breach, complete feature failure, 5xx errors on core flows
+- high: feature partially broken, data corruption, JS errors blocking interaction, failed API calls returning wrong data
+- medium: degraded UX, slow performance (>3s), broken layout on primary viewport, form validation not working
+- low: cosmetic issues, minor accessibility warnings, edge case UI glitches, informational console warnings
 
-Focus on:
-- Functional bugs and errors (HIGHEST PRIORITY)
-- Performance issues
-- Accessibility findings (lower priority — informational)
-- Visual inconsistencies
-- Security vulnerabilities
-- User experience issues
+CLASSIFICATION RULES:
+1. "errors" array = REAL bugs (console errors, network failures, JS exceptions). Classify by impact.
+2. "accessibilityWarnings" = WCAG automated scan findings. Default severity: low. Only medium if it blocks a form input. Never high/critical unless it prevents core functionality for disabled users.
+3. If status="completed" AND errors=[] → severity="low", confidence >= 80. Do NOT manufacture bugs from warnings.
+4. Console warnings (not errors) → recommendations, not bugs.
+5. 404s for analytics/tracking scripts → low severity, not high.
+6. CORS errors on third-party scripts (analytics, chat widgets) → low severity.
+7. Never report the same issue twice with different wording.
 
-Be specific and actionable in your recommendations. Use your expertise to identify patterns and root causes.`;
+CONFIDENCE GUIDELINES:
+- 90-100: Clear errors with obvious root cause
+- 70-89: Errors found but root cause uncertain
+- 50-69: Potential issues based on patterns, not clear errors
+- Below 50: Speculative, insufficient data
+
+FEW-SHOT EXAMPLE:
+
+Input: status=completed, errors=[{type:"console",message:"TypeError: Cannot read property 'map' of undefined",source:"app.js:142"}], logs=["Navigated to /dashboard","Clicked Reports tab","Error in console"], networkLogs=[{url:"/api/reports",status:500,method:"GET"}]
+Output:
+{
+  "summary": "Dashboard reports tab crashes with TypeError due to API returning 500. The /api/reports endpoint fails, causing undefined data to be rendered.",
+  "bugs": [{
+    "title": "Reports tab crashes due to /api/reports 500 error",
+    "description": "Clicking the Reports tab triggers a GET /api/reports call that returns HTTP 500. The frontend attempts to .map() the response without null checking, causing a TypeError.",
+    "severity": "high",
+    "category": "functional",
+    "steps": ["Navigate to /dashboard", "Click Reports tab", "Observe console error"],
+    "expectedResult": "Reports data loads and displays correctly",
+    "actualResult": "TypeError: Cannot read property 'map' of undefined — reports tab shows blank/crash",
+    "domSelector": null
+  }],
+  "recommendations": ["Add null check before .map() in reports component", "Fix /api/reports 500 error on backend", "Add error boundary around Reports tab"],
+  "severity": "high",
+  "confidence": 92
+}`;
   }
 
   /**
    * Get user prompt with test context
    */
   private getUserPrompt(context: string): string {
-    return `Please analyze the following test results and provide a comprehensive QA report:
+    return `Analyze these test results and respond with JSON:
 
-${context}
-
-Please provide your analysis in the following JSON format:
-{
-  "summary": "Brief summary of the test results and main findings",
-  "bugs": [
-    {
-      "title": "Bug title",
-      "description": "Detailed description of the bug",
-      "severity": "low|medium|high|critical",
-      "category": "visual|functional|performance|accessibility|security",
-      "steps": ["Step 1", "Step 2", "Step 3"],
-      "expectedResult": "What should happen",
-      "actualResult": "What actually happened",
-      "domSelector": "CSS selector if applicable",
-      "line": "Line number if applicable",
-      "column": "Column number if applicable"
-    }
-  ],
-  "recommendations": [
-    "Specific recommendation 1",
-    "Specific recommendation 2"
-  ],
-  "severity": "low|medium|high|critical",
-  "confidence": 85
-}
-
-If no bugs are found, return an empty bugs array but still provide recommendations for improvements.`;
+${context}`;
   }
 
   /**
@@ -335,24 +326,31 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
    */
   private parseAIResponse(content: string): AISummary {
     try {
-      // Try to extract JSON from the response
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        logger.error('[AI_SERVICE] No JSON found in AI response', {
-          contentPreview: content.substring(0, 200),
-        });
-        throw new Error('No JSON found in AI response');
-      }
-
       let parsed: any;
+
+      // Try direct JSON.parse first (works when response_format: json_object is used)
       try {
-        parsed = JSON.parse(jsonMatch[0]);
-      } catch (parseError) {
-        logger.error('[AI_SERVICE] Failed to parse JSON from AI response', {
-          jsonPreview: jsonMatch[0].substring(0, 200),
-          parseError,
-        });
-        throw new Error('Invalid JSON in AI response');
+        parsed = JSON.parse(content);
+        logger.debug('[AI_SERVICE] Parsed AI response via direct JSON.parse');
+      } catch {
+        // Fallback: extract JSON from markdown/text wrapping
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) {
+          logger.error('[AI_SERVICE] No JSON found in AI response', {
+            contentPreview: content.substring(0, 200),
+          });
+          throw new Error('No JSON found in AI response');
+        }
+        try {
+          parsed = JSON.parse(jsonMatch[0]);
+          logger.debug('[AI_SERVICE] Parsed AI response via regex fallback');
+        } catch (parseError) {
+          logger.error('[AI_SERVICE] Failed to parse JSON from AI response', {
+            jsonPreview: jsonMatch[0].substring(0, 200),
+            parseError,
+          });
+          throw new Error('Invalid JSON in AI response');
+        }
       }
 
       // Validate and transform the response
@@ -437,10 +435,18 @@ If no bugs are found, return an empty bugs array but still provide recommendatio
 
       logger.info('[AI_SERVICE] Generating test summary', { summary });
 
-      const prompt = `Generate a concise test execution summary for the following results:
+      const prompt = `You are a QA lead writing a test execution summary for project stakeholders.
+
+DATA:
 ${JSON.stringify(summary, null, 2)}
 
-Provide a brief, professional summary suitable for stakeholders.`;
+Write a 3-5 sentence professional summary covering:
+1. Overall result (X of Y tests passed)
+2. Critical findings (if any bugs, mention severity breakdown)
+3. Recommendation (ship / investigate / block release)
+
+Tone: concise, factual, no jargon. Example:
+"8 of 10 tests passed across Chrome. 2 critical bugs found: checkout form validation fails and payment API returns 500 on retry. Recommend blocking release until payment flow is fixed. 3 low-severity accessibility warnings noted for backlog."`;
 
       const response = await this.openai.chat.completions.create({
         model: env.OPENAI_MODEL,
@@ -478,22 +484,32 @@ Provide a brief, professional summary suitable for stakeholders.`;
         category: bug.category,
       });
 
-      const prompt = `Generate a detailed bug report for the following issue:
+      const stepsFormatted = bug.steps.map((s: string, i: number) => `${i + 1}. ${s}`).join('\n');
+      const logsFormatted = context.logs.slice(0, 10).join('\n');
 
-Bug: ${bug.title}
-Description: ${bug.description}
-Severity: ${bug.severity}
-Category: ${bug.category}
-Steps: ${bug.steps.join(', ')}
-Expected: ${bug.expectedResult}
-Actual: ${bug.actualResult}
+      const prompt = `Generate a bug report for a development team using this template:
 
-Context:
-- URL: ${context.url}
-- Browser: ${context.browser}
-- Logs: ${context.logs.slice(0, 10).join('\n')}
+## ${bug.title}
 
-Generate a professional bug report suitable for development teams.`;
+**Severity**: ${bug.severity} | **Category**: ${bug.category}
+**URL**: ${context.url} | **Browser**: ${context.browser}
+
+### Steps to Reproduce
+${stepsFormatted}
+
+### Expected Result
+${bug.expectedResult}
+
+### Actual Result
+${bug.actualResult}
+
+### Technical Details
+Relevant logs:
+${logsFormatted}
+
+---
+
+Fill in any gaps with reasonable inferences from the logs. Keep the report under 300 words. Use markdown formatting. Do not add sections that have no data.`;
 
       const response = await this.openai.chat.completions.create({
         model: env.OPENAI_MODEL,

@@ -137,13 +137,13 @@ export async function getOrCreateWorkspaceChat(
     }
   }
 
-  // Find this user's chat session in the workspace
+  // Find this user's most recent chat session in the workspace
   const { data: userSession } = await supabaseAdmin
     .from('chat_sessions')
     .select('id')
     .eq('workspace_id', workspaceId)
     .eq('user_id', userId)
-    .order('created_at', { ascending: true })
+    .order('updated_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 

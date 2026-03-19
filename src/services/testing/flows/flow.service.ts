@@ -298,24 +298,19 @@ export class FlowService {
     flowId: string,
     userId: string
   ): Promise<{ ui: string[]; api: string[] }> {
-    // Get UI test cases from intent_test_cases (unified table)
-    const { data: uiCases, error: uiError } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id')
-      .eq('flow_id', flowId)
-      .eq('user_id', userId);
+    // Get UI + API test cases in parallel (independent reads on different tables)
+    const [uiResult, apiResult] = await Promise.all([
+      supabaseAdmin.from('intent_test_cases').select('id').eq('flow_id', flowId).eq('user_id', userId),
+      supabaseAdmin.from('api_test_configs').select('id').eq('flow_id', flowId).eq('user_id', userId),
+    ]);
+
+    const { data: uiCases, error: uiError } = uiResult;
+    const { data: apiCases, error: apiError } = apiResult;
 
     if (uiError) {
       logger.error('[FLOW_SERVICE] Failed to get UI test cases', { error: uiError, flowId });
       throw new Error(`Failed to get test cases: ${uiError.message}`);
     }
-
-    // Get API test cases (unchanged)
-    const { data: apiCases, error: apiError } = await supabaseAdmin
-      .from('api_test_configs')
-      .select('id')
-      .eq('flow_id', flowId)
-      .eq('user_id', userId);
 
     if (apiError) {
       logger.error('[FLOW_SERVICE] Failed to get API test cases', { error: apiError, flowId });

@@ -126,7 +126,7 @@ function augmentErrorWithPageContext(error: string, pageSummary: PageSummary | n
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['navigate', 'ai_check', 'wait']);
+const NO_RETRY_STEP_TYPES = new Set(['navigate', 'ai_check', 'wait', 'wait_for_email']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;
@@ -146,6 +146,35 @@ interface RunState {
  * Key: previewSessionId
  */
 const activeRuns = new Map<string, RunState>();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V12: Email variable interpolation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Replace {{email.variableName}} placeholders in step.value with extracted email values.
+ * Pure function — returns original step unchanged if no placeholders found.
+ *
+ * Values are stored in session.contextData by the wait_for_email handler
+ * (e.g., contextData['email.otp'] = '123456').
+ */
+function interpolateEmailVariables(step: IntentStep, previewSessionId: string): IntentStep {
+  if (!step.value || !step.value.includes('{{email.')) return step;
+
+  const sessionService = getPreviewSessionService();
+  const session = sessionService.getSession(previewSessionId);
+  const contextData = session?.contextData;
+  if (!contextData) return step;
+
+  let value = step.value;
+  value = value.replace(/\{\{email\.([\w-]+)\}\}/g, (match, key) => {
+    const replacement = contextData[`email.${key}`];
+    return typeof replacement === 'string' ? replacement : match;
+  });
+
+  if (value === step.value) return step; // No changes
+  return { ...step, value };
+}
 
 /**
  * Service for running steps in preview session
@@ -548,11 +577,14 @@ export class PreviewRunService {
           },
         };
 
+        // V12: Interpolate email variables ({{email.otp}}, {{email.link}}, etc.)
+        const interpolatedStep = interpolateEmailVariables(stepWithCachePolicy, previewSessionId);
+
         try {
           const stepStartMs = Date.now();
           let result = await PreviewStepApplyService.applyStep({
             previewSessionId,
-            stepDraft: stepWithCachePolicy,
+            stepDraft: interpolatedStep,
             userId,
             skipPostActionWait: true, // V12: Lookahead handles inter-step timing
           });
@@ -697,9 +729,9 @@ export class PreviewRunService {
               const nextStep = steps[i + 1];
               try {
                 const lookahead = await waitForStepReadiness(session.page, nextStep, {
-                  maxWaitMs: 5000,
-                  settleMs: 1500,
-                  autoWaitThresholdMs: 1000,
+                  maxWaitMs: 3000,
+                  settleMs: 800,
+                  autoWaitThresholdMs: 600,
                 });
 
                 if (lookahead.autoWaitApplied) {
@@ -913,9 +945,9 @@ export class PreviewRunService {
                   const nextStep = steps[i + 1];
                   try {
                     await waitForStepReadiness(session.page, nextStep, {
-                      maxWaitMs: 5000,
-                      settleMs: 1500,
-                      autoWaitThresholdMs: 1000,
+                      maxWaitMs: 3000,
+                      settleMs: 800,
+                      autoWaitThresholdMs: 600,
                     });
                   } catch {
                     // Lookahead failure is non-fatal
@@ -1083,6 +1115,25 @@ export class PreviewRunService {
             error: batchError instanceof Error ? batchError.message : String(batchError),
           });
         }
+      }
+
+      // 8c. V12: Cleanup email inbox (non-blocking, best-effort)
+      try {
+        const sessionService = getPreviewSessionService();
+        const session = sessionService.getSession(previewSessionId);
+        const inboxAddress = session?.contextData?.['email._inboxAddress'] as string | undefined;
+        if (inboxAddress) {
+          import('@/services/testing/email-inbox/email-inbox.service').then(({ EmailInboxService }) => {
+            EmailInboxService.cleanupEmails(inboxAddress).catch(err => {
+              logger.warn('[PreviewRun] Email inbox cleanup failed (non-fatal)', {
+                previewSessionId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }).catch(() => {});
+        }
+      } catch {
+        // Silently ignore — email cleanup is best-effort
       }
 
       // 9. Close trace writer (flushes pending writes) — with timeout guard

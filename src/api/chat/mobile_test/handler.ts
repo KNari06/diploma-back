@@ -145,7 +145,12 @@ export async function handleMobileTest(
 
     // ── Step 4: Extract test parameters ───────────────────────────
     const platform: MobilePlatform = parsedIntent?.mobilePlatform || 'android';
-    const browser = platform === 'ios' ? 'mobile-ios' : 'mobile-android';
+    const BROWSER_MAP: Record<MobilePlatform, 'mobile-android' | 'mobile-ios' | 'mobile-flutter'> = {
+      android: 'mobile-android',
+      ios: 'mobile-ios',
+      flutter: 'mobile-flutter',
+    };
+    const browser = BROWSER_MAP[platform] ?? 'mobile-android';
     const intentSteps: MobileIntentStep[] = parsedIntent?.intentSteps || [];
 
     if (intentSteps.length === 0) {
@@ -254,7 +259,7 @@ export async function handleMobileTest(
       projectId,
       chatSessionId,
       platform,
-      browser: browser as 'mobile-android' | 'mobile-ios',
+      browser: browser as 'mobile-android' | 'mobile-ios' | 'mobile-flutter',
       appPackage,
       intentSteps,
       geminiApiKey: parsedIntent?.geminiApiKey,

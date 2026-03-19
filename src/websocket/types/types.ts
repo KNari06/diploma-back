@@ -171,6 +171,15 @@ export interface ServerToClientEvents {
   // Preview page switch events (popup/new tab auto-switch)
   'preview:page:navigated': (data: { previewSessionId: string; url: string; previousUrl: string; reason: string; timestamp: string }) => void;
 
+  // Preview loading progress (emitted during slow page loads > 5s)
+  'preview:loading': (data: {
+    previewSessionId: string;
+    phase: 'navigating' | 'dom_ready' | 'stabilizing' | 'complete' | 'error';
+    url: string;
+    elapsedMs: number;
+    error?: string;
+  }) => void;
+
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;
@@ -682,7 +691,9 @@ export interface ChatProcessingStepPayload {
   // Sub-agent pipeline thinking steps
   'agent_routing' | 'agent_planning' | 'agent_executing_tool' | 'agent_formatting' |
   // Cooperative multi-agent pipeline steps
-  'agent_reviewing' | 'agent_spawning';
+  'agent_reviewing' | 'agent_spawning' |
+  // Live thinking — shows what the AI agent is currently doing/thinking
+  'agent_thinking';
   message: string;
   progress?: number; // 0-100
   metadata?: Record<string, any>;

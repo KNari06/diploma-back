@@ -41,7 +41,7 @@ export interface WarmupData {
  * POST /api/v1/mobile/sessions/warmup
  *
  * Create an eager emulator session so it's ready when the user runs a test.
- * Body: { projectId, platform: 'android' | 'ios' }
+ * Body: { projectId, platform: 'android' | 'ios' | 'flutter' }
  * Returns: { sessionId, runnerSocketUrl }
  */
 export async function warmupSession(req: Request, res: Response): Promise<void> {
@@ -62,7 +62,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const platform: MobilePlatform = rawPlatform === 'ios' ? 'ios' : 'android';
+  const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
 
   try {
     // Feature flag check

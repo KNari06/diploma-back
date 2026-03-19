@@ -6,7 +6,7 @@
  * Performs breadth-first traversal of the web application:
  *   1. Navigate to entry URL
  *   2. Collect DOM snapshot + screenshot
- *   3. Call AI (GPT-4.1 vision) to classify page and discover entry points
+ *   3. Call AI (vision model) to classify page and discover entry points
  *   4. Navigate to each main navigation link (BFS)
  *   5. Build ExplorationTree with all discovered flows
  *
@@ -365,6 +365,36 @@ export class SurveyAgent {
         });
       }
 
+      // Collect page health signals (console errors + failed network requests)
+      let pageHealth: string | undefined;
+      try {
+        const health = await this.page.evaluate(`
+          (() => {
+            const parts = [];
+            // Check for visible error elements on page
+            const errorEls = document.querySelectorAll(
+              '[role="alert"], .error, .alert-danger, [class*="error-message"]'
+            );
+            const errorTexts = [];
+            errorEls.forEach(el => {
+              const text = el.innerText && el.innerText.trim();
+              if (text && text.length > 0 && text.length < 150) errorTexts.push(text);
+            });
+            if (errorTexts.length > 0) {
+              parts.push('Visible errors: ' + [...new Set(errorTexts)].slice(0, 3).map(t => '"' + t + '"').join(', '));
+            }
+            // Check document readyState
+            if (document.readyState !== 'complete') {
+              parts.push('Page still loading (readyState: ' + document.readyState + ')');
+            }
+            return parts.length > 0 ? parts.join('. ') : null;
+          })()
+        `) as string | null;
+        if (health) pageHealth = health;
+      } catch {
+        // Non-critical
+      }
+
       // AI classification
       const classification = await this.classifyPage(
         formattedSnapshot,
@@ -374,6 +404,7 @@ export class SurveyAgent {
         item.depth,
         snapshot,
         overlayCleanupResult?.overlaySummary ?? undefined,
+        pageHealth,
       );
 
       // Log discovered entry points & nav links
@@ -674,6 +705,7 @@ export class SurveyAgent {
     depth: number,
     snapshot?: LiteSnapshot,
     overlaySummary?: string,
+    pageHealth?: string,
   ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
     // Early exit if AI is degraded — use heuristic fallback
     if (this.rateLimiter.isDegraded('openai')) {
@@ -702,6 +734,7 @@ export class SurveyAgent {
       depth,
       structureSummary,
       overlaySummary,
+      pageHealth,
     });
 
     try {

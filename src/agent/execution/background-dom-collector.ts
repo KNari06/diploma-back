@@ -177,11 +177,15 @@ function buildExtractScript(maxNodes: number): string {
       var mStyle = window.getComputedStyle(mel);
       if (mStyle.position !== 'fixed' && mStyle.position !== 'absolute') continue;
       var mz = parseInt(mStyle.zIndex, 10);
-      if (isNaN(mz) || mz < 100) continue; // Skip low z-index
+      if (isNaN(mz) || mz < 3) continue; // z-index >= 3: aligned with snapshot-collector
       var mRect = mel.getBoundingClientRect();
       var mArea = mRect.width * mRect.height;
-      // Must cover at least 30% of viewport
-      if (mArea / vpArea >= 0.3 && mz > bestZIndex) {
+      var mCoverage = vpArea > 0 ? mArea / vpArea : 0;
+      // Must cover at least 3% of viewport (aligned with snapshot-collector)
+      if (mCoverage < 0.03) continue;
+      // Full-screen overlay (>90%) is likely a backdrop, not a popup container
+      if (mCoverage > 0.9) continue;
+      if (mz > bestZIndex) {
         bestCandidate = mel;
         bestZIndex = mz;
       }
@@ -233,7 +237,7 @@ function buildExtractScript(maxNodes: number): string {
     let labelText = '';
     const id = el.getAttribute('id');
     if (id) {
-      const label = document.querySelector('label[for="' + id + '"]');
+      const label = document.querySelector('label[for="' + CSS.escape(id) + '"]');
       if (label) labelText = label.textContent?.trim() || '';
     }
     if (!labelText) {

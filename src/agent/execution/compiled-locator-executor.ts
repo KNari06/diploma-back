@@ -167,7 +167,8 @@ async function quickFingerprintCheck(
       let labelText: string | null = null;
       const doc = el.ownerDocument;
       if (el.id && doc) {
-        const label = doc.querySelector(`label[for="${el.id}"]`);
+        // @ts-expect-error - CSS.escape is available in browser context
+        const label = doc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (label) labelText = label.textContent?.trim() || null;
       }
       if (!labelText && el.closest?.('label')) {

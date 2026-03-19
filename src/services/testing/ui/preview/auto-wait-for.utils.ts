@@ -41,6 +41,7 @@ const SKIP_INJECT_AFTER_TYPES: Set<IntentActionType> = new Set([
   'wait',
   'wait_for',
   'ai_check',
+  'wait_for_email',  // V12: Already a waiting action
 ]);
 
 /**

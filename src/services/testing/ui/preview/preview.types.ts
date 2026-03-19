@@ -119,6 +119,8 @@ export interface InteractiveNode {
   hasOnclick?: boolean;
   /** Phase 4: Element has aria-haspopup attribute (popup trigger) */
   hasAriaHaspopup?: boolean;
+  /** Nearby sibling/row text for disambiguation of duplicate elements (e.g. row context in tables) */
+  nearText?: string;
 }
 
 /**
@@ -169,7 +171,9 @@ export type IntentActionType =
   // V10: Advanced interaction types (recording)
   | 'dblclick'
   | 'contextmenu'
-  | 'drag_and_drop';
+  | 'drag_and_drop'
+  // V12: Email inbox (wait for email, extract OTP/link via AI)
+  | 'wait_for_email';
 
 /**
  * Binding hints for element resolution
@@ -415,6 +419,20 @@ export interface StepOptions {
     /** Max file size in bytes (default: 50MB) */
     maxSizeBytes?: number;
   };
+  /**
+   * V12: Email filter for wait_for_email step.
+   * Configures which email to wait for and what to extract.
+   */
+  emailFilter?: {
+    /** Subject substring to match (case-insensitive) */
+    subject?: string;
+    /** Sender email address to match */
+    from?: string;
+    /** AI extraction prompt, e.g. "Extract the 6-digit OTP code" */
+    extractPrompt: string;
+    /** Variable name to store extracted value — accessible as {{email.<variable>}} in subsequent steps */
+    extractVariable: string;
+  };
 }
 
 /**
@@ -532,6 +550,24 @@ export interface LintResult {
   similarityDelta?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** @internal Rule trace from buildAllowedSets */
+  _ruleTrace?: Array<{ ruleId: string; version: string; action: 'exclude' | 'boost' | 'penalize' | 'shortcircuit'; evidence: string; affectedRefs: string[] }>;
+  /** @internal Hard allowed count */
+  _hardAllowedCount?: number;
+  /** @internal Soft allowed count */
+  _softAllowedCount?: number;
+  /** @internal LLM call trace (prompt + response) for debugging */
+  _llmTrace?: {
+    model: string;
+    prompt: string;
+    response: string;
+    latencyMs: number;
+    path: 'selectElementWithLLM' | 'rescueWithGeminiFlash';
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -673,6 +709,8 @@ export const COMPILED_TTL_MS: Record<string, number> = {
   uncheck: 14 * 24 * 60 * 60 * 1000,  // 14 days
   hover: 14 * 24 * 60 * 60 * 1000,    // 14 days
   upload: 14 * 24 * 60 * 60 * 1000,  // 14 days
+  // V12: Email inbox (short TTL — email-dependent steps are volatile)
+  wait_for_email: 7 * 24 * 60 * 60 * 1000,  // 7 days
   default: 14 * 24 * 60 * 60 * 1000,  // 14 days
 };
 
@@ -776,7 +814,7 @@ export type IntentTestCaseKind = 'standalone' | 'regression_member';
 /**
  * Testing platform for test cases
  */
-export type IntentTestCasePlatform = 'web' | 'mobile_android' | 'mobile_ios';
+export type IntentTestCasePlatform = 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
 
 /**
  * Replay strategy for test execution

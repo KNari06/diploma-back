@@ -125,6 +125,32 @@ export class AnalyticsQueryService {
   }
 
   /**
+   * Combined helper: resolve projectIds + runIds in one cached call.
+   * Avoids repeated sequential cascade when multiple analytics methods
+   * are called with the same filters (e.g. dashboard fires 5+ in parallel).
+   */
+  private static async getWorkspaceRunContext(
+    workspaceId: string,
+    projectId?: string,
+    startDate?: Date,
+    endDate?: Date
+  ): Promise<{ projectIds: string[]; runIds: string[] }> {
+    const cKey = `qait:cache:analytics:run-ctx:${workspaceId}:${projectId ?? '*'}:${startDate?.toISOString() ?? '*'}:${endDate?.toISOString() ?? '*'}`;
+    const cached = await cache.get<{ projectIds: string[]; runIds: string[] }>(cKey);
+    if (cached) return cached;
+
+    const projectIds = await this.getWorkspaceProjectIds(workspaceId, projectId);
+    if (projectIds.length === 0) return { projectIds: [], runIds: [] };
+
+    const runIds = await this.getRunIdsForProjects(projectIds, startDate, endDate);
+    const result = { projectIds, runIds };
+
+    // fire-and-forget (cache is fail-safe)
+    cache.set(cKey, result, ANALYTICS_CACHE_TTL);
+    return result;
+  }
+
+  /**
    * Helper: Get API test executions for projects within date range
    */
   private static async getApiTestExecutions(
@@ -233,13 +259,13 @@ export class AnalyticsQueryService {
     if (cached) return cached;
 
     try {
-      const projectIds = await this.getWorkspaceProjectIds(filters.workspaceId, filters.projectId);
+      const { projectIds, runIds } = await this.getWorkspaceRunContext(
+        filters.workspaceId, filters.projectId, filters.startDate, filters.endDate
+      );
 
       if (projectIds.length === 0) {
         return this.getEmptySummary();
       }
-
-      const runIds = await this.getRunIdsForProjects(projectIds, filters.startDate, filters.endDate);
 
       // Parallel queries for performance
       const [executionsResult, runsResult, tokensResult, scheduleResult, apiTestExecs] = await Promise.all([
@@ -460,13 +486,13 @@ export class AnalyticsQueryService {
     if (cached) return cached;
 
     try {
-      const projectIds = await this.getWorkspaceProjectIds(filters.workspaceId, filters.projectId);
+      const { projectIds, runIds } = await this.getWorkspaceRunContext(
+        filters.workspaceId, filters.projectId, filters.startDate, filters.endDate
+      );
 
       if (projectIds.length === 0) {
         return { passed: 0, failed: 0, skipped: 0, flaky: 0, total: 0, percentages: { passed: 0, failed: 0, skipped: 0, flaky: 0 } };
       }
-
-      const runIds = await this.getRunIdsForProjects(projectIds, filters.startDate, filters.endDate);
 
       if (runIds.length === 0) {
         return { passed: 0, failed: 0, skipped: 0, flaky: 0, total: 0, percentages: { passed: 0, failed: 0, skipped: 0, flaky: 0 } };
@@ -951,7 +977,16 @@ export class AnalyticsQueryService {
         return { points: [], interval: filters.interval };
       }
 
-      const startIso = filters.startDate?.toISOString() || new Date(Date.now() - 3600000).toISOString();
+      // Default lookback window based on interval so chart isn't empty for infrequent runs
+      const defaultLookbackMs: Record<string, number> = {
+        '1m':  60 * 60 * 1000,          // 1 hour
+        '5m':  6 * 60 * 60 * 1000,      // 6 hours
+        '15m': 24 * 60 * 60 * 1000,     // 24 hours
+        '1h':  7 * 24 * 60 * 60 * 1000, // 7 days
+        '1d':  30 * 24 * 60 * 60 * 1000, // 30 days
+      };
+      const lookback = defaultLookbackMs[filters.interval] || 3600000;
+      const startIso = filters.startDate?.toISOString() || new Date(Date.now() - lookback).toISOString();
       const endIso = filters.endDate?.toISOString() || new Date().toISOString();
 
       const [runsResult, apiExecsResult] = await Promise.all([

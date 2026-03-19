@@ -23,7 +23,8 @@ export type IntegrationProvider =
   | 'slack'
   | 'telegram'
   | 'qa'
-  | 'memory';
+  | 'memory'
+  | 'kb';
 
 /**
  * Context provided to skills during execution

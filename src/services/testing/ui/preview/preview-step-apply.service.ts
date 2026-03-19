@@ -6,6 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import type { FrameLocator, Locator, Page } from 'playwright';
 import { sanitizeIntent } from './element-resolver.service';
 import { IntentStepLintService } from './intent-step-lint.service';
@@ -52,7 +53,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -107,6 +108,29 @@ function randomIntInclusive(min: number, max: number): number {
   const hi = Math.floor(max);
   if (hi <= lo) return lo;
   return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+/**
+ * Classify navigation errors into user-friendly messages.
+ * Replaces raw Playwright TimeoutError with actionable descriptions.
+ */
+function classifyNavigationError(error: Error, url: string): string {
+  const msg = error.message.toLowerCase();
+  if (msg.includes('net::err_name_not_resolved'))
+    return `Domain not found — check the URL: ${url}`;
+  if (msg.includes('net::err_connection_refused'))
+    return `Connection refused — the site may be down: ${url}`;
+  if (msg.includes('net::err_connection_timed_out'))
+    return `Connection timed out — the server is not responding: ${url}`;
+  if (msg.includes('net::err_cert') || msg.includes('net::err_ssl'))
+    return `SSL certificate error for: ${url}`;
+  if (msg.includes('net::err_internet_disconnected') || msg.includes('net::err_network'))
+    return `Network error — check your internet connection`;
+  if (msg.includes('net::err_aborted'))
+    return `Navigation was aborted: ${url}`;
+  if (msg.includes('timeout'))
+    return `Site did not finish loading within timeout. The website may be slow or unresponsive: ${url}`;
+  return error.message;
 }
 
 /**
@@ -1002,7 +1026,15 @@ async function executeAction(
       case 'navigate': {
         if (!step.value) throw new Error('No URL for navigate action');
         const safeUrl = sanitizeUrl(step.value);
-        await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
+        try {
+          await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
+        } catch (navError) {
+          // Classify navigation error into user-friendly message
+          throw new Error(classifyNavigationError(
+            navError instanceof Error ? navError : new Error(String(navError)),
+            safeUrl,
+          ));
+        }
         break;
       }
 
@@ -1309,8 +1341,45 @@ export class PreviewStepApplyService {
         // V5: Capture URL BEFORE action for accurate compiled context
         // This is important for auto-wait-for-url injection which compares adjacent pageUrls
         const urlBeforeAction = page.url();
-        
-        const result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+
+        // ── Progress events for navigate (slow site feedback) ──
+        let navProgressInterval: ReturnType<typeof setInterval> | null = null;
+        if (stepDraft.type === 'navigate') {
+          const navStart = Date.now();
+          const navUrl = stepDraft.value || '';
+          navProgressInterval = setInterval(() => {
+            const elapsed = Date.now() - navStart;
+            if (elapsed >= 5000) {
+              webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+                previewSessionId, phase: 'navigating' as const, url: navUrl, elapsedMs: elapsed,
+              });
+            }
+          }, 3000);
+        }
+
+        let result;
+        try {
+          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+          // Emit complete phase for navigate
+          if (stepDraft.type === 'navigate') {
+            const navUrl = stepDraft.value || '';
+            webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+              previewSessionId, phase: 'complete' as const, url: navUrl, elapsedMs: Date.now() - (navProgressInterval ? Date.now() : 0),
+            });
+          }
+        } catch (navErr) {
+          // Emit error phase for navigate
+          if (stepDraft.type === 'navigate') {
+            const navUrl = stepDraft.value || '';
+            webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+              previewSessionId, phase: 'error' as const, url: navUrl, elapsedMs: 0,
+              error: navErr instanceof Error ? navErr.message : String(navErr),
+            });
+          }
+          throw navErr;
+        } finally {
+          if (navProgressInterval) clearInterval(navProgressInterval);
+        }
 
         // Generate compiled plan for non-targeting actions
         // Use urlBeforeAction to record the context where action was initiated
@@ -1577,6 +1646,130 @@ export class PreviewStepApplyService {
           return {
             success: false,
             error: `AI check failed: ${error instanceof Error ? error.message : String(error)}`,
+            attempts: 0,
+          };
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V12: Handle wait_for_email (IMAP polling + AI extraction)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'wait_for_email') {
+        const emailFilter = stepDraft.options?.emailFilter;
+        if (!emailFilter?.extractPrompt || !emailFilter?.extractVariable) {
+          return {
+            success: false,
+            error: 'emailFilter with extractPrompt and extractVariable is required for wait_for_email',
+            attempts: 0,
+          };
+        }
+
+        logger.info('[PREVIEW_APPLY] Handling wait_for_email', {
+          previewSessionId,
+          extractVariable: emailFilter.extractVariable,
+          subject: emailFilter.subject,
+          from: emailFilter.from,
+        });
+
+        try {
+          const { EmailInboxService } = await import('@/services/testing/email-inbox/email-inbox.service');
+
+          if (!EmailInboxService.isConfigured()) {
+            return {
+              success: false,
+              error: 'Email inbox not configured. Set IMAP_USER and IMAP_PASSWORD in environment.',
+              attempts: 0,
+            };
+          }
+
+          // Get or generate inbox address from session contextData
+          const sessionService = getPreviewSessionService();
+          const session = sessionService.getSession(previewSessionId);
+          const contextData = session?.contextData || {};
+
+          // Use existing inbox address or generate a new one
+          let inboxAddress = contextData['email._inboxAddress'] as string | undefined;
+          if (!inboxAddress) {
+            inboxAddress = EmailInboxService.generateAddress(previewSessionId);
+            // Store in session contextData for subsequent steps
+            if (session) {
+              session.contextData['email._inboxAddress'] = inboxAddress;
+            }
+          }
+
+          const timeoutMs = stepDraft.options?.timeout ?? 60_000;
+
+          // Poll IMAP for matching email
+          const result = await EmailInboxService.waitForEmail({
+            recipient: inboxAddress,
+            filter: {
+              subject: emailFilter.subject,
+              from: emailFilter.from,
+            },
+            extractPrompt: emailFilter.extractPrompt,
+            extractVariable: emailFilter.extractVariable,
+            timeoutMs,
+          });
+
+          // Store extracted value in session contextData
+          if (session && result.value) {
+            session.contextData[`email.${emailFilter.extractVariable}`] = result.value;
+          }
+
+          // Build compiled plan for wait_for_email
+          let compiled;
+          try {
+            const { LocatorPlanBuilder } = await import('./locator-plan-builder.service');
+            compiled = LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction({
+              step: stepDraft,
+              pageUrl: page.url(),
+              pageTitle: await page.title().catch(() => undefined),
+            });
+          } catch {
+            // Non-fatal
+          }
+
+          const updatedStep: IntentStep = {
+            ...stepDraft,
+            evidence: {
+              ...stepDraft.evidence,
+              confidence: result.confidence,
+              resolutionMeta: {
+                allowedCount: 1,
+                usedRules: ['wait_for_email'],
+                usedLLM: true,
+                confidenceTier: result.confidence >= 0.85 ? 'high' :
+                                result.confidence >= 0.6 ? 'medium' : 'low',
+              },
+            },
+            compiled,
+          };
+
+          logger.info('[PREVIEW_APPLY] wait_for_email completed', {
+            previewSessionId,
+            extractVariable: emailFilter.extractVariable,
+            valueLength: result.value.length,
+            confidence: result.confidence,
+            inboxAddress,
+          });
+
+          return {
+            success: !!result.value,
+            error: result.value ? undefined : `Email extraction returned empty value: ${result.reasoning}`,
+            appliedStep: updatedStep,
+            urlChanged: false,
+            url: page.url(),
+            attempts: 1,
+          };
+        } catch (error) {
+          logger.error('[PREVIEW_APPLY] wait_for_email failed', {
+            previewSessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+
+          return {
+            success: false,
+            error: `Email wait failed: ${error instanceof Error ? error.message : String(error)}`,
             attempts: 0,
           };
         }

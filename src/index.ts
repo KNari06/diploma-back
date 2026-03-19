@@ -1,5 +1,6 @@
 import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
+import emailInboxRoutes from '@/api/email-inbox/email-inbox.routes';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
@@ -1307,6 +1308,7 @@ app.use(`/api/${env.API_VERSION}/preview`, requireAuth, requireApproved, preview
 app.use(`/api/${env.API_VERSION}/saved-test-cases`, requireAuth, requireApproved, savedTestCasesRoutes);
 app.use(`/api/${env.API_VERSION}/tests`, requireAuth, requireApproved, testsRoutes);
 app.use(`/api/${env.API_VERSION}/allure-import`, requireAuth, requireApproved, allureImportRoutes);
+app.use(`/api/${env.API_VERSION}/email-inbox`, emailInboxRoutes);
 
 // Root endpoint
 app.get('/', (req: express.Request, res: express.Response) => {

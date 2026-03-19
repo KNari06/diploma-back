@@ -365,8 +365,9 @@ export class TestBlackboard {
         step.status === 'completed' ? '✓' :
         step.status === 'failed' ? '✗' :
         step.status === 'in_progress' ? '→' : '○';
+      const refTag = step.targetRef ? `[${step.targetRef}] ` : '';
       const errorSuffix = step.error ? ` (error: ${step.error.slice(0, 60)})` : '';
-      lines.push(`  ${statusIcon} ${step.stepNumber}. ${step.description}${errorSuffix}`);
+      lines.push(`  ${statusIcon} ${step.stepNumber}. ${refTag}${step.description}${errorSuffix}`);
     }
 
     return lines.join('\n');

@@ -25,6 +25,158 @@ import { SUB_AGENT_CONFIG } from './sub-agents/config';
 import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: Resolve project ID (Tier 1: session → Tier 2: workspace default)
+// ═══════════════════════════════════════════════════════════════════════════
+async function resolveProjectId(
+  chatSessionId: string | undefined,
+  userId: string,
+  workspaceId: string,
+): Promise<{ id: string; name?: string } | null> {
+  try {
+    // Tier 1: Get projectId from chat session (linked when user ran tests)
+    if (chatSessionId) {
+      const sessionWithProject = await ChatService.getSessionWithProject(chatSessionId, userId);
+      if (sessionWithProject?.project_id) {
+        const sessionProjectId = sessionWithProject.project_id;
+
+        // Validate: does this session-linked project actually have test data?
+        const { count: testCaseCount } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('id', { count: 'exact', head: true })
+          .eq('project_id', sessionProjectId)
+          .limit(1);
+
+        if (testCaseCount && testCaseCount > 0) {
+          const { data: proj } = await supabaseAdmin
+            .from('projects')
+            .select('name')
+            .eq('id', sessionProjectId)
+            .maybeSingle();
+          logger.debug('[GENERAL_CHAT] Resolved projectId from chat session (validated: has test data)', {
+            projectId: sessionProjectId,
+            projectName: proj?.name,
+            testCaseCount,
+          });
+          return { id: sessionProjectId, name: proj?.name };
+        } else {
+          logger.info('[GENERAL_CHAT] Session-linked project has NO test data, skipping to default project', {
+            sessionProjectId,
+            testCaseCount: testCaseCount ?? 0,
+          });
+        }
+      }
+    }
+    // Tier 2: Get default project for workspace (most active project)
+    const { ProjectContextService } = await import('@/services/utils/project-context.service');
+    const defaultProject = await ProjectContextService.getDefaultProject(workspaceId, userId);
+    if (defaultProject) {
+      logger.debug('[GENERAL_CHAT] Resolved projectId from default workspace project', {
+        projectId: defaultProject.id,
+        projectName: defaultProject.name,
+      });
+      return { id: defaultProject.id, name: defaultProject.name };
+    }
+    return null;
+  } catch (projectError) {
+    logger.warn('[GENERAL_CHAT] Failed to auto-resolve projectId, continuing without it', {
+      error: projectError instanceof Error ? projectError.message : String(projectError),
+    });
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: Resolve editor page context + preview session ID
+// ═══════════════════════════════════════════════════════════════════════════
+async function resolveEditorPageContext(
+  mode: string | undefined,
+  parsedContext: Record<string, any> | undefined,
+  userId: string,
+): Promise<{ pageContext: PageContext | null; previewSessionId?: string }> {
+  if (mode !== 'editor') {
+    return { pageContext: null, previewSessionId: parsedContext?.previewSessionId };
+  }
+
+  let resolvedPreviewSessionId = parsedContext?.previewSessionId as string | undefined;
+
+  // Resolve the correct previewSessionId for this user (client may send stale ID)
+  if (parsedContext?.previewSessionId) {
+    try {
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const previewService = getPreviewSessionService();
+      if (!previewService.isSessionOwned(parsedContext.previewSessionId, userId)) {
+        const userSession = previewService.getSessionForUser(userId);
+        if (userSession) {
+          logger.info('[GENERAL_CHAT] Client previewSessionId mismatch, resolved to user\'s active session', {
+            clientSessionId: parsedContext.previewSessionId,
+            resolvedSessionId: userSession.id,
+            userId: userId.substring(0, 8) + '...',
+          });
+          resolvedPreviewSessionId = userSession.id;
+        }
+      }
+    } catch { /* non-critical — getPageContext has its own fallback */ }
+  } else {
+    // No previewSessionId from client — try to find user's active session
+    try {
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const userSession = getPreviewSessionService().getSessionForUser(userId);
+      if (userSession) {
+        resolvedPreviewSessionId = userSession.id;
+        logger.info('[GENERAL_CHAT] Editor mode: no client previewSessionId, resolved from user session', {
+          resolvedSessionId: userSession.id,
+        });
+      } else {
+        logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context and no active session', {
+          hasContext: !!parsedContext,
+          contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+        });
+      }
+    } catch {
+      logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
+        hasContext: !!parsedContext,
+        contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+      });
+    }
+  }
+
+  if (!resolvedPreviewSessionId) {
+    return { pageContext: null, previewSessionId: undefined };
+  }
+
+  try {
+    const editorPageContext = await getPageContext(resolvedPreviewSessionId, userId);
+
+    // Merge frontend-provided pageContext (test steps, title) if available
+    if (editorPageContext && parsedContext?.pageContext) {
+      if (parsedContext.pageContext.title) editorPageContext.title = parsedContext.pageContext.title;
+      if (parsedContext.pageContext.testSteps) editorPageContext.testSteps = parsedContext.pageContext.testSteps;
+    }
+
+    if (editorPageContext) {
+      logger.info('[GENERAL_CHAT] Editor mode: page context loaded', {
+        url: editorPageContext.url,
+        domSummaryLength: editorPageContext.domSummary.length,
+        hasTestSteps: !!editorPageContext.testSteps?.length,
+      });
+    } else {
+      logger.warn('[GENERAL_CHAT] Editor mode: getPageContext returned null', {
+        previewSessionId: resolvedPreviewSessionId,
+        userId: userId.substring(0, 8) + '...',
+      });
+    }
+
+    return { pageContext: editorPageContext, previewSessionId: resolvedPreviewSessionId };
+  } catch (editorError) {
+    logger.warn('[GENERAL_CHAT] Editor mode: failed to get page context', {
+      error: editorError instanceof Error ? editorError.message : String(editorError),
+      previewSessionId: resolvedPreviewSessionId,
+    });
+    return { pageContext: null, previewSessionId: resolvedPreviewSessionId };
+  }
+}
+
 /**
  * ═══════════════════════════════════════════════════════════════════════════
  * HANDLER: GENERAL CHAT
@@ -44,9 +196,10 @@ export async function handleGeneralChat(
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
     attachments?: ChatAttachment[]; // File attachments (images + documents)
+    needsTools?: boolean; // Signal from Intent Parser: false = skip Router in pipeline (~600ms saved)
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments } = params;
+  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools } = params;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -318,239 +471,125 @@ export async function handleGeneralChat(
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2: SEARCH KNOWLEDGE BASE (ALWAYS!)
+  // STEP 2: PARALLEL CONTEXT LOADING
   // ═══════════════════════════════════════════════════════════════════════
-  // KB search provides persistent background context from global + project KB.
-  // Non-fatal: continues without KB on error.
+  // All context sources are independent — run concurrently to save ~400-800ms.
+  // Only getAvailableTools depends on projectId, so it runs after.
 
-  let kbContext = '';
+  const contextStartMs = Date.now();
+
   let projectId = typeof context === 'object' ? context?.projectId : undefined;
-
-  try {
-    const kbResults = await searchKB(message, projectId, {
-      matchThreshold: 0.5,
-      matchCount: 3,
-    });
-
-    if (kbResults.chunks.length > 0) {
-      kbContext = kbResults.chunks.map(chunk => chunk.content).join('\n---\n');
-      logger.info('[GENERAL_CHAT] KB search returned results', {
-        chunksCount: kbResults.chunks.length,
-        sources: {
-          global: kbResults.sources.global.length,
-          project: kbResults.sources.project.length,
-        },
-      });
-    }
-  } catch (kbError) {
-    logger.warn('[GENERAL_CHAT] KB search failed, continuing without KB context', {
-      error: kbError instanceof Error ? kbError.message : String(kbError),
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2.5: LOAD AGENT MEMORY (SUMMARIES)
-  // ═══════════════════════════════════════════════════════════════════════
-  let agentMemory = '';
-  if (chatSessionId) {
-    agentMemory = await getSummariesForContext(chatSessionId);
-    if (agentMemory) {
-      logger.info('[GENERAL_CHAT] Loaded agent memory (summaries)', {
-        memoryLength: agentMemory.length,
-      });
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2.6: LOAD WORKSPACE MEMORY (PERSISTENT SEMANTIC MEMORY)
-  // ═══════════════════════════════════════════════════════════════════════
-  let workspaceMemory = '';
-  const workspaceId = paramWorkspaceId
-    || (typeof context === 'object' && context !== null && !Array.isArray(context)
-      ? context?.workspaceId || context?.workspace_id
-      : undefined);
-
-  if (workspaceId) {
-    try {
-      const { WorkspaceMemoryService } = await import('@/services/ai/memory/workspace-memory.service');
-      workspaceMemory = await WorkspaceMemoryService.getMemoryForContext(workspaceId, 2000);
-      if (workspaceMemory) {
-        logger.info('[GENERAL_CHAT] Loaded workspace memory', {
-          workspaceId,
-          memoryLength: workspaceMemory.length,
-        });
-      }
-    } catch (memoryError) {
-      logger.warn('[GENERAL_CHAT] Failed to load workspace memory', {
-        error: memoryError instanceof Error ? memoryError.message : String(memoryError),
-        workspaceId,
-      });
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2.7: EDITOR MODE — GET PAGE CONTEXT
-  // ═══════════════════════════════════════════════════════════════════════
-  let editorPageContext: PageContext | null = null;
   const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
     ? context as Record<string, any>
     : undefined;
+  const workspaceId = paramWorkspaceId
+    || (parsedContext?.workspaceId || parsedContext?.workspace_id);
 
-  // Resolve the correct previewSessionId for this user (client may send stale ID).
-  // Used for both page context and SkillContext downstream.
-  let resolvedPreviewSessionId = parsedContext?.previewSessionId as string | undefined;
-
-  if (mode === 'editor' && parsedContext?.previewSessionId) {
-    // Pre-resolve: if client sessionId is not owned, find user's actual session
-    try {
-      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
-      const previewService = getPreviewSessionService();
-      if (!previewService.isSessionOwned(parsedContext.previewSessionId, userId)) {
-        const userSession = previewService.getSessionForUser(userId);
-        if (userSession) {
-          logger.info('[GENERAL_CHAT] Client previewSessionId mismatch, resolved to user\'s active session', {
-            clientSessionId: parsedContext.previewSessionId,
-            resolvedSessionId: userSession.id,
-            userId: userId.substring(0, 8) + '...',
+  // Launch all independent fetches in parallel
+  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult] =
+    await Promise.allSettled([
+      // 1. KB search (non-fatal)
+      searchKB(message, projectId, { matchThreshold: 0.45, matchCount: 5 })
+        .catch((err: Error) => {
+          logger.warn('[GENERAL_CHAT] KB search failed, continuing without KB context', {
+            error: err.message,
           });
-          resolvedPreviewSessionId = userSession.id;
-        }
-      }
-    } catch { /* non-critical — getPageContext has its own fallback */ }
+          return { chunks: [], sources: { global: [], project: [] } };
+        }),
 
-    try {
-      editorPageContext = await getPageContext(resolvedPreviewSessionId!, userId);
+      // 2. Agent memory — summaries from old conversations
+      chatSessionId
+        ? getSummariesForContext(chatSessionId).catch((err: Error) => {
+            logger.warn('[GENERAL_CHAT] Failed to load agent memory', { error: err.message });
+            return '';
+          })
+        : Promise.resolve(''),
 
-      // Merge frontend-provided pageContext (test steps, title) if available
-      if (editorPageContext && parsedContext.pageContext) {
-        if (parsedContext.pageContext.title) editorPageContext.title = parsedContext.pageContext.title;
-        if (parsedContext.pageContext.testSteps) editorPageContext.testSteps = parsedContext.pageContext.testSteps;
-      }
+      // 3. Workspace memory — persistent semantic memory
+      workspaceId
+        ? import('@/services/ai/memory/workspace-memory.service')
+            .then(m => m.WorkspaceMemoryService.getMemoryForContext(workspaceId!, 2000))
+            .catch((err: Error) => {
+              logger.warn('[GENERAL_CHAT] Failed to load workspace memory', {
+                error: err.message, workspaceId,
+              });
+              return '';
+            })
+        : Promise.resolve(''),
 
-      if (editorPageContext) {
-        logger.info('[GENERAL_CHAT] Editor mode: page context loaded', {
-          url: editorPageContext.url,
-          domSummaryLength: editorPageContext.domSummary.length,
-          hasTestSteps: !!editorPageContext.testSteps?.length,
-        });
-      } else {
-        logger.warn('[GENERAL_CHAT] Editor mode: getPageContext returned null', {
-          previewSessionId: resolvedPreviewSessionId,
-          userId: userId.substring(0, 8) + '...',
-        });
-      }
-    } catch (editorError) {
-      logger.warn('[GENERAL_CHAT] Editor mode: failed to get page context', {
-        error: editorError instanceof Error ? editorError.message : String(editorError),
-        previewSessionId: resolvedPreviewSessionId,
-      });
-    }
-  } else if (mode === 'editor' && !parsedContext?.previewSessionId) {
-    // No previewSessionId from client — try to find user's active session
-    try {
-      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
-      const userSession = getPreviewSessionService().getSessionForUser(userId);
-      if (userSession) {
-        resolvedPreviewSessionId = userSession.id;
-        logger.info('[GENERAL_CHAT] Editor mode: no client previewSessionId, resolved from user session', {
-          resolvedSessionId: userSession.id,
-        });
-        editorPageContext = await getPageContext(resolvedPreviewSessionId, userId);
-      } else {
-        logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context and no active session', {
-          hasContext: !!parsedContext,
-          contextKeys: parsedContext ? Object.keys(parsedContext) : [],
-        });
-      }
-    } catch {
-      logger.warn('[GENERAL_CHAT] Editor mode but no previewSessionId in context', {
-        hasContext: !!parsedContext,
-        contextKeys: parsedContext ? Object.keys(parsedContext) : [],
+      // 4. Editor page context (editor mode only)
+      resolveEditorPageContext(mode, parsedContext, userId),
+
+      // 5. Project ID resolution (Tier 1: session → Tier 2: default)
+      !projectId && workspaceId
+        ? resolveProjectId(chatSessionId, userId, workspaceId!)
+        : Promise.resolve(projectId ? { id: projectId, name: undefined as string | undefined } : null),
+    ]);
+
+  // Check if request was cancelled during parallel loading
+  if (abortSignal) checkRequestAborted(abortSignal);
+
+  // ── Extract results (allSettled never rejects) ──
+
+  let kbContext = '';
+  let kbSources: string[] = [];
+  if (kbResult.status === 'fulfilled') {
+    const kbResults = kbResult.value;
+    if (kbResults.chunks.length > 0) {
+      kbContext = kbResults.chunks.map((chunk: any) => {
+        const source = chunk.source_file || chunk.file_name;
+        return source
+          ? `[Source: ${source}]\n${chunk.content}`
+          : chunk.content;
+      }).join('\n---\n');
+      kbSources = [...kbResults.sources.project, ...kbResults.sources.global];
+      logger.info('[GENERAL_CHAT] KB search returned results', {
+        chunksCount: kbResults.chunks.length,
+        sources: kbSources,
       });
     }
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
-  // ═══════════════════════════════════════════════════════════════════════
-  // Context assembly order:
-  // 1. System prompt (+ editor instructions if applicable)
-  // 2. Agent Memory (summaries from chat_summaries)
-  // 3. KB Context (global + project knowledge base)
-  // 4. Editor page context (DOM, URL, test steps)
-  // 5. Vector search old context
-  // 6. Additional context (legacy)
-  // 7. Conversation history (recent messages)
-  // 8. Current user message
+  let agentMemory = '';
+  if (agentMemoryResult.status === 'fulfilled' && agentMemoryResult.value) {
+    agentMemory = agentMemoryResult.value;
+    logger.info('[GENERAL_CHAT] Loaded agent memory (summaries)', {
+      memoryLength: agentMemory.length,
+    });
+  }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2.7.1: AUTO-RESOLVE PROJECT ID (needed for QA tools availability)
-  // ═══════════════════════════════════════════════════════════════════════
-  // QA skill requires projectId to be available. If not provided in context,
-  // resolve it from the chat session or workspace's default project.
+  let workspaceMemory = '';
+  if (workspaceMemoryResult.status === 'fulfilled' && workspaceMemoryResult.value) {
+    workspaceMemory = workspaceMemoryResult.value;
+    logger.info('[GENERAL_CHAT] Loaded workspace memory', {
+      workspaceId, memoryLength: workspaceMemory.length,
+    });
+  }
+
+  let editorPageContext: PageContext | null = null;
+  let resolvedPreviewSessionId: string | undefined;
+  if (editorContextResult.status === 'fulfilled') {
+    editorPageContext = editorContextResult.value.pageContext;
+    resolvedPreviewSessionId = editorContextResult.value.previewSessionId;
+  }
+
   let projectName: string | undefined;
-  if (!projectId && workspaceId) {
-    try {
-      // Try 1: Get projectId from chat session (linked when user ran tests in this session)
-      if (chatSessionId) {
-        const sessionWithProject = await ChatService.getSessionWithProject(chatSessionId, userId);
-        if (sessionWithProject?.project_id) {
-          const sessionProjectId = sessionWithProject.project_id;
-
-          // Validate: does this session-linked project actually have test data?
-          // If not, fall through to Tier 3 (smart default) — the session may be linked
-          // to an auto-created project from a one-off platform_test against a URL.
-          const { count: testCaseCount } = await supabaseAdmin
-            .from('intent_test_cases')
-            .select('id', { count: 'exact', head: true })
-            .eq('project_id', sessionProjectId)
-            .limit(1);
-
-          if (testCaseCount && testCaseCount > 0) {
-            projectId = sessionProjectId;
-            // Resolve project name for AI context
-            const { data: proj } = await supabaseAdmin
-              .from('projects')
-              .select('name')
-              .eq('id', projectId)
-              .maybeSingle();
-            projectName = proj?.name;
-            logger.debug('[GENERAL_CHAT] Resolved projectId from chat session (validated: has test data)', {
-              projectId,
-              projectName,
-              testCaseCount,
-            });
-          } else {
-            // Session-linked project has no test cases — skip it, let Tier 3 find the right one
-            logger.info('[GENERAL_CHAT] Session-linked project has NO test data, skipping to default project', {
-              sessionProjectId,
-              testCaseCount: testCaseCount ?? 0,
-            });
-          }
-        }
-      }
-      // Try 2: Get default project for workspace (most active project)
-      if (!projectId) {
-        const { ProjectContextService } = await import('@/services/utils/project-context.service');
-        const defaultProject = await ProjectContextService.getDefaultProject(workspaceId, userId);
-        if (defaultProject) {
-          projectId = defaultProject.id;
-          projectName = defaultProject.name;
-          logger.debug('[GENERAL_CHAT] Resolved projectId from default workspace project', {
-            projectId,
-            projectName,
-          });
-        }
-      }
-    } catch (projectError) {
-      logger.warn('[GENERAL_CHAT] Failed to auto-resolve projectId, continuing without it', {
-        error: projectError instanceof Error ? projectError.message : String(projectError),
-      });
-    }
+  if (projectResult.status === 'fulfilled' && projectResult.value) {
+    projectId = projectResult.value.id;
+    projectName = projectResult.value.name;
   }
 
+  logger.info('[GENERAL_CHAT] Parallel context loading complete', {
+    durationMs: Date.now() - contextStartMs,
+    hasKB: !!kbContext,
+    hasAgentMemory: !!agentMemory,
+    hasWorkspaceMemory: !!workspaceMemory,
+    hasEditorContext: !!editorPageContext,
+    resolvedProjectId: !!projectId,
+  });
+
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 2.8: COLLECT AVAILABLE TOOLS (SKILLS + MEMORY)
+  // STEP 2.8: COLLECT AVAILABLE TOOLS (depends on projectId — sequential)
   // ═══════════════════════════════════════════════════════════════════════
   let availableTools: any[] = [];
   let skillDescriptions = '';
@@ -559,7 +598,6 @@ export async function handleGeneralChat(
     try {
       const { SkillRegistry } = await import('@/services/skills');
 
-      // Get available skill tools (includes MemorySkill — registered in SkillRegistry)
       const skillContext = { userId, workspaceId, chatSessionId, projectId, mode: mode as 'lite' | 'pro' | 'editor' | undefined };
       availableTools = await SkillRegistry.getAvailableTools(skillContext);
       skillDescriptions = await SkillRegistry.getSkillDescriptions(skillContext);
@@ -573,6 +611,10 @@ export async function handleGeneralChat(
       });
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3: BUILD MESSAGES ARRAY FOR OPENAI
+  // ═══════════════════════════════════════════════════════════════════════
 
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
@@ -686,7 +728,7 @@ You can still help with general questions, saved test cases, and test management
   if (kbContext) {
     messages.push({
       role: 'system',
-      content: `--- Knowledge Base ---\n${kbContext}\nUse this documentation for accurate, product-specific answers.`,
+      content: `--- Knowledge Base (Project Documentation) ---\n${kbContext}\n\nUse this documentation for accurate, product-specific answers. When referencing information from the KB, mention the source document name naturally (e.g., "According to your API docs..." or "Based on the requirements document...").`,
     });
   }
 
@@ -851,6 +893,7 @@ You can still help with general questions, saved test cases, and test management
             availableTools,
             skillDescriptions,
             abortSignal,
+            needsTools,
           });
 
           // Store pipeline metrics for analytics (regardless of success/failure)

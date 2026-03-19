@@ -1,20 +1,27 @@
 /**
  * Jira QA Orchestrator
- * When a task lands in the QA column: analyze (KB + context + capabilities), then either
- * run tests, send back to rework, or prepare test cases for manual QA.
+ * When a task lands in the QA column: analyze (KB + test cases + past bugs + memory + capabilities),
+ * then either run tests, send back to rework, or prepare test cases for manual QA.
+ *
+ * Context enrichment (v2): fetches 4 data sources in parallel for accurate AI decisions.
  */
 
 import { randomUUID } from 'crypto';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { generateEmbedding } from '@/services/ai/core/embedding.service';
 import { getJiraToken, ensureValidToken, getJiraIssue, addJiraComment, transitionJiraIssue } from '@/services/api/jira.service';
 import { searchKB } from '@/services/kb/kb.service';
+import { TestCaseResolverService } from '@/services/testing/resolver/test-case-resolver.service';
+import { WorkspaceMemoryService } from '@/services/ai/memory/workspace-memory.service';
 import { createTest } from '@/services/testing/ui/manual/test-creator';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import type { ResolverResult } from '@/services/testing/resolver/resolver.types';
+import type { IntentActionType } from '@/services/testing/ui/preview/preview.types';
 
 export type JiraQaOutcome = 'CAN_RUN_AUTO' | 'NEEDS_REWORK' | 'PREPARE_MANUAL';
 
@@ -29,6 +36,8 @@ export interface JiraQaAnalysisResult {
   };
   extractedUrl?: string;
   testCaseSummary?: string;
+  existingTestCaseId?: string | null;
+  reworkQuestions?: string[];
 }
 
 export interface JiraQaOrchestratorParams {
@@ -37,6 +46,7 @@ export interface JiraQaOrchestratorParams {
   userId: string;
   cloudId?: string;
   reworkStatusName?: string; // e.g. "To Do" or "Rework"
+  workspaceId?: string;
 }
 
 export interface JiraQaOrchestratorResult {
@@ -45,45 +55,127 @@ export interface JiraQaOrchestratorResult {
   message: string;
   testId?: string;
   testCaseId?: string;
+  existingTestCaseId?: string;
   error?: string;
 }
 
-const CAPABILITIES_TEXT = `We can:
-- Run platform (UI) tests: Lite (exploratory) or Pro (intelligent) mode. Requires a start URL.
-- Run API tests: Light / Medium / Hard level. Requires API URL and optional method/body.
-- Generate test cases and steps for manual QA (no URL required).`;
-
-function buildAnalysisPrompt(issueSummary: string, issueDescription: string | null, kbContext: string): string {
-  return `You are a QA analyst. Given a Jira task and our capabilities, decide what we can do.
-
-TASK:
-Summary: ${issueSummary}
-Description: ${issueDescription || '(none)'}
-
-KNOWLEDGE BASE (project context):
-${kbContext || '(no relevant docs)'}
-
-${CAPABILITIES_TEXT}
-
-Respond with JSON only, no markdown:
-{
-  "outcome": "CAN_RUN_AUTO" | "NEEDS_REWORK" | "PREPARE_MANUAL",
-  "reason": "short explanation",
-  "missingData": ["list of missing items if NEEDS_REWORK"],
-  "suggestedAction": { "type": "api_test"|"platform_test", "level"?: "light"|"medium"|"hard", "mode"?: "lite"|"pro" } | null,
-  "extractedUrl": "url from description or KB if we can run a test",
-  "testCaseSummary": "brief test case summary if PREPARE_MANUAL"
+interface FindingSearchResult {
+  title: string;
+  description: string;
+  severity: string;
+  similarity: number;
 }
 
-Rules:
-- CAN_RUN_AUTO: we have enough data to run (URL for platform or API; clear scope). Set suggestedAction and extractedUrl if applicable.
-- NEEDS_REWORK: missing critical data (e.g. no URL, unclear scope). Set missingData.
-- PREPARE_MANUAL: task is testable but better as manual (e.g. one-off, no env). Set testCaseSummary.`;
+// Map AICommand.action → IntentActionType for building draft test case steps
+const AI_ACTION_TO_INTENT: Record<string, string> = {
+  click: 'click',
+  fill: 'type',
+  goto: 'navigate',
+  press: 'press',
+  select: 'select',
+  hover: 'hover',
+  scroll: 'scroll',
+  wait: 'wait',
+  toggle: 'toggle',
+  clear: 'click', // closest intent type
+  setRange: 'click',
+  selectDate: 'click',
+};
+
+const ANALYSIS_SYSTEM_PROMPT = `You are a senior QA engineer triaging Jira tickets for automated testing.
+Your job is to decide if a Jira issue can be auto-tested, needs more information, or should be prepared for manual QA.
+
+CAPABILITIES:
+- Platform (UI) tests: Lite (exploratory AI) or Pro (intelligent multi-agent). Requires a start URL.
+- API tests: Light / Medium / Hard. Requires API URL and optional method/body.
+- Manual test case generation (no URL required).
+
+OUTPUT FORMAT:
+Respond with JSON only. Schema:
+{
+  "outcome": "CAN_RUN_AUTO" | "NEEDS_REWORK" | "PREPARE_MANUAL",
+  "reason": "1-2 sentence explanation",
+  "missingData": ["item1", "item2"],
+  "suggestedAction": { "type": "platform_test"|"api_test", "mode"?: "lite"|"pro", "level"?: "light"|"medium"|"hard" } | null,
+  "extractedUrl": "URL to test or null",
+  "testCaseSummary": "step-by-step if PREPARE_MANUAL",
+  "existingTestCaseId": "ID or null",
+  "reworkQuestions": ["question1"]
+}
+
+DECISION RULES:
+1. CAN_RUN_AUTO — we have a URL (from description, KB, or existing test case) AND clear test scope.
+   - If EXACT MATCH test case exists → always CAN_RUN_AUTO with existingTestCaseId.
+   - If related test cases have URLs → use as extractedUrl.
+   - Default to "lite" mode unless task explicitly needs deep validation.
+2. NEEDS_REWORK — missing critical data. MUST include specific reworkQuestions.
+   - BAD question: "What is the URL?"
+   - GOOD question: "The checkout flow needs a URL — is it /checkout or /cart/checkout based on your routing?"
+   - Use HISTORICAL BUGS to ask targeted questions (e.g. "Similar bug X was found last time — does this affect the same component?").
+   - Maximum 3 questions, each must be answerable in one sentence.
+3. PREPARE_MANUAL — task is testable but not suitable for automation (visual review, one-off, complex multi-system flow).
+   - testCaseSummary must be step-by-step (numbered), not a paragraph.
+   - Reference related test cases when building steps.
+
+EDGE CASES:
+- If description says "test this page" with a URL → CAN_RUN_AUTO platform_test lite.
+- If description is vague ("fix the bug") with no URL, no KB match, no test case → NEEDS_REWORK.
+- If issue is about API/backend with endpoint mentioned → CAN_RUN_AUTO api_test.
+- If issue is a design review or "check if it looks right" → PREPARE_MANUAL.
+- Never guess URLs — only use URLs found in the task description, KB, or existing test cases.
+
+FEW-SHOT EXAMPLES:
+
+Example 1 — CAN_RUN_AUTO with existing test case:
+Input: Summary="Login page returns 500 after deploy", TestCase="Login Flow (exact match, ID=tc-123, URL=/login)"
+Output: {"outcome":"CAN_RUN_AUTO","reason":"Exact match test case exists for login flow with URL","suggestedAction":{"type":"platform_test","mode":"lite"},"extractedUrl":"/login","existingTestCaseId":"tc-123","reworkQuestions":[]}
+
+Example 2 — NEEDS_REWORK with historical context:
+Input: Summary="Payment form validation broken", Description="users complain about checkout", HistoricalBug="[HIGH] Stripe iframe not loading on /checkout (similarity: 0.82)"
+Output: {"outcome":"NEEDS_REWORK","reason":"No specific URL and unclear which validation — similar Stripe issue found before","missingData":["exact page URL","which validation rule is broken"],"suggestedAction":null,"extractedUrl":null,"reworkQuestions":["Is this the same Stripe iframe issue we found before on /checkout, or a different validation problem?","Which form field is affected — email, card number, or expiry?","Can you provide the exact URL where the form is broken?"]}
+
+Example 3 — PREPARE_MANUAL:
+Input: Summary="Verify new brand colors across all pages", Description="Design team updated the color palette, need visual review"
+Output: {"outcome":"PREPARE_MANUAL","reason":"Visual design review requires human judgment across multiple pages","suggestedAction":null,"extractedUrl":null,"testCaseSummary":"1. Open homepage and verify header uses new brand blue (#1A73E8)\\n2. Navigate to /about and check section backgrounds\\n3. Open /pricing and verify CTA button colors\\n4. Check mobile responsive view for color consistency\\n5. Compare against Figma design spec"}`;
+
+function buildAnalysisMessages(
+  issueSummary: string,
+  issueDescription: string | null,
+  kbContext: string,
+  testCaseContext: string,
+  pastBugsContext: string,
+  memoryContext: string,
+): { system: string; user: string } {
+  const userSections: string[] = [];
+
+  userSections.push(`JIRA ISSUE:
+Summary: ${issueSummary}
+Description: ${issueDescription || '(none provided)'}`);
+
+  userSections.push(`KNOWLEDGE BASE:
+${kbContext || '(no relevant documentation found)'}`);
+
+  if (testCaseContext) {
+    userSections.push(`EXISTING TEST CASES:\n${testCaseContext}`);
+  }
+
+  if (pastBugsContext) {
+    userSections.push(`HISTORICAL BUGS:\n${pastBugsContext}`);
+  }
+
+  if (memoryContext) {
+    userSections.push(`WORKSPACE CONTEXT:\n${memoryContext}`);
+  }
+
+  userSections.push('Analyze and respond with JSON.');
+
+  return { system: ANALYSIS_SYSTEM_PROMPT, user: userSections.join('\n\n') };
 }
 
 export class JiraQaOrchestratorService {
   /**
    * Analyze Jira task and execute the chosen outcome (run test, rework, or prepare manual).
+   * Enriches AI decision with 4 parallel data sources: KB, test cases, past bugs, workspace memory.
    */
   static async analyzeAndExecute(params: JiraQaOrchestratorParams): Promise<JiraQaOrchestratorResult> {
     const { issueKey, projectId, userId, cloudId, reworkStatusName } = params;
@@ -97,18 +189,77 @@ export class JiraQaOrchestratorService {
       const cloudIdToUse = cloudId || tokenData.cloud_id;
 
       const issue = await getJiraIssue(accessToken, cloudIdToUse, issueKey);
+
+      // Resolve workspaceId (from params or from project)
+      const workspaceId = params.workspaceId || await this.resolveWorkspaceId(projectId);
+
       const query = [issue.summary, issue.description].filter(Boolean).join(' ');
-      const kbResult = await searchKB(query, projectId, { matchCount: 5, matchThreshold: 0.5 });
-      const kbContext = (kbResult.chunks || [])
-        .map((c) => (c as { content?: string }).content)
+
+      // Fetch all 4 data sources in parallel (each is non-fatal)
+      const [kbResult, resolverResult, findingsResult, memoryContext] = await Promise.all([
+        // 1. Knowledge Base (existing)
+        searchKB(query, projectId, { matchCount: 5, matchThreshold: 0.5 })
+          .catch((err) => {
+            logger.warn('[JIRA_QA] KB search failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+            return { chunks: [] } as { chunks: Array<{ content?: string }> };
+          }),
+
+        // 2. Test Case Resolver (NEW) — find similar existing test cases
+        workspaceId
+          ? TestCaseResolverService.resolve({ message: query, userId, workspaceId })
+              .catch((err) => {
+                logger.warn('[JIRA_QA] Resolver failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+                return null as ResolverResult | null;
+              })
+          : Promise.resolve(null as ResolverResult | null),
+
+        // 3. Past Bug Findings vector search (NEW) — similar bugs in this project
+        this.searchProjectFindings(query, projectId)
+          .catch((err) => {
+            logger.warn('[JIRA_QA] Findings search failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+            return [] as FindingSearchResult[];
+          }),
+
+        // 4. Workspace Memory (NEW) — user-saved patterns and facts
+        workspaceId
+          ? WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500)
+              .catch((err) => {
+                logger.warn('[JIRA_QA] Memory context failed (non-fatal)', { issueKey, error: err instanceof Error ? err.message : String(err) });
+                return '';
+              })
+          : Promise.resolve(''),
+      ]);
+
+      // Build context strings
+      const kbContext = ((kbResult as { chunks: Array<{ content?: string }> }).chunks || [])
+        .map((c) => c.content)
         .filter(Boolean)
         .join('\n\n')
         .slice(0, 3000);
 
-      const prompt = buildAnalysisPrompt(issue.summary, issue.description, kbContext);
+      const testCaseContext = this.buildTestCaseContext(resolverResult);
+      const pastBugsContext = this.buildPastBugsContext(findingsResult);
+
+      logger.info('[JIRA_QA] Context enrichment complete', {
+        issueKey,
+        kbChunks: ((kbResult as { chunks: any[] }).chunks || []).length,
+        resolverMatch: resolverResult?.matchType || 'none',
+        findingsCount: findingsResult.length,
+        hasMemory: !!memoryContext,
+      });
+
+      const { system, user } = buildAnalysisMessages(
+        issue.summary,
+        issue.description,
+        kbContext,
+        testCaseContext,
+        pastBugsContext,
+        memoryContext,
+      );
+
       const completion = await getChatCompletionWithMessages(
-        [{ role: 'user', content: prompt }],
-        { temperature: 0.2, max_tokens: 600, response_format: { type: 'json_object' } }
+        [{ role: 'system', content: system }, { role: 'user', content: user }],
+        { temperature: 0.2, max_tokens: 1000, response_format: { type: 'json_object' } }
       );
       let analysis: JiraQaAnalysisResult;
       try {
@@ -120,6 +271,8 @@ export class JiraQaOrchestratorService {
           suggestedAction: raw.suggestedAction as JiraQaAnalysisResult['suggestedAction'],
           extractedUrl: raw.extractedUrl as string | undefined,
           testCaseSummary: raw.testCaseSummary as string | undefined,
+          existingTestCaseId: (raw.existingTestCaseId as string | null) || null,
+          reworkQuestions: Array.isArray(raw.reworkQuestions) ? (raw.reworkQuestions as string[]) : undefined,
         };
       } catch {
         analysis = { outcome: 'PREPARE_MANUAL', reason: 'Could not parse AI response' };
@@ -127,8 +280,14 @@ export class JiraQaOrchestratorService {
 
       logger.info('[JIRA_QA] Analysis result', { issueKey, outcome: analysis.outcome, reason: analysis.reason });
 
+      // ── NEEDS_REWORK ──────────────────────────────────────────────────
       if (analysis.outcome === 'NEEDS_REWORK') {
-        const comment = `[QAI] Cannot run automated test yet.\nReason: ${analysis.reason || 'Insufficient data'}\n${(analysis.missingData?.length ? `Missing: ${analysis.missingData.join(', ')}` : '')}`;
+        const questions = analysis.reworkQuestions?.length
+          ? '\n\nPlease clarify:\n' + analysis.reworkQuestions.map(q => `• ${q}`).join('\n')
+          : '';
+        const comment = `[QAI] Cannot run automated test yet.\nReason: ${analysis.reason || 'Insufficient data'}`
+          + (analysis.missingData?.length ? `\nMissing: ${analysis.missingData.join(', ')}` : '')
+          + questions;
         await addJiraComment(accessToken, cloudIdToUse, issueKey, comment);
         if (reworkStatusName) {
           try {
@@ -144,6 +303,7 @@ export class JiraQaOrchestratorService {
         };
       }
 
+      // ── CAN_RUN_AUTO: platform test ───────────────────────────────────
       if (analysis.outcome === 'CAN_RUN_AUTO' && analysis.suggestedAction?.type === 'platform_test' && analysis.extractedUrl) {
         const mode = (analysis.suggestedAction.mode === 'pro' ? 'pro' : 'lite') as 'lite' | 'pro';
         const creditsRequired = mode === 'pro' ? TokenCalculatorService.getTestCreditCost('intelligent') : 15; // lite=15, pro=20
@@ -156,14 +316,24 @@ export class JiraQaOrchestratorService {
             message: 'Insufficient credits; test case prepared for manual QA instead',
           };
         }
+
+        // Build test goal; include prefilled steps hint if resolver found a match
+        let testGoal = issue.summary + (issue.description ? '\n' + issue.description.slice(0, 500) : '');
+        const prefilledSteps = resolverResult?.prefilledSteps;
+
         const test = await createTest({
           url: analysis.extractedUrl,
           projectId,
           userId,
           browsers: ['chrome'],
           intelligentMode: true,
-          testGoal: issue.summary + (issue.description ? '\n' + issue.description.slice(0, 500) : ''),
+          testGoal,
           mode,
+          metadata: {
+            source: 'jira_qa_orchestrator' as const,
+            sourceJiraIssueKey: issueKey,
+            sourceJiraCloudId: cloudIdToUse,
+          },
         });
         await QueueManager.addTestRunJob({
           testId: test.id,
@@ -174,6 +344,7 @@ export class JiraQaOrchestratorService {
           intelligentMode: true,
           testGoal: issue.summary,
           mode,
+          ...(prefilledSteps?.length ? { prefilledSteps } : {}),
         });
         await CreditCostTrackerService.deductCreditsForTest({
           userId,
@@ -183,17 +354,19 @@ export class JiraQaOrchestratorService {
           testId: test.id,
           description: `Jira QA auto-test: ${issue.key} (${mode})`,
         });
-        await addJiraComment(accessToken, cloudIdToUse, issueKey, `[QAI] Automated platform test started (${mode}). Test ID: ${test.id}`);
+        const prefilledNote = prefilledSteps?.length ? ` Enriched with ${prefilledSteps.length} prefilled steps from similar test cases.` : '';
+        await addJiraComment(accessToken, cloudIdToUse, issueKey, `[QAI] Automated platform test started (${mode}). Test ID: ${test.id}${prefilledNote}`);
         return {
           success: true,
           outcome: 'CAN_RUN_AUTO',
           message: 'Platform test started',
           testId: test.id,
+          existingTestCaseId: analysis.existingTestCaseId || undefined,
         };
       }
 
+      // ── CAN_RUN_AUTO: API test ────────────────────────────────────────
       if (analysis.outcome === 'CAN_RUN_AUTO' && analysis.suggestedAction?.type === 'api_test' && analysis.extractedUrl) {
-        // API test: could enqueue or call ApiAgentOrchestratorService.run. For now we only support platform run; API can be added similarly.
         await addJiraComment(accessToken, cloudIdToUse, issueKey, `[QAI] API test not yet automated from board. Please run from chat. URL: ${analysis.extractedUrl}`);
         return {
           success: true,
@@ -202,15 +375,27 @@ export class JiraQaOrchestratorService {
         };
       }
 
-      // PREPARE_MANUAL or CAN_RUN_AUTO without URL: create a draft test case and comment
+      // ── PREPARE_MANUAL (or CAN_RUN_AUTO without URL) ──────────────────
       const name = `Jira: ${issue.key} - ${issue.summary.slice(0, 80)}`;
-      const steps = [
-        {
-          id: randomUUID(),
-          type: 'assert' as const,
-          description: analysis.testCaseSummary || issue.summary,
-        },
-      ];
+
+      // Use prefilled steps from resolver if available, otherwise single assert
+      const steps = (resolverResult?.prefilledSteps?.length)
+        ? resolverResult.prefilledSteps.map(ps => {
+            const intentType = (AI_ACTION_TO_INTENT[ps.command.action] || 'click') as IntentActionType;
+            return {
+              id: randomUUID(),
+              type: intentType,
+              description: `${ps.command.action}: ${ps.command.ref || ps.command.url || ps.command.value || ''}`.trim(),
+            };
+          })
+        : [
+            {
+              id: randomUUID(),
+              type: 'assert' as const,
+              description: analysis.testCaseSummary || issue.summary,
+            },
+          ];
+
       const testCase = await IntentTestCaseService.create({
         projectId,
         userId,
@@ -221,7 +406,7 @@ export class JiraQaOrchestratorService {
         status: 'draft',
         kind: 'standalone',
       });
-      const comment = `[QAI] Test case prepared for manual QA.\n${analysis.testCaseSummary || issue.summary}\nTest case ID: ${testCase.id}`;
+      const comment = `[QAI] Test case prepared for manual QA.\n${analysis.testCaseSummary || issue.summary}\nTest case ID: ${testCase.id}${steps.length > 1 ? `\nPre-populated with ${steps.length} steps from similar test cases.` : ''}`;
       await addJiraComment(accessToken, cloudIdToUse, issueKey, comment);
       return {
         success: true,
@@ -252,5 +437,82 @@ export class JiraQaOrchestratorService {
       .maybeSingle();
     const jira = (project?.settings as any)?.integrations?.jira || {};
     return { reworkStatusName: jira.reworkStatusName || undefined };
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // PRIVATE HELPERS
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Resolve workspaceId from projectId (lightweight single-column query).
+   */
+  private static async resolveWorkspaceId(projectId: string): Promise<string | null> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('projects')
+        .select('workspace_id')
+        .eq('id', projectId)
+        .maybeSingle();
+      if (error || !data?.workspace_id) {
+        logger.warn('[JIRA_QA] Could not resolve workspaceId from projectId', { projectId });
+        return null;
+      }
+      return data.workspace_id;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Semantic search for past bug findings in the project via vector similarity RPC.
+   */
+  private static async searchProjectFindings(
+    query: string,
+    projectId: string,
+  ): Promise<FindingSearchResult[]> {
+    const queryEmbedding = await generateEmbedding(query);
+    const { data, error } = await supabaseAdmin.rpc('search_project_findings', {
+      p_project_id: projectId,
+      p_query_embedding: JSON.stringify(queryEmbedding),
+      p_match_count: 5,
+      p_match_threshold: 0.5,
+    });
+    if (error) {
+      logger.warn('[JIRA_QA] search_project_findings RPC error', { projectId, error: error.message });
+      return [];
+    }
+    return (data || []) as FindingSearchResult[];
+  }
+
+  /**
+   * Build context string from TestCaseResolver result.
+   */
+  private static buildTestCaseContext(resolverResult: ResolverResult | null): string {
+    if (!resolverResult) return '';
+
+    if (resolverResult.matchType === 'exact' && resolverResult.bestMatch) {
+      const m = resolverResult.bestMatch;
+      return `EXACT MATCH found: "${m.name}" (ID: ${m.id}, score: ${m.score.toFixed(2)}, ${m.commands?.length || 0} steps)`
+        + (m.url ? `\nURL: ${m.url}` : '');
+    }
+
+    if (resolverResult.matchType === 'partial' && resolverResult.relatedCases?.length) {
+      return resolverResult.relatedCases.slice(0, 3).map(c =>
+        `- "${c.name}" (score: ${c.score.toFixed(2)}, ${c.commands?.length || 0} steps${c.url ? ', URL: ' + c.url : ''})`
+      ).join('\n');
+    }
+
+    return '';
+  }
+
+  /**
+   * Build context string from findings vector search results.
+   */
+  private static buildPastBugsContext(findings: FindingSearchResult[]): string {
+    if (!findings || findings.length === 0) return '';
+
+    return findings.map(f =>
+      `- [${f.severity}] ${f.title}: ${(f.description || '').slice(0, 150)} (similarity: ${typeof f.similarity === 'number' ? f.similarity.toFixed(2) : 'N/A'})`
+    ).join('\n');
   }
 }

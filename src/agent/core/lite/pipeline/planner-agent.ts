@@ -112,11 +112,12 @@ export class PlannerAgent {
         return PlannerAgent.buildDefaultPlan(blackboard);
       }
 
-      // Normalize steps
+      // Normalize steps (including optional grounded element refs)
       const steps: PlanStep[] = parsed.steps.map((s: any, idx: number) => ({
         stepNumber: s.stepNumber || idx + 1,
         description: s.description || `Step ${idx + 1}`,
         status: 'pending' as const,
+        ...(s.targetRef ? { targetRef: String(s.targetRef) } : {}),
       }));
 
       // Cap at 8 steps

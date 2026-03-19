@@ -12,6 +12,8 @@ import {
   signUpWithEmail,
   updatePassword,
   updateUserProfile,
+  invalidateAuthCache,
+  invalidateAuthCacheForUser,
 } from '@/services/auth/auth.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -328,6 +330,7 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
     }
 
     await signOut(accessToken);
+    await invalidateAuthCache(accessToken);
 
     res.json({
       success: true,
@@ -655,6 +658,9 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
       newStatus: status,
       updatedBy: req.user?.id,
     });
+
+    // Invalidate auth cache so the user's next request picks up the new status
+    await invalidateAuthCacheForUser(userId);
 
     res.json({
       success: true,

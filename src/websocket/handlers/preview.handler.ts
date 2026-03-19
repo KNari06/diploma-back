@@ -1009,9 +1009,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // Import apply service dynamically to avoid circular deps
       const { PreviewStepApplyService } = await import('@/services/testing/ui/preview/preview-step-apply.service');
 
-      // Editor trace: log step apply request
-      const applyTrace = EditorTraceService.get(previewSessionId);
-      if (applyTrace) applyTrace.writeStepApplyRequest(stepDraft);
+      // Editor trace: log step apply request (getOrCreate ensures trace file exists even without recording)
+      const applyTrace = EditorTraceService.getOrCreate(previewSessionId, ensuredUserId);
+      applyTrace.writeStepApplyRequest(stepDraft);
 
       const result = await PreviewStepApplyService.applyStep({
         previewSessionId,
@@ -1022,7 +1022,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       // Editor trace: log step apply result
-      if (applyTrace) applyTrace.writeStepApplyResult(result);
+      applyTrace.writeStepApplyResult(result);
 
       // V3: Clean up confirmed selection only after successful apply
       if (result.success && confirmedSelection) {
@@ -2656,8 +2656,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      const { previewSessionId, domVersion } = data;
+      const { previewSessionId: rawPsid, domVersion } = data;
+      const previewSessionId = rawPsid as string | undefined;
       if (!previewSessionId) return;
+
+      logger.debug('[WebSocket] HTML request received', {
+        socketId: socket.id,
+        previewSessionId,
+        clientDomVersion: domVersion,
+      });
 
       const { getPreviewSessionService, getPreviewDevToolsRegistry } =
         await import('@/services/testing/ui/preview');
@@ -2671,23 +2678,25 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const currentDomVersion = sessionService.getDomVersion(previewSessionId, ensuredUserId);
 
-      // If client has same or newer version, skip
-      if (domVersion !== undefined && currentDomVersion !== null && domVersion >= currentDomVersion) {
+      // NOTE: Removed domVersion skip check — always respond to prevent frontend "Loading..." hang.
+      // Previously: if client domVersion >= server domVersion, we silently returned with no response.
+
+      const collector = devtoolsRegistry.get(previewSessionId);
+      if (!collector) {
+        // Always respond so frontend doesn't hang on "Loading..."
+        socket.emit('preview:html:update', { previewSessionId, domVersion: 0, html: '<!-- No collector available -->', truncated: false });
         return;
       }
 
-      const collector = devtoolsRegistry.get(previewSessionId);
-      if (!collector) return;
-
       const htmlPayload = await collector.fetchHtml(currentDomVersion || 1);
-      if (htmlPayload) {
-        socket.emit('preview:html:update', htmlPayload);
-      }
+      socket.emit('preview:html:update', htmlPayload || { previewSessionId, domVersion: 0, html: '<!-- Failed to fetch -->', truncated: false });
     } catch (error) {
       logger.debug('[WebSocket] Error in preview:html:request', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
+      // Always respond on error so frontend doesn't hang
+      socket.emit('preview:html:update', { previewSessionId: (data as any)?.previewSessionId, domVersion: 0, html: `<!-- Error: ${error instanceof Error ? error.message : String(error)} -->`, truncated: false });
     }
   });
 
@@ -2712,23 +2721,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const currentDomVersion = sessionService.getDomVersion(previewSessionId, ensuredUserId);
 
-      // If client has same or newer version, skip
-      if (domVersion !== undefined && currentDomVersion !== null && domVersion >= currentDomVersion) {
+      // NOTE: Removed domVersion skip check — always respond to prevent frontend "Loading..." hang.
+      // Previously: if client domVersion >= server domVersion, we silently returned with no response.
+
+      const collector = devtoolsRegistry.get(previewSessionId);
+      if (!collector) {
+        socket.emit('preview:accessibility:update', { previewSessionId, domVersion: 0, tree: [], truncated: false });
         return;
       }
 
-      const collector = devtoolsRegistry.get(previewSessionId);
-      if (!collector) return;
-
       const accessibilityPayload = await collector.fetchAccessibility(currentDomVersion || 1);
-      if (accessibilityPayload) {
-        socket.emit('preview:accessibility:update', accessibilityPayload);
-      }
+      socket.emit('preview:accessibility:update', accessibilityPayload || { previewSessionId, domVersion: 0, tree: [], truncated: false });
     } catch (error) {
       logger.debug('[WebSocket] Error in preview:accessibility:request', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
+      // Always respond on error so frontend doesn't hang
+      socket.emit('preview:accessibility:update', { previewSessionId: (data as any)?.previewSessionId, domVersion: 0, tree: [], truncated: false });
     }
   });
 
@@ -3457,6 +3467,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               });
             }
           }
+
+          // Always close editor trace writer on disconnect (may have been created by Apply, not just recording)
+          try {
+            const traceOnDisconnect = EditorTraceService.get(previewSessionId);
+            if (traceOnDisconnect) {
+              EditorTraceService.close(previewSessionId).then((meta) => {
+                if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
+              }).catch(() => {});
+            }
+          } catch { /* non-fatal */ }
 
           logger.debug('[WebSocket] Stopped streams on disconnect', {
             socketId: socket.id,

@@ -78,19 +78,16 @@ async function getWorkspaceChatInternal(
     .select('id, title, created_at, updated_at, workspace_id')
     .eq('workspace_id', workspaceId)
     .eq('user_id', userId)
-    .order('created_at', { ascending: true })
+    .order('updated_at', { ascending: false })
     .limit(1)
     .maybeSingle();
 
   if (!session) {
-    // Auto-create chat session for this user
+    // Auto-create first chat session for this user
     const sessionId = await ChatService.createChatSession(userId, workspaceId);
-    const { data: newSession } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('id, title, created_at, updated_at, workspace_id')
-      .eq('id', sessionId)
-      .single();
-    session = newSession;
+    // Build session from known data instead of re-fetching from DB
+    const now = new Date().toISOString();
+    session = { id: sessionId, title: null, created_at: now, updated_at: now, workspace_id: workspaceId } as any;
   }
 
   if (!session) {
@@ -149,17 +146,89 @@ async function getWorkspaceChatInternal(
 }
 
 /**
+ * POST /api/v1/chat/sessions/new
+ * Create a new chat session (replaces "clear chat" — old session is preserved)
+ */
+export const createNewChatSession = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user!.id;
+    const workspaceId = typeof req.query.workspaceId === 'string'
+      ? req.query.workspaceId
+      : typeof req.body?.workspaceId === 'string'
+        ? req.body.workspaceId
+        : undefined;
+
+    const resolvedWorkspaceId = workspaceId || await WorkspaceService.getActiveWorkspaceForUser(userId);
+    if (!resolvedWorkspaceId) {
+      res.status(400).json({
+        success: false,
+        error: 'No workspace found. Please create a workspace first.',
+      });
+      return;
+    }
+
+    // Validate workspace membership
+    const isMember = await WorkspaceAccessService.isMember(userId, resolvedWorkspaceId);
+    if (!isMember) {
+      res.status(403).json({ success: false, error: 'Not a member of this workspace' });
+      return;
+    }
+
+    const sessionId = await ChatService.createChatSession(userId, resolvedWorkspaceId);
+
+    // Fetch the created session for response
+    const { data: session } = await supabaseAdmin
+      .from('chat_sessions')
+      .select('id, title, created_at, updated_at, workspace_id')
+      .eq('id', sessionId)
+      .single();
+
+    logger.info('[CHAT_SESSIONS] New chat session created', {
+      sessionId,
+      userId,
+      workspaceId: resolvedWorkspaceId,
+    });
+
+    res.status(201).json({
+      success: true,
+      data: {
+        session: {
+          ...session,
+          message_count: 0,
+        },
+      },
+      message: 'New chat session created',
+    });
+  } catch (error) {
+    logger.error('[CHAT_SESSIONS] Error creating new chat session', { error });
+    if (!res.headersSent) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      const status = message.includes('Maximum chat sessions') ? 400 : 500;
+      res.status(status).json({
+        success: false,
+        error: status === 400 ? message : 'Failed to create chat session',
+        message,
+      });
+    }
+  }
+};
+
+/**
  * GET /api/v1/chat/sessions/list
- * @deprecated Returns the single workspace chat session for backward compatibility
+ * Returns all user chat sessions in the workspace with pagination
  */
 export const listUserChatSessions = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
     const workspaceId = typeof req.query.workspaceId === 'string' ? req.query.workspaceId : undefined;
+    const limit = parseInt(req.query.limit as string) || 50;
+    const offset = parseInt(req.query.offset as string) || 0;
 
-    logger.info('[CHAT_SESSIONS] Listing workspace chat (single session model)', {
+    logger.info('[CHAT_SESSIONS] Listing user chat sessions', {
       userId,
       workspaceId: workspaceId || 'active',
+      limit,
+      offset,
     });
 
     const resolvedWorkspaceId = workspaceId || await WorkspaceService.getActiveWorkspaceForUser(userId);
@@ -168,33 +237,23 @@ export const listUserChatSessions = async (req: Request, res: Response): Promise
         success: true,
         data: {
           sessions: [],
-          pagination: { limit: 50, offset: 0, total: 0, has_more: false },
+          pagination: { limit, offset, total: 0, has_more: false },
         },
       });
       return;
     }
 
-    // Get this user's session in the workspace
-    const { data: session } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('id, title, created_at, updated_at, workspace_id')
-      .eq('workspace_id', resolvedWorkspaceId)
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true })
-      .limit(1)
-      .maybeSingle();
-
-    const sessions = session ? [session] : [];
+    const result = await ChatService.getUserChatSessions(userId, limit, offset, resolvedWorkspaceId);
 
     res.json({
       success: true,
       data: {
-        sessions,
+        sessions: result.sessions,
         pagination: {
-          limit: 50,
-          offset: 0,
-          total: sessions.length,
-          has_more: false,
+          limit,
+          offset,
+          total: result.total,
+          has_more: offset + limit < result.total,
         },
       },
     });
@@ -253,15 +312,8 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
     const offset = usePagination ? Math.max(Number(offsetParam) || 0, 0) : undefined;
 
     let totalCount: number | undefined;
-    if (usePagination) {
-      const { count } = await supabaseAdmin
-        .from('chat_messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('session_id', sessionId);
-      totalCount = count || 0;
-    }
 
-    let query = supabaseAdmin
+    let dataQuery = supabaseAdmin
       .from('chat_messages')
       .select('id, role, content, metadata, created_at, author_id')
       .eq('session_id', sessionId)
@@ -269,10 +321,30 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
       .order('id', { ascending: true });
 
     if (usePagination && limit !== undefined && offset !== undefined) {
-      query = query.range(offset, offset + limit - 1);
+      dataQuery = dataQuery.range(offset, offset + limit - 1);
     }
 
-    const { data: messages, error: messagesError } = await query;
+    let messages: any[] | null;
+    let messagesError: any;
+
+    if (usePagination) {
+      // Run count + data in parallel (independent reads on same table)
+      const [countRes, dataRes] = await Promise.all([
+        supabaseAdmin
+          .from('chat_messages')
+          .select('id', { count: 'exact', head: true })
+          .eq('session_id', sessionId),
+        dataQuery,
+      ]);
+      totalCount = countRes.count || 0;
+      messages = dataRes.data;
+      messagesError = dataRes.error;
+    } else {
+      const dataRes = await dataQuery;
+      messages = dataRes.data;
+      messagesError = dataRes.error;
+    }
+
     if (messagesError) throw messagesError;
 
     const sortedMessages = (messages || []).sort((a, b) => {
@@ -462,10 +534,39 @@ export const clearWorkspaceChat = async (req: Request, res: Response): Promise<v
 
 /**
  * DELETE /api/v1/chat/sessions/:sessionId
- * @deprecated Use POST /sessions/:sessionId/clear instead.
- * Delete chat session and all messages (kept for backward compatibility)
+ * Permanently delete a chat session and all its messages
  */
 export const deleteChatSession = async (req: Request, res: Response): Promise<void> => {
-  // Redirect to clear behavior instead of delete
-  return clearWorkspaceChat(req, res);
+  try {
+    const userId = req.user!.id;
+    const { sessionId } = req.params;
+
+    if (!sessionId) {
+      res.status(400).json({ success: false, error: 'Session ID is required' });
+      return;
+    }
+
+    const result = await ChatService.deleteChatSession(sessionId, userId);
+
+    if (!result.success) {
+      res.status(404).json({ success: false, error: result.message });
+      return;
+    }
+
+    logger.info('[CHAT_SESSIONS] Session deleted', { sessionId, userId });
+
+    res.json({
+      success: true,
+      message: result.message,
+    });
+  } catch (error) {
+    logger.error('[CHAT_SESSIONS] Error deleting chat session', { error });
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to delete chat session',
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
 };
