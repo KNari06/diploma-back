@@ -3458,6 +3458,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             }
           }
 
+          // Always close editor trace writer on disconnect (may have been created by Apply, not just recording)
+          try {
+            const traceOnDisconnect = EditorTraceService.get(previewSessionId);
+            if (traceOnDisconnect) {
+              EditorTraceService.close(previewSessionId).then((meta) => {
+                if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
+              }).catch(() => {});
+            }
+          } catch { /* non-fatal */ }
+
           logger.debug('[WebSocket] Stopped streams on disconnect', {
             socketId: socket.id,
             room,

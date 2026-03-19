@@ -1699,8 +1699,11 @@ export class SnapshotCollector {
 
         const metadata = detectVisualContentMetadata();
 
-        // ✅ TASK 10: Cleanup stale fingerprint map entries (>1000 entries)
-        if (win.__agentFingerprintMap.size > 1000) {
+        // ✅ TASK 10: Cleanup stale fingerprint map entries
+        // Trigger at 300 entries (reduced from 1000) to prevent memory growth on long sessions.
+        // Removing stale entries only causes a one-time ref reassignment — no data loss,
+        // just a single LLM call instead of evidence cache hit for affected elements.
+        if (win.__agentFingerprintMap.size > 300) {
           const currentRefs = new Set();
           for (const el of elements) {
             currentRefs.add(el.ref);
@@ -1716,6 +1719,12 @@ export class SnapshotCollector {
 
           for (const fingerprint of fingerprintsToDelete) {
             win.__agentFingerprintMap.delete(fingerprint);
+          }
+
+          // Hard cap: if still over 500 after cleanup (many elements in DOM), clear entirely
+          // This prevents O(n) map lookups from slowing snapshots on complex pages
+          if (win.__agentFingerprintMap.size > 500) {
+            win.__agentFingerprintMap.clear();
           }
         }
 
