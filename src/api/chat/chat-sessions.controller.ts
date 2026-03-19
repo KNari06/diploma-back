@@ -85,12 +85,9 @@ async function getWorkspaceChatInternal(
   if (!session) {
     // Auto-create first chat session for this user
     const sessionId = await ChatService.createChatSession(userId, workspaceId);
-    const { data: newSession } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('id, title, created_at, updated_at, workspace_id')
-      .eq('id', sessionId)
-      .single();
-    session = newSession;
+    // Build session from known data instead of re-fetching from DB
+    const now = new Date().toISOString();
+    session = { id: sessionId, title: null, created_at: now, updated_at: now, workspace_id: workspaceId } as any;
   }
 
   if (!session) {
@@ -315,15 +312,8 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
     const offset = usePagination ? Math.max(Number(offsetParam) || 0, 0) : undefined;
 
     let totalCount: number | undefined;
-    if (usePagination) {
-      const { count } = await supabaseAdmin
-        .from('chat_messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('session_id', sessionId);
-      totalCount = count || 0;
-    }
 
-    let query = supabaseAdmin
+    let dataQuery = supabaseAdmin
       .from('chat_messages')
       .select('id, role, content, metadata, created_at, author_id')
       .eq('session_id', sessionId)
@@ -331,10 +321,30 @@ export const getChatSessionById = async (req: Request, res: Response): Promise<v
       .order('id', { ascending: true });
 
     if (usePagination && limit !== undefined && offset !== undefined) {
-      query = query.range(offset, offset + limit - 1);
+      dataQuery = dataQuery.range(offset, offset + limit - 1);
     }
 
-    const { data: messages, error: messagesError } = await query;
+    let messages: any[] | null;
+    let messagesError: any;
+
+    if (usePagination) {
+      // Run count + data in parallel (independent reads on same table)
+      const [countRes, dataRes] = await Promise.all([
+        supabaseAdmin
+          .from('chat_messages')
+          .select('id', { count: 'exact', head: true })
+          .eq('session_id', sessionId),
+        dataQuery,
+      ]);
+      totalCount = countRes.count || 0;
+      messages = dataRes.data;
+      messagesError = dataRes.error;
+    } else {
+      const dataRes = await dataQuery;
+      messages = dataRes.data;
+      messagesError = dataRes.error;
+    }
+
     if (messagesError) throw messagesError;
 
     const sortedMessages = (messages || []).sort((a, b) => {

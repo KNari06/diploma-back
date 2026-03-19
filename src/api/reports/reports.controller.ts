@@ -68,12 +68,14 @@ export const generateReport = async (req: Request, res: Response): Promise<void>
       return;
     }
 
-    // Fetch test result from database
-    const { data: testResult, error: testError } = await supabaseAdmin
-      .from('test_results')
-      .select('*')
-      .eq('test_id', testId)
-      .single();
+    // Fetch test result and AI analysis in parallel (independent reads)
+    const [testResultRes, aiAnalysisRes] = await Promise.all([
+      supabaseAdmin.from('test_results').select('*').eq('test_id', testId).single(),
+      supabaseAdmin.from('ai_analysis').select('*').eq('test_id', testId).single(),
+    ]);
+
+    const { data: testResult, error: testError } = testResultRes;
+    const { data: aiAnalysis } = aiAnalysisRes;
 
     if (testError || !testResult) {
       res.status(404).json({
@@ -82,13 +84,6 @@ export const generateReport = async (req: Request, res: Response): Promise<void>
       });
       return;
     }
-
-    // Fetch AI analysis if exists
-    const { data: aiAnalysis } = await supabaseAdmin
-      .from('ai_analysis')
-      .select('*')
-      .eq('test_id', testId)
-      .single();
 
     // Generate report
     const report = await TestReportGeneratorService.generateFinalReport({

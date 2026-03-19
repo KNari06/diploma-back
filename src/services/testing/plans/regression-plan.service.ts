@@ -298,7 +298,7 @@ export class RegressionPlanService {
       itemsByPlan.get(item.plan_id)!.push(item);
     }
 
-    // 2. Collect all module IDs to resolve → flows
+    // 2. Collect IDs for parallel resolution
     const allModuleIds = [
       ...new Set(
         allItems
@@ -307,21 +307,42 @@ export class RegressionPlanService {
       ),
     ];
 
-    // Resolve modules → flows in one query
-    let moduleFlowMap = new Map<string, string[]>(); // moduleId → flowId[]
-    if (allModuleIds.length > 0) {
-      const { data: moduleFlows } = await supabaseAdmin
-        .from('test_flows')
-        .select('id, module_id')
-        .in('module_id', allModuleIds);
+    const testCaseIds = allItems
+      .filter((i) => i.item_type === 'test_case' && i.test_case_id)
+      .map((i) => i.test_case_id as string);
 
-      for (const f of moduleFlows || []) {
-        if (!moduleFlowMap.has(f.module_id)) moduleFlowMap.set(f.module_id, []);
-        moduleFlowMap.get(f.module_id)!.push(f.id);
-      }
-    }
+    // Queries 2 + 4 in parallel (both depend only on Query 1, independent of each other)
+    const [moduleFlowMap, testCaseFlowMap] = await Promise.all([
+      // Query 2: modules → flows
+      (async () => {
+        const map = new Map<string, string[]>();
+        if (allModuleIds.length === 0) return map;
+        const { data: moduleFlows } = await supabaseAdmin
+          .from('test_flows')
+          .select('id, module_id')
+          .in('module_id', allModuleIds);
+        for (const f of moduleFlows || []) {
+          if (!map.has(f.module_id)) map.set(f.module_id, []);
+          map.get(f.module_id)!.push(f.id);
+        }
+        return map;
+      })(),
+      // Query 4: test_cases → flow_id
+      (async () => {
+        const map = new Map<string, string | null>();
+        if (testCaseIds.length === 0) return map;
+        const { data: tcFlows } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('id, flow_id')
+          .in('id', testCaseIds);
+        for (const tc of tcFlows || []) {
+          map.set(tc.id, tc.flow_id);
+        }
+        return map;
+      })(),
+    ]);
 
-    // 3. Collect ALL flow IDs we need test counts for
+    // 3. Collect ALL flow IDs we need test counts for (depends on moduleFlowMap from Query 2)
     const allFlowIds = new Set<string>();
     for (const item of allItems) {
       if (item.item_type === 'module' && item.module_id) {
@@ -344,23 +365,6 @@ export class RegressionPlanService {
       // Count per flow_id
       for (const row of flowCounts || []) {
         flowTestCounts.set(row.flow_id, (flowTestCounts.get(row.flow_id) || 0) + 1);
-      }
-    }
-
-    // 4. Resolve test_case items → flow_id for flow counting
-    const testCaseIds = allItems
-      .filter((i) => i.item_type === 'test_case' && i.test_case_id)
-      .map((i) => i.test_case_id as string);
-
-    const testCaseFlowMap = new Map<string, string | null>();
-    if (testCaseIds.length > 0) {
-      const { data: tcFlows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, flow_id')
-        .in('id', testCaseIds);
-
-      for (const tc of tcFlows || []) {
-        testCaseFlowMap.set(tc.id, tc.flow_id);
       }
     }
 

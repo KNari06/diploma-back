@@ -85,11 +85,11 @@ export class FailureAnalysisService {
       };
     }
 
-    // 3. Fetch test results (errors, statuses)
-    const testResults = await this.fetchTestResults(testId);
-
-    // 4. Fetch intelligent session for execution context
-    const session = await this.fetchIntelligentSession(testId);
+    // 3 + 4. Fetch test results and intelligent session in parallel (independent reads)
+    const [testResults, session] = await Promise.all([
+      this.fetchTestResults(testId),
+      this.fetchIntelligentSession(testId),
+    ]);
 
     // 5. Build error summary (truncated to stay within LLM limits)
     let errorDetails = this.buildErrorSummary(test, testResults, session);

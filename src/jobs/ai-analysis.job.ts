@@ -163,11 +163,18 @@ export class AIAnalysisJobHandler {
       // Send notifications if critical issues found
       await this.handleCriticalIssues(testId, aiSummary);
 
+      // Pre-fetch project once for integrations (Jira sync + webhook)
+      const test = testResult?.tests;
+      let project: any = null;
+      if (test?.project_id) {
+        try { project = await dbAdminService.getProject(test.project_id); } catch { /* non-fatal */ }
+      }
+
       // Send webhook notifications
-      await this.sendWebhookNotifications(testId, aiSummary);
+      await this.sendWebhookNotifications(testId, aiSummary, project);
 
       // Sync on bug creation: create Jira issue if project has syncOnCreate enabled
-      await this.handleSyncOnCreate(testId, testResult, aiSummary);
+      await this.handleSyncOnCreate(testId, testResult, aiSummary, project);
 
       // Auto-extract bug patterns to workspace memory for agent learning
       await this.extractBugPatterns(testId, testResult, aiSummary);
@@ -382,7 +389,8 @@ export class AIAnalysisJobHandler {
   private static async handleSyncOnCreate(
     testId: string,
     dbResult: any,
-    aiSummary: any
+    aiSummary: any,
+    prefetchedProject?: any
   ): Promise<void> {
     try {
       const bugs = aiSummary?.bugs || [];
@@ -396,7 +404,7 @@ export class AIAnalysisJobHandler {
         return;
       }
 
-      const project = await dbAdminService.getProject(test.project_id) as any;
+      const project = (prefetchedProject ?? await dbAdminService.getProject(test.project_id)) as any;
       if (!project?.settings?.integrations?.jira) {
         logger.debug('[AI-ANALYSIS] No Jira integration settings for project', {
           projectId: test.project_id,
@@ -529,7 +537,7 @@ export class AIAnalysisJobHandler {
   /**
    * Send webhook notifications
    */
-  private static async sendWebhookNotifications(testId: string, aiSummary: any) {
+  private static async sendWebhookNotifications(testId: string, aiSummary: any, prefetchedProject?: any) {
     try {
       // Get test details
       const test = await dbAdminService.getTest(testId) as any;
@@ -539,7 +547,7 @@ export class AIAnalysisJobHandler {
       }
 
       // Get project settings for webhook configuration
-      const project = await dbAdminService.getProject(test.project_id) as any;
+      const project = (prefetchedProject ?? await dbAdminService.getProject(test.project_id)) as any;
       if (!project?.settings?.integrations?.webhook) {
         logger.debug(`[AI-ANALYSIS] No webhook configured for project: ${test.project_id}`);
         return;

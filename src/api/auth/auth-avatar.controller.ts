@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { invalidateAuthCacheForUser } from '@/services/auth/auth.service';
 import { UserAvatarStorageService } from '@/services/storage/user-avatar-storage.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -96,6 +97,9 @@ export const uploadAvatar = async (req: Request, res: Response): Promise<void> =
       });
       throw updateError;
     }
+
+    // Invalidate auth cache so next request picks up the new avatar
+    await invalidateAuthCacheForUser(userId);
 
     res.status(200).json({
       success: true,
@@ -197,6 +201,9 @@ export const deleteAvatar = async (req: Request, res: Response): Promise<void> =
       logger.error('[AUTH_AVATAR_API] Error updating user', { error: updateError, userId });
       throw updateError;
     }
+
+    // Invalidate auth cache so next request picks up the cleared avatar
+    await invalidateAuthCacheForUser(userId);
 
     res.status(200).json({
       success: true,

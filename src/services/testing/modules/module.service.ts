@@ -114,13 +114,6 @@ export class ModuleService {
       countQuery = countQuery.eq('platform_id', platformId);
     }
 
-    const { count, error: countError } = await countQuery;
-
-    if (countError) {
-      logger.error('[MODULE_SERVICE] Failed to count modules', { error: countError });
-      throw new Error(`Failed to list modules: ${countError.message}`);
-    }
-
     // Build query for items with platform join
     let itemsQuery = supabaseAdmin
       .from('test_modules')
@@ -136,9 +129,19 @@ export class ModuleService {
       itemsQuery = itemsQuery.eq('test_platforms.platform_key', platformKey);
     }
 
-    const { data, error } = await itemsQuery
-      .order('created_at', { ascending: false })
-      .range(offset, offset + limit - 1);
+    // Execute count + data queries in parallel (independent reads)
+    const [countResult, itemsResult] = await Promise.all([
+      countQuery,
+      itemsQuery.order('created_at', { ascending: false }).range(offset, offset + limit - 1),
+    ]);
+
+    const { count, error: countError } = countResult;
+    const { data, error } = itemsResult;
+
+    if (countError) {
+      logger.error('[MODULE_SERVICE] Failed to count modules', { error: countError });
+      throw new Error(`Failed to list modules: ${countError.message}`);
+    }
 
     if (error) {
       logger.error('[MODULE_SERVICE] Failed to list modules', { error });

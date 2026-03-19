@@ -82,13 +82,18 @@ export class PatternsQueryService {
       let totalFindings = 0;
 
       const batchSize = 100;
+      const findingsBatches: PromiseLike<any>[] = [];
       for (let i = 0; i < sessionIds.length; i += batchSize) {
         const batch = sessionIds.slice(i, i + batchSize);
-        const { count, error: findingsError } = await supabaseAdmin
-          .from('intelligent_test_findings')
-          .select('id', { count: 'exact', head: true })
-          .in('session_id', batch);
-
+        findingsBatches.push(
+          supabaseAdmin
+            .from('intelligent_test_findings')
+            .select('id', { count: 'exact', head: true })
+            .in('session_id', batch)
+        );
+      }
+      const findingsResults = await Promise.all(findingsBatches);
+      for (const { count, error: findingsError } of findingsResults) {
         if (!findingsError && count !== null) {
           totalFindings += count;
         }
@@ -131,15 +136,20 @@ export class PatternsQueryService {
 
       // Get all page visits for these sessions (batched to avoid URL length limits)
       const batchSize = 100;
-      const visits: any[] = [];
+      const visitsBatches: PromiseLike<any>[] = [];
       for (let i = 0; i < sessionIds.length; i += batchSize) {
         const batch = sessionIds.slice(i, i + batchSize);
-        const { data, error: visitsError } = await supabaseAdmin
-          .from('intelligent_page_visits')
-          .select('url, page_type, created_at')
-          .in('session_id', batch)
-          .order('created_at', { ascending: false });
-
+        visitsBatches.push(
+          supabaseAdmin
+            .from('intelligent_page_visits')
+            .select('url, page_type, created_at')
+            .in('session_id', batch)
+            .order('created_at', { ascending: false })
+        );
+      }
+      const visitsResults = await Promise.all(visitsBatches);
+      const visits: any[] = [];
+      for (const { data, error: visitsError } of visitsResults) {
         if (visitsError) {
           logger.error('[PATTERNS] Failed to query page visits batch', { error: visitsError.message });
         } else if (data) {
@@ -207,17 +217,22 @@ export class PatternsQueryService {
 
       const sessionIds = sessions.map(s => s.id);
 
-      // Get all findings (batched to avoid URL length limits)
+      // Get all findings (batched, parallel to avoid URL length limits)
       const batchSize = 100;
-      const findings: any[] = [];
+      const findingsBatches: PromiseLike<any>[] = [];
       for (let i = 0; i < sessionIds.length; i += batchSize) {
         const batch = sessionIds.slice(i, i + batchSize);
-        const { data, error: findingsError } = await supabaseAdmin
-          .from('intelligent_test_findings')
-          .select('finding_type, description, found_at')
-          .in('session_id', batch)
-          .order('found_at', { ascending: false });
-
+        findingsBatches.push(
+          supabaseAdmin
+            .from('intelligent_test_findings')
+            .select('finding_type, description, found_at')
+            .in('session_id', batch)
+            .order('found_at', { ascending: false })
+        );
+      }
+      const findingsResults = await Promise.all(findingsBatches);
+      const findings: any[] = [];
+      for (const { data, error: findingsError } of findingsResults) {
         if (findingsError) {
           logger.error('[PATTERNS] Failed to query findings batch', { error: findingsError.message });
         } else if (data) {
@@ -300,17 +315,21 @@ export class PatternsQueryService {
 
       const pageVisitIds = pageVisits.map(pv => pv.id);
 
-      // Get actions — query in batches if too many page visits
+      // Get actions — query in parallel batches if too many page visits
       const batchSize = 100;
-      const allActions: any[] = [];
-
+      const actionsBatches: PromiseLike<any>[] = [];
       for (let i = 0; i < pageVisitIds.length; i += batchSize) {
         const batch = pageVisitIds.slice(i, i + batchSize);
-        const { data: actions, error: actionsError } = await supabaseAdmin
-          .from('intelligent_test_actions')
-          .select('action_type, selector, success, created_at')
-          .in('page_visit_id', batch);
-
+        actionsBatches.push(
+          supabaseAdmin
+            .from('intelligent_test_actions')
+            .select('action_type, selector, success, created_at')
+            .in('page_visit_id', batch)
+        );
+      }
+      const actionsResults = await Promise.all(actionsBatches);
+      const allActions: any[] = [];
+      for (const { data: actions, error: actionsError } of actionsResults) {
         if (!actionsError && actions) {
           allActions.push(...actions);
         }
