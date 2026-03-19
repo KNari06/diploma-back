@@ -12,7 +12,6 @@ import { supabaseAdmin } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { logger } from '@/utils/core/logger';
-import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import path from 'path';
 
 // ── Constants ──────────────────────────────────────────────────────
