@@ -324,19 +324,27 @@ export class ChatService {
     }
 
     try {
-      // UPSERT to handle race condition: if two concurrent requests try to create
-      // a session for the same (user_id, workspace_id), only one will win.
-      // ignoreDuplicates: true = ON CONFLICT DO NOTHING, then we query afterward.
-      const { error: insertError } = await supabaseAdmin
+      // Guard: limit sessions per user per workspace (prevent abuse)
+      const { count: sessionCount } = await supabaseAdmin
         .from('chat_sessions')
-        .upsert(
-          {
-            user_id: userId,
-            workspace_id: workspaceId,
-            created_at: new Date().toISOString(),
-          },
-          { onConflict: 'user_id, workspace_id', ignoreDuplicates: true }
-        );
+        .select('id', { count: 'exact', head: true })
+        .eq('user_id', userId)
+        .eq('workspace_id', workspaceId);
+
+      if ((sessionCount ?? 0) >= 50) {
+        throw new Error('Maximum chat sessions reached (50). Please delete old sessions to create new ones.');
+      }
+
+      // Insert new session (multi-session: no unique constraint on user_id + workspace_id)
+      const { data, error: insertError } = await supabaseAdmin
+        .from('chat_sessions')
+        .insert({
+          user_id: userId,
+          workspace_id: workspaceId,
+          created_at: new Date().toISOString(),
+        })
+        .select('id')
+        .single();
 
       if (insertError) {
         logger.error('[CHAT_SERVICE] Failed to create chat session', {
@@ -348,46 +356,18 @@ export class ChatService {
         throw insertError;
       }
 
-      // Fetch the session (either just created or already existed due to race)
-      const { data, error: fetchError } = await supabaseAdmin
-        .from('chat_sessions')
-        .select('id')
-        .eq('user_id', userId)
-        .eq('workspace_id', workspaceId)
-        .order('created_at', { ascending: true })
-        .limit(1)
-        .maybeSingle();
-
-      if (fetchError) {
-        logger.error('[CHAT_SERVICE] Failed to fetch chat session after upsert', {
-          error: fetchError instanceof Error ? fetchError.message : String(fetchError),
-          userId,
-          workspaceId,
-        });
-        throw fetchError;
-      }
-
       if (!data || !data.id) {
-        logger.error('[CHAT_SERVICE] No session found after upsert', { userId, workspaceId });
         throw new Error('Failed to create chat session: no data returned');
       }
 
-      logger.info('[CHAT_SERVICE] Chat session ready', {
+      logger.info('[CHAT_SERVICE] Chat session created', {
         sessionId: data.id,
         userId,
         workspaceId,
       });
 
-      // Insert welcome message only if this is a newly created session
-      // (check by seeing if there are any messages yet)
-      const { count } = await supabaseAdmin
-        .from('chat_messages')
-        .select('id', { count: 'exact', head: true })
-        .eq('session_id', data.id);
-
-      if ((count ?? 0) === 0) {
-        await ChatService.insertWelcomeMessage(data.id, workspaceId);
-      }
+      // Insert welcome message for the new session
+      await ChatService.insertWelcomeMessage(data.id, workspaceId);
 
       return data.id;
 
