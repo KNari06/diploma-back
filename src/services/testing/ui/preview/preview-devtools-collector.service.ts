@@ -10,7 +10,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
-import { Page, CDPSession } from 'playwright';
+import { Page } from 'playwright';
 import type { Namespace } from 'socket.io';
 import type {
   PreviewConsoleEntry,
@@ -46,7 +46,7 @@ const DEVTOOLS_CONFIG = {
   ],
 
   // HTML/Accessibility
-  htmlMaxBytes: 2 * 1024 * 1024,        // 2MB max HTML size
+  htmlMaxBytes: 200 * 1024,              // 200KB max — larger causes React render freeze in <pre> tag
   accessibilityMaxNodes: 1000,          // Max accessibility nodes
 };
 
@@ -603,43 +603,54 @@ export async function fetchAccessibility(
   previewSessionId: string,
   domVersion: number
 ): Promise<PreviewAccessibilityUpdatePayload> {
-  let cdpSession: CDPSession | null = null;
-
   try {
-    const context = page.context();
-    cdpSession = await context.newCDPSession(page);
+    // Use Playwright's built-in accessibility snapshot API instead of raw CDP.
+    // Raw CDP (Accessibility.enable + getFullAXTree) creates a separate CDP session
+    // that can conflict with the video screencast CDP session, causing video to freeze.
+    const snapshot = await page.accessibility.snapshot({ interestingOnly: false });
 
-    // Enable Accessibility domain before querying (required by CDP protocol)
-    await cdpSession.send('Accessibility.enable');
+    if (!snapshot) {
+      return { previewSessionId, domVersion, tree: [], truncated: false };
+    }
 
-    // Get accessibility tree via CDP
-    const result = await cdpSession.send('Accessibility.getFullAXTree');
+    // Transform Playwright's tree format to our PreviewAccessibilityNode format
+    const tree: PreviewAccessibilityNode[] = [];
+    const maxNodes = DEVTOOLS_CONFIG.accessibilityMaxNodes;
 
-    // Transform to our format with depth limit
-    const tree = transformAccessibilityTree(result.nodes || [], DEVTOOLS_CONFIG.accessibilityMaxNodes);
+    const walk = (node: any): PreviewAccessibilityNode | null => {
+      if (tree.length >= maxNodes) return null;
+      const result: PreviewAccessibilityNode = {
+        role: String(node.role || 'unknown'),
+        name: node.name || undefined,
+        value: node.value || undefined,
+        description: node.description || undefined,
+      };
+      if (node.children && Array.isArray(node.children)) {
+        const children: PreviewAccessibilityNode[] = [];
+        for (const child of node.children) {
+          if (tree.length + children.length >= maxNodes) break;
+          const mapped = walk(child);
+          if (mapped) children.push(mapped);
+        }
+        if (children.length > 0) result.children = children;
+      }
+      tree.push(result);
+      return result;
+    };
 
-    await cdpSession.detach();
+    walk(snapshot);
 
     return {
       previewSessionId,
       domVersion,
       tree,
-      truncated: (result.nodes?.length || 0) > DEVTOOLS_CONFIG.accessibilityMaxNodes,
+      truncated: tree.length >= maxNodes,
     };
   } catch (error) {
     logger.warn('[PREVIEW_ACCESSIBILITY] Failed to fetch accessibility tree', {
       previewSessionId,
       error: error instanceof Error ? error.message : String(error),
     });
-
-    // Try to detach CDP session
-    if (cdpSession) {
-      try {
-        await cdpSession.detach();
-      } catch {
-        // Ignore
-      }
-    }
 
     return {
       previewSessionId,
