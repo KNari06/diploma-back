@@ -489,7 +489,7 @@ export async function handleGeneralChat(
   const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult] =
     await Promise.allSettled([
       // 1. KB search (non-fatal)
-      searchKB(message, projectId, { matchThreshold: 0.5, matchCount: 3 })
+      searchKB(message, projectId, { matchThreshold: 0.45, matchCount: 5 })
         .catch((err: Error) => {
           logger.warn('[GENERAL_CHAT] KB search failed, continuing without KB context', {
             error: err.message,
@@ -532,12 +532,20 @@ export async function handleGeneralChat(
   // ── Extract results (allSettled never rejects) ──
 
   let kbContext = '';
+  let kbSources: string[] = [];
   if (kbResult.status === 'fulfilled') {
     const kbResults = kbResult.value;
     if (kbResults.chunks.length > 0) {
-      kbContext = kbResults.chunks.map((chunk: any) => chunk.content).join('\n---\n');
+      kbContext = kbResults.chunks.map((chunk: any) => {
+        const source = chunk.source_file || chunk.file_name;
+        return source
+          ? `[Source: ${source}]\n${chunk.content}`
+          : chunk.content;
+      }).join('\n---\n');
+      kbSources = [...kbResults.sources.project, ...kbResults.sources.global];
       logger.info('[GENERAL_CHAT] KB search returned results', {
         chunksCount: kbResults.chunks.length,
+        sources: kbSources,
       });
     }
   }
@@ -720,7 +728,7 @@ You can still help with general questions, saved test cases, and test management
   if (kbContext) {
     messages.push({
       role: 'system',
-      content: `--- Knowledge Base ---\n${kbContext}\nUse this documentation for accurate, product-specific answers.`,
+      content: `--- Knowledge Base (Project Documentation) ---\n${kbContext}\n\nUse this documentation for accurate, product-specific answers. When referencing information from the KB, mention the source document name naturally (e.g., "According to your API docs..." or "Based on the requirements document...").`,
     });
   }
 

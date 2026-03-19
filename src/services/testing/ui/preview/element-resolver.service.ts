@@ -34,11 +34,12 @@ import type {
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { ELEMENT_RESOLVER_CONFIG } from '@/config/testing/playwright-tuning';
+import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 
 const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
 const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
 const MAX_CANDIDATES_FOR_LLM = ELEMENT_RESOLVER_CONFIG.maxCandidatesForLlm;
+const PREVIEW_VIEWPORT = PREVIEW_SESSION_CONFIG.viewport;
 
 /**
  * Action type to expected element tags mapping (HardAllowed filter)
@@ -745,6 +746,12 @@ export function buildCandidateText(node: InteractiveNode): string {
     parts.push(node.text);
   }
 
+  // Near text: row/sibling context for disambiguation of duplicate elements
+  // e.g. "Delete" button near "Anna Lee" → "near: Anna Lee, anna@mail.com"
+  if (node.nearText) {
+    parts.push(`near: ${node.nearText}`);
+  }
+
   // Structural hints (lower priority)
   if (node.autocomplete) {
     parts.push(`autocomplete: ${node.autocomplete}`);
@@ -775,6 +782,12 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Active layer hint (element is inside the foreground modal/popup/dropdown overlay)
   if (node.isInsideActiveModal) {
     parts.push('[active-layer]');
+  }
+
+  // Position hint — lets LLM understand spatial layout (overlays, drawers, dropdowns)
+  if (node.boundingBox) {
+    const bb = node.boundingBox;
+    parts.push(`@(${Math.round(bb.x)},${Math.round(bb.y)},${Math.round(bb.width)}x${Math.round(bb.height)})`);
   }
 
   // Phase 4: Custom component signals (rich text editor, framework buttons)
@@ -825,7 +838,7 @@ function buildSceneSummary(
     scenes.push(`"${label}" tab is selected`);
   }
 
-  // Detect active modal/popup layer
+  // Detect active modal/popup layer (from snapshot collector heuristics)
   const modalElements = candidates.filter(c => c.node.isInsideActiveModal === true);
   if (modalElements.length > 0) {
     scenes.push(`A modal/popup is open with ${modalElements.length} interactive elements`);
@@ -1076,7 +1089,7 @@ interface LlmSelectResult {
 
 const LLM_SELECT_SYSTEM_PROMPT = `You are an AI element selector for a browser testing tool.
 
-TASK: Given a user's intent (ANY language) and a list of candidate UI elements, select the SINGLE best matching element.
+TASK: Given a user's intent (ANY language) and a list of candidate UI elements with their positions, select the SINGLE best matching element.
 
 RULES:
 1. Match semantically, not literally. Cross-language matching is critical:
@@ -1098,28 +1111,51 @@ RULES:
    - "arrow" / "back" = "go back" / "navigate back"
    - "trash" / "delete icon" = "remove" / "delete item"
    - "pencil" / "edit icon" = "edit" / "modify"
-5. PAGE STATE AWARENESS: Use the PAGE STATE line and element state hints to understand the live page:
+5. SPATIAL LAYOUT AWARENESS: Each element has position @(x,y,widthxheight).
+   Use positions to understand the page layout and detect overlay layers:
+   - MODAL/DIALOG: group of elements clustered in the CENTER of the viewport
+   - DRAWER/SIDEBAR: group of elements clustered on the RIGHT or LEFT edge
+   - DROPDOWN/MENU: small group of elements appearing BELOW a trigger
+   - TOOLTIP/POPOVER: small cluster near a specific element
+   - TOAST/SNACKBAR: small element at TOP or BOTTOM edge
+   When an overlay is present, ALWAYS prefer elements INSIDE the overlay over background elements.
+   Overlay elements cluster together spatially and appear ON TOP of the main content.
+   Background elements are spread across the full page and are NOT the user's target.
+6. PAGE STATE AWARENESS: Use the PAGE STATE line and element state hints to understand the live page:
    - [expanded] = container/dropdown/menu is currently OPEN — its children are visible targets
    - [collapsed] = container is CLOSED — its children are NOT the target
    - [selected] = tab/option is currently active — content within is visible
-   - [active-layer] = element is inside the foreground modal/popup/overlay
+   - [active-layer] = element is inside the foreground modal/popup/overlay (if detected)
    When the user says "inside dropdown/menu/popup/dialog":
    - Find elements that are CHILDREN of an expanded/open container (check [container] prefixes)
    - Prefer [active-layer] elements over background elements
    - The trigger element (the one with [expanded]) is NOT the target — the content INSIDE is
-6. PARTIAL / ABBREVIATED DESCRIPTIONS: Users often shorten element descriptions:
+7. PARTIAL / ABBREVIATED DESCRIPTIONS: Users often shorten element descriptions:
    - Match the MOST SPECIFIC candidate, not the broadest
    - If a keyword appears in both a parent section/tab AND a child element, prefer the CHILD —
      users describe what they want to interact with, using the parent as scope
    - [Section > Subsection] prefixes are LOCATION context: "X inside Y" = find X within Y container
-7. DISAMBIGUATION when 2+ candidates share a keyword:
+8. DISAMBIGUATION when 2+ candidates share a keyword:
    - Prefer candidates with more context overlap with the intent
    - Prefer deeper-nested [A > B > C] elements over shallow [A] — more specific
    - Prefer action-oriented text ("Create", "Add", "Delete", "Edit") for click/hover actions
-   - Prefer elements inside [expanded] containers or [active-layer] over background elements
-8. If 2+ elements are equally valid, return alternatives (not a single pick)
-9. ONLY use refs from the provided list — never invent refs
-10. Respond ONLY with valid JSON, no markdown
+   - Prefer elements inside overlays or [active-layer] over background elements
+   - Use spatial position to disambiguate: if the intent mentions an element visible in an overlay, pick the overlay element
+9. DUPLICATE ELEMENTS: When multiple elements have the same label, they are marked [N of M].
+   Each duplicate has "near:" context showing neighboring text (row/card content).
+   - If the intent mentions context that matches ONE element's "near:" text → pick THAT one confidently
+   - "second delete" / "2nd remove" / "второй удалить" → pick [2 of M]
+   - "first/last" → pick [1 of M] / [M of M]
+   - If intent has NO context to distinguish duplicates → MUST return alternatives, NEVER guess
+10. HONEST CONFIDENCE — be accurate, not optimistic:
+   - 0.9-1.0: exact or near-exact text/semantic match, no ambiguity
+   - 0.7-0.9: strong semantic match but indirect (cross-language, abbreviation, partial match)
+   - 0.5-0.7: plausible match but uncertain (multiple candidates could fit)
+   - below 0.5: weak guess — return alternatives instead
+   NEVER return confidence > 0.8 when guessing between duplicates without distinguishing context
+11. If 2+ elements are equally valid, return alternatives (not a single pick)
+12. ONLY use refs from the provided list — never invent refs
+13. Respond ONLY with valid JSON, no markdown
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
@@ -1165,7 +1201,8 @@ async function selectElementWithLLM(params: {
 
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
-PAGE: ${pageUrl}${sceneContext}
+PAGE: ${pageUrl}
+VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
@@ -1552,6 +1589,24 @@ export async function resolveElement(params: {
   for (const node of allAllowed.slice(0, MAX_CANDIDATES_FOR_LLM)) {
     const candidateText = buildCandidateText(node);
     candidatesToProcess.push({ node, candidateText });
+  }
+
+  // Mark duplicate elements with [N of M] so LLM can disambiguate
+  // e.g. two "Delete" buttons → "Delete [1 of 2]", "Delete [2 of 2]"
+  const labelCounts = new Map<string, number>();
+  for (const c of candidatesToProcess) {
+    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    if (label) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+  }
+  // Only mark elements that appear more than once
+  const labelIndex = new Map<string, number>();
+  for (const c of candidatesToProcess) {
+    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    if (label && (labelCounts.get(label) || 0) > 1) {
+      const idx = (labelIndex.get(label) || 0) + 1;
+      labelIndex.set(label, idx);
+      c.candidateText += ` [${idx} of ${labelCounts.get(label)}]`;
+    }
   }
 
   // Compute page signature for cache

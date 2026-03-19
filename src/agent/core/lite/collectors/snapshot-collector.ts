@@ -1568,6 +1568,37 @@ export class SnapshotCollector {
               tabIndex: el.getAttribute('tabindex') !== null ? parseInt(el.getAttribute('tabindex') as string, 10) : undefined,
               hasOnclick: el.hasAttribute('onclick') || undefined,
               hasAriaHaspopup: el.hasAttribute('aria-haspopup') || undefined,
+
+              // Near text: collect text from sibling/row elements for disambiguation
+              // When multiple identical buttons exist (e.g. "Delete" in each table row),
+              // nearText provides row context so LLM can match "delete Anna Lee"
+              nearText: (() => {
+                try {
+                  // Strategy: walk up to nearest row-like container (tr, li, [role=row], article,
+                  // or parent with multiple similar children), then extract its text minus our element's text
+                  const ownText = (getReadableElementText(el) || '').slice(0, 30);
+                  let container: Element | null = el.parentElement;
+                  // Walk up max 4 levels to find a row-like container
+                  for (let depth = 0; depth < 4 && container; depth++) {
+                    const tag = container.tagName.toLowerCase();
+                    const role = container.getAttribute('role') || '';
+                    // Row-like containers: table row, list item, card, article, grid row
+                    if (tag === 'tr' || tag === 'li' || tag === 'article' || tag === 'section' ||
+                        role === 'row' || role === 'listitem' || role === 'article' ||
+                        container.classList.contains('card') || container.classList.contains('item') ||
+                        container.classList.contains('row')) {
+                      break;
+                    }
+                    container = container.parentElement;
+                  }
+                  if (!container) return undefined;
+                  const containerText = getReadableElementText(container).slice(0, 120);
+                  if (!containerText || containerText === ownText) return undefined;
+                  // Remove own text from container text to get sibling context
+                  const context = containerText.replace(ownText, '').replace(/\s+/g, ' ').trim();
+                  return context.length > 3 ? context.slice(0, 80) : undefined;
+                } catch { return undefined; }
+              })(),
             });
           } catch (err) {
             // Skip element if any error

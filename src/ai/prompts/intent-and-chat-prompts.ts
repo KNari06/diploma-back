@@ -528,6 +528,13 @@ Tool chains:
 • For coverage insights: qa_list_test_cases + qa_list_page_visits → identify gaps${projectId ? `\n• **Current project: ${projectName ? `"${projectName}" (${projectId})` : projectId}** — ALWAYS use this project_id. NEVER ask the user for it.\n• Zero results → mention project name${projectName ? ` ("${projectName}")` : ''} so user can verify.` : ''}`;
   }
 
+  // Add KB instructions
+  prompt += `\n\n--- KNOWLEDGE BASE ---
+The user's uploaded documents (PDF, DOCX, TXT, MD) are automatically searched on every message. Relevant excerpts appear in a "Knowledge Base" section above.
+• When KB context is present — use it to give accurate, product-specific answers. Mention the source document naturally (e.g., "According to your API docs...", "Based on the requirements document...").
+• When KB context is NOT present or insufficient — use the kb_search tool with a focused query to find specific information. Do NOT say "I don't have that information" without trying kb_search first.
+• When kb_search returns no results — tell the user clearly and suggest uploading relevant documents to the Knowledge Base.`;
+
   // Add memory instructions
   prompt += `\n\n--- MEMORY ---
 Persistent workspace memory: remember_fact (save facts/preferences), search_memory (recall), forget_fact (remove outdated). Use naturally during conversation.`;

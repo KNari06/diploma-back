@@ -119,6 +119,8 @@ export interface InteractiveNode {
   hasOnclick?: boolean;
   /** Phase 4: Element has aria-haspopup attribute (popup trigger) */
   hasAriaHaspopup?: boolean;
+  /** Nearby sibling/row text for disambiguation of duplicate elements (e.g. row context in tables) */
+  nearText?: string;
 }
 
 /**
