@@ -46,7 +46,7 @@ const DEVTOOLS_CONFIG = {
   ],
 
   // HTML/Accessibility
-  htmlMaxBytes: 200 * 1024,              // 200KB max — larger causes React render freeze in <pre> tag
+  htmlMaxBytes: 30 * 1024,               // 30KB max — larger causes React render freeze in <pre> tag
   accessibilityMaxNodes: 1000,          // Max accessibility nodes
 };
 
