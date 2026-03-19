@@ -22,6 +22,7 @@ export function calculateRequiredCredits(
     'mobile-safari': 2,
     'mobile-android': 3,
     'mobile-ios': 3,
+    'mobile-flutter': 3,
   };
 
   // 1. Calculate base browser cost
