@@ -15,6 +15,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { Job } from 'bullmq';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
+import { generateEmbeddings } from '@/services/ai/core/embedding.service';
 
 /** Credits charged for generating a bug report when bugs are found */
 const BUG_REPORT_CREDITS = 5;
@@ -179,6 +180,9 @@ export class AIAnalysisJobHandler {
       // Auto-extract bug patterns to workspace memory for agent learning
       await this.extractBugPatterns(testId, testResult, aiSummary);
 
+      // Send feedback to source Jira issue (if triggered from Jira QA orchestrator)
+      await this.sendJiraFeedback(testId, testResultId, testResult, aiSummary);
+
       logger.info(`[AI-ANALYSIS] Analysis completed successfully: ${testResultId}`);
       logAIAnalysis(testId, aiSummary);
 
@@ -334,6 +338,7 @@ export class AIAnalysisJobHandler {
             url,
             project_id,
             user_id,
+            options,
             projects (
               workspace_id
             )
@@ -623,9 +628,27 @@ export class AIAnalysisJobHandler {
         status: 'new' as const,
       }));
 
+      // Generate embeddings for semantic search (non-fatal)
+      let findingsToInsert = findings as Array<(typeof findings)[0] & { embedding?: string | null }>;
+      try {
+        const embeddingTexts = findings.map(f =>
+          [f.title, f.description].filter(Boolean).join(' — ')
+        );
+        const embeddings = await generateEmbeddings(embeddingTexts);
+        findingsToInsert = findings.map((f, i) => ({
+          ...f,
+          embedding: embeddings[i] ? JSON.stringify(embeddings[i]) : null,
+        }));
+      } catch (embError) {
+        logger.warn('[AI-ANALYSIS] Failed to generate finding embeddings (non-fatal)', {
+          testId,
+          error: embError instanceof Error ? embError.message : String(embError),
+        });
+      }
+
       const { error: insertError } = await dbAdminService.supabaseAdmin
         .from('intelligent_test_findings')
-        .insert(findings);
+        .insert(findingsToInsert);
 
       if (insertError) {
         logger.warn('[AI-ANALYSIS] Failed to insert bug pattern findings', {
@@ -642,6 +665,57 @@ export class AIAnalysisJobHandler {
       });
     } catch (error) {
       logger.warn('[AI-ANALYSIS] Failed to extract bug patterns (non-fatal)', {
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Send feedback to source Jira issue if test was triggered from Jira QA orchestrator.
+   * Non-fatal: errors logged but not thrown.
+   */
+  private static async sendJiraFeedback(
+    testId: string,
+    testResultId: string,
+    testResult: any,
+    aiSummary: any,
+  ): Promise<void> {
+    try {
+      const test = testResult?.tests;
+      const metadata = (test as any)?.options?.metadata;
+      if (!metadata?.sourceJiraIssueKey || !metadata?.sourceJiraCloudId) return;
+
+      const { JiraFeedbackService } = await import(
+        '@/services/integrations/jira-feedback.service'
+      );
+
+      const bugs = (aiSummary?.bugs || []).map((b: any) => ({
+        severity: b.severity || 'medium',
+        title: b.message || b.description || 'Unknown issue',
+      }));
+
+      await JiraFeedbackService.sendTestFeedback({
+        testId,
+        testResultId,
+        sourceJiraIssueKey: metadata.sourceJiraIssueKey,
+        sourceJiraCloudId: metadata.sourceJiraCloudId,
+        userId: test.user_id,
+        projectId: test.project_id,
+        testPassed: bugs.length === 0,
+        bugs,
+        summary: aiSummary?.summary || '',
+        confidence: aiSummary?.confidence || 0,
+        testUrl: test.url,
+      });
+
+      logger.info('[AI-ANALYSIS] Jira feedback sent to source issue', {
+        testId,
+        issueKey: metadata.sourceJiraIssueKey,
+        bugsCount: bugs.length,
+      });
+    } catch (error) {
+      logger.warn('[AI-ANALYSIS] Jira feedback failed (non-fatal)', {
         testId,
         error: error instanceof Error ? error.message : String(error),
       });

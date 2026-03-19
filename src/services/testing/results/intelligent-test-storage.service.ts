@@ -1,5 +1,6 @@
 import type { ActionResult, DynamicAction, IntelligentTestResult, PageVisit } from '@/agent/types/intelligent-testing.types';
 import { supabaseAdmin } from '@/db/supabase';
+import { generateEmbeddings } from '@/services/ai/core/embedding.service';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -342,9 +343,29 @@ export class IntelligentTestStorageService {
           };
         });
 
+      // Generate embeddings for semantic search (non-fatal)
+      let recordsToInsert = findingRecords as Array<(typeof findingRecords)[0] & { embedding?: string | null }>;
+      try {
+        if (findingRecords.length > 0) {
+          const embeddingTexts = findingRecords.map(f =>
+            [f.title, f.description].filter(Boolean).join(' — ')
+          );
+          const embeddings = await generateEmbeddings(embeddingTexts);
+          recordsToInsert = findingRecords.map((f, i) => ({
+            ...f,
+            embedding: embeddings[i] ? JSON.stringify(embeddings[i]) : null,
+          }));
+        }
+      } catch (embError) {
+        logger.warn('[INTELLIGENT_STORAGE] Failed to generate finding embeddings (non-fatal)', {
+          sessionId,
+          error: embError instanceof Error ? embError.message : String(embError),
+        });
+      }
+
       const { error } = await supabaseAdmin
         .from('intelligent_test_findings')
-        .insert(findingRecords);
+        .insert(recordsToInsert);
 
       if (error) {
         logger.error('[INTELLIGENT_STORAGE] Failed to save findings', { error });

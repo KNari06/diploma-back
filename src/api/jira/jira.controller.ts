@@ -815,6 +815,10 @@ export interface JiraSyncSettings {
   projectKey?: string;
   /** Status name to move issue to when sending back to rework (e.g. "To Do", "Rework") */
   reworkStatusName?: string;
+  /** Status to transition source issue to when test PASSES (e.g. "Done", "Verified") */
+  doneStatusName?: string;
+  /** Status to transition source issue to when test FAILS / has bugs (e.g. "In Progress", "Reopened") */
+  failStatusName?: string;
 }
 
 /**
@@ -878,6 +882,8 @@ export const getJiraSettings = async (req: Request, res: Response): Promise<void
       autoSyncIssues: jira.autoSyncIssues ?? true,
       projectKey: jira.projectKey || undefined,
       reworkStatusName: jira.reworkStatusName || undefined,
+      doneStatusName: jira.doneStatusName || undefined,
+      failStatusName: jira.failStatusName || undefined,
     };
 
     res.json({ success: true, data: settings, projectId: resolvedId });
@@ -895,7 +901,7 @@ export const getJiraSettings = async (req: Request, res: Response): Promise<void
 export const updateJiraSettings = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const { projectId, workspaceId, syncOnCreate, autoSyncIssues, projectKey, reworkStatusName } = req.body;
+    const { projectId, workspaceId, syncOnCreate, autoSyncIssues, projectKey, reworkStatusName, doneStatusName, failStatusName } = req.body;
 
     const resolvedId = await resolveProjectId(
       userId,
@@ -928,6 +934,8 @@ export const updateJiraSettings = async (req: Request, res: Response): Promise<v
     if (typeof autoSyncIssues === 'boolean') updates.autoSyncIssues = autoSyncIssues;
     if (projectKey !== undefined) updates.projectKey = projectKey ? String(projectKey).trim() : undefined;
     if (reworkStatusName !== undefined) updates.reworkStatusName = reworkStatusName ? String(reworkStatusName).trim() : undefined;
+    if (doneStatusName !== undefined) updates.doneStatusName = doneStatusName ? String(doneStatusName).trim() : undefined;
+    if (failStatusName !== undefined) updates.failStatusName = failStatusName ? String(failStatusName).trim() : undefined;
 
     const newSettings = {
       ...currentSettings,
@@ -980,17 +988,33 @@ export const qaAnalyze = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    const trimmedProjectId = String(projectId).trim();
+
     const settings = await JiraQaOrchestratorService.getProjectJiraQaSettings(
-      String(projectId).trim(),
+      trimmedProjectId,
       userId
     );
 
+    // Resolve workspaceId for context enrichment (non-fatal)
+    let workspaceId: string | undefined;
+    try {
+      const { data: proj } = await supabaseAdmin
+        .from('projects')
+        .select('workspace_id')
+        .eq('id', trimmedProjectId)
+        .maybeSingle();
+      workspaceId = proj?.workspace_id || undefined;
+    } catch (err) {
+      logger.warn('[JIRA_QA] Failed to resolve workspaceId', { projectId: trimmedProjectId, err });
+    }
+
     const result = await JiraQaOrchestratorService.analyzeAndExecute({
       issueKey: String(issueKey).trim(),
-      projectId: String(projectId).trim(),
+      projectId: trimmedProjectId,
       userId,
       cloudId: cloudId ? String(cloudId).trim() : undefined,
       reworkStatusName: settings.reworkStatusName,
+      workspaceId,
     });
 
     if (!result.success && result.error) {

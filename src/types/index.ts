@@ -43,7 +43,11 @@ export interface TestRunRequest {
     /** Intent test case name */
     intentTestCaseName?: string;
     /** Source of the test run */
-    source?: 'intent_test_case' | 'chat' | 'api' | 'manual';
+    source?: 'intent_test_case' | 'chat' | 'api' | 'manual' | 'jira_qa_orchestrator';
+    /** Jira issue key that triggered this test (for feedback loop) */
+    sourceJiraIssueKey?: string;
+    /** Jira cloud ID for the source issue */
+    sourceJiraCloudId?: string;
     /** Any additional custom data */
     [key: string]: any;
   };
