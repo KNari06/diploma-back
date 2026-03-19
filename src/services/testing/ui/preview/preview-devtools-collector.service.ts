@@ -609,6 +609,9 @@ export async function fetchAccessibility(
     const context = page.context();
     cdpSession = await context.newCDPSession(page);
 
+    // Enable Accessibility domain before querying (required by CDP protocol)
+    await cdpSession.send('Accessibility.enable');
+
     // Get accessibility tree via CDP
     const result = await cdpSession.send('Accessibility.getFullAXTree');
 
