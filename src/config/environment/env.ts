@@ -143,6 +143,12 @@ const envSchema = z.object({
   // Email / SMTP
   SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
 
+  // Email Inbox (IMAP for test email reception — catch-all inbox)
+  IMAP_HOST: z.string().default('imap.gmail.com'),
+  IMAP_PORT: z.string().transform(Number).default('993'),
+  IMAP_USER: z.string().optional(),       // inbox@qait.dev (catch-all account)
+  IMAP_PASSWORD: z.string().optional(),   // App Password for IMAP access
+
   // Integrations
   JIRA_CLIENT_ID: z.string().optional(),
   JIRA_CLIENT_SECRET: z.string().optional(),

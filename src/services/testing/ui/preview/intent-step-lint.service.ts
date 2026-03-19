@@ -80,6 +80,8 @@ const ACTION_TO_ELEMENT_TYPES: Record<string, string[]> = {
   ai_check: [],
   // V5: URL wait
   wait_for: [],
+  // V12: Email inbox (no element target)
+  wait_for_email: [],
   // V6: File upload — includes trigger elements (button/label/div) since real file input is often hidden
   upload: ['input', 'button', 'label', 'div', 'span'],
   // V10: Advanced interaction types
@@ -1260,7 +1262,7 @@ export function isEvidenceShortcutNodeCompatible(
 ): { ok: boolean; reason?: string } {
   // Evidence shortcut is only meaningful for actions that target a specific element.
   // For non-targeting actions, accept by default.
-  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for' || step.type === 'ai_check') {
+  if (step.type === 'navigate' || step.type === 'wait' || step.type === 'wait_for' || step.type === 'ai_check' || step.type === 'wait_for_email') {
     return { ok: true };
   }
 

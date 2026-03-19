@@ -54,6 +54,15 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     pressEnter?: boolean;
     /** V11: Expected outcome for 4xx detection (default: 'success') */
     expectedOutcome?: ExpectedStepOutcome;
+    /** V12: Email filter for wait_for_email step */
+    emailFilter?: {
+      subject?: string;
+      from?: string;
+      extractPrompt: string;
+      extractVariable: string;
+    };
+    /** V12: Timeout override for wait_for_email */
+    emailTimeoutMs?: number;
   };
 }
 
@@ -98,6 +107,9 @@ function mapActionType(intentAction: IntentActionType): string {
     // V5: URL wait
     case 'wait_for':
       return 'waitFor'; // SPA-safe URL waiting
+    // V12: Email inbox
+    case 'wait_for_email':
+      return 'waitForEmail'; // IMAP polling + AI extraction
     // V6: File upload
     case 'upload':
       return 'upload';
@@ -199,6 +211,11 @@ export function convertIntentStepToCommand(
         assertionText: step.assertionText,
         aiContextMode: step.options?.aiContextMode || 'html+a11y+screenshot',
       }),
+      // V12: Email inbox metadata
+      ...(step.type === 'wait_for_email' && step.options?.emailFilter && {
+        emailFilter: step.options.emailFilter,
+        emailTimeoutMs: step.options.timeout,
+      }),
       // Iframe metadata (if step is within an iframe)
       ...(step.options?.iframe?.selector && {
         iframeSelector: step.options.iframe.selector,
@@ -286,6 +303,11 @@ export function convertIntentStepToCommand(
           timeoutMs: step.options.urlMatcher.timeoutMs ?? 15000,
         };
       }
+      break;
+
+    case 'wait_for_email':
+      // V12: Email inbox — emailFilter is passed through intentMeta
+      // Actual execution handled in preview-step-apply.service.ts (early return path)
       break;
 
     case 'scroll':

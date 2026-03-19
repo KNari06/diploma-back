@@ -2140,6 +2140,89 @@ export class CommandExecutor {
           break;
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // V12: WAIT FOR EMAIL (IMAP polling + AI extraction)
+        // ═══════════════════════════════════════════════════════════════
+        case 'waitForEmail': {
+          logger.info('[COMMAND_EXECUTOR] Executing waitForEmail', {
+            stepId: isIntentCommand ? intentCommand.intentMeta?.stepId : undefined,
+          });
+
+          if (!isIntentCommand) {
+            throw new Error('waitForEmail requires intent command with intentMeta');
+          }
+
+          const emailFilter = intentCommand.intentMeta?.emailFilter;
+          if (!emailFilter?.extractPrompt || !emailFilter?.extractVariable) {
+            throw new Error('waitForEmail requires intentMeta.emailFilter with extractPrompt and extractVariable');
+          }
+
+          try {
+            const { EmailInboxService } = await import('@/services/testing/email-inbox/email-inbox.service');
+
+            if (!EmailInboxService.isConfigured()) {
+              throw new Error('Email inbox not configured. Set IMAP_USER and IMAP_PASSWORD.');
+            }
+
+            // Generate inbox address using step ID for uniqueness
+            const testRunId = intentCommand.intentMeta?.stepId || `run-${Date.now()}`;
+            const recipient = EmailInboxService.generateAddress(testRunId);
+
+            const timeoutMs = intentCommand.intentMeta?.emailTimeoutMs ?? 60_000;
+
+            const extractionResult = await EmailInboxService.waitForEmail({
+              recipient,
+              filter: {
+                subject: emailFilter.subject,
+                from: emailFilter.from,
+              },
+              extractPrompt: emailFilter.extractPrompt,
+              extractVariable: emailFilter.extractVariable,
+              timeoutMs,
+            });
+
+            // Store extracted value for subsequent step interpolation
+            if (extractionResult.value) {
+              this.extractedData.set(`email.${emailFilter.extractVariable}`, extractionResult.value);
+            }
+
+            // Record success in runtime meta
+            if (intentCommand.intentMeta?.stepId) {
+              this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {
+                runtimeStatus: extractionResult.value ? 'executed' : 'failed',
+                source: 'resolver',
+                confidenceTier: extractionResult.confidence >= 0.85 ? 'high' :
+                                extractionResult.confidence >= 0.6 ? 'medium' : 'low',
+                failedReason: extractionResult.value ? undefined : 'unknown',
+                failureExplanation: extractionResult.value ? undefined : extractionResult.reasoning,
+              });
+            }
+
+            if (!extractionResult.value) {
+              throw new Error(`Email extraction returned empty value: ${extractionResult.reasoning}`);
+            }
+
+            logger.info('[COMMAND_EXECUTOR] waitForEmail succeeded', {
+              extractVariable: emailFilter.extractVariable,
+              valueLength: extractionResult.value.length,
+              confidence: extractionResult.confidence,
+            });
+          } catch (error) {
+            if (isIntentCommand && intentCommand.intentMeta?.stepId) {
+              this.stepRuntimeMeta.set(intentCommand.intentMeta.stepId, {
+                runtimeStatus: 'failed',
+                source: 'resolver',
+                confidenceTier: 'low',
+                failedReason: 'unknown',
+                failureExplanation: error instanceof Error ? error.message : String(error),
+              });
+            }
+            throw error;
+          }
+
+          break;
+        }
+
         default:
           throw new Error(`Unknown action: ${action}`);
       }
@@ -3889,6 +3972,7 @@ export class CommandExecutor {
       case 'waitForNavigation':
       case 'waitForLoadState':
       case 'waitFor': // V5: SPA-safe URL waiting (no selector needed)
+      case 'waitForEmail': // V12: Email inbox polling (no selector needed)
         logger.warn('[COMMAND_EXECUTOR] Navigation action in self-healing - no selector needed', {
           actionType,
         });

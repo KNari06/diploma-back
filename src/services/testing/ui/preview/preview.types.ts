@@ -169,7 +169,9 @@ export type IntentActionType =
   // V10: Advanced interaction types (recording)
   | 'dblclick'
   | 'contextmenu'
-  | 'drag_and_drop';
+  | 'drag_and_drop'
+  // V12: Email inbox (wait for email, extract OTP/link via AI)
+  | 'wait_for_email';
 
 /**
  * Binding hints for element resolution
@@ -414,6 +416,20 @@ export interface StepOptions {
     envVar?: string;
     /** Max file size in bytes (default: 50MB) */
     maxSizeBytes?: number;
+  };
+  /**
+   * V12: Email filter for wait_for_email step.
+   * Configures which email to wait for and what to extract.
+   */
+  emailFilter?: {
+    /** Subject substring to match (case-insensitive) */
+    subject?: string;
+    /** Sender email address to match */
+    from?: string;
+    /** AI extraction prompt, e.g. "Extract the 6-digit OTP code" */
+    extractPrompt: string;
+    /** Variable name to store extracted value — accessible as {{email.<variable>}} in subsequent steps */
+    extractVariable: string;
   };
 }
 
@@ -673,6 +689,8 @@ export const COMPILED_TTL_MS: Record<string, number> = {
   uncheck: 14 * 24 * 60 * 60 * 1000,  // 14 days
   hover: 14 * 24 * 60 * 60 * 1000,    // 14 days
   upload: 14 * 24 * 60 * 60 * 1000,  // 14 days
+  // V12: Email inbox (short TTL — email-dependent steps are volatile)
+  wait_for_email: 7 * 24 * 60 * 60 * 1000,  // 7 days
   default: 14 * 24 * 60 * 60 * 1000,  // 14 days
 };
 
