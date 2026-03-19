@@ -729,9 +729,9 @@ export class PreviewRunService {
               const nextStep = steps[i + 1];
               try {
                 const lookahead = await waitForStepReadiness(session.page, nextStep, {
-                  maxWaitMs: 5000,
-                  settleMs: 1500,
-                  autoWaitThresholdMs: 1000,
+                  maxWaitMs: 3000,
+                  settleMs: 800,
+                  autoWaitThresholdMs: 600,
                 });
 
                 if (lookahead.autoWaitApplied) {
@@ -945,9 +945,9 @@ export class PreviewRunService {
                   const nextStep = steps[i + 1];
                   try {
                     await waitForStepReadiness(session.page, nextStep, {
-                      maxWaitMs: 5000,
-                      settleMs: 1500,
-                      autoWaitThresholdMs: 1000,
+                      maxWaitMs: 3000,
+                      settleMs: 800,
+                      autoWaitThresholdMs: 600,
                     });
                   } catch {
                     // Lookahead failure is non-fatal

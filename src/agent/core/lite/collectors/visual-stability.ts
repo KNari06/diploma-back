@@ -21,7 +21,7 @@ export class VisualStability {
   /**
    * Wait for page to become visually stable
    * Checks element count at intervals - if unchanged, page is stable
-   * ✅ FIX: Hard timeout (3 seconds max) to prevent hanging on infinite animations
+   * ✅ FIX: Hard timeout (1.5 seconds max) to prevent hanging on infinite animations
    * ✅ V6: Streaming/SSE awareness — monotonic low-rate growth = "streaming stable"
    *
    * @param page - Playwright page instance
@@ -36,8 +36,8 @@ export class VisualStability {
     }
   ): Promise<void> {
     const interval = options?.checkInterval ?? 150; // 150ms between checks
-    const maxAttempts = options?.maxAttempts ?? 5;  // Max 5 attempts (750ms total)
-    const hardTimeout = 3000; // ✅ FIX: Absolute max wait time (3s)
+    const maxAttempts = options?.maxAttempts ?? 3;  // Max 3 attempts (450ms total) — reduced from 5 for faster snapshots
+    const hardTimeout = 1500; // Reduced from 3s — 1.5s is enough for most SPA re-renders
 
     try {
       // ✅ FIX: Set hard timeout to prevent hanging on infinite animations
@@ -97,7 +97,7 @@ export class VisualStability {
       const result = await Promise.race([stabilityPromise, timeoutPromise]);
 
       if (result === 'timeout') {
-        logger.warn('[VISUAL_STABILITY] Hard timeout reached (3s), proceeding anyway', {
+        logger.warn('[VISUAL_STABILITY] Hard timeout reached, proceeding anyway', {
           hardTimeout,
           reason: 'Page may have infinite animations (loader, cursor, etc.)',
         });

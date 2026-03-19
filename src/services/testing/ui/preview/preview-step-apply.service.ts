@@ -6,6 +6,7 @@
 
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import type { FrameLocator, Locator, Page } from 'playwright';
 import { sanitizeIntent } from './element-resolver.service';
 import { IntentStepLintService } from './intent-step-lint.service';
@@ -107,6 +108,29 @@ function randomIntInclusive(min: number, max: number): number {
   const hi = Math.floor(max);
   if (hi <= lo) return lo;
   return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+/**
+ * Classify navigation errors into user-friendly messages.
+ * Replaces raw Playwright TimeoutError with actionable descriptions.
+ */
+function classifyNavigationError(error: Error, url: string): string {
+  const msg = error.message.toLowerCase();
+  if (msg.includes('net::err_name_not_resolved'))
+    return `Domain not found — check the URL: ${url}`;
+  if (msg.includes('net::err_connection_refused'))
+    return `Connection refused — the site may be down: ${url}`;
+  if (msg.includes('net::err_connection_timed_out'))
+    return `Connection timed out — the server is not responding: ${url}`;
+  if (msg.includes('net::err_cert') || msg.includes('net::err_ssl'))
+    return `SSL certificate error for: ${url}`;
+  if (msg.includes('net::err_internet_disconnected') || msg.includes('net::err_network'))
+    return `Network error — check your internet connection`;
+  if (msg.includes('net::err_aborted'))
+    return `Navigation was aborted: ${url}`;
+  if (msg.includes('timeout'))
+    return `Site did not finish loading within timeout. The website may be slow or unresponsive: ${url}`;
+  return error.message;
 }
 
 /**
@@ -1002,7 +1026,15 @@ async function executeAction(
       case 'navigate': {
         if (!step.value) throw new Error('No URL for navigate action');
         const safeUrl = sanitizeUrl(step.value);
-        await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
+        try {
+          await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
+        } catch (navError) {
+          // Classify navigation error into user-friendly message
+          throw new Error(classifyNavigationError(
+            navError instanceof Error ? navError : new Error(String(navError)),
+            safeUrl,
+          ));
+        }
         break;
       }
 
@@ -1309,8 +1341,45 @@ export class PreviewStepApplyService {
         // V5: Capture URL BEFORE action for accurate compiled context
         // This is important for auto-wait-for-url injection which compares adjacent pageUrls
         const urlBeforeAction = page.url();
-        
-        const result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+
+        // ── Progress events for navigate (slow site feedback) ──
+        let navProgressInterval: ReturnType<typeof setInterval> | null = null;
+        if (stepDraft.type === 'navigate') {
+          const navStart = Date.now();
+          const navUrl = stepDraft.value || '';
+          navProgressInterval = setInterval(() => {
+            const elapsed = Date.now() - navStart;
+            if (elapsed >= 5000) {
+              webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+                previewSessionId, phase: 'navigating' as const, url: navUrl, elapsedMs: elapsed,
+              });
+            }
+          }, 3000);
+        }
+
+        let result;
+        try {
+          result = await executeAction(page, stepDraft, { label: '', reason: '', confidence: 1 });
+          // Emit complete phase for navigate
+          if (stepDraft.type === 'navigate') {
+            const navUrl = stepDraft.value || '';
+            webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+              previewSessionId, phase: 'complete' as const, url: navUrl, elapsedMs: Date.now() - (navProgressInterval ? Date.now() : 0),
+            });
+          }
+        } catch (navErr) {
+          // Emit error phase for navigate
+          if (stepDraft.type === 'navigate') {
+            const navUrl = stepDraft.value || '';
+            webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+              previewSessionId, phase: 'error' as const, url: navUrl, elapsedMs: 0,
+              error: navErr instanceof Error ? navErr.message : String(navErr),
+            });
+          }
+          throw navErr;
+        } finally {
+          if (navProgressInterval) clearInterval(navProgressInterval);
+        }
 
         // Generate compiled plan for non-targeting actions
         // Use urlBeforeAction to record the context where action was initiated

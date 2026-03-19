@@ -71,6 +71,98 @@ async function waitForDOMStability(page: Page, maxWaitMs = 3000, stabilityMs = 8
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NAVIGATION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Threshold before emitting progress events (don't spam for fast sites) */
+const SLOW_LOAD_THRESHOLD_MS = 5000;
+/** Interval between progress event emissions */
+const PROGRESS_EMIT_INTERVAL_MS = 3000;
+
+/**
+ * Navigate to URL with WebSocket progress events for slow loads.
+ * Emits 'preview:loading' events every 3s after 5s threshold.
+ * Replaces raw page.goto with user-visible progress feedback.
+ */
+async function navigateWithProgress(
+  page: Page,
+  url: string,
+  previewSessionId: string,
+  opts: { waitUntil: 'load' | 'domcontentloaded' | 'networkidle' | 'commit'; timeout: number },
+): Promise<void> {
+  const start = Date.now();
+  let phase: 'navigating' | 'dom_ready' | 'stabilizing' | 'complete' | 'error' = 'navigating';
+
+  // Emit progress every PROGRESS_EMIT_INTERVAL_MS, but only after SLOW_LOAD_THRESHOLD_MS
+  const interval = setInterval(() => {
+    const elapsed = Date.now() - start;
+    if (elapsed >= SLOW_LOAD_THRESHOLD_MS) {
+      webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+        previewSessionId, phase, url, elapsedMs: elapsed,
+      });
+    }
+  }, PROGRESS_EMIT_INTERVAL_MS);
+
+  try {
+    await page.goto(url, opts as any);
+    phase = 'complete';
+  } catch (error) {
+    phase = 'error';
+    const elapsed = Date.now() - start;
+    const originalError = error instanceof Error ? error : new Error(String(error));
+    const friendlyError = classifyNavigationError(originalError, url);
+    // Log original error for server-side debugging (stack trace preserved)
+    logger.warn('[PREVIEW_SESSION] Navigation failed', {
+      url, elapsed, friendlyError, originalError: originalError.message,
+    });
+    webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+      previewSessionId, phase, url, elapsedMs: elapsed, error: friendlyError,
+    });
+    // Re-throw with friendly message (original stack in logs above)
+    throw new Error(friendlyError);
+  } finally {
+    clearInterval(interval);
+    // Emit final complete event (only if not error — error already emitted above)
+    if (phase === 'complete') {
+      webSocketService.emitToRoom('preview', previewSessionId, 'preview:loading', {
+        previewSessionId, phase, url, elapsedMs: Date.now() - start,
+      });
+    }
+  }
+}
+
+/**
+ * Classify navigation errors into user-friendly messages.
+ * Replaces raw Playwright TimeoutError with actionable descriptions.
+ */
+function classifyNavigationError(error: Error, url: string): string {
+  const msg = error.message.toLowerCase();
+
+  if (msg.includes('net::err_name_not_resolved'))
+    return `Domain not found — check the URL: ${url}`;
+
+  if (msg.includes('net::err_connection_refused'))
+    return `Connection refused — the site may be down: ${url}`;
+
+  if (msg.includes('net::err_connection_timed_out'))
+    return `Connection timed out — the server is not responding: ${url}`;
+
+  if (msg.includes('net::err_cert') || msg.includes('net::err_ssl'))
+    return `SSL certificate error for: ${url}`;
+
+  if (msg.includes('net::err_internet_disconnected') || msg.includes('net::err_network'))
+    return `Network error — check your internet connection`;
+
+  if (msg.includes('net::err_aborted'))
+    return `Navigation was aborted: ${url}`;
+
+  if (msg.includes('timeout'))
+    return `Site did not finish loading within timeout. The website may be slow or unresponsive: ${url}`;
+
+  return error.message;
+}
+
 /**
  * Sanitize Playwright close errors.
  * Playwright sometimes appends huge Chromium "Browser logs" to the error message.
@@ -350,6 +442,9 @@ export class PreviewSessionService {
 
         page = await context.newPage();
 
+        // Generate session ID early (needed for progress events during navigation)
+        const sessionId = `preview_${randomUUID()}`;
+
         // Block third-party requests to prevent slow networkidle waits
         try {
           await setupThirdPartyBlocker(page);
@@ -357,8 +452,12 @@ export class PreviewSessionService {
           // Non-fatal: preview should work without blocker
         }
 
-        // Navigate to start URL
-        await page.goto(safeStartUrl, {
+        // Navigate to start URL (with progress events for slow sites)
+        // NOTE: Client hasn't joined WebSocket room yet at this point, so progress events
+        // during initial load are best-effort (lost if no subscriber). This is acceptable
+        // because frontend shows its own HTTP loading spinner. Progress events are mainly
+        // useful for navigate steps during runtime when client IS subscribed.
+        await navigateWithProgress(page, safeStartUrl, sessionId, {
           waitUntil: 'domcontentloaded',
           timeout: 30000,
         });
@@ -372,9 +471,6 @@ export class PreviewSessionService {
         // Collect initial snapshot (skip stability wait — already done above via waitForDOMStability)
         const snapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
         const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
-
-        // Generate session ID
-        const sessionId = `preview_${randomUUID()}`;
 
         // Compute initial page signature
         const initialUrl = page.url();
