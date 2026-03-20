@@ -384,6 +384,31 @@ export class IntegrationTokenService {
   }
 
   /**
+   * Get a compact summary of connected/not-connected integrations for AI context injection.
+   * Non-fatal: returns empty string on any error.
+   */
+  static async getIntegrationSummary(userId: string, workspaceId?: string): Promise<string> {
+    const ALL_PROVIDERS: IntegrationProvider[] = ['jira', 'github', 'gitlab', 'notion', 'trello', 'slack', 'telegram'];
+    try {
+      const tokens = await this.listConnectedIntegrations(userId, workspaceId);
+      const connectedProviders = new Set(tokens.map(t => t.provider));
+
+      const connected = ALL_PROVIDERS.filter(p => connectedProviders.has(p));
+      const notConnected = ALL_PROVIDERS.filter(p => !connectedProviders.has(p));
+
+      if (connected.length === 0) return 'No integrations connected.';
+
+      let summary = `Connected: ${connected.join(', ')}`;
+      if (notConnected.length > 0) {
+        summary += ` | Not connected: ${notConnected.join(', ')}`;
+      }
+      return summary;
+    } catch {
+      return '';
+    }
+  }
+
+  /**
    * Disable token (soft delete - keeps record but marks as disabled).
    * When workspaceId is provided, only disables tokens scoped to that workspace.
    */

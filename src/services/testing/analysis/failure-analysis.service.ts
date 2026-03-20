@@ -85,10 +85,14 @@ export class FailureAnalysisService {
       };
     }
 
-    // 3 + 4. Fetch test results and intelligent session in parallel (independent reads)
-    const [testResults, session] = await Promise.all([
+    // 3 + 4. Fetch test results, intelligent session, and integration status in parallel
+    const workspaceId = (test.projects as any)?.workspace_id;
+    const [testResults, session, integrationContext] = await Promise.all([
       this.fetchTestResults(testId),
       this.fetchIntelligentSession(testId),
+      import('@/services/api/integration-token.service')
+        .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId || ''))
+        .catch(() => ''),
     ]);
 
     // 5. Build error summary (truncated to stay within LLM limits)
@@ -132,8 +136,8 @@ export class FailureAnalysisService {
       // Non-fatal — continue analysis without memory context
     }
 
-    // 7. Call LLM for analysis (with memory context if available)
-    const analysis = await this.callLLM(errorDetails + memoryContext);
+    // 7. Call LLM for analysis (with memory + integration context)
+    const analysis = await this.callLLM(errorDetails + memoryContext, integrationContext);
 
     logger.info('[FAILURE_ANALYSIS] Analysis complete', {
       testId,
@@ -271,12 +275,16 @@ export class FailureAnalysisService {
   /**
    * Call LLM for structured failure analysis
    */
-  private static async callLLM(errorDetails: string): Promise<Omit<FailureAnalysisResult, 'errorDetails'>> {
+  private static async callLLM(errorDetails: string, integrationContext?: string): Promise<Omit<FailureAnalysisResult, 'errorDetails'>> {
     try {
+      const integrationHint = integrationContext
+        ? `\n\nUser's integrations: ${integrationContext}\nWhen suggesting fixes, consider available integrations (e.g. "Create a Jira issue" if Jira is connected).`
+        : '';
+
       const response = await getChatCompletionWithMessages(
         [
           { role: 'system', content: ANALYSIS_SYSTEM_PROMPT },
-          { role: 'user', content: `Analyze this test failure:\n\n${errorDetails}` },
+          { role: 'user', content: `Analyze this test failure:\n\n${errorDetails}${integrationHint}` },
         ],
         {
           model: LLM_MODEL,

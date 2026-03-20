@@ -103,6 +103,8 @@ export class LitePromptBuilder {
     auditedDrift?: StateDriftAuditResult;
     /** Workspace skills/knowledge from KB */
     skillsContext?: string;
+    /** Connected integrations status */
+    integrationContext?: string;
   }): string {
     // ✅ NEW: Sanitize snapshot to prevent prompt injection attacks
     const sanitizationResult = PromptSanitizer.sanitizeSnapshot(
@@ -338,12 +340,16 @@ ${params.skillsContext}
 `
       : '';
 
+    const integrationSection = params.integrationContext
+      ? `\nCONNECTED INTEGRATIONS: ${params.integrationContext}\n`
+      : '';
+
     // Build complete prompt with JSON-only response format
     return `You are a browser automation agent testing a web application.
 Your job is to REACH THE TARGET STATE through intermediate steps. Navigation is expected.
 
 GOAL: ${params.goal}
-${skillsSection}
+${skillsSection}${integrationSection}
 CURRENT PAGE:
 ${snapshot}
 ${taskPlanSection}${goalOrientedSummarySection}${transitionSummarySection}${formFocusSection}${auditedDriftSection || stateDriftSection}${stuckWarning}${lastOutcomeSection}${progressSection}${guidanceSection}${registrationHint}${contextualHintsSection}${credentialHintSection}${visionHintsSection}${modalDismissSection}${validationErrorSection}${failedActionsSection}

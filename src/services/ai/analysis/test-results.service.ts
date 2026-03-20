@@ -34,7 +34,7 @@ export class AIService {
   /**
    * Analyze test results and generate AI summary
    */
-  async analyzeTestResults(testResult: TestResult): Promise<AISummary> {
+  async analyzeTestResults(testResult: TestResult, options?: { integrationContext?: string }): Promise<AISummary> {
     // Validate input
     if (!testResult) {
       throw new Error('TestResult is required');
@@ -54,7 +54,12 @@ export class AIService {
       });
 
       // Prepare context for AI analysis
-      const context = this.prepareAnalysisContext(testResult);
+      let context = this.prepareAnalysisContext(testResult);
+
+      // Append integration context if available
+      if (options?.integrationContext) {
+        context += `\n\nConnected integrations: ${options.integrationContext}`;
+      }
 
       // Generate AI analysis
       const analysis = await this.generateAnalysis(context);

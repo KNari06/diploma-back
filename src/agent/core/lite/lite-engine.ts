@@ -119,6 +119,7 @@ export class LiteEngine {
   private lastGoalOrientedSummary: string | null = null; // ✅ NEW: Goal-Oriented Summary from last iteration (Hybrid Semantic Weight)
   private lastTransitionSummary: string | null = null; // ✅ NEW: Transition summary from last meaningful state change
   private skillsContext = ''; // Workspace skills from KB (loaded once at start)
+  private integrationContext = ''; // Connected integrations status (loaded once at start)
 
   // ═══════════════════════════════════════════════════════════════════════════
   // L2-L4-L5 MANUS ALIGNMENT PROPERTIES
@@ -949,13 +950,14 @@ export class LiteEngine {
       setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs);
     });
 
-    // Load workspace skills for AI context (best-effort, 5s timeout to avoid blocking test start)
+    // Load workspace skills + integration status for AI context (best-effort, 5s timeout to avoid blocking test start)
     if (this.config.userId) {
+      let resolvedWorkspaceId: string | null = null;
       try {
         const skillsPromise = (async () => {
-          const workspaceId = await WorkspaceService.getActiveWorkspaceForUser(this.config.userId!);
-          if (workspaceId) {
-            return await WorkspaceMemoryService.getMemoryForContext(workspaceId, 1500);
+          resolvedWorkspaceId = await WorkspaceService.getActiveWorkspaceForUser(this.config.userId!);
+          if (resolvedWorkspaceId) {
+            return await WorkspaceMemoryService.getMemoryForContext(resolvedWorkspaceId, 1500);
           }
           return '';
         })();
@@ -972,6 +974,16 @@ export class LiteEngine {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+
+      // Load integration status (non-fatal, 3s timeout)
+      try {
+        const { IntegrationTokenService } = await import('@/services/api/integration-token.service');
+        const intTimeout = new Promise<string>(r => setTimeout(() => r(''), 3000));
+        this.integrationContext = await Promise.race([
+          IntegrationTokenService.getIntegrationSummary(this.config.userId!, resolvedWorkspaceId || ''),
+          intTimeout,
+        ]);
+      } catch { /* non-fatal */ }
     }
 
     try {
@@ -1026,6 +1038,7 @@ export class LiteEngine {
     this.downloadApprovalAskedForRefs.clear();
     this.deniedDownloadRefs.clear();
     this.skillsContext = '';
+    this.integrationContext = '';
     this.snapshotPruner?.clear();
   }
 
@@ -1308,6 +1321,7 @@ export class LiteEngine {
           maxRounds: LITE_ENGINE_FLAGS.pipelineMaxRounds,
           timeoutMs: LITE_ENGINE_FLAGS.pipelineTimeoutMs,
           skillsContext: this.skillsContext,
+          integrationContext: this.integrationContext || undefined,
         });
 
         logger.info('[LITE_ENGINE] Pipeline v2 complete', {
@@ -2603,6 +2617,7 @@ export class LiteEngine {
           failedActions, // Negative Reinforcement: blacklisted actions
           auditedDrift, // State Drift Auditor: enriched drift analysis
           skillsContext: this.skillsContext || undefined, // KB skills for smarter decisions
+          integrationContext: this.integrationContext || undefined, // Connected integrations status
         });
 
         // ═══════════════════════════════════════════════════════════════════════

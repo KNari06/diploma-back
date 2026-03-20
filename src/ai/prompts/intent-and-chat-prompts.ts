@@ -449,7 +449,7 @@ Ex27: "Проверь авторизацию на juz40-edu.kz Логин: admin
  * Used for general conversations with users
  * @param skillDescriptions - Optional skill descriptions for integration tools
  */
-export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string, projectName?: string): string {
+export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string, projectName?: string, integrationContext?: string): string {
   let prompt = `You are QAIT - an AI QA automation assistant. Have natural conversations about testing like ChatGPT.
 
 MINDSET: Understand CONTEXT, not just keywords.
@@ -538,6 +538,14 @@ The user's uploaded documents (PDF, DOCX, TXT, MD) are automatically searched on
   // Add memory instructions
   prompt += `\n\n--- MEMORY ---
 Persistent workspace memory: remember_fact (save facts/preferences), search_memory (recall), forget_fact (remove outdated). Use naturally during conversation.`;
+
+  // Add integration awareness
+  if (integrationContext) {
+    prompt += `\n\n--- USER'S INTEGRATIONS ---
+${integrationContext}
+
+When suggesting actions (create Jira issue, send Slack message, etc.), check if the required integration is connected. If not connected, tell the user they need to connect it first in Settings > Integrations.`;
+  }
 
   return prompt;
 }
