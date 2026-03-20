@@ -80,8 +80,21 @@ export class AIAnalysisJobHandler {
       // Convert database result to TestResult type
       const testResultData = this.convertToTestResult(testResult);
 
+      // Load integration context (non-fatal, best-effort)
+      let integrationContext = '';
+      try {
+        const analysisUserId = testResult?.tests?.user_id;
+        const analysisWorkspaceId = (testResult?.tests?.projects as any)?.workspace_id;
+        if (analysisUserId) {
+          const { IntegrationTokenService } = await import('@/services/api/integration-token.service');
+          integrationContext = await IntegrationTokenService.getIntegrationSummary(analysisUserId, analysisWorkspaceId || '');
+        }
+      } catch { /* non-fatal */ }
+
       // Perform AI analysis
-      const aiSummary = await aiService.analyzeTestResults(testResultData);
+      const aiSummary = await aiService.analyzeTestResults(testResultData, {
+        integrationContext: integrationContext || undefined,
+      });
 
       // Save AI summary to database
       await dbAdminService.updateTestResult(testResultId, {

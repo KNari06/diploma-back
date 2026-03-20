@@ -199,6 +199,8 @@ export interface PipelineConfig {
   timeoutMs: number;
   /** Optional skills/context from user settings */
   skillsContext?: string;
+  /** Connected integrations status */
+  integrationContext?: string;
 }
 
 /** Result returned by the pipeline */

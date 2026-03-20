@@ -75,17 +75,20 @@ export class TestRecommendationService {
     logger.info('[TEST_RECOMMENDATIONS] Generating recommendations', { projectId, userId });
 
     // Fetch data sources in parallel
-    const [recentTests, savedCases, recentFailures] = await Promise.all([
+    const [recentTests, savedCases, recentFailures, integrationContext] = await Promise.all([
       this.fetchRecentTests(projectId, userId),
       this.fetchSavedCases(projectId, userId),
       this.fetchRecentFailures(projectId),
+      import('@/services/api/integration-token.service')
+        .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId))
+        .catch(() => ''),
     ]);
 
     // Build context for LLM
     const contextSummary = this.buildContextSummary(recentTests, savedCases, recentFailures);
 
     // Call LLM for recommendations
-    const recommendations = await this.callLLM(contextSummary);
+    const recommendations = await this.callLLM(contextSummary, integrationContext);
 
     logger.info('[TEST_RECOMMENDATIONS] Generated recommendations', {
       projectId,
@@ -210,12 +213,16 @@ export class TestRecommendationService {
   /**
    * Call LLM for recommendations
    */
-  private static async callLLM(contextSummary: string): Promise<TestRecommendation[]> {
+  private static async callLLM(contextSummary: string, integrationContext?: string): Promise<TestRecommendation[]> {
     try {
+      const integrationHint = integrationContext
+        ? `\n\n--- CONNECTED INTEGRATIONS ---\n${integrationContext}\nConsider available integrations when making recommendations (e.g. suggest setting up Slack notifications if Slack is connected).`
+        : '';
+
       const response = await getChatCompletionWithMessages(
         [
           { role: 'system', content: RECOMMENDATION_SYSTEM_PROMPT },
-          { role: 'user', content: `Based on this project's testing profile, what should be tested next?\n\n${contextSummary}` },
+          { role: 'user', content: `Based on this project's testing profile, what should be tested next?\n\n${contextSummary}${integrationHint}` },
         ],
         {
           model: LLM_MODEL,

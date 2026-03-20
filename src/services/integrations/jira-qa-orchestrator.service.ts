@@ -123,6 +123,7 @@ EDGE CASES:
 - If issue is about API/backend with endpoint mentioned → CAN_RUN_AUTO api_test.
 - If issue is a design review or "check if it looks right" → PREPARE_MANUAL.
 - Never guess URLs — only use URLs found in the task description, KB, or existing test cases.
+- CONNECTED INTEGRATIONS tells you what notification channels are available. When suggesting outcomes, consider whether the user can receive notifications via Slack, Telegram, etc.
 
 FEW-SHOT EXAMPLES:
 
@@ -145,6 +146,7 @@ function buildAnalysisMessages(
   testCaseContext: string,
   pastBugsContext: string,
   memoryContext: string,
+  integrationContext: string,
 ): { system: string; user: string } {
   const userSections: string[] = [];
 
@@ -165,6 +167,10 @@ ${kbContext || '(no relevant documentation found)'}`);
 
   if (memoryContext) {
     userSections.push(`WORKSPACE CONTEXT:\n${memoryContext}`);
+  }
+
+  if (integrationContext) {
+    userSections.push(`CONNECTED INTEGRATIONS:\n${integrationContext}`);
   }
 
   userSections.push('Analyze and respond with JSON.');
@@ -196,7 +202,7 @@ export class JiraQaOrchestratorService {
       const query = [issue.summary, issue.description].filter(Boolean).join(' ');
 
       // Fetch all 4 data sources in parallel (each is non-fatal)
-      const [kbResult, resolverResult, findingsResult, memoryContext] = await Promise.all([
+      const [kbResult, resolverResult, findingsResult, memoryContext, integrationContext] = await Promise.all([
         // 1. Knowledge Base (existing)
         searchKB(query, projectId, { matchCount: 5, matchThreshold: 0.5 })
           .catch((err) => {
@@ -228,6 +234,11 @@ export class JiraQaOrchestratorService {
                 return '';
               })
           : Promise.resolve(''),
+
+        // 5. Integration status — which providers are connected
+        import('@/services/api/integration-token.service')
+          .then(m => m.IntegrationTokenService.getIntegrationSummary(userId, workspaceId || ''))
+          .catch(() => ''),
       ]);
 
       // Build context strings
@@ -255,6 +266,7 @@ export class JiraQaOrchestratorService {
         testCaseContext,
         pastBugsContext,
         memoryContext,
+        integrationContext,
       );
 
       const completion = await getChatCompletionWithMessages(

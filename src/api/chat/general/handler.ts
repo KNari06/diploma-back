@@ -486,7 +486,7 @@ export async function handleGeneralChat(
     || (parsedContext?.workspaceId || parsedContext?.workspace_id);
 
   // Launch all independent fetches in parallel
-  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult] =
+  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult, integrationResult] =
     await Promise.allSettled([
       // 1. KB search (non-fatal)
       searchKB(message, projectId, { matchThreshold: 0.45, matchCount: 5 })
@@ -524,6 +524,13 @@ export async function handleGeneralChat(
       !projectId && workspaceId
         ? resolveProjectId(chatSessionId, userId, workspaceId!)
         : Promise.resolve(projectId ? { id: projectId, name: undefined as string | undefined } : null),
+
+      // 6. Integration status — which providers are connected
+      userId && workspaceId
+        ? import('@/services/api/integration-token.service')
+            .then(m => m.IntegrationTokenService.getIntegrationSummary(userId!, workspaceId!))
+            .catch(() => '')
+        : Promise.resolve(''),
     ]);
 
   // Check if request was cancelled during parallel loading
@@ -579,6 +586,11 @@ export async function handleGeneralChat(
     projectName = projectResult.value.name;
   }
 
+  let integrationContext = '';
+  if (integrationResult.status === 'fulfilled' && integrationResult.value) {
+    integrationContext = integrationResult.value;
+  }
+
   logger.info('[GENERAL_CHAT] Parallel context loading complete', {
     durationMs: Date.now() - contextStartMs,
     hasKB: !!kbContext,
@@ -586,6 +598,7 @@ export async function handleGeneralChat(
     hasWorkspaceMemory: !!workspaceMemory,
     hasEditorContext: !!editorPageContext,
     resolvedProjectId: !!projectId,
+    hasIntegrationContext: !!integrationContext,
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -619,7 +632,7 @@ export async function handleGeneralChat(
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName);
+  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext);
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor' && editorPageContext) {
