@@ -53,7 +53,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -859,7 +859,8 @@ async function executeAction(
   page: Page,
   step: IntentStep,
   candidate: LintCandidate,
-  preResolvedLocator?: Locator
+  preResolvedLocator?: Locator,
+  options?: { expectsNavigation?: boolean }
 ): Promise<{ success: boolean; error?: string; urlChanged: boolean }> {
   const urlBefore = page.url();
 
@@ -889,6 +890,37 @@ async function executeAction(
         // Preserve exact user-entered text (including leading/trailing spaces and newlines).
         const value = normalizeTypeActionValue(step.value);
         const humanLike = step.options?.humanLike === true;
+
+        // V13: Paste mode — write to clipboard then dispatch paste via keyboard shortcut.
+        // Web apps that listen for 'paste' events (OTP fields, code editors) won't trigger with fill().
+        if (step.options?.isPaste) {
+          await locator.click({ timeout }); // Focus the element
+          // Write to system clipboard via CDP
+          const pasteContext = page.context();
+          await pasteContext.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+          // @ts-expect-error - navigator exists in browser context
+          await page.evaluate((text) => navigator.clipboard.writeText(text), value).catch(async () => {
+            // Fallback: use deprecated execCommand for older pages
+            await page.evaluate((text) => {
+              // @ts-expect-error - document exists in browser context
+              const ta = document.createElement('textarea');
+              ta.value = text;
+              // @ts-expect-error - document exists in browser context
+              document.body.appendChild(ta);
+              ta.select();
+              // @ts-expect-error - document exists in browser context
+              document.execCommand('copy');
+              ta.remove();
+            }, value);
+          });
+          // Dispatch Ctrl+V / Cmd+V to trigger paste event listeners
+          const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+          await page.keyboard.press(`${modifier}+v`);
+          if (step.options?.pressEnter) {
+            await locator.press('Enter', { timeout });
+          }
+          break;
+        }
 
         // Human-like typing: gradual per-character input (instead of instant fill).
         // - If replaceContent is false: append by typing
@@ -932,6 +964,22 @@ async function executeAction(
         if (!locator) throw new Error('No selector for click action');
         const humanLike = step.options?.humanLike === true;
 
+        // V13: Build Playwright modifiers array from step options
+        const clickModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
+        if (step.options?.modifiers) {
+          if (step.options.modifiers.shift) clickModifiers.push('Shift');
+          if (step.options.modifiers.ctrl) clickModifiers.push('Control');
+          if (step.options.modifiers.meta) clickModifiers.push('Meta');
+          if (step.options.modifiers.alt) clickModifiers.push('Alt');
+        }
+        const clickOpts: Parameters<Locator['click']>[0] = {
+          timeout,
+          ...(clickModifiers.length > 0 && { modifiers: clickModifiers }),
+        };
+
+        // V13: Track pages before click for new-tab detection
+        const pagesBefore = page.context().pages().length;
+
         if (humanLike) {
           // Human-like click: hover -> small pause -> click
           await locator.hover({ timeout });
@@ -945,13 +993,34 @@ async function executeAction(
               // Position is relative to the element's top-left in Playwright
               const x = randomIntInclusive(3, Math.floor(box.width) - 3);
               const y = randomIntInclusive(3, Math.floor(box.height) - 3);
-              await locator.click({ timeout, position: { x, y } });
+              await locator.click({ ...clickOpts, position: { x, y } });
               break;
             }
           }
         }
 
-        await locator.click({ timeout });
+        // V13: If next step expects navigation (wait_for changedFrom), wrap click with
+        // waitForNavigation to reliably capture the navigation event.
+        if (options?.expectsNavigation) {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'load', timeout: 15000 }).catch(() => {}),
+            locator.click(clickOpts),
+          ]);
+        } else {
+          await locator.click(clickOpts);
+        }
+
+        // V13: Detect new tab opened by click (target="_blank", window.open)
+        // Wait for new page to load so subsequent steps can target it
+        if (page.context().pages().length > pagesBefore) {
+          const newPage = page.context().pages().at(-1);
+          if (newPage) {
+            logger.info('[EXECUTE_ACTION] New tab detected after click, waiting for load', {
+              pagesAfter: page.context().pages().length,
+            });
+            await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+          }
+        }
         break;
       }
 
@@ -1313,8 +1382,9 @@ export class PreviewStepApplyService {
     userId: string;
     selectedRef?: string; // V3: User-confirmed element ref from clarification
     skipPostActionWait?: boolean; // V12: Skip post-action settle when caller uses lookahead (e.g. Run mode)
+    expectsNavigation?: boolean; // V13: Next step is wait_for with changedFrom — wrap click with waitForNavigation
   }): Promise<ApplyResult> {
-    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait } = params;
+    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
 
     logger.info('[PREVIEW_APPLY] Applying step', {
       previewSessionId,
@@ -1418,14 +1488,21 @@ export class PreviewStepApplyService {
         // V5.1: timeout is now primary (required from frontend), urlMatcher.timeoutMs is fallback
         const timeoutMs = stepDraft.options?.timeout ?? matcher?.timeoutMs ?? 15000;
 
+        // V13: changedFrom uses recording-time URL which may differ from runtime.
+        // Replace with current page URL so "wait until URL changes" works at runtime.
+        const runtimeMatcher = matcher?.changedFrom
+          ? { ...matcher, changedFrom: page.url() }
+          : matcher;
+
         logger.info('[PREVIEW_APPLY] Handling wait_for', {
           previewSessionId,
-          matcher: matcher ? Object.keys(matcher).filter(k => (matcher as any)[k] !== undefined) : [],
+          matcher: runtimeMatcher ? Object.keys(runtimeMatcher).filter(k => (runtimeMatcher as any)[k] !== undefined) : [],
           timeoutMs,
+          changedFromOverride: matcher?.changedFrom ? `${matcher.changedFrom} → ${page.url()}` : undefined,
         });
 
         try {
-          const result = await executeWaitFor(page, matcher, timeoutMs);
+          const result = await executeWaitFor(page, runtimeMatcher, timeoutMs);
 
           // Generate compiled plan for wait_for
           let compiled;
@@ -1457,6 +1534,92 @@ export class PreviewStepApplyService {
             success: false,
             error: error instanceof Error ? error.message : 'wait_for failed',
             urlChanged: urlBefore !== page.url(),
+            url: page.url(),
+            attempts: 1,
+          };
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V13: Handle dialog steps (pre-install handler for upcoming dialog)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'dialog') {
+        const dialogOpts = stepDraft.options?.dialog;
+        if (!dialogOpts) {
+          return {
+            success: false,
+            error: 'Dialog step missing dialog options',
+            attempts: 0,
+          };
+        }
+
+        logger.info('[PREVIEW_APPLY] Pre-installing dialog handler', {
+          previewSessionId,
+          dialogType: dialogOpts.dialogType,
+          action: dialogOpts.action,
+        });
+
+        // Pre-install the pending dialog action on the session.
+        // The next step (typically a click) will trigger the dialog,
+        // and the session's dialog handler will consume this action.
+        const sessionService = getPreviewSessionService();
+        sessionService.setPendingDialogAction(previewSessionId, userId, {
+          action: dialogOpts.action,
+          promptText: dialogOpts.promptText,
+        });
+
+        return {
+          success: true,
+          appliedStep: stepDraft,
+          url: page.url(),
+          attempts: 1,
+        };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V13: Handle download verification (wait for download event)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'download') {
+        const downloadOpts = stepDraft.options?.download;
+        const expectedFilename = downloadOpts?.filename || stepDraft.value;
+        const timeoutMs = downloadOpts?.timeoutMs || 15000;
+
+        logger.info('[PREVIEW_APPLY] Waiting for download', {
+          previewSessionId, expectedFilename, timeoutMs,
+        });
+
+        try {
+          // Wait for the download event (triggered by the previous click)
+          const download = await page.waitForEvent('download', { timeout: timeoutMs });
+          const actualFilename = download.suggestedFilename();
+
+          // Verify filename matches if expected
+          if (expectedFilename && !actualFilename.toLowerCase().includes(expectedFilename.toLowerCase())) {
+            // Cancel download to prevent temp file buildup
+            await download.cancel().catch(() => {});
+            return {
+              success: false,
+              error: `Download filename mismatch. Expected: "${expectedFilename}", Got: "${actualFilename}"`,
+              appliedStep: stepDraft,
+              url: page.url(),
+              attempts: 1,
+            };
+          }
+
+          // Cancel download (preview/test mode — we only verify it started)
+          await download.cancel().catch(() => {});
+
+          return {
+            success: true,
+            appliedStep: stepDraft,
+            url: page.url(),
+            attempts: 1,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: `Download did not start within ${timeoutMs}ms`,
+            appliedStep: stepDraft,
             url: page.url(),
             attempts: 1,
           };
@@ -1792,7 +1955,7 @@ export class PreviewStepApplyService {
         // V5: Capture URL BEFORE action for accurate compiled context
         const urlBeforeAction = page.url();
         
-        const result = await executeAction(page, stepDraft, confirmedCandidate);
+        const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation });
 
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
@@ -1925,7 +2088,7 @@ export class PreviewStepApplyService {
             };
 
             // Execute action with compiled locator
-            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator);
+            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation });
 
             if (result.success) {
               // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
@@ -2096,7 +2259,7 @@ export class PreviewStepApplyService {
           confidence: candidate.confidence,
         });
 
-        const result = await executeAction(page, stepDraft, candidate);
+        const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
 
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step

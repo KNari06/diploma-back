@@ -863,6 +863,7 @@ export class IntentStepLintService {
     }
 
     // Step 1: Try LLM-based resolver (PRIMARY) with includeAlternatives flag
+    // V14: Pass lazy screenshot callback — only captures when vision rescue is needed (0 allowed elements)
     const resolveStartMs = Date.now();
     const resolverResult = await resolveElement({
       previewSessionId,
@@ -870,6 +871,14 @@ export class IntentStepLintService {
       domNodes,
       pageUrl: snapshot.url,
       includeAlternatives,
+      screenshot: async () => {
+        try {
+          const page = sessionService.getPage(previewSessionId, userId);
+          if (!page) return null;
+          const buf = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+          return buf.toString('base64');
+        } catch { return null; }
+      },
     });
     const resolveLatencyMs = Date.now() - resolveStartMs;
 

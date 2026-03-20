@@ -218,6 +218,8 @@ interface InternalSession extends PreviewSession {
     isMultiline?: boolean;
     /** URL where typing started (guards against cross-page ref collision) */
     pageUrl?: string;
+    /** V13: CSS selector of iframe containing the focused element */
+    iframeSelector?: string;
   } | null;
   recordingLastUrl: string;
   /** V10: Drag state tracked between mouse:down and mouse:up */
@@ -246,6 +248,20 @@ interface InternalSession extends PreviewSession {
     ref?: string;
     timestamp: number;
   } | null;
+
+  /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
+  recordingStartUrl?: string;
+
+  /** V13: Dialog handling mode — controls how native dialogs are handled */
+  dialogMode: 'passive' | 'recording' | 'replay';
+  /** V13: Pre-installed dialog action for replay (set before the step that triggers the dialog) */
+  pendingDialogAction?: {
+    action: 'accept' | 'dismiss';
+    promptText?: string;
+  };
+
+  /** V13: True when next keyboard:type is a paste (Ctrl+V/Cmd+V detected in keyboard:press) */
+  recordingPendingPaste?: boolean;
 
   /** V11: Callback invoked when session switches to a new page (popup/navigation) */
   onPageSwitch?: (newPage: Page, previousUrl: string) => void;
@@ -512,6 +528,7 @@ export class PreviewSessionService {
           recordingLastTypeStep: null,
           recordingLastScrollStep: null,
           recordingLastHover: null,
+          dialogMode: 'passive',
         };
 
         // Store session
@@ -887,9 +904,10 @@ export class PreviewSessionService {
         const meta = await EditorTraceService.close(sessionId);
         if (meta) {
           const { uploadEditorTrace } = await import('./editor-trace-upload');
-          uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId: sessionId, traceType: 'editor' }).catch(() => {});
+          uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId: sessionId, traceType: 'editor' })
+            .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on session cleanup', { sessionId, error: err instanceof Error ? err.message : String(err) }));
         }
-      } catch { /* non-fatal */ }
+      } catch (err) { logger.error('[EDITOR_TRACE] Close failed on session cleanup', { sessionId, error: err instanceof Error ? err.message : String(err) }); }
 
       // Safe cleanup of browser resources
       await this.safeCloseBrowserResources(session.browser, session.context, session.page);
@@ -923,9 +941,10 @@ export class PreviewSessionService {
       const meta = await EditorTraceService.close(sessionId);
       if (meta) {
         const { uploadEditorTrace } = await import('./editor-trace-upload');
-        uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId: sessionId, traceType: 'editor' }).catch(() => {});
+        uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId: sessionId, traceType: 'editor' })
+          .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on session destroy', { sessionId, error: err instanceof Error ? err.message : String(err) }));
       }
-    } catch { /* non-fatal */ }
+    } catch (err) { logger.error('[EDITOR_TRACE] Close failed on session destroy', { sessionId, error: err instanceof Error ? err.message : String(err) }); }
 
     try {
       // Safe cleanup of browser resources
@@ -1688,6 +1707,23 @@ export class PreviewSessionService {
   }
 
   /**
+   * V13: Get the URL where recording started (actual page URL, not frontend editorBaseUrl).
+   * Used as fallback startUrl for Apply All when frontend doesn't provide one.
+   */
+  getRecordingStartUrl(sessionId: string, userId?: string): string | undefined {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingStartUrl;
+  }
+
+  /**
+   * V13: Set the URL where recording started
+   */
+  setRecordingStartUrl(sessionId: string, userId: string, url: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingStartUrl = url;
+  }
+
+  /**
    * V10: Get recording drag state (for drag & drop detection)
    */
   getRecordingDragState(sessionId: string, userId?: string): InternalSession['recordingDragState'] {
@@ -1717,6 +1753,22 @@ export class PreviewSessionService {
   setRecordingLastTypeStep(sessionId: string, userId: string, step: InternalSession['recordingLastTypeStep']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastTypeStep = step;
+  }
+
+  /**
+   * V13: Check if next typing is a paste (Ctrl+V/Cmd+V detected)
+   */
+  isRecordingPendingPaste(sessionId: string, userId?: string): boolean {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return !!session?.recordingPendingPaste;
+  }
+
+  /**
+   * V13: Set/clear paste flag
+   */
+  setRecordingPendingPaste(sessionId: string, userId: string, isPaste: boolean): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingPendingPaste = isPaste;
   }
 
   /**
@@ -1752,20 +1804,129 @@ export class PreviewSessionService {
   }
 
   /**
-   * Attach a dialog handler to auto-dismiss native dialogs (alert/confirm/prompt/beforeunload).
-   * Prevents page from hanging on blocking dialogs.
+   * V13: Set dialog mode for a session.
+   * - 'passive': Auto-dismiss dialogs (default, browsing mode)
+   * - 'recording': Emit dialog to frontend, wait for user response, record as step
+   * - 'replay': Use pre-installed pendingDialogAction
+   */
+  setDialogMode(sessionId: string, userId: string, mode: 'passive' | 'recording' | 'replay'): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) {
+      session.dialogMode = mode;
+      logger.debug('[PREVIEW_SESSION] Dialog mode changed', { sessionId, mode });
+    }
+  }
+
+  /**
+   * V13: Pre-install a dialog action for replay.
+   * Must be called BEFORE the step that triggers the dialog.
+   */
+  setPendingDialogAction(sessionId: string, userId: string, action: { action: 'accept' | 'dismiss'; promptText?: string } | undefined): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.pendingDialogAction = action;
+  }
+
+  /**
+   * Attach a dialog handler to handle native dialogs (alert/confirm/prompt/beforeunload).
+   * V13: Behavior depends on dialogMode:
+   * - passive: Auto-dismiss (prevents hanging)
+   * - recording: Emit to frontend, wait for user response, record as step
+   * - replay: Use pre-installed pendingDialogAction from recorded step
    */
   private attachDialogHandler(page: Page, previewSessionId: string): void {
     page.on('dialog', async (dialog) => {
       try {
-        const type = dialog.type();
+        const type = dialog.type() as 'alert' | 'confirm' | 'prompt' | 'beforeunload';
         const msg = dialog.message();
-        logger.info('[PREVIEW_SESSION] Dialog auto-dismissed', {
-          previewSessionId,
-          type,
-          message: msg.slice(0, 200),
+
+        // Find session to check dialog mode
+        const session = this.sessions.get(previewSessionId);
+        const mode = session?.dialogMode || 'passive';
+
+        logger.info('[PREVIEW_SESSION] Dialog triggered', {
+          previewSessionId, type, mode, message: msg.slice(0, 200),
         });
 
+        // ═══════════════════════════════════════════════════════════════════
+        // REPLAY MODE: Use pre-installed action from recorded dialog step
+        // ═══════════════════════════════════════════════════════════════════
+        if (mode === 'replay' && session?.pendingDialogAction) {
+          const { action, promptText } = session.pendingDialogAction;
+          session.pendingDialogAction = undefined; // consume
+          try {
+            if (action === 'accept') {
+              await dialog.accept(promptText);
+            } else {
+              await dialog.dismiss();
+            }
+            logger.info('[PREVIEW_SESSION] Dialog handled via replay action', {
+              previewSessionId, type, action, promptText: promptText?.slice(0, 50),
+            });
+          } catch (e) {
+            logger.warn('[PREVIEW_SESSION] Replay dialog action failed', {
+              previewSessionId, error: e instanceof Error ? e.message : String(e),
+            });
+          }
+          return;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // RECORDING MODE: Notify frontend, wait for user response
+        // ═══════════════════════════════════════════════════════════════════
+        if (mode === 'recording' && session) {
+          // Emit pending dialog to frontend — frontend shows accept/dismiss UI
+          try {
+            webSocketService.emitToRoom('preview', previewSessionId, 'preview:dialog:pending' as any, {
+              previewSessionId,
+              dialogType: type,
+              message: msg.slice(0, 500),
+              timestamp: new Date().toISOString(),
+            });
+          } catch { /* non-critical */ }
+
+          // Wait for frontend response (stored by WS handler via setPendingDialogAction)
+          // Poll for up to 30s — user must respond to the dialog
+          const deadline = Date.now() + 30000;
+          while (Date.now() < deadline) {
+            if (session.pendingDialogAction) {
+              const { action, promptText } = session.pendingDialogAction;
+              session.pendingDialogAction = undefined;
+              try {
+                if (action === 'accept') {
+                  await dialog.accept(promptText);
+                } else {
+                  await dialog.dismiss();
+                }
+              } catch { /* dialog may have been handled */ }
+
+              // Create and emit the dialog recording step directly
+              try {
+                const { RecordingCaptureService } = await import('./recording-capture.service');
+                const step = RecordingCaptureService.captureDialog({
+                  dialogType: type,
+                  action,
+                  message: msg,
+                  promptText,
+                  pageUrl: page.url(),
+                });
+                webSocketService.emitToRoom('preview', previewSessionId, 'preview:recording:step' as any, {
+                  previewSessionId, step, timestamp: new Date().toISOString(),
+                });
+              } catch { /* non-critical — step emission failure doesn't block recording */ }
+              return;
+            }
+            await new Promise(r => setTimeout(r, 200));
+          }
+
+          // Timeout — auto-dismiss to prevent hanging
+          logger.warn('[PREVIEW_SESSION] Dialog recording timeout, auto-dismissing', { previewSessionId, type });
+          try { await dialog.dismiss(); } catch { /* ok */ }
+          return;
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // PASSIVE MODE: Auto-dismiss (original behavior)
+        // ═══════════════════════════════════════════════════════════════════
         try {
           if (type === 'beforeunload') {
             await dialog.accept();
@@ -1773,32 +1934,24 @@ export class PreviewSessionService {
             await dialog.dismiss();
           }
         } catch (dialogError) {
-          // Dialog may have already been handled (e.g., by test execution)
           logger.warn('[PREVIEW_SESSION] Failed to dismiss dialog (may already be handled)', {
-            previewSessionId,
-            type,
+            previewSessionId, type,
             error: dialogError instanceof Error ? dialogError.message : String(dialogError),
           });
-          return; // Skip WS notification if dismiss failed
+          return;
         }
 
         // Notify frontend (best-effort)
         try {
           webSocketService.emitToRoom('preview', previewSessionId, 'preview:dialog' as any, {
-            previewSessionId,
-            type,
-            message: msg.slice(0, 500),
+            previewSessionId, type, message: msg.slice(0, 500),
             action: type === 'beforeunload' ? 'accepted' : 'dismissed',
             timestamp: new Date().toISOString(),
           });
-        } catch {
-          // Non-critical: frontend notification is optional
-        }
+        } catch { /* non-critical */ }
       } catch (error) {
-        // Outer catch: prevent unhandled promise rejection for any unexpected error
         logger.warn('[PREVIEW_SESSION] Dialog handler error', {
-          previewSessionId,
-          error: error instanceof Error ? error.message : String(error),
+          previewSessionId, error: error instanceof Error ? error.message : String(error),
         });
       }
     });
@@ -1986,17 +2139,49 @@ export class PreviewSessionService {
       const url = download.url();
       const suggestedFilename = download.suggestedFilename();
 
-      logger.info('[PREVIEW_SESSION] Download intercepted (preview mode — cancelled)', {
+      logger.info('[PREVIEW_SESSION] Download intercepted', {
         previewSessionId,
         url: url.slice(0, 200),
         filename: suggestedFilename,
       });
 
-      // Cancel the download
+      const session = this.sessions.get(previewSessionId);
+
+      // V13: During replay, save the download to a temp path for verification
+      if (session?.dialogMode === 'replay') {
+        try {
+          // Save to temp path instead of cancelling — allows verification
+          const path = await download.path();
+          logger.info('[PREVIEW_SESSION] Download saved for replay verification', {
+            previewSessionId, filename: suggestedFilename, path,
+          });
+        } catch {
+          // If save fails, cancel to prevent hanging
+          try { await download.cancel(); } catch { /* ok */ }
+        }
+        return;
+      }
+
+      // Cancel the download (preview mode — headless can't save files to user disk)
       try {
         await download.cancel();
       } catch {
         // May already be cancelled
+      }
+
+      // V13: During recording, emit download step
+      if (session?.recording) {
+        try {
+          const { RecordingCaptureService } = await import('./recording-capture.service');
+          const step = RecordingCaptureService.captureDownload({
+            filename: suggestedFilename,
+            url: url.slice(0, 500),
+            pageUrl: page.url(),
+          });
+          webSocketService.emitToRoom('preview', previewSessionId, 'preview:recording:step' as any, {
+            previewSessionId, step, timestamp: new Date().toISOString(),
+          });
+        } catch { /* non-critical */ }
       }
 
       // Notify frontend
@@ -2005,7 +2190,7 @@ export class PreviewSessionService {
           previewSessionId,
           url: url.slice(0, 500),
           filename: suggestedFilename,
-          message: 'File download is not supported in preview mode.',
+          message: 'File download detected.',
           timestamp: new Date().toISOString(),
         });
       } catch {

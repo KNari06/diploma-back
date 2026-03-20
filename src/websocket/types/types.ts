@@ -1165,6 +1165,8 @@ export interface PreviewMouseClickRequest {
   y: number;
   button?: 'left' | 'right' | 'middle';
   clickCount?: number; // 1=single, 2=double
+  /** V13: Modifier keys held during click (for Shift+Click multi-select, Ctrl+Click, etc.) */
+  modifiers?: { shift?: boolean; ctrl?: boolean; meta?: boolean; alt?: boolean };
 }
 
 /**

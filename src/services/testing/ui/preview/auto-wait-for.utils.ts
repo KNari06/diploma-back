@@ -3,8 +3,8 @@
  * Smart auto-insertion of wait_for steps between navigating actions
  * 
  * This module provides utilities for:
- * 1. Detecting implicit navigation between steps (via compiled.context.pageUrl diff)
- * 2. Injecting wait_for steps to ensure stability during background runs
+ * 1. Detecting implicit navigation between steps (via compiled.context.pageUrl or evidence.pageUrl diff)
+ * 2. Injecting wait_for steps to ensure stability during background runs and first-run Apply All
  * 3. URL normalization for comparison
  */
 
@@ -58,9 +58,10 @@ const SKIP_INJECT_AFTER_TYPES: Set<IntentActionType> = new Set([
  * @returns true if wait_for should be injected between them
  */
 function shouldInjectWaitFor(prevStep: IntentStep, nextStep: IntentStep): boolean {
-  // Get URLs from compiled context
-  const prevUrl = prevStep.compiled?.context?.pageUrl;
-  const nextUrl = nextStep.compiled?.context?.pageUrl;
+  // Get URLs from compiled context, fallback to evidence.pageUrl (captured during recording)
+  // This fallback is critical for first-run: steps have evidence but no compiled plans yet
+  const prevUrl = prevStep.compiled?.context?.pageUrl || prevStep.evidence?.pageUrl;
+  const nextUrl = nextStep.compiled?.context?.pageUrl || nextStep.evidence?.pageUrl;
 
   // Skip if either URL is missing
   if (!prevUrl || !nextUrl) {
@@ -135,16 +136,17 @@ export function injectAutoWaitForSteps(steps: IntentStep[]): IntentStep[] {
       const nextStep = steps[i + 1];
 
       if (shouldInjectWaitFor(currentStep, nextStep)) {
-        const prevUrl = currentStep.compiled?.context?.pageUrl!;
+        const prevUrl = (currentStep.compiled?.context?.pageUrl || currentStep.evidence?.pageUrl)!;
         const autoStep = createAutoWaitForStep(prevUrl);
         result.push(autoStep);
         injectedCount++;
 
+        const nextUrl = nextStep.compiled?.context?.pageUrl || nextStep.evidence?.pageUrl || '';
         logger.debug('[AUTO_WAIT_FOR] Injected wait_for step', {
           afterStepId: currentStep.id,
           afterStepType: currentStep.type,
           prevUrl: normalizeUrlForComparison(prevUrl),
-          nextUrl: normalizeUrlForComparison(nextStep.compiled?.context?.pageUrl || ''),
+          nextUrl: normalizeUrlForComparison(nextUrl),
           autoStepId: autoStep.id,
         });
       }

@@ -422,11 +422,25 @@ export class CommandExecutor {
             await this.ensureTopMostAtCenter(locator, 2000);
             // ✅ Wait for enabled: Ensure element is not disabled
             await this.waitForEnabled(locator, 5000);
+
+            // V13: Build Playwright modifiers array from command modifiers
+            const cmdModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
+            if (command.modifiers) {
+              if (command.modifiers.shift) cmdModifiers.push('Shift');
+              if (command.modifiers.ctrl) cmdModifiers.push('Control');
+              if (command.modifiers.meta) cmdModifiers.push('Meta');
+              if (command.modifiers.alt) cmdModifiers.push('Alt');
+            }
+            const clickOpts: Parameters<Locator['click']>[0] = {
+              timeout: timeout || 30000,
+              ...(cmdModifiers.length > 0 && { modifiers: cmdModifiers }),
+            };
+
             if (awaitNavigation) {
               // Capture URL before click to detect navigation
               const urlBeforeClick = this.page.url();
               const pagesBefore = this.page.context().pages().length;
-              await locator.click({ timeout: timeout || 30000 });
+              await locator.click(clickOpts);
               // Wait for URL to change (replaces deprecated waitForNavigation)
               try {
                 await this.page.waitForURL(
@@ -465,7 +479,7 @@ export class CommandExecutor {
                 }
               }
             } else {
-              await locator.click({ timeout: timeout || 30000 });
+              await locator.click(clickOpts);
             }
           };
 
@@ -590,8 +604,32 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            // Use type() to simulate real keyboard events character by character
-            await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+
+            // V13: Paste mode — clipboard write + Ctrl/Cmd+V to trigger paste event listeners
+            if (intentCommand.intentMeta.isPaste) {
+              await intentTypeLocator.click({ timeout: timeout || 30000 }); // Focus
+              const ctx = this.page.context();
+              await ctx.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+              // @ts-expect-error - navigator exists in browser context
+              await this.page.evaluate((text) => navigator.clipboard.writeText(text), String(value)).catch(async () => {
+                await this.page.evaluate((text) => {
+                  // @ts-expect-error - document exists in browser context
+                  const ta = document.createElement('textarea');
+                  ta.value = text;
+                  // @ts-expect-error - document exists in browser context
+                  document.body.appendChild(ta);
+                  ta.select();
+                  // @ts-expect-error - document exists in browser context
+                  document.execCommand('copy');
+                  ta.remove();
+                }, String(value));
+              });
+              const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
+              await this.page.keyboard.press(`${mod}+v`);
+            } else {
+              // Use type() to simulate real keyboard events character by character
+              await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+            }
 
             // V10: Smart Enter decision
             const shouldPressIntent = await decideEnterAfterType(intentTypeLocator);
@@ -1115,6 +1153,43 @@ export class CommandExecutor {
           // V5.2: urlMatcher.timeoutMs takes priority (set explicitly per matcher type)
           const waitForTimeout = matcher?.timeoutMs ?? timeout ?? 15000;
           await this.executeWaitFor(matcher, waitForTimeout);
+          break;
+        }
+
+        // V13: Verify file download (wait for download event from previous click)
+        case 'verifyDownload': {
+          const dlOpts = command.download;
+          const dlTimeout = dlOpts?.timeoutMs ?? timeout ?? 15000;
+          const expectedName = dlOpts?.filename || (typeof command.value === 'string' ? command.value : undefined);
+
+          const dl = await this.page.waitForEvent('download', { timeout: dlTimeout });
+          const actualName = dl.suggestedFilename();
+
+          if (expectedName && !actualName.toLowerCase().includes(expectedName.toLowerCase())) {
+            await dl.cancel().catch(() => {});
+            throw new Error(`Download filename mismatch. Expected: "${expectedName}", Got: "${actualName}"`);
+          }
+          await dl.cancel().catch(() => {});
+          break;
+        }
+
+        // V13: Handle native dialog (alert/confirm/prompt/beforeunload)
+        // Pre-installs a one-time dialog handler that fires when the next action triggers the dialog.
+        case 'handleDialog': {
+          const dialogOpts = command.dialog;
+          if (!dialogOpts) throw new Error('handleDialog requires dialog options');
+
+          this.page.once('dialog', async (dialog) => {
+            try {
+              if (dialogOpts.action === 'accept') {
+                await dialog.accept(dialogOpts.promptText);
+              } else {
+                await dialog.dismiss();
+              }
+            } catch { /* dialog may already be handled */ }
+          });
+          // Return immediately — the handler is pre-installed and will fire
+          // when the next command (e.g., click) triggers the dialog.
           break;
         }
 
@@ -2939,6 +3014,8 @@ export class CommandExecutor {
         } else {
           // Run LLM-based element resolution
           const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
+          // V14: Lazy screenshot callback for vision rescue when 0 candidates match
+          const pageForScreenshot = this.page;
           const resolveResult = await resolveElement({
             previewSessionId: 'background', // Not a preview session
             stepDraft: {
@@ -2951,6 +3028,12 @@ export class CommandExecutor {
             domNodes,
             pageUrl: this.page.url(),
             includeAlternatives: false,
+            screenshot: async () => {
+              try {
+                const buf = await pageForScreenshot.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+                return buf.toString('base64');
+              } catch { return null; }
+            },
           });
 
           if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
@@ -4023,13 +4106,14 @@ export class CommandExecutor {
     // Priority: changedFrom > regex > glob > substring > domain
 
     if (matcher.changedFrom) {
-      // Wait until URL changes from the specified value.
-      // Use page.waitForURL which is navigation-lifecycle-aware:
-      // - Checks current URL immediately (catches already-changed case)
-      // - Listens for frame.navigated events (catches in-flight navigation)
-      // - Waits for waitUntil load state after URL matches (ensures page is ready)
-      // - Handles both full-page nav and SPA pushState
-      const prevUrl = matcher.changedFrom;
+      // V13: Use runtime URL instead of recording-time URL.
+      // The recorded changedFrom may differ from the actual URL at execution time
+      // (different env, query params, etc.) — use current page URL as baseline.
+      const prevUrl = this.page.url();
+      logger.debug('[COMMAND_EXECUTOR] changedFrom using runtime URL', {
+        recorded: matcher.changedFrom,
+        runtime: prevUrl,
+      });
       await this.page.waitForURL(
         (url) => url.toString() !== prevUrl,
         { timeout: timeoutMs, waitUntil: 'load' }

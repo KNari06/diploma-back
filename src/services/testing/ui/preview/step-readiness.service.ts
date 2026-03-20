@@ -89,7 +89,8 @@ const NAVIGATION_TRIGGER_ACTIONS: Set<IntentActionType> = new Set([
   'close',
   'toggle',
   'press',
-  'navigate', // goto triggers full page navigation, needs networkIdle + DOM settle
+  'hover',     // V13: Hover can trigger dropdowns, menus, tooltips — next step needs DOM settle
+  'navigate',  // goto triggers full page navigation, needs networkIdle + DOM settle
 ]);
 
 /** Action types that require visible + enabled */
@@ -137,7 +138,7 @@ function getDomStableThresholdMs(
 
   if (NAVIGATION_TRIGGER_ACTIONS.has(prevActionType)) return DOM_STABLE_THRESHOLD_MS.navigation;
   if (prevActionType === 'type' || prevActionType === 'select') return DOM_STABLE_THRESHOLD_MS.input;
-  if (prevActionType === 'assert' || prevActionType === 'hover') return DOM_STABLE_THRESHOLD_MS.assertion;
+  if (prevActionType === 'assert') return DOM_STABLE_THRESHOLD_MS.assertion;
 
   return DOM_STABLE_THRESHOLD_MS.default;
 }

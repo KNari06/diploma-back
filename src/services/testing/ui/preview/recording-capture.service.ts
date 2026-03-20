@@ -49,6 +49,8 @@ export interface ProbedElement {
   isMultiline?: boolean;
   /** Nearest heading/landmark text — provides container context for multi-page AI lint */
   containerText?: string;
+  /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
+  iframeSelector?: string;
 }
 
 /** Typing buffer stored on session */
@@ -63,6 +65,8 @@ export interface RecordingTypingBuffer {
   isMultiline?: boolean;
   /** URL where typing started (guards against cross-page ref collision) */
   pageUrl?: string;
+  /** V13: CSS selector of iframe containing the focused element */
+  iframeSelector?: string;
 }
 
 /** Drag state tracked between mouse:down and mouse:up events */
@@ -293,16 +297,39 @@ export class RecordingCaptureService {
    */
   private static async probeInChildFrames(page: Page, x: number, y: number): Promise<ProbedElement | null> {
     try {
-      // Get all iframe elements with their bounding rects
+      // V13: Get all iframe elements with bounding rects AND a CSS selector for each
       const iframeRects = await page.evaluate(`
         (() => {
           var iframes = Array.from(document.querySelectorAll('iframe'));
           return iframes.map(function(iframe, index) {
             var rect = iframe.getBoundingClientRect();
-            return { index: index, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+            // Build a CSS selector for this iframe (id > name > title > nth-of-type)
+            var sel = '';
+            if (iframe.id) {
+              sel = 'iframe#' + iframe.id;
+            } else if (iframe.getAttribute('name')) {
+              sel = 'iframe[name="' + iframe.getAttribute('name') + '"]';
+            } else if (iframe.getAttribute('title')) {
+              sel = 'iframe[title="' + iframe.getAttribute('title') + '"]';
+            } else if (iframe.getAttribute('src')) {
+              // Use a short src substring to identify (avoid query params)
+              var src = iframe.getAttribute('src') || '';
+              var pathname = src.split('?')[0].split('#')[0];
+              if (pathname.length > 0 && pathname.length < 200) {
+                sel = 'iframe[src*="' + pathname.replace(/"/g, '') + '"]';
+              }
+            }
+            if (!sel) {
+              // Fallback: nth-of-type
+              var parent = iframe.parentElement;
+              var siblings = parent ? Array.from(parent.querySelectorAll(':scope > iframe')) : [];
+              var nth = siblings.indexOf(iframe) + 1;
+              sel = 'iframe:nth-of-type(' + nth + ')';
+            }
+            return { index: index, x: rect.x, y: rect.y, width: rect.width, height: rect.height, selector: sel };
           });
         })()
-      `) as Array<{ index: number; x: number; y: number; width: number; height: number }>;
+      `) as Array<{ index: number; x: number; y: number; width: number; height: number; selector: string }>;
 
       // Find which iframe contains the point
       for (const rect of iframeRects) {
@@ -328,6 +355,8 @@ export class RecordingCaptureService {
                 probed.boundingBox.x += Math.round(rect.x);
                 probed.boundingBox.y += Math.round(rect.y);
               }
+              // V13: Store iframe CSS selector so replay can scope to the correct iframe
+              probed.iframeSelector = rect.selector;
               return probed;
             }
           } catch {
@@ -366,13 +395,39 @@ export class RecordingCaptureService {
 
   /**
    * Probe focused element in child frames.
+   * V13: Also captures iframe CSS selector when element is found.
    */
   private static async probeFocusedInChildFrames(page: Page): Promise<ProbedElement | null> {
-    const childFrames = page.frames().filter(f => f !== page.mainFrame());
-    for (const frame of childFrames) {
+    // V13: Get iframe selectors from the page to attach to the result
+    let iframeSelectors: string[] = [];
+    try {
+      iframeSelectors = await page.evaluate(`
+        (() => {
+          var iframes = Array.from(document.querySelectorAll('iframe'));
+          return iframes.map(function(iframe) {
+            if (iframe.id) return 'iframe#' + iframe.id;
+            if (iframe.getAttribute('name')) return 'iframe[name="' + iframe.getAttribute('name') + '"]';
+            if (iframe.getAttribute('title')) return 'iframe[title="' + iframe.getAttribute('title') + '"]';
+            var src = iframe.getAttribute('src') || '';
+            var pathname = src.split('?')[0].split('#')[0];
+            if (pathname.length > 0 && pathname.length < 200) return 'iframe[src*="' + pathname.replace(/"/g, '') + '"]';
+            var parent = iframe.parentElement;
+            var siblings = parent ? Array.from(parent.querySelectorAll(':scope > iframe')) : [];
+            return 'iframe:nth-of-type(' + (siblings.indexOf(iframe) + 1) + ')';
+          });
+        })()
+      `) as string[];
+    } catch { /* non-critical */ }
+
+    const childFrames = page.mainFrame().childFrames();
+    for (let i = 0; i < childFrames.length; i++) {
+      const frame = childFrames[i];
       try {
         const result = await frame.evaluate(`${PROBE_FOCUSED_FN}()`) as ProbedElement | null;
-        if (result) return result;
+        if (result) {
+          result.iframeSelector = iframeSelectors[i] || undefined;
+          return result;
+        }
       } catch {
         // Frame may be cross-origin or detached
       }
@@ -618,13 +673,28 @@ export class RecordingCaptureService {
     label: string;
     selectedText: string;
     selectedValue: string;
+    pageUrl?: string;
+    name?: string;
+    id?: string;
+    ariaLabel?: string;
+    role?: string;
   }): PreviewIntentStep {
-    const { label, selectedText, selectedValue } = params;
+    const { label, selectedText, selectedValue, pageUrl, name, id, ariaLabel, role } = params;
+
+    // V13: Build bindingHints from captured select metadata
+    const hints: Record<string, string> = {};
+    if (label) hints.label = label;
+    if (ariaLabel) hints.label = ariaLabel; // aria-label takes priority
+    if (name) hints.name = name;
+    if (role && role !== 'combobox') hints.role = role;
+
     return {
       id: recStepId(),
       type: 'select',
       description: this.buildDescription('select', { tag: 'select', labelText: label } as ProbedElement, selectedText),
       value: selectedValue,
+      bindingHints: Object.keys(hints).length > 0 ? hints : undefined,
+      evidence: { confidence: 1.0, pageUrl },
     };
   }
 
@@ -642,6 +712,7 @@ export class RecordingCaptureService {
     endX: number,
     endY: number,
     endElement: ProbedElement | null,
+    pageUrl?: string,
   ): PreviewIntentStep | null {
     const distance = Math.sqrt(
       Math.pow(endX - dragState.startX, 2) + Math.pow(endY - dragState.startY, 2),
@@ -668,9 +739,11 @@ export class RecordingCaptureService {
       bindingHints: dragState.startElement
         ? this.buildBindingHints(dragState.startElement) as BindingHints | undefined
         : undefined,
-      ...(startRef && {
-        evidence: { lastSuccessRef: startRef, confidence: 1.0 },
-      }),
+      evidence: {
+        ...(startRef && { lastSuccessRef: startRef }),
+        confidence: 1.0,
+        pageUrl,
+      },
     };
   }
 
@@ -683,6 +756,7 @@ export class RecordingCaptureService {
   static captureFileUpload(
     filePaths: string[],
     element: ProbedElement | null,
+    pageUrl?: string,
   ): PreviewIntentStep | null {
     if (!filePaths || filePaths.length === 0) return null;
 
@@ -700,9 +774,11 @@ export class RecordingCaptureService {
       description,
       value: fileNames[0],
       bindingHints: element ? this.buildBindingHints(element) as BindingHints | undefined : undefined,
-      ...(element?.ref && {
-        evidence: { lastSuccessRef: element.ref, confidence: 1.0 },
-      }),
+      evidence: {
+        ...(element?.ref && { lastSuccessRef: element.ref }),
+        confidence: 1.0,
+        pageUrl,
+      },
     };
   }
 
@@ -711,7 +787,7 @@ export class RecordingCaptureService {
    *
    * @param accumulatedDeltaY - Total pixels scrolled during the debounce window
    */
-  static captureScroll(accumulatedDeltaY: number): PreviewIntentStep | null {
+  static captureScroll(accumulatedDeltaY: number, pageUrl?: string): PreviewIntentStep | null {
     if (accumulatedDeltaY === 0) return null;
 
     const direction = accumulatedDeltaY > 0 ? 'down' : 'up';
@@ -723,6 +799,7 @@ export class RecordingCaptureService {
       description: `Scroll ${direction} ${absDelta}px`,
       // Store the actual delta as value so replay can use it
       value: String(Math.round(accumulatedDeltaY)),
+      evidence: { confidence: 1.0, pageUrl },
     };
   }
 
@@ -734,16 +811,87 @@ export class RecordingCaptureService {
    * Capture a hover action as an IntentStep.
    * Used when a hover on a different element precedes a click (e.g., dropdown menus).
    */
-  static captureHover(element: ProbedElement): PreviewIntentStep {
+  static captureHover(element: ProbedElement, pageUrl?: string): PreviewIntentStep {
     const label = this.getElementLabel(element);
     return {
       id: recStepId(),
       type: 'hover',
       description: `Hover '${label}'`,
       bindingHints: this.buildBindingHints(element) as BindingHints | undefined,
-      ...(element.ref && {
-        evidence: { lastSuccessRef: element.ref, confidence: 1.0 },
-      }),
+      evidence: {
+        ...(element.ref && { lastSuccessRef: element.ref }),
+        confidence: 1.0,
+        pageUrl,
+      },
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // DIALOG CAPTURE (V13)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Capture a native dialog interaction (alert/confirm/prompt/beforeunload).
+   * Records what the user did (accept/dismiss) so replay can reproduce it.
+   */
+  static captureDialog(params: {
+    dialogType: 'alert' | 'confirm' | 'prompt' | 'beforeunload';
+    action: 'accept' | 'dismiss';
+    message?: string;
+    promptText?: string;
+    pageUrl?: string;
+  }): PreviewIntentStep {
+    const { dialogType, action, message, promptText, pageUrl } = params;
+
+    const actionLabel = action === 'accept' ? 'Accept' : 'Dismiss';
+    const dialogLabel = dialogType === 'beforeunload' ? 'beforeunload dialog' : `${dialogType} dialog`;
+    const msgPreview = message ? `: "${message.slice(0, 40)}"` : '';
+    const description = `${actionLabel} ${dialogLabel}${msgPreview}`;
+
+    return {
+      id: recStepId(),
+      type: 'dialog',
+      description,
+      options: {
+        dialog: {
+          dialogType,
+          action,
+          ...(promptText && { promptText }),
+          ...(message && { message: message.slice(0, 500) }),
+        },
+      },
+      evidence: { confidence: 1.0, pageUrl },
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // DOWNLOAD CAPTURE (V13)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Capture a file download as an IntentStep.
+   * Auto-recorded when a download event fires during recording.
+   * During replay, verifies that the download actually starts.
+   */
+  static captureDownload(params: {
+    filename: string;
+    url?: string;
+    pageUrl?: string;
+  }): PreviewIntentStep {
+    const { filename, url, pageUrl } = params;
+    return {
+      id: recStepId(),
+      type: 'download',
+      description: `Verify file download: '${filename.slice(0, 60)}'`,
+      value: filename,
+      options: {
+        download: {
+          filename,
+          url,
+          timeoutMs: 15000,
+        },
+      },
+      evidence: { confidence: 1.0, pageUrl },
     };
   }
 
@@ -773,15 +921,17 @@ export class RecordingCaptureService {
       ? `Type '${textPreview}' in '${label}' and press Enter`
       : `Type '${textPreview}' in '${label}'`;
 
+    const opts: Record<string, any> = {};
+    if (triggeredByEnter) opts.pressEnter = true;
+    if (buffer.iframeSelector) opts.iframe = { selector: buffer.iframeSelector };
+
     return {
       id: recStepId(),
       type: 'type',
       description,
       value: buffer.text,
       bindingHints: buffer.bindingHints as BindingHints | undefined,
-      ...(triggeredByEnter && {
-        options: { pressEnter: true },
-      }),
+      ...(Object.keys(opts).length > 0 && { options: opts }),
       ...(buffer.elementRef && {
         evidence: { lastSuccessRef: buffer.elementRef, confidence: 1.0, pageUrl: buffer.pageUrl },
       }),
@@ -825,8 +975,14 @@ export class RecordingCaptureService {
           const text = selectedOption?.text || '';
           const value = select.value;
 
+          // V13: Capture additional binding hints for element resolution during replay
+          const name = select.getAttribute('name') || '';
+          const id = select.getAttribute('id') || '';
+          const ariaLabel = select.getAttribute('aria-label') || '';
+          const role = select.getAttribute('role') || 'combobox';
+
           // @ts-ignore
-          if (window[cbName]) window[cbName]({ label, text, value });
+          if (window[cbName]) window[cbName]({ label, text, value, name, id, ariaLabel, role });
         };
 
         // @ts-ignore
@@ -858,6 +1014,136 @@ export class RecordingCaptureService {
           // @ts-ignore
           delete window.__qai_select_injected;
         }
+      });
+    } catch {
+      // Page may already be closed
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // AUTOFILL DETECTION (V13)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Inject an autofill detection listener into the page.
+   * Monitors 'change' events on input elements that fire without prior keyboard 'input' events.
+   * Browser autofill triggers 'change' directly (no keydown/keypress/keyup/input sequence).
+   * We track which inputs had recent 'input' events (from keyboard) and skip those.
+   */
+  static async injectAutofillListener(
+    page: Page,
+    callbackName: string,
+  ): Promise<void> {
+    try {
+      // @ts-ignore - browser context code
+      await page.evaluate((cbName: string) => {
+        // @ts-ignore
+        if (window.__qai_autofill_injected) return;
+        // @ts-ignore
+        window.__qai_autofill_injected = true;
+
+        // Track which inputs had recent keyboard 'input' events
+        // @ts-ignore
+        const recentKeyboardInputs = new Set();
+        // @ts-ignore
+        let clearTimer: ReturnType<typeof setTimeout> | null = null;
+
+        // Listen for 'input' events from keyboard (user typing)
+        // @ts-ignore
+        const inputHandler = (e) => {
+          if (e.inputType && e.inputType.startsWith('insert') && e.target?.tagName) {
+            const tag = e.target.tagName.toLowerCase();
+            if (tag === 'input' || tag === 'textarea') {
+              const key = (e.target.getAttribute('data-agent-ref') || e.target.name || e.target.id || '');
+              if (key) recentKeyboardInputs.add(key);
+              // Clear after 500ms
+              if (clearTimer) clearTimeout(clearTimer);
+              clearTimer = setTimeout(() => recentKeyboardInputs.clear(), 500);
+            }
+          }
+        };
+        // @ts-ignore
+        document.addEventListener('input', inputHandler, true);
+
+        // Listen for 'change' events — autofill triggers these without prior 'input' events
+        // @ts-ignore
+        const changeHandler = (e) => {
+          const el = e.target;
+          if (!el || !el.tagName) return;
+          const tag = el.tagName.toLowerCase();
+          if (tag !== 'input' && tag !== 'textarea') return;
+          // Skip select elements (handled by select listener)
+          if (tag === 'select') return;
+
+          const key = (el.getAttribute('data-agent-ref') || el.name || el.id || '');
+          // If this input had recent keyboard input, skip — it's not autofill
+          if (key && recentKeyboardInputs.has(key)) return;
+
+          const value = el.value || '';
+          if (!value) return;
+
+          // Get label for the input
+          let label = '';
+          if (el.labels && el.labels.length > 0) {
+            label = (el.labels[0].textContent || '').trim().slice(0, 100);
+          }
+          if (!label) {
+            label = el.getAttribute('aria-label') || '';
+          }
+
+          // @ts-ignore
+          if (window[cbName]) {
+            // @ts-ignore
+            window[cbName]({
+              tag: tag,
+              type: el.getAttribute('type') || '',
+              name: el.getAttribute('name') || '',
+              id: el.getAttribute('id') || '',
+              ariaLabel: el.getAttribute('aria-label') || '',
+              label: label,
+              value: value,
+              ref: el.getAttribute('data-agent-ref') || '',
+            });
+          }
+        };
+        // @ts-ignore
+        document.addEventListener('change', changeHandler, true);
+
+        // @ts-ignore
+        window.__qai_autofill_input_handler = inputHandler;
+        // @ts-ignore
+        window.__qai_autofill_change_handler = changeHandler;
+      }, callbackName);
+    } catch (error) {
+      logger.debug('[RECORDING] Failed to inject autofill listener', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Remove the injected autofill detection listener.
+   */
+  static async removeAutofillListener(page: Page): Promise<void> {
+    try {
+      // @ts-ignore - browser context code
+      await page.evaluate(() => {
+        // @ts-ignore
+        if (window.__qai_autofill_input_handler) {
+          // @ts-ignore
+          document.removeEventListener('input', window.__qai_autofill_input_handler, true);
+          // @ts-ignore
+          delete window.__qai_autofill_input_handler;
+        }
+        // @ts-ignore
+        if (window.__qai_autofill_change_handler) {
+          // @ts-ignore
+          document.removeEventListener('change', window.__qai_autofill_change_handler, true);
+          // @ts-ignore
+          delete window.__qai_autofill_change_handler;
+        }
+        // @ts-ignore
+        delete window.__qai_autofill_injected;
       });
     } catch {
       // Page may already be closed

@@ -173,7 +173,11 @@ export type IntentActionType =
   | 'contextmenu'
   | 'drag_and_drop'
   // V12: Email inbox (wait for email, extract OTP/link via AI)
-  | 'wait_for_email';
+  | 'wait_for_email'
+  // V13: Native browser dialog (alert/confirm/prompt/beforeunload)
+  | 'dialog'
+  // V13: File download verification (auto-recorded when download triggers)
+  | 'download';
 
 /**
  * Binding hints for element resolution
@@ -370,6 +374,8 @@ export interface StepOptions {
   replaceContent?: boolean;
   /** Press Enter after filling */
   pressEnter?: boolean;
+  /** V13: Content was pasted (Ctrl+V / Cmd+V), not typed — dispatch paste event during replay */
+  isPaste?: boolean;
   /** Delay between keystrokes in milliseconds (for type actions) */
   keyPressDelay?: number;
   /** Manual CSS selector override - bypasses AI resolution */
@@ -420,6 +426,26 @@ export interface StepOptions {
     maxSizeBytes?: number;
   };
   /**
+   * V13: Dialog handling options for dialog step type.
+   * Records what the user did with a native browser dialog (alert/confirm/prompt).
+   */
+  dialog?: {
+    /** Type of the native dialog */
+    dialogType: 'alert' | 'confirm' | 'prompt' | 'beforeunload';
+    /** User's action: accept (OK) or dismiss (Cancel) */
+    action: 'accept' | 'dismiss';
+    /** Text entered by user in prompt() dialog */
+    promptText?: string;
+    /** The dialog message text (for logging/debugging) */
+    message?: string;
+  };
+  /**
+   * V13: Modifier keys held during click (Shift+Click, Ctrl+Click, etc.)
+   * Captured during recording when user holds modifier keys while clicking.
+   * Used in replay to reproduce multi-select and other modifier interactions.
+   */
+  modifiers?: { shift?: boolean; ctrl?: boolean; meta?: boolean; alt?: boolean };
+  /**
    * V12: Email filter for wait_for_email step.
    * Configures which email to wait for and what to extract.
    */
@@ -432,6 +458,18 @@ export interface StepOptions {
     extractPrompt: string;
     /** Variable name to store extracted value — accessible as {{email.<variable>}} in subsequent steps */
     extractVariable: string;
+  };
+  /**
+   * V13: Download verification options.
+   * Recorded when a file download is triggered during recording.
+   */
+  download?: {
+    /** Expected filename (or pattern) */
+    filename?: string;
+    /** URL that triggered the download */
+    url?: string;
+    /** Timeout for waiting for download (ms, default 15000) */
+    timeoutMs?: number;
   };
 }
 
