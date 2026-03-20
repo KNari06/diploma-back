@@ -7,7 +7,6 @@
  *   CLASSIFY   → AI classification for ambiguous files (already done in parser)
  *   TESTS      → Create IntentTestCase records (with tags/priority via update)
  *   KB         → Push cleaned documentation to Knowledge Base
- *   ARTIFACTS  → Upload screenshots to Supabase Storage
  *   DONE       → Emit final stats
  *
  * Error handling:
@@ -22,11 +21,11 @@ import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test
 import { parseAllureZip } from './allure-parser';
 import {
   mapAllureResult,
+  mapAllureResultLabelsOnly,
   getWebUiPlatformId,
   HierarchyCache,
 } from './allure-mapper';
 import { processAllureDocumentation } from './allure-kb-processor';
-import { uploadAllureScreenshots } from './allure-storage.service';
 import type {
   AllureImportJobData,
   AllureImportStats,
@@ -34,6 +33,7 @@ import type {
   AllureImportProgressPayload,
   AllureImportCompletedPayload,
   AllureImportFailedPayload,
+  AllureImportResultHierarchy,
 } from './allure-import.types';
 import { emptyStats } from './allure-import.types';
 
@@ -146,17 +146,23 @@ async function updateImportRecord(
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Result returned from processAllureImport — stats + hierarchy for the frontend popup. */
+export interface AllureImportResult {
+  stats: AllureImportStats;
+  hierarchy: AllureImportResultHierarchy;
+}
+
 /**
  * Process a full Allure ZIP import.
  *
  * @param jobData       - BullMQ job data (importId, projectId, userId, zipBase64, options)
  * @param emitProgress  - Callback for WebSocket progress events
- * @returns Final AllureImportStats (always — never throws)
+ * @returns Final stats + hierarchy tree (always — never throws)
  */
 export async function processAllureImport(
   jobData: AllureImportJobData,
   emitProgress: ProgressEmitter,
-): Promise<AllureImportStats> {
+): Promise<AllureImportResult> {
   const { importId, projectId, userId, workspaceId, zipBase64, options } = jobData;
   const stats = emptyStats();
   const startTime = Date.now();
@@ -200,7 +206,6 @@ export async function processAllureImport(
     stats.totalFiles =
       parsedData.results.length +
       parsedData.containers.length +
-      parsedData.classified.screenshots.length +
       parsedData.classified.documentation.length +
       parsedData.classified.videosSkipped +
       parsedData.classified.filesSkipped;
@@ -212,8 +217,7 @@ export async function processAllureImport(
       'classifying',
       1,
       1,
-      `Found ${stats.testsFound} test results, ${parsedData.classified.documentation.length} docs, ` +
-      `${parsedData.classified.screenshots.length} screenshots`,
+      `Found ${stats.testsFound} test results, ${parsedData.classified.documentation.length} docs`,
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -238,12 +242,13 @@ export async function processAllureImport(
   }
 
   // ── Phase 3: CREATE TEST CASES ────────────────────────────────────────────
+  const hierarchyCache = new HierarchyCache();
+
   if (options.importTestCases && parsedData.results.length > 0) {
     emitPhase('tests', 0, parsedData.results.length, 'Importing test cases…');
 
     try {
       const webUiPlatformId = await getWebUiPlatformId(projectId, userId);
-      const hierarchyCache = new HierarchyCache();
 
       // Fetch existing test names for dedup
       const existingNames = options.deduplicateTests
@@ -262,6 +267,28 @@ export async function processAllureImport(
               name: result.name,
             });
             stats.testsSkipped++;
+
+            // Lightweight label-only mapping — no AI call needed for duplicates.
+            // Only resolves module/flow hierarchy for correct tree placement.
+            const skippedLabels = await mapAllureResultLabelsOnly(
+              result,
+              hierarchyCache,
+              webUiPlatformId,
+              { projectId, userId, autoCreateModules: options.autoCreateModules, autoCreateFlows: options.autoCreateFlows },
+            );
+
+            hierarchyCache.addTestNode(
+              {
+                id: '',
+                name: result.name,
+                status: result.status,
+                priority: skippedLabels.priority,
+                stepsCount: 0,
+                skipped: true,
+              },
+              skippedLabels.flowId,
+              skippedLabels.moduleId,
+            );
             continue;
           }
 
@@ -320,6 +347,19 @@ export async function processAllureImport(
           // Register name in dedup set to avoid same-batch duplicates
           existingNames.add(result.name.toLowerCase());
           stats.testsImported++;
+
+          // Track in hierarchy tree for the frontend popup
+          hierarchyCache.addTestNode(
+            {
+              id: created.id,
+              name: created.name,
+              status: result.status,
+              priority: mapped.createParams.priority,
+              stepsCount: mapped.createParams.steps.length,
+            },
+            mapped.createParams.flowId,
+            mapped.moduleId,
+          );
 
           logger.debug('[AllureImport] Test case imported', {
             id: created.id,
@@ -386,48 +426,16 @@ export async function processAllureImport(
     }
   }
 
-  // ── Phase 5: SCREENSHOTS ──────────────────────────────────────────────────
-  if (options.importScreenshots && parsedData.classified.screenshots.length > 0) {
-    emitPhase(
-      'artifacts',
-      0,
-      parsedData.classified.screenshots.length,
-      'Uploading screenshots…',
-    );
-
-    try {
-      const uploadResult = await uploadAllureScreenshots(
-        parsedData.classified.screenshots,
-        parsedData.attachmentBuffers,
-        projectId,
-        importId,
-      );
-
-      stats.screenshotsUploaded = uploadResult.uploaded;
-      stats.filesSkipped += uploadResult.skipped;
-      stats.errors.push(...uploadResult.errors);
-
-      emitPhase(
-        'artifacts',
-        uploadResult.uploaded,
-        parsedData.classified.screenshots.length,
-        `${stats.screenshotsUploaded} screenshots uploaded`,
-      );
-    } catch (storageErr) {
-      const msg = `Screenshot upload failed: ${storageErr instanceof Error ? storageErr.message : String(storageErr)}`;
-      stats.errors.push(msg);
-      logger.error('[AllureImport] Storage phase error', { importId, error: msg });
-      emitPhase('artifacts', 0, 1, 'Screenshot upload failed (non-fatal)');
-    }
-  }
-
-  // ── Phase 6: DONE ─────────────────────────────────────────────────────────
+  // ── Phase 5: DONE ──────────────────────────────────────────────────────────
   const durationMs = Date.now() - startTime;
+  const hierarchy = hierarchyCache.buildHierarchy();
 
   logger.info('[AllureImport] Import complete', {
     importId,
     durationMs,
     stats,
+    hierarchyModules: hierarchy.modules.length,
+    hierarchyUnassigned: hierarchy.unassigned.length,
   });
 
   try {
@@ -435,6 +443,7 @@ export async function processAllureImport(
       importId,
       success: stats.errors.length === 0,
       stats: { ...stats },
+      hierarchy,
       durationMs,
       timestamp: new Date().toISOString(),
     } satisfies AllureImportCompletedPayload);
@@ -445,5 +454,5 @@ export async function processAllureImport(
     stats,
   });
 
-  return stats;
+  return { stats, hierarchy };
 }

@@ -19,7 +19,6 @@
 export type AllureFileCategory =
   | 'test_result'    // *-result.json  → IntentTestCase
   | 'container'      // *-container.json → preconditions / teardown
-  | 'screenshot'     // *.png/jpg/gif/bmp/svg → Supabase Storage + step evidence
   | 'documentation'  // text-based attachments (txt, html, json, log, har…) → KB
   | 'metadata'       // environment.properties, executor.json, categories.json
   | 'structure'      // data/behaviors.csv, data/suites.csv, widgets/summary.json
@@ -38,7 +37,7 @@ export interface ClassifiedFile {
   category: AllureFileCategory;
   /**
    * Raw content for text files (first 2000 chars used during AI classification).
-   * Undefined for binary files (screenshots, videos).
+   * Undefined for binary files (videos).
    */
   textPreview?: string;
   /**
@@ -181,11 +180,6 @@ export interface AllureParsedData {
    * Used to attach preconditions / teardown to test cases.
    */
   containerByResultUuid: Map<string, AllureContainer>;
-  /**
-   * Maps attachment source filename → raw Buffer from the ZIP.
-   * Used for uploading screenshots to Supabase Storage.
-   */
-  attachmentBuffers: Map<string, Buffer>;
   /** Metadata from environment.properties, executor.json, categories.json. */
   metadata: AllureImportMetadata;
   /** Classification summary for all non-result/container files. */
@@ -207,10 +201,9 @@ export interface AllureImportMetadata {
 
 /** Summary of how files were classified (for stats / logging). */
 export interface AllureClassificationSummary {
-  screenshots: string[];                 // source filenames eligible for upload
   documentation: DocumentationFile[];    // text files to push to KB
   videosSkipped: number;                 // always-skipped video files
-  filesSkipped: number;                  // report UI, plugins, binaries, noise
+  filesSkipped: number;                  // report UI, plugins, binaries, images, noise
 }
 
 /** A documentation file ready for KB ingestion. */
@@ -224,6 +217,47 @@ export interface DocumentationFile {
   documentTitle?: string;
   /** AI classification category ("test_log", "api_response", "page_snapshot", etc.) */
   aiCategory?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IMPORT RESULT HIERARCHY (for frontend popup)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** A test case node in the result hierarchy. */
+export interface AllureImportedTestNode {
+  id: string;
+  name: string;
+  /** Original Allure status (passed/failed/broken/skipped/unknown). */
+  status: AllureTestResult['status'];
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  stepsCount: number;
+  /** True if this test was skipped as a duplicate. */
+  skipped?: boolean;
+}
+
+/** A flow node in the result hierarchy. */
+export interface AllureImportedFlowNode {
+  id: string;
+  name: string;
+  /** True if this flow was auto-created during import. */
+  isNew: boolean;
+  tests: AllureImportedTestNode[];
+}
+
+/** A module node in the result hierarchy. */
+export interface AllureImportedModuleNode {
+  id: string;
+  name: string;
+  /** True if this module was auto-created during import. */
+  isNew: boolean;
+  flows: AllureImportedFlowNode[];
+}
+
+/** Full result hierarchy returned after import completes. */
+export interface AllureImportResultHierarchy {
+  modules: AllureImportedModuleNode[];
+  /** Test cases not assigned to any module/flow. */
+  unassigned: AllureImportedTestNode[];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -249,8 +283,6 @@ export interface AllureImportOptions {
   deduplicateTests?: boolean;
   /** Save documentation attachments to Knowledge Base. Default: true */
   saveDocsToKB?: boolean;
-  /** Upload screenshots to Supabase Storage and link to step evidence. Default: true */
-  importScreenshots?: boolean;
 }
 
 /**
@@ -263,7 +295,6 @@ export interface ResolvedAllureImportOptions {
   autoCreateFlows: boolean;
   deduplicateTests: boolean;
   saveDocsToKB: boolean;
-  importScreenshots: boolean;
 }
 
 /**
@@ -278,7 +309,6 @@ export function resolveImportOptions(
     autoCreateFlows:   opts.autoCreateFlows   ?? true,
     deduplicateTests:  opts.deduplicateTests  ?? true,
     saveDocsToKB:      opts.saveDocsToKB      ?? true,
-    importScreenshots: opts.importScreenshots ?? true,
   };
 }
 
@@ -313,7 +343,6 @@ export type AllureImportPhase =
   | 'classifying' // AI classification of ambiguous files
   | 'tests'       // Creating IntentTestCase records
   | 'kb'          // Pushing documentation to Knowledge Base
-  | 'artifacts'   // Uploading screenshots to Supabase Storage
   | 'done';       // Import complete
 
 /**
@@ -327,7 +356,6 @@ export interface AllureImportStats {
   modulesCreated: number;
   flowsCreated: number;
   kbDocumentsCreated: number;
-  screenshotsUploaded: number;
   filesSkipped: number;
   videosSkipped: number;
   /** Non-fatal errors (one string per issue). */
@@ -354,6 +382,7 @@ export interface AllureImportCompletedPayload {
   importId: string;
   success: boolean;
   stats: AllureImportStats;
+  hierarchy: AllureImportResultHierarchy;
   durationMs: number;
   timestamp: string;
 }
@@ -380,7 +409,6 @@ export function emptyStats(): AllureImportStats {
     modulesCreated: 0,
     flowsCreated: 0,
     kbDocumentsCreated: 0,
-    screenshotsUploaded: 0,
     filesSkipped: 0,
     videosSkipped: 0,
     errors: [],

@@ -173,4 +173,9 @@ export const AI_TASK_MODELS = {
    * Strips HTML/noise, summarises logs, extracts useful content.
    */
   allurePreprocess: AI_MODELS.classify,
+  /**
+   * Converts Allure test steps into platform IntentSteps.
+   * Understands UI action context, splits composite steps, filters non-UI steps.
+   */
+  allureStepConvert: AI_MODELS.classify,
 } as const;

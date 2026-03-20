@@ -1467,7 +1467,6 @@ export interface AllureImportStatsWS {
   modulesCreated: number;
   flowsCreated: number;
   kbDocumentsCreated: number;
-  screenshotsUploaded: number;
   filesSkipped: number;
   videosSkipped: number;
   errors: string[];
@@ -1476,7 +1475,7 @@ export interface AllureImportStatsWS {
 export interface AllureImportProgressWSPayload {
   importId: string;
   /** Current import phase. */
-  phase: 'scanning' | 'classifying' | 'tests' | 'kb' | 'artifacts' | 'done';
+  phase: 'scanning' | 'classifying' | 'tests' | 'kb' | 'done';
   current: number;
   total: number;
   message: string;
@@ -1484,10 +1483,43 @@ export interface AllureImportProgressWSPayload {
   timestamp: string;
 }
 
+/** A test case in the import result tree. */
+export interface AllureImportedTestNodeWS {
+  id: string;
+  name: string;
+  status: 'passed' | 'failed' | 'broken' | 'skipped' | 'unknown';
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  stepsCount: number;
+  skipped?: boolean;
+}
+
+/** A flow in the import result tree. */
+export interface AllureImportedFlowNodeWS {
+  id: string;
+  name: string;
+  isNew: boolean;
+  tests: AllureImportedTestNodeWS[];
+}
+
+/** A module in the import result tree. */
+export interface AllureImportedModuleNodeWS {
+  id: string;
+  name: string;
+  isNew: boolean;
+  flows: AllureImportedFlowNodeWS[];
+}
+
+/** Full hierarchy returned in the completed payload. */
+export interface AllureImportResultHierarchyWS {
+  modules: AllureImportedModuleNodeWS[];
+  unassigned: AllureImportedTestNodeWS[];
+}
+
 export interface AllureImportCompletedWSPayload {
   importId: string;
   success: boolean;
   stats: AllureImportStatsWS;
+  hierarchy: AllureImportResultHierarchyWS;
   durationMs: number;
   timestamp: string;
 }

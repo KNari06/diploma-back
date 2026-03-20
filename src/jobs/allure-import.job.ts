@@ -12,8 +12,8 @@ import { Job } from 'bullmq';
 import { logger, logQueueEvent } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { processAllureImport } from '@/services/allure-import/allure-import.service';
-import type { AllureImportJobData, AllureImportStats } from '@/services/allure-import/allure-import.types';
-import type { ProgressEmitter } from '@/services/allure-import/allure-import.service';
+import type { AllureImportJobData } from '@/services/allure-import/allure-import.types';
+import type { ProgressEmitter, AllureImportResult } from '@/services/allure-import/allure-import.service';
 
 export class AllureImportJobHandler {
   /**
@@ -26,7 +26,7 @@ export class AllureImportJobHandler {
    * All other errors are collected in stats.errors[] and the job completes
    * with partial success.
    */
-  static async process(job: Job<AllureImportJobData>): Promise<AllureImportStats> {
+  static async process(job: Job<AllureImportJobData>): Promise<AllureImportResult> {
     const { importId, projectId, userId } = job.data;
 
     logger.info('[AllureImportJob] Starting job', {
@@ -60,21 +60,21 @@ export class AllureImportJobHandler {
     };
 
     try {
-      const stats = await processAllureImport(job.data, emitProgress);
+      const result = await processAllureImport(job.data, emitProgress);
 
       logQueueEvent('completed', job.id!, {
         importId,
-        testsImported: stats.testsImported,
-        errors: stats.errors.length,
+        testsImported: result.stats.testsImported,
+        errors: result.stats.errors.length,
       });
 
       logger.info('[AllureImportJob] Job complete', {
         jobId: job.id,
         importId,
-        stats,
+        stats: result.stats,
       });
 
-      return stats;
+      return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logQueueEvent('failed', job.id!, { importId, error: message });
