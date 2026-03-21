@@ -285,8 +285,18 @@ Return one entry per input file. The "filename" must match EXACTLY.`;
       },
     );
 
-    const rawContent = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '';
-    const parsed: AIBatchResponse = JSON.parse(rawContent);
+    const rawContent = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '{}';
+
+    let parsed: AIBatchResponse;
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      logger.warn('[AllureClassifier] AI response JSON parse failed (truncated?)', {
+        filesCount: files.length,
+        contentLength: rawContent.length,
+      });
+      return results; // Return empty map — caller treats missing entries as 'skip'
+    }
 
     if (Array.isArray(parsed.files)) {
       for (const item of parsed.files) {

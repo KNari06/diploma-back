@@ -99,7 +99,7 @@ You receive a test name and its steps. Each step has:
 - status: passed/failed/broken/skipped
 
 ## Output
-Convert each MEANINGFUL step into a UI test action. Return a JSON array of actions.
+Convert each MEANINGFUL step into a UI test action.
 
 ## Action types (pick the most specific one)
 - navigate: Go to a URL, open a page, redirect
@@ -696,6 +696,43 @@ export interface MapperOptions {
 }
 
 /**
+ * Resolve module + flow from label names using the HierarchyCache.
+ * Shared by both mapAllureResult (full mapping) and mapAllureResultLabelsOnly (dedup).
+ */
+async function resolveHierarchy(
+  cache: HierarchyCache,
+  webUiPlatformId: string,
+  opts: MapperOptions,
+  moduleName?: string,
+  flowName?: string,
+): Promise<{ moduleId?: string; flowId?: string }> {
+  if (!moduleName) return {};
+
+  const moduleId = await cache.resolveModule({
+    projectId: opts.projectId,
+    userId: opts.userId,
+    platformId: webUiPlatformId,
+    epicName: moduleName,
+    autoCreate: opts.autoCreateModules,
+  });
+
+  if (!moduleId) return {};
+
+  let flowId: string | undefined;
+  if (flowName) {
+    const resolved = await cache.resolveFlow({
+      moduleId,
+      userId: opts.userId,
+      featureName: flowName,
+      autoCreate: opts.autoCreateFlows,
+    });
+    if (resolved) flowId = resolved;
+  }
+
+  return { moduleId, flowId };
+}
+
+/**
  * Lightweight label-only mapper — resolves module/flow hierarchy WITHOUT
  * calling AI for step conversion. Used for duplicate tests that need
  * hierarchy placement but not full mapping.
@@ -706,37 +743,9 @@ export async function mapAllureResultLabelsOnly(
   webUiPlatformId: string,
   opts: MapperOptions,
 ): Promise<{ moduleId?: string; flowId?: string; priority: ExtractedLabels['priority'] }> {
-  const { projectId, userId, autoCreateModules, autoCreateFlows } = opts;
   const { moduleName, flowName, priority } = extractLabels(result.labels);
-
-  let flowId: string | undefined;
-  let resolvedModuleId: string | undefined;
-
-  if (moduleName) {
-    const moduleId = await cache.resolveModule({
-      projectId,
-      userId,
-      platformId: webUiPlatformId,
-      epicName: moduleName,
-      autoCreate: autoCreateModules,
-    });
-
-    if (moduleId) {
-      resolvedModuleId = moduleId;
-
-      if (flowName) {
-        const resolved = await cache.resolveFlow({
-          moduleId,
-          userId,
-          featureName: flowName,
-          autoCreate: autoCreateFlows,
-        });
-        if (resolved) flowId = resolved;
-      }
-    }
-  }
-
-  return { moduleId: resolvedModuleId, flowId, priority };
+  const { moduleId, flowId } = await resolveHierarchy(cache, webUiPlatformId, opts, moduleName, flowName);
+  return { moduleId, flowId, priority };
 }
 
 /**
@@ -755,7 +764,7 @@ export async function mapAllureResult(
   webUiPlatformId: string,
   opts: MapperOptions,
 ): Promise<MappedTestCase> {
-  const { projectId, userId, autoCreateModules, autoCreateFlows } = opts;
+  const { projectId, userId } = opts;
 
   // ── 1. Flatten + AI-convert steps ──────────────────────────────────────────
   const rawSteps = flattenRawSteps(result.steps);
@@ -779,36 +788,9 @@ export async function mapAllureResult(
   const description = buildDescription(result, descriptionSuffix, preconditions);
 
   // ── 5. Resolve hierarchy (Module → Flow) ──────────────────────────────────
-  //
-  // moduleName comes from: epic → parentSuite → suite (fallback chain)
-  // flowName comes from:   feature → suite (if parentSuite) → subSuite
-  //
-  let flowId: string | undefined;
-  let resolvedModuleId: string | undefined;
-
-  if (moduleName) {
-    const moduleId = await cache.resolveModule({
-      projectId,
-      userId,
-      platformId: webUiPlatformId,
-      epicName: moduleName,
-      autoCreate: autoCreateModules,
-    });
-
-    if (moduleId) {
-      resolvedModuleId = moduleId;
-
-      if (flowName) {
-        const resolvedFlowId = await cache.resolveFlow({
-          moduleId,
-          userId,
-          featureName: flowName,
-          autoCreate: autoCreateFlows,
-        });
-        if (resolvedFlowId) flowId = resolvedFlowId;
-      }
-    }
-  }
+  const { moduleId: resolvedModuleId, flowId } = await resolveHierarchy(
+    cache, webUiPlatformId, opts, moduleName, flowName,
+  );
 
   // ── 6. Compose create params ──────────────────────────────────────────────
   return {

@@ -143,12 +143,19 @@ Clean the file content so it's useful for future retrieval. The cleaned content 
       },
     );
 
-    const raw = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '';
-    const parsed = JSON.parse(raw) as {
-      cleaned_content?: string;
-      document_title?: string;
-      is_noise?: boolean;
-    };
+    const raw = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '{}';
+
+    let parsed: { cleaned_content?: string; document_title?: string; is_noise?: boolean };
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.warn('[AllureKBProcessor] AI response JSON parse failed (truncated?)', {
+        filename,
+        contentLength: raw.length,
+      });
+      // Fallback: use raw content as-is
+      return { cleanedContent: rawContent, documentTitle: filename, isNoise: false };
+    }
 
     return {
       cleanedContent: parsed.cleaned_content?.trim() ?? rawContent,
