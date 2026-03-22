@@ -228,6 +228,7 @@ interface InternalSession extends PreviewSession {
     startY: number;
     startElement: any; // ProbedElement from recording-capture.service
     startedAt: number;
+    viewport?: { width: number; height: number };
   } | null;
   /** V10: Last emitted type step — for merging consecutive typing in same element */
   recordingLastTypeStep: {
@@ -239,6 +240,7 @@ interface InternalSession extends PreviewSession {
   recordingLastScrollStep: {
     id: string;
     totalDelta: number;
+    totalDeltaX: number;
     emittedAt: number;
   } | null;
   /** V11: Last hover position — for recording hover steps before click on different element */
@@ -251,6 +253,8 @@ interface InternalSession extends PreviewSession {
 
   /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
   recordingStartUrl?: string;
+  /** V14: Timestamp when last recording step was emitted (for inter-step delay calculation) */
+  recordingLastStepEmittedAt?: number;
 
   /** V13: Dialog handling mode — controls how native dialogs are handled */
   dialogMode: 'passive' | 'recording' | 'replay';
@@ -1437,8 +1441,7 @@ export class PreviewSessionService {
    */
   private computePageSignature(url: string, domNodes: InteractiveNode[]): string {
     const data = `${url}|${domNodes.length}|${domNodes.map(n => n.ref).join(',')}`;
-    // Simple hash - just use first 16 chars of base64
-    return Buffer.from(data).toString('base64').substring(0, 32);
+    return Buffer.from(data).toString('base64');
   }
 
   /**
@@ -1656,12 +1659,16 @@ export class PreviewSessionService {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return false;
     session.recording = recording;
-    if (!recording) {
+    if (recording) {
+      // V14: Reset inter-step delay tracking on recording start
+      session.recordingLastStepEmittedAt = undefined;
+    } else {
       session.recordingTypingBuffer = null;
       session.recordingDragState = null;
       session.recordingLastTypeStep = null;
       session.recordingLastScrollStep = null;
       session.recordingLastHover = null;
+      session.recordingLastStepEmittedAt = undefined;
     }
     return true;
   }
@@ -1801,6 +1808,36 @@ export class PreviewSessionService {
   setRecordingLastHover(sessionId: string, userId: string, state: InternalSession['recordingLastHover']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastHover = state;
+  }
+
+  /**
+   * V14: Compute and stamp interStepDelayMs on a step, then update the timestamp.
+   * Call right before emitting a recording step to automatically track timing.
+   * Returns the delay in ms (0 if this is the first step).
+   */
+  stampInterStepDelay(sessionId: string, userId: string, step: { evidence?: { interStepDelayMs?: number } } | null | undefined): number {
+    if (!step) return 0;
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return 0;
+    const now = Date.now();
+    const prevTs = session.recordingLastStepEmittedAt;
+    const delayMs = prevTs ? now - prevTs : 0;
+    session.recordingLastStepEmittedAt = now;
+    // Only stamp meaningful delays (>500ms) — sub-500ms is just fast clicking
+    if (delayMs > 500 && step.evidence) {
+      step.evidence.interStepDelayMs = delayMs;
+    } else if (delayMs > 500 && !step.evidence) {
+      (step as any).evidence = { interStepDelayMs: delayMs };
+    }
+    return delayMs;
+  }
+
+  /**
+   * V14: Reset recording timestamp (call on recording start).
+   */
+  resetRecordingStepTimestamp(sessionId: string, userId: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastStepEmittedAt = undefined;
   }
 
   /**

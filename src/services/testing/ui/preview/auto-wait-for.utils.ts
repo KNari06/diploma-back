@@ -42,6 +42,9 @@ const SKIP_INJECT_AFTER_TYPES: Set<IntentActionType> = new Set([
   'wait_for',
   'ai_check',
   'wait_for_email',  // V12: Already a waiting action
+  'dialog',          // V14: Non-targeting — pre-installs handler, no navigation
+  'download',        // V14: Non-targeting — waits for download event, no navigation
+  'scroll',          // V14: Scroll doesn't trigger navigation
 ]);
 
 /**

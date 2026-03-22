@@ -692,7 +692,7 @@ function computeTextHash(text: string): string {
 function computePageSignature(url: string, nodes: InteractiveNode[]): string {
   const refs = nodes.map(n => n.ref || '').join(',');
   const data = `${url}|${nodes.length}|${refs}`;
-  return Buffer.from(data).toString('base64').substring(0, 32);
+  return Buffer.from(data).toString('base64');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

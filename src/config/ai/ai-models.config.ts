@@ -27,8 +27,8 @@ export const AI_MODELS = {
   /** High-quality model for complex reasoning, auditing, vision. Default: gpt-5.4-mini */
   smart: env.OPENAI_MODEL || 'gpt-5.4-mini',
 
-  /** Fast/cheap model for classification, extraction, disambiguation. Default: gpt-4.1-mini */
-  fast: env.OPENAI_MODEL_FAST || 'gpt-4.1-mini',
+  /** Fast/cheap model for classification, extraction, disambiguation. Default: gpt-5.4-mini */
+  fast: env.OPENAI_MODEL_FAST || 'gpt-5.4-mini',
 
   /** Vision-capable model for screenshot analysis. Default: gpt-5.4-mini */
   vision: env.OPENAI_MODEL || 'gpt-5.4-mini',

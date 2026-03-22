@@ -112,9 +112,35 @@ async function checkPageSignature(
   const isBase64Signature = compiledParts.length <= 1 || compiledParts.every(p => !p.includes(':'));
 
   if (isBase64Signature) {
-    logger.debug('[COMPILED_EXECUTOR] Compiled signature is base64 format (from recording), skipping comparison', {
-      compiledSignaturePreview: compiledSignature.slice(0, 30),
-    });
+    // V14: Decode base64 signature — format: base64(url|nodeCount|refs).
+    // Compare decoded URL path against current page URL to detect page mismatch.
+    // nodeCount comparison is unreliable (recording uses broader selectors than replay),
+    // so we only use URL-based matching here; fingerprint validation guards element accuracy.
+    try {
+      const decoded = Buffer.from(compiledSignature, 'base64').toString('utf-8');
+      const decodedParts = decoded.split('|');
+      if (decodedParts.length >= 1 && decodedParts[0]) {
+        const compiledUrl = decodedParts[0];
+        const currentUrl = page.url();
+        // Compare pathname — ignore query params and hash (they change between runs)
+        try {
+          const compiledPath = new URL(compiledUrl).pathname;
+          const currentPath = new URL(currentUrl).pathname;
+          if (compiledPath !== currentPath) {
+            logger.warn('[COMPILED_EXECUTOR] Base64 signature: URL path mismatch — likely different page', {
+              compiledPath,
+              currentPath,
+            });
+            return { matched: false, currentSignature };
+          }
+        } catch {
+          // URL parsing failed — skip comparison
+        }
+      }
+    } catch {
+      // Decode failed — treat as matched (backward compatibility for truncated signatures)
+    }
+    logger.debug('[COMPILED_EXECUTOR] Compiled signature is base64 format (from recording), URL check passed');
     return { matched: true, currentSignature };
   }
 

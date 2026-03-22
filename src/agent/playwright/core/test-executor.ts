@@ -160,6 +160,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   videoPath?: string;
   traceUrl?: string;
   tracePath?: string;
+  /** V14: URL to replay trace JSONL in Supabase Storage */
+  replayTraceUrl?: string;
   error?: string;
   /** Step-level runtime metadata for reporting (keyed by stepId) */
   stepRuntimeMeta?: Record<string, any>;
@@ -172,6 +174,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   let context: BrowserContext | null = null;
   let tracePath: string | undefined;
   let videoStreamService: VideoStreamService | null = null;
+  /** V14: Hoisted for access in outer catch — replay trace JSONL file path */
+  let replayTraceFilePath: string | undefined;
 
   // Create runKey for isolation of parallel browser runs (defined here for access in catch block)
   const runKey = createRunKey(testData.testId, testData.browser);
@@ -348,6 +352,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Create executor with self-healing enabled (for AI fallback without clarification)
       // On retry attempts: skip compiled plan (Stage 1) and go straight to LLM resolver (Stage 2)
       const { MAX_NODES_REPLAY } = await import('@/agent/execution/background-dom-collector');
+      // Initialize replay trace writer (JSONL log per run)
+      const replayTrace = new ReplayTraceWriter({ testId: testData.testId });
+      replayTraceFilePath = replayTrace.getFilePath();
+
       const executor = new CommandExecutor(page, {
         selfHealingEnabled: true,
         skipCompiledPlan: retryAttempt > 0,
@@ -357,14 +365,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           projectId: testData.projectId,
           userId: testData.userId,
         },
+        replayTrace,  // V14: Pass trace writer for detailed local logging
+        totalSteps: testData.commands.length,
       });
 
       // Start error collection for background monitoring
       const errorCollector = new ErrorCollectorService(page);
       errorCollector.startCollecting();
-
-      // Initialize replay trace writer (JSONL log per run)
-      const replayTrace = new ReplayTraceWriter({ testId: testData.testId });
 
       // Begin AI usage tracking session for background replay
       // Self-healing may trigger AI calls (OpenAI/Gemini) that need to be tracked
@@ -782,11 +789,16 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               eventType: isSoftFailure ? 'step_soft_failed' : 'step_completed', step: currentStepIndex, totalSteps,
               payload: {
                 action, success: stepResult.success, durationMs: stepDurationMs,
+                description: intentMeta?.elementDescription,
+                url: activePage.url(),
                 softFailure: isSoftFailure || undefined,
                 softFailureError: isSoftFailure ? stepResult.error : undefined,
                 source: meta?.source, resolutionPath: meta?.resolutionPath,
                 usedStrategy: meta?.usedLocatorStrategy, confidence: meta?.confidenceTier,
                 healed: meta?.source === 'self_heal', healConfidence: meta?.healConfidence,
+                retryAttempts: meta?.retryAttempts,
+                readinessTrace: meta?.readinessTrace,
+                blockerDiagnosis: meta?.blockerDiagnosis,
                 errors: {
                   console: stepErrors.consoleErrors.length,
                   network: stepErrors.networkErrors.length,
@@ -872,6 +884,19 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                       reason: lookahead.skipReason,
                     });
                   }
+
+                  // V14: Trace readiness check details to local JSONL
+                  replayTrace.write({
+                    eventType: 'step_readiness', step: currentStepIndex + 1, totalSteps,
+                    payload: {
+                      autoWaitApplied: lookahead.autoWaitApplied,
+                      waitedMs: lookahead.waited,
+                      skipReason: lookahead.skipReason,
+                      readinessChecks: lookahead.readinessChecks,
+                      prevAction: prevActionType,
+                      urlChanged: lookahead.urlChanged,
+                    },
+                  });
                 } catch (lookaheadError) {
                   // Lookahead failure is non-fatal, log and continue
                   logger.warn('[PLAYWRIGHT] Lookahead wait failed, continuing', {
@@ -971,6 +996,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 error: finalError, rootCause: finalMeta.rootCause,
                 failedReason: finalMeta.failedReason,
                 source: baseMeta.source, resolutionPath: baseMeta.resolutionPath,
+                url: activePage.url(),
+                description: intentMeta?.elementDescription,
+                compiledStrategies: (command as any).intentMeta?.compiled?.locatorPlan?.map((l: any) => l.strategy),
+                bindingHints: (command as any).intentMeta?.bindingHints,
+                networkEvidence: finalMeta.networkEvidence,
                 errors: {
                   console: stepErrors.consoleErrors.length,
                   network: stepErrors.networkErrors.length,
@@ -1276,6 +1306,27 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         return { videoUrl: undefined, traceUrl: undefined };
       });
 
+      // V14: Upload replay trace JSONL to Supabase Storage (non-fatal)
+      let replayTraceUrl: string | undefined;
+      try {
+        const traceFilePath = replayTrace.getFilePath();
+        const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+        replayTraceUrl = await uploadReplayTraceToStorage(
+          traceFilePath,
+          testData.testId,
+          testData.userId || 'anonymous',
+        );
+        logger.info('[PLAYWRIGHT] Replay trace JSONL uploaded to storage', {
+          testId: testData.testId,
+          url: replayTraceUrl,
+        });
+      } catch (traceUploadError) {
+        logger.debug('[PLAYWRIGHT] Failed to upload replay trace JSONL', {
+          testId: testData.testId,
+          error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
+        });
+      }
+
       logger.info('[PLAYWRIGHT] Background Replay Mode completed', {
         testId: testData.testId,
         success: allSuccess,
@@ -1303,6 +1354,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         videoPath: artifacts.videoPath,
         traceUrl: uploadedArtifacts.traceUrl,
         tracePath: artifacts.tracePath,
+        replayTraceUrl, // V14: Replay trace JSONL URL for debugging
         stepRuntimeMeta, // Step-level execution intelligence for reporting
         qualityChecks, // Non-UI quality checks — stored in test_results for user viewing
         needsVideoOnRetry, // Flag: self-healing was triggered, enable video on next retry
@@ -1642,6 +1694,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Unregister from TestRunRegistry
       TestRunRegistry.unregister(runKey);
 
+      // V14: Upload replay trace JSONL (best-effort, even on cancellation)
+      let cancelledReplayTraceUrl: string | undefined;
+      if (replayTraceFilePath) {
+        try {
+          const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+          cancelledReplayTraceUrl = await uploadReplayTraceToStorage(
+            replayTraceFilePath, testData.testId, testData.userId || 'anonymous',
+          );
+        } catch { /* non-fatal */ }
+      }
+
       return {
         success: false,
         status: 'cancelled',
@@ -1657,6 +1720,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         videoPath: artifacts.videoPath,
         traceUrl: uploadedArtifacts.traceUrl,
         tracePath: artifacts.tracePath,
+        replayTraceUrl: cancelledReplayTraceUrl,
       };
     }
 
@@ -1757,6 +1821,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     const uploadedArtifacts = await uploadArtifacts(testData, artifacts.videoPath, artifacts.tracePath, [])
       .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
 
+    // V14: Upload replay trace JSONL (best-effort, even on crash)
+    let failedReplayTraceUrl: string | undefined;
+    if (replayTraceFilePath) {
+      try {
+        const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+        failedReplayTraceUrl = await uploadReplayTraceToStorage(
+          replayTraceFilePath, testData.testId, testData.userId || 'anonymous',
+        );
+      } catch { /* non-fatal */ }
+    }
+
     // Unregister from TestRunRegistry
     TestRunRegistry.unregister(runKey);
 
@@ -1778,6 +1853,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       videoPath: artifacts.videoPath,
       traceUrl: uploadedArtifacts.traceUrl,
       tracePath: artifacts.tracePath,
+      replayTraceUrl: failedReplayTraceUrl,
     };
   }
 }

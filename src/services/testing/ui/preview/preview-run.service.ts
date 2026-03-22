@@ -22,6 +22,7 @@ import type { IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness } from './step-readiness.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
+import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 
 /** Maximum wall-clock time for an entire run (all steps). Prevents infinite hangs. */
 const GLOBAL_RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -68,6 +69,102 @@ async function waitForDOMStability(page: import('playwright').Page, maxWaitMs = 
     );
   } catch {
     // Page navigating/crashed — continue
+  }
+}
+
+// ── LLM Blocker Diagnosis + Retry Helper (DRY — used in both result and exception paths) ──
+
+interface DiagnosisRetryResult {
+  /** The final step result after LLM-guided retry (or null if not attempted) */
+  result: Awaited<ReturnType<typeof PreviewStepApplyService.applyStep>> | null;
+  /** True if LLM diagnosis was attempted */
+  diagnosed: boolean;
+  /** The diagnosis (if attempted) */
+  diagnosis: Awaited<ReturnType<typeof diagnoseStepBlocker>> | undefined;
+  /** True if actOnDiagnosis wait succeeded */
+  waitSucceeded?: boolean;
+}
+
+/**
+ * After a deterministic retry fails, ask LLM what's blocking the step,
+ * wait for the suggested selector, then retry once more.
+ *
+ * @returns null result if diagnosis was skipped/failed/not-retryable
+ */
+async function attemptLLMDiagnosisAndRetry(params: {
+  page: import('playwright').Page;
+  step: IntentStep;
+  error: string;
+  previewSessionId: string;
+  userId: string;
+  stepWithCachePolicy: IntentStep;
+  runStartTime: number;
+  cancelled: boolean;
+}): Promise<DiagnosisRetryResult> {
+  const { page, step, error, previewSessionId, userId, stepWithCachePolicy, runStartTime, cancelled } = params;
+
+  const elapsedTotal = Date.now() - runStartTime;
+  if (cancelled || elapsedTotal >= GLOBAL_RUN_TIMEOUT_MS - 15000) {
+    return { result: null, diagnosed: false, diagnosis: undefined };
+  }
+
+  try {
+    const diagnosis = await diagnoseStepBlocker(page, step, error);
+
+    if (diagnosis && diagnosis.shouldRetry) {
+      logger.info('[PreviewRun] LLM diagnosis suggests retry', {
+        previewSessionId,
+        stepId: step.id,
+        blocker: diagnosis.blocker,
+        waitForSelector: diagnosis.waitForSelector,
+        confidence: diagnosis.confidence,
+      });
+
+      const waitSucceeded = await actOnDiagnosis(page, diagnosis);
+
+      const result = await PreviewStepApplyService.applyStep({
+        previewSessionId,
+        stepDraft: {
+          ...stepWithCachePolicy,
+          options: {
+            ...stepWithCachePolicy.options,
+            disableCaching: true,
+            timeout: Math.max(stepWithCachePolicy.options?.timeout || 10000, 15000),
+          },
+        },
+        userId,
+        skipPostActionWait: true,
+      });
+
+      if (!result.success) {
+        logger.warn('[PreviewRun] LLM-guided retry also failed', {
+          previewSessionId,
+          stepId: step.id,
+          blocker: diagnosis.blocker,
+          retryError: result.error,
+        });
+      }
+
+      return { result, diagnosed: true, diagnosis, waitSucceeded };
+    }
+
+    if (diagnosis) {
+      logger.info('[PreviewRun] LLM diagnosis: not retryable', {
+        previewSessionId,
+        stepId: step.id,
+        blocker: diagnosis.blocker,
+        confidence: diagnosis.confidence,
+      });
+    }
+
+    return { result: null, diagnosed: true, diagnosis };
+  } catch (diagError) {
+    logger.warn('[PreviewRun] LLM diagnosis failed', {
+      previewSessionId,
+      stepId: step.id,
+      error: diagError instanceof Error ? diagError.message : String(diagError),
+    });
+    return { result: null, diagnosed: false, diagnosis: undefined };
   }
 }
 
@@ -672,12 +769,20 @@ export class PreviewRunService {
                   stepId: step.id,
                 });
               } else {
-                logger.warn('[PreviewRun] Retry also failed', {
+                // ── LLM Diagnosis: deterministic retry failed, ask LLM what's blocking ──
+                const diagResult = await attemptLLMDiagnosisAndRetry({
+                  page: session.page,
+                  step,
+                  error: result.error || 'Step failed after retry',
                   previewSessionId,
-                  stepIndex: i,
-                  stepId: step.id,
-                  retryError: result.error,
+                  userId,
+                  stepWithCachePolicy,
+                  runStartTime: runState.startTime,
+                  cancelled: runState.cancelled,
                 });
+                if (diagResult.result) {
+                  result = diagResult.result;
+                }
               }
             } catch (retryError) {
               // Retry threw — fall through to original failure handling
@@ -777,6 +882,7 @@ export class PreviewRunService {
                   autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                   prevActionType: step.type,
                   prevUrl: trackedUrl,
+                  recordedDelayMs: nextStep.evidence?.interStepDelayMs,
                 });
 
                 if (lookahead.autoWaitApplied) {
@@ -1000,6 +1106,7 @@ export class PreviewRunService {
                       autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                       prevActionType: step.type,
                       prevUrl: trackedUrl,
+                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
                     });
                   } catch {
                     // Lookahead failure is non-fatal — apply DOM stability fallback
@@ -1008,6 +1115,62 @@ export class PreviewRunService {
                 }
 
                 continue; // Skip to next step — recovered!
+              } else {
+                // ── LLM Diagnosis on exception retry failure ──
+                const diagResult = await attemptLLMDiagnosisAndRetry({
+                  page: session.page,
+                  step,
+                  error: retryResult.error || originalError,
+                  previewSessionId,
+                  userId,
+                  stepWithCachePolicy,
+                  runStartTime: runState.startTime,
+                  cancelled: runState.cancelled,
+                });
+
+                if (diagResult.result?.success) {
+                  const finalResult = diagResult.result;
+
+                  traceWriter.write({
+                    iteration: i, stage: 'step_execution', eventType: 'step_result',
+                    spanId: traceWriter.generateSpanId(), parentSpanId: stepSpanId,
+                    payload: { stepIndex: i, stepId: step.id, status: 'pass',
+                      urlChanged: finalResult.urlChanged, url: finalResult.url, retried: true },
+                  });
+
+                  webSocketService.emitToUser(userId, 'preview:run:step', {
+                    previewSessionId, stepIndex: i, stepId: step.id, status: 'pass',
+                    action: step.type, description: step.description,
+                    timestamp: new Date().toISOString(),
+                    ...(finalResult.appliedStep ? { appliedStep: finalResult.appliedStep } : {}),
+                    retried: true,
+                  });
+                  passedSteps++;
+                  trackedUrl = session.page.url();
+                  if (step.type === 'navigate' || finalResult.urlChanged) {
+                    try { lastNavigationSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
+                  }
+                  if (finalResult.appliedStep) enrichedSteps.set(finalResult.appliedStep.id, finalResult.appliedStep);
+
+                  // Lookahead before next step (same as deterministic retry success path)
+                  if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+                    const nextStep = stepsToExecute[i + 1];
+                    try {
+                      await waitForStepReadiness(session.page, nextStep, {
+                        maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                        settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                        autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                        prevActionType: step.type,
+                        prevUrl: trackedUrl,
+                        recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                      });
+                    } catch {
+                      await waitForDOMStability(session.page, 3000, 500).catch(() => {});
+                    }
+                  }
+
+                  continue; // Recovered via LLM diagnosis!
+                }
               }
             } catch {
               // Retry also threw — fall through to original error handling

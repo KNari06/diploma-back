@@ -240,6 +240,12 @@ export interface StepEvidence {
   resolutionMeta?: ResolutionMeta;
   /** URL where this evidence was captured (guards against cross-page ref collision in SPAs) */
   pageUrl?: string;
+  /**
+   * V14: Time between previous step recording and this step recording (ms).
+   * Used as a minimum wait hint during replay — if user waited 3s between steps,
+   * the page likely needs at least ~2s to be ready.
+   */
+  interStepDelayMs?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -733,6 +739,35 @@ export interface StepRuntimeMeta {
     method: string;
     responseTime: number;
   }>;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V14: Readiness & diagnosis trace (for Supabase — prod debugging)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Step readiness check results (what blocked, what was waited for) */
+  readinessTrace?: {
+    loadingCleared: boolean;
+    apiIdle: boolean;
+    animationDone: boolean;
+    overlayClear: boolean;
+    elementEnabled: boolean;
+    iframeReady: boolean;
+    waitedMs: number;
+  };
+  /** LLM blocker diagnosis (if first retry failed and LLM was invoked) */
+  blockerDiagnosis?: {
+    blocker: string;
+    waitForSelector?: string;
+    waitForDisappear?: boolean;
+    shouldRetry: boolean;
+    confidence: number;
+    waitSucceeded?: boolean;
+  };
+  /** Number of retry attempts before success/failure */
+  retryAttempts?: number;
+  /** Screenshot URL at the time of failure (for bug investigation) */
+  bugScreenshotUrl?: string;
+  /** Step ID from intent step */
+  stepId?: string;
 }
 
 /**

@@ -42,10 +42,37 @@ const recordingTypingTimers = new Map<string, NodeJS.Timeout>();
 const RECORDING_TYPING_DEBOUNCE_MS = 1500;
 
 /** Per-session scroll debounce timers */
-const recordingScrollTimers = new Map<string, { deltaY: number; timer: NodeJS.Timeout }>();
+const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout }>();
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V14: Inter-step delay stamping for recording
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Emit a NEW recording step with inter-step delay stamping.
+ * Replaces direct `socket.nsp.to(room).emit('preview:recording:step', ...)` calls.
+ * Automatically computes and stamps interStepDelayMs on the step's evidence.
+ */
+function emitRecordingStep(
+  socket: TypedSocket,
+  room: string,
+  sessionService: ReturnType<typeof import('@/services/testing/ui/preview/preview-session.service').getPreviewSessionService>,
+  previewSessionId: string,
+  userId: string,
+  payload: { step: Record<string, any>; highlight?: any; timestamp?: string; previewSessionId?: string },
+): void {
+  try {
+    sessionService.stampInterStepDelay(previewSessionId, userId, payload.step);
+  } catch { /* non-critical — don't break recording */ }
+  socket.nsp.to(room).emit('preview:recording:step', {
+    previewSessionId,
+    ...payload,
+    timestamp: payload.timestamp || new Date().toISOString(),
+  } as any);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V7: Video + DevTools streaming registry
@@ -1238,6 +1265,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // V9: Recording hook (non-blocking)
         if (isRecording && preClickElement) {
+          // V14: Warn user if click was inside a cross-origin iframe (cannot be recorded)
+          if (preClickElement.crossOriginIframe) {
+            const room = createRoomName('preview', previewSessionId);
+            socket.nsp.to(room).emit('preview:recording:warning' as any, {
+              previewSessionId,
+              type: 'cross_origin_iframe',
+              message: 'This element is inside a cross-origin iframe and cannot be recorded. Payment forms, OAuth widgets, and third-party embeds are not yet supported.',
+              iframeSelector: preClickElement.iframeSelector,
+              timestamp: new Date().toISOString(),
+            });
+            return; // Don't try to create a step from cross-origin element
+          }
           setImmediate(async () => {
             try {
               const { RecordingCaptureService } = await import(
@@ -1270,9 +1309,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 } else {
                   const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
                   if (typingStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
                     if (cTrace) cTrace.writeStepCaptured(typingStep, 'type_flush_on_click');
                   }
                 }
@@ -1296,9 +1333,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       const hoverElement = await RecordingCaptureService.probeForRecording(page, lastHover.x, lastHover.y);
                       if (hoverElement && hoverElement.ref !== preClickElement!.ref) {
                         const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
-                        socket.nsp.to(room).emit('preview:recording:step', {
-                          previewSessionId, step: hoverStep, timestamp: new Date().toISOString(),
-                        });
+                        emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
                         if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
                       }
                     }
@@ -1353,12 +1388,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId,
-                step,
-                highlight: preClickElement?.boundingBox,
-                timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
               if (cTrace) cTrace.writeStepCaptured(step, 'click');
 
               // V13: Smart navigation detection — condition-based polling instead of fixed 500ms
@@ -1384,11 +1414,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   if (cTrace) cTrace.writeNavDetected({ fromUrl: prevUrl, toUrl: currentUrl });
                   const navStep = RecordingCaptureService.captureNavigation(currentUrl, prevUrl);
                   if (navStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId,
-                      step: navStep,
-                      timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: navStep });
                     if (cTrace) cTrace.writeStepCaptured(navStep, 'nav_after_click');
                   }
                   sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, currentUrl);
@@ -1460,6 +1486,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 startY: y,
                 startElement,
                 startedAt: Date.now(),
+                viewport: page?.viewportSize() || undefined,
               });
             } catch (e) {
               logger.debug('[RECORDING] Drag start capture failed', {
@@ -1546,11 +1573,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
               if (dragStep) {
                 const room = createRoomName('preview', previewSessionId);
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId,
-                  step: dragStep,
-                  timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: dragStep });
                 // Editor trace: log drag-drop step
                 const ddTrace = EditorTraceService.get(previewSessionId);
                 if (ddTrace) {
@@ -1619,15 +1642,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           const existing = recordingScrollTimers.get(previewSessionId);
           const accumulatedDeltaY = (existing?.deltaY ?? 0) + (data.deltaY ?? 0);
+          // V14: Track horizontal scroll
+          const accumulatedDeltaX = (existing?.deltaX ?? 0) + (data.deltaX ?? 0);
           if (existing) clearTimeout(existing.timer);
 
           recordingScrollTimers.set(previewSessionId, {
             deltaY: accumulatedDeltaY,
+            deltaX: accumulatedDeltaX,
             timer: setTimeout(async () => {
               try {
-                const finalDeltaY = recordingScrollTimers.get(previewSessionId)?.deltaY ?? accumulatedDeltaY;
+                const scrollState = recordingScrollTimers.get(previewSessionId);
+                const finalDeltaY = scrollState?.deltaY ?? accumulatedDeltaY;
+                const finalDeltaX = scrollState?.deltaX ?? accumulatedDeltaX;
                 recordingScrollTimers.delete(previewSessionId);
-                if (finalDeltaY === 0) return;
+                if (finalDeltaY === 0 && finalDeltaX === 0) return;
 
                 const { RecordingCaptureService } = await import(
                   '@/services/testing/ui/preview/recording-capture.service'
@@ -1647,7 +1675,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (withinMergeWindow && lastScrollStep) {
                   // Same direction or continuation — merge deltas
                   const mergedDelta = lastScrollStep.totalDelta + finalDeltaY;
-                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl);
+                  const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + finalDeltaX;
+                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX);
                   if (scrollStep) {
                     scrollStep.id = lastScrollStep.id; // Reuse original step id
                     socket.nsp.to(room).emit('preview:recording:step:update', {
@@ -1657,20 +1686,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, {
                       id: lastScrollStep.id,
                       totalDelta: mergedDelta,
+                      totalDeltaX: mergedDeltaX,
                       emittedAt: now,
                     });
                   }
                 } else {
                   // New scroll sequence — emit new step
-                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl);
+                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl, finalDeltaX);
                   if (scrollStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
                     if (sTrace) sTrace.writeStepCaptured(scrollStep, 'scroll');
                     sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, {
                       id: scrollStep.id,
                       totalDelta: finalDeltaY,
+                      totalDeltaX: finalDeltaX,
                       emittedAt: now,
                     });
                   }
@@ -1755,9 +1784,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }),
                 };
                 const room = createRoomName('preview', previewSessionId);
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId, step: pasteStep, timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pasteStep });
                 const ptTrace = EditorTraceService.get(previewSessionId);
                 if (ptTrace) ptTrace.writeStepCaptured(pasteStep, 'paste');
                 return; // Don't accumulate paste into typing buffer
@@ -1826,9 +1853,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       // New element or first type — emit new step
                       const step = RecordingCaptureService.flushTypingBuffer(currentBuffer);
                       if (step) {
-                        socket.nsp.to(room).emit('preview:recording:step', {
-                          previewSessionId, step, timestamp: new Date().toISOString(),
-                        });
+                        emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
                         if (tTrace) tTrace.writeStepCaptured(step, 'type');
                         sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, {
                           id: step.id,
@@ -1932,9 +1957,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   } else {
                     const step = RecordingCaptureService.flushTypingBuffer(existingBuffer);
                     if (step) {
-                      socket.nsp.to(room).emit('preview:recording:step', {
-                        previewSessionId, step, timestamp: new Date().toISOString(),
-                      });
+                      emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
                     }
                   }
                   sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
@@ -1996,9 +2019,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                         } else {
                           const step = RecordingCaptureService.flushTypingBuffer(currentBuffer);
                           if (step) {
-                            socket.nsp.to(room).emit('preview:recording:step', {
-                              previewSessionId, step, timestamp: new Date().toISOString(),
-                            });
+                            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
                             if (pTrace) pTrace.writeStepCaptured(step, 'multiline_type');
                             sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, {
                               id: step.id,
@@ -2120,9 +2141,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       isEnterKey,
                     );
                     if (typingStep) {
-                      socket.nsp.to(room).emit('preview:recording:step', {
-                        previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                      });
+                      emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
                       if (pTrace) pTrace.writeStepCaptured(typingStep, isEnterKey ? 'type_enter' : 'type_flush');
                       if (isEnterKey) mergedEnterIntoType = true;
                     }
@@ -2141,9 +2160,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               if (!mergedEnterIntoType) {
                 const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
                 if (pressStep) {
-                  socket.nsp.to(room).emit('preview:recording:step', {
-                    previewSessionId, step: pressStep, timestamp: new Date().toISOString(),
-                  });
+                  emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pressStep });
                   if (pTrace) pTrace.writeStepCaptured(pressStep, 'press');
                 }
               }
@@ -2247,6 +2264,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       logger.info('[WebSocket] Preview refresh requested', { previewSessionId, userId: ensuredUserId });
 
+      // Block page actions during active run — prevents race conditions with step execution
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'refresh', false, 'Cannot refresh while test is running');
+        return;
+      }
+
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
@@ -2296,9 +2320,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 } else {
                   const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
                   if (typingStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
                   }
                 }
                 sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
@@ -2316,9 +2338,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   description: 'Refresh page',
                   value: page.url(),
                 };
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId, step: refreshStep, timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: refreshStep });
 
                 // Update URL baseline (URL may change after redirect)
                 sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
@@ -2357,6 +2377,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       logger.info('[WebSocket] Preview goBack requested', { previewSessionId, userId: ensuredUserId });
 
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'back', false, 'Cannot navigate while test is running');
+        return;
+      }
+
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
@@ -2388,9 +2414,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               description: 'Navigate back',
               value: page.url(),
             };
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
             sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
           }
         }
@@ -2420,6 +2444,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (!previewSessionId) return;
 
       logger.info('[WebSocket] Preview goForward requested', { previewSessionId, userId: ensuredUserId });
+
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'forward', false, 'Cannot navigate while test is running');
+        return;
+      }
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -2451,9 +2481,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               description: 'Navigate forward',
               value: page.url(),
             };
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
             sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
           }
         }
@@ -2488,6 +2516,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       logger.info('[WebSocket] Preview reset requested', { previewSessionId, userId: ensuredUserId });
 
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'reset', false, 'Cannot reset while test is running');
+        return;
+      }
+
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
@@ -2503,9 +2537,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
           if (typingStep) {
             const room = createRoomName('preview', previewSessionId);
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
           }
         }
       }
@@ -2936,9 +2968,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           } else {
             const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
             if (typingStep) {
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: typingStep });
               if (rsTrace) rsTrace.writeStepCaptured(typingStep, 'type_flush_on_run_start');
             }
           }
@@ -3159,11 +3189,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 role: changeData.role,
               });
               const room = createRoomName('preview', previewSessionId);
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId,
-                step,
-                timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
               // Editor trace: log select change
               const selTrace = EditorTraceService.get(previewSessionId);
               if (selTrace) {
@@ -3236,9 +3262,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               };
 
               const room = createRoomName('preview', previewSessionId);
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId, step, timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
               const afTrace = EditorTraceService.get(previewSessionId);
               if (afTrace) afTrace.writeStepCaptured(step, 'autofill');
             } catch { /* non-critical */ }
@@ -3301,11 +3325,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const uploadStep = RecCapSvc.captureFileUpload(['(file)'], probedEl, page.url());
               if (uploadStep) {
                 const recordRoom = createRoomName('preview', previewSessionId);
-                socket.nsp.to(recordRoom).emit('preview:recording:step', {
-                  previewSessionId,
-                  step: uploadStep,
-                  timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, recordRoom, sessionService, previewSessionId, ensuredUserId, { step: uploadStep });
                 // Editor trace: log file upload
                 const fuTrace = EditorTraceService.get(previewSessionId);
                 if (fuTrace) {
@@ -3385,9 +3405,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         } else {
           const step = RecordingCaptureService.flushTypingBuffer(buffer);
           if (step) {
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
             if (stopTrace) stopTrace.writeStepCaptured(step, 'type_flush_on_stop');
           }
         }
@@ -3420,7 +3438,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         if (withinMergeWindow && lastScrollStep) {
           const mergedDelta = lastScrollStep.totalDelta + scrollState.deltaY;
-          const scrollStep = RecCapSvcScroll.captureScroll(mergedDelta, stopScrollPageUrl);
+          const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + (scrollState.deltaX || 0);
+          const scrollStep = RecCapSvcScroll.captureScroll(mergedDelta, stopScrollPageUrl, mergedDeltaX);
           if (scrollStep) {
             scrollStep.id = lastScrollStep.id;
             socket.nsp.to(room).emit('preview:recording:step:update', {
@@ -3429,11 +3448,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             if (stopTrace) stopTrace.writeStepUpdated(scrollStep, 'scroll_merge_on_stop');
           }
         } else {
-          const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY, stopScrollPageUrl);
+          const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY, stopScrollPageUrl, scrollState.deltaX);
           if (scrollStep) {
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
             if (stopTrace) stopTrace.writeStepCaptured(scrollStep, 'scroll_flush_on_stop');
           }
         }

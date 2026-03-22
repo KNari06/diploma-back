@@ -115,6 +115,13 @@ function mapActionType(intentAction: IntentActionType): string {
     // V6: File upload
     case 'upload':
       return 'upload';
+    // V10: Advanced recording types
+    case 'dblclick':
+      return 'dblclick';
+    case 'contextmenu':
+      return 'contextmenu';
+    case 'drag_and_drop':
+      return 'dragAndDrop';
     // V13: Dialog handling
     case 'dialog':
       return 'handleDialog';
@@ -323,7 +330,18 @@ export function convertIntentStepToCommand(
       break;
 
     case 'scroll':
-      // Scroll doesn't need value, but may have selector
+      // V14: Pass deltaY,deltaX value so regression scroll matches recorded distance
+      if (step.value) {
+        command.value = step.value;
+      }
+      break;
+
+    case 'drag_and_drop':
+      // V14: Pass coordinate data or dropTarget for regression replay
+      command.value = step.value || '';
+      if (step.options?.dropTarget) {
+        command.dropTarget = step.options.dropTarget;
+      }
       break;
 
     case 'upload': {

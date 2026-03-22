@@ -51,6 +51,8 @@ export interface ProbedElement {
   containerText?: string;
   /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
   iframeSelector?: string;
+  /** V14: Marker — element is inside a cross-origin iframe and cannot be probed/recorded */
+  crossOriginIframe?: boolean;
 }
 
 /** Typing buffer stored on session */
@@ -79,6 +81,8 @@ export interface RecordingDragState {
   startElement: ProbedElement | null;
   /** Timestamp when drag started */
   startedAt: number;
+  /** V14: Viewport dimensions at recording time for coordinate normalization */
+  viewport?: { width: number; height: number };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -359,8 +363,14 @@ export class RecordingCaptureService {
               probed.iframeSelector = rect.selector;
               return probed;
             }
-          } catch {
-            // Frame may be cross-origin or detached — skip
+          } catch (frameErr) {
+            // V14: Log cross-origin iframe detection so the handler can warn the user
+            logger.warn('[RECORDING] Cross-origin iframe detected — element inside cannot be recorded', {
+              iframeSelector: rect.selector,
+              error: frameErr instanceof Error ? frameErr.message : String(frameErr),
+            });
+            // Return a minimal marker — caller checks crossOriginIframe before using other fields
+            return { tag: 'iframe', crossOriginIframe: true, iframeSelector: rect.selector };
           }
         }
       }
@@ -728,6 +738,7 @@ export class RecordingCaptureService {
       : `Drag '${fromLabel}'`;
 
     const startRef = dragState.startElement?.ref;
+    // V14: Store viewport dimensions for coordinate normalization during replay
     return {
       id: recStepId(),
       type: 'drag_and_drop',
@@ -735,6 +746,7 @@ export class RecordingCaptureService {
       value: JSON.stringify({
         from: { x: Math.round(dragState.startX), y: Math.round(dragState.startY) },
         to: { x: Math.round(endX), y: Math.round(endY) },
+        viewport: dragState.viewport,
       }),
       bindingHints: dragState.startElement
         ? this.buildBindingHints(dragState.startElement) as BindingHints | undefined
@@ -787,18 +799,26 @@ export class RecordingCaptureService {
    *
    * @param accumulatedDeltaY - Total pixels scrolled during the debounce window
    */
-  static captureScroll(accumulatedDeltaY: number, pageUrl?: string): PreviewIntentStep | null {
-    if (accumulatedDeltaY === 0) return null;
+  static captureScroll(accumulatedDeltaY: number, pageUrl?: string, accumulatedDeltaX?: number): PreviewIntentStep | null {
+    if (accumulatedDeltaY === 0 && (!accumulatedDeltaX || accumulatedDeltaX === 0)) return null;
 
-    const direction = accumulatedDeltaY > 0 ? 'down' : 'up';
-    const absDelta = Math.abs(Math.round(accumulatedDeltaY));
+    const parts: string[] = [];
+    if (accumulatedDeltaY !== 0) {
+      parts.push(`${accumulatedDeltaY > 0 ? 'down' : 'up'} ${Math.abs(Math.round(accumulatedDeltaY))}px`);
+    }
+    if (accumulatedDeltaX && accumulatedDeltaX !== 0) {
+      parts.push(`${accumulatedDeltaX > 0 ? 'right' : 'left'} ${Math.abs(Math.round(accumulatedDeltaX))}px`);
+    }
+
+    // V14: Store both deltaX and deltaY as comma-separated value for replay
+    const deltaXRounded = Math.round(accumulatedDeltaX || 0);
+    const deltaYRounded = Math.round(accumulatedDeltaY);
 
     return {
       id: recStepId(),
       type: 'scroll',
-      description: `Scroll ${direction} ${absDelta}px`,
-      // Store the actual delta as value so replay can use it
-      value: String(Math.round(accumulatedDeltaY)),
+      description: `Scroll ${parts.join(', ')}`,
+      value: deltaXRounded !== 0 ? `${deltaYRounded},${deltaXRounded}` : String(deltaYRounded),
       evidence: { confidence: 1.0, pageUrl },
     };
   }

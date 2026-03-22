@@ -1067,6 +1067,8 @@ export interface PlaywrightCommand {
     url?: string;
     timeoutMs?: number;
   };
+  /** V14: Drop target selector for dragAndDrop action (element-based drag) */
+  dropTarget?: string;
 }
 
 export interface PlaywrightTestPlan {
