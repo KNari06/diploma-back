@@ -86,8 +86,11 @@ export class PreviewVideoStreamService {
   private pageCloseHandler: (() => void) | null = null;
   private pageLoadHandler: (() => void) | null = null;
 
-  // Deferred frame injection timers (cleared on stop to prevent orphan execution)
-  private pendingTimers: NodeJS.Timeout[] = [];
+  // Deferred frame injection timers (cleared on stop to prevent orphan execution).
+  // pageLoadInjectTimer: single slot, replaced on each SPA navigation (not accumulated).
+  // initialInjectTimer: one-shot, fired once after start().
+  private pageLoadInjectTimer: NodeJS.Timeout | null = null;
+  private initialInjectTimer: NodeJS.Timeout | null = null;
 
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
@@ -131,13 +134,17 @@ export class PreviewVideoStreamService {
       // V11: After same-page navigation, CDP screencast may lag or emit stale frames.
       // Inject a fresh screenshot-based frame after the page finishes loading.
       this.pageLoadHandler = () => {
+        // Clear previous page-load timer (SPA fires 'load' on each navigation)
+        if (this.pageLoadInjectTimer) {
+          clearTimeout(this.pageLoadInjectTimer);
+        }
         // Small delay to let the paint settle after load
-        const timer = setTimeout(() => {
+        this.pageLoadInjectTimer = setTimeout(() => {
+          this.pageLoadInjectTimer = null;
           if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
             this.injectFrame().catch(() => {});
           }
         }, 300);
-        this.pendingTimers.push(timer);
       };
       page.on('load', this.pageLoadHandler);
 
@@ -174,12 +181,12 @@ export class PreviewVideoStreamService {
       // V11: Inject an immediate screenshot frame after start.
       // CDP screencast may not emit frames on already-loaded/static pages,
       // so we guarantee at least one frame reaches the frontend.
-      const initialInjectTimer = setTimeout(() => {
+      this.initialInjectTimer = setTimeout(() => {
+        this.initialInjectTimer = null;
         if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
           this.injectFrame().catch(() => {});
         }
       }, 500);
-      this.pendingTimers.push(initialInjectTimer);
 
       return true;
     } catch (error) {
@@ -457,11 +464,15 @@ export class PreviewVideoStreamService {
       this.circuitBreakerResetTimeout = null;
     }
 
-    // Clear all pending inject timers (page-load + initial inject)
-    for (const timer of this.pendingTimers) {
-      clearTimeout(timer);
+    // Clear pending inject timers
+    if (this.pageLoadInjectTimer) {
+      clearTimeout(this.pageLoadInjectTimer);
+      this.pageLoadInjectTimer = null;
     }
-    this.pendingTimers = [];
+    if (this.initialInjectTimer) {
+      clearTimeout(this.initialInjectTimer);
+      this.initialInjectTimer = null;
+    }
 
     // Remove page close listener
     if (this.page && this.pageCloseHandler) {
