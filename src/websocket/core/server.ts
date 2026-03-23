@@ -95,7 +95,7 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
       allowUpgrades: true, // Allow upgrade from polling to websocket
       // Additional polling optimization
       httpCompression: true, // Compress polling responses
-      maxHttpBufferSize: 1e6, // 1MB max message size
+      maxHttpBufferSize: 2e6, // 2MB max message size (base64 video frames can reach ~900KB + JSON envelope)
     }
   );
 
