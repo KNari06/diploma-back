@@ -59,8 +59,8 @@ export const PREVIEW_SESSION_CONFIG = {
 
   /** Screenshot capture settings */
   screenshot: {
-    /** JPEG quality (0-100) */
-    quality: 60,
+    /** JPEG quality (0-100). 65 balances text clarity with bandwidth at ~15 fps. */
+    quality: 65,
     /** Skip frame if encoded size exceeds this (bytes) */
     maxSizeBytes: 900_000,
     /** Min time between screenshot emissions per session (ms) */

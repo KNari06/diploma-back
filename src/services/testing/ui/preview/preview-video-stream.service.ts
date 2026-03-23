@@ -3,7 +3,7 @@
  * Manages real-time video streaming for preview sessions via CDP screencast
  *
  * Features:
- * - CDP screencast frame capture (1280x720, JPEG quality 60)
+ * - CDP screencast frame capture (1280x720, JPEG quality 65, ~15 fps)
  * - Throttling to ~10 FPS
  * - No Redis dependency (direct Socket.IO emit)
  * - Backpressure handling
@@ -22,17 +22,17 @@ import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 
 const PREVIEW_VIDEO_CONFIG = {
   // CDP Screencast settings
-  fps: 10,
+  fps: 15,
   maxWidth: PREVIEW_SESSION_CONFIG.viewport.width,
   maxHeight: PREVIEW_SESSION_CONFIG.viewport.height,
   quality: PREVIEW_SESSION_CONFIG.screenshot.quality,
   format: 'jpeg' as const,
 
-  // Throttle settings (target ~10 fps = 100ms between frames)
-  minFrameIntervalMs: 90, // Slightly less than 100ms to account for processing
+  // Throttle settings (target ~15 fps = ~66ms between frames)
+  minFrameIntervalMs: 65,
 
   // Backpressure handling
-  maxPendingFrames: 3,
+  maxPendingFrames: 4,
   publishTimeoutMs: 200,
   circuitBreakerThreshold: 5,
   circuitBreakerResetMs: 3000,
@@ -77,6 +77,7 @@ export class PreviewVideoStreamService {
   // Circuit breaker
   private consecutiveFailures = 0;
   private isPaused = false;
+  private circuitBreakerResetTimeout: NodeJS.Timeout | null = null;
 
   // CDP state
   private cdpSessionClosed = false;
@@ -84,6 +85,9 @@ export class PreviewVideoStreamService {
   private page: Page | null = null;
   private pageCloseHandler: (() => void) | null = null;
   private pageLoadHandler: (() => void) | null = null;
+
+  // Deferred frame injection timers (cleared on stop to prevent orphan execution)
+  private pendingTimers: NodeJS.Timeout[] = [];
 
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
@@ -128,11 +132,12 @@ export class PreviewVideoStreamService {
       // Inject a fresh screenshot-based frame after the page finishes loading.
       this.pageLoadHandler = () => {
         // Small delay to let the paint settle after load
-        setTimeout(() => {
+        const timer = setTimeout(() => {
           if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
             this.injectFrame().catch(() => {});
           }
         }, 300);
+        this.pendingTimers.push(timer);
       };
       page.on('load', this.pageLoadHandler);
 
@@ -169,11 +174,12 @@ export class PreviewVideoStreamService {
       // V11: Inject an immediate screenshot frame after start.
       // CDP screencast may not emit frames on already-loaded/static pages,
       // so we guarantee at least one frame reaches the frontend.
-      setTimeout(() => {
+      const initialInjectTimer = setTimeout(() => {
         if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
           this.injectFrame().catch(() => {});
         }
       }, 500);
+      this.pendingTimers.push(initialInjectTimer);
 
       return true;
     } catch (error) {
@@ -330,8 +336,12 @@ export class PreviewVideoStreamService {
           consecutiveFailures: this.consecutiveFailures,
         });
 
-        // Auto-reset after timeout
-        setTimeout(() => {
+        // Auto-reset after timeout (clear previous to avoid stacking)
+        if (this.circuitBreakerResetTimeout) {
+          clearTimeout(this.circuitBreakerResetTimeout);
+        }
+        this.circuitBreakerResetTimeout = setTimeout(() => {
+          this.circuitBreakerResetTimeout = null;
           if (this.isStreaming && !this.isStopped) {
             this.isPaused = false;
             this.consecutiveFailures = 0;
@@ -440,6 +450,18 @@ export class PreviewVideoStreamService {
       clearInterval(this.statsInterval);
       this.statsInterval = null;
     }
+
+    // Clear circuit breaker reset timeout
+    if (this.circuitBreakerResetTimeout) {
+      clearTimeout(this.circuitBreakerResetTimeout);
+      this.circuitBreakerResetTimeout = null;
+    }
+
+    // Clear all pending inject timers (page-load + initial inject)
+    for (const timer of this.pendingTimers) {
+      clearTimeout(timer);
+    }
+    this.pendingTimers = [];
 
     // Remove page close listener
     if (this.page && this.pageCloseHandler) {
@@ -570,6 +592,12 @@ export class PreviewVideoStreamRegistry {
   private static instance: PreviewVideoStreamRegistry;
   private streams = new Map<string, PreviewVideoStreamService>();
 
+  // Per-session mutex to prevent concurrent startStream() from creating orphaned CDP sessions.
+  // Without this, two rapid page switches can race: both call stopStream() then create a new
+  // stream, but only the last one gets registered — the first becomes a zombie with an open
+  // CDP session that can never be cleaned up.
+  private startLocks = new Map<string, Promise<boolean>>();
+
   private constructor() {}
 
   static getInstance(): PreviewVideoStreamRegistry {
@@ -580,7 +608,10 @@ export class PreviewVideoStreamRegistry {
   }
 
   /**
-   * Start video stream for a preview session
+   * Start video stream for a preview session.
+   * Uses a per-session promise chain (mutex) so concurrent calls for the same
+   * previewSessionId are serialised — the second caller waits for the first to
+   * finish before it stops-and-replaces, preventing orphaned CDP sessions.
    */
   async startStream(
     previewSessionId: string,
@@ -589,29 +620,48 @@ export class PreviewVideoStreamRegistry {
     page: Page,
     nsp: Namespace
   ): Promise<boolean> {
-    // Capture seq from old stream before stopping (for continuity on page switch)
-    const oldStream = this.streams.get(previewSessionId);
-    const inheritedSeq = oldStream ? oldStream.getSeq() : undefined;
+    // Chain onto any in-flight start for this session (resolves immediately if none)
+    const prev = this.startLocks.get(previewSessionId) ?? Promise.resolve(false);
 
-    // Stop existing stream if any
-    await this.stopStream(previewSessionId);
+    const next = prev
+      // Swallow errors from the previous call so this one always runs
+      .catch(() => false)
+      .then(async () => {
+        // Capture seq from old stream before stopping (for continuity on page switch)
+        const oldStream = this.streams.get(previewSessionId);
+        const inheritedSeq = oldStream ? oldStream.getSeq() : undefined;
 
-    const stream = new PreviewVideoStreamService(previewSessionId, userId, room, inheritedSeq);
+        // Stop existing stream if any
+        await this.stopStream(previewSessionId);
 
-    if (inheritedSeq !== undefined) {
-      logger.info('[PREVIEW_VIDEO] Stream restart with inherited seq', {
-        previewSessionId,
-        inheritedSeq,
+        const stream = new PreviewVideoStreamService(previewSessionId, userId, room, inheritedSeq);
+
+        if (inheritedSeq !== undefined) {
+          logger.info('[PREVIEW_VIDEO] Stream restart with inherited seq', {
+            previewSessionId,
+            inheritedSeq,
+          });
+        }
+
+        const started = await stream.start(page, nsp);
+
+        if (started) {
+          this.streams.set(previewSessionId, stream);
+        }
+
+        return started;
       });
+
+    this.startLocks.set(previewSessionId, next);
+
+    try {
+      return await next;
+    } finally {
+      // Clean up lock entry if it's still ours (no newer call queued)
+      if (this.startLocks.get(previewSessionId) === next) {
+        this.startLocks.delete(previewSessionId);
+      }
     }
-
-    const started = await stream.start(page, nsp);
-
-    if (started) {
-      this.streams.set(previewSessionId, stream);
-    }
-
-    return started;
   }
 
   /**
@@ -673,6 +723,7 @@ export class PreviewVideoStreamRegistry {
   async stopAll(): Promise<void> {
     const stopPromises = Array.from(this.streams.keys()).map((id) => this.stopStream(id));
     await Promise.all(stopPromises);
+    this.startLocks.clear();
   }
 }
 
