@@ -391,6 +391,8 @@ export interface StrategistInput {
   goalUrl?: string;
   /** Supervisor Blackboard — shared recovery context */
   blackboard?: SupervisorBlackboard;
+  /** Time pressure level from TimeoutGovernor — affects strategy directness */
+  urgencyLevel?: 'normal' | 'hurry' | 'critical';
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -580,6 +582,10 @@ export interface MultiAgentInput {
   recentValidationErrors?: NetworkValidationError[];
   /** Optional callback for emitting real-time thinking steps to the user */
   onThinkingStep?: (phase: string, message: string) => void;
+
+  // TimeoutGovernor: time pressure signal
+  /** Time pressure level from TimeoutGovernor — affects Strategist and Critic behavior */
+  urgencyLevel?: 'normal' | 'hurry' | 'critical';
 
   // Layer 2/3: Universal Obstacle Intelligence
   /** Structured facts about positioned elements for Observer LLM classification */

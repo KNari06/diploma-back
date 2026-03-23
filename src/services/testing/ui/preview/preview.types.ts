@@ -200,6 +200,10 @@ export interface BindingHints {
   autocomplete?: string;
   /** Input type (text, email, password, etc.) */
   type?: string;
+  /** V15: Element text content — helps LLM resolver find element after redesign */
+  text?: string;
+  /** V15: HTML tag of the interactive element — structural hint for replay */
+  tag?: string;
 }
 
 /**

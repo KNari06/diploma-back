@@ -1320,21 +1320,32 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
               }
 
-              // V11: Emit hover step before click if user hovered a different element (dropdown/menu pattern)
+              // V15: Emit hover step before click only if user dwelled on a genuinely different interactive element.
+              // Fixes: V11 had hoverOnDifferentElement always true (ref never stored) → mass false positives.
+              // Now: 400ms minimum dwell + structural comparison (tag + boundingBox) of resolved targets.
               const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
-              if (lastHover && preClickElement!.ref) {
+              if (lastHover && preClickElement) {
                 const timeSinceHover = Date.now() - lastHover.timestamp;
-                const hoverOnDifferentElement = !lastHover.ref || lastHover.ref !== preClickElement!.ref;
-                if (hoverOnDifferentElement && timeSinceHover > 200 && timeSinceHover < 5000) {
-                  // Probe the hover target to get element info
+                // V15: Raised minimum dwell from 200ms to 400ms — real dropdown hovers require intentional pause
+                if (timeSinceHover > 400 && timeSinceHover < 5000) {
                   try {
                     const page = sessionService.getPage(previewSessionId, ensuredUserId);
                     if (page) {
                       const hoverElement = await RecordingCaptureService.probeForRecording(page, lastHover.x, lastHover.y);
-                      if (hoverElement && hoverElement.ref !== preClickElement!.ref) {
-                        const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
-                        emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
-                        if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                      if (hoverElement) {
+                        // V15: Compare resolved interactive targets structurally.
+                        // data-agent-ref is NOT injected during recording, so we compare by
+                        // boundingBox (position+size) which uniquely identifies elements on page.
+                        const hBB = hoverElement.boundingBox;
+                        const cBB = preClickElement.boundingBox;
+                        const isSameElement = hBB && cBB
+                          && hBB.x === cBB.x && hBB.y === cBB.y
+                          && hBB.width === cBB.width && hBB.height === cBB.height;
+                        if (!isSameElement) {
+                          const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
+                          emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
+                          if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                        }
                       }
                     }
                   } catch {
@@ -1343,6 +1354,22 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 }
               }
               sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
+
+              // V15: LLM fallback — if probe couldn't find interactive element (directHit/cssClass),
+              // ask LLM to pick the correct ancestor from the chain.
+              // This runs async but BEFORE we build the step, so the step gets correct element data.
+              if (preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass') {
+                try {
+                  const llmPage = sessionService.getPage(previewSessionId, ensuredUserId);
+                  if (llmPage) {
+                    preClickElement = await RecordingCaptureService.resolveInteractiveTarget(
+                      llmPage, preClickElement!, x, y,
+                    );
+                  }
+                } catch {
+                  // Non-critical — use original probe result
+                }
+              }
 
               // V10: Pass button and clickCount to inferClickActionType for dblclick/right-click support
               const safeButton = (data.button === 'right' || data.button === 'middle') ? data.button : 'left';
@@ -1667,6 +1694,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const scrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
                 const scrollPageUrl = scrollPage?.url();
 
+                // V15: Guard against scroll before page load (race condition)
+                if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
+
+                // V15: Probe scroll target — find meaningful element near viewport center
+                // so replay can use scrollIntoView instead of absolute pixels
+                let scrollTargetHints: import('@/services/testing/ui/preview/preview.types').BindingHints | null = null;
+                if (scrollPage) {
+                  try {
+                    scrollTargetHints = await RecordingCaptureService.probeScrollTarget(scrollPage);
+                  } catch { /* non-critical */ }
+                }
+
                 // V10: Merge with previous scroll step if emitted recently (within 3s)
                 const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, ensuredUserId);
                 const now = Date.now();
@@ -1676,7 +1715,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   // Same direction or continuation — merge deltas
                   const mergedDelta = lastScrollStep.totalDelta + finalDeltaY;
                   const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + finalDeltaX;
-                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX);
+                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined);
                   if (scrollStep) {
                     scrollStep.id = lastScrollStep.id; // Reuse original step id
                     socket.nsp.to(room).emit('preview:recording:step:update', {
@@ -1692,7 +1731,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }
                 } else {
                   // New scroll sequence — emit new step
-                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl, finalDeltaX);
+                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl, finalDeltaX, scrollTargetHints ?? undefined);
                   if (scrollStep) {
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
                     if (sTrace) sTrace.writeStepCaptured(scrollStep, 'scroll');

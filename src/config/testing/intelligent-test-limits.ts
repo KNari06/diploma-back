@@ -287,6 +287,32 @@ export const LITE_ENGINE_FLAGS = {
   supervisorTier2TimeoutMs: 3000,
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // TIMEOUT GOVERNOR (Adaptive Timeout System)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Enable adaptive timeout governor (replaces static 5-min timeout) */
+  enableTimeoutGovernor: true,
+  /** Base timeout (ms) — starting deadline before any extensions */
+  timeoutGovernorBaseMs: 5 * 60 * 1000,
+  /** Hard cap (ms) — maximum total timeout after all extensions */
+  timeoutGovernorMaxMs: 10 * 60 * 1000,
+  /** Max extension per single AI decision (ms) */
+  timeoutGovernorExtensionMaxPerCallMs: 2 * 60 * 1000,
+  /** Urgency 'hurry' threshold — remaining time below this (ms) */
+  timeoutGovernorHurryMs: 60_000,
+  /** Urgency 'critical' threshold — remaining time below this (ms) */
+  timeoutGovernorCriticalMs: 30_000,
+  /** Stall monitor sliding window size (iterations) */
+  timeoutGovernorStallWindowSize: 5,
+  /** Same URL repeated this many times in window → stall */
+  timeoutGovernorStallUrlThreshold: 3,
+  /** Same network error repeated this many times in window → stall */
+  timeoutGovernorStallErrorThreshold: 3,
+  /** N out of windowSize outcomes are no_effect/validation_error → stall */
+  timeoutGovernorStallOutcomeThreshold: 4,
+  /** 0 new accomplishments for this many iterations → stall */
+  timeoutGovernorStallAccomplishmentIters: 5,
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // PIPELINE V2: COLLABORATIVE AGENT TEAM (Planner → Executor → Reviewer)
   // ═══════════════════════════════════════════════════════════════════════════
   /** Enable Pipeline v2 (replaces multi-agent brain + monolithic fallback) */
