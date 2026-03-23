@@ -98,15 +98,22 @@ export class SubAgentSpawner {
       blackboard.updateStepStatus(step.stepNumber, 'in_progress', undefined, undefined, executorId);
 
       try {
-        const result = await executeToolsForStep(
-          step,
-          userMessage,
-          trimmedContext,
-          stepTools,
-          context,
-          abortSignal,
-          userGoal
-        );
+        // Per-executor timeout: agentTimeoutMs * maxSubExecutorRounds (each round may use full timeout)
+        const perExecutorTimeoutMs = SUB_AGENT_CONFIG.agentTimeoutMs * SUB_AGENT_CONFIG.maxSubExecutorRounds;
+        const result = await Promise.race([
+          executeToolsForStep(
+            step,
+            userMessage,
+            trimmedContext,
+            stepTools,
+            context,
+            abortSignal,
+            userGoal
+          ),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`Sub-executor timeout (${perExecutorTimeoutMs}ms)`)), perExecutorTimeoutMs)
+          ),
+        ]);
 
         // Update blackboard with results
         blackboard.updateStepStatus(

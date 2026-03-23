@@ -2,9 +2,9 @@
  * Allure → IntentTestCase Mapper
  *
  * Transforms AllureTestResult objects into IntentTestCase creation params:
- *  - Flattens nested Allure step trees into flat IntentStep arrays
- *  - Infers IntentActionType from step names via regex
- *  - Extracts labels (epic → Module, feature → Flow, severity → priority, tags)
+ *  - Flattens nested Allure step trees and uses AI to convert them to IntentSteps
+ *  - AI infers IntentActionType, description, and value from step context
+ *  - Extracts labels (epic/parentSuite → Module, feature/suite → Flow, severity → priority)
  *  - Resolves/creates Modules and Flows (with an in-process cache to avoid
  *    redundant DB round-trips)
  *  - Links container befores/afters as preconditions
@@ -13,6 +13,8 @@
 
 import { randomUUID } from 'crypto';
 import { logger } from '@/utils/core/logger';
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { ModuleService } from '@/services/testing/modules/module.service';
 import { FlowService } from '@/services/testing/flows/flow.service';
 import { PlatformService } from '@/services/testing/platforms/platform.service';
@@ -22,82 +24,243 @@ import type {
   AllureContainer,
   AllureStep,
   AllureLabel,
+  AllureImportResultHierarchy,
+  AllureImportedModuleNode,
+  AllureImportedFlowNode,
+  AllureImportedTestNode,
 } from './allure-import.types';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Action-type inference
+// Step tree flattening (pre-AI: extract raw step data)
 // ─────────────────────────────────────────────────────────────────────────────
 
+interface FlattenedRawStep {
+  name: string;
+  status?: string;
+  value?: string; // from first visible parameter
+  parentName?: string; // parent grouping step name for context
+}
+
 /**
- * Infer an IntentActionType from a step's display name.
- * Uses priority-ordered regex matching — first match wins.
+ * Recursively walk an Allure step tree and collect leaf steps as raw data.
+ * Parent grouping step names are passed as context so AI can understand
+ * what section each leaf step belongs to.
  */
-function inferActionType(stepName: string): IntentActionType {
-  const n = stepName.toLowerCase();
+function flattenRawSteps(allureSteps: AllureStep[], parentName?: string): FlattenedRawStep[] {
+  const result: FlattenedRawStep[] = [];
 
-  if (/navigate|open|go to|visit|url|launch|browse/i.test(n)) return 'navigate';
-  if (/double.?click|dblclick/i.test(n))                        return 'dblclick';
-  if (/right.?click|context.?menu/i.test(n))                   return 'contextmenu';
-  if (/drag|drop/i.test(n))                                     return 'drag_and_drop';
-  if (/upload|attach file/i.test(n))                            return 'upload';
-  if (/hover|mouse.?over/i.test(n))                             return 'hover';
-  if (/scroll/i.test(n))                                        return 'scroll';
-  if (/type|fill|write|set text|enter.*(text|value|input)/i.test(n)) return 'type';
-  if (/select|choose|pick|dropdown/i.test(n))                  return 'select';
-  if (/check\s*box|tick\s*box|toggle.*on/i.test(n))            return 'check';
-  if (/uncheck|untick|toggle.*off/i.test(n))                   return 'uncheck';
-  if (/press|hit|key|enter\s*key/i.test(n))                    return 'press';
-  if (/wait|pause|delay|sleep/i.test(n))                       return 'wait';
-  if (/assert|verify|check|expect|should|see|validate|confirm/i.test(n)) return 'assert';
-  if (/click|tap|submit|button/i.test(n))                      return 'click';
+  for (const step of allureSteps) {
+    const children = step.steps ?? [];
 
-  // Generic fallback
-  return 'click';
+    if (children.length > 0) {
+      // Grouping step — recurse with this step's name as parent context
+      result.push(...flattenRawSteps(children, step.name));
+    } else {
+      // Leaf step — extract value from first non-masked parameter
+      const visibleParam = step.parameters?.find(
+        (p) => p.mode !== 'masked' && p.mode !== 'hidden' && p.value,
+      );
+
+      result.push({
+        name: step.name,
+        status: step.status,
+        value: visibleParam?.value,
+        parentName,
+      });
+    }
+  }
+
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Step tree flattening
+// AI step conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Valid action types for the AI prompt */
+const VALID_ACTION_TYPES: IntentActionType[] = [
+  'navigate', 'click', 'type', 'select', 'hover', 'scroll', 'press',
+  'assert', 'wait', 'check', 'uncheck', 'upload', 'dblclick', 'drag_and_drop',
+];
+
+interface AIStepResult {
+  type: IntentActionType;
+  description: string;
+  value?: string;
+}
+
+const STEP_CONVERSION_SYSTEM_PROMPT = `You convert Allure test report steps into UI test actions for a web testing platform.
+
+## Input
+You receive a test name and its steps. Each step has:
+- name: the step description from Allure
+- value: parameter value (if any)
+- parent: parent grouping step name (context)
+- status: passed/failed/broken/skipped
+
+## Output
+Convert each MEANINGFUL step into a UI test action.
+
+## Action types (pick the most specific one)
+- navigate: Go to a URL, open a page, redirect
+- click: Click a button, link, element, submit
+- type: Type/fill text into an input field, textarea, search box
+- select: Choose an option from a dropdown/select/combobox
+- hover: Mouse over an element
+- scroll: Scroll page or element
+- press: Press a keyboard key (Enter, Tab, Escape, etc.)
+- assert: Verify something is visible, exists, has text, matches condition
+- wait: Wait for page load, element to appear, timeout
+- check: Check a checkbox, enable a toggle
+- uncheck: Uncheck a checkbox, disable a toggle
+- upload: Upload/attach a file
+- dblclick: Double-click an element
+- drag_and_drop: Drag element to another position
+
+## Rules
+1. SKIP non-UI steps: API calls, database queries, internal assertions about response codes, screenshot captures, log statements, "Given/When/Then" wrappers that contain no action
+2. SKIP redundant steps: if "Click Login" and "Login button clicked" both exist, keep only one
+3. SPLIT composite steps: "Enter email and click Submit" → two separate actions (type + click)
+4. For "type" actions: put the typed value in "value" field. If step says 'Type "hello"' → value: "hello"
+5. For "navigate" actions: put the URL in "value" field if present
+6. For "press" actions: put the key name in "value" field (e.g. "Enter", "Tab", "Escape")
+7. For "assert" actions: write what should be verified as the description (e.g. "Verify error message is displayed")
+8. Description should be clear, concise, human-readable (not code). Max 80 chars.
+9. If a step is ambiguous but seems like a UI action, include it as "click" with a descriptive description
+10. Return empty array [] if there are NO meaningful UI steps
+11. Preserve the logical order of steps
+
+## Response format
+Return a JSON object with a "steps" array:
+{
+  "steps": [
+    { "type": "navigate", "description": "Open login page", "value": "https://example.com/login" },
+    { "type": "type", "description": "Enter email address", "value": "user@test.com" },
+    { "type": "click", "description": "Click Sign In button" },
+    { "type": "assert", "description": "Verify dashboard is displayed" }
+  ]
+}
+If no meaningful UI steps exist, return: { "steps": [] }`;
+
 /**
- * Recursively walk an Allure step tree and collect only **leaf** steps
- * (steps with no children) as IntentStep objects.
- * Parent grouping steps are skipped but their children are recursed into.
+ * Maximum raw steps to send in a single AI call.
+ * Keeps the prompt under ~4K tokens (each step ~30 tokens).
+ * 50 steps × ~50 output tokens each ≈ 2500 tokens — safely within max_tokens.
  */
-function flattenSteps(allureSteps: AllureStep[]): IntentStep[] {
-  const result: IntentStep[] = [];
+const AI_STEP_BATCH_SIZE = 50;
 
-  function recurse(steps: AllureStep[]): void {
-    for (const step of steps) {
-      const children = step.steps ?? [];
+/**
+ * Convert flattened Allure steps into IntentSteps using AI.
+ * For tests with many steps, processes in batches.
+ */
+async function convertStepsWithAI(
+  testName: string,
+  rawSteps: FlattenedRawStep[],
+): Promise<IntentStep[]> {
+  if (rawSteps.length === 0) return [];
 
-      if (children.length > 0) {
-        // This is a grouping/parent step — recurse into children only
-        recurse(children);
-      } else {
-        // Leaf step → convert to IntentStep
-        const actionType = inferActionType(step.name);
+  const allResults: IntentStep[] = [];
 
-        // Extract value from the first non-masked parameter (if any)
-        const visibleParam = step.parameters?.find(
-          (p) => p.mode !== 'masked' && p.mode !== 'hidden' && p.value,
-        );
-        const value = visibleParam?.value;
+  // Process in batches to keep prompt size reasonable
+  for (let i = 0; i < rawSteps.length; i += AI_STEP_BATCH_SIZE) {
+    const batch = rawSteps.slice(i, i + AI_STEP_BATCH_SIZE);
+    const batchNum = Math.floor(i / AI_STEP_BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(rawSteps.length / AI_STEP_BATCH_SIZE);
 
-        const intentStep: IntentStep = {
+    const stepsText = batch
+      .map((s, idx) => {
+        const parts = [`${idx + 1}. "${s.name}"`];
+        if (s.value) parts.push(`value="${s.value}"`);
+        if (s.parentName) parts.push(`(in: "${s.parentName}")`);
+        if (s.status && s.status !== 'passed') parts.push(`[${s.status}]`);
+        return parts.join(' ');
+      })
+      .join('\n');
+
+    const batchContext = totalBatches > 1
+      ? ` (batch ${batchNum}/${totalBatches}, steps ${i + 1}-${Math.min(i + AI_STEP_BATCH_SIZE, rawSteps.length)})`
+      : '';
+
+    const userPrompt = `Test: "${testName}"${batchContext}\n\nSteps:\n${stepsText}`;
+
+    try {
+      const response = await getChatCompletionWithMessages(
+        [
+          { role: 'system', content: STEP_CONVERSION_SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        {
+          model: AI_TASK_MODELS.allureStepConvert,
+          temperature: 0,
+          max_tokens: 8192,
+          response_format: { type: 'json_object' },
+        },
+      );
+
+      const rawContent = response.content?.trim() ?? '{"steps":[]}';
+      // AI returns {steps: [...]} (json_object mode always returns objects)
+      let parsed: AIStepResult[];
+      try {
+        const json = JSON.parse(rawContent);
+        if (Array.isArray(json)) {
+          parsed = json;
+        } else if (Array.isArray(json.steps)) {
+          parsed = json.steps;
+        } else {
+          parsed = [];
+        }
+      } catch (parseErr) {
+        // JSON may be truncated if max_tokens was hit
+        logger.warn('[AllureMapper] AI response JSON parse failed (truncated?)', {
+          testName,
+          batch: batchNum,
+          contentLength: rawContent.length,
+        });
+        parsed = [];
+      }
+
+      for (const step of parsed) {
+        // Skip malformed entries (AI sometimes returns nulls or strings)
+        if (!step || typeof step !== 'object') continue;
+
+        const desc = typeof step.description === 'string' ? step.description.trim() : '';
+        if (!desc) continue; // skip steps with no description
+
+        // Validate action type
+        const actionType: IntentActionType = VALID_ACTION_TYPES.includes(step.type as IntentActionType)
+          ? (step.type as IntentActionType)
+          : 'click';
+
+        allResults.push({
           id: randomUUID(),
           type: actionType,
-          description: step.name,
-          ...(value !== undefined && { value }),
-        };
+          description: desc.slice(0, 120),
+          ...(step.value !== undefined && step.value !== null && step.value !== '' && {
+            value: String(step.value),
+          }),
+        });
+      }
+    } catch (err) {
+      logger.warn('[AllureMapper] AI step conversion failed, using fallback', {
+        testName,
+        batch: batchNum,
+        stepsCount: batch.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
 
-        result.push(intentStep);
+      // Fallback: create basic steps from raw data without AI
+      for (const raw of batch) {
+        allResults.push({
+          id: randomUUID(),
+          type: 'click', // safe default
+          description: raw.name.slice(0, 120),
+          ...(raw.value !== undefined && { value: raw.value }),
+        });
       }
     }
   }
 
-  recurse(allureSteps);
-  return result;
+  return allResults;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,47 +268,113 @@ function flattenSteps(allureSteps: AllureStep[]): IntentStep[] {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ExtractedLabels {
-  epicName?: string;
-  featureName?: string;
+  /**
+   * Module name — resolved with fallback chain:
+   *   epic → parentSuite → suite (when no epic/parentSuite)
+   */
+  moduleName?: string;
+  /**
+   * Flow name — resolved with fallback chain:
+   *   feature → suite (when module came from parentSuite) → subSuite
+   */
+  flowName?: string;
   priority: 'critical' | 'high' | 'medium' | 'low';
   tags: string[];
   descriptionSuffix: string; // Extra context from story/layer/owner labels
 }
 
+/**
+ * Extract hierarchy and metadata labels from an Allure test result.
+ *
+ * Allure supports TWO navigation hierarchies:
+ *   Behaviors:  epic → feature → story
+ *   Suites:     parentSuite → suite → subSuite
+ *
+ * Our platform hierarchy:  Module → Flow → TestCase
+ *
+ * Resolution strategy (first non-empty wins):
+ *   Module ← epic  ‖  parentSuite  ‖  suite (only if no parentSuite)
+ *   Flow   ← feature  ‖  suite (when module came from parentSuite)  ‖  subSuite
+ *
+ * This ensures projects using BDD-style (epic/feature) AND projects using
+ * JUnit/NUnit-style (parentSuite/suite/subSuite) both produce meaningful
+ * hierarchy instead of everything landing in "Unassigned".
+ */
 function extractLabels(labels: AllureLabel[]): ExtractedLabels {
   const byName = (name: string) =>
     labels.filter((l) => l.name === name).map((l) => l.value);
 
-  const epicNames   = byName('epic');
-  const featureNames = byName('feature');
-  const severities  = byName('severity');
-  const stories     = byName('story');
-  const tagValues   = byName('tag');
-  const layers      = byName('layer');
-  const owners      = byName('owner');
+  // ── BDD hierarchy labels ────────────────────────────────────────────────
+  const epicNames      = byName('epic');
+  const featureNames   = byName('feature');
+  const stories        = byName('story');
 
-  // Priority from severity
+  // ── Suite hierarchy labels (fallback) ───────────────────────────────────
+  const parentSuites   = byName('parentSuite');
+  const suiteNames     = byName('suite');
+  const subSuites      = byName('subSuite');
+
+  // ── Metadata labels ─────────────────────────────────────────────────────
+  const severities     = byName('severity');
+  const tagValues      = byName('tag');
+  const layers         = byName('layer');
+  const owners         = byName('owner');
+
+  // ── Resolve Module name (fallback chain) ────────────────────────────────
+  let moduleName: string | undefined;
+  let moduleSource: 'epic' | 'parentSuite' | 'suite' | undefined;
+
+  if (epicNames[0]) {
+    moduleName = epicNames[0];
+    moduleSource = 'epic';
+  } else if (parentSuites[0]) {
+    moduleName = parentSuites[0];
+    moduleSource = 'parentSuite';
+  } else if (suiteNames[0] && !featureNames[0] && !subSuites[0]) {
+    // suite as module ONLY when it's the sole grouping label
+    // (no feature/subSuite to disambiguate flow-level meaning)
+    moduleName = suiteNames[0];
+    moduleSource = 'suite';
+  }
+
+  // ── Resolve Flow name (fallback chain) ──────────────────────────────────
+  let flowName: string | undefined;
+
+  if (featureNames[0]) {
+    flowName = featureNames[0];
+  } else if (moduleSource === 'parentSuite' && suiteNames[0]) {
+    // parentSuite is the module → suite becomes the flow
+    flowName = suiteNames[0];
+  } else if (subSuites[0]) {
+    flowName = subSuites[0];
+  }
+
+  // ── Priority from severity ──────────────────────────────────────────────
+  // Allure severity order: blocker > critical > normal > minor > trivial
+  // Mapped to our priority: critical > high > medium > low
   const severity = severities[0]?.toLowerCase() ?? '';
   let priority: ExtractedLabels['priority'] = 'medium';
   if (severity === 'blocker' || severity === 'critical') priority = 'critical';
+  else if (severity === 'major')                         priority = 'high';
+  else if (severity === 'normal')                        priority = 'medium';
   else if (severity === 'minor' || severity === 'trivial') priority = 'low';
-  else if (severity === 'normal' || severity === 'major') priority = 'medium';
 
-  // Composite tags
+  // ── Composite tags ──────────────────────────────────────────────────────
   const tags: string[] = [
     ...tagValues,
+    ...stories.map((s) => `story:${s}`),
     ...layers.map((l) => `layer:${l}`),
     ...owners.map((o) => `owner:${o}`),
   ];
 
-  // Build description suffix from story labels
+  // ── Description suffix from story labels ────────────────────────────────
   const descriptionSuffix = stories.length > 0
     ? `\n\n**Story:** ${stories.join(', ')}`
     : '';
 
   return {
-    epicName:    epicNames[0],
-    featureName: featureNames[0],
+    moduleName,
+    flowName,
     priority,
     tags,
     descriptionSuffix,
@@ -217,6 +446,84 @@ export class HierarchyCache {
   /** Number of NEW flows created during this import batch. */
   public flowsCreated = 0;
 
+  // ── Hierarchy tree tracking ───────────────────────────────────────────────
+  /** Module metadata: id → { name, isNew } */
+  private readonly moduleInfo = new Map<string, { name: string; isNew: boolean }>();
+  /** Flow metadata: id → { name, isNew, moduleId } */
+  private readonly flowInfo = new Map<string, { name: string; isNew: boolean; moduleId: string }>();
+  /** Test nodes tracked per flow or unassigned. Key: flowId or '__unassigned__' */
+  private readonly testsByFlow = new Map<string, AllureImportedTestNode[]>();
+  /** Flow IDs grouped by module. Key: moduleId */
+  private readonly flowsByModule = new Map<string, Set<string>>();
+
+  /**
+   * Register a test node in the hierarchy tree.
+   *
+   * When a test has a moduleId but no flowId (epic label without feature label),
+   * it's placed under a synthetic "General" flow within that module — instead of
+   * falling through to the "unassigned" bucket.
+   */
+  addTestNode(node: AllureImportedTestNode, flowId?: string, moduleId?: string): void {
+    let key: string;
+
+    if (flowId) {
+      key = flowId;
+    } else if (moduleId) {
+      // Module exists but no flow — use synthetic "General" flow under this module
+      const syntheticKey = `__general__::${moduleId}`;
+      key = syntheticKey;
+
+      // Register the synthetic flow node once
+      if (!this.flowInfo.has(syntheticKey)) {
+        this.flowInfo.set(syntheticKey, { name: 'General', isNew: false, moduleId });
+        if (!this.flowsByModule.has(moduleId)) this.flowsByModule.set(moduleId, new Set());
+        this.flowsByModule.get(moduleId)!.add(syntheticKey);
+      }
+    } else {
+      key = '__unassigned__';
+    }
+
+    let list = this.testsByFlow.get(key);
+    if (!list) {
+      list = [];
+      this.testsByFlow.set(key, list);
+    }
+    list.push(node);
+  }
+
+  /** Build the final hierarchy for the frontend popup. */
+  buildHierarchy(): AllureImportResultHierarchy {
+    const modules: AllureImportedModuleNode[] = [];
+
+    for (const [moduleId, moduleData] of this.moduleInfo) {
+      const flowIds = this.flowsByModule.get(moduleId) ?? new Set();
+      const flows: AllureImportedFlowNode[] = [];
+
+      for (const flowId of flowIds) {
+        const flowData = this.flowInfo.get(flowId);
+        if (!flowData) continue;
+        flows.push({
+          id: flowId,
+          name: flowData.name,
+          isNew: flowData.isNew,
+          tests: this.testsByFlow.get(flowId) ?? [],
+        });
+      }
+
+      modules.push({
+        id: moduleId,
+        name: moduleData.name,
+        isNew: moduleData.isNew,
+        flows,
+      });
+    }
+
+    return {
+      modules,
+      unassigned: this.testsByFlow.get('__unassigned__') ?? [],
+    };
+  }
+
   /**
    * Resolve (or create) a Module for the given epic label.
    * Returns the module ID, or null if not applicable / creation fails.
@@ -248,6 +555,7 @@ export class HierarchyCache {
 
       if (existing) {
         this.moduleCache.set(cacheKey, existing.id);
+        this.moduleInfo.set(existing.id, { name: existing.name, isNew: false });
         return existing.id;
       }
 
@@ -273,6 +581,7 @@ export class HierarchyCache {
 
       this.modulesCreated++;
       this.moduleCache.set(cacheKey, created.id);
+      this.moduleInfo.set(created.id, { name: epicName, isNew: true });
       return created.id;
     } catch (err) {
       logger.warn('[AllureMapper] Failed to resolve/create module', {
@@ -310,6 +619,9 @@ export class HierarchyCache {
 
       if (existing) {
         this.flowCache.set(cacheKey, existing.id);
+        this.flowInfo.set(existing.id, { name: existing.name, isNew: false, moduleId });
+        if (!this.flowsByModule.has(moduleId)) this.flowsByModule.set(moduleId, new Set());
+        this.flowsByModule.get(moduleId)!.add(existing.id);
         return existing.id;
       }
 
@@ -333,6 +645,9 @@ export class HierarchyCache {
 
       this.flowsCreated++;
       this.flowCache.set(cacheKey, created.id);
+      this.flowInfo.set(created.id, { name: featureName, isNew: true, moduleId });
+      if (!this.flowsByModule.has(moduleId)) this.flowsByModule.set(moduleId, new Set());
+      this.flowsByModule.get(moduleId)!.add(created.id);
       return created.id;
     } catch (err) {
       logger.warn('[AllureMapper] Failed to resolve/create flow', {
@@ -365,6 +680,8 @@ export interface MappedTestCase {
     priority: 'critical' | 'high' | 'medium' | 'low';
     preconditions: string[];
   };
+  /** Resolved module ID (for hierarchy tree). */
+  moduleId?: string;
   /** Source UUID from Allure, for cross-referencing. */
   sourceUuid: string;
   /** Source testCaseId from Allure, for dedup checks. */
@@ -376,6 +693,59 @@ export interface MapperOptions {
   userId: string;
   autoCreateModules: boolean;
   autoCreateFlows: boolean;
+}
+
+/**
+ * Resolve module + flow from label names using the HierarchyCache.
+ * Shared by both mapAllureResult (full mapping) and mapAllureResultLabelsOnly (dedup).
+ */
+async function resolveHierarchy(
+  cache: HierarchyCache,
+  webUiPlatformId: string,
+  opts: MapperOptions,
+  moduleName?: string,
+  flowName?: string,
+): Promise<{ moduleId?: string; flowId?: string }> {
+  if (!moduleName) return {};
+
+  const moduleId = await cache.resolveModule({
+    projectId: opts.projectId,
+    userId: opts.userId,
+    platformId: webUiPlatformId,
+    epicName: moduleName,
+    autoCreate: opts.autoCreateModules,
+  });
+
+  if (!moduleId) return {};
+
+  let flowId: string | undefined;
+  if (flowName) {
+    const resolved = await cache.resolveFlow({
+      moduleId,
+      userId: opts.userId,
+      featureName: flowName,
+      autoCreate: opts.autoCreateFlows,
+    });
+    if (resolved) flowId = resolved;
+  }
+
+  return { moduleId, flowId };
+}
+
+/**
+ * Lightweight label-only mapper — resolves module/flow hierarchy WITHOUT
+ * calling AI for step conversion. Used for duplicate tests that need
+ * hierarchy placement but not full mapping.
+ */
+export async function mapAllureResultLabelsOnly(
+  result: AllureTestResult,
+  cache: HierarchyCache,
+  webUiPlatformId: string,
+  opts: MapperOptions,
+): Promise<{ moduleId?: string; flowId?: string; priority: ExtractedLabels['priority'] }> {
+  const { moduleName, flowName, priority } = extractLabels(result.labels);
+  const { moduleId, flowId } = await resolveHierarchy(cache, webUiPlatformId, opts, moduleName, flowName);
+  return { moduleId, flowId, priority };
 }
 
 /**
@@ -394,13 +764,14 @@ export async function mapAllureResult(
   webUiPlatformId: string,
   opts: MapperOptions,
 ): Promise<MappedTestCase> {
-  const { projectId, userId, autoCreateModules, autoCreateFlows } = opts;
+  const { projectId, userId } = opts;
 
-  // ── 1. Flatten steps ───────────────────────────────────────────────────────
-  const steps = flattenSteps(result.steps);
+  // ── 1. Flatten + AI-convert steps ──────────────────────────────────────────
+  const rawSteps = flattenRawSteps(result.steps);
+  const steps = await convertStepsWithAI(result.name, rawSteps);
 
   // ── 2. Extract labels ──────────────────────────────────────────────────────
-  const { epicName, featureName, priority, tags, descriptionSuffix } =
+  const { moduleName, flowName, priority, tags, descriptionSuffix } =
     extractLabels(result.labels);
 
   // ── 3. Extract preconditions from container (needed before buildDescription) ──
@@ -417,32 +788,15 @@ export async function mapAllureResult(
   const description = buildDescription(result, descriptionSuffix, preconditions);
 
   // ── 5. Resolve hierarchy (Module → Flow) ──────────────────────────────────
-  let flowId: string | undefined;
-
-  if (epicName) {
-    const moduleId = await cache.resolveModule({
-      projectId,
-      userId,
-      platformId: webUiPlatformId,
-      epicName,
-      autoCreate: autoCreateModules,
-    });
-
-    if (moduleId && featureName) {
-      const resolvedFlowId = await cache.resolveFlow({
-        moduleId,
-        userId,
-        featureName,
-        autoCreate: autoCreateFlows,
-      });
-      if (resolvedFlowId) flowId = resolvedFlowId;
-    }
-  }
+  const { moduleId: resolvedModuleId, flowId } = await resolveHierarchy(
+    cache, webUiPlatformId, opts, moduleName, flowName,
+  );
 
   // ── 6. Compose create params ──────────────────────────────────────────────
   return {
     sourceUuid: result.uuid,
     sourceTestCaseId: result.testCaseId,
+    ...(resolvedModuleId && { moduleId: resolvedModuleId }),
     createParams: {
       projectId,
       userId,

@@ -348,6 +348,74 @@ export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {
 }
 
 /**
+ * Upload replay trace JSONL to Supabase Storage.
+ * Contains step-by-step execution details: element resolution, readiness checks,
+ * retry attempts, LLM diagnosis, errors — everything needed to debug failures.
+ *
+ * @param localPath - Path to local JSONL file (from ReplayTraceWriter)
+ * @param testId - Test ID for organizing in storage
+ * @param userId - User ID for storage path
+ * @returns Public URL of the uploaded file
+ */
+export async function uploadReplayTraceToStorage(
+  localPath: string,
+  testId: string,
+  userId: string,
+): Promise<string> {
+  try {
+    await fs.access(localPath);
+
+    const fileBuffer = await fs.readFile(localPath);
+    const fileSize = fileBuffer.length;
+
+    if (fileSize === 0) {
+      logger.warn('[STORAGE] Replay trace file is empty', { testId, localPath });
+      throw new Error('Replay trace file is empty');
+    }
+
+    const fileName = `replay-trace-${testId}-${Date.now()}.jsonl`;
+    const storagePath = `${userId}/replay-traces/${fileName}`;
+
+    const { error } = await supabaseAdmin.storage
+      .from(env.SUPABASE_BUCKET_NAME)
+      .upload(storagePath, fileBuffer, {
+        contentType: 'application/x-ndjson',
+        upsert: false,
+        cacheControl: '3600',
+      });
+
+    if (error) {
+      throw new Error(`Failed to upload replay trace: ${error.message}`);
+    }
+
+    const { data: urlData } = supabaseAdmin.storage
+      .from(env.SUPABASE_BUCKET_NAME)
+      .getPublicUrl(storagePath);
+
+    logger.info('[STORAGE] Replay trace uploaded successfully', {
+      testId,
+      url: urlData.publicUrl,
+      fileSize: `${Math.round(fileSize / 1024)}KB`,
+    });
+
+    // Clean up local file
+    try {
+      await fs.unlink(localPath);
+    } catch {
+      // Non-fatal
+    }
+
+    return urlData.publicUrl;
+  } catch (error) {
+    logger.error('[STORAGE] Replay trace upload error', {
+      error: error instanceof Error ? error.message : String(error),
+      testId,
+    });
+    throw error;
+  }
+}
+
+/**
  * Upload Lite trace log (JSONL) to Supabase Storage
  * @param localPath - Path to local JSONL file
  * @param userId - User ID (must be valid UUID)

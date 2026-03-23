@@ -692,7 +692,7 @@ function computeTextHash(text: string): string {
 function computePageSignature(url: string, nodes: InteractiveNode[]): string {
   const refs = nodes.map(n => n.ref || '').join(',');
   const data = `${url}|${nodes.length}|${refs}`;
-  return Buffer.from(data).toString('base64').substring(0, 32);
+  return Buffer.from(data).toString('base64');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -878,6 +878,41 @@ function escapeRegex(str: string): string {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
+// V14: JSON EXTRACTION UTILITY
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Extract first balanced JSON object from a string.
+ * Handles nested objects (e.g. boundingBox inside the response).
+ * Simple regex `\{.*?\}` fails on nested braces.
+ */
+function extractFirstJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // GEMINI FLASH RESCUE
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -901,9 +936,23 @@ async function rescueWithGeminiFlash(params: {
 }): Promise<{ ref: string; confidence: number; reason: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null> {
   const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport } = params;
 
+  // V14: Prioritize candidates by relevance (label/aria/text match) instead of DOM order
+  // Note: disabled elements NOT filtered out — buildAllowedSets treats disabled as soft penalty,
+  // so rescue should be equally lenient. LLM decides if a disabled element is the right target.
+  const intentLower = intentText.toLowerCase();
   const rescueCandidates = excludedNodes
-    .filter(n => n.ref && n.isVisible !== false && !n.isDisabled)
-    .slice(0, 10);
+    .filter(n => n.ref && n.isVisible !== false)
+    .sort((a, b) => {
+      const scoreNode = (n: InteractiveNode): number => {
+        const texts = [n.labelText, n.ariaLabel, n.text, n.placeholder, n.title].filter(Boolean).map(t => t!.toLowerCase());
+        if (texts.some(t => t === intentLower)) return 3;           // exact match
+        if (texts.some(t => t.includes(intentLower) || intentLower.includes(t))) return 2; // partial match
+        if (n.role || n.ariaLabel) return 1;                       // has a11y info
+        return 0;
+      };
+      return scoreNode(b) - scoreNode(a);
+    })
+    .slice(0, 15);
 
   if (rescueCandidates.length === 0) return null;
 
@@ -963,10 +1012,12 @@ Select the single best matching element. If unsure, return ref: null.`;
     if (screenshot) {
       const visionPrompt = `${systemPrompt}\n\n${userPrompt}\n\nIMPORTANT: Look at the screenshot to visually identify the target element. If the element is visible in the screenshot but NOT in the candidate list, return ref as null and provide bounding box coordinates (x, y, width, height in pixels).\n\nJSON format with optional boundingBox: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief","boundingBox":{"x":0,"y":0,"width":0,"height":0}}`;
 
+      // V14: Detect mime type from base64 header — JPEG starts with /9j/, PNG with iVBOR
+      const mimeType: 'image/jpeg' | 'image/png' = screenshot.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
       const visionResponse = await generateTextWithGeminiVision({
         prompt: visionPrompt,
         imageBase64: screenshot,
-        mimeType: 'image/png',
+        mimeType,
         model: AI_TASK_MODELS.visionElementResolution as any,
         temperature: 0,
         maxTokens: 200,
@@ -989,10 +1040,11 @@ Select the single best matching element. If unsure, return ref: null.`;
       responseContent = response.content;
     }
 
-    const jsonMatch = responseContent.match(/\{[\s\S]*?\}/);
+    // V14: Handle nested JSON objects (boundingBox is nested) — match balanced braces
+    const jsonMatch = extractFirstJsonObject(responseContent);
     if (!jsonMatch) return null;
 
-    const parsed = JSON.parse(jsonMatch[0]);
+    const parsed = JSON.parse(jsonMatch);
 
     // ref must be a non-empty string (null or absent = no match) OR have bounding box
     if ((!parsed.ref || typeof parsed.ref !== 'string') && !parsed.boundingBox) return null;
@@ -1018,7 +1070,9 @@ Select the single best matching element. If unsure, return ref: null.`;
         : 0;
     const confidence = Number.isFinite(rawConfidence) ? Math.min(1, Math.max(0, rawConfidence)) : 0;
 
-    if (confidence < ELEMENT_RESOLVER_CONFIG.confidenceThreshold) return null;
+    // V14: Use lower threshold for rescue (last-resort path) — 0.5 instead of default 0.7
+    const rescueThreshold = Math.min(ELEMENT_RESOLVER_CONFIG.confidenceThreshold, 0.5);
+    if (confidence < rescueThreshold) return null;
 
     return {
       ref: parsed.ref || '',
@@ -1369,8 +1423,8 @@ export async function resolveElement(params: {
   pageUrl: string;
   /** When true, include candidates in result (for Show Alternatives) */
   includeAlternatives?: boolean;
-  /** Phase 6: Optional screenshot for vision-enhanced rescue (base64 PNG) */
-  screenshot?: string;
+  /** Phase 6: Screenshot for vision-enhanced rescue (base64 JPEG/PNG or lazy callback) */
+  screenshot?: string | (() => Promise<string | null>);
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -1378,7 +1432,7 @@ export async function resolveElement(params: {
     domNodes,
     pageUrl,
     includeAlternatives = false,
-    screenshot,
+    screenshot: screenshotOrFn,
   } = params;
   const startTime = Date.now();
 
@@ -1485,16 +1539,26 @@ export async function resolveElement(params: {
     const allowedRefs = new Set([...hardAllowed, ...softAllowed].map(n => n.ref));
     const excludedNodes = domNodes.filter(n => n.ref && !allowedRefs.has(n.ref));
 
+    // V14: Resolve screenshot lazily — only capture when we actually need vision rescue
+    let screenshot: string | undefined;
+    if (typeof screenshotOrFn === 'function') {
+      try { screenshot = (await screenshotOrFn()) ?? undefined; } catch { /* non-critical */ }
+    } else {
+      screenshot = screenshotOrFn;
+    }
+
     const rescueResult = await rescueWithGeminiFlash({
       intentText,
       actionType: stepDraft.type,
       excludedNodes,
       pageUrl,
-      screenshot, // Phase 6: Pass screenshot for vision-enhanced rescue
+      screenshot,
     });
 
     if (rescueResult) {
-      const rescuedNode = domNodes.find(n => n.ref === rescueResult.ref);
+      // V14: Handle both ref-based and boundingBox-only results
+      const rescuedNode = rescueResult.ref ? domNodes.find(n => n.ref === rescueResult.ref) : undefined;
+
       if (rescuedNode) {
         logger.info('[ELEMENT_RESOLVER] Gemini Flash rescue succeeded', {
           event: 'gemini_rescue',
@@ -1523,6 +1587,74 @@ export async function resolveElement(params: {
           degradedMode: false,
           ..._diag,
         };
+      }
+
+      // V14: BoundingBox-only result — vision found element by coordinates but not in DOM list.
+      // Search ALL domNodes (not just excluded) — vision coordinates may match any element.
+      if (rescueResult.boundingBox) {
+        const bb = rescueResult.boundingBox;
+        const bbCenterX = bb.x + bb.width / 2;
+        const bbCenterY = bb.y + bb.height / 2;
+
+        let bestNode: InteractiveNode | undefined;
+        let bestDist = Infinity;
+
+        for (const node of domNodes) {
+          if (!node.ref || !node.boundingBox || node.isVisible === false) continue;
+          const nb = node.boundingBox;
+          // Check if vision center falls inside this node's bounding box
+          if (bbCenterX >= nb.x && bbCenterX <= nb.x + nb.width &&
+              bbCenterY >= nb.y && bbCenterY <= nb.y + nb.height) {
+            // Prefer smallest element that contains the point (most specific)
+            const area = nb.width * nb.height;
+            if (area < bestDist) { bestDist = area; bestNode = node; }
+          }
+        }
+
+        // Fallback: nearest center-to-center if no containment match (100px threshold)
+        if (!bestNode) {
+          bestDist = Infinity;
+          for (const node of domNodes) {
+            if (!node.ref || !node.boundingBox || node.isVisible === false) continue;
+            const nb = node.boundingBox;
+            const nCenterX = nb.x + nb.width / 2;
+            const nCenterY = nb.y + nb.height / 2;
+            const dist = Math.sqrt((bbCenterX - nCenterX) ** 2 + (bbCenterY - nCenterY) ** 2);
+            if (dist < bestDist && dist < 100) { bestDist = dist; bestNode = node; }
+          }
+        }
+
+        if (bestNode) {
+          logger.info('[ELEMENT_RESOLVER] Vision rescue: matched by bounding box', {
+            event: 'gemini_rescue_bbox',
+            previewSessionId,
+            ref: bestNode.ref,
+            visionBBox: bb,
+            nodeBBox: bestNode.boundingBox,
+            distance: bestDist,
+            totalLatencyMs: Date.now() - startTime,
+          });
+
+          const lintCandidate: LintCandidate = {
+            ref: bestNode.ref,
+            label: bestNode.labelText || bestNode.ariaLabel || bestNode.text || bestNode.placeholder || `<${bestNode.tag}>`,
+            reason: `Vision rescue (coordinates): ${rescueResult.reason}`,
+            confidence: Math.min(rescueResult.confidence, 0.85),
+            boundingBox: bestNode.boundingBox,
+            node: bestNode,
+          };
+
+          return {
+            status: 'resolved',
+            message: `Element found by vision coordinates: ${rescueResult.reason}`,
+            confidence: lintCandidate.confidence,
+            candidates: [lintCandidate],
+            highlight: [{ ref: bestNode.ref, boundingBox: bestNode.boundingBox, type: 'success' }],
+            cacheHit: false,
+            degradedMode: false,
+            ..._diag,
+          };
+        }
       }
     }
 

@@ -114,6 +114,21 @@ export class MultiAgentOrchestrator {
     return this.lastVerificationCriteria;
   }
 
+  /** Get circuit breaker state for TimeoutGovernor */
+  isCircuitBreakerOpen(): boolean {
+    return this.circuitState === 'open';
+  }
+
+  /** Get a copy of working memory for TimeoutGovernor narrative */
+  getWorkingMemoryCopy(): WorkingMemory {
+    return {
+      formProgress: { ...this.workingMemory.formProgress },
+      successfulActions: [...this.workingMemory.successfulActions],
+      accomplishments: [...this.workingMemory.accomplishments],
+      visitedPages: { ...this.workingMemory.visitedPages },
+    };
+  }
+
   /** Get accumulated context for monolithic fallback — don't lose knowledge */
   getAccumulatedContext(): AccumulatedContext | undefined {
     if (!LITE_ENGINE_FLAGS.preserveContextOnFallback) return undefined;
@@ -472,6 +487,8 @@ export class MultiAgentOrchestrator {
         goalUrl: input.goalUrl,
         // Supervisor: shared recovery context
         blackboard,
+        // TimeoutGovernor: time pressure signal
+        urgencyLevel: input.urgencyLevel,
       });
 
       if (!strategy) {
@@ -721,11 +738,12 @@ export class MultiAgentOrchestrator {
       think?.('critic', `Checking safety: ${action.command.action}${action.command.ref ? ` on ${action.command.ref}` : ''}...`);
       let policyViolationCount = 0;
 
-      // Cognitive: Skip critic for low-risk deterministic actions
-      const shouldSkipCritic = LITE_ENGINE_FLAGS.criticSkipForLowRisk
+      // Cognitive: Skip critic for low-risk deterministic actions OR critical time pressure
+      const shouldSkipCritic = (LITE_ENGINE_FLAGS.criticSkipForLowRisk
         && actorDeterministic
         && strategy.confidence >= 0.9
-        && strategy.riskLevel === 'low';
+        && strategy.riskLevel === 'low')
+        || input.urgencyLevel === 'critical';
 
       if (LITE_ENGINE_FLAGS.enableCriticAgent && !shouldSkipCritic) {
         const criticStart = Date.now();
@@ -871,6 +889,8 @@ export class MultiAgentOrchestrator {
                   goalUrl: input.goalUrl,
                   // Supervisor: shared recovery context
                   blackboard,
+                  // TimeoutGovernor: time pressure signal
+                  urgencyLevel: input.urgencyLevel,
                 });
                 strategistMs += Date.now() - reStrategistStart;
 

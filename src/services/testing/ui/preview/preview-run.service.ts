@@ -20,6 +20,9 @@ import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness } from './step-readiness.service';
+import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+import { injectAutoWaitForSteps } from './auto-wait-for.utils';
+import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 
 /** Maximum wall-clock time for an entire run (all steps). Prevents infinite hangs. */
 const GLOBAL_RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -66,6 +69,102 @@ async function waitForDOMStability(page: import('playwright').Page, maxWaitMs = 
     );
   } catch {
     // Page navigating/crashed — continue
+  }
+}
+
+// ── LLM Blocker Diagnosis + Retry Helper (DRY — used in both result and exception paths) ──
+
+interface DiagnosisRetryResult {
+  /** The final step result after LLM-guided retry (or null if not attempted) */
+  result: Awaited<ReturnType<typeof PreviewStepApplyService.applyStep>> | null;
+  /** True if LLM diagnosis was attempted */
+  diagnosed: boolean;
+  /** The diagnosis (if attempted) */
+  diagnosis: Awaited<ReturnType<typeof diagnoseStepBlocker>> | undefined;
+  /** True if actOnDiagnosis wait succeeded */
+  waitSucceeded?: boolean;
+}
+
+/**
+ * After a deterministic retry fails, ask LLM what's blocking the step,
+ * wait for the suggested selector, then retry once more.
+ *
+ * @returns null result if diagnosis was skipped/failed/not-retryable
+ */
+async function attemptLLMDiagnosisAndRetry(params: {
+  page: import('playwright').Page;
+  step: IntentStep;
+  error: string;
+  previewSessionId: string;
+  userId: string;
+  stepWithCachePolicy: IntentStep;
+  runStartTime: number;
+  cancelled: boolean;
+}): Promise<DiagnosisRetryResult> {
+  const { page, step, error, previewSessionId, userId, stepWithCachePolicy, runStartTime, cancelled } = params;
+
+  const elapsedTotal = Date.now() - runStartTime;
+  if (cancelled || elapsedTotal >= GLOBAL_RUN_TIMEOUT_MS - 15000) {
+    return { result: null, diagnosed: false, diagnosis: undefined };
+  }
+
+  try {
+    const diagnosis = await diagnoseStepBlocker(page, step, error);
+
+    if (diagnosis && diagnosis.shouldRetry) {
+      logger.info('[PreviewRun] LLM diagnosis suggests retry', {
+        previewSessionId,
+        stepId: step.id,
+        blocker: diagnosis.blocker,
+        waitForSelector: diagnosis.waitForSelector,
+        confidence: diagnosis.confidence,
+      });
+
+      const waitSucceeded = await actOnDiagnosis(page, diagnosis);
+
+      const result = await PreviewStepApplyService.applyStep({
+        previewSessionId,
+        stepDraft: {
+          ...stepWithCachePolicy,
+          options: {
+            ...stepWithCachePolicy.options,
+            disableCaching: true,
+            timeout: Math.max(stepWithCachePolicy.options?.timeout || 10000, 15000),
+          },
+        },
+        userId,
+        skipPostActionWait: true,
+      });
+
+      if (!result.success) {
+        logger.warn('[PreviewRun] LLM-guided retry also failed', {
+          previewSessionId,
+          stepId: step.id,
+          blocker: diagnosis.blocker,
+          retryError: result.error,
+        });
+      }
+
+      return { result, diagnosed: true, diagnosis, waitSucceeded };
+    }
+
+    if (diagnosis) {
+      logger.info('[PreviewRun] LLM diagnosis: not retryable', {
+        previewSessionId,
+        stepId: step.id,
+        blocker: diagnosis.blocker,
+        confidence: diagnosis.confidence,
+      });
+    }
+
+    return { result: null, diagnosed: true, diagnosis };
+  } catch (diagError) {
+    logger.warn('[PreviewRun] LLM diagnosis failed', {
+      previewSessionId,
+      stepId: step.id,
+      error: diagError instanceof Error ? diagError.message : String(diagError),
+    });
+    return { result: null, diagnosed: false, diagnosis: undefined };
   }
 }
 
@@ -126,7 +225,7 @@ function augmentErrorWithPageContext(error: string, pageSummary: PageSummary | n
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['navigate', 'ai_check', 'wait', 'wait_for_email']);
+const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'wait_for_email', 'dialog', 'download']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;
@@ -253,6 +352,17 @@ export class PreviewRunService {
     if (savedSteps.length === 0) {
       throw new Error('No steps to run');
     }
+
+    // V13: Fallback to recording-time page URL if no startUrl from DB/frontend
+    if (!startUrl) {
+      startUrl = sessionService.getRecordingStartUrl(previewSessionId, userId);
+      if (startUrl) {
+        logger.info('[PreviewRun] Using recordingStartUrl as fallback', {
+          previewSessionId, startUrl,
+        });
+      }
+    }
+
     if (!startUrl) {
       throw new Error('Test case has no startUrl or url');
     }
@@ -437,25 +547,44 @@ export class PreviewRunService {
       let trackedUrl = session.page.url();
       // Track page summary after navigation for better error context
       let lastNavigationSummary: PageSummary | null = null;
+
+      // V13: Pre-inject auto-wait steps for first-run stability.
+      // On second+ runs these are already in the DB from batchUpdateStepsFromRun().
+      // The injection is idempotent — it skips if the next step is already wait_for.
+      // Uses evidence.pageUrl (captured during recording) as fallback when compiled plans are missing.
+      const stepsToExecute = injectAutoWaitForSteps(steps);
+      if (stepsToExecute.length !== steps.length) {
+        logger.info('[PreviewRun] Pre-injected auto-wait steps for first-run stability', {
+          previewSessionId,
+          originalSteps: steps.length,
+          withAutoWaits: stepsToExecute.length,
+          injectedCount: stepsToExecute.length - steps.length,
+        });
+      }
+
       logger.debug('[PreviewRun] Starting run with URL tracking', {
         previewSessionId,
         initialUrl: trackedUrl,
+        totalSteps: stepsToExecute.length,
       });
 
+      // V13: Switch dialog handler to replay mode — use pre-installed actions from recorded dialog steps
+      sessionService.setDialogMode(previewSessionId, userId, 'replay');
+
       // ─── Step execution loop ───────────────────────────────────────────
-      for (let i = 0; i < steps.length; i++) {
+      for (let i = 0; i < stepsToExecute.length; i++) {
         // Check cancellation
         const currentRunState = activeRuns.get(previewSessionId);
         if (!currentRunState || runState.cancelled || currentRunState.cancelled) {
           logger.info('[PreviewRun] Run cancelled, skipping remaining steps', {
             previewSessionId,
             currentStep: i,
-            remainingSteps: steps.length - i,
+            remainingSteps: stepsToExecute.length - i,
           });
 
           // Emit remaining steps as skipped
-          for (let j = i; j < steps.length; j++) {
-            const step = steps[j];
+          for (let j = i; j < stepsToExecute.length; j++) {
+            const step = stepsToExecute[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: j,
@@ -471,7 +600,7 @@ export class PreviewRunService {
         }
 
         runState.currentStepIndex = i;
-        const step = steps[i];
+        const step = stepsToExecute[i];
 
         logger.info('[PreviewRun] Executing step', {
           previewSessionId,
@@ -522,7 +651,7 @@ export class PreviewRunService {
           logger.info('[PreviewRun] Cancel detected before step execute, skipping remaining steps', {
             previewSessionId,
             currentStep: i,
-            remainingSteps: steps.length - i,
+            remainingSteps: stepsToExecute.length - i,
           });
 
           // Current step already received 'running' — emit it as cancelled, then skip the rest
@@ -536,8 +665,8 @@ export class PreviewRunService {
             timestamp: new Date().toISOString(),
           });
           skippedSteps++;
-          for (let j = i + 1; j < steps.length; j++) {
-            const remaining = steps[j];
+          for (let j = i + 1; j < stepsToExecute.length; j++) {
+            const remaining = stepsToExecute[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: j,
@@ -580,6 +709,13 @@ export class PreviewRunService {
         // V12: Interpolate email variables ({{email.otp}}, {{email.link}}, etc.)
         const interpolatedStep = interpolateEmailVariables(stepWithCachePolicy, previewSessionId);
 
+        // V13: Peek ahead — if next step is wait_for with changedFrom, current click expects navigation.
+        // This enables Promise.all([waitForNavigation(), click()]) pattern for reliable nav capture.
+        const peekNext = (i < stepsToExecute.length - 1) ? stepsToExecute[i + 1] : null;
+        const expectsNavigation = !!peekNext
+          && peekNext.type === 'wait_for'
+          && !!peekNext.options?.urlMatcher?.changedFrom;
+
         try {
           const stepStartMs = Date.now();
           let result = await PreviewStepApplyService.applyStep({
@@ -587,13 +723,17 @@ export class PreviewRunService {
             stepDraft: interpolatedStep,
             userId,
             skipPostActionWait: true, // V12: Lookahead handles inter-step timing
+            expectsNavigation, // V13: Wrap click with waitForNavigation if next step expects URL change
           });
           let retried = false;
 
           // ── Step-level retry: one attempt with relaxed params on failure ──
+          // V13: navigate is retryable on timeout errors (not DNS/SSL which won't improve)
+          const isNonRetryable = NO_RETRY_STEP_TYPES.has(step.type)
+            || (step.type === 'navigate' && !result.error?.toLowerCase().includes('timeout'));
           if (
             !result.success &&
-            !NO_RETRY_STEP_TYPES.has(step.type) &&
+            !isNonRetryable &&
             !runState.cancelled &&
             !(result.error?.includes('session') || result.error?.includes('expired'))
           ) {
@@ -629,12 +769,20 @@ export class PreviewRunService {
                   stepId: step.id,
                 });
               } else {
-                logger.warn('[PreviewRun] Retry also failed', {
+                // ── LLM Diagnosis: deterministic retry failed, ask LLM what's blocking ──
+                const diagResult = await attemptLLMDiagnosisAndRetry({
+                  page: session.page,
+                  step,
+                  error: result.error || 'Step failed after retry',
                   previewSessionId,
-                  stepIndex: i,
-                  stepId: step.id,
-                  retryError: result.error,
+                  userId,
+                  stepWithCachePolicy,
+                  runStartTime: runState.startTime,
+                  cancelled: runState.cancelled,
                 });
+                if (diagResult.result) {
+                  result = diagResult.result;
+                }
               }
             } catch (retryError) {
               // Retry threw — fall through to original failure handling
@@ -725,13 +873,16 @@ export class PreviewRunService {
             // Lookahead wait: check next step readiness before executing it
             // Uses fast Playwright checks only (no AI/LLM)
             // ─────────────────────────────────────────────────────────────────
-            if (i < steps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
-              const nextStep = steps[i + 1];
+            if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+              const nextStep = stepsToExecute[i + 1];
               try {
                 const lookahead = await waitForStepReadiness(session.page, nextStep, {
-                  maxWaitMs: 3000,
-                  settleMs: 800,
-                  autoWaitThresholdMs: 600,
+                  maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                  settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                  autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                  prevActionType: step.type,
+                  prevUrl: trackedUrl,
+                  recordedDelayMs: nextStep.evidence?.interStepDelayMs,
                 });
 
                 if (lookahead.autoWaitApplied) {
@@ -742,6 +893,7 @@ export class PreviewRunService {
                     nextStepId: nextStep.id,
                     waitedMs: lookahead.waited,
                     ready: lookahead.ready,
+                    navigationDetected: lookahead.navigationDetected,
                   });
                 } else if (lookahead.skipReason) {
                   logger.debug('[PreviewRun] Lookahead skipped', {
@@ -751,12 +903,14 @@ export class PreviewRunService {
                   });
                 }
               } catch (lookaheadError) {
-                // Lookahead failure is non-fatal, log and continue
-                logger.warn('[PreviewRun] Lookahead wait failed, continuing', {
+                // Lookahead failure is non-fatal — apply condition-based DOM stability fallback
+                logger.warn('[PreviewRun] Lookahead wait failed, applying fallback DOM settle', {
                   previewSessionId,
                   nextStepIndex: i + 1,
                   error: lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError),
                 });
+                // MutationObserver-based: resolves when DOM stops mutating for 500ms, caps at 3s
+                await waitForDOMStability(session.page, 3000, 500).catch(() => {});
               }
             }
 
@@ -772,11 +926,11 @@ export class PreviewRunService {
               logger.info('[PreviewRun] Cancellation detected after step completion, skipping remaining steps', {
                 previewSessionId,
                 completedStep: i,
-                remainingSteps: steps.length - i - 1,
+                remainingSteps: stepsToExecute.length - i - 1,
               });
 
-              for (let j = i + 1; j < steps.length; j++) {
-                const remainingStep = steps[j];
+              for (let j = i + 1; j < stepsToExecute.length; j++) {
+                const remainingStep = stepsToExecute[j];
                 webSocketService.emitToUser(userId, 'preview:run:step', {
                   previewSessionId,
                   stepIndex: j,
@@ -842,11 +996,11 @@ export class PreviewRunService {
             logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
               previewSessionId,
               failedStep: i,
-              remainingSteps: steps.length - i - 1,
+              remainingSteps: stepsToExecute.length - i - 1,
             });
 
-            for (let j = i + 1; j < steps.length; j++) {
-              const remainingStep = steps[j];
+            for (let j = i + 1; j < stepsToExecute.length; j++) {
+              const remainingStep = stepsToExecute[j];
               webSocketService.emitToUser(userId, 'preview:run:step', {
                 previewSessionId,
                 stepIndex: j,
@@ -865,8 +1019,10 @@ export class PreviewRunService {
           let exceptionRetried = false;
 
           // ── Retry on exception (same logic as result.success === false) ──
+          const isExceptionNonRetryable = NO_RETRY_STEP_TYPES.has(step.type)
+            || (step.type === 'navigate' && !originalError.toLowerCase().includes('timeout'));
           if (
-            !NO_RETRY_STEP_TYPES.has(step.type) &&
+            !isExceptionNonRetryable &&
             !runState.cancelled &&
             !originalError.includes('session') &&
             !originalError.includes('expired')
@@ -941,20 +1097,80 @@ export class PreviewRunService {
                 }
 
                 // Lookahead before next step (same as main success path)
-                if (i < steps.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
-                  const nextStep = steps[i + 1];
+                if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+                  const nextStep = stepsToExecute[i + 1];
                   try {
                     await waitForStepReadiness(session.page, nextStep, {
-                      maxWaitMs: 3000,
-                      settleMs: 800,
-                      autoWaitThresholdMs: 600,
+                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                      settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                      autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                      prevActionType: step.type,
+                      prevUrl: trackedUrl,
+                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
                     });
                   } catch {
-                    // Lookahead failure is non-fatal
+                    // Lookahead failure is non-fatal — apply DOM stability fallback
+                    await waitForDOMStability(session.page, 3000, 500).catch(() => {});
                   }
                 }
 
                 continue; // Skip to next step — recovered!
+              } else {
+                // ── LLM Diagnosis on exception retry failure ──
+                const diagResult = await attemptLLMDiagnosisAndRetry({
+                  page: session.page,
+                  step,
+                  error: retryResult.error || originalError,
+                  previewSessionId,
+                  userId,
+                  stepWithCachePolicy,
+                  runStartTime: runState.startTime,
+                  cancelled: runState.cancelled,
+                });
+
+                if (diagResult.result?.success) {
+                  const finalResult = diagResult.result;
+
+                  traceWriter.write({
+                    iteration: i, stage: 'step_execution', eventType: 'step_result',
+                    spanId: traceWriter.generateSpanId(), parentSpanId: stepSpanId,
+                    payload: { stepIndex: i, stepId: step.id, status: 'pass',
+                      urlChanged: finalResult.urlChanged, url: finalResult.url, retried: true },
+                  });
+
+                  webSocketService.emitToUser(userId, 'preview:run:step', {
+                    previewSessionId, stepIndex: i, stepId: step.id, status: 'pass',
+                    action: step.type, description: step.description,
+                    timestamp: new Date().toISOString(),
+                    ...(finalResult.appliedStep ? { appliedStep: finalResult.appliedStep } : {}),
+                    retried: true,
+                  });
+                  passedSteps++;
+                  trackedUrl = session.page.url();
+                  if (step.type === 'navigate' || finalResult.urlChanged) {
+                    try { lastNavigationSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
+                  }
+                  if (finalResult.appliedStep) enrichedSteps.set(finalResult.appliedStep.id, finalResult.appliedStep);
+
+                  // Lookahead before next step (same as deterministic retry success path)
+                  if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+                    const nextStep = stepsToExecute[i + 1];
+                    try {
+                      await waitForStepReadiness(session.page, nextStep, {
+                        maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                        settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                        autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                        prevActionType: step.type,
+                        prevUrl: trackedUrl,
+                        recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                      });
+                    } catch {
+                      await waitForDOMStability(session.page, 3000, 500).catch(() => {});
+                    }
+                  }
+
+                  continue; // Recovered via LLM diagnosis!
+                }
               }
             } catch {
               // Retry also threw — fall through to original error handling
@@ -1004,8 +1220,8 @@ export class PreviewRunService {
           failedSteps++;
 
           // Stop and skip remaining
-          for (let j = i + 1; j < steps.length; j++) {
-            const remainingStep = steps[j];
+          for (let j = i + 1; j < stepsToExecute.length; j++) {
+            const remainingStep = stepsToExecute[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: j,
@@ -1023,6 +1239,9 @@ export class PreviewRunService {
     } finally {
       // Clear global timeout
       clearTimeout(globalTimeout);
+
+      // V13: Reset dialog mode back to passive
+      try { sessionService.setDialogMode(previewSessionId, userId, 'passive'); } catch { /* session may be gone */ }
 
       // 7. ALWAYS emit completed event — even if run failed before 'started' was emitted.
       //    This guarantees the frontend never stays stuck in 'running' state.
@@ -1155,8 +1374,8 @@ export class PreviewRunService {
           previewSessionId,
           traceType: intentTestCaseId ? 'preview_run' : 'draft_run',
           intentTestCaseId,
-        }).catch(() => {});
-      }).catch(() => {});
+        }).catch((err) => logger.error('[EDITOR_TRACE] Upload failed on preview run cleanup', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
+      }).catch((err) => logger.error('[EDITOR_TRACE] Import failed on preview run cleanup', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
 
       // 10. Cleanup run state
       activeRuns.delete(previewSessionId);

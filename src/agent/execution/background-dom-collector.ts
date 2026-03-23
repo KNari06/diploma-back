@@ -18,8 +18,8 @@ import type { Page } from 'playwright';
 /** Maximum interactive nodes to collect (default for exploration/intelligent mode) */
 const MAX_NODES_DEFAULT = 500;
 
-/** Reduced node limit for replay mode (saves memory) */
-export const MAX_NODES_REPLAY = 200;
+/** V14: Increased from 200→400 — complex dashboards/tables need more nodes for reliable resolution */
+export const MAX_NODES_REPLAY = 400;
 
 /** Attribute name for temporary refs */
 const TEMP_REF_ATTR = 'data-agent-ref';
@@ -130,12 +130,36 @@ function buildExtractScript(maxNodes: number): string {
     var computedStyle = framework ? null : window.getComputedStyle(el);
     var hasCursorPointer = computedStyle ? computedStyle.cursor === 'pointer' : false;
 
-    if (framework || hasCursorPointer) {
+    // Heuristic: short actionable text on a compact element = likely a custom button/link
+    // Catches <div class="btn">Submit</div> with addEventListener (no onclick attr, no framework binding)
+    var isLikelyButton = false;
+    if (!framework && !hasCursorPointer) {
+      var tag = el.tagName;
+      // Skip elements that are commonly non-interactive despite short text
+      if (tag !== 'LABEL' && tag !== 'P') {
+        var cls = el.className || '';
+        var isBadgeOrMeta = typeof cls === 'string' && (/badge|tag|chip|breadcrumb|pagination|caption|status|label(?!.*btn)/i.test(cls));
+        if (!isBadgeOrMeta) {
+          var text = (el.textContent || '').trim();
+          // Short text (2-25 chars), no child block elements, button-like size
+          if (text.length >= 2 && text.length <= 25 && !el.querySelector('div, p, ul, ol, table, section, article, header, footer, nav')) {
+            var btnRect = el.getBoundingClientRect();
+            // Button-like proportions: not too tall (< 60px), not too wide (< 300px), non-trivial
+            if (btnRect.width >= 24 && btnRect.height >= 24 && btnRect.height <= 60 && btnRect.width <= 300) {
+              isLikelyButton = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (framework || hasCursorPointer || isLikelyButton) {
       // Also require non-trivial size (at least 10x10px)
       var rect = el.getBoundingClientRect();
       if (rect.width >= 10 && rect.height >= 10) {
         elements.push(el);
         existingSet.add(el);
+        if (isLikelyButton) el.__qai_heuristic_button = true;
       }
     }
   }
@@ -405,6 +429,7 @@ function buildExtractScript(maxNodes: number): string {
       tabIndex: el.getAttribute('tabindex') !== null ? parseInt(el.getAttribute('tabindex'), 10) : undefined,
       hasOnclick: el.hasAttribute('onclick') || undefined,
       hasAriaHaspopup: el.hasAttribute('aria-haspopup') || undefined,
+      heuristicButton: el.__qai_heuristic_button || undefined,
     };
 
     results.push(node);

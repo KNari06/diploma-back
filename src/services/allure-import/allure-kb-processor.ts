@@ -73,19 +73,57 @@ async function preprocessDocContent(
 ): Promise<PreprocessResult> {
   const preview = rawContent.slice(0, AI_PREPROCESS_CHARS);
 
-  const systemPrompt = `You are a content preprocessor for a QA knowledge base.
-Clean the given file content for storage. Your task:
-1. Remove all HTML tags, scripts, CSS, and inline styles.
-2. Remove noise: ANSI escape codes, timestamps with PIDs, base64 blobs, minified JS/CSS.
-3. If it's a test log: summarise key events, assertions, and failures; discard repetitive stack frames.
-4. If it's an API response: extract endpoint name, status, schema, and any error fields.
-5. If it's a page snapshot: extract the visible text content and key UI labels.
-6. If there is virtually no useful content, set is_noise to true.
+  const systemPrompt = `You preprocess files from Allure test reports for a QA Knowledge Base (KB).
+The KB is used by QA engineers and AI agents to understand test patterns, debug failures, and learn about the tested application.
 
-Respond in this exact JSON format:
+## Your task
+Clean the file content so it's useful for future retrieval. The cleaned content will be chunked, embedded, and stored for semantic search.
+
+## Cleaning rules by category
+
+### test_log (console output, CI logs, pytest/JUnit output)
+- KEEP: assertion failures, error messages, failed test names, exception types, HTTP status codes
+- KEEP: timing info for slow tests (>5s)
+- REMOVE: repetitive "PASSED" lines (keep count: "47 tests passed")
+- REMOVE: ANSI escape codes (\\x1b[...), PID/thread prefixes, timestamps on every line
+- REMOVE: duplicate stack frames (keep first occurrence only)
+- SUMMARISE: if >20 similar pass entries → "X tests passed in module Y"
+
+### api_response (HTTP response bodies, HAR, OpenAPI)
+- KEEP: endpoint URL/path, HTTP method, status code, response schema/structure
+- KEEP: error response bodies in full
+- KEEP: authentication requirements, rate limit headers
+- REMOVE: large binary payloads, base64 images
+- For HAR files: extract unique endpoints + status codes, discard duplicate requests
+
+### page_snapshot (HTML captures)
+- EXTRACT: visible text content, form labels, button text, error messages, page title
+- REMOVE: all <script>, <style>, <svg>, <noscript> blocks
+- REMOVE: HTML boilerplate (doctype, meta, link tags)
+- KEEP: form structure (input names, types, placeholders) — useful for test creation
+
+### config (environment, properties, YAML)
+- KEEP: all key-value pairs as-is (they're already clean)
+- REMOVE: comments that are just separators (####, //--)
+- FORMAT: as "key: value" list, one per line
+
+### documentation (markdown, README, test plans)
+- KEEP: almost everything — this is already high-value content
+- REMOVE: table of contents if it's just link anchors
+- FIX: broken markdown formatting if obvious
+
+## Output rules
+- Output cleaned_content as PLAIN TEXT or MARKDOWN (not HTML)
+- Maximum 4000 chars for cleaned_content (truncate with "[...truncated]" if needed)
+- document_title: descriptive, specific, max 60 chars.
+  Good: "Login API — 401 error responses", "Checkout flow — form validation rules"
+  Bad: "Log file", "Response", "Test output"
+- Set is_noise=true ONLY if <30 chars of meaningful content remain after cleaning
+
+## Response format
 {
-  "cleaned_content": "<cleaned text>",
-  "document_title": "<short descriptive title, max 60 chars>",
+  "cleaned_content": "<cleaned text in markdown>",
+  "document_title": "<specific descriptive title, max 60 chars>",
   "is_noise": false
 }`;
 
@@ -105,12 +143,19 @@ Respond in this exact JSON format:
       },
     );
 
-    const raw = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '';
-    const parsed = JSON.parse(raw) as {
-      cleaned_content?: string;
-      document_title?: string;
-      is_noise?: boolean;
-    };
+    const raw = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '{}';
+
+    let parsed: { cleaned_content?: string; document_title?: string; is_noise?: boolean };
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      logger.warn('[AllureKBProcessor] AI response JSON parse failed (truncated?)', {
+        filename,
+        contentLength: raw.length,
+      });
+      // Fallback: use raw content as-is
+      return { cleanedContent: rawContent, documentTitle: filename, isNoise: false };
+    }
 
     return {
       cleanedContent: parsed.cleaned_content?.trim() ?? rawContent,
@@ -276,7 +321,7 @@ function resolveGroup(filename: string, aiCategory?: string): DocGroup {
   if (cat === 'test_log' || /\.log$/.test(lname)) return 'test_log';
   if (cat === 'api_response') return 'api_response';
   if (cat === 'page_snapshot') return 'page_snapshot';
-  if (lname === 'environment.properties' || lname === 'executor.json') return 'env_config';
+  if (cat === 'config' || lname.endsWith('.properties') || lname.endsWith('.yml') || lname.endsWith('.yaml')) return 'env_config';
   return 'documentation';
 }
 

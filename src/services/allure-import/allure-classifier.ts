@@ -29,15 +29,26 @@ const AI_PREVIEW_CHARS = 2000;
 /** Maximum files sent in one AI batch prompt (keeps prompt under 30K tokens). */
 const AI_BATCH_SIZE = 15;
 
-/** Screenshot image extensions. */
-const SCREENSHOT_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg']);
+/**
+ * Image extensions — always skipped (screenshots not imported).
+ * Allure supports: image/png, image/jpeg, image/gif, image/bmp, image/svg+xml, image/tiff.
+ */
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.tiff', '.tif']);
 
-/** Video extensions — always skipped. */
+/**
+ * Video extensions — always skipped.
+ * Common formats attached by Allure adapters.
+ */
 const VIDEO_EXTS = new Set(['.webm', '.mp4', '.ogg', '.avi', '.mov']);
 
-/** Text-based extensions that may contain valuable documentation. */
+/**
+ * Text-based extensions that may contain valuable documentation.
+ * Allure attaches these as step/test-level artifacts.
+ * Includes formats documented in Allure: text/csv, text/tab-separated-values,
+ * application/json, application/xml, application/yaml, text/plain, text/html.
+ */
 const TEXT_EXTS = new Set([
-  '.txt', '.log', '.html', '.json', '.xml', '.csv',
+  '.txt', '.log', '.html', '.json', '.xml', '.csv', '.tsv',
   '.har', '.yaml', '.yml', '.md', '.markdown',
 ]);
 
@@ -125,8 +136,8 @@ function classifyDeterministic(
     if (lowerPath.includes(pattern)) return 'structure';
   }
 
-  // ── Screenshots / images ─────────────────────────────────────────────
-  if (SCREENSHOT_EXTS.has(ext)) return 'screenshot';
+  // ── Images — always skip (screenshots not imported) ─────────────────
+  if (IMAGE_EXTS.has(ext)) return 'skip';
 
   // ── Test result JSON: filename must end with -result.json ─────────────
   if (lowerName.endsWith('-result.json')) {
@@ -155,7 +166,7 @@ function classifyDeterministic(
   // ── Attachment-named files (contain "-attachment." in the filename) ────
   // These are binary or text files explicitly attached to test steps.
   if (lowerName.includes('-attachment.')) {
-    if (SCREENSHOT_EXTS.has(ext)) return 'screenshot';
+    if (IMAGE_EXTS.has(ext)) return 'skip';
     if (VIDEO_EXTS.has(ext))      return 'video';
     if (TEXT_EXTS.has(ext))       return null; // send to AI — may be doc or noise
     // Unknown binary extension → skip
@@ -217,31 +228,46 @@ async function classifyBatchWithAI(
     })
     .join('\n\n');
 
-  const systemPrompt = `You are a file content classifier for a QA test management platform.
-You will receive a list of files extracted from an Allure test report archive.
-For each file, determine its content type and whether it should be saved to a Knowledge Base.
+  const systemPrompt = `You classify files extracted from an Allure test report ZIP archive.
+Allure is a popular test reporting framework (Java/Python/JS/C#). Its ZIP contains:
+- *-result.json / *-container.json (already handled — you will NOT see these)
+- Text attachments (logs, API responses, HTML snapshots, configs, docs)
+- Generated report UI files (noise — should be skipped)
 
-Respond with a JSON object in this exact format:
+You receive files that passed deterministic classification but are AMBIGUOUS.
+Your job: decide the category and whether the file is worth saving to our QA Knowledge Base.
+
+## Categories
+
+| Category | What it is | kb_worthy? |
+|---|---|---|
+| documentation | Human-written docs, test plans, README, markdown, wiki exports, changelogs | Usually YES |
+| test_log | Automated test output, console logs, CI runner output, assertion results, pytest/JUnit output | YES if contains failures, key events, or unique info. NO if repetitive pass logs |
+| api_response | HTTP response bodies, GraphQL responses, REST payloads, OpenAPI/Swagger specs, HAR files | YES if contains endpoint schemas, error responses. NO if just "200 OK" with empty body |
+| page_snapshot | HTML snapshots of web pages captured during tests (contains <html>, <body>, DOM) | YES only if contains meaningful UI content (forms, errors). NO if just boilerplate/nav |
+| config | Environment config, .properties, .yml/.yaml setup files, Docker/CI configs | YES if contains test env details. NO if generic/default config |
+| noise | Minified JS/CSS, empty/near-empty, binary-looking base64 blobs, repeated stack traces, generated Allure report UI assets | Always NO |
+
+## Rules
+1. When in doubt → noise (better to skip than pollute KB with junk)
+2. Files <50 chars of meaningful text → noise
+3. Minified code (single long line, no whitespace) → noise
+4. Allure report UI files (app.js, styles.css, widgets) → noise
+5. Stack traces repeated >3 times → noise (keep one occurrence → test_log)
+
+## Response format
+Respond with ONLY this JSON object:
 {
   "files": [
     {
-      "filename": "<exact filename>",
-      "category": "<one of: documentation | test_log | api_response | page_snapshot | config | noise>",
-      "kb_worthy": <true|false>,
-      "summary": "<one sentence description>"
+      "filename": "<exact filename from input>",
+      "category": "<documentation|test_log|api_response|page_snapshot|config|noise>",
+      "kb_worthy": true/false,
+      "summary": "<10 words max>"
     }
   ]
 }
-
-Category definitions:
-- documentation: human-written docs, test plans, README files, wiki exports, markdown
-- test_log: automated test output, console logs, CI runner output, assertion traces
-- api_response: HTTP response bodies, GraphQL responses, REST payloads, OpenAPI specs
-- page_snapshot: HTML snapshots of web pages captured during test execution
-- config: environment config, setup scripts, properties files, build configs
-- noise: repetitive/redundant content, near-empty files, binary-looking text, minified JS/CSS
-
-kb_worthy = true means the content adds real value to a QA knowledge base (not noise/duplicates).`;
+Return one entry per input file. The "filename" must match EXACTLY.`;
 
   const userPrompt = `Classify these ${files.length} files:\n\n${fileList}`;
 
@@ -259,8 +285,18 @@ kb_worthy = true means the content adds real value to a QA knowledge base (not n
       },
     );
 
-    const rawContent = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '';
-    const parsed: AIBatchResponse = JSON.parse(rawContent);
+    const rawContent = response.content?.replace(/```json\s*|```\s*/g, '').trim() ?? '{}';
+
+    let parsed: AIBatchResponse;
+    try {
+      parsed = JSON.parse(rawContent);
+    } catch {
+      logger.warn('[AllureClassifier] AI response JSON parse failed (truncated?)', {
+        filesCount: files.length,
+        contentLength: rawContent.length,
+      });
+      return results; // Return empty map — caller treats missing entries as 'skip'
+    }
 
     if (Array.isArray(parsed.files)) {
       for (const item of parsed.files) {

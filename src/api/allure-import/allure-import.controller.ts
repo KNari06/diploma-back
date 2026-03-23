@@ -138,7 +138,6 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       autoCreateFlows:    req.body.autoCreateFlows   !== 'false',
       deduplicateTests:   req.body.deduplicateTests  !== 'false',
       saveDocsToKB:       req.body.saveDocsToKB      !== 'false',
-      importScreenshots:  req.body.importScreenshots !== 'false',
     });
 
     const importId = randomUUID();
@@ -168,13 +167,14 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       };
 
       // No-op progress emitter for sync path (client polls or waits for response)
-      const stats = await processAllureImport(jobData, () => { /* no WS in sync */ });
+      const result = await processAllureImport(jobData, () => { /* no WS in sync */ });
 
       res.status(200).json({
         success: true,
         importId,
         async: false,
-        stats,
+        stats: result.stats,
+        hierarchy: result.hierarchy,
       });
       return;
     }

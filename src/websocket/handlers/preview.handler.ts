@@ -21,8 +21,6 @@ import {
     SocketData,
 } from '../types/types';
 import {
-    emitInputError,
-    emitInputSuccess,
     emitSnapshotAlways,
     emitSnapshotIfChanged,
     validateInputRequest,
@@ -44,10 +42,37 @@ const recordingTypingTimers = new Map<string, NodeJS.Timeout>();
 const RECORDING_TYPING_DEBOUNCE_MS = 1500;
 
 /** Per-session scroll debounce timers */
-const recordingScrollTimers = new Map<string, { deltaY: number; timer: NodeJS.Timeout }>();
+const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout }>();
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V14: Inter-step delay stamping for recording
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Emit a NEW recording step with inter-step delay stamping.
+ * Replaces direct `socket.nsp.to(room).emit('preview:recording:step', ...)` calls.
+ * Automatically computes and stamps interStepDelayMs on the step's evidence.
+ */
+function emitRecordingStep(
+  socket: TypedSocket,
+  room: string,
+  sessionService: ReturnType<typeof import('@/services/testing/ui/preview/preview-session.service').getPreviewSessionService>,
+  previewSessionId: string,
+  userId: string,
+  payload: { step: Record<string, any>; highlight?: any; timestamp?: string; previewSessionId?: string },
+): void {
+  try {
+    sessionService.stampInterStepDelay(previewSessionId, userId, payload.step);
+  } catch { /* non-critical — don't break recording */ }
+  socket.nsp.to(room).emit('preview:recording:step', {
+    previewSessionId,
+    ...payload,
+    timestamp: payload.timestamp || new Date().toISOString(),
+  } as any);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V7: Video + DevTools streaming registry
@@ -1140,28 +1165,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   // V5: Interactive preview control handlers
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // Handle mouse move (hover)
+  // Handle mouse move (hover) — fire-and-forget, no error/success emitted to client.
+  // Hover is a passive, high-frequency event; emitting errors would spam the UI with
+  // "Preview action failed (move)" toasts that are meaningless to the user.
   socket.on('preview:mouse:move', async (data) => {
     try {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'mouse')) {
-        emitInputError(socket, data.previewSessionId || '', 'move', 'Mouse rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'mouse')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'move', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
       const { x, y } = data;
-      if (x === undefined || y === undefined) {
-        emitInputError(socket, previewSessionId, 'move', 'Missing x or y coordinates');
-        return;
-      }
+      if (x === undefined || y === undefined) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1175,18 +1193,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'move');
-
         // V11: Track last hover position for recording (used to emit hover step before click)
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, {
             x, y, timestamp: Date.now(),
           });
         }
-      } else {
-        emitInputError(socket, previewSessionId, 'move', result.error || 'Move failed');
       }
-      // No snapshot for hover
+      // No snapshot, no error emit for hover
     } catch (error) {
       logger.error('[WebSocket] Error in preview:mouse:move', {
         socketId: socket.id,
@@ -1201,22 +1215,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'mouse')) {
-        emitInputError(socket, data.previewSessionId || '', 'click', 'Mouse rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'mouse')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'click', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
-      const { x, y, button, clickCount } = data;
-      if (x === undefined || y === undefined) {
-        emitInputError(socket, previewSessionId, 'click', 'Missing x or y coordinates');
-        return;
-      }
+      const { x, y, button, clickCount, modifiers } = data;
+      if (x === undefined || y === undefined) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1249,7 +1254,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'click');
         if (result.needsSnapshot) {
           // Always emit snapshot after click so user always sees visual feedback
           setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
@@ -1261,6 +1265,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // V9: Recording hook (non-blocking)
         if (isRecording && preClickElement) {
+          // V14: Warn user if click was inside a cross-origin iframe (cannot be recorded)
+          if (preClickElement.crossOriginIframe) {
+            const room = createRoomName('preview', previewSessionId);
+            socket.nsp.to(room).emit('preview:recording:warning' as any, {
+              previewSessionId,
+              type: 'cross_origin_iframe',
+              message: 'This element is inside a cross-origin iframe and cannot be recorded. Payment forms, OAuth widgets, and third-party embeds are not yet supported.',
+              iframeSelector: preClickElement.iframeSelector,
+              timestamp: new Date().toISOString(),
+            });
+            return; // Don't try to create a step from cross-origin element
+          }
           setImmediate(async () => {
             try {
               const { RecordingCaptureService } = await import(
@@ -1293,9 +1309,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 } else {
                   const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
                   if (typingStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
                     if (cTrace) cTrace.writeStepCaptured(typingStep, 'type_flush_on_click');
                   }
                 }
@@ -1306,23 +1320,32 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
               }
 
-              // V11: Emit hover step before click if user hovered a different element (dropdown/menu pattern)
+              // V15: Emit hover step before click only if user dwelled on a genuinely different interactive element.
+              // Fixes: V11 had hoverOnDifferentElement always true (ref never stored) → mass false positives.
+              // Now: 400ms minimum dwell + structural comparison (tag + boundingBox) of resolved targets.
               const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
-              if (lastHover && preClickElement!.ref) {
+              if (lastHover && preClickElement) {
                 const timeSinceHover = Date.now() - lastHover.timestamp;
-                const hoverOnDifferentElement = !lastHover.ref || lastHover.ref !== preClickElement!.ref;
-                if (hoverOnDifferentElement && timeSinceHover > 200 && timeSinceHover < 5000) {
-                  // Probe the hover target to get element info
+                // V15: Raised minimum dwell from 200ms to 400ms — real dropdown hovers require intentional pause
+                if (timeSinceHover > 400 && timeSinceHover < 5000) {
                   try {
                     const page = sessionService.getPage(previewSessionId, ensuredUserId);
                     if (page) {
                       const hoverElement = await RecordingCaptureService.probeForRecording(page, lastHover.x, lastHover.y);
-                      if (hoverElement && hoverElement.ref !== preClickElement!.ref) {
-                        const hoverStep = RecordingCaptureService.captureHover(hoverElement);
-                        socket.nsp.to(room).emit('preview:recording:step', {
-                          previewSessionId, step: hoverStep, timestamp: new Date().toISOString(),
-                        });
-                        if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                      if (hoverElement) {
+                        // V15: Compare resolved interactive targets structurally.
+                        // data-agent-ref is NOT injected during recording, so we compare by
+                        // boundingBox (position+size) which uniquely identifies elements on page.
+                        const hBB = hoverElement.boundingBox;
+                        const cBB = preClickElement.boundingBox;
+                        const isSameElement = hBB && cBB
+                          && hBB.x === cBB.x && hBB.y === cBB.y
+                          && hBB.width === cBB.width && hBB.height === cBB.height;
+                        if (!isSameElement) {
+                          const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
+                          emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
+                          if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                        }
                       }
                     }
                   } catch {
@@ -1332,6 +1355,22 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               }
               sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
 
+              // V15: LLM fallback — if probe couldn't find interactive element (directHit/cssClass),
+              // ask LLM to pick the correct ancestor from the chain.
+              // This runs async but BEFORE we build the step, so the step gets correct element data.
+              if (preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass') {
+                try {
+                  const llmPage = sessionService.getPage(previewSessionId, ensuredUserId);
+                  if (llmPage) {
+                    preClickElement = await RecordingCaptureService.resolveInteractiveTarget(
+                      llmPage, preClickElement!, x, y,
+                    );
+                  }
+                } catch {
+                  // Non-critical — use original probe result
+                }
+              }
+
               // V10: Pass button and clickCount to inferClickActionType for dblclick/right-click support
               const safeButton = (data.button === 'right' || data.button === 'middle') ? data.button : 'left';
               const safeClickCount = (data.clickCount === 2) ? 2 : 1;
@@ -1340,44 +1379,69 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const bindingHints = RecordingCaptureService.buildBindingHints(preClickElement!);
 
               const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
+
+              // V13: Capture modifier keys for multi-select (Shift+Click, Ctrl+Click, etc.)
+              const hasModifiers = modifiers && (modifiers.shift || modifiers.ctrl || modifiers.meta || modifiers.alt);
+              // V13: Capture iframe context for replay (auto-detected from probing)
+              const iframeSel = preClickElement!.iframeSelector;
+
               const step: PreviewIntentStep = {
                 id: `rec_${Date.now().toString(36)}`,
                 type: actionType,
                 description,
                 bindingHints: Object.keys(bindingHints).length > 0 ? bindingHints : undefined,
+                options: {
+                  ...(hasModifiers && {
+                    modifiers: {
+                      ...(modifiers.shift && { shift: true }),
+                      ...(modifiers.ctrl && { ctrl: true }),
+                      ...(modifiers.meta && { meta: true }),
+                      ...(modifiers.alt && { alt: true }),
+                    },
+                  }),
+                  ...(iframeSel && { iframe: { selector: iframeSel } }),
+                },
                 evidence: preClickElement!.ref ? {
                   lastSuccessRef: preClickElement!.ref,
                   confidence: 1.0,
                   pageUrl: currentPage?.url(),
                 } : undefined,
               };
+              // Clean up empty options
+              if (step.options && Object.keys(step.options).length === 0) {
+                delete step.options;
+              }
 
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId,
-                step,
-                highlight: preClickElement?.boundingBox,
-                timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
               if (cTrace) cTrace.writeStepCaptured(step, 'click');
 
-              // Check for navigation (wait a bit for page to settle)
-              const page = sessionService.getPage(previewSessionId, ensuredUserId);
-              if (page) {
-                await page.waitForLoadState('domcontentloaded', { timeout: 500 }).catch(() => {});
-                const currentUrl = page.url();
+              // V13: Smart navigation detection — condition-based polling instead of fixed 500ms
+              // Wait for domcontentloaded first, then poll URL for up to 2s (SPA redirects can be delayed)
+              const navPage = sessionService.getPage(previewSessionId, ensuredUserId);
+              if (navPage) {
+                await navPage.waitForLoadState('domcontentloaded', { timeout: 500 }).catch(() => {});
+                let currentUrl = navPage.url();
                 const prevUrl = sessionService.getRecordingLastUrl(previewSessionId, ensuredUserId);
+
+                // Smart poll: if URL hasn't changed yet, give SPA routers up to 2s to push new URL
+                // Exits immediately once URL changes — no wasted time on fast navigations
+                if (prevUrl && currentUrl === prevUrl) {
+                  const deadline = Date.now() + 2000;
+                  while (Date.now() < deadline) {
+                    await new Promise(r => setTimeout(r, 100));
+                    currentUrl = navPage.url();
+                    if (currentUrl !== prevUrl) break;
+                  }
+                }
+
                 if (prevUrl && currentUrl !== prevUrl) {
                   if (cTrace) cTrace.writeNavDetected({ fromUrl: prevUrl, toUrl: currentUrl });
                   const navStep = RecordingCaptureService.captureNavigation(currentUrl, prevUrl);
                   if (navStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId,
-                      step: navStep,
-                      timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: navStep });
                     if (cTrace) cTrace.writeStepCaptured(navStep, 'nav_after_click');
                   }
                   sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, currentUrl);
@@ -1391,7 +1455,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
       } else {
-        emitInputError(socket, previewSessionId, 'click', result.error || 'Click failed');
         const clickErrTrace = EditorTraceService.get(previewSessionId);
         if (clickErrTrace) clickErrTrace.writeError('click_failed', { x, y, button, error: result.error });
       }
@@ -1409,22 +1472,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'mouse')) {
-        emitInputError(socket, data.previewSessionId || '', 'down', 'Mouse rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'mouse')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'down', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
       const { x, y, button } = data;
-      if (x === undefined || y === undefined) {
-        emitInputError(socket, previewSessionId, 'down', 'Missing x or y coordinates');
-        return;
-      }
+      if (x === undefined || y === undefined) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1439,8 +1493,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'down');
-
         // Editor trace: log mouse down
         const downTrace = EditorTraceService.get(previewSessionId);
         if (downTrace) downTrace.writeMouseDown({ x, y, button });
@@ -1461,6 +1513,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 startY: y,
                 startElement,
                 startedAt: Date.now(),
+                viewport: page?.viewportSize() || undefined,
               });
             } catch (e) {
               logger.debug('[RECORDING] Drag start capture failed', {
@@ -1470,7 +1523,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
       } else {
-        emitInputError(socket, previewSessionId, 'down', result.error || 'Mouse down failed');
         const downErrTrace = EditorTraceService.get(previewSessionId);
         if (downErrTrace) downErrTrace.writeError('mouse_down_failed', { x, y, error: result.error });
       }
@@ -1488,22 +1540,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'mouse')) {
-        emitInputError(socket, data.previewSessionId || '', 'up', 'Mouse rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'mouse')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'up', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
       const { x, y, button } = data;
-      if (x === undefined || y === undefined) {
-        emitInputError(socket, previewSessionId, 'up', 'Missing x or y coordinates');
-        return;
-      }
+      if (x === undefined || y === undefined) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1518,7 +1561,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'up');
         if (result.needsSnapshot) {
           // Always emit snapshot after mouse up (drag end) so user sees visual feedback
           setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
@@ -1553,15 +1595,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 x,
                 y,
                 endElement,
+                page?.url(),
               );
 
               if (dragStep) {
                 const room = createRoomName('preview', previewSessionId);
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId,
-                  step: dragStep,
-                  timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: dragStep });
                 // Editor trace: log drag-drop step
                 const ddTrace = EditorTraceService.get(previewSessionId);
                 if (ddTrace) {
@@ -1581,7 +1620,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
       } else {
-        emitInputError(socket, previewSessionId, 'up', result.error || 'Mouse up failed');
         const upErrTrace = EditorTraceService.get(previewSessionId);
         if (upErrTrace) upErrTrace.writeError('mouse_up_failed', { x, y, error: result.error });
       }
@@ -1593,28 +1631,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
-  // Handle mouse wheel (scroll)
+  // Handle mouse wheel (scroll) — fire-and-forget for validation errors.
+  // Scroll is high-frequency; emitting errors would spam the UI with toasts.
   socket.on('preview:mouse:wheel', async (data) => {
     try {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'mouse')) {
-        emitInputError(socket, data.previewSessionId || '', 'wheel', 'Mouse rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'mouse')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'wheel', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
       const { deltaX, deltaY } = data;
-      if (deltaX === undefined || deltaY === undefined) {
-        emitInputError(socket, previewSessionId, 'wheel', 'Missing deltaX or deltaY');
-        return;
-      }
+      if (deltaX === undefined || deltaY === undefined) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1627,7 +1657,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'wheel');
         // Scroll may reveal lazy-loaded content – always emit for visual feedback
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
 
@@ -1640,21 +1669,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           const existing = recordingScrollTimers.get(previewSessionId);
           const accumulatedDeltaY = (existing?.deltaY ?? 0) + (data.deltaY ?? 0);
+          // V14: Track horizontal scroll
+          const accumulatedDeltaX = (existing?.deltaX ?? 0) + (data.deltaX ?? 0);
           if (existing) clearTimeout(existing.timer);
 
           recordingScrollTimers.set(previewSessionId, {
             deltaY: accumulatedDeltaY,
+            deltaX: accumulatedDeltaX,
             timer: setTimeout(async () => {
               try {
-                const finalDeltaY = recordingScrollTimers.get(previewSessionId)?.deltaY ?? accumulatedDeltaY;
+                const scrollState = recordingScrollTimers.get(previewSessionId);
+                const finalDeltaY = scrollState?.deltaY ?? accumulatedDeltaY;
+                const finalDeltaX = scrollState?.deltaX ?? accumulatedDeltaX;
                 recordingScrollTimers.delete(previewSessionId);
-                if (finalDeltaY === 0) return;
+                if (finalDeltaY === 0 && finalDeltaX === 0) return;
 
                 const { RecordingCaptureService } = await import(
                   '@/services/testing/ui/preview/recording-capture.service'
                 );
                 const room = createRoomName('preview', previewSessionId);
                 const sTrace = EditorTraceService.get(previewSessionId);
+
+                // V13: Capture page URL for evidence (used by auto-wait injection)
+                const scrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
+                const scrollPageUrl = scrollPage?.url();
+
+                // V15: Guard against scroll before page load (race condition)
+                if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
+
+                // V15: Probe scroll target — find meaningful element near viewport center
+                // so replay can use scrollIntoView instead of absolute pixels
+                let scrollTargetHints: import('@/services/testing/ui/preview/preview.types').BindingHints | null = null;
+                if (scrollPage) {
+                  try {
+                    scrollTargetHints = await RecordingCaptureService.probeScrollTarget(scrollPage);
+                  } catch { /* non-critical */ }
+                }
 
                 // V10: Merge with previous scroll step if emitted recently (within 3s)
                 const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, ensuredUserId);
@@ -1664,7 +1714,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (withinMergeWindow && lastScrollStep) {
                   // Same direction or continuation — merge deltas
                   const mergedDelta = lastScrollStep.totalDelta + finalDeltaY;
-                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta);
+                  const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + finalDeltaX;
+                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined);
                   if (scrollStep) {
                     scrollStep.id = lastScrollStep.id; // Reuse original step id
                     socket.nsp.to(room).emit('preview:recording:step:update', {
@@ -1674,20 +1725,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, {
                       id: lastScrollStep.id,
                       totalDelta: mergedDelta,
+                      totalDeltaX: mergedDeltaX,
                       emittedAt: now,
                     });
                   }
                 } else {
                   // New scroll sequence — emit new step
-                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY);
+                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl, finalDeltaX, scrollTargetHints ?? undefined);
                   if (scrollStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
                     if (sTrace) sTrace.writeStepCaptured(scrollStep, 'scroll');
                     sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, {
                       id: scrollStep.id,
                       totalDelta: finalDeltaY,
+                      totalDeltaX: finalDeltaX,
                       emittedAt: now,
                     });
                   }
@@ -1701,7 +1752,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
       } else {
-        emitInputError(socket, previewSessionId, 'wheel', result.error || 'Wheel failed');
+        // Silent — no error emit for scroll; trace only
         const wheelErrTrace = EditorTraceService.get(previewSessionId);
         if (wheelErrTrace) wheelErrTrace.writeError('wheel_failed', { deltaX, deltaY, error: result.error });
       }
@@ -1719,22 +1770,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'keyboard')) {
-        emitInputError(socket, data.previewSessionId || '', 'type', 'Keyboard rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'keyboard')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'type', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
       const { text } = data;
-      if (!text) {
-        emitInputError(socket, previewSessionId, 'type', 'Missing text');
-        return;
-      }
+      if (!text) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1746,7 +1788,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'type');
         setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
 
         // Editor trace: log type input
@@ -1760,6 +1801,33 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const { RecordingCaptureService } = await import(
                 '@/services/testing/ui/preview/recording-capture.service'
               );
+
+              // V13: Check if this typing is from a paste (Ctrl+V/Cmd+V detected in keyboard:press)
+              const isPaste = sessionService.isRecordingPendingPaste(previewSessionId, ensuredUserId);
+              if (isPaste) {
+                sessionService.setRecordingPendingPaste(previewSessionId, ensuredUserId, false);
+
+                // Immediately emit paste step — no debounce, no merge with regular typing
+                const page = sessionService.getPage(previewSessionId, ensuredUserId);
+                const focusedEl = page ? await RecordingCaptureService.probeFocusedElement(page) : null;
+                const label = RecordingCaptureService.getElementLabel(focusedEl);
+                const pasteStep: PreviewIntentStep = {
+                  id: `rec_${require('crypto').randomUUID().slice(0, 8)}`,
+                  type: 'type',
+                  description: `Paste '${data.text.slice(0, 40)}' in '${label}'`,
+                  value: data.text,
+                  bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
+                  options: { isPaste: true },
+                  ...(focusedEl?.ref && {
+                    evidence: { lastSuccessRef: focusedEl.ref, confidence: 1.0, pageUrl: page?.url() },
+                  }),
+                };
+                const room = createRoomName('preview', previewSessionId);
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pasteStep });
+                const ptTrace = EditorTraceService.get(previewSessionId);
+                if (ptTrace) ptTrace.writeStepCaptured(pasteStep, 'paste');
+                return; // Don't accumulate paste into typing buffer
+              }
 
               let buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
 
@@ -1775,6 +1843,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
                   isMultiline: focusedEl?.isMultiline,
                   pageUrl: page?.url(),
+                  iframeSelector: focusedEl?.iframeSelector, // V13: iframe context for replay
                 };
               } else {
                 buffer.text += data.text;
@@ -1823,9 +1892,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       // New element or first type — emit new step
                       const step = RecordingCaptureService.flushTypingBuffer(currentBuffer);
                       if (step) {
-                        socket.nsp.to(room).emit('preview:recording:step', {
-                          previewSessionId, step, timestamp: new Date().toISOString(),
-                        });
+                        emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
                         if (tTrace) tTrace.writeStepCaptured(step, 'type');
                         sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, {
                           id: step.id,
@@ -1852,7 +1919,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
       } else {
-        emitInputError(socket, previewSessionId, 'type', result.error || 'Type failed');
         const typeErrTrace = EditorTraceService.get(previewSessionId);
         if (typeErrTrace) typeErrTrace.writeError('type_failed', { text: data.text, error: result.error });
       }
@@ -1870,22 +1936,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const ensuredUserId = requireUser();
       if (!ensuredUserId) return;
 
-      if (!checkRateLimit(socket.id, 'keyboard')) {
-        emitInputError(socket, data.previewSessionId || '', 'press', 'Keyboard rate limit exceeded');
-        return;
-      }
+      if (!checkRateLimit(socket.id, 'keyboard')) return;
 
       const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
-      if (!previewSessionId) {
-        emitInputError(socket, data.previewSessionId || '', 'press', 'Invalid previewSessionId');
-        return;
-      }
+      if (!previewSessionId) return;
 
       const { key, modifiers } = data;
-      if (!key) {
-        emitInputError(socket, previewSessionId, 'press', 'Missing key');
-        return;
-      }
+      if (!key) return;
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -1898,7 +1955,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result.success) {
-        emitInputSuccess(socket, previewSessionId, 'press');
         setImmediate(() => emitSnapshotIfChanged(socket, previewSessionId, ensuredUserId));
 
         // Editor trace: log press input
@@ -1916,6 +1972,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               );
               const room = createRoomName('preview', previewSessionId);
               const pTrace = EditorTraceService.get(previewSessionId);
+
+              // V13: Detect paste (Ctrl+V / Cmd+V) — set flag so next keyboard:type marks step as isPaste
+              const isPasteShortcut = data.key?.toLowerCase() === 'v'
+                && data.modifiers
+                && (data.modifiers.includes('Control') || data.modifiers.includes('Meta'))
+                && !data.modifiers.includes('Shift'); // Shift+Ctrl+V is "paste as plain text" — handled separately if needed
+              if (isPasteShortcut) {
+                // Flush any existing typing buffer before paste (different input method)
+                const existingBuffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+                if (existingBuffer) {
+                  const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
+                  const sameElement = lastTypeStep && existingBuffer.elementRef && lastTypeStep.elementRef === existingBuffer.elementRef;
+                  if (sameElement && lastTypeStep) {
+                    const mergedValue = lastTypeStep.value + existingBuffer.text;
+                    const mergedStep = RecordingCaptureService.flushTypingBuffer({ ...existingBuffer, text: mergedValue });
+                    if (mergedStep) {
+                      mergedStep.id = lastTypeStep.id;
+                      socket.nsp.to(room).emit('preview:recording:step:update', {
+                        previewSessionId, step: mergedStep, timestamp: new Date().toISOString(),
+                      });
+                    }
+                  } else {
+                    const step = RecordingCaptureService.flushTypingBuffer(existingBuffer);
+                    if (step) {
+                      emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
+                    }
+                  }
+                  sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                  sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
+                  const timer = recordingTypingTimers.get(previewSessionId);
+                  if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+                }
+
+                sessionService.setRecordingPendingPaste(previewSessionId, ensuredUserId, true);
+                return; // Don't emit press step for Ctrl+V
+              }
 
               const isEnterKey = data.key === 'Enter';
               let mergedEnterIntoType = false;
@@ -1966,9 +2058,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                         } else {
                           const step = RecordingCaptureService.flushTypingBuffer(currentBuffer);
                           if (step) {
-                            socket.nsp.to(room).emit('preview:recording:step', {
-                              previewSessionId, step, timestamp: new Date().toISOString(),
-                            });
+                            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
                             if (pTrace) pTrace.writeStepCaptured(step, 'multiline_type');
                             sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, {
                               id: step.id,
@@ -2090,9 +2180,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       isEnterKey,
                     );
                     if (typingStep) {
-                      socket.nsp.to(room).emit('preview:recording:step', {
-                        previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                      });
+                      emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
                       if (pTrace) pTrace.writeStepCaptured(typingStep, isEnterKey ? 'type_enter' : 'type_flush');
                       if (isEnterKey) mergedEnterIntoType = true;
                     }
@@ -2111,9 +2199,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               if (!mergedEnterIntoType) {
                 const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
                 if (pressStep) {
-                  socket.nsp.to(room).emit('preview:recording:step', {
-                    previewSessionId, step: pressStep, timestamp: new Date().toISOString(),
-                  });
+                  emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pressStep });
                   if (pTrace) pTrace.writeStepCaptured(pressStep, 'press');
                 }
               }
@@ -2125,7 +2211,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
       } else {
-        emitInputError(socket, previewSessionId, 'press', result.error || 'Press failed');
+        // Silent — no error emit for press; trace only
         const pressErrTrace = EditorTraceService.get(previewSessionId);
         if (pressErrTrace) pressErrTrace.writeError('press_failed', { key, error: result.error });
       }
@@ -2217,6 +2303,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       logger.info('[WebSocket] Preview refresh requested', { previewSessionId, userId: ensuredUserId });
 
+      // Block page actions during active run — prevents race conditions with step execution
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'refresh', false, 'Cannot refresh while test is running');
+        return;
+      }
+
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
@@ -2266,9 +2359,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 } else {
                   const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
                   if (typingStep) {
-                    socket.nsp.to(room).emit('preview:recording:step', {
-                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                    });
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
                   }
                 }
                 sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
@@ -2286,9 +2377,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   description: 'Refresh page',
                   value: page.url(),
                 };
-                socket.nsp.to(room).emit('preview:recording:step', {
-                  previewSessionId, step: refreshStep, timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: refreshStep });
 
                 // Update URL baseline (URL may change after redirect)
                 sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
@@ -2327,6 +2416,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       logger.info('[WebSocket] Preview goBack requested', { previewSessionId, userId: ensuredUserId });
 
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'back', false, 'Cannot navigate while test is running');
+        return;
+      }
+
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
@@ -2358,9 +2453,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               description: 'Navigate back',
               value: page.url(),
             };
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
             sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
           }
         }
@@ -2390,6 +2483,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (!previewSessionId) return;
 
       logger.info('[WebSocket] Preview goForward requested', { previewSessionId, userId: ensuredUserId });
+
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'forward', false, 'Cannot navigate while test is running');
+        return;
+      }
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
@@ -2421,9 +2520,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               description: 'Navigate forward',
               value: page.url(),
             };
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
             sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
           }
         }
@@ -2458,6 +2555,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       logger.info('[WebSocket] Preview reset requested', { previewSessionId, userId: ensuredUserId });
 
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitPageActionResult(socket, previewSessionId, 'reset', false, 'Cannot reset while test is running');
+        return;
+      }
+
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
@@ -2473,9 +2576,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
           if (typingStep) {
             const room = createRoomName('preview', previewSessionId);
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
           }
         }
       }
@@ -2545,8 +2646,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (resetTrace) {
             resetTrace.writeRecordingStop('user');
             EditorTraceService.close(previewSessionId).then((meta) => {
-              if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
-            }).catch(() => {});
+              if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' })
+                .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on page reset', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
+            }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on page reset', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
           }
 
           logger.info('[RECORDING] Stopped due to page reset', { previewSessionId, userId: ensuredUserId });
@@ -2905,9 +3007,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           } else {
             const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
             if (typingStep) {
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: typingStep });
               if (rsTrace) rsTrace.writeStepCaptured(typingStep, 'type_flush_on_run_start');
             }
           }
@@ -2956,8 +3056,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         if (runStopTrace) {
           runStopTrace.writeRecordingStop('user');
           EditorTraceService.close(previewSessionId).then((meta) => {
-            if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor', intentTestCaseId });
-          }).catch(() => {});
+            if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor', intentTestCaseId })
+              .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on run:start', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
+          }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on run:start', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
         }
         logger.info('[RECORDING] Stopped due to run:start', { previewSessionId, userId });
       }
@@ -3082,8 +3183,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       sessionService.setRecording(previewSessionId, ensuredUserId, true);
 
+      // V13: Switch dialog handler to recording mode (emit to frontend, wait for user response)
+      sessionService.setDialogMode(previewSessionId, ensuredUserId, 'recording');
+
       // Set the current URL as baseline for navigation detection
       const page = sessionService.getPage(previewSessionId, ensuredUserId);
+
+      // V13: Save actual page URL at recording start (used as fallback startUrl for Apply All)
+      if (page) {
+        sessionService.setRecordingStartUrl(previewSessionId, ensuredUserId, page.url());
+      }
 
       // Editor trace: create writer and log recording start
       const recStartTrace = EditorTraceService.getOrCreate(previewSessionId, ensuredUserId);
@@ -3101,22 +3210,25 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const SELECT_CB_NAME = '__qai_select_change';
 
           // Expose callback function (ignore if already exposed)
-          await page.exposeFunction(SELECT_CB_NAME, (changeData: { label: string; text: string; value: string }) => {
+          await page.exposeFunction(SELECT_CB_NAME, (changeData: { label: string; text: string; value: string; name?: string; id?: string; ariaLabel?: string; role?: string }) => {
             try {
               // Guard: only emit if still recording
               if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
 
+              // V13: Capture page URL for evidence (page accessible from closure)
+              const selectPageUrl = page.url();
               const step = RecordingCaptureService.captureSelectChange({
                 label: changeData.label,
                 selectedText: changeData.text,
                 selectedValue: changeData.value,
+                pageUrl: selectPageUrl,
+                name: changeData.name,
+                id: changeData.id,
+                ariaLabel: changeData.ariaLabel,
+                role: changeData.role,
               });
               const room = createRoomName('preview', previewSessionId);
-              socket.nsp.to(room).emit('preview:recording:step', {
-                previewSessionId,
-                step,
-                timestamp: new Date().toISOString(),
-              });
+              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
               // Editor trace: log select change
               const selTrace = EditorTraceService.get(previewSessionId);
               if (selTrace) {
@@ -3147,6 +3259,66 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           page.on('load', reInjectHandler);
           // Store cleanup reference (removed on recording:stop)
           (page as any).__qai_recording_load_handler = reInjectHandler;
+        // V13: Inject autofill detection listener
+          // Monitors 'change' events on input fields that weren't caused by keyboard typing.
+          // Autofill typically fires 'change' without prior 'input' events from user keystrokes.
+          const AUTOFILL_CB_NAME = '__qai_autofill_change';
+          await page.exposeFunction(AUTOFILL_CB_NAME, (data: {
+            tag: string;
+            type: string;
+            name: string;
+            id: string;
+            ariaLabel: string;
+            label: string;
+            value: string;
+            ref: string;
+          }) => {
+            try {
+              if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
+              if (!data.value) return;
+
+              // Skip if there's an active typing buffer for this element (user is typing, not autofill)
+              const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
+              if (buffer && buffer.elementRef === data.ref) return;
+
+              const autoPage = sessionService.getPage(previewSessionId, ensuredUserId);
+              const step: PreviewIntentStep = {
+                id: `rec_${Date.now().toString(36)}`,
+                type: 'type',
+                description: `Autofill '${data.value.slice(0, 40)}' in '${data.label || data.name || data.ariaLabel || data.tag}'`,
+                value: data.value,
+                bindingHints: {
+                  ...(data.label && { label: data.label }),
+                  ...(data.ariaLabel && { nearText: data.ariaLabel }),
+                  ...(data.name && { autocomplete: data.name }),
+                  ...(data.type && { type: data.type }),
+                },
+                evidence: {
+                  ...(data.ref && { lastSuccessRef: data.ref }),
+                  confidence: 1.0,
+                  pageUrl: autoPage?.url(),
+                },
+              };
+
+              const room = createRoomName('preview', previewSessionId);
+              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
+              const afTrace = EditorTraceService.get(previewSessionId);
+              if (afTrace) afTrace.writeStepCaptured(step, 'autofill');
+            } catch { /* non-critical */ }
+          }).catch(() => { /* already exposed — OK */ });
+
+          await RecordingCaptureService.injectAutofillListener(page, AUTOFILL_CB_NAME);
+
+          // Re-inject on navigation
+          const reInjectAutofill = async () => {
+            try {
+              if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+                await RecordingCaptureService.injectAutofillListener(page, AUTOFILL_CB_NAME);
+              }
+            } catch { /* page may be closing */ }
+          };
+          page.on('load', reInjectAutofill);
+          (page as any).__qai_recording_autofill_handler = reInjectAutofill;
         } catch (e) {
           logger.debug('[RECORDING] Select listener injection failed (non-critical)', {
             error: e instanceof Error ? e.message : String(e),
@@ -3189,14 +3361,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
               // Record confirmed upload interaction.
               // Actual file path will be configured by user in step editor.
-              const uploadStep = RecCapSvc.captureFileUpload(['(file)'], probedEl);
+              const uploadStep = RecCapSvc.captureFileUpload(['(file)'], probedEl, page.url());
               if (uploadStep) {
                 const recordRoom = createRoomName('preview', previewSessionId);
-                socket.nsp.to(recordRoom).emit('preview:recording:step', {
-                  previewSessionId,
-                  step: uploadStep,
-                  timestamp: new Date().toISOString(),
-                });
+                emitRecordingStep(socket, recordRoom, sessionService, previewSessionId, ensuredUserId, { step: uploadStep });
                 // Editor trace: log file upload
                 const fuTrace = EditorTraceService.get(previewSessionId);
                 if (fuTrace) {
@@ -3276,9 +3444,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         } else {
           const step = RecordingCaptureService.flushTypingBuffer(buffer);
           if (step) {
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
             if (stopTrace) stopTrace.writeStepCaptured(step, 'type_flush_on_stop');
           }
         }
@@ -3302,12 +3468,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const { RecordingCaptureService: RecCapSvcScroll } = await import(
           '@/services/testing/ui/preview/recording-capture.service'
         );
+        // V13: Capture page URL for evidence
+        const stopScrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
+        const stopScrollPageUrl = stopScrollPage?.url();
+
         const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, ensuredUserId);
         const withinMergeWindow = lastScrollStep && (Date.now() - lastScrollStep.emittedAt) < RECORDING_SCROLL_MERGE_WINDOW_MS;
 
         if (withinMergeWindow && lastScrollStep) {
           const mergedDelta = lastScrollStep.totalDelta + scrollState.deltaY;
-          const scrollStep = RecCapSvcScroll.captureScroll(mergedDelta);
+          const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + (scrollState.deltaX || 0);
+          const scrollStep = RecCapSvcScroll.captureScroll(mergedDelta, stopScrollPageUrl, mergedDeltaX);
           if (scrollStep) {
             scrollStep.id = lastScrollStep.id;
             socket.nsp.to(room).emit('preview:recording:step:update', {
@@ -3316,11 +3487,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             if (stopTrace) stopTrace.writeStepUpdated(scrollStep, 'scroll_merge_on_stop');
           }
         } else {
-          const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY);
+          const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY, stopScrollPageUrl, scrollState.deltaX);
           if (scrollStep) {
-            socket.nsp.to(room).emit('preview:recording:step', {
-              previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
-            });
+            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
             if (stopTrace) stopTrace.writeStepCaptured(scrollStep, 'scroll_flush_on_stop');
           }
         }
@@ -3347,6 +3516,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             page.off('filechooser', fcHandler);
             delete (page as any).__qai_recording_filechooser_handler;
           }
+          // V13: Remove autofill listener
+          await RecordingCaptureService.removeAutofillListener(page).catch(() => {});
+          const autofillHandler = (page as any).__qai_recording_autofill_handler;
+          if (autofillHandler) {
+            page.off('load', autofillHandler);
+            delete (page as any).__qai_recording_autofill_handler;
+          }
         } catch {
           // Page may be closed
         }
@@ -3354,13 +3530,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       sessionService.setRecording(previewSessionId, ensuredUserId, false);
 
+      // V13: Reset dialog mode back to passive
+      sessionService.setDialogMode(previewSessionId, ensuredUserId, 'passive');
+
       // Editor trace: log recording stop and close writer
       const recStopTrace = EditorTraceService.get(previewSessionId);
       if (recStopTrace) {
         recStopTrace.writeRecordingStop('user');
         EditorTraceService.close(previewSessionId).then((meta) => {
-          if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
-        }).catch(() => {});
+          if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' })
+            .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on recording:stop', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
+        }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on recording:stop', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
       }
 
       socket.nsp.to(room).emit('preview:recording:state', {
@@ -3372,6 +3552,45 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       logger.info('[RECORDING] Stopped', { previewSessionId, userId: ensuredUserId });
     } catch (error) {
       logger.error('[RECORDING] Stop failed', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V13: Dialog recording — frontend sends user's accept/dismiss choice
+  // ═══════════════════════════════════════════════════════════════════════════
+  socket.on('preview:dialog:response' as any, async (data: {
+    previewSessionId: string;
+    action: 'accept' | 'dismiss';
+    promptText?: string;
+  }) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, action, promptText } = data;
+      if (!previewSessionId || !action) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) return;
+      if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
+
+      // Set the pending dialog action — the dialog handler in preview-session.service.ts
+      // is polling for this and will consume it, then emit preview:dialog:handled
+      sessionService.setPendingDialogAction(previewSessionId, ensuredUserId, {
+        action,
+        promptText,
+      });
+
+      logger.info('[RECORDING] Dialog response received from frontend', {
+        previewSessionId, action, promptText: promptText?.slice(0, 50),
+      });
+    } catch (error) {
+      logger.error('[RECORDING] Dialog response handler error', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -3456,8 +3675,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               if (dcTrace) {
                 dcTrace.writeRecordingStop('disconnect');
                 EditorTraceService.close(previewSessionId).then((meta) => {
-                  if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
-                }).catch(() => {});
+                  if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' })
+                    .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on disconnect', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
+                }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on disconnect', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
               }
             } catch (error) {
               logger.debug('[WebSocket] Recording cleanup failed on disconnect', {
@@ -3473,8 +3693,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const traceOnDisconnect = EditorTraceService.get(previewSessionId);
             if (traceOnDisconnect) {
               EditorTraceService.close(previewSessionId).then((meta) => {
-                if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' });
-              }).catch(() => {});
+                if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' })
+                  .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on disconnect (apply trace)', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
+              }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on disconnect (apply trace)', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
             }
           } catch { /* non-fatal */ }
 

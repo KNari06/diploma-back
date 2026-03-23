@@ -23,6 +23,7 @@ import type {
 } from './preview.types';
 
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
@@ -53,7 +54,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -774,8 +775,31 @@ async function selectFromCustomDropdown(
   value: string,
   timeout: number
 ): Promise<void> {
-  // Click the trigger to open the dropdown
-  await triggerLocator.click({ timeout });
+  // Detect combobox pattern: if trigger is an input or has role="combobox",
+  // type the value first to filter options, then search.
+  const isCombobox = await triggerLocator.evaluate((el: any) => {
+    const tag = el.tagName?.toLowerCase();
+    const role = el.getAttribute?.('role');
+    return tag === 'input' || role === 'combobox' || role === 'searchbox'
+      || !!el.querySelector('input') || el.getAttribute?.('aria-autocomplete') != null;
+  }).catch(() => false);
+
+  if (isCombobox) {
+    // For combobox: focus input and type value to filter options
+    const inputLocator = await triggerLocator.evaluate((el: any) => {
+      return el.tagName?.toLowerCase() === 'input' ? null : 'has-child-input';
+    }).catch(() => null);
+    const inputTarget = inputLocator === 'has-child-input'
+      ? triggerLocator.locator('input').first()
+      : triggerLocator;
+    await inputTarget.click({ timeout });
+    await inputTarget.fill(value, { timeout });
+    // Wait for filtered options to appear
+    await page.waitForTimeout(500);
+  } else {
+    // Click the trigger to open the dropdown
+    await triggerLocator.click({ timeout });
+  }
 
   // V10 Fix #7: Measure actual dropdown animation latency instead of hardcoding
   // This adapts to slow animations (Material UI transitions, CSS keyframes, etc.)
@@ -787,6 +811,7 @@ async function selectFromCustomDropdown(
     animationLatency,
     phaseTimeout,
     value: value.substring(0, 50),
+    isCombobox,
   });
 
   // Phase 1: Try scoped search inside a visible ARIA container (listbox/menu)
@@ -798,16 +823,44 @@ async function selectFromCustomDropdown(
 
   for (const container of containers) {
     try {
-      const isVisible = await container.first().isVisible().catch(() => false);
+      const ctr = container.first();
+      const isVisible = await ctr.isVisible().catch(() => false);
       if (!isVisible) continue;
 
       // Search for option inside this container
-      const scopedOpt = container.first().getByText(value, { exact: true }).first();
+      const scopedOpt = ctr.getByText(value, { exact: true }).first();
       await scopedOpt.waitFor({ state: 'visible', timeout: phaseTimeout });
       await scopedOpt.click({ timeout: phaseTimeout });
       return;
     } catch {
-      // Container exists but option not found inside — try next
+      // Option not found — check if container is virtualized (scrollable with many items)
+      // If so, scroll through to reveal off-viewport items
+      try {
+        const ctr = container.first();
+        const isScrollable = await ctr.evaluate((el: any) => el.scrollHeight > el.clientHeight + 50).catch(() => false);
+        if (isScrollable) {
+          // Scroll in chunks (300px at a time), search after each scroll
+          let lastScrollTop = -1;
+          for (let scrollAttempt = 0; scrollAttempt < 10; scrollAttempt++) {
+            const currentScrollTop = await ctr.evaluate((el: any) => {
+              el.scrollTop += 300;
+              return el.scrollTop;
+            });
+            // Stop if we've hit the bottom (scrollTop didn't change)
+            if (currentScrollTop === lastScrollTop) break;
+            lastScrollTop = currentScrollTop;
+            await page.waitForTimeout(150); // Let virtualized items render
+            const found = ctr.getByText(value, { exact: true }).first();
+            const isVis = await found.isVisible().catch(() => false);
+            if (isVis) {
+              await found.click({ timeout: phaseTimeout });
+              return;
+            }
+          }
+        }
+      } catch {
+        // Scroll attempt failed — continue to next phase
+      }
     }
   }
 
@@ -831,7 +884,27 @@ async function selectFromCustomDropdown(
   }
 
   // Phase 3: Universal text fallback (non-ARIA dropdowns)
-  // getByText matches hidden elements too, so we filter with :visible
+  // Scoped to recently-appeared overlay containers first, then page-level as last resort
+  const overlayContainers = [
+    page.locator('[class*="dropdown"]:visible, [class*="Dropdown"]:visible').first(),
+    page.locator('[class*="popup"]:visible, [class*="Popup"]:visible, [class*="popover"]:visible, [class*="Popover"]:visible').first(),
+    page.locator('[class*="select"]:visible, [class*="Select"]:visible').last(),
+  ];
+
+  for (const container of overlayContainers) {
+    try {
+      const isVisible = await container.isVisible().catch(() => false);
+      if (!isVisible) continue;
+      const scopedOpt = container.getByText(value, { exact: true }).first();
+      await scopedOpt.waitFor({ state: 'visible', timeout: phaseTimeout });
+      await scopedOpt.click({ timeout: phaseTimeout });
+      return;
+    } catch {
+      // Try next container
+    }
+  }
+
+  // Last resort: page-level text search (getByText matches hidden elements too, so we filter with :visible)
   const textStrategies = [
     page.getByText(value, { exact: true }).and(page.locator(':visible')),
     page.getByText(value, { exact: false }).and(page.locator(':visible')),
@@ -859,7 +932,8 @@ async function executeAction(
   page: Page,
   step: IntentStep,
   candidate: LintCandidate,
-  preResolvedLocator?: Locator
+  preResolvedLocator?: Locator,
+  options?: { expectsNavigation?: boolean }
 ): Promise<{ success: boolean; error?: string; urlChanged: boolean }> {
   const urlBefore = page.url();
 
@@ -889,6 +963,37 @@ async function executeAction(
         // Preserve exact user-entered text (including leading/trailing spaces and newlines).
         const value = normalizeTypeActionValue(step.value);
         const humanLike = step.options?.humanLike === true;
+
+        // V13: Paste mode — write to clipboard then dispatch paste via keyboard shortcut.
+        // Web apps that listen for 'paste' events (OTP fields, code editors) won't trigger with fill().
+        if (step.options?.isPaste) {
+          await locator.click({ timeout }); // Focus the element
+          // Write to system clipboard via CDP
+          const pasteContext = page.context();
+          await pasteContext.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+          // @ts-expect-error - navigator exists in browser context
+          await page.evaluate((text) => navigator.clipboard.writeText(text), value).catch(async () => {
+            // Fallback: use deprecated execCommand for older pages
+            await page.evaluate((text) => {
+              // @ts-expect-error - document exists in browser context
+              const ta = document.createElement('textarea');
+              ta.value = text;
+              // @ts-expect-error - document exists in browser context
+              document.body.appendChild(ta);
+              ta.select();
+              // @ts-expect-error - document exists in browser context
+              document.execCommand('copy');
+              ta.remove();
+            }, value);
+          });
+          // Dispatch Ctrl+V / Cmd+V to trigger paste event listeners
+          const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
+          await page.keyboard.press(`${modifier}+v`);
+          if (step.options?.pressEnter) {
+            await locator.press('Enter', { timeout });
+          }
+          break;
+        }
 
         // Human-like typing: gradual per-character input (instead of instant fill).
         // - If replaceContent is false: append by typing
@@ -932,6 +1037,22 @@ async function executeAction(
         if (!locator) throw new Error('No selector for click action');
         const humanLike = step.options?.humanLike === true;
 
+        // V13: Build Playwright modifiers array from step options
+        const clickModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
+        if (step.options?.modifiers) {
+          if (step.options.modifiers.shift) clickModifiers.push('Shift');
+          if (step.options.modifiers.ctrl) clickModifiers.push('Control');
+          if (step.options.modifiers.meta) clickModifiers.push('Meta');
+          if (step.options.modifiers.alt) clickModifiers.push('Alt');
+        }
+        const clickOpts: Parameters<Locator['click']>[0] = {
+          timeout,
+          ...(clickModifiers.length > 0 && { modifiers: clickModifiers }),
+        };
+
+        // V13: Track pages before click for new-tab detection
+        const pagesBefore = page.context().pages().length;
+
         if (humanLike) {
           // Human-like click: hover -> small pause -> click
           await locator.hover({ timeout });
@@ -945,13 +1066,34 @@ async function executeAction(
               // Position is relative to the element's top-left in Playwright
               const x = randomIntInclusive(3, Math.floor(box.width) - 3);
               const y = randomIntInclusive(3, Math.floor(box.height) - 3);
-              await locator.click({ timeout, position: { x, y } });
+              await locator.click({ ...clickOpts, position: { x, y } });
               break;
             }
           }
         }
 
-        await locator.click({ timeout });
+        // V13: If next step expects navigation (wait_for changedFrom), wrap click with
+        // waitForNavigation to reliably capture the navigation event.
+        if (options?.expectsNavigation) {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'load', timeout: 15000 }).catch(() => {}),
+            locator.click(clickOpts),
+          ]);
+        } else {
+          await locator.click(clickOpts);
+        }
+
+        // V13: Detect new tab opened by click (target="_blank", window.open)
+        // Wait for new page to load so subsequent steps can target it
+        if (page.context().pages().length > pagesBefore) {
+          const newPage = page.context().pages().at(-1);
+          if (newPage) {
+            logger.info('[EXECUTE_ACTION] New tab detected after click, waiting for load', {
+              pagesAfter: page.context().pages().length,
+            });
+            await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+          }
+        }
         break;
       }
 
@@ -1004,13 +1146,16 @@ async function executeAction(
         if (locator) {
           await locator.scrollIntoViewIfNeeded({ timeout });
         } else {
-          // V10 Fix #8: Use actual delta from step.value instead of hardcoded 300px
-          // step.value is the accumulated deltaY from recording (positive = down, negative = up)
-          const rawDelta = parseFloat(step.value || '');
-          const deltaY = Number.isFinite(rawDelta) ? rawDelta : 300;
-          await page.evaluate((dy: number) => {
-            (globalThis as any).scrollBy(0, dy);
-          }, deltaY);
+          // V14: Parse both deltaY and optional deltaX from step.value
+          // Format: "deltaY" or "deltaY,deltaX"
+          const valueParts = (step.value || '').split(',');
+          const rawDeltaY = parseFloat(valueParts[0] || '');
+          const rawDeltaX = valueParts.length > 1 ? parseFloat(valueParts[1] || '') : 0;
+          const deltaY = Number.isFinite(rawDeltaY) ? rawDeltaY : 300;
+          const deltaX = Number.isFinite(rawDeltaX) ? rawDeltaX : 0;
+          await page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
+            (globalThis as any).scrollBy(dx, dy);
+          }, { dx: deltaX, dy: deltaY });
         }
         // Post-scroll settle — give lazy-loaded content time to appear
         await sleepMs(page, STEP_READINESS_CONFIG.domStableThresholdMs.assertion);
@@ -1118,31 +1263,10 @@ async function executeAction(
 
       case 'drag_and_drop': {
         if (!locator) throw new Error('No selector for drag_and_drop source');
-        // step.value is JSON: { from: {x,y}, to: {x,y} }
-        const dragData = (() => {
-          try { return JSON.parse(step.value || ''); } catch { return null; }
-        })();
+        const dragCoords = parseDragCoordinates(step.value);
 
-        if (dragData?.from && dragData?.to) {
-          // Coordinate-based drag (recorded from mouse events)
-          // Wrapped in try/catch: if drag fails mid-way, mouse.up() must still be called
-          // to prevent the mouse staying "stuck" in down state and corrupting subsequent steps
-          try {
-            await page.mouse.move(dragData.from.x, dragData.from.y);
-            await page.mouse.down();
-            // Gradual move for realistic drag behaviour
-            const steps = Math.max(5, Math.round(
-              Math.sqrt(
-                Math.pow(dragData.to.x - dragData.from.x, 2) +
-                Math.pow(dragData.to.y - dragData.from.y, 2)
-              ) / 10
-            ));
-            await page.mouse.move(dragData.to.x, dragData.to.y, { steps });
-            await page.mouse.up();
-          } catch (dragError) {
-            await page.mouse.up().catch(() => {});
-            throw dragError;
-          }
+        if (dragCoords) {
+          await executeCoordinateDrag(page, dragCoords);
         } else if (step.options?.dropTarget) {
           // Element-based drag: drag source locator to a target selector
           const targetLocator = (getLocatorContext(page, step) as Page | FrameLocator)
@@ -1313,8 +1437,9 @@ export class PreviewStepApplyService {
     userId: string;
     selectedRef?: string; // V3: User-confirmed element ref from clarification
     skipPostActionWait?: boolean; // V12: Skip post-action settle when caller uses lookahead (e.g. Run mode)
+    expectsNavigation?: boolean; // V13: Next step is wait_for with changedFrom — wrap click with waitForNavigation
   }): Promise<ApplyResult> {
-    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait } = params;
+    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
 
     logger.info('[PREVIEW_APPLY] Applying step', {
       previewSessionId,
@@ -1418,14 +1543,21 @@ export class PreviewStepApplyService {
         // V5.1: timeout is now primary (required from frontend), urlMatcher.timeoutMs is fallback
         const timeoutMs = stepDraft.options?.timeout ?? matcher?.timeoutMs ?? 15000;
 
+        // V13: changedFrom uses recording-time URL which may differ from runtime.
+        // Replace with current page URL so "wait until URL changes" works at runtime.
+        const runtimeMatcher = matcher?.changedFrom
+          ? { ...matcher, changedFrom: page.url() }
+          : matcher;
+
         logger.info('[PREVIEW_APPLY] Handling wait_for', {
           previewSessionId,
-          matcher: matcher ? Object.keys(matcher).filter(k => (matcher as any)[k] !== undefined) : [],
+          matcher: runtimeMatcher ? Object.keys(runtimeMatcher).filter(k => (runtimeMatcher as any)[k] !== undefined) : [],
           timeoutMs,
+          changedFromOverride: matcher?.changedFrom ? `${matcher.changedFrom} → ${page.url()}` : undefined,
         });
 
         try {
-          const result = await executeWaitFor(page, matcher, timeoutMs);
+          const result = await executeWaitFor(page, runtimeMatcher, timeoutMs);
 
           // Generate compiled plan for wait_for
           let compiled;
@@ -1457,6 +1589,92 @@ export class PreviewStepApplyService {
             success: false,
             error: error instanceof Error ? error.message : 'wait_for failed',
             urlChanged: urlBefore !== page.url(),
+            url: page.url(),
+            attempts: 1,
+          };
+        }
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V13: Handle dialog steps (pre-install handler for upcoming dialog)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'dialog') {
+        const dialogOpts = stepDraft.options?.dialog;
+        if (!dialogOpts) {
+          return {
+            success: false,
+            error: 'Dialog step missing dialog options',
+            attempts: 0,
+          };
+        }
+
+        logger.info('[PREVIEW_APPLY] Pre-installing dialog handler', {
+          previewSessionId,
+          dialogType: dialogOpts.dialogType,
+          action: dialogOpts.action,
+        });
+
+        // Pre-install the pending dialog action on the session.
+        // The next step (typically a click) will trigger the dialog,
+        // and the session's dialog handler will consume this action.
+        const sessionService = getPreviewSessionService();
+        sessionService.setPendingDialogAction(previewSessionId, userId, {
+          action: dialogOpts.action,
+          promptText: dialogOpts.promptText,
+        });
+
+        return {
+          success: true,
+          appliedStep: stepDraft,
+          url: page.url(),
+          attempts: 1,
+        };
+      }
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V13: Handle download verification (wait for download event)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (stepDraft.type === 'download') {
+        const downloadOpts = stepDraft.options?.download;
+        const expectedFilename = downloadOpts?.filename || stepDraft.value;
+        const timeoutMs = downloadOpts?.timeoutMs || 15000;
+
+        logger.info('[PREVIEW_APPLY] Waiting for download', {
+          previewSessionId, expectedFilename, timeoutMs,
+        });
+
+        try {
+          // Wait for the download event (triggered by the previous click)
+          const download = await page.waitForEvent('download', { timeout: timeoutMs });
+          const actualFilename = download.suggestedFilename();
+
+          // Verify filename matches if expected
+          if (expectedFilename && !actualFilename.toLowerCase().includes(expectedFilename.toLowerCase())) {
+            // Cancel download to prevent temp file buildup
+            await download.cancel().catch(() => {});
+            return {
+              success: false,
+              error: `Download filename mismatch. Expected: "${expectedFilename}", Got: "${actualFilename}"`,
+              appliedStep: stepDraft,
+              url: page.url(),
+              attempts: 1,
+            };
+          }
+
+          // Cancel download (preview/test mode — we only verify it started)
+          await download.cancel().catch(() => {});
+
+          return {
+            success: true,
+            appliedStep: stepDraft,
+            url: page.url(),
+            attempts: 1,
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: `Download did not start within ${timeoutMs}ms`,
+            appliedStep: stepDraft,
             url: page.url(),
             attempts: 1,
           };
@@ -1792,7 +2010,7 @@ export class PreviewStepApplyService {
         // V5: Capture URL BEFORE action for accurate compiled context
         const urlBeforeAction = page.url();
         
-        const result = await executeAction(page, stepDraft, confirmedCandidate);
+        const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation });
 
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
@@ -1925,7 +2143,7 @@ export class PreviewStepApplyService {
             };
 
             // Execute action with compiled locator
-            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator);
+            const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation });
 
             if (result.success) {
               // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
@@ -2096,7 +2314,7 @@ export class PreviewStepApplyService {
           confidence: candidate.confidence,
         });
 
-        const result = await executeAction(page, stepDraft, candidate);
+        const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
 
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step

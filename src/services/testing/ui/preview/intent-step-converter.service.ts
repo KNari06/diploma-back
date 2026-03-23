@@ -52,6 +52,8 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     lookaheadTimeoutMs?: number;
     /** V10: Press Enter after type action (from step.options.pressEnter) */
     pressEnter?: boolean;
+    /** V13: Content was pasted — use clipboard paste instead of fill/pressSequentially */
+    isPaste?: boolean;
     /** V11: Expected outcome for 4xx detection (default: 'success') */
     expectedOutcome?: ExpectedStepOutcome;
     /** V12: Email filter for wait_for_email step */
@@ -113,6 +115,19 @@ function mapActionType(intentAction: IntentActionType): string {
     // V6: File upload
     case 'upload':
       return 'upload';
+    // V10: Advanced recording types
+    case 'dblclick':
+      return 'dblclick';
+    case 'contextmenu':
+      return 'contextmenu';
+    case 'drag_and_drop':
+      return 'dragAndDrop';
+    // V13: Dialog handling
+    case 'dialog':
+      return 'handleDialog';
+    // V13: Download verification
+    case 'download':
+      return 'verifyDownload';
     default:
       return 'click'; // Fallback
   }
@@ -239,6 +254,10 @@ export function convertIntentStepToCommand(
       if (step.options?.pressEnter && command.intentMeta) {
         command.intentMeta.pressEnter = true;
       }
+      // V13: Pass isPaste flag so executor dispatches clipboard paste instead of fill
+      if (step.options?.isPaste && command.intentMeta) {
+        command.intentMeta.isPaste = true;
+      }
       break;
 
     case 'navigate':
@@ -311,7 +330,18 @@ export function convertIntentStepToCommand(
       break;
 
     case 'scroll':
-      // Scroll doesn't need value, but may have selector
+      // V14: Pass deltaY,deltaX value so regression scroll matches recorded distance
+      if (step.value) {
+        command.value = step.value;
+      }
+      break;
+
+    case 'drag_and_drop':
+      // V14: Pass coordinate data or dropTarget for regression replay
+      command.value = step.value || '';
+      if (step.options?.dropTarget) {
+        command.dropTarget = step.options.dropTarget;
+      }
       break;
 
     case 'upload': {
@@ -328,8 +358,31 @@ export function convertIntentStepToCommand(
       break;
     }
 
+    case 'click':
+    case 'dblclick':
+    case 'contextmenu':
+      // V13: Pass modifier keys for multi-select (Shift+Click, Ctrl+Click)
+      if (step.options?.modifiers) {
+        command.modifiers = step.options.modifiers;
+      }
+      break;
+
+    case 'dialog':
+      // V13: Pass dialog options for replay
+      if (step.options?.dialog) {
+        command.dialog = step.options.dialog;
+      }
+      break;
+
+    case 'download':
+      // V13: Pass download options for verification
+      if (step.options?.download) {
+        command.download = step.options.download;
+      }
+      break;
+
     default:
-      // For click, hover, check, uncheck, toggle, open, close
+      // For hover, check, uncheck, toggle, open, close
       // Just need the selector which is handled above
       break;
   }

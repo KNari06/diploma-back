@@ -24,6 +24,7 @@ import type {
   ElementBoundingBox,
   IntentActionType,
 } from './preview.types';
+// V15: generateText imported lazily inside resolveInteractiveTarget() to avoid loading AI pipeline on service init
 import type { PreviewIntentStep } from '@/websocket/types/types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -49,6 +50,20 @@ export interface ProbedElement {
   isMultiline?: boolean;
   /** Nearest heading/landmark text — provides container context for multi-page AI lint */
   containerText?: string;
+  /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
+  iframeSelector?: string;
+  /** V14: Marker — element is inside a cross-origin iframe and cannot be probed/recorded */
+  crossOriginIframe?: boolean;
+  /** V15: How the interactive target was resolved from the click point */
+  resolvedVia?: 'nativeTag' | 'ariaRole' | 'behavioral' | 'cssClass' | 'cursorPointer' | 'directHit' | 'llm';
+  /** V15: Ancestor chain from directHit to body — transient, used for server-side LLM fallback, NOT saved to DB */
+  ancestorChain?: Array<{
+    tag: string;
+    role?: string;
+    text?: string;
+    ariaLabel?: string;
+    className?: string;
+  }>;
 }
 
 /** Typing buffer stored on session */
@@ -63,6 +78,8 @@ export interface RecordingTypingBuffer {
   isMultiline?: boolean;
   /** URL where typing started (guards against cross-page ref collision) */
   pageUrl?: string;
+  /** V13: CSS selector of iframe containing the focused element */
+  iframeSelector?: string;
 }
 
 /** Drag state tracked between mouse:down and mouse:up events */
@@ -75,6 +92,8 @@ export interface RecordingDragState {
   startElement: ProbedElement | null;
   /** Timestamp when drag started */
   startedAt: number;
+  /** V14: Viewport dimensions at recording time for coordinate normalization */
+  viewport?: { width: number; height: number };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -115,17 +134,124 @@ const PROBE_AT_POINT_FN = `
   var el = document.elementFromPoint(px, py);
   if (!el) return null;
 
-  var target = el;
-  var interactiveTags = ['button', 'a', 'input', 'select', 'textarea'];
-  var interactiveRoles = ['button', 'link', 'checkbox', 'tab', 'menuitem', 'combobox', 'switch'];
+  // ── Pass 1: Collect ancestor chain (up to 12 ancestors) ──────────────
+  var INTERACTIVE_TAGS = ['button', 'a', 'input', 'select', 'textarea', 'summary'];
+  var WIDGET_ROLES = [
+    'button', 'link', 'checkbox', 'radio', 'tab', 'menuitem',
+    'menuitemcheckbox', 'menuitemradio', 'option', 'switch',
+    'combobox', 'slider', 'spinbutton', 'treeitem', 'gridcell',
+    'searchbox', 'textbox'
+  ];
+  var FRAMEWORK_ATTRS = ['ng-click', 'v-on:click', 'x-on:click'];
+  var BTN_CLASS_RE = /\\b(btn|button|clickable|toggle-btn|action-btn)\\b/i;
+
+  var chain = [];
   var walk = el;
-  for (var i = 0; i < 5 && walk; i++) {
-    if (interactiveTags.indexOf(walk.tagName.toLowerCase()) !== -1) { target = walk; break; }
-    var r = walk.getAttribute('role');
-    if (r && interactiveRoles.indexOf(r) !== -1) { target = walk; break; }
+  for (var i = 0; i < 12 && walk && walk !== document.body; i++) {
+    var wtag = walk.tagName.toLowerCase();
+    var wrole = walk.getAttribute('role');
+    var wclass = (walk.getAttribute('class') || '').slice(0, 120);
+    var hasTabindex = walk.hasAttribute('tabindex') && walk.getAttribute('tabindex') !== '-1';
+    var hasOnclick = walk.hasAttribute('onclick');
+    var hasDraggable = walk.getAttribute('draggable') === 'true';
+    // Check (click) — Angular binding: attribute name starts with "(click"
+    var hasAngularClick = false;
+    try {
+      var attrs = walk.attributes;
+      for (var ai = 0; ai < attrs.length; ai++) {
+        var aname = attrs[ai].name;
+        if (aname === '(click)' || aname.indexOf('@click') === 0 || FRAMEWORK_ATTRS.indexOf(aname) !== -1) {
+          hasAngularClick = true;
+          break;
+        }
+      }
+    } catch(e) {}
+
+    chain.push({
+      el: walk,
+      tag: wtag,
+      role: wrole,
+      className: wclass,
+      hasTabindex: hasTabindex,
+      hasOnclick: hasOnclick,
+      hasFrameworkBinding: hasAngularClick,
+      hasDraggable: hasDraggable,
+      text: (walk.textContent || '').trim().slice(0, 80),
+      ariaLabel: walk.getAttribute('aria-label') || ''
+    });
     walk = walk.parentElement;
   }
 
+  // ── Pass 2: Pick best interactive target from chain ──────────────────
+  var target = el;
+  var resolvedVia = 'directHit';
+  var cssCandidateIdx = -1;
+
+  for (var ci = 0; ci < chain.length; ci++) {
+    var node = chain[ci];
+    // Priority 1: Native interactive tags
+    if (INTERACTIVE_TAGS.indexOf(node.tag) !== -1) {
+      target = node.el;
+      resolvedVia = 'nativeTag';
+      break;
+    }
+    // Priority 2: ARIA widget roles
+    if (node.role && WIDGET_ROLES.indexOf(node.role) !== -1) {
+      target = node.el;
+      resolvedVia = 'ariaRole';
+      break;
+    }
+    // Priority 3: Behavioral (tabindex, onclick, framework bindings)
+    if (node.hasTabindex || node.hasOnclick || node.hasFrameworkBinding) {
+      target = node.el;
+      resolvedVia = 'behavioral';
+      break;
+    }
+    // Priority 3.5: draggable
+    if (node.hasDraggable) {
+      target = node.el;
+      resolvedVia = 'behavioral';
+      break;
+    }
+    // Priority 4: CSS class heuristic (remember first candidate, keep looking)
+    if (cssCandidateIdx === -1 && node.className && BTN_CLASS_RE.test(node.className)) {
+      cssCandidateIdx = ci;
+    }
+  }
+
+  // If no strong match, use CSS class candidate
+  if (resolvedVia === 'directHit' && cssCandidateIdx !== -1) {
+    target = chain[cssCandidateIdx].el;
+    resolvedVia = 'cssClass';
+  }
+
+  // Priority 5: cursor:pointer on direct hit (single getComputedStyle call)
+  if (resolvedVia === 'directHit') {
+    try {
+      var cursor = getComputedStyle(el).cursor;
+      if (cursor === 'pointer') {
+        // Walk up to find the highest ancestor with cursor:pointer
+        // (the actual interactive container, not just an inherited child)
+        for (var pi = 0; pi < chain.length; pi++) {
+          try {
+            if (getComputedStyle(chain[pi].el).cursor !== 'pointer') {
+              // Previous element was the last one with cursor:pointer
+              if (pi > 0) {
+                target = chain[pi - 1].el;
+                resolvedVia = 'cursorPointer';
+              }
+              break;
+            }
+          } catch(e) { break; }
+        }
+        // If ALL chain elements have cursor:pointer (e.g., global * { cursor: pointer }),
+        // cursor gives no signal — leave as directHit so LLM fallback can decide
+        // (target stays as el, resolvedVia stays as 'directHit')
+      }
+    } catch(e) {}
+  }
+
+  // ── Collect data from chosen target ──────────────────────────────────
   var tag = target.tagName.toLowerCase();
   var labelText = undefined;
   if (target.labels && target.labels.length > 0) {
@@ -149,7 +275,7 @@ const PROBE_AT_POINT_FN = `
     || target.getAttribute('contenteditable') === ''
     || (target.getAttribute('role') === 'textbox' && target.getAttribute('aria-multiline') === 'true');
 
-  // V11: Collect nearest heading/landmark for container context (multi-page AI lint)
+  // V11: Collect nearest heading/landmark for container context
   var containerText = undefined;
   var walk2 = target.parentElement;
   for (var j = 0; j < 8 && walk2; j++) {
@@ -159,6 +285,19 @@ const PROBE_AT_POINT_FN = `
       break;
     }
     walk2 = walk2.parentElement;
+  }
+
+  // V15: Build ancestor chain summary for server-side LLM fallback (transient, not saved to DB)
+  var ancestorChain = [];
+  for (var aci = 0; aci < chain.length; aci++) {
+    var ac = chain[aci];
+    ancestorChain.push({
+      tag: ac.tag,
+      role: ac.role || undefined,
+      text: ac.text ? ac.text.slice(0, 50) : undefined,
+      ariaLabel: ac.ariaLabel || undefined,
+      className: ac.className ? ac.className.split(' ').slice(0, 3).join(' ') : undefined
+    });
   }
 
   return {
@@ -181,7 +320,9 @@ const PROBE_AT_POINT_FN = `
       y: Math.round(rect.y),
       width: Math.round(rect.width),
       height: Math.round(rect.height)
-    }
+    },
+    resolvedVia: resolvedVia,
+    ancestorChain: resolvedVia === 'directHit' || resolvedVia === 'cssClass' ? ancestorChain : undefined
   };
 })
 `;
@@ -293,16 +434,39 @@ export class RecordingCaptureService {
    */
   private static async probeInChildFrames(page: Page, x: number, y: number): Promise<ProbedElement | null> {
     try {
-      // Get all iframe elements with their bounding rects
+      // V13: Get all iframe elements with bounding rects AND a CSS selector for each
       const iframeRects = await page.evaluate(`
         (() => {
           var iframes = Array.from(document.querySelectorAll('iframe'));
           return iframes.map(function(iframe, index) {
             var rect = iframe.getBoundingClientRect();
-            return { index: index, x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+            // Build a CSS selector for this iframe (id > name > title > nth-of-type)
+            var sel = '';
+            if (iframe.id) {
+              sel = 'iframe#' + iframe.id;
+            } else if (iframe.getAttribute('name')) {
+              sel = 'iframe[name="' + iframe.getAttribute('name') + '"]';
+            } else if (iframe.getAttribute('title')) {
+              sel = 'iframe[title="' + iframe.getAttribute('title') + '"]';
+            } else if (iframe.getAttribute('src')) {
+              // Use a short src substring to identify (avoid query params)
+              var src = iframe.getAttribute('src') || '';
+              var pathname = src.split('?')[0].split('#')[0];
+              if (pathname.length > 0 && pathname.length < 200) {
+                sel = 'iframe[src*="' + pathname.replace(/"/g, '') + '"]';
+              }
+            }
+            if (!sel) {
+              // Fallback: nth-of-type
+              var parent = iframe.parentElement;
+              var siblings = parent ? Array.from(parent.querySelectorAll(':scope > iframe')) : [];
+              var nth = siblings.indexOf(iframe) + 1;
+              sel = 'iframe:nth-of-type(' + nth + ')';
+            }
+            return { index: index, x: rect.x, y: rect.y, width: rect.width, height: rect.height, selector: sel };
           });
         })()
-      `) as Array<{ index: number; x: number; y: number; width: number; height: number }>;
+      `) as Array<{ index: number; x: number; y: number; width: number; height: number; selector: string }>;
 
       // Find which iframe contains the point
       for (const rect of iframeRects) {
@@ -328,10 +492,18 @@ export class RecordingCaptureService {
                 probed.boundingBox.x += Math.round(rect.x);
                 probed.boundingBox.y += Math.round(rect.y);
               }
+              // V13: Store iframe CSS selector so replay can scope to the correct iframe
+              probed.iframeSelector = rect.selector;
               return probed;
             }
-          } catch {
-            // Frame may be cross-origin or detached — skip
+          } catch (frameErr) {
+            // V14: Log cross-origin iframe detection so the handler can warn the user
+            logger.warn('[RECORDING] Cross-origin iframe detected — element inside cannot be recorded', {
+              iframeSelector: rect.selector,
+              error: frameErr instanceof Error ? frameErr.message : String(frameErr),
+            });
+            // Return a minimal marker — caller checks crossOriginIframe before using other fields
+            return { tag: 'iframe', crossOriginIframe: true, iframeSelector: rect.selector };
           }
         }
       }
@@ -366,13 +538,39 @@ export class RecordingCaptureService {
 
   /**
    * Probe focused element in child frames.
+   * V13: Also captures iframe CSS selector when element is found.
    */
   private static async probeFocusedInChildFrames(page: Page): Promise<ProbedElement | null> {
-    const childFrames = page.frames().filter(f => f !== page.mainFrame());
-    for (const frame of childFrames) {
+    // V13: Get iframe selectors from the page to attach to the result
+    let iframeSelectors: string[] = [];
+    try {
+      iframeSelectors = await page.evaluate(`
+        (() => {
+          var iframes = Array.from(document.querySelectorAll('iframe'));
+          return iframes.map(function(iframe) {
+            if (iframe.id) return 'iframe#' + iframe.id;
+            if (iframe.getAttribute('name')) return 'iframe[name="' + iframe.getAttribute('name') + '"]';
+            if (iframe.getAttribute('title')) return 'iframe[title="' + iframe.getAttribute('title') + '"]';
+            var src = iframe.getAttribute('src') || '';
+            var pathname = src.split('?')[0].split('#')[0];
+            if (pathname.length > 0 && pathname.length < 200) return 'iframe[src*="' + pathname.replace(/"/g, '') + '"]';
+            var parent = iframe.parentElement;
+            var siblings = parent ? Array.from(parent.querySelectorAll(':scope > iframe')) : [];
+            return 'iframe:nth-of-type(' + (siblings.indexOf(iframe) + 1) + ')';
+          });
+        })()
+      `) as string[];
+    } catch { /* non-critical */ }
+
+    const childFrames = page.mainFrame().childFrames();
+    for (let i = 0; i < childFrames.length; i++) {
+      const frame = childFrames[i];
       try {
         const result = await frame.evaluate(`${PROBE_FOCUSED_FN}()`) as ProbedElement | null;
-        if (result) return result;
+        if (result) {
+          result.iframeSelector = iframeSelectors[i] || undefined;
+          return result;
+        }
       } catch {
         // Frame may be cross-origin or detached
       }
@@ -381,19 +579,210 @@ export class RecordingCaptureService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // LLM FALLBACK FOR INTERACTIVE ELEMENT RESOLUTION (V15)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** In-memory cache for LLM decisions — keyed by structural pattern, value = chain index */
+  private static llmResolutionCache = new Map<string, number>();
+
+  /**
+   * V15: When probe returns resolvedVia='directHit' or 'cssClass' (low confidence),
+   * ask LLM to pick the correct interactive element from the ancestor chain.
+   *
+   * Flow:
+   *   1. Check cache by structural pattern → instant if cached
+   *   2. LLM call (fast model, ~100 tokens) → returns index into ancestorChain
+   *   3. Re-probe the chosen ancestor for full ProbedElement data
+   *   4. Cache the result for future similar patterns
+   *
+   * @param page - Playwright page to re-probe the chosen element
+   * @param probed - Original probe result with ancestorChain
+   * @param x - Click x coordinate (for re-probing the chosen ancestor)
+   * @param y - Click y coordinate
+   * @returns Updated ProbedElement with resolvedVia='llm', or original if LLM fails
+   */
+  static async resolveInteractiveTarget(
+    page: Page,
+    probed: ProbedElement,
+    x: number,
+    y: number,
+  ): Promise<ProbedElement> {
+    const chain = probed.ancestorChain;
+    if (!chain || chain.length === 0) return probed;
+
+    // Build cache key from structural pattern (tag.firstClass chain)
+    const cacheKey = chain
+      .slice(0, 4)
+      .map(n => `${n.tag}${n.className ? '.' + n.className.split(' ')[0] : ''}`)
+      .join('|');
+
+    // 1. Check cache
+    const cachedIndex = this.llmResolutionCache.get(cacheKey);
+    if (cachedIndex !== undefined && cachedIndex < chain.length) {
+      logger.debug('[RECORDING] LLM resolution cache hit', { cacheKey, index: cachedIndex });
+      return await this.reprobeAtAncestorIndex(page, x, y, probed, cachedIndex);
+    }
+
+    // 2. LLM call
+    try {
+      const chainDescription = chain.map((n, i) =>
+        `[${i}] <${n.tag}>${n.role ? ` role="${n.role}"` : ''}${n.ariaLabel ? ` aria-label="${n.ariaLabel}"` : ''}${n.className ? ` class="${n.className}"` : ''}${n.text ? ` text="${n.text.slice(0, 30)}"` : ''}`,
+      ).join('\n');
+
+      const prompt = `Given this DOM ancestor chain from a click point (index 0 = element under cursor, higher indices = parents), which element is the interactive control the user intended to click?
+
+${chainDescription}
+
+Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an interactive control (button, link, menu item, etc). If index 0 is already the correct interactive element, return "0".`;
+
+      const { generateText } = await import('@/services/ai/core/ai-provider.service');
+      const response = await generateText({
+        prompt,
+        task: 'fast',
+        temperature: 0,
+        maxTokens: 10,
+        timeout: 2000,
+      });
+
+      const indexStr = response.content.trim().replace(/[^0-9]/g, '');
+      const index = parseInt(indexStr, 10);
+
+      if (isNaN(index) || index < 0 || index >= chain.length) {
+        logger.debug('[RECORDING] LLM returned invalid index', { response: response.content, chainLength: chain.length });
+        return probed;
+      }
+
+      // 3. Cache result
+      this.llmResolutionCache.set(cacheKey, index);
+      // Cap cache size
+      if (this.llmResolutionCache.size > 200) {
+        const firstKey = this.llmResolutionCache.keys().next().value;
+        if (firstKey) this.llmResolutionCache.delete(firstKey);
+      }
+
+      logger.debug('[RECORDING] LLM resolved interactive target', { cacheKey, index, tag: chain[index].tag });
+
+      // 4. Re-probe at the chosen ancestor
+      if (index === 0) {
+        // LLM confirmed directHit is correct
+        probed.resolvedVia = 'llm';
+        return probed;
+      }
+
+      return await this.reprobeAtAncestorIndex(page, x, y, probed, index);
+    } catch (error) {
+      logger.debug('[RECORDING] LLM resolution failed, using original probe', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return probed;
+    }
+  }
+
+  /**
+   * V15: Re-probe a specific ancestor from the chain to get full ProbedElement data.
+   * Uses page.evaluate to walk from elementFromPoint up N levels and collect data.
+   */
+  private static async reprobeAtAncestorIndex(
+    page: Page,
+    x: number,
+    y: number,
+    original: ProbedElement,
+    ancestorIndex: number,
+  ): Promise<ProbedElement> {
+    try {
+      const result = await page.evaluate(`
+        (function(px, py, idx) {
+          var el = document.elementFromPoint(px, py);
+          if (!el) return null;
+          var walk = el;
+          for (var i = 0; i < idx && walk && walk.parentElement; i++) {
+            walk = walk.parentElement;
+          }
+          if (!walk || walk === document.body) return null;
+          var tag = walk.tagName.toLowerCase();
+          var labelText = undefined;
+          if (walk.labels && walk.labels.length > 0) {
+            labelText = (walk.labels[0].textContent || '').trim().slice(0, 100) || undefined;
+          }
+          if (!labelText) {
+            var lby = walk.getAttribute('aria-labelledby');
+            if (lby) {
+              var lel = document.getElementById(lby);
+              if (lel) labelText = (lel.textContent || '').trim().slice(0, 100) || undefined;
+            }
+          }
+          var rect = walk.getBoundingClientRect();
+          var ae = walk.getAttribute('aria-expanded');
+          var ap = walk.getAttribute('aria-pressed');
+          var isMultiline = tag === 'textarea'
+            || walk.getAttribute('contenteditable') === 'true'
+            || walk.getAttribute('contenteditable') === ''
+            || (walk.getAttribute('role') === 'textbox' && walk.getAttribute('aria-multiline') === 'true');
+          return {
+            tag: tag,
+            role: walk.getAttribute('role') || undefined,
+            type: walk.getAttribute('type') || undefined,
+            text: (walk.textContent || '').trim().slice(0, 80) || undefined,
+            ariaLabel: walk.getAttribute('aria-label') || undefined,
+            labelText: labelText,
+            placeholder: walk.getAttribute('placeholder') || undefined,
+            name: walk.getAttribute('name') || undefined,
+            ref: walk.getAttribute('data-agent-ref') || undefined,
+            checked: (tag === 'input' && (walk.type === 'checkbox' || walk.type === 'radio')) ? walk.checked : undefined,
+            ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
+            ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
+            isMultiline: isMultiline || undefined,
+            boundingBox: {
+              x: Math.round(rect.x),
+              y: Math.round(rect.y),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            }
+          };
+        })(${x}, ${y}, ${ancestorIndex})
+      `) as ProbedElement | null;
+
+      if (!result) return original;
+
+      // V15: Verify that reprobe found the expected element (DOM may have changed after click)
+      const expectedTag = original.ancestorChain?.[ancestorIndex]?.tag;
+      if (expectedTag && result.tag !== expectedTag) {
+        logger.debug('[RECORDING] Reprobe tag mismatch (DOM changed?), using original', {
+          expected: expectedTag, got: result.tag,
+        });
+        return original;
+      }
+
+      // Preserve iframe/container context from original probe
+      result.iframeSelector = original.iframeSelector;
+      result.containerText = original.containerText;
+      result.resolvedVia = 'llm';
+      return result;
+    } catch {
+      return original;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // DESCRIPTION & HINTS BUILDING
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Extract the best human-readable label from a probed element.
-   * Used for storing in typing buffer so description can be rebuilt later.
+   * Tags and roles whose textContent is a meaningful label for the element.
+   * V15: Expanded from just a/button to all interactive widget roles.
    */
+  private static TEXT_LABEL_TAGS = new Set(['a', 'button', 'summary', 'th', 'label', 'legend']);
+  private static TEXT_LABEL_ROLES = new Set([
+    'button', 'link', 'tab', 'menuitem', 'menuitemcheckbox',
+    'menuitemradio', 'option', 'switch', 'treeitem',
+  ]);
+
   static getElementLabel(element: ProbedElement | null): string {
     if (!element) return 'element';
     return (
       element.ariaLabel
       || element.labelText
-      || (element.tag === 'a' || element.tag === 'button' || element.role === 'button' || element.role === 'link'
+      || (this.TEXT_LABEL_TAGS.has(element.tag) || (element.role && this.TEXT_LABEL_ROLES.has(element.role))
         ? element.text
         : undefined)
       || element.placeholder
@@ -417,10 +806,10 @@ export class RecordingCaptureService {
       return `${actionType} element`;
     }
 
-    // Determine the best label for the element
+    // Determine the best label for the element (V15: reuse TEXT_LABEL_TAGS/ROLES for consistency)
     const label = element.ariaLabel
       || element.labelText
-      || (element.tag === 'a' || element.tag === 'button' || element.role === 'button' || element.role === 'link'
+      || (this.TEXT_LABEL_TAGS.has(element.tag) || (element.role && this.TEXT_LABEL_ROLES.has(element.role))
         ? element.text
         : undefined)
       || element.placeholder
@@ -483,6 +872,9 @@ export class RecordingCaptureService {
     if (element.containerText && !hints.nearText) hints.nearText = element.containerText;
     if (element.type) hints.type = element.type;
     if (element.name) hints.autocomplete = element.name;
+    // V15: Add text content and tag for better LLM resolution at replay time
+    if (element.text) hints.text = element.text;
+    if (element.tag) hints.tag = element.tag;
     return hints;
   }
 
@@ -618,13 +1010,28 @@ export class RecordingCaptureService {
     label: string;
     selectedText: string;
     selectedValue: string;
+    pageUrl?: string;
+    name?: string;
+    id?: string;
+    ariaLabel?: string;
+    role?: string;
   }): PreviewIntentStep {
-    const { label, selectedText, selectedValue } = params;
+    const { label, selectedText, selectedValue, pageUrl, name, id, ariaLabel, role } = params;
+
+    // V13: Build bindingHints from captured select metadata
+    const hints: Record<string, string> = {};
+    if (label) hints.label = label;
+    if (ariaLabel) hints.label = ariaLabel; // aria-label takes priority
+    if (name) hints.name = name;
+    if (role && role !== 'combobox') hints.role = role;
+
     return {
       id: recStepId(),
       type: 'select',
       description: this.buildDescription('select', { tag: 'select', labelText: label } as ProbedElement, selectedText),
       value: selectedValue,
+      bindingHints: Object.keys(hints).length > 0 ? hints : undefined,
+      evidence: { confidence: 1.0, pageUrl },
     };
   }
 
@@ -642,6 +1049,7 @@ export class RecordingCaptureService {
     endX: number,
     endY: number,
     endElement: ProbedElement | null,
+    pageUrl?: string,
   ): PreviewIntentStep | null {
     const distance = Math.sqrt(
       Math.pow(endX - dragState.startX, 2) + Math.pow(endY - dragState.startY, 2),
@@ -657,6 +1065,7 @@ export class RecordingCaptureService {
       : `Drag '${fromLabel}'`;
 
     const startRef = dragState.startElement?.ref;
+    // V14: Store viewport dimensions for coordinate normalization during replay
     return {
       id: recStepId(),
       type: 'drag_and_drop',
@@ -664,13 +1073,16 @@ export class RecordingCaptureService {
       value: JSON.stringify({
         from: { x: Math.round(dragState.startX), y: Math.round(dragState.startY) },
         to: { x: Math.round(endX), y: Math.round(endY) },
+        viewport: dragState.viewport,
       }),
       bindingHints: dragState.startElement
         ? this.buildBindingHints(dragState.startElement) as BindingHints | undefined
         : undefined,
-      ...(startRef && {
-        evidence: { lastSuccessRef: startRef, confidence: 1.0 },
-      }),
+      evidence: {
+        ...(startRef && { lastSuccessRef: startRef }),
+        confidence: 1.0,
+        pageUrl,
+      },
     };
   }
 
@@ -683,6 +1095,7 @@ export class RecordingCaptureService {
   static captureFileUpload(
     filePaths: string[],
     element: ProbedElement | null,
+    pageUrl?: string,
   ): PreviewIntentStep | null {
     if (!filePaths || filePaths.length === 0) return null;
 
@@ -700,30 +1113,126 @@ export class RecordingCaptureService {
       description,
       value: fileNames[0],
       bindingHints: element ? this.buildBindingHints(element) as BindingHints | undefined : undefined,
-      ...(element?.ref && {
-        evidence: { lastSuccessRef: element.ref, confidence: 1.0 },
-      }),
+      evidence: {
+        ...(element?.ref && { lastSuccessRef: element.ref }),
+        confidence: 1.0,
+        pageUrl,
+      },
     };
   }
 
   /**
+   * V15: Minimum scroll threshold (px) — ignore trackpad noise / micro-scrolls.
+   * Below this, scroll event is not recorded.
+   */
+  private static SCROLL_MIN_THRESHOLD_PX = 50;
+
+  /**
    * V10 Fix #8: Capture a scroll step with actual delta value.
+   * V15: Added minimum threshold, optional bindingHints for scroll-to-element replay.
    *
    * @param accumulatedDeltaY - Total pixels scrolled during the debounce window
+   * @param pageUrl - Current page URL for evidence
+   * @param accumulatedDeltaX - Total horizontal scroll (V14)
+   * @param scrollTargetHints - Optional: bindingHints for the element that became visible after scroll (V15)
    */
-  static captureScroll(accumulatedDeltaY: number): PreviewIntentStep | null {
-    if (accumulatedDeltaY === 0) return null;
+  static captureScroll(
+    accumulatedDeltaY: number,
+    pageUrl?: string,
+    accumulatedDeltaX?: number,
+    scrollTargetHints?: BindingHints,
+  ): PreviewIntentStep | null {
+    if (accumulatedDeltaY === 0 && (!accumulatedDeltaX || accumulatedDeltaX === 0)) return null;
 
-    const direction = accumulatedDeltaY > 0 ? 'down' : 'up';
-    const absDelta = Math.abs(Math.round(accumulatedDeltaY));
+    // V15: Filter micro-scrolls (trackpad noise, accidental touch)
+    const totalMagnitude = Math.abs(accumulatedDeltaY) + Math.abs(accumulatedDeltaX || 0);
+    if (totalMagnitude < this.SCROLL_MIN_THRESHOLD_PX) return null;
+
+    const parts: string[] = [];
+    if (accumulatedDeltaY !== 0) {
+      parts.push(`${accumulatedDeltaY > 0 ? 'down' : 'up'} ${Math.abs(Math.round(accumulatedDeltaY))}px`);
+    }
+    if (accumulatedDeltaX && accumulatedDeltaX !== 0) {
+      parts.push(`${accumulatedDeltaX > 0 ? 'right' : 'left'} ${Math.abs(Math.round(accumulatedDeltaX))}px`);
+    }
+
+    // V14: Store both deltaX and deltaY as comma-separated value for replay
+    const deltaXRounded = Math.round(accumulatedDeltaX || 0);
+    const deltaYRounded = Math.round(accumulatedDeltaY);
 
     return {
       id: recStepId(),
       type: 'scroll',
-      description: `Scroll ${direction} ${absDelta}px`,
-      // Store the actual delta as value so replay can use it
-      value: String(Math.round(accumulatedDeltaY)),
+      description: `Scroll ${parts.join(', ')}`,
+      value: deltaXRounded !== 0 ? `${deltaYRounded},${deltaXRounded}` : String(deltaYRounded),
+      // V15: If we found a target element after scroll, attach hints so replay can use scrollIntoView
+      ...(scrollTargetHints && Object.keys(scrollTargetHints).length > 0 && { bindingHints: scrollTargetHints }),
+      evidence: { confidence: 1.0, pageUrl },
     };
+  }
+
+  /**
+   * V15: After scroll completes, find a meaningful element near viewport center
+   * that can serve as a scroll-to anchor during replay.
+   * Returns BindingHints for the element, or null if nothing meaningful found.
+   */
+  static async probeScrollTarget(page: Page): Promise<BindingHints | null> {
+    try {
+      const result = await page.evaluate(`
+        (function() {
+          var vw = window.innerWidth;
+          var vh = window.innerHeight;
+          // Sample a point in the upper-center area (where user likely scrolled to see)
+          var cx = Math.round(vw / 2);
+          var cy = Math.round(vh * 0.35);
+          // Look for a meaningful element: heading, landmark, labeled section
+          // Avoid [id] — too many matches on heavy pages, causes reflow storm
+          var candidates = document.querySelectorAll(
+            'h1,h2,h3,h4,h5,h6,[role="heading"],section[aria-label],main,article,' +
+            '[data-testid],[aria-label]'
+          );
+          var best = null;
+          var bestDist = Infinity;
+          // Cap iterations to avoid perf issues on element-heavy pages
+          var maxCandidates = Math.min(candidates.length, 200);
+          for (var i = 0; i < maxCandidates; i++) {
+            var c = candidates[i];
+            var rect = c.getBoundingClientRect();
+            // Element must be in viewport
+            if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) continue;
+            if (rect.width === 0 || rect.height === 0) continue;
+            // Distance from element center to our sample point
+            var ecx = rect.left + rect.width / 2;
+            var ecy = rect.top + rect.height / 2;
+            var dist = Math.abs(ecx - cx) + Math.abs(ecy - cy);
+            if (dist < bestDist) {
+              bestDist = dist;
+              best = c;
+            }
+          }
+          if (!best) return null;
+          var tag = best.tagName.toLowerCase();
+          return {
+            tag: tag,
+            text: (best.textContent || '').trim().slice(0, 80) || undefined,
+            role: best.getAttribute('role') || undefined,
+            ariaLabel: best.getAttribute('aria-label') || undefined,
+            id: best.getAttribute('id') || undefined
+          };
+        })()
+      `) as { tag: string; text?: string; role?: string; ariaLabel?: string; id?: string } | null;
+
+      if (!result) return null;
+
+      const hints: BindingHints = {};
+      if (result.role) hints.role = result.role;
+      if (result.ariaLabel) hints.nearText = result.ariaLabel;
+      if (result.text) hints.text = result.text;
+      if (result.tag) hints.tag = result.tag;
+      return Object.keys(hints).length > 0 ? hints : null;
+    } catch {
+      return null;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -734,16 +1243,87 @@ export class RecordingCaptureService {
    * Capture a hover action as an IntentStep.
    * Used when a hover on a different element precedes a click (e.g., dropdown menus).
    */
-  static captureHover(element: ProbedElement): PreviewIntentStep {
+  static captureHover(element: ProbedElement, pageUrl?: string): PreviewIntentStep {
     const label = this.getElementLabel(element);
     return {
       id: recStepId(),
       type: 'hover',
       description: `Hover '${label}'`,
       bindingHints: this.buildBindingHints(element) as BindingHints | undefined,
-      ...(element.ref && {
-        evidence: { lastSuccessRef: element.ref, confidence: 1.0 },
-      }),
+      evidence: {
+        ...(element.ref && { lastSuccessRef: element.ref }),
+        confidence: 1.0,
+        pageUrl,
+      },
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // DIALOG CAPTURE (V13)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Capture a native dialog interaction (alert/confirm/prompt/beforeunload).
+   * Records what the user did (accept/dismiss) so replay can reproduce it.
+   */
+  static captureDialog(params: {
+    dialogType: 'alert' | 'confirm' | 'prompt' | 'beforeunload';
+    action: 'accept' | 'dismiss';
+    message?: string;
+    promptText?: string;
+    pageUrl?: string;
+  }): PreviewIntentStep {
+    const { dialogType, action, message, promptText, pageUrl } = params;
+
+    const actionLabel = action === 'accept' ? 'Accept' : 'Dismiss';
+    const dialogLabel = dialogType === 'beforeunload' ? 'beforeunload dialog' : `${dialogType} dialog`;
+    const msgPreview = message ? `: "${message.slice(0, 40)}"` : '';
+    const description = `${actionLabel} ${dialogLabel}${msgPreview}`;
+
+    return {
+      id: recStepId(),
+      type: 'dialog',
+      description,
+      options: {
+        dialog: {
+          dialogType,
+          action,
+          ...(promptText && { promptText }),
+          ...(message && { message: message.slice(0, 500) }),
+        },
+      },
+      evidence: { confidence: 1.0, pageUrl },
+    };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // DOWNLOAD CAPTURE (V13)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Capture a file download as an IntentStep.
+   * Auto-recorded when a download event fires during recording.
+   * During replay, verifies that the download actually starts.
+   */
+  static captureDownload(params: {
+    filename: string;
+    url?: string;
+    pageUrl?: string;
+  }): PreviewIntentStep {
+    const { filename, url, pageUrl } = params;
+    return {
+      id: recStepId(),
+      type: 'download',
+      description: `Verify file download: '${filename.slice(0, 60)}'`,
+      value: filename,
+      options: {
+        download: {
+          filename,
+          url,
+          timeoutMs: 15000,
+        },
+      },
+      evidence: { confidence: 1.0, pageUrl },
     };
   }
 
@@ -773,15 +1353,17 @@ export class RecordingCaptureService {
       ? `Type '${textPreview}' in '${label}' and press Enter`
       : `Type '${textPreview}' in '${label}'`;
 
+    const opts: Record<string, any> = {};
+    if (triggeredByEnter) opts.pressEnter = true;
+    if (buffer.iframeSelector) opts.iframe = { selector: buffer.iframeSelector };
+
     return {
       id: recStepId(),
       type: 'type',
       description,
       value: buffer.text,
       bindingHints: buffer.bindingHints as BindingHints | undefined,
-      ...(triggeredByEnter && {
-        options: { pressEnter: true },
-      }),
+      ...(Object.keys(opts).length > 0 && { options: opts }),
       ...(buffer.elementRef && {
         evidence: { lastSuccessRef: buffer.elementRef, confidence: 1.0, pageUrl: buffer.pageUrl },
       }),
@@ -825,8 +1407,14 @@ export class RecordingCaptureService {
           const text = selectedOption?.text || '';
           const value = select.value;
 
+          // V13: Capture additional binding hints for element resolution during replay
+          const name = select.getAttribute('name') || '';
+          const id = select.getAttribute('id') || '';
+          const ariaLabel = select.getAttribute('aria-label') || '';
+          const role = select.getAttribute('role') || 'combobox';
+
           // @ts-ignore
-          if (window[cbName]) window[cbName]({ label, text, value });
+          if (window[cbName]) window[cbName]({ label, text, value, name, id, ariaLabel, role });
         };
 
         // @ts-ignore
@@ -858,6 +1446,136 @@ export class RecordingCaptureService {
           // @ts-ignore
           delete window.__qai_select_injected;
         }
+      });
+    } catch {
+      // Page may already be closed
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // AUTOFILL DETECTION (V13)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Inject an autofill detection listener into the page.
+   * Monitors 'change' events on input elements that fire without prior keyboard 'input' events.
+   * Browser autofill triggers 'change' directly (no keydown/keypress/keyup/input sequence).
+   * We track which inputs had recent 'input' events (from keyboard) and skip those.
+   */
+  static async injectAutofillListener(
+    page: Page,
+    callbackName: string,
+  ): Promise<void> {
+    try {
+      // @ts-ignore - browser context code
+      await page.evaluate((cbName: string) => {
+        // @ts-ignore
+        if (window.__qai_autofill_injected) return;
+        // @ts-ignore
+        window.__qai_autofill_injected = true;
+
+        // Track which inputs had recent keyboard 'input' events
+        // @ts-ignore
+        const recentKeyboardInputs = new Set();
+        // @ts-ignore
+        let clearTimer: ReturnType<typeof setTimeout> | null = null;
+
+        // Listen for 'input' events from keyboard (user typing)
+        // @ts-ignore
+        const inputHandler = (e) => {
+          if (e.inputType && e.inputType.startsWith('insert') && e.target?.tagName) {
+            const tag = e.target.tagName.toLowerCase();
+            if (tag === 'input' || tag === 'textarea') {
+              const key = (e.target.getAttribute('data-agent-ref') || e.target.name || e.target.id || '');
+              if (key) recentKeyboardInputs.add(key);
+              // Clear after 500ms
+              if (clearTimer) clearTimeout(clearTimer);
+              clearTimer = setTimeout(() => recentKeyboardInputs.clear(), 500);
+            }
+          }
+        };
+        // @ts-ignore
+        document.addEventListener('input', inputHandler, true);
+
+        // Listen for 'change' events — autofill triggers these without prior 'input' events
+        // @ts-ignore
+        const changeHandler = (e) => {
+          const el = e.target;
+          if (!el || !el.tagName) return;
+          const tag = el.tagName.toLowerCase();
+          if (tag !== 'input' && tag !== 'textarea') return;
+          // Skip select elements (handled by select listener)
+          if (tag === 'select') return;
+
+          const key = (el.getAttribute('data-agent-ref') || el.name || el.id || '');
+          // If this input had recent keyboard input, skip — it's not autofill
+          if (key && recentKeyboardInputs.has(key)) return;
+
+          const value = el.value || '';
+          if (!value) return;
+
+          // Get label for the input
+          let label = '';
+          if (el.labels && el.labels.length > 0) {
+            label = (el.labels[0].textContent || '').trim().slice(0, 100);
+          }
+          if (!label) {
+            label = el.getAttribute('aria-label') || '';
+          }
+
+          // @ts-ignore
+          if (window[cbName]) {
+            // @ts-ignore
+            window[cbName]({
+              tag: tag,
+              type: el.getAttribute('type') || '',
+              name: el.getAttribute('name') || '',
+              id: el.getAttribute('id') || '',
+              ariaLabel: el.getAttribute('aria-label') || '',
+              label: label,
+              value: value,
+              ref: el.getAttribute('data-agent-ref') || '',
+            });
+          }
+        };
+        // @ts-ignore
+        document.addEventListener('change', changeHandler, true);
+
+        // @ts-ignore
+        window.__qai_autofill_input_handler = inputHandler;
+        // @ts-ignore
+        window.__qai_autofill_change_handler = changeHandler;
+      }, callbackName);
+    } catch (error) {
+      logger.debug('[RECORDING] Failed to inject autofill listener', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Remove the injected autofill detection listener.
+   */
+  static async removeAutofillListener(page: Page): Promise<void> {
+    try {
+      // @ts-ignore - browser context code
+      await page.evaluate(() => {
+        // @ts-ignore
+        if (window.__qai_autofill_input_handler) {
+          // @ts-ignore
+          document.removeEventListener('input', window.__qai_autofill_input_handler, true);
+          // @ts-ignore
+          delete window.__qai_autofill_input_handler;
+        }
+        // @ts-ignore
+        if (window.__qai_autofill_change_handler) {
+          // @ts-ignore
+          document.removeEventListener('change', window.__qai_autofill_change_handler, true);
+          // @ts-ignore
+          delete window.__qai_autofill_change_handler;
+        }
+        // @ts-ignore
+        delete window.__qai_autofill_injected;
       });
     } catch {
       // Page may already be closed

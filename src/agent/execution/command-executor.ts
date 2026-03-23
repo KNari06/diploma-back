@@ -7,6 +7,7 @@ import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/inte
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
+import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
 import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
@@ -14,6 +15,8 @@ import { Frame, Locator, Page } from 'playwright';
 import { shouldPressEnterAfterFill } from '../utils/ai/enter-detection-ai';
 import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector, validateAndGetLocator } from '../utils/selectors/selector-utils';
 import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/smart-wait.service';
+import type { ReplayTraceWriter } from '../playwright/core/replay-trace-writer';
+import { executeCoordinateDrag, parseDragCoordinates } from '../playwright/core/drag-helpers';
 import { buildRuntimeMeta, executeCompiledLocatorPlan } from './compiled-locator-executor';
 import {
   buildGlobWaitPayload,
@@ -222,6 +225,10 @@ export class CommandExecutor {
   private currentCommandIndex?: number;
   /** V10: Current commands list in executeCommands loop (for next-step lookahead) */
   private currentCommandsList?: PlaywrightCommand[];
+  /** V14: Replay trace writer for local JSONL logging (optional) */
+  private replayTrace?: ReplayTraceWriter;
+  /** V14: Total steps count for trace events */
+  private totalSteps?: number;
 
   constructor(
     page: Page,
@@ -233,6 +240,8 @@ export class CommandExecutor {
       selfHealingConfidenceThreshold?: number; // ✅ NEW: Configurable confidence
       skipCompiledPlan?: boolean; // Skip compiled locator plan (Stage 1) — used on retry attempts
       maxDomNodes?: number; // Limit DOM nodes collected (saves memory in replay mode)
+      replayTrace?: ReplayTraceWriter; // V14: JSONL trace writer for local debugging
+      totalSteps?: number; // V14: Total steps for trace events
     } = {}
   ) {
     this.page = page;
@@ -242,6 +251,8 @@ export class CommandExecutor {
     this.selfHealingConfidenceThreshold = options.selfHealingConfidenceThreshold ?? COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
     this.skipCompiledPlan = options.skipCompiledPlan ?? false;
     this.maxDomNodes = options.maxDomNodes;
+    this.replayTrace = options.replayTrace;
+    this.totalSteps = options.totalSteps;
 
     this.abortController = new AbortController();
 
@@ -275,6 +286,22 @@ export class CommandExecutor {
   dispose(): void {
     // Cleanup is handled by { once: true } in addEventListener
     this.externalAbortHandler = undefined;
+  }
+
+  /**
+   * V14: Write a trace event to local JSONL file (if trace writer is attached).
+   * Non-blocking — never throws, never blocks execution.
+   */
+  private trace(eventType: string, step: number, payload: Record<string, any>): void {
+    if (!this.replayTrace) return;
+    try {
+      this.replayTrace.write({
+        eventType,
+        step,
+        totalSteps: this.totalSteps || 0,
+        payload,
+      });
+    } catch { /* non-fatal */ }
   }
 
   /**
@@ -422,11 +449,25 @@ export class CommandExecutor {
             await this.ensureTopMostAtCenter(locator, 2000);
             // ✅ Wait for enabled: Ensure element is not disabled
             await this.waitForEnabled(locator, 5000);
+
+            // V13: Build Playwright modifiers array from command modifiers
+            const cmdModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
+            if (command.modifiers) {
+              if (command.modifiers.shift) cmdModifiers.push('Shift');
+              if (command.modifiers.ctrl) cmdModifiers.push('Control');
+              if (command.modifiers.meta) cmdModifiers.push('Meta');
+              if (command.modifiers.alt) cmdModifiers.push('Alt');
+            }
+            const clickOpts: Parameters<Locator['click']>[0] = {
+              timeout: timeout || 30000,
+              ...(cmdModifiers.length > 0 && { modifiers: cmdModifiers }),
+            };
+
             if (awaitNavigation) {
               // Capture URL before click to detect navigation
               const urlBeforeClick = this.page.url();
               const pagesBefore = this.page.context().pages().length;
-              await locator.click({ timeout: timeout || 30000 });
+              await locator.click(clickOpts);
               // Wait for URL to change (replaces deprecated waitForNavigation)
               try {
                 await this.page.waitForURL(
@@ -465,7 +506,7 @@ export class CommandExecutor {
                 }
               }
             } else {
-              await locator.click({ timeout: timeout || 30000 });
+              await locator.click(clickOpts);
             }
           };
 
@@ -590,8 +631,32 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            // Use type() to simulate real keyboard events character by character
-            await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+
+            // V13: Paste mode — clipboard write + Ctrl/Cmd+V to trigger paste event listeners
+            if (intentCommand.intentMeta.isPaste) {
+              await intentTypeLocator.click({ timeout: timeout || 30000 }); // Focus
+              const ctx = this.page.context();
+              await ctx.grantPermissions(['clipboard-read', 'clipboard-write']).catch(() => {});
+              // @ts-expect-error - navigator exists in browser context
+              await this.page.evaluate((text) => navigator.clipboard.writeText(text), String(value)).catch(async () => {
+                await this.page.evaluate((text) => {
+                  // @ts-expect-error - document exists in browser context
+                  const ta = document.createElement('textarea');
+                  ta.value = text;
+                  // @ts-expect-error - document exists in browser context
+                  document.body.appendChild(ta);
+                  ta.select();
+                  // @ts-expect-error - document exists in browser context
+                  document.execCommand('copy');
+                  ta.remove();
+                }, String(value));
+              });
+              const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
+              await this.page.keyboard.press(`${mod}+v`);
+            } else {
+              // Use type() to simulate real keyboard events character by character
+              await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+            }
 
             // V10: Smart Enter decision
             const shouldPressIntent = await decideEnterAfterType(intentTypeLocator);
@@ -1056,13 +1121,7 @@ export class CommandExecutor {
           break;
         }
 
-        case 'dragAndDrop':
-          if (!selector) throw new Error('Source selector is required for dragAndDrop action');
-          if (!value) throw new Error('Target selector is required for dragAndDrop action');
-          const dragSource = this.getLocatorInternal(selector);
-          const dragTarget = this.getLocatorInternal(this.prepareSelector(String(value)) || String(value));
-          await dragSource.dragTo(dragTarget, { timeout: timeout || 30000 });
-          break;
+        // V14: dragAndDrop moved below (unified handler with coordinate + selector + intent support)
 
         case 'tap':
           if (!selector) throw new Error('Selector is required for tap action');
@@ -1118,10 +1177,56 @@ export class CommandExecutor {
           break;
         }
 
+        // V13: Verify file download (wait for download event from previous click)
+        case 'verifyDownload': {
+          const dlOpts = command.download;
+          const dlTimeout = dlOpts?.timeoutMs ?? timeout ?? 15000;
+          const expectedName = dlOpts?.filename || (typeof command.value === 'string' ? command.value : undefined);
+
+          const dl = await this.page.waitForEvent('download', { timeout: dlTimeout });
+          const actualName = dl.suggestedFilename();
+
+          if (expectedName && !actualName.toLowerCase().includes(expectedName.toLowerCase())) {
+            await dl.cancel().catch(() => {});
+            throw new Error(`Download filename mismatch. Expected: "${expectedName}", Got: "${actualName}"`);
+          }
+          await dl.cancel().catch(() => {});
+          break;
+        }
+
+        // V13: Handle native dialog (alert/confirm/prompt/beforeunload)
+        // Pre-installs a one-time dialog handler that fires when the next action triggers the dialog.
+        case 'handleDialog': {
+          const dialogOpts = command.dialog;
+          if (!dialogOpts) throw new Error('handleDialog requires dialog options');
+
+          this.page.once('dialog', async (dialog) => {
+            try {
+              if (dialogOpts.action === 'accept') {
+                await dialog.accept(dialogOpts.promptText);
+              } else {
+                await dialog.dismiss();
+              }
+            } catch { /* dialog may already be handled */ }
+          });
+          // Return immediately — the handler is pre-installed and will fire
+          // when the next command (e.g., click) triggers the dialog.
+          break;
+        }
+
         case 'scroll':
           if (selector) {
             const scrollLocator = this.getLocatorInternal(selector);
             await scrollLocator.scrollIntoViewIfNeeded();
+          } else if (command.value) {
+            // V14: Use deltaY,deltaX from step value
+            const sParts = (typeof command.value === 'string' ? command.value : String(command.value)).split(',');
+            const sDy = parseFloat(sParts[0] || '') || 300;
+            const sDx = sParts.length > 1 ? (parseFloat(sParts[1] || '') || 0) : 0;
+            await this.page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
+              // @ts-expect-error - browser context
+              window.scrollBy(dx, dy);
+            }, { dx: sDx, dy: sDy });
           } else {
             await this.page.evaluate(() => {
               // @ts-expect-error - browser context
@@ -2223,6 +2328,53 @@ export class CommandExecutor {
           break;
         }
 
+        // V14: Context menu (right-click)
+        case 'contextmenu': {
+          const performRightClick = async (locator: Locator) => {
+            await this.forceScrollIntoView(locator);
+            await locator.click({ button: 'right', timeout: timeout || 30000 });
+          };
+
+          if (isIntentCommand && intentCommand.intentMeta) {
+            const { locator: intentLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 30000
+            );
+            await performRightClick(intentLocator);
+            break;
+          }
+
+          if (!selector) throw new Error('Selector is required for contextmenu action');
+          const ctxLocator = getLocator(this.page, selector);
+          await performRightClick(ctxLocator);
+          break;
+        }
+
+        // V14: Drag & Drop (coordinate-based from recording, or selector-based)
+        case 'dragAndDrop': {
+          const dragCoords = parseDragCoordinates(value);
+
+          if (dragCoords) {
+            await executeCoordinateDrag(this.page, dragCoords);
+          } else if (isIntentCommand && intentCommand.intentMeta) {
+            // Intent-based: resolve source element, use dropTarget or value as target
+            const { locator: srcLocator } = await this.getLocatorForIntentCommand(
+              intentCommand, 'click', timeout || 30000
+            );
+            const targetSel = command.dropTarget || String(value || '');
+            if (!targetSel) throw new Error('dragAndDrop requires coordinate data or a target selector');
+            const tgtLocator = this.getLocatorInternal(targetSel);
+            await srcLocator.dragTo(tgtLocator, { timeout: timeout || 30000 });
+          } else {
+            // Pipeline-generated: selector-based
+            if (!selector) throw new Error('Source selector is required for dragAndDrop action');
+            if (!value) throw new Error('Target selector is required for dragAndDrop action');
+            const dSrc = this.getLocatorInternal(selector);
+            const dTgt = this.getLocatorInternal(this.prepareSelector(String(value)) || String(value));
+            await dSrc.dragTo(dTgt, { timeout: timeout || 30000 });
+          }
+          break;
+        }
+
         default:
           throw new Error(`Unknown action: ${action}`);
       }
@@ -2385,10 +2537,49 @@ export class CommandExecutor {
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
+
+        // ── LLM Blocker Diagnosis: diagnose + wait + final retry ──
+        // Only for intent-based commands (have step context for diagnosis)
+        const intentCmd = command as IntentPlaywrightCommand;
+        if (!command.continueOnError && intentCmd.intentMeta) {
+          try {
+            const diagStep: IntentStep = {
+              id: intentCmd.intentMeta.stepId || `cmd-${index}`,
+              type: intentCmd.intentMeta.actionType as any,
+              description: command.description || '',
+              bindingHints: intentCmd.intentMeta.bindingHints,
+              compiled: intentCmd.intentMeta.compiled,
+            };
+
+            const diagnosis = await diagnoseStepBlocker(this.page, diagStep, errorMessage);
+
+            if (diagnosis && diagnosis.shouldRetry) {
+              logger.info('[COMMAND_EXECUTOR] LLM diagnosis suggests retry', {
+                index, action: command.action, blocker: diagnosis.blocker,
+                confidence: diagnosis.confidence,
+              });
+
+              await actOnDiagnosis(this.page, diagnosis);
+              const retryResult = await this.executeCommand(command);
+
+              if (retryResult.success) {
+                logger.info('[COMMAND_EXECUTOR] LLM-guided retry succeeded', {
+                  index, action: command.action, blocker: diagnosis.blocker,
+                });
+                results.push({ command, result: retryResult });
+                continue; // Recovered — proceed to next command
+              }
+            }
+          } catch (diagError) {
+            logger.warn('[COMMAND_EXECUTOR] LLM diagnosis failed', {
+              index, error: diagError instanceof Error ? diagError.message : String(diagError),
+            });
+          }
+        }
+
         errors.push({ command, error: errorMessage });
 
         if (!command.continueOnError) {
-          // ✅ FIX: Enhanced error logging with full command context
           logger.error('[COMMAND_EXECUTOR] Command execution stopped due to error', {
             command: {
               action: command.action,
@@ -2834,6 +3025,14 @@ export class CommandExecutor {
           error: lastError.message,
           totalCandidatesEver: retryCtx.totalCandidatesEver,
         });
+
+        this.trace('element_resolution_retry', attempt + 1, {
+          stepId: command.intentMeta?.stepId,
+          attempt: attempt + 1,
+          error: lastError.message,
+          totalCandidatesEver: retryCtx.totalCandidatesEver,
+          stageFails: { ...retryCtx.stageDeterministicFail },
+        });
       }
     }
 
@@ -2889,6 +3088,14 @@ export class CommandExecutor {
           iframe: !!iframeSelector,
         });
 
+        this.trace('element_resolution', retryCtx.attempt + 1, {
+          stepId, stage: 'compiled', success: true,
+          strategy: compiledResult.usedStrategy,
+          confidence: compiledResult.confidence,
+          signatureMatched: compiledResult.signatureMatched,
+          durationMs: Date.now() - startTime,
+        });
+
         return { locator: compiledResult.locator, runtimeMeta };
       }
 
@@ -2898,6 +3105,14 @@ export class CommandExecutor {
         skipReason: compiledResult.skipReason,
         expired: compiledResult.expired,
         signatureMatched: compiledResult.signatureMatched,
+      });
+
+      this.trace('element_resolution', retryCtx.attempt + 1, {
+        stepId, stage: 'compiled', success: false,
+        skipReason: compiledResult.skipReason,
+        expired: compiledResult.expired,
+        signatureMatched: compiledResult.signatureMatched,
+        durationMs: Date.now() - startTime,
       });
 
       // Store failure meta so replay trace includes compiled plan failure info
@@ -2939,6 +3154,8 @@ export class CommandExecutor {
         } else {
           // Run LLM-based element resolution
           const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
+          // V14: Lazy screenshot callback for vision rescue when 0 candidates match
+          const pageForScreenshot = this.page;
           const resolveResult = await resolveElement({
             previewSessionId: 'background', // Not a preview session
             stepDraft: {
@@ -2951,6 +3168,12 @@ export class CommandExecutor {
             domNodes,
             pageUrl: this.page.url(),
             includeAlternatives: false,
+            screenshot: async () => {
+              try {
+                const buf = await pageForScreenshot.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+                return buf.toString('base64');
+              } catch { return null; }
+            },
           });
 
           if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
@@ -3006,6 +3229,16 @@ export class CommandExecutor {
                 resolutionPath: 'llm_resolver',
               });
 
+              this.trace('element_resolution', retryCtx.attempt + 1, {
+                stepId, stage: 'llm_resolver', success: true,
+                confidence: topCandidate.confidence,
+                candidateCount: resolveResult.candidates.length,
+                domNodesCollected: domNodes.length,
+                ref: topCandidate.ref,
+                label: topCandidate.label?.slice(0, 80),
+                durationMs: Date.now() - startTime,
+              });
+
               // TODO P1: Persist healed ref back to intent test case for future runs
               // if (topCandidate.confidence >= 0.85 && intentMeta.intentTestCaseId) {
               //   await IntentTestCaseService.updateStep(...)
@@ -3027,6 +3260,15 @@ export class CommandExecutor {
             status: resolveResult.status,
             candidateCount: resolveResult.candidates.length,
             message: resolveResult.message,
+          });
+
+          this.trace('element_resolution', retryCtx.attempt + 1, {
+            stepId, stage: 'llm_resolver', success: false,
+            status: resolveResult.status,
+            candidateCount: resolveResult.candidates.length,
+            domNodesCollected: domNodes.length,
+            message: resolveResult.message,
+            durationMs: Date.now() - startTime,
           });
         }
       } catch (resolverError) {
@@ -3231,6 +3473,16 @@ export class CommandExecutor {
               needsReview,
               flaky,
               verified: healingResult.verified,
+            });
+
+            this.trace('element_resolution', retryCtx.attempt + 1, {
+              stepId, stage: 'self_heal', success: true,
+              confidence: healConfidence,
+              newSelector: healingResult.newSelector,
+              escalated: healingResult.escalated,
+              verified: healingResult.verified,
+              needsReview, flaky,
+              durationMs: Date.now() - startTime,
             });
 
             // V2: Update compiled in DB if high-confidence heal (≥0.9)
@@ -3781,6 +4033,11 @@ export class CommandExecutor {
         await locator.dblclick({ timeout: defaultTimeout });
         break;
 
+      case 'contextmenu':
+        await this.forceScrollIntoView(locator);
+        await locator.click({ button: 'right', timeout: defaultTimeout });
+        break;
+
       case 'type':
         if (value === undefined) throw new Error('Value is required for type action');
         // Use pressSequentially (not fill) to match main handler — fires keydown/keypress/keyup per char
@@ -3840,11 +4097,19 @@ export class CommandExecutor {
       // ═══════════════════════════════════════════════════════════════
       // DRAG & DROP / MOBILE
       // ═══════════════════════════════════════════════════════════════
-      case 'dragAndDrop':
-        if (!value) throw new Error('Target selector is required for dragAndDrop action');
-        const targetLocator = this.getLocatorInternal(String(value));
-        await locator.dragTo(targetLocator, { timeout: defaultTimeout });
+      case 'dragAndDrop': {
+        const dragCoords = parseDragCoordinates(value);
+        if (dragCoords) {
+          await executeCoordinateDrag(this.page, dragCoords);
+        } else if (value) {
+          // Selector-based drag (target selector in value)
+          const targetLocator = this.getLocatorInternal(String(value));
+          await locator.dragTo(targetLocator, { timeout: defaultTimeout });
+        } else {
+          throw new Error('dragAndDrop requires coordinate data (JSON value) or a target selector');
+        }
         break;
+      }
 
       case 'tap':
         await locator.tap({ timeout: defaultTimeout });
@@ -3861,7 +4126,18 @@ export class CommandExecutor {
       // ═══════════════════════════════════════════════════════════════
       case 'scroll':
       case 'scrollIntoView':
-        await locator.scrollIntoViewIfNeeded({ timeout: defaultTimeout });
+        if (locator) {
+          await locator.scrollIntoViewIfNeeded({ timeout: defaultTimeout });
+        } else if (value) {
+          // V14: Use deltaY,deltaX from step value
+          const scrollParts = (typeof value === 'string' ? value : String(value)).split(',');
+          const sdy = parseFloat(scrollParts[0] || '') || 300;
+          const sdx = scrollParts.length > 1 ? (parseFloat(scrollParts[1] || '') || 0) : 0;
+          await this.page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
+            // @ts-expect-error - browser context
+            window.scrollBy(dx, dy);
+          }, { dx: sdx, dy: sdy });
+        }
         break;
 
       // ═══════════════════════════════════════════════════════════════
@@ -4023,13 +4299,14 @@ export class CommandExecutor {
     // Priority: changedFrom > regex > glob > substring > domain
 
     if (matcher.changedFrom) {
-      // Wait until URL changes from the specified value.
-      // Use page.waitForURL which is navigation-lifecycle-aware:
-      // - Checks current URL immediately (catches already-changed case)
-      // - Listens for frame.navigated events (catches in-flight navigation)
-      // - Waits for waitUntil load state after URL matches (ensures page is ready)
-      // - Handles both full-page nav and SPA pushState
-      const prevUrl = matcher.changedFrom;
+      // V13: Use runtime URL instead of recording-time URL.
+      // The recorded changedFrom may differ from the actual URL at execution time
+      // (different env, query params, etc.) — use current page URL as baseline.
+      const prevUrl = this.page.url();
+      logger.debug('[COMMAND_EXECUTOR] changedFrom using runtime URL', {
+        recorded: matcher.changedFrom,
+        runtime: prevUrl,
+      });
       await this.page.waitForURL(
         (url) => url.toString() !== prevUrl,
         { timeout: timeoutMs, waitUntil: 'load' }

@@ -1052,6 +1052,23 @@ export interface PlaywrightCommand {
   };
   /** URL matcher for waitFor action (V5: SPA-safe URL waiting) */
   urlMatcher?: PlaywrightUrlMatcher;
+  /** V13: Modifier keys held during click (for multi-select, range select, etc.) */
+  modifiers?: { shift?: boolean; ctrl?: boolean; meta?: boolean; alt?: boolean };
+  /** V13: Dialog handling options (for handleDialog action) */
+  dialog?: {
+    dialogType: 'alert' | 'confirm' | 'prompt' | 'beforeunload';
+    action: 'accept' | 'dismiss';
+    promptText?: string;
+    message?: string;
+  };
+  /** V13: Download verification options (for verifyDownload action) */
+  download?: {
+    filename?: string;
+    url?: string;
+    timeoutMs?: number;
+  };
+  /** V14: Drop target selector for dragAndDrop action (element-based drag) */
+  dropTarget?: string;
 }
 
 export interface PlaywrightTestPlan {

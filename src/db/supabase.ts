@@ -352,12 +352,13 @@ export class SupabaseService {
       // Backward-compatible fallback: some Supabase instances may not have the artifact columns yet.
       // PostgREST returns PGRST204 when a column is missing.
       const errorCode = (error as any)?.code;
-      if (errorCode === 'PGRST204' && (resultData?.video_url !== undefined || resultData?.trace_url !== undefined)) {
-        const { video_url: _videoUrl, trace_url: _traceUrl, ...withoutArtifacts } = resultData || {};
+      if (errorCode === 'PGRST204' && (resultData?.video_url !== undefined || resultData?.trace_url !== undefined || resultData?.replay_trace_url !== undefined)) {
+        const { video_url: _videoUrl, trace_url: _traceUrl, replay_trace_url: _replayTraceUrl, ...withoutArtifacts } = resultData || {};
         // Keep explicit destructuring for clarity, but avoid unused-vars lint errors
         void _videoUrl;
         void _traceUrl;
-        logger.warn('[DB] test_results schema missing artifact columns; retrying insert without video_url/trace_url', {
+        void _replayTraceUrl;
+        logger.warn('[DB] test_results schema missing artifact columns; retrying insert without video_url/trace_url/replay_trace_url', {
           testId: resultData.test_id,
           browser: resultData.browser,
           originalError: (error as any)?.message,

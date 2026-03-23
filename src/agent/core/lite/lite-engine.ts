@@ -32,6 +32,7 @@ import { StateDriftAuditor } from './analysis/state-drift-auditor';
 import { StateValidator } from './analysis/state-validator';
 import { TargetAudit, type RankedCandidate } from './analysis/target-audit';
 import { TaskPlanBuilder, type TaskPlan } from './analysis/task-plan-builder';
+import { TimeoutGovernor, type TimeoutDecision, type TimeoutGovernorInput, type IterationSnapshot, type AITimeoutDecision } from './analysis/timeout-governor';
 import { ConsoleCollector } from './collectors/console-collector';
 import { ErrorCollector } from './collectors/error-collector';
 import { NetworkTracker } from './collectors/network-tracker';
@@ -131,6 +132,19 @@ export class LiteEngine {
   private readonly _GOAL_REFINEMENT_COOLDOWN_MS = 5000; // Min time between refinements (reserved for future use)
   private consecutiveNoEffectCount: number = 0;
   private activeFrame: import('playwright').Frame | null = null; // L5: Store active frame for iframe execution
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // TIMEOUT GOVERNOR (Adaptive Timeout System)
+  // ═══════════════════════════════════════════════════════════════════════════
+  private timeoutGovernor: TimeoutGovernor | null = null;
+  private lastTimeoutDecision: TimeoutDecision | null = null;
+  private _rescheduleTimeout: ((newDeadlineMs: number) => void) | null = null;
+  private _timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  private totalClarificationPauseMs = 0;
+  private totalRateLimitBackoffMs = 0;
+  private _lastGovernorAccomplishmentCount = 0;
+  private _lastGovernorPlanStep = -1;
+  private _blockerFirstSeenMs: number | null = null;
 
   // ✅ P0 FEATURE: Proactive Vision Detection
   // Track pages where we've already attempted vision to avoid redundant calls
@@ -946,9 +960,48 @@ export class LiteEngine {
     // ✅ FIX: Use config.timeout if provided (with minimum 60s validation)
     const timeoutMs = Math.max(this.config.timeout || this.TIMEOUT_MS, 60000);
 
+    // Initialize TimeoutGovernor (adaptive timeout system)
+    if (LITE_ENGINE_FLAGS.enableTimeoutGovernor) {
+      this.timeoutGovernor = new TimeoutGovernor({
+        baseTimeoutMs: timeoutMs,
+        maxTimeoutMs: LITE_ENGINE_FLAGS.timeoutGovernorMaxMs,
+        extensionMaxPerCallMs: LITE_ENGINE_FLAGS.timeoutGovernorExtensionMaxPerCallMs,
+        hurryThresholdMs: LITE_ENGINE_FLAGS.timeoutGovernorHurryMs,
+        criticalThresholdMs: LITE_ENGINE_FLAGS.timeoutGovernorCriticalMs,
+        stallWindowSize: LITE_ENGINE_FLAGS.timeoutGovernorStallWindowSize,
+        stallUrlThreshold: LITE_ENGINE_FLAGS.timeoutGovernorStallUrlThreshold,
+        stallErrorThreshold: LITE_ENGINE_FLAGS.timeoutGovernorStallErrorThreshold,
+        stallOutcomeThreshold: LITE_ENGINE_FLAGS.timeoutGovernorStallOutcomeThreshold,
+        stallAccomplishmentIters: LITE_ENGINE_FLAGS.timeoutGovernorStallAccomplishmentIters,
+      });
+    }
+
+    // Dynamic reschedulable timeout (replaces static setTimeout when governor enabled)
+    let timeoutReject: ((err: Error) => void) | null = null;
     const timeoutPromise = new Promise<LiteTestResult>((_, reject) => {
-      setTimeout(() => reject(new Error('TIMEOUT')), timeoutMs);
+      timeoutReject = reject;
+      const effectiveTimeout = this.timeoutGovernor
+        ? this.timeoutGovernor.getCurrentDeadlineMs()
+        : timeoutMs;
+      this._timeoutHandle = setTimeout(
+        () => reject(new Error('TIMEOUT')),
+        effectiveTimeout,
+      );
     });
+
+    // Expose reschedule function for governor to adjust deadline dynamically
+    this._rescheduleTimeout = (newDeadlineMs: number) => {
+      if (this._timeoutHandle) clearTimeout(this._timeoutHandle);
+      const remaining = newDeadlineMs - (Date.now() - this.startTime);
+      if (remaining <= 0) {
+        timeoutReject?.(new Error('TIMEOUT'));
+        return;
+      }
+      this._timeoutHandle = setTimeout(
+        () => timeoutReject?.(new Error('TIMEOUT')),
+        remaining,
+      );
+    };
 
     // Load workspace skills + integration status for AI context (best-effort, 5s timeout to avoid blocking test start)
     if (this.config.userId) {
@@ -990,16 +1043,33 @@ export class LiteEngine {
       return await Promise.race([this.runLoop(), timeoutPromise]);
     } catch (error) {
       if (error instanceof Error && error.message === 'TIMEOUT') {
+        // Clean up timeout handle
+        if (this._timeoutHandle) { clearTimeout(this._timeoutHandle); this._timeoutHandle = null; }
+
+        const governorLog = this.timeoutGovernor?.getExtensionLog() || [];
+        const totalExtensions = governorLog.reduce((sum, e) => sum + e.amount, 0);
+        const effectiveTimeout = this.timeoutGovernor
+          ? this.timeoutGovernor.getCurrentDeadlineMs()
+          : timeoutMs;
+
         logger.error('[LITE_ENGINE] Time limit exceeded', {
           testId: this.config.testId,
-          timeout: timeoutMs,
+          baseTimeout: timeoutMs,
+          effectiveTimeout,
+          totalExtensions,
+          extensionCount: governorLog.length,
+          lastUrgency: this.lastTimeoutDecision?.urgencyLevel,
+          lastStallSignals: this.lastTimeoutDecision?.stallSignals?.isStalled,
         });
-        this.emitCompletion(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} min)`);
+
+        const timeStr = Math.round(effectiveTimeout / 60000);
+        const extNote = totalExtensions > 0 ? `, extended +${Math.round(totalExtensions / 1000)}s` : '';
+        this.emitCompletion(false, `Time limit exceeded (${timeStr} min${extNote})`);
 
         // Flush pending uploads before returning (so graphData has URLs)
         await this.flushPendingGraphScreenshotUploads();
 
-        return await this.buildResult(false, `Time limit exceeded (${Math.round(timeoutMs / 60000)} minutes)`);
+        return await this.buildResult(false, `Time limit exceeded (${timeStr} minutes${extNote})`);
       }
 
       // ═══════════════════════════════════════════════════════════════════════
@@ -1040,13 +1110,17 @@ export class LiteEngine {
     this.skillsContext = '';
     this.integrationContext = '';
     this.snapshotPruner?.clear();
+    // TimeoutGovernor: clean up dynamic timer + prevent leaked reschedules
+    if (this._timeoutHandle) { clearTimeout(this._timeoutHandle); this._timeoutHandle = null; }
+    this._rescheduleTimeout = null;
   }
 
   /**
    * Main test loop
    */
   private async runLoop(): Promise<LiteTestResult> {
-    this.startTime = Date.now();
+    // Note: startTime is set once in execute() before the timeout timer starts.
+    // Do NOT reset here — it must share the same time base as setTimeout/rescheduleTimeout.
 
     logger.info('[LITE_ENGINE] Starting test loop', {
       testId: this.config.testId,
@@ -1957,6 +2031,7 @@ export class LiteEngine {
             });
 
             try {
+              const _clarificationStart = Date.now();
               const response = await ClarificationService.requestClarification({
                 testId: this.config.testId,
                 userId: this.config.userId,
@@ -1965,6 +2040,7 @@ export class LiteEngine {
                 required: true,
                 timeout: LITE_ENGINE_FLAGS.credentialClarificationTimeoutMs,
               });
+              this.totalClarificationPauseMs += Date.now() - _clarificationStart;
 
               if (response) {
                 const parsed = parseCredentialsFromResponse(response, expectingField);
@@ -2152,6 +2228,204 @@ export class LiteEngine {
               });
               // Continue without completing (conservative)
             }
+          }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // TIMEOUT GOVERNOR: Evaluate adaptive deadline each iteration
+        // ═══════════════════════════════════════════════════════════════════════
+        if (this.timeoutGovernor) {
+          const lastIter = i > 0 ? this.state.getAllIterations()[i - 1] : null;
+          const workingMem = this.multiAgentOrchestrator?.getWorkingMemoryCopy();
+          const prevAccomplishmentCount = workingMem?.accomplishments.length || 0;
+          // When multi-agent is off, workingMem is null — suppress accomplishment plateau
+          // detection by treating every iteration as "accomplishment added" (we have no data).
+          const hasWorkingMemory = workingMem !== null && workingMem !== undefined;
+
+          // Build iteration snapshot from last iteration's outcome (skip iter 0 — no prior data)
+          const iterSnapshot: IterationSnapshot = {
+            iteration: i,
+            url: snapshotBefore.url,
+            outcome: i > 0 && lastIter ? (lastIter.result?.outcome || 'unknown') : 'initial',
+            action: i > 0 && lastIter ? (lastIter.decision?.command?.action || 'none') : 'none',
+            ref: i > 0 && lastIter ? (lastIter.decision?.command?.ref || null) : null,
+            networkErrors: (this.lastNetworkErrors || []).map(e => ({
+              method: e.method || 'GET',
+              url: e.url || '',
+              status: e.status || 0,
+            })),
+            accomplishmentAdded: hasWorkingMemory
+              ? prevAccomplishmentCount > (this._lastGovernorAccomplishmentCount || 0)
+              : true, // No working memory → suppress false stall detection
+            durationMs: lastIter?.result?.duration || 0,
+          };
+          this._lastGovernorAccomplishmentCount = prevAccomplishmentCount;
+
+          // Build plan steps with status
+          const currentPlanIdx = this.planProgressEvaluator?.getCurrentStepIndex() ?? -1;
+          const planSteps = this.currentPlan?.steps.map((s, idx) => ({
+            id: s.id,
+            goal: s.goal,
+            status: idx < currentPlanIdx ? 'done'
+              : idx === currentPlanIdx ? 'current'
+                : 'pending',
+          })) || null;
+          const planStepChanged = currentPlanIdx !== -1 && currentPlanIdx !== this._lastGovernorPlanStep;
+          this._lastGovernorPlanStep = currentPlanIdx;
+
+          const governorInput: TimeoutGovernorInput = {
+            elapsedMs: Date.now() - this.startTime,
+            iteration: i,
+            latestSnapshot: iterSnapshot,
+            progressScore: goalCheck.progressScore,
+            planSteps,
+            planStepChanged,
+            stuck: stuckCheck.stuck,
+            consecutiveStuckCount: this.state.getConsecutiveStuckCount(),
+            stuckReason: stuckCheck.stuck ? (stuckCheck.reason || null) : null,
+            consecutiveNoEffectCount: this.consecutiveNoEffectCount,
+            currentBlocker: this.lastBlockerInfo
+              ? `${this.lastBlockerInfo.hintType || this.lastBlockerInfo.blockerTag} blocking ${this.lastBlockerInfo.targetRef}: "${this.lastBlockerInfo.blockerText}"`
+              : null,
+            lastBlockerInfo: this.lastBlockerInfo
+              ? { type: this.lastBlockerInfo.hintType || this.lastBlockerInfo.blockerTag, description: `${this.lastBlockerInfo.blockerTag}.${this.lastBlockerInfo.blockerClass.slice(0, 40)} — "${this.lastBlockerInfo.blockerText}"` }
+              : null,
+            blockerDurationMs: (() => {
+              if (!this.lastBlockerInfo) return 0;
+              if (!this._blockerFirstSeenMs) {
+                this._blockerFirstSeenMs = Date.now();
+              }
+              return Date.now() - this._blockerFirstSeenMs;
+            })(),
+            circuitBreakerOpen: this.multiAgentOrchestrator?.isCircuitBreakerOpen() ?? false,
+            visionAttemptedForPage: this.visionAttemptedForPage?.has(snapshotBefore.url) ?? false,
+            clarificationPauseMs: this.totalClarificationPauseMs,
+            rateLimitBackoffMs: this.totalRateLimitBackoffMs,
+            goal: this.config.goal,
+            currentUrl: snapshotBefore.url,
+            pageTitle: snapshotBefore.title || '',
+            accomplishments: workingMem?.accomplishments || [],
+            visitedPages: workingMem?.visitedPages || {},
+            last5Outcomes: this.state.getAllIterations().slice(-5).map(it => ({
+              iteration: it.iteration,
+              action: it.decision?.command?.action || 'unknown',
+              outcome: it.result?.outcome || 'unknown',
+              durationMs: it.result?.duration || 0,
+            })),
+            recentNetworkErrors: (this.lastNetworkErrors || []).slice(-3).map(e => ({
+              method: e.method || 'GET',
+              url: e.url || '',
+              status: e.status || 0,
+            })),
+            recentConsoleErrors: (this.lastConsoleErrors || []).slice(-3),
+          };
+
+          // Reset blocker tracking when blocker clears
+          if (!this.lastBlockerInfo) {
+            this._blockerFirstSeenMs = null;
+          }
+
+          const timeoutDecision = this.timeoutGovernor.evaluate(governorInput);
+          this.lastTimeoutDecision = timeoutDecision;
+
+          // Trace governor decision
+          this.traceWriter.write({
+            iteration: i,
+            stage: 'timeout_governor',
+            eventType: 'timeout_decision',
+            spanId: this.traceWriter.generateSpanId(),
+            parentSpanId: iterationSpanId,
+            payload: {
+              deadlineMs: timeoutDecision.deadlineMs,
+              remainingMs: timeoutDecision.remainingMs,
+              urgencyLevel: timeoutDecision.urgencyLevel,
+              extended: timeoutDecision.extended,
+              extensionReason: timeoutDecision.extensionReason,
+              shouldTerminate: timeoutDecision.shouldTerminate,
+              terminateReason: timeoutDecision.terminateReason,
+              gateTriggered: timeoutDecision.gateTriggered,
+              stallSignals: timeoutDecision.stallSignals.isStalled ? timeoutDecision.stallSignals : undefined,
+            },
+          });
+
+          // Immediate termination
+          if (timeoutDecision.shouldTerminate) {
+            logger.warn('[TIMEOUT_GOVERNOR] Terminating early', {
+              testId: this.config.testId,
+              reason: timeoutDecision.terminateReason,
+              iteration: i,
+              elapsedMs: Date.now() - this.startTime,
+            });
+            this.emitCompletion(false, timeoutDecision.terminateReason || 'Adaptive timeout — test terminated');
+            await this.flushPendingGraphScreenshotUploads();
+            closeIteration({ iteration: i, outcome: 'timeout_governor_terminate', reason: timeoutDecision.terminateReason });
+            return await this.buildResult(false, timeoutDecision.terminateReason || 'Adaptive timeout — test terminated');
+          }
+
+          // Tier 2 AI call if gate triggered
+          if (timeoutDecision.requiresAICall && timeoutDecision.gateTriggered) {
+            try {
+              const aiDecision = await this.timeoutGovernor.evaluateWithAI(
+                governorInput,
+                timeoutDecision.gateTriggered,
+                timeoutDecision.stallSignals,
+              );
+
+              this.traceWriter.write({
+                iteration: i,
+                stage: 'timeout_governor',
+                eventType: 'ai_decision',
+                spanId: this.traceWriter.generateSpanId(),
+                parentSpanId: iterationSpanId,
+                payload: {
+                  gate: timeoutDecision.gateTriggered,
+                  decision: aiDecision.decision,
+                  extensionMs: aiDecision.extensionMs,
+                  reason: aiDecision.reason,
+                  confidence: aiDecision.confidence,
+                  newDeadlineMs: this.timeoutGovernor.getCurrentDeadlineMs(),
+                },
+              });
+
+              // Handle AI decisions
+              if (aiDecision.decision === 'terminate') {
+                this.emitCompletion(false, aiDecision.reason || 'TimeoutGovernor AI: terminate');
+                await this.flushPendingGraphScreenshotUploads();
+                closeIteration({ iteration: i, outcome: 'timeout_governor_ai_terminate', reason: aiDecision.reason });
+                return await this.buildResult(false, aiDecision.reason || 'TimeoutGovernor AI: terminate');
+              }
+
+              if (aiDecision.decision === 'partial_success') {
+                this.emitCompletion(true, `Partial success: ${aiDecision.reason}`);
+                await this.flushPendingGraphScreenshotUploads();
+                closeIteration({ iteration: i, outcome: 'partial_success', reason: aiDecision.reason });
+                return await this.buildResult(true, `Partial success: ${aiDecision.reason}`);
+              }
+
+              // Reschedule timer if deadline changed
+              if (aiDecision.decision === 'extend' || aiDecision.decision === 'reduce') {
+                this._rescheduleTimeout?.(this.timeoutGovernor.getCurrentDeadlineMs());
+                logger.info('[TIMEOUT_GOVERNOR] Deadline adjusted by AI', {
+                  testId: this.config.testId,
+                  decision: aiDecision.decision,
+                  extensionMs: aiDecision.extensionMs,
+                  reason: aiDecision.reason,
+                  newDeadlineMs: this.timeoutGovernor.getCurrentDeadlineMs(),
+                  iteration: i,
+                });
+              }
+            } catch (governorErr) {
+              logger.warn('[TIMEOUT_GOVERNOR] AI evaluation failed (non-fatal)', {
+                testId: this.config.testId,
+                gate: timeoutDecision.gateTriggered,
+                error: governorErr instanceof Error ? governorErr.message : String(governorErr),
+              });
+            }
+          }
+
+          // Reschedule if auto-compensation changed deadline
+          if (timeoutDecision.extended) {
+            this._rescheduleTimeout?.(this.timeoutGovernor.getCurrentDeadlineMs());
           }
         }
 
@@ -2699,6 +2973,8 @@ export class LiteEngine {
             recentNetworkErrors: this.lastNetworkErrors.length > 0 ? this.lastNetworkErrors.slice(-3) : undefined,
             recentValidationErrors: this.lastValidationErrors.length > 0 ? this.lastValidationErrors.slice(-3) : undefined,
             transitionSummary: this.lastTransitionSummary || undefined,
+            // TimeoutGovernor: time pressure signal for Strategist and Critic
+            urgencyLevel: this.lastTimeoutDecision?.urgencyLevel || 'normal',
             // Thinking step callback for real-time agent progress (fire-and-forget)
             onThinkingStep: (phase: string, message: string) => {
               try {
@@ -2978,6 +3254,7 @@ export class LiteEngine {
             });
 
             try {
+              const _paymentClarStart = Date.now();
               const response = await ClarificationService.requestClarification({
                 testId: this.config.testId,
                 userId: this.config.userId,
@@ -2987,6 +3264,7 @@ export class LiteEngine {
                 options: ['proceed', 'stop_here', 'cancel_test'],
                 timeout: LITE_ENGINE_FLAGS.paymentApprovalTimeoutMs,
               });
+              this.totalClarificationPauseMs += Date.now() - _paymentClarStart;
               const normalized = response?.trim().toLowerCase();
 
               if (normalized === 'stop_here') {
@@ -3718,6 +3996,7 @@ export class LiteEngine {
           });
 
           await this.page.waitForTimeout(backoffMs);
+          this.totalRateLimitBackoffMs += backoffMs; // Track for TimeoutGovernor compensation
         } else {
           // Reset rate limit counter on any non-rate-limited outcome
           if (this.consecutiveRateLimitCount > 0) {

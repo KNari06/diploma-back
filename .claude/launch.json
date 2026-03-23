@@ -19,6 +19,13 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "scheduler"],
       "port": 0
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "/Users/yerassylospanov/Desktop/qai-frontend/apps/web"],
+      "port": 5173,
+      "autoPort": false
     }
   ]
 }

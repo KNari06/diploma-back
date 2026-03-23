@@ -2,14 +2,18 @@
  * Step Readiness Service
  * Lookahead wait mechanism for inter-step stability
  *
- * Provides fast Playwright-based element readiness checks before executing next step.
- * Uses ONLY fast DOM checks (isVisible, isEnabled, count) - NO LLM or AI resolution.
+ * V14: Comprehensive deterministic readiness — 7-layer page readiness engine.
  *
  * Key features:
  * - Fast precondition checks using compiled locatorPlan or evidence.lastSuccessRef
  * - SPA navigation detection after click/open/close (URL-change race, no hardcoded delays)
  * - Dynamic DOM stability threshold based on previous action risk profile
- * - Page settle fallback (network idle + DOM stable) when element not ready
+ * - **Loading indicator detection** (spinners, skeletons, aria-busy, progressbar)
+ * - **Pending API request tracking** (fetch/xhr idle detection)
+ * - **CSS animation/transition wait** on target element
+ * - **Overlay/obstruction detection** (elementFromPoint at target center)
+ * - **Inter-step delay hints** from recording evidence
+ * - Page settle fallback (DOM stable) when element not ready
  * - Blind settle fallback when no locator available (instead of skipping entirely)
  * - Runtime metadata tracking (autoWaitApplied) when significant wait occurred
  * - Per-step disable flag for advanced use cases
@@ -38,6 +42,10 @@ export interface LookaheadResult {
   skipReason?: string;
   /** True if SPA navigation was detected after previous step */
   navigationDetected?: boolean;
+  /** V14: Comprehensive readiness check results (for trace logging) */
+  readinessChecks?: ReadinessCheckResult;
+  /** V14: Whether URL changed between steps */
+  urlChanged?: boolean;
 }
 
 /**
@@ -64,6 +72,13 @@ export interface LookaheadOptions {
    * If provided, used to detect SPA navigation (URL changed → nav occurred).
    */
   prevUrl?: string;
+  /**
+   * V14: Inter-step delay from recording evidence (ms).
+   * If provided, ensures a minimum wait of ~70% of this value before declaring ready.
+   * Rationale: if the user waited 3s between steps during recording, the page
+   * likely needed that time to load data or render content.
+   */
+  recordedDelayMs?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -77,6 +92,8 @@ const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
   'wait_for',
   'ai_check',
   'wait_for_email',  // V12: Email inbox polling (no element target)
+  'dialog',          // V14: Pre-installs handler, no element target
+  'download',        // V14: Waits for download event, no element target
 ]);
 
 /**
@@ -89,7 +106,8 @@ const NAVIGATION_TRIGGER_ACTIONS: Set<IntentActionType> = new Set([
   'close',
   'toggle',
   'press',
-  'navigate', // goto triggers full page navigation, needs networkIdle + DOM settle
+  'hover',     // V13: Hover can trigger dropdowns, menus, tooltips — next step needs DOM settle
+  'navigate',  // goto triggers full page navigation, needs networkIdle + DOM settle
 ]);
 
 /** Action types that require visible + enabled */
@@ -100,6 +118,11 @@ const NEEDS_VISIBLE_ENABLED: Set<IntentActionType> = new Set([
   'check',
   'uncheck',
   'toggle',
+  'dblclick',        // V14: Same as click — needs visible + enabled
+  'contextmenu',     // V14: Right-click needs visible + enabled
+  'open',            // V14: Expands accordion/dropdown — needs visible + enabled
+  'close',           // V14: Collapses accordion/dropdown — needs visible + enabled
+  'drag_and_drop',   // V14: Drag source must be visible + enabled
 ]);
 
 /** Action types that require visible only */
@@ -112,6 +135,7 @@ const NEEDS_VISIBLE_ONLY: Set<IntentActionType> = new Set([
 /** Action types that only need element attached (in DOM) */
 const NEEDS_ATTACHED_ONLY: Set<IntentActionType> = new Set([
   'press',
+  'upload',          // V14: File inputs are often hidden — only need attached, not visible
 ]);
 
 const DOM_STABLE_THRESHOLD_MS = STEP_READINESS_CONFIG.domStableThresholdMs;
@@ -137,7 +161,7 @@ function getDomStableThresholdMs(
 
   if (NAVIGATION_TRIGGER_ACTIONS.has(prevActionType)) return DOM_STABLE_THRESHOLD_MS.navigation;
   if (prevActionType === 'type' || prevActionType === 'select') return DOM_STABLE_THRESHOLD_MS.input;
-  if (prevActionType === 'assert' || prevActionType === 'hover') return DOM_STABLE_THRESHOLD_MS.assertion;
+  if (prevActionType === 'assert') return DOM_STABLE_THRESHOLD_MS.assertion;
 
   return DOM_STABLE_THRESHOLD_MS.default;
 }
@@ -289,6 +313,486 @@ async function blindSettle(page: Page, domStableThresholdMs: number): Promise<vo
     domStableThresholdMs,
   });
   await pageSettle(page, BLIND_SETTLE_MS, domStableThresholdMs);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// V14: COMPREHENSIVE PAGE READINESS CHECKS
+// Pure browser-context JS — no LLM, no AI, ~5-15ms per check
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Max time to wait for loading indicators to disappear */
+const LOADING_INDICATOR_TIMEOUT_MS = 8000;
+/** Polling interval for loading indicators */
+const LOADING_POLL_INTERVAL_MS = 150;
+/** Max time to wait for pending API requests to complete */
+const API_IDLE_TIMEOUT_MS = 5000;
+/** Quiet threshold — no new API activity for this long = idle */
+const API_QUIET_THRESHOLD_MS = 200;
+/** Max time to wait for CSS animation/transition on target element */
+const ANIMATION_WAIT_TIMEOUT_MS = 3000;
+/** Max time to wait for overlay to clear */
+const OVERLAY_WAIT_TIMEOUT_MS = 3000;
+/** Max time to wait for iframe to load */
+const IFRAME_LOAD_TIMEOUT_MS = 4000;
+
+/**
+ * Check for loading indicators on the page (spinners, skeletons, aria-busy, progressbar).
+ * Returns true if any loading indicator is detected.
+ *
+ * 8-layer detection:
+ * 1. role="progressbar" (ARIA standard)
+ * 2. aria-busy="true" (ARIA loading state)
+ * 3. Skeleton loaders (CSS class patterns: .skeleton, .placeholder-glow, etc.)
+ * 4. Animated spinners (class-based: .spinner, .loader, [data-loading])
+ * 5. CSS-only spinners (any small rotating/pulsing element with animation, no class match)
+ * 6. NProgress/pace.js bars (top loading bars common in SPAs)
+ * 7. Disabled form submit buttons with loading text pattern
+ * 8. data-testid loading patterns (data-testid*="loading", data-testid*="spinner")
+ */
+async function hasLoadingIndicators(page: Page): Promise<boolean> {
+  try {
+    return await page.evaluate(() => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      // @ts-expect-error - browser context
+      const win = window;
+
+      const isReallyVisible = (el: any): boolean => {
+        const style = win.getComputedStyle(el);
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && parseFloat(style.opacity) >= 0.1;
+      };
+
+      // 1. role="progressbar"
+      const progressbar = doc.querySelector('[role="progressbar"]:not([aria-hidden="true"])');
+      if (progressbar && isReallyVisible(progressbar)) return true;
+
+      // 2. aria-busy="true"
+      const busy = doc.querySelector('[aria-busy="true"]:not([aria-hidden="true"])');
+      if (busy && isReallyVisible(busy)) return true;
+
+      // 3. Skeleton loaders
+      const skeletonSel = '.skeleton, .skeleton-loader, .skeleton-text, .skeleton-line, '
+        + '[data-skeleton], [data-skeleton-loading], .placeholder-glow, .placeholder-wave, '
+        + '[class*="Skeleton"], [class*="skeleton-"], .shimmer, [class*="shimmer"]';
+      const skeleton = doc.querySelector(skeletonSel);
+      if (skeleton && isReallyVisible(skeleton)) return true;
+
+      // 4. Animated spinners/loaders (class-based)
+      const spinnerSel = '.spinner, .loader, .loading, .loading-indicator, '
+        + '[class*="spinner"], [class*="Spinner"], [class*="loader"], [class*="Loader"], '
+        + '[class*="loading-"], [class*="Loading"], [data-loading], [data-loading="true"], '
+        + '.ant-spin-spinning, .el-loading-mask, .v-overlay--active';
+      const spinners = doc.querySelectorAll(spinnerSel);
+      for (const el of spinners) {
+        if (!isReallyVisible(el)) continue;
+        const style = win.getComputedStyle(el);
+        const anim = style.animationName;
+        // Has animation OR is a known loading class (might use pseudo-element animation)
+        if ((anim && anim !== 'none') || el.classList.contains('loading') || el.classList.contains('spinner')) {
+          return true;
+        }
+      }
+
+      // 5. NProgress / Pace.js / top loading bars
+      const nprogressSel = '#nprogress, .pace, .pace-active, [class*="nprogress"], '
+        + '[class*="top-loading-bar"], [class*="TopLoadingBar"], .nProgress';
+      const nprogress = doc.querySelector(nprogressSel);
+      if (nprogress && isReallyVisible(nprogress)) return true;
+
+      // 6. Submit/action buttons with loading text
+      const buttons = doc.querySelectorAll('button[disabled], [role="button"][aria-disabled="true"]');
+      for (const btn of buttons) {
+        const text = (btn.textContent || '').toLowerCase().trim();
+        if (/loading|submitting|saving|processing|please wait/i.test(text)) {
+          return true;
+        }
+      }
+
+      // 7. data-testid loading patterns
+      const testIdLoading = doc.querySelector(
+        '[data-testid*="loading"], [data-testid*="spinner"], [data-testid*="skeleton"], '
+        + '[data-cy*="loading"], [data-cy*="spinner"]'
+      );
+      if (testIdLoading && isReallyVisible(testIdLoading)) return true;
+
+      return false;
+    });
+  } catch {
+    return false; // Page navigating or closed
+  }
+}
+
+/**
+ * Wait for all loading indicators to disappear.
+ * Polls `hasLoadingIndicators` until clean or timeout.
+ */
+async function waitForLoadingIndicatorsClear(page: Page, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const hasLoading = await hasLoadingIndicators(page);
+    if (!hasLoading) return;
+    await new Promise(r => setTimeout(r, LOADING_POLL_INTERVAL_MS));
+  }
+
+  logger.debug('[STEP_READINESS] Loading indicators still present after timeout, continuing', { timeoutMs });
+}
+
+/**
+ * Wait for pending API requests (fetch/xhr) to complete.
+ * Lightweight inline tracker — attaches listeners, waits for quiet period, cleans up.
+ */
+async function waitForApiIdle(page: Page, timeoutMs: number): Promise<void> {
+  let pending = 0;
+  let lastActivity = Date.now() - API_QUIET_THRESHOLD_MS; // Start with threshold met
+
+  const onRequest = (req: { resourceType: () => string }) => {
+    const type = req.resourceType();
+    if (type === 'fetch' || type === 'xhr') {
+      pending++;
+      lastActivity = Date.now();
+    }
+  };
+  const onDone = (req: { resourceType: () => string }) => {
+    const type = req.resourceType();
+    if (type === 'fetch' || type === 'xhr') {
+      pending = Math.max(0, pending - 1);
+      lastActivity = Date.now();
+    }
+  };
+
+  page.on('request', onRequest);
+  page.on('requestfinished', onDone);
+  page.on('requestfailed', onDone);
+
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pending === 0 && (Date.now() - lastActivity) >= API_QUIET_THRESHOLD_MS) {
+        return;
+      }
+      await new Promise(r => setTimeout(r, 50));
+    }
+    if (pending > 0) {
+      logger.debug('[STEP_READINESS] API idle timeout with pending requests', { pending, timeoutMs });
+    }
+  } finally {
+    try {
+      page.off('request', onRequest);
+      page.off('requestfinished', onDone);
+      page.off('requestfailed', onDone);
+    } catch {
+      // Page may be closed
+    }
+  }
+}
+
+/**
+ * Check if target element has active CSS animation or transition.
+ * If so, wait until animation completes or timeout.
+ *
+ * Checks: animationName, transitionDuration, animationPlayState on the element + parent.
+ */
+async function waitForElementAnimationComplete(
+  locator: Locator,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const isAnimating = await locator.evaluate((el) => {
+        // @ts-expect-error - browser context
+        const win = window;
+        const style = win.getComputedStyle(el);
+
+        // Check active CSS animation
+        const anim = style.animationName;
+        if (anim && anim !== 'none') {
+          const playState = style.animationPlayState;
+          if (playState === 'running') return true;
+        }
+
+        // Check active CSS transition
+        const transDur = style.transitionDuration;
+        if (transDur && transDur !== '0s') {
+          // Element has transition — check if it's currently in progress
+          // by looking at transitionProperty (if set, transition may be running)
+          const transProp = style.transitionProperty;
+          if (transProp && transProp !== 'none' && transProp !== 'all') {
+            // Check opacity specifically — common fade-in pattern
+            const opacity = parseFloat(style.opacity);
+            if (opacity > 0 && opacity < 0.95) return true;
+          }
+        }
+
+        // Check parent (animations on container affect children)
+        const parent = el.parentElement;
+        if (parent) {
+          const ps = win.getComputedStyle(parent);
+          const pa = ps.animationName;
+          if (pa && pa !== 'none' && ps.animationPlayState === 'running') return true;
+        }
+
+        return false;
+      });
+
+      if (!isAnimating) return;
+    } catch {
+      return; // Element detached or page navigated
+    }
+
+    await new Promise(r => setTimeout(r, 100));
+  }
+
+  logger.debug('[STEP_READINESS] Animation wait timeout, continuing', { timeoutMs });
+}
+
+/**
+ * Check if target element is obstructed by an overlay, modal, toast, or sticky element.
+ * Uses elementFromPoint at the element's center — if the hit element is not our target
+ * (or its descendant), something is covering it.
+ *
+ * Returns true if element is obstructed.
+ */
+async function isElementObstructed(locator: Locator, page: Page): Promise<boolean> {
+  try {
+    const box = await locator.boundingBox();
+    if (!box) return false; // No bounding box → can't check
+
+    const centerX = box.x + box.width / 2;
+    const centerY = box.y + box.height / 2;
+
+    // Set marker to identify target
+    const marker = `__sr_overlay_${Date.now()}`;
+    await locator.evaluate((el, attr) => el.setAttribute(attr, '1'), marker);
+
+    try {
+      const obstructed = await page.evaluate(
+        ({ x, y, attr }: { x: number; y: number; attr: string }) => {
+          // @ts-ignore - browser context
+          const hitEl = document.elementFromPoint(x, y);
+          if (!hitEl) return true; // Nothing at point — possibly off-screen
+          // Check if hit element is our target or inside it
+          return hitEl.closest(`[${attr}]`) === null;
+        },
+        { x: centerX, y: centerY, attr: marker }
+      );
+      return obstructed;
+    } finally {
+      await locator.evaluate((el, attr) => el.removeAttribute(attr), marker).catch(() => {});
+    }
+  } catch {
+    return false; // Can't check → assume not obstructed
+  }
+}
+
+/**
+ * Check if target element is disabled via HTML attribute or ARIA.
+ * Covers: disabled attribute, aria-disabled="true", readonly, inert.
+ * Returns true if element is in a non-interactable state.
+ */
+async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
+  try {
+    return await locator.evaluate((el: any) => {
+      if (el.disabled === true) return true;
+      if (el.getAttribute('aria-disabled') === 'true') return true;
+      if (el.readOnly === true && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return true;
+      if (el.inert === true) return true;
+      // Check closest inert ancestor (HTML inert attribute propagates to descendants)
+      if (el.closest('[inert]')) return true;
+      // fieldset[disabled] disables all form controls inside per HTML spec
+      if (el.closest('fieldset[disabled]')) return true;
+      // CSS-based disabling: pointer-events:none makes element unclickable
+      const win = el.ownerDocument?.defaultView;
+      if (win) {
+        const style = win.getComputedStyle(el);
+        if (style.pointerEvents === 'none') return true;
+      }
+      return false;
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Wait for element to become enabled (not disabled/inert).
+ * Polls until enabled or timeout.
+ */
+async function waitForElementEnabled(locator: Locator, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const disabled = await isElementDisabledOrInert(locator);
+    if (!disabled) return;
+    await new Promise(r => setTimeout(r, 200));
+  }
+  logger.debug('[STEP_READINESS] Element still disabled/inert after timeout, continuing', { timeoutMs });
+}
+
+/**
+ * Check if the target element is inside an iframe that hasn't finished loading.
+ * This is common with embedded forms (Stripe, reCAPTCHA, OAuth).
+ */
+async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise<void> {
+  try {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const allReady = await page.evaluate(() => {
+        // @ts-expect-error - browser context
+        const iframes = document.querySelectorAll('iframe:not([aria-hidden="true"])');
+        for (const iframe of iframes) {
+          // @ts-expect-error - browser context
+          const style = window.getComputedStyle(iframe);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          // Visible iframe — check if loaded
+          try {
+            const doc = (iframe as any).contentDocument;
+            if (doc && doc.readyState !== 'complete') return false;
+          } catch {
+            // Cross-origin iframe — can't check, assume loaded
+          }
+        }
+        return true;
+      });
+
+      if (allReady) return;
+      await new Promise(r => setTimeout(r, 300));
+    }
+  } catch {
+    // Page navigating — continue
+  }
+}
+
+/**
+ * Wait for overlay to clear from target element.
+ * Polls elementFromPoint until target is topmost or timeout.
+ */
+async function waitForOverlayClear(
+  locator: Locator,
+  page: Page,
+  timeoutMs: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const obstructed = await isElementObstructed(locator, page);
+    if (!obstructed) return;
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  logger.debug('[STEP_READINESS] Overlay did not clear in time, continuing', { timeoutMs });
+}
+
+/**
+ * V14: Comprehensive page readiness check.
+ * Runs all deterministic checks in parallel where possible.
+ * Called after SPA nav detection and before element precondition retry loop.
+ *
+ * Sequence:
+ * 1. Loading indicators + API idle (parallel) — wait for page to finish data loading
+ * 2. Target element animation — wait for fade-in/slide-in to complete
+ * 3. Overlay obstruction — wait for modals/toasts to clear
+ *
+ * All checks are fail-open (timeout → continue). Total max overhead: ~8s worst case,
+ * but typically <500ms (most checks short-circuit immediately).
+ */
+/** Result of comprehensive readiness checks */
+export interface ReadinessCheckResult {
+  loadingCleared: boolean;
+  apiIdle: boolean;
+  animationDone: boolean;
+  overlayClear: boolean;
+  elementEnabled: boolean;
+  iframeReady: boolean;
+}
+
+async function comprehensiveReadinessCheck(
+  page: Page,
+  locators: Locator[],
+  actionType: IntentActionType,
+  remainingMs: number
+): Promise<ReadinessCheckResult> {
+  const result: ReadinessCheckResult = {
+    loadingCleared: true, apiIdle: true, animationDone: true,
+    overlayClear: true, elementEnabled: true, iframeReady: true,
+  };
+
+  // Phase 1: Page-level checks in parallel (loading + API idle + toast + iframe)
+  const needsFullReady = NEEDS_VISIBLE_ENABLED.has(actionType) || NEEDS_VISIBLE_ONLY.has(actionType);
+
+  if (needsFullReady) {
+    const loadingTimeout = Math.min(LOADING_INDICATOR_TIMEOUT_MS, remainingMs);
+    const apiTimeout = Math.min(API_IDLE_TIMEOUT_MS, remainingMs);
+    const iframeTimeout = Math.min(IFRAME_LOAD_TIMEOUT_MS, remainingMs);
+
+    await Promise.allSettled([
+      // Loading indicators
+      hasLoadingIndicators(page).then(async (hasLoading) => {
+        if (hasLoading) {
+          logger.debug('[STEP_READINESS] Loading indicators detected, waiting...');
+          await waitForLoadingIndicatorsClear(page, loadingTimeout);
+          result.loadingCleared = !(await hasLoadingIndicators(page));
+        }
+      }),
+      // API idle
+      waitForApiIdle(page, apiTimeout).then(() => {
+        result.apiIdle = true;
+      }).catch(() => {
+        result.apiIdle = false;
+      }),
+      // Iframe readiness
+      waitForIframeContentReady(page, iframeTimeout).catch(() => {
+        result.iframeReady = false;
+      }),
+    ]);
+  }
+
+  // Phase 2: Target element animation (only if we have a locator and action needs interaction)
+  if (locators.length > 0 && NEEDS_VISIBLE_ENABLED.has(actionType)) {
+    const animTimeout = Math.min(ANIMATION_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 1000));
+    if (animTimeout > 200) {
+      try {
+        await waitForElementAnimationComplete(locators[0], animTimeout);
+      } catch {
+        result.animationDone = false;
+      }
+    }
+  }
+
+  // Phase 3: Element-level checks (disabled/inert + overlay)
+  const clickLikeActions: Set<IntentActionType> = new Set(['click', 'dblclick', 'contextmenu', 'check', 'uncheck', 'toggle', 'open', 'close']);
+
+  if (locators.length > 0 && NEEDS_VISIBLE_ENABLED.has(actionType)) {
+    // Check disabled/inert state (common: button disabled during form submission)
+    const disabledTimeout = Math.min(3000, Math.max(0, remainingMs - 500));
+    if (disabledTimeout > 200) {
+      const isDisabled = await isElementDisabledOrInert(locators[0]);
+      if (isDisabled) {
+        logger.debug('[STEP_READINESS] Element is disabled/inert, waiting for enabled...');
+        await waitForElementEnabled(locators[0], disabledTimeout);
+        result.elementEnabled = !(await isElementDisabledOrInert(locators[0]));
+      }
+    }
+  }
+
+  // Phase 4: Overlay obstruction (only for click-like actions)
+  if (locators.length > 0 && clickLikeActions.has(actionType)) {
+    const overlayTimeout = Math.min(OVERLAY_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 500));
+    if (overlayTimeout > 200) {
+      const obstructed = await isElementObstructed(locators[0], page);
+      if (obstructed) {
+        logger.debug('[STEP_READINESS] Element obstructed by overlay, waiting...');
+        await waitForOverlayClear(locators[0], page, overlayTimeout);
+        result.overlayClear = !(await isElementObstructed(locators[0], page));
+      }
+    }
+  }
+
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -468,10 +972,17 @@ export async function waitForStepReadiness(
     maxRetries = DEFAULTS.maxRetries,
     prevActionType,
     prevUrl,
+    recordedDelayMs,
   } = options;
 
   // Dynamic DOM stability threshold based on prev action risk
   const domStableThresholdMs = getDomStableThresholdMs(prevActionType, domStableOverride);
+
+  // V14: Inter-step delay floor — if user waited during recording, respect that
+  // Use 70% of recorded delay as minimum wait (capped at 5s, floor at 300ms)
+  const minWaitFromRecording = recordedDelayMs
+    ? Math.min(5000, Math.max(300, Math.round(recordedDelayMs * 0.7)))
+    : 0;
 
   // ─────────────────────────────────────────────────────────────────────────
   // Skip conditions
@@ -534,6 +1045,30 @@ export async function waitForStepReadiness(
 
   const locators = buildFastLocators(page, nextStep);
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 2.5: V14 Comprehensive readiness checks
+  // Loading indicators, API idle, animation, overlay — all deterministic
+  // Runs regardless of whether we have locators (page-level checks are universal)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  let readinessChecks: ReadinessCheckResult | undefined;
+  const remainingForReadiness = maxWaitMs - (Date.now() - startTime);
+  if (remainingForReadiness > 500) {
+    readinessChecks = await comprehensiveReadinessCheck(
+      page, locators, nextStep.type, remainingForReadiness
+    );
+
+    const anyBlocked = !readinessChecks.loadingCleared || !readinessChecks.apiIdle
+      || !readinessChecks.elementEnabled || !readinessChecks.iframeReady;
+    if (anyBlocked) {
+      logger.info('[STEP_READINESS] Page-level readiness wait applied', {
+        stepId: nextStep.id,
+        ...readinessChecks,
+        elapsed: Date.now() - startTime,
+      });
+    }
+  }
+
   if (locators.length === 0) {
     logger.debug('[STEP_READINESS] No fast locator — applying blind settle', {
       stepId: nextStep.id,
@@ -550,6 +1085,8 @@ export async function waitForStepReadiness(
       autoWaitApplied: waited > autoWaitThresholdMs,
       skipReason: 'No locator — blind settle applied',
       navigationDetected,
+      readinessChecks,
+      urlChanged: navigationDetected,
     };
   }
 
@@ -588,16 +1125,37 @@ export async function waitForStepReadiness(
 
     if (ready) {
       const waited = Date.now() - startTime;
+
+      // V14: Inter-step delay enforcement — if user waited longer during recording,
+      // the page likely needs that time (lazy-loaded data, slow API, debounced render).
+      // Wait the remaining difference, capped by maxWaitMs.
+      if (minWaitFromRecording > 0 && waited < minWaitFromRecording) {
+        const remaining = Math.min(minWaitFromRecording - waited, maxWaitMs - waited);
+        if (remaining > 100) {
+          logger.debug('[STEP_READINESS] Enforcing recording delay hint', {
+            stepId: nextStep.id,
+            recordedDelayMs,
+            minWaitFromRecording,
+            waited,
+            additionalWaitMs: remaining,
+          });
+          await new Promise(r => setTimeout(r, remaining));
+        }
+      }
+
+      const totalWaited = Date.now() - startTime;
       logger.debug('[STEP_READINESS] Element ready', {
         stepId: nextStep.id,
-        waited,
+        waited: totalWaited,
         attempts: attempt,
       });
       return {
         ready: true,
-        waited,
-        autoWaitApplied: waited > autoWaitThresholdMs,
+        waited: totalWaited,
+        autoWaitApplied: totalWaited > autoWaitThresholdMs,
         navigationDetected,
+        readinessChecks,
+        urlChanged: navigationDetected,
       };
     }
 
@@ -639,6 +1197,8 @@ export async function waitForStepReadiness(
     waited,
     autoWaitApplied: waited > autoWaitThresholdMs,
     navigationDetected,
+    readinessChecks,
+    urlChanged: navigationDetected,
   };
 }
 

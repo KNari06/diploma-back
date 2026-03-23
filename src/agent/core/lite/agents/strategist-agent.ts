@@ -305,6 +305,26 @@ You MUST choose a fundamentally different element/action. Forbidden actions will
 `
       : '';
 
+    // TimeoutGovernor: Time pressure section
+    let timePressureSection = '';
+    if (input.urgencyLevel === 'hurry') {
+      timePressureSection = `
+⏰ TIME PRESSURE: HURRY — Less than 60 seconds remaining.
+- Take the most DIRECT path to the goal. Skip exploratory actions.
+- If you see the goal target (form, button, page), interact with it NOW.
+- Prefer single-step actions over multi-step sequences.
+- Do NOT try alternative approaches — commit to the most likely path.
+`;
+    } else if (input.urgencyLevel === 'critical') {
+      timePressureSection = `
+🚨 TIME PRESSURE: CRITICAL — Less than 30 seconds remaining. THIS IS YOUR LAST CHANCE.
+- Execute the SINGLE most likely action to reach the goal.
+- Do NOT fill optional fields — only mandatory fields.
+- If goal appears partially achieved (progress ≥ 70%), set "done": true immediately.
+- Prefer "done" over another action if the main objective is visibly accomplished.
+`;
+    }
+
     // URL context
     const urlLine = input.currentUrl ? `- Current URL: ${input.currentUrl}\n` : '';
     const transitionSection = input.transitionSummary
@@ -356,7 +376,7 @@ Before choosing an action, consider its cost and risk:
 | press    | MEDIUM | MEDIUM | Keyboard shortcut. May trigger submit.   |
 | goto     | HIGH   | HIGH   | Navigate to new URL. Loses current page. |
 Prefer LOW-cost actions when multiple paths exist. Use HIGH-risk actions only when necessary.
-${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${supervisorSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
+${timePressureSection}${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${supervisorSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
 ═══ PROGRESS ═══
 Progress: ${Math.round(input.progressScore * 100)}% | Iteration: ${input.iteration}
 Last outcome: ${input.lastOutcome || 'none'}

@@ -32,8 +32,8 @@ export const SUB_AGENT_CONFIG: SubAgentConfig = {
   /** Below this → fallback to monolithic. Between this and routerConfidenceThreshold → ask clarification. */
   routerClarificationThreshold: envNum(process.env.CHAT_ROUTER_CLARIFICATION_THRESHOLD, 0.3),
 
-  /** Maximum tool-calling rounds for executor agent */
-  maxToolRounds: 3,
+  /** Maximum tool-calling rounds for executor agent (3 too low for multi-step writes with confirmations) */
+  maxToolRounds: envNum(process.env.CHAT_MAX_TOOL_ROUNDS, 5),
 
   /** Circuit breaker: sliding window size */
   circuitBreakerWindowSize: 10,

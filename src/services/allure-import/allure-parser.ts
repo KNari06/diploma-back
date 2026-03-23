@@ -7,7 +7,6 @@
  *  - Parses *-result.json and *-container.json files
  *  - Deduplicates parameterised tests by testCaseId
  *  - Builds container → result UUID linkage map
- *  - Collects attachment buffers for screenshots
  *  - Parses environment.properties and executor.json
  *  - Returns DocumentationFile[] for the KB processor
  */
@@ -156,9 +155,7 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
   // ── 4. Process by category ────────────────────────────────────────────────
   const rawResults: AllureTestResult[] = [];
   const rawContainers: AllureContainer[] = [];
-  const attachmentBuffers = new Map<string, Buffer>();
   const documentation: DocumentationFile[] = [];
-  const screenshots: string[] = [];
   let videosSkipped = 0;
   let filesSkipped = 0;
   const metadataRaw: AllureImportMetadata = {};
@@ -172,14 +169,27 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
       case 'test_result': {
         const text = buf.toString('utf-8');
         const parsed = safeParseJSON<AllureTestResult>(text);
-        if (!parsed || !parsed.uuid || !parsed.name) {
+        if (!parsed || !parsed.uuid) {
           logger.warn('[AllureParser] Skipping malformed result file', { path: file.path });
           filesSkipped++;
           break;
         }
+
+        // Resolve name: name → fullName → filename-derived fallback
+        const resolvedName = parsed.name
+          || parsed.fullName?.split('.').pop()
+          || file.filename.replace(/-result\.json$/i, '');
+
+        if (!resolvedName) {
+          logger.warn('[AllureParser] Skipping result with no name', { path: file.path });
+          filesSkipped++;
+          break;
+        }
+
         // Ensure required arrays are present
         rawResults.push({
           ...parsed,
+          name: resolvedName,
           labels: parsed.labels ?? [],
           links: parsed.links ?? [],
           parameters: parsed.parameters ?? [],
@@ -204,13 +214,6 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
           befores: parsed.befores ?? [],
           afters: parsed.afters ?? [],
         });
-        break;
-      }
-
-      // ── Screenshots ───────────────────────────────────────────────────
-      case 'screenshot': {
-        attachmentBuffers.set(file.filename, buf);
-        screenshots.push(file.filename);
         break;
       }
 
@@ -278,8 +281,6 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
   logger.info('[AllureParser] Raw extraction complete', {
     results: rawResults.length,
     containers: rawContainers.length,
-    attachments: attachmentBuffers.size,
-    screenshots: screenshots.length,
     documentation: documentation.length,
     videosSkipped,
     filesSkipped,
@@ -298,7 +299,6 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
 
   // ── 7. Compose final output ───────────────────────────────────────────────
   const classificationSummary: AllureClassificationSummary = {
-    screenshots,
     documentation,
     videosSkipped,
     filesSkipped,
@@ -308,7 +308,6 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
     results,
     containers: rawContainers,
     containerByResultUuid,
-    attachmentBuffers,
     metadata: metadataRaw,
     classified: classificationSummary,
   };

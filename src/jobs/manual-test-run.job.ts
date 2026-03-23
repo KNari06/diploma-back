@@ -423,6 +423,7 @@ export class ManualTestRunJobHandler {
         quality_checks: result.qualityChecks, // Non-UI quality checks (Web Vitals, a11y, broken resources, slow APIs)
         video_url: result.videoUrl, // Supabase Storage URL
         trace_url: result.traceUrl, // Supabase Storage URL
+        replay_trace_url: result.replayTraceUrl, // V14: Replay trace JSONL URL
         completed_at: new Date().toISOString(),
       });
 
@@ -545,6 +546,7 @@ export class ManualTestRunJobHandler {
       quality_checks: result?.qualityChecks, // Non-UI quality checks
       video_url: result?.videoUrl, // Supabase Storage URL (even for failed tests)
       trace_url: result?.traceUrl, // Supabase Storage URL (even for failed tests)
+      replay_trace_url: result?.replayTraceUrl, // V14: Replay trace JSONL URL (especially important for failed tests)
       completed_at: new Date().toISOString(),
     });
 
