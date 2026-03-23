@@ -141,17 +141,34 @@ export async function createPlan(
       return defaultCategory;
     };
 
+    // Build set of all valid tool names for expectedTool validation
+    const allValidToolNames = availableToolNames ?? new Set(
+      groups.flatMap(g => toolCategories.includes(g.category) ? g.toolNames : [])
+    );
+
     // Parse steps and force unique sequential stepNumbers (LLM may return duplicates)
-    const rawSteps = (parsed.steps || []).map((step: any, idx: number) => ({
-      stepNumber: idx + 1, // Always re-number sequentially — prevents duplicates
-      description: step.description || '',
-      category: sanitizeCategory(step.category),
-      expectedTool: step.expectedTool,
-      // Remap dependsOn from LLM step numbers to our sequential numbers
-      dependsOn: Array.isArray(step.dependsOn)
-        ? (step.dependsOn as number[]).filter((d: number) => typeof d === 'number' && d >= 1 && d <= (parsed.steps || []).length)
-        : [],
-    }));
+    const rawSteps = (parsed.steps || []).map((step: any, idx: number) => {
+      // Validate expectedTool against real tool registry — LLM may hallucinate tool names
+      let expectedTool = step.expectedTool;
+      if (expectedTool && !allValidToolNames.has(expectedTool)) {
+        logger.warn('[PLANNER_AGENT] expectedTool not in registry, clearing', {
+          expectedTool,
+          stepNumber: idx + 1,
+        });
+        expectedTool = undefined;
+      }
+
+      return {
+        stepNumber: idx + 1, // Always re-number sequentially — prevents duplicates
+        description: step.description || '',
+        category: sanitizeCategory(step.category),
+        expectedTool,
+        // Remap dependsOn from LLM step numbers to our sequential numbers
+        dependsOn: Array.isArray(step.dependsOn)
+          ? (step.dependsOn as number[]).filter((d: number) => typeof d === 'number' && d >= 1 && d <= (parsed.steps || []).length)
+          : [],
+      };
+    });
 
     const result: PlannerResult = {
       summary: parsed.summary || 'Multi-step task',

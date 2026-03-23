@@ -1,7 +1,7 @@
 import { buildChatSystemPrompt } from '@/ai/prompts';
 import { supabaseAdmin } from '@/db/supabase';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { autoEmbedOldMessages, searchChatHistory } from '@/services/ai/embeddings/chat-embeddings.service';
+import { autoEmbedOldMessages, hasEmbeddings, searchChatHistory } from '@/services/ai/embeddings/chat-embeddings.service';
 import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
@@ -255,7 +255,7 @@ export async function handleGeneralChat(
     // Speed: ~100ms (vs 2-3 sec for GPT summary)
     // ═══════════════════════════════════════════════════════════════════════
 
-    // Check if we need vector search (only if we have old messages beyond last 20)
+    // Check if we need vector search (only if we have old messages beyond the recent window)
     // If recentMessages returned exactly LIMIT messages, there are likely more old messages
     if (recentMessages.length >= CONSTANTS.RECENT_MESSAGES_LIMIT && chatSessionId) {
       logger.info('[GENERAL_CHAT] Recent messages at limit, using vector search for old context', {
@@ -263,48 +263,65 @@ export async function handleGeneralChat(
         recentCount: recentMessages.length
       });
 
-      // recentMessages.length >= LIMIT implies there are older messages
-      {
-        logger.info('[GENERAL_CHAT] Chat has old messages, using vector search');
+      try {
+        // Ensure embeddings exist before searching — fixes first-request miss where
+        // vector search returns empty because embeddings haven't been created yet.
+        // autoEmbedOldMessages is idempotent (skips already-embedded messages).
+        const embeddingsExist = await hasEmbeddings(chatSessionId);
 
-        try {
-          // Search for relevant old messages using semantic similarity
-          // Note: We don't await autoEmbedOldMessages - it runs in background for NEXT request
-          const searchChatHistoryWithLogging = functionLogger
-            ? withFunctionLogging(searchChatHistory, 'searchChatHistory', functionLogger)
-            : searchChatHistory;
-          const relevantOldMessages = await searchChatHistoryWithLogging(
-            chatSessionId,
-            message, // Current user query
-            {
-              matchCount: 5, // Top 5 (increased from 3 for better recall)
-              matchThreshold: 0.4, // Lowered from 0.5 for better recall on vague questions
-            }
-          );
-          if (abortSignal) checkRequestAborted(abortSignal);
-
-          if (relevantOldMessages.length > 0) {
-            // Format relevant messages as context
-            oldContextSummary = relevantOldMessages
-              .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
-              .join('\n\n');
-
-            logger.info('[GENERAL_CHAT] Retrieved relevant old context via vectors', {
-              retrievedCount: relevantOldMessages.length,
-              avgSimilarity: (relevantOldMessages.reduce((sum, m) => sum + m.similarity, 0) / relevantOldMessages.length).toFixed(2),
-              oldestDate: relevantOldMessages[0]?.created_at,
-            });
-          } else {
-            logger.info('[GENERAL_CHAT] No relevant old messages found in vector search');
-          }
-        } catch (vectorError) {
-          // Fallback: If vector search fails, continue without old context
-          logger.error('[GENERAL_CHAT] Vector search failed, continuing without old context', {
-            error: vectorError,
-            sessionId: chatSessionId
+        if (!embeddingsExist) {
+          logger.info('[GENERAL_CHAT] No embeddings found, creating before search (first-time)', {
+            sessionId: chatSessionId,
           });
-          oldContextSummary = ''; // No old context
+          // Await with timeout — first time is slower but guarantees context is available
+          const embedPromise = autoEmbedOldMessages(chatSessionId);
+          const embedTimeout = new Promise<{ success: number; failed: number }>((resolve) =>
+            setTimeout(() => resolve({ success: 0, failed: 0 }), 10_000) // 10s cap for first-time embed
+          );
+          const embedResult = await Promise.race([embedPromise, embedTimeout]);
+          logger.info('[GENERAL_CHAT] First-time embedding complete', {
+            sessionId: chatSessionId,
+            ...embedResult,
+          });
         }
+
+        if (abortSignal) checkRequestAborted(abortSignal);
+
+        // Search for relevant old messages using semantic similarity
+        const searchChatHistoryWithLogging = functionLogger
+          ? withFunctionLogging(searchChatHistory, 'searchChatHistory', functionLogger)
+          : searchChatHistory;
+        const relevantOldMessages = await searchChatHistoryWithLogging(
+          chatSessionId,
+          message, // Current user query
+          {
+            matchCount: 5, // Top 5 (increased from 3 for better recall)
+            matchThreshold: 0.4, // Lowered from 0.5 for better recall on vague questions
+          }
+        );
+        if (abortSignal) checkRequestAborted(abortSignal);
+
+        if (relevantOldMessages.length > 0) {
+          // Format relevant messages as context
+          oldContextSummary = relevantOldMessages
+            .map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+            .join('\n\n');
+
+          logger.info('[GENERAL_CHAT] Retrieved relevant old context via vectors', {
+            retrievedCount: relevantOldMessages.length,
+            avgSimilarity: (relevantOldMessages.reduce((sum, m) => sum + m.similarity, 0) / relevantOldMessages.length).toFixed(2),
+            oldestDate: relevantOldMessages[0]?.created_at,
+          });
+        } else {
+          logger.info('[GENERAL_CHAT] No relevant old messages found in vector search');
+        }
+      } catch (vectorError) {
+        // Fallback: If vector search fails, continue without old context
+        logger.error('[GENERAL_CHAT] Vector search failed, continuing without old context', {
+          error: vectorError,
+          sessionId: chatSessionId
+        });
+        oldContextSummary = ''; // No old context
       }
     }
 
