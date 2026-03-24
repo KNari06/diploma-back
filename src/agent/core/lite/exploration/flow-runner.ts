@@ -51,6 +51,8 @@ import {
 } from './prompts';
 import { ClarificationService } from '@/agent/utils/context/clarification.service';
 import type { ExplorationTraceService } from './exploration-trace.service';
+import { Scout } from './agents/scout';
+import type { ScoutInput, ScoutOutput } from './agents/agent-types';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -90,6 +92,7 @@ export class FlowRunner {
   private flowsCompleted: number = 0;
   private totalFlows: number = 0;
   private checkpointCallback?: CheckpointCallback;
+  private readonly scout: Scout;
 
   constructor(
     private readonly browser: Browser,
@@ -100,6 +103,7 @@ export class FlowRunner {
     private readonly trace?: ExplorationTraceService,
   ) {
     this.stateManager = new StateManager(browser);
+    this.scout = new Scout(rateLimiter, trace);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -525,22 +529,13 @@ export class FlowRunner {
       // 8. Track this flow name for branch dedup
       this.knownFlowNames.push(entryPoint.name);
 
-      // 9. Detect branch points on final page (also for partially-successful flows)
+      // 9. Detect branch points via Scout agent (also for partially-successful flows)
       let branchPoints: EntryPoint[] = [];
       if (pipelineResult.success || pipelineResult.progressScore > 30) {
-        // Build flow outcome summary for branch detection AI context
-        const outcomeParts: string[] = [];
-        outcomeParts.push(pipelineResult.success ? 'Completed successfully' : `Partial (${pipelineResult.progressScore}% progress)`);
-        if (entryPoint.sourcePageUrl && page.url() !== entryPoint.sourcePageUrl) {
-          outcomeParts.push(`URL changed: ${entryPoint.sourcePageUrl} → ${page.url()}`);
-        }
-        if (pipelineResult.blockedReason) {
-          outcomeParts.push(`Blocked: ${pipelineResult.blockedReason}`);
-        }
-        outcomeParts.push(`${pipelineResult.commandsExecuted} commands in ${pipelineResult.roundsExecuted} rounds`);
-        const flowOutcome = outcomeParts.join('. ');
-
-        branchPoints = await this.detectBranchPoints(page, entryPoint, this.knownFlowNames, flowOutcome);
+        branchPoints = await this.detectBranchesWithScout(
+          page, entryPoint, discoveredSteps, errors,
+          pipelineResult.success ? 'passed' : pipelineResult.blockedReason ? 'blocked' : 'failed',
+        );
       }
 
       // 10. Determine status + extract blocker metadata
@@ -1112,7 +1107,64 @@ export class FlowRunner {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * After a flow completes, analyze the final page for new entry points.
+   * Scout-based branch detection — delegates AI call to Scout agent.
+   * Keeps overlay dismissal + snapshot collection in FlowRunner.
+   */
+  private async detectBranchesWithScout(
+    page: Page,
+    completedEntry: EntryPoint,
+    discoveredSteps: DiscoveredStep[],
+    errors: FlowError[],
+    flowStatus: 'passed' | 'failed' | 'blocked',
+  ): Promise<EntryPoint[]> {
+    try {
+      // Dismiss post-flow overlays (reuse existing logic)
+      try {
+        await OverlayDismisser.dismissOverlays(page, { maxPasses: 2, maxTimeMs: 3000, mode: 'flow' });
+      } catch { /* non-fatal */ }
+
+      try {
+        await VisualStability.waitForPageReady(page, { timeout: 3000 });
+      } catch { /* non-fatal */ }
+
+      const snapshot = await SnapshotCollector.collect(page);
+
+      const scoutInput: ScoutInput = {
+        completedFlow: {
+          name: completedEntry.name,
+          goal: completedEntry.goal,
+          category: completedEntry.category,
+          status: flowStatus,
+          steps: discoveredSteps,
+          finalUrl: page.url(),
+          errorsFound: errors.length,
+        },
+        snapshot,
+        knownFlows: [...this.knownFlowNames],
+        knownPages: [], // TODO: wire from blackboard
+        flowsRemaining: this.budget.remainingFlows(),
+      };
+
+      const scoutResult = await this.scout.detect(scoutInput);
+
+      return scoutResult.newEntryPoints.map((bp, index) => ({
+        ...bp,
+        id: `ep-scout-${completedEntry.id}-${index}`,
+        sourceNodeId: completedEntry.sourceNodeId,
+        sourcePageUrl: page.url(),
+      }));
+    } catch (error) {
+      logger.warn('[FLOW_RUNNER] Scout branch detection failed', {
+        flow: completedEntry.name,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * LEGACY: After a flow completes, analyze the final page for new entry points.
+   * Kept as reference — new code uses detectBranchesWithScout() above.
    */
   private async detectBranchPoints(
     page: Page,

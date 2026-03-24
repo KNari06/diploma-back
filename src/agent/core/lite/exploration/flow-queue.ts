@@ -13,6 +13,7 @@
  */
 
 import type { EntryPoint, FlowPriority, FlowComplexity, QueueCheckpoint } from './types';
+import type { StrategistOutput, StrategistFlowPlan } from './agents/agent-types';
 
 /** Priority weights (higher = explore sooner) */
 const PRIORITY_WEIGHT: Record<FlowPriority, number> = {
@@ -51,6 +52,59 @@ export class FlowQueue {
       q.enqueueSync(ep, true); // skip sort during batch load
     }
     q.sort(); // sort once at the end
+    return q;
+  }
+
+  /**
+   * Build queue from Strategist output — AI-driven ordering replaces static formula.
+   * Entry points not in the strategy plan are appended after planned ones.
+   * Skipped flows are excluded.
+   */
+  static fromStrategyOutput(
+    entryPoints: EntryPoint[],
+    strategy: StrategistOutput,
+  ): FlowQueue {
+    const q = new FlowQueue();
+    const skipIds = new Set(strategy.skipFlows.map((s) => s.id));
+    const planMap = new Map(strategy.plan.map((p) => [p.entryPointId, p]));
+
+    // Separate into planned (ordered by Strategist) and unplanned
+    const planned: EntryPoint[] = [];
+    const unplanned: EntryPoint[] = [];
+
+    for (const ep of entryPoints) {
+      if (skipIds.has(ep.id)) continue; // Strategist said skip
+      if (planMap.has(ep.id)) {
+        planned.push(ep);
+      } else {
+        unplanned.push(ep);
+      }
+    }
+
+    // Sort planned by Strategist priority (1 = first)
+    planned.sort((a, b) => {
+      const pa = planMap.get(a.id)!.priority;
+      const pb = planMap.get(b.id)!.priority;
+      return pa - pb;
+    });
+
+    // Apply dependency overrides from Strategist
+    for (const ep of planned) {
+      const planEntry = planMap.get(ep.id);
+      if (planEntry?.dependsOn) {
+        ep.dependsOn = planEntry.dependsOn;
+      }
+    }
+
+    // Enqueue: planned first (in Strategist order), then unplanned (in default score order)
+    for (const ep of planned) {
+      q.enqueueSync(ep, true);
+    }
+    for (const ep of unplanned) {
+      q.enqueueSync(ep, true);
+    }
+    // Don't sort — planned order is intentional from Strategist
+
     return q;
   }
 
@@ -118,6 +172,49 @@ export class FlowQueue {
    */
   remaining(): EntryPoint[] {
     return [...this.queue];
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // REORDER (Strategist-driven)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Reorder the queue based on Strategist's updated plan.
+   * Moves planned entries to front in Strategist priority order.
+   * Removes entries marked as skip.
+   */
+  reorder(plan: StrategistFlowPlan[], skipIds?: string[]): void {
+    const skipSet = new Set(skipIds || []);
+    const planMap = new Map(plan.map((p) => [p.entryPointId, p]));
+
+    // Remove skipped entries
+    if (skipSet.size > 0) {
+      this.queue = this.queue.filter((ep) => !skipSet.has(ep.id));
+    }
+
+    // Separate into entries that are in plan vs not
+    const inPlan: EntryPoint[] = [];
+    const notInPlan: EntryPoint[] = [];
+    for (const ep of this.queue) {
+      if (planMap.has(ep.id)) {
+        // Apply dependency overrides
+        const planEntry = planMap.get(ep.id)!;
+        if (planEntry.dependsOn) ep.dependsOn = planEntry.dependsOn;
+        inPlan.push(ep);
+      } else {
+        notInPlan.push(ep);
+      }
+    }
+
+    // Sort in-plan by Strategist priority (1 = first)
+    inPlan.sort((a, b) => {
+      const pa = planMap.get(a.id)?.priority ?? 999;
+      const pb = planMap.get(b.id)?.priority ?? 999;
+      return pa - pb;
+    });
+
+    // Rebuild queue: Strategist-ordered first, then remainder
+    this.queue = [...inPlan, ...notInPlan];
   }
 
   // ═══════════════════════════════════════════════════════════════════════

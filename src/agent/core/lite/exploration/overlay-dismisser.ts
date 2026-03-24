@@ -220,15 +220,25 @@ export class OverlayDismisser {
         for (const { fact, type } of dismissible) {
           if (Date.now() - startTime > maxTimeMs) break;
 
-          // Destructive guard
+          // Destructive guard: if overlay contains destructive text,
+          // try safe dismissal (Escape/Cancel) instead of skipping entirely.
+          // This handles confirmation dialogs like "Delete item? [Cancel] [Delete]"
           if (isDestructiveOverlay(fact.textPreview)) {
+            // Try Escape first — safest way to dismiss confirmation dialogs
+            const escResult = await this.executeRecovery(page, fact, type, 'dismiss_escape');
+            if (escResult.dismissed) {
+              attempts.push(escResult);
+              anyDismissed = true;
+              continue;
+            }
+            // Escape didn't work — skip (don't risk clicking destructive button)
             attempts.push({
               ref: fact.ref,
               obstacleType: type,
               recovery: 'skipped',
               dismissed: false,
               skipped: true,
-              skipReason: 'potentially destructive content',
+              skipReason: 'destructive content — Escape failed, skipping to avoid data loss',
             });
             continue;
           }

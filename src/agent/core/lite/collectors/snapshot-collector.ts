@@ -203,9 +203,9 @@ export class SnapshotCollector {
             const elArea = elRect.width * elRect.height;
             const coverage = viewportArea2 > 0 ? elArea / viewportArea2 : 0;
 
-            // Must be meaningful size (>3% viewport) — lowered from 10% to catch
-            // small popups, autocomplete dropdowns, context menus, tooltips with forms
-            if (coverage < 0.03) continue;
+            // Must be meaningful size (>1% viewport) — lowered from 3% to catch
+            // small dropdowns, autocomplete menus, tooltips, mobile modals
+            if (coverage < 0.01) continue;
 
             // ── Q5 FIX: Exclude structural navigation elements (sidebars, headers, footers) ──
             // Sidebars: flush to left/right edge + tall (>70% viewport height)
@@ -546,9 +546,9 @@ export class SnapshotCollector {
             });
           }
 
-          // Sort by z-index descending, take top 8
+          // Sort by z-index descending, take top 15 (raised from 8 to catch stacked modals + widgets)
           facts.sort((a: any, b: any) => b.zIndex - a.zIndex);
-          return facts.slice(0, 8);
+          return facts.slice(0, 15);
         };
 
         const obstacleFacts = collectObstacleFacts();
@@ -819,7 +819,7 @@ export class SnapshotCollector {
          * Scans container (document.body), capped at MAX_SECONDARY_ELEMENTS.
          * Returns Set of added elements for overlay-aware isInsideModal logic.
          */
-        const MAX_SECONDARY_ELEMENTS = 120; // Cap to prevent flooding from global scan
+        const MAX_SECONDARY_ELEMENTS = 300; // Cap to prevent flooding from global scan (raised from 120 for large SPAs)
 
         const collectFrameworkInteractiveElements = (
           container: Element,
@@ -844,9 +844,9 @@ export class SnapshotCollector {
             if (style.display === 'none' || style.visibility === 'hidden') continue;
             if (parseFloat(style.opacity) < 0.1) continue;
 
-            // Skip elements too small to be interactive
+            // Skip elements too small to be interactive (lowered from 10 to catch icon buttons)
             const rect = el.getBoundingClientRect();
-            if (rect.width < 10 || rect.height < 10) continue;
+            if (rect.width < 5 || rect.height < 5) continue;
 
             // Skip structural/container elements that are too large (likely wrappers, not clickables)
             if (rect.width > 600 && rect.height > 600) continue;

@@ -1,33 +1,33 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * EXPLORATION ENGINE — Top-level orchestrator
+ * EXPLORATION ENGINE v2 — Autonomous Multi-Agent Orchestrator
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Coordinates the autonomous test case discovery process:
+ * 4-phase exploration with specialized agents:
  *
  *   Phase 1: SURVEY
- *   - BFS traversal of the web application
- *   - AI classification of each page
- *   - Discovery of all testable entry points
+ *   - BFS traversal with Cartographer agent (per page)
+ *   - Deep page understanding + entry point discovery
  *
- *   Phase 2: FLOW EXPLORATION
- *   - Prioritize discovered entry points
- *   - Run up to 5 parallel sub-agents (TestPipeline per flow)
- *   - Extract test steps from each flow
- *   - Detect branch points (new flows after completion)
+ *   Phase 1.5: STRATEGY (NEW)
+ *   - Strategist agent sees full tree + all insights
+ *   - AI-driven prioritization replaces static formula
+ *   - Auth strategy planning
  *
- *   Output: ExplorationResult with DiscoveredTestCase[]
+ *   Phase 2: FLOW EXECUTION
+ *   - Parallel TestPipeline per flow
+ *   - Scout agent discovers branches after each flow
+ *   - Adaptive re-strategy every batch
+ *
+ *   Phase 2.5: COVERAGE EVALUATION (NEW)
+ *   - Sentinel agent evaluates coverage gaps
+ *   - Decides whether to continue exploring
+ *
+ * All agents share context through ExplorationBlackboard.
  *
  * Usage:
  *   const engine = new ExplorationEngine(browser, config);
  *   const result = await engine.run();
- *
- * Reuses:
- *   - TestPipeline (pipeline/) for individual flow execution
- *   - SnapshotCollector for page analysis
- *   - ActionExecutor for Playwright actions
- *   - GoalDetector for progress scoring
- *   - All existing collector/analysis infrastructure
  */
 
 import type { Browser } from 'playwright';
@@ -44,6 +44,10 @@ import { FlowRunner } from './flow-runner';
 import { TestCaseBuilder } from './test-case-builder';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { ExplorationTraceService } from './exploration-trace.service';
+import { createBlackboard, taskToFlowResult } from './agents/blackboard';
+import { ExplorationStrategist } from './agents/strategist';
+import { ExplorationSentinel } from './agents/sentinel';
+import type { ExplorationBlackboard } from './agents/agent-types';
 
 /** Save checkpoint every N completed flows */
 const CHECKPOINT_EVERY_N_FLOWS = 3;
@@ -89,17 +93,25 @@ export class ExplorationEngine {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Run the full exploration: Survey → Prioritize → Explore → Build results.
+   * Run the full 4-phase exploration:
+   *   Phase 1:   Survey (BFS + Cartographer per page)
+   *   Phase 1.5: Strategy (Strategist plans + prioritizes)
+   *   Phase 2:   Flow Execution (TestPipeline + Scout per flow)
+   *   Phase 2.5: Coverage Evaluation (Sentinel assesses gaps)
    */
   async run(): Promise<ExplorationResult> {
     const startTime = Date.now();
     const budget = new BudgetTracker(this.config.budget);
     const rateLimiter = new RateLimiter(this.config.rateLimiting, budget);
     const trace = new ExplorationTraceService(this.config.explorationId);
+    const emitProgress = this.onProgress || (() => {});
+
+    // Create shared blackboard for all agents
+    const bb = createBlackboard(this.config, budget, rateLimiter, trace, emitProgress);
 
     trace.writeExplorationStart(this.config);
 
-    logger.info('[EXPLORATION] Starting autonomous exploration', {
+    logger.info('[EXPLORATION] Starting autonomous multi-agent exploration', {
       explorationId: this.config.explorationId,
       entryUrl: this.config.entryUrl,
       maxFlows: this.config.budget.maxFlows,
@@ -109,7 +121,7 @@ export class ExplorationEngine {
 
     // ════════════════════════════════════════════════════════════════════
     // PHASE 1: SURVEY
-    // BFS page discovery — read-only, no side effects
+    // BFS page discovery — Cartographer analyzes each page
     // ════════════════════════════════════════════════════════════════════
 
     logger.info('[EXPLORATION] Phase 1: Starting page survey');
@@ -121,38 +133,36 @@ export class ExplorationEngine {
       userAgent: DESKTOP_USER_AGENT,
     });
 
-    let tree: ExplorationTree;
     try {
       const surveyPage = await surveyContext.newPage();
 
-      // Block third-party requests for faster page discovery
       try {
         const { setupThirdPartyBlocker } = await import('@/agent/playwright/execution/third-party-blocker');
         await setupThirdPartyBlocker(surveyPage);
       } catch { /* non-fatal */ }
 
       const surveyAgent = new SurveyAgent(surveyPage, this.config, budget, rateLimiter, trace);
-      tree = await surveyAgent.survey();
+      bb.tree = await surveyAgent.survey();
       await surveyPage.close();
     } finally {
       await surveyContext.close();
     }
 
-    const allEntryPoints = tree.getAllEntryPoints();
+    const allEntryPoints = bb.tree.getAllEntryPoints();
 
     this.emitProgress('survey', 'survey_complete', {
-      pagesVisited: tree.getNodeCount(),
+      pagesVisited: bb.tree.getNodeCount(),
       entryPointsFound: allEntryPoints.length,
-    }, 30);
+    }, 25);
 
     trace.writePhaseEnd('survey', {
-      pagesVisited: tree.getNodeCount(),
+      pagesVisited: bb.tree.getNodeCount(),
       entryPointsFound: allEntryPoints.length,
       timeUsedMs: Date.now() - startTime,
     });
 
     logger.info('[EXPLORATION] Phase 1 complete', {
-      pagesVisited: tree.getNodeCount(),
+      pagesVisited: bb.tree.getNodeCount(),
       entryPointsFound: allEntryPoints.length,
       timeUsedMs: Date.now() - startTime,
     });
@@ -162,11 +172,10 @@ export class ExplorationEngine {
       version: 1,
       phase: 'survey',
       timestamp: Date.now(),
-      tree: tree.toCheckpoint(),
+      tree: bb.tree.toCheckpoint(),
       budget: budget.toCheckpoint(),
     });
 
-    // If no entry points found, return early
     if (allEntryPoints.length === 0) {
       logger.warn('[EXPLORATION] No entry points discovered, returning empty result');
       trace.writeExplorationEnd({
@@ -178,36 +187,58 @@ export class ExplorationEngine {
       await trace.close();
       const builder = new TestCaseBuilder();
       await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
-      return builder.build(tree, [], budget, this.config, startTime, []);
+      return builder.build(bb.tree, [], budget, this.config, startTime, []);
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // PRIORITIZE: Build flow queue from discovered entry points
+    // PHASE 1.5: STRATEGY (NEW)
+    // Strategist sees full tree + all insights → AI-driven prioritization
     // ════════════════════════════════════════════════════════════════════
 
-    const queue = FlowQueue.fromEntryPoints(allEntryPoints);
+    logger.info('[EXPLORATION] Phase 1.5: Strategist planning');
 
-    logger.info('[EXPLORATION] Flow queue built', {
-      totalFlows: queue.size(),
-      budgetRemaining: budget.remainingFlows(),
+    const strategist = new ExplorationStrategist(bb);
+    bb.currentStrategy = await strategist.plan();
+
+    // Build queue from Strategist output (AI-driven order, not static formula)
+    bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy);
+
+    this.emitProgress('survey', 'survey_complete', {
+      event: 'strategy_planned',
+      totalFlowsPlanned: bb.currentStrategy.plan.length,
+      focusAreas: bb.currentStrategy.focusAreas,
+      loginFirst: bb.currentStrategy.authPlan.loginFirst,
+      strategyReasoning: bb.currentStrategy.strategyReasoning,
+    }, 30);
+
+    logger.info('[EXPLORATION] Strategy planned', {
+      plannedFlows: bb.currentStrategy.plan.length,
+      skipFlows: bb.currentStrategy.skipFlows.length,
+      loginFirst: bb.currentStrategy.authPlan.loginFirst,
+      continueSurvey: bb.currentStrategy.continueSurvey,
+      focusAreas: bb.currentStrategy.focusAreas,
     });
+
+    // TODO: If Strategist wants more survey, run targeted survey here
+    // if (bb.currentStrategy.continueSurvey && bb.currentStrategy.surveyTargets?.length) { ... }
 
     // ════════════════════════════════════════════════════════════════════
     // PHASE 2: FLOW EXPLORATION
     // Parallel sub-agents, each in isolated BrowserContext
+    // Scout discovers branches after each flow
     // ════════════════════════════════════════════════════════════════════
 
     logger.info('[EXPLORATION] Phase 2: Starting flow exploration');
     trace.writePhaseStart('flow');
     trace.writeQueueState({
-      pendingCount: queue.size(),
+      pendingCount: bb.queue.size(),
       completedCount: 0,
-      totalEnqueued: queue.size(),
+      totalEnqueued: bb.queue.size(),
     });
 
     const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace);
 
-    // Periodic checkpoint callback: save every N flows
+    // Periodic checkpoint callback
     let lastCheckpointFlows = 0;
     flowRunner.setCheckpointCallback(async (completedTasks) => {
       if (completedTasks.length - lastCheckpointFlows >= CHECKPOINT_EVERY_N_FLOWS) {
@@ -217,9 +248,9 @@ export class ExplorationEngine {
           version: 1,
           phase: 'flow',
           timestamp: Date.now(),
-          tree: tree.toCheckpoint(),
+          tree: bb.tree!.toCheckpoint(),
           budget: budget.toCheckpoint(),
-          queue: queue.toCheckpoint(),
+          queue: bb.queue!.toCheckpoint(),
           flowRunner: {
             loginCompleted: flowRunner.isLoginCompleted(),
             knownFlowNames: flowRunner.getKnownFlowNames(),
@@ -231,11 +262,15 @@ export class ExplorationEngine {
     });
 
     let flowTasks;
-
     try {
-      flowTasks = await flowRunner.runAll(queue);
+      flowTasks = await flowRunner.runAll(bb.queue);
     } finally {
       await flowRunner.cleanup();
+    }
+
+    // Store completed flows in blackboard for Sentinel
+    for (const task of flowTasks) {
+      bb.completedFlows.push(taskToFlowResult(task));
     }
 
     trace.writePhaseEnd('flow', {
@@ -255,16 +290,74 @@ export class ExplorationEngine {
     });
 
     // ════════════════════════════════════════════════════════════════════
+    // PHASE 2.5: COVERAGE EVALUATION (NEW)
+    // Sentinel evaluates gaps, decides if another round is needed
+    // ════════════════════════════════════════════════════════════════════
+
+    logger.info('[EXPLORATION] Phase 2.5: Sentinel coverage evaluation');
+
+    const sentinel = new ExplorationSentinel(bb);
+    bb.coverageAssessment = await sentinel.evaluate();
+
+    this.emitProgress('flow', 'flow_completed', {
+      event: 'coverage_evaluated',
+      coverageScore: bb.coverageAssessment.coverageScore,
+      gaps: bb.coverageAssessment.gaps,
+      qualitySummary: bb.coverageAssessment.qualitySummary,
+      continueExploring: bb.coverageAssessment.continueExploring,
+    }, 90);
+
+    logger.info('[EXPLORATION] Coverage assessment', {
+      coverageScore: bb.coverageAssessment.coverageScore,
+      gaps: bb.coverageAssessment.gaps.length,
+      continueExploring: bb.coverageAssessment.continueExploring,
+      qualitySummary: bb.coverageAssessment.qualitySummary,
+    });
+
+    // If Sentinel says continue and budget allows → run extra round
+    if (bb.coverageAssessment.continueExploring && !budget.isExhausted() && budget.canExploreMoreFlows()) {
+      logger.info('[EXPLORATION] Sentinel requested extra round', {
+        focusNext: bb.coverageAssessment.focusNext,
+      });
+
+      const focused = await strategist.planFocused(bb.coverageAssessment.focusNext);
+      if (bb.queue) {
+        bb.queue.reorder(focused.plan, focused.skipFlows.map((s) => s.id));
+      }
+
+      if (bb.queue && !bb.queue.isEmpty()) {
+        const extraFlowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace);
+        try {
+          const extraTasks = await extraFlowRunner.runAll(bb.queue);
+          flowTasks = [...flowTasks, ...extraTasks];
+
+          for (const task of extraTasks) {
+            bb.completedFlows.push(taskToFlowResult(task));
+          }
+        } finally {
+          await extraFlowRunner.cleanup();
+        }
+      }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // BUILD RESULT
     // ════════════════════════════════════════════════════════════════════
 
-    // Collect skipped entry points (remaining in queue after budget exhaustion)
-    const skippedEntryPoints = queue.remaining();
+    const skippedEntryPoints = bb.queue.remaining();
 
     const builder = new TestCaseBuilder();
-    const result = builder.build(tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
+    const result = builder.build(bb.tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
 
-    // Clear checkpoint on successful completion
+    // Attach Sentinel assessment to result
+    if (bb.coverageAssessment) {
+      result.summary.coverageScore = bb.coverageAssessment.coverageScore;
+      result.summary.qualitySummary = bb.coverageAssessment.qualitySummary;
+      result.summary.gaps = bb.coverageAssessment.gaps;
+      result.summary.recommendations = bb.coverageAssessment.recommendations;
+      result.summary.riskAreas = bb.coverageAssessment.riskAreas;
+    }
+
     await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
 
     this.emitProgress('complete', 'survey_complete', {
@@ -273,6 +366,8 @@ export class ExplorationEngine {
       flowsFailed: result.summary.flowsFailed,
       flowsBlocked: result.summary.flowsBlocked,
       totalSteps: result.summary.totalStepsDiscovered,
+      coverageScore: bb.coverageAssessment?.coverageScore,
+      qualitySummary: bb.coverageAssessment?.qualitySummary,
     }, 100);
 
     trace.writeExplorationEnd({
@@ -293,6 +388,7 @@ export class ExplorationEngine {
       testCasesSkipped: result.summary.flowsSkipped,
       totalSteps: result.summary.totalStepsDiscovered,
       categories: result.summary.categories,
+      coverageScore: bb.coverageAssessment?.coverageScore,
     });
 
     return result;

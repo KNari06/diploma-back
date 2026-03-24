@@ -35,6 +35,8 @@ import {
 } from './prompts';
 import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser';
 import type { ExplorationTraceService } from './exploration-trace.service';
+import { Cartographer } from './agents/cartographer';
+import type { CartographerInput, CartographerOutput } from './agents/agent-types';
 
 /** Max navigation links to follow per page */
 const MAX_NAV_LINKS_PER_PAGE = 8;
@@ -45,11 +47,11 @@ const NAV_TIMEOUT_MS = 15_000;
 /** Timeout for AI classification call (ms) */
 const AI_TIMEOUT_MS = 20_000;
 
-/** Max fallback entry points when AI returns 0 */
-const MAX_FALLBACK_ENTRY_POINTS = 8;
+/** Max fallback entry points when AI returns 0 (raised from 8 for form-heavy pages) */
+const MAX_FALLBACK_ENTRY_POINTS = 20;
 
-/** Max SPA route clicks per page during BFS */
-const MAX_SPA_CLICKS_PER_PAGE = 5;
+/** Max SPA route clicks per page during BFS (raised from 5 for tab-heavy SPAs) */
+const MAX_SPA_CLICKS_PER_PAGE = 10;
 
 /** Common login URL patterns */
 const LOGIN_URL_PATTERNS = [
@@ -60,6 +62,9 @@ const LOGIN_URL_PATTERNS = [
 export class SurveyAgent {
   private tree: ExplorationTree;
   private entryPointCounter: number = 0;
+  private readonly cartographer: Cartographer;
+  /** Track page types seen for Cartographer exploration context */
+  private pageTypesSeen: string[] = [];
 
   constructor(
     private readonly page: Page,
@@ -69,6 +74,7 @@ export class SurveyAgent {
     private readonly trace?: ExplorationTraceService,
   ) {
     this.tree = new ExplorationTree();
+    this.cartographer = new Cartographer(rateLimiter, trace);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -395,8 +401,8 @@ export class SurveyAgent {
         // Non-critical
       }
 
-      // AI classification
-      const classification = await this.classifyPage(
+      // AI classification via Cartographer agent
+      const classification = await this.classifyWithCartographer(
         formattedSnapshot,
         screenshotBase64,
         this.page.url(),
@@ -404,7 +410,6 @@ export class SurveyAgent {
         item.depth,
         snapshot,
         overlayCleanupResult?.overlaySummary ?? undefined,
-        pageHealth,
       );
 
       // Log discovered entry points & nav links
@@ -460,8 +465,8 @@ export class SurveyAgent {
 
         await this.budget.recordPageSurvey();
 
-        // Enqueue navigation links (BFS children)
-        const navLinks = classification.navigationLinks.slice(0, MAX_NAV_LINKS_PER_PAGE);
+        // Enqueue navigation links (BFS children) — no hardcoded cap, AI decides relevance
+        const navLinks = classification.navigationLinks;
         for (const link of navLinks) {
           // Resolve link URL from element ref
           const linkUrl = await this.resolveLinkUrl(link.ref, snapshot);
@@ -694,7 +699,106 @@ export class SurveyAgent {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // AI CLASSIFICATION
+  // CARTOGRAPHER AGENT — AI-driven page classification (v2)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Classify a page using the Cartographer agent.
+   * Returns the same format as the legacy classifyPage() for backward compatibility.
+   * Falls back to legacy classifyPage() if Cartographer returns empty.
+   */
+  private async classifyWithCartographer(
+    formattedSnapshot: string,
+    screenshotBase64: string | undefined,
+    url: string,
+    title: string,
+    depth: number,
+    snapshot?: LiteSnapshot,
+    overlaySummary?: string,
+  ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
+    // Build Cartographer input with exploration context
+    const categoriesSeen = [...new Set(this.pageTypesSeen)];
+    const recentPageTypes = this.pageTypesSeen.slice(-3);
+
+    const cartographerInput: CartographerInput = {
+      url,
+      title,
+      snapshot: snapshot || ({} as LiteSnapshot),
+      screenshot: screenshotBase64,
+      scopeHint: this.config.scopeHint,
+      hasCredentials: !!this.config.credentials,
+      depth,
+      explorationContext: {
+        pagesVisited: this.tree.getNodeCount(),
+        categoriesSeen,
+        entryPointsSoFar: this.tree.getAllEntryPoints().length,
+        recentPageTypes,
+      },
+      overlaysDismissed: overlaySummary ? [overlaySummary] : undefined,
+    };
+
+    const result = await this.cartographer.analyze(cartographerInput, formattedSnapshot);
+
+    // Track page type for future context
+    this.pageTypesSeen.push(result.pageType);
+
+    // Store auth detection in tree metadata
+    if (result.authDetection.isLoginPage && result.authDetection.loginUrl) {
+      // Auth detection available for Strategist via blackboard
+      logger.info('[SURVEY] Cartographer detected login page', {
+        url,
+        loginFormRef: result.authDetection.loginFormRef,
+      });
+    }
+
+    // If Cartographer returned entry points, use them
+    if (result.entryPoints.length > 0 || result.navigationLinks.length > 0) {
+      return {
+        pageType: result.pageType,
+        entryPoints: result.entryPoints.map((ep) => ({
+          name: ep.name,
+          goal: ep.goal,
+          category: ep.category,
+          priority: ep.priority,
+          requiresAuth: ep.requiresAuth,
+          estimatedComplexity: ep.estimatedComplexity,
+          relatedElements: ep.relatedElements,
+          dependsOn: ep.dependsOn,
+        })),
+        navigationLinks: result.navigationLinks.map((nl) => ({
+          ref: nl.ref,
+          label: nl.label,
+          estimatedPageType: nl.estimatedPageType,
+        })),
+      };
+    }
+
+    // Fallback: Cartographer returned empty → use heuristic detection
+    if (snapshot) {
+      const fallbackEntryPoints = this.buildFallbackEntryPoints(snapshot, url);
+      if (fallbackEntryPoints.length > 0) {
+        this.trace?.writePageClassificationFallback({
+          url,
+          reason: 'cartographer_returned_empty',
+          entryPointCount: fallbackEntryPoints.length,
+        });
+        return {
+          pageType: result.pageType || this.inferPageTypeFromUrl(url),
+          entryPoints: fallbackEntryPoints,
+          navigationLinks: [],
+        };
+      }
+    }
+
+    return {
+      pageType: result.pageType || 'unknown',
+      entryPoints: [],
+      navigationLinks: [],
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // LEGACY AI CLASSIFICATION (kept as fallback)
   // ═══════════════════════════════════════════════════════════════════════
 
   private async classifyPage(
@@ -1051,7 +1155,7 @@ export class SurveyAgent {
             screenshotBase64 = buf.toString('base64');
           } catch { /* ignore */ }
 
-          const classification = await this.classifyPage(
+          const classification = await this.classifyWithCartographer(
             formattedSnapshot,
             screenshotBase64,
             urlBefore,

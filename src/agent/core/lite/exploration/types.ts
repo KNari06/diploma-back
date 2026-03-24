@@ -548,6 +548,16 @@ export interface ExplorationSummary {
   uniquePages: number;
   /** Categories discovered */
   categories: TestFlowCategory[];
+  /** Sentinel coverage score (0-100), set after Phase 2.5 */
+  coverageScore?: number;
+  /** Sentinel quality summary, set after Phase 2.5 */
+  qualitySummary?: string;
+  /** Sentinel coverage gaps, set after Phase 2.5 */
+  gaps?: string[];
+  /** Sentinel recommendations, set after Phase 2.5 */
+  recommendations?: string[];
+  /** Sentinel risk areas, set after Phase 2.5 */
+  riskAreas?: string[];
 }
 
 export interface BudgetUsage {
