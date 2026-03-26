@@ -305,6 +305,12 @@ export class FlowRunner {
         steps: task.discoveredSteps.length,
         branches: task.branchPoints.length,
         goalAchieved: task.goalAchieved,
+        durationMs: task.durationMs,
+        progressScore: task.progressScore,
+        blockerType: task.blockerType || undefined,
+        errorMessage: task.errors.length > 0 ? task.errors[0].message : undefined,
+        failedAtStep: task.errors.length > 0 ? task.errors[0].stepNumber : undefined,
+        errorsCount: task.errors.length,
       });
 
       this.trace?.writeFlowEnd({

@@ -49,6 +49,12 @@ export class ExplorationSentinel {
     const input = this.buildInput();
     const prompt = buildSentinelPrompt(input);
 
+    this.bb.trace?.writeSentinelPrompt({
+      model: AI_MODELS.smart,
+      systemPrompt: SENTINEL_SYSTEM_PROMPT,
+      userPrompt: prompt,
+    });
+
     try {
       await this.bb.rateLimiter.acquireSlot('ai');
 
@@ -75,9 +81,23 @@ export class ExplorationSentinel {
       this.bb.rateLimiter.recordSuccess('openai');
 
       const result = parseSentinelResponse(response.content);
+      const latencyMs = Date.now() - aiStartTime;
+
+      this.bb.trace?.writeSentinelResponse({
+        model: AI_MODELS.smart,
+        rawResponse: response.content,
+        parsed: result ? {
+          coverageScore: result.coverageScore,
+          gaps: result.gaps.length,
+          continueExploring: result.continueExploring,
+          riskAreas: result.riskAreas.length,
+        } : null,
+        latencyMs,
+      });
 
       if (!result) {
         logger.warn('[SENTINEL] Failed to parse response');
+        this.bb.emitProgress?.({ explorationId: '', phase: 'evaluating', event: 'agent_warning', data: { agent: 'sentinel', message: 'Failed to parse AI response, using fallback' }, progressPercent: 0, timestamp: Date.now() });
         return this.fallbackAssessment();
       }
 
@@ -86,14 +106,15 @@ export class ExplorationSentinel {
         gaps: result.gaps.length,
         continueExploring: result.continueExploring,
         riskAreas: result.riskAreas.length,
-        latencyMs: Date.now() - aiStartTime,
+        latencyMs,
       });
 
       return result;
     } catch (error) {
-      logger.warn('[SENTINEL] AI call failed, using fallback', {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      const errMsg = error instanceof Error ? error.message : String(error);
+      logger.warn('[SENTINEL] AI call failed, using fallback', { error: errMsg });
+      this.bb.trace?.writeSentinelFallback({ reason: errMsg, coverageScore: 0 });
+      this.bb.emitProgress?.({ explorationId: '', phase: 'evaluating', event: 'agent_error', data: { agent: 'sentinel', message: `AI call failed: ${errMsg}`, severity: 'warning' }, progressPercent: 0, timestamp: Date.now() });
       return this.fallbackAssessment();
     }
   }

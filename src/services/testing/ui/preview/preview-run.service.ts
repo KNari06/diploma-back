@@ -99,12 +99,12 @@ async function attemptLLMDiagnosisAndRetry(params: {
   userId: string;
   stepWithCachePolicy: IntentStep;
   runStartTime: number;
-  cancelled: boolean;
+  signal: AbortSignal;
 }): Promise<DiagnosisRetryResult> {
-  const { page, step, error, previewSessionId, userId, stepWithCachePolicy, runStartTime, cancelled } = params;
+  const { page, step, error, previewSessionId, userId, stepWithCachePolicy, runStartTime, signal } = params;
 
   const elapsedTotal = Date.now() - runStartTime;
-  if (cancelled || elapsedTotal >= GLOBAL_RUN_TIMEOUT_MS - 15000) {
+  if (signal.aborted || elapsedTotal >= GLOBAL_RUN_TIMEOUT_MS - 15000) {
     return { result: null, diagnosed: false, diagnosis: undefined };
   }
 
@@ -238,6 +238,22 @@ interface RunState {
   cancelled: boolean;
   startTime: number;
   currentStepIndex: number;
+  abortController: AbortController;
+}
+
+/**
+ * Race a promise against an AbortSignal.
+ * Rejects immediately with AbortError when signal fires — used to interrupt
+ * long-running Playwright/LLM operations on user cancel.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    }),
+  ]);
 }
 
 /**
@@ -432,7 +448,9 @@ export class PreviewRunService {
       cancelled: false,
       startTime: Date.now(),
       currentStepIndex: 0,
+      abortController: new AbortController(),
     };
+    const signal = runState.abortController.signal;
     activeRuns.set(previewSessionId, runState);
 
     let startedEmitted = false;
@@ -461,6 +479,7 @@ export class PreviewRunService {
     const globalTimeout = setTimeout(() => {
       timedOut = true;
       runState.cancelled = true;
+      runState.abortController.abort();
       logger.error('[PreviewRun] Global timeout exceeded, forcing cancellation', {
         previewSessionId,
         timeoutMs: GLOBAL_RUN_TIMEOUT_MS,
@@ -517,21 +536,26 @@ export class PreviewRunService {
       });
 
       try {
-        await session.page.goto(startUrl, {
+        await raceAbort(session.page.goto(startUrl, {
           waitUntil: 'domcontentloaded',
           timeout: 30000,
-        });
+        }), signal);
 
         // Wait for DOM to stabilize after initial navigation (SPA hydration).
         // networkidle waits for images/fonts/analytics — irrelevant for element resolution.
         // DOM stability (no mutations for 800ms) is what we actually need.
-        await waitForDOMStability(session.page, 3000, 800);
+        await raceAbort(waitForDOMStability(session.page, 3000, 800), signal);
 
         logger.info('[PreviewRun] Navigation to startUrl complete', {
           previewSessionId,
           currentUrl: session.page.url(),
         });
       } catch (navError) {
+        // AbortError from raceAbort — run was cancelled during initial navigation
+        if (navError instanceof DOMException && navError.name === 'AbortError') {
+          logger.info('[PreviewRun] Initial navigation aborted by cancel signal', { previewSessionId });
+          throw navError; // Propagate to outer catch — finally block will emit completion
+        }
         logger.error('[PreviewRun] Failed to navigate to startUrl', {
           previewSessionId,
           startUrl,
@@ -718,13 +742,13 @@ export class PreviewRunService {
 
         try {
           const stepStartMs = Date.now();
-          let result = await PreviewStepApplyService.applyStep({
+          let result = await raceAbort(PreviewStepApplyService.applyStep({
             previewSessionId,
             stepDraft: interpolatedStep,
             userId,
             skipPostActionWait: true, // V12: Lookahead handles inter-step timing
             expectsNavigation, // V13: Wrap click with waitForNavigation if next step expects URL change
-          });
+          }), signal);
           let retried = false;
 
           // ── Step-level retry: one attempt with relaxed params on failure ──
@@ -746,8 +770,8 @@ export class PreviewRunService {
             });
 
             try {
-              await waitForDOMStability(session.page, RETRY_SETTLE_MS, 500);
-              result = await PreviewStepApplyService.applyStep({
+              await raceAbort(waitForDOMStability(session.page, RETRY_SETTLE_MS, 500), signal);
+              result = await raceAbort(PreviewStepApplyService.applyStep({
                 previewSessionId,
                 stepDraft: {
                   ...stepWithCachePolicy,
@@ -759,7 +783,7 @@ export class PreviewRunService {
                 },
                 userId,
                 skipPostActionWait: true,
-              });
+              }), signal);
               retried = true;
 
               if (result.success) {
@@ -768,9 +792,11 @@ export class PreviewRunService {
                   stepIndex: i,
                   stepId: step.id,
                 });
+              } else if (runState.cancelled) {
+                // Cancel arrived during retry — skip LLM diagnosis
               } else {
                 // ── LLM Diagnosis: deterministic retry failed, ask LLM what's blocking ──
-                const diagResult = await attemptLLMDiagnosisAndRetry({
+                const diagResult = await raceAbort(attemptLLMDiagnosisAndRetry({
                   page: session.page,
                   step,
                   error: result.error || 'Step failed after retry',
@@ -778,13 +804,15 @@ export class PreviewRunService {
                   userId,
                   stepWithCachePolicy,
                   runStartTime: runState.startTime,
-                  cancelled: runState.cancelled,
-                });
+                  signal,
+                }), signal);
                 if (diagResult.result) {
                   result = diagResult.result;
                 }
               }
             } catch (retryError) {
+              // AbortError from raceAbort — propagate to trigger cancellation handling
+              if (retryError instanceof DOMException && retryError.name === 'AbortError') throw retryError;
               // Retry threw — fall through to original failure handling
               retried = true;
               logger.warn('[PreviewRun] Retry threw exception, using original failure', {
@@ -873,17 +901,17 @@ export class PreviewRunService {
             // Lookahead wait: check next step readiness before executing it
             // Uses fast Playwright checks only (no AI/LLM)
             // ─────────────────────────────────────────────────────────────────
-            if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+            if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
               const nextStep = stepsToExecute[i + 1];
               try {
-                const lookahead = await waitForStepReadiness(session.page, nextStep, {
+                const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
                   maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
                   settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
                   autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                   prevActionType: step.type,
                   prevUrl: trackedUrl,
                   recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                });
+                }), signal);
 
                 if (lookahead.autoWaitApplied) {
                   logger.info('[PreviewRun] Lookahead auto-wait applied before next step', {
@@ -903,6 +931,8 @@ export class PreviewRunService {
                   });
                 }
               } catch (lookaheadError) {
+                // AbortError from raceAbort — propagate to trigger cancellation handling
+                if (lookaheadError instanceof DOMException && lookaheadError.name === 'AbortError') throw lookaheadError;
                 // Lookahead failure is non-fatal — apply condition-based DOM stability fallback
                 logger.warn('[PreviewRun] Lookahead wait failed, applying fallback DOM settle', {
                   previewSessionId,
@@ -1015,6 +1045,40 @@ export class PreviewRunService {
             break; // Stop execution
           }
         } catch (stepError) {
+          // AbortError from raceAbort — run was cancelled, skip remaining steps
+          if (stepError instanceof DOMException && stepError.name === 'AbortError') {
+            logger.info('[PreviewRun] Step aborted by cancel signal', {
+              previewSessionId,
+              stepIndex: i,
+              stepId: step.id,
+            });
+            // Current step already emitted 'running' — mark as skipped
+            webSocketService.emitToUser(userId, 'preview:run:step', {
+              previewSessionId,
+              stepIndex: i,
+              stepId: step.id,
+              status: 'skipped',
+              action: step.type,
+              description: step.description,
+              timestamp: new Date().toISOString(),
+            });
+            skippedSteps++;
+            for (let j = i + 1; j < stepsToExecute.length; j++) {
+              const remaining = stepsToExecute[j];
+              webSocketService.emitToUser(userId, 'preview:run:step', {
+                previewSessionId,
+                stepIndex: j,
+                stepId: remaining.id,
+                status: 'skipped',
+                action: remaining.type,
+                description: remaining.description,
+                timestamp: new Date().toISOString(),
+              });
+              skippedSteps++;
+            }
+            break;
+          }
+
           const originalError = stepError instanceof Error ? stepError.message : String(stepError);
           let exceptionRetried = false;
 
@@ -1035,8 +1099,8 @@ export class PreviewRunService {
             });
 
             try {
-              await waitForDOMStability(session.page, RETRY_SETTLE_MS, 500);
-              const retryResult = await PreviewStepApplyService.applyStep({
+              await raceAbort(waitForDOMStability(session.page, RETRY_SETTLE_MS, 500), signal);
+              const retryResult = await raceAbort(PreviewStepApplyService.applyStep({
                 previewSessionId,
                 stepDraft: {
                   ...stepWithCachePolicy,
@@ -1048,7 +1112,7 @@ export class PreviewRunService {
                 },
                 userId,
                 skipPostActionWait: true,
-              });
+              }), signal);
               exceptionRetried = true;
 
               if (retryResult.success) {
@@ -1097,27 +1161,30 @@ export class PreviewRunService {
                 }
 
                 // Lookahead before next step (same as main success path)
-                if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+                if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
                   const nextStep = stepsToExecute[i + 1];
                   try {
-                    await waitForStepReadiness(session.page, nextStep, {
+                    await raceAbort(waitForStepReadiness(session.page, nextStep, {
                       maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
                       settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
                       autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                       prevActionType: step.type,
                       prevUrl: trackedUrl,
                       recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                    });
-                  } catch {
+                    }), signal);
+                  } catch (laError) {
+                    if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                     // Lookahead failure is non-fatal — apply DOM stability fallback
                     await waitForDOMStability(session.page, 3000, 500).catch(() => {});
                   }
                 }
 
                 continue; // Skip to next step — recovered!
+              } else if (runState.cancelled) {
+                // Cancel arrived during exception retry — skip LLM diagnosis
               } else {
                 // ── LLM Diagnosis on exception retry failure ──
-                const diagResult = await attemptLLMDiagnosisAndRetry({
+                const diagResult = await raceAbort(attemptLLMDiagnosisAndRetry({
                   page: session.page,
                   step,
                   error: retryResult.error || originalError,
@@ -1125,8 +1192,8 @@ export class PreviewRunService {
                   userId,
                   stepWithCachePolicy,
                   runStartTime: runState.startTime,
-                  cancelled: runState.cancelled,
-                });
+                  signal,
+                }), signal);
 
                 if (diagResult.result?.success) {
                   const finalResult = diagResult.result;
@@ -1153,18 +1220,19 @@ export class PreviewRunService {
                   if (finalResult.appliedStep) enrichedSteps.set(finalResult.appliedStep.id, finalResult.appliedStep);
 
                   // Lookahead before next step (same as deterministic retry success path)
-                  if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type)) {
+                  if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
                     const nextStep = stepsToExecute[i + 1];
                     try {
-                      await waitForStepReadiness(session.page, nextStep, {
+                      await raceAbort(waitForStepReadiness(session.page, nextStep, {
                         maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
                         settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
                         autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                         prevActionType: step.type,
                         prevUrl: trackedUrl,
                         recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                      });
-                    } catch {
+                      }), signal);
+                    } catch (laError) {
+                      if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                       await waitForDOMStability(session.page, 3000, 500).catch(() => {});
                     }
                   }
@@ -1172,7 +1240,9 @@ export class PreviewRunService {
                   continue; // Recovered via LLM diagnosis!
                 }
               }
-            } catch {
+            } catch (exRetryError) {
+              // AbortError from raceAbort — propagate to trigger cancellation handling
+              if (exRetryError instanceof DOMException && exRetryError.name === 'AbortError') throw exRetryError;
               // Retry also threw — fall through to original error handling
               exceptionRetried = true;
             }
@@ -1377,8 +1447,11 @@ export class PreviewRunService {
         }).catch((err) => logger.error('[EDITOR_TRACE] Upload failed on preview run cleanup', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
       }).catch((err) => logger.error('[EDITOR_TRACE] Import failed on preview run cleanup', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
 
-      // 10. Cleanup run state
-      activeRuns.delete(previewSessionId);
+      // 10. Cleanup run state — only delete if it's still OUR run (prevents
+      // wiping a newer run's state when user quickly starts a new run after cancel)
+      if (activeRuns.get(previewSessionId) === runState) {
+        activeRuns.delete(previewSessionId);
+      }
     }
   }
 
@@ -1400,6 +1473,7 @@ export class PreviewRunService {
     }
 
     runState.cancelled = true;
+    runState.abortController.abort();
     logger.info('[PreviewRun] Run cancelled by user', {
       previewSessionId,
       userId,

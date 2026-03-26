@@ -33,7 +33,7 @@
 import type { Browser } from 'playwright';
 import { logger } from '@/utils/core/logger';
 
-import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback, ExplorationCheckpoint } from './types';
+import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback, ExplorationProgressEvent, ExplorationCheckpoint } from './types';
 import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY, DESKTOP_USER_AGENT } from './types';
 import { BudgetTracker } from './budget-tracker';
 import { RateLimiter } from './rate-limiter';
@@ -70,10 +70,10 @@ export class ExplorationEngine {
   }
 
   private emitProgress(
-    phase: 'survey' | 'flow' | 'complete',
-    event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found',
+    phase: ExplorationProgressEvent['phase'],
+    event: ExplorationProgressEvent['event'],
     data: Record<string, any>,
-    progressPercent: number,
+    progressPercent?: number,
   ): void {
     if (!this.onProgress) return;
     try {
@@ -82,7 +82,7 @@ export class ExplorationEngine {
         phase,
         event,
         data,
-        progressPercent: Math.min(100, Math.max(0, Math.round(progressPercent))),
+        progressPercent: progressPercent != null ? Math.min(100, Math.max(0, Math.round(progressPercent))) : 0,
         timestamp: Date.now(),
       });
     } catch { /* never let progress reporting crash exploration */ }
@@ -203,8 +203,7 @@ export class ExplorationEngine {
     // Build queue from Strategist output (AI-driven order, not static formula)
     bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy);
 
-    this.emitProgress('survey', 'survey_complete', {
-      event: 'strategy_planned',
+    this.emitProgress('strategizing', 'strategy_planned', {
       totalFlowsPlanned: bb.currentStrategy.plan.length,
       focusAreas: bb.currentStrategy.focusAreas,
       loginFirst: bb.currentStrategy.authPlan.loginFirst,
@@ -299,12 +298,13 @@ export class ExplorationEngine {
     const sentinel = new ExplorationSentinel(bb);
     bb.coverageAssessment = await sentinel.evaluate();
 
-    this.emitProgress('flow', 'flow_completed', {
-      event: 'coverage_evaluated',
+    this.emitProgress('evaluating', 'coverage_evaluated', {
       coverageScore: bb.coverageAssessment.coverageScore,
       gaps: bb.coverageAssessment.gaps,
       qualitySummary: bb.coverageAssessment.qualitySummary,
       continueExploring: bb.coverageAssessment.continueExploring,
+      recommendations: bb.coverageAssessment.recommendations,
+      riskAreas: bb.coverageAssessment.riskAreas,
     }, 90);
 
     logger.info('[EXPLORATION] Coverage assessment', {

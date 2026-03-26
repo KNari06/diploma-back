@@ -84,6 +84,13 @@ export class ExplorationStrategist {
     const input = this.buildInput(userDirective);
     const prompt = buildStrategistPrompt(input);
 
+    this.bb.trace?.writeStrategistPrompt({
+      model: AI_MODELS.smart,
+      systemPrompt: STRATEGIST_SYSTEM_PROMPT,
+      userPrompt: prompt,
+      userDirective,
+    });
+
     try {
       await this.bb.rateLimiter.acquireSlot('ai');
 
@@ -110,9 +117,24 @@ export class ExplorationStrategist {
       this.bb.rateLimiter.recordSuccess('openai');
 
       const result = parseStrategistResponse(response.content);
+      const latencyMs = Date.now() - aiStartTime;
+
+      this.bb.trace?.writeStrategistResponse({
+        model: AI_MODELS.smart,
+        rawResponse: response.content,
+        parsed: result ? {
+          plannedFlows: result.plan.length,
+          loginFirst: result.authPlan.loginFirst,
+          continueSurvey: result.continueSurvey,
+          skipFlows: result.skipFlows.length,
+          focusAreas: result.focusAreas,
+        } : null,
+        latencyMs,
+      });
 
       if (!result) {
         logger.warn('[STRATEGIST] Failed to parse response');
+        this.bb.emitProgress?.({ explorationId: '', phase: 'strategizing', event: 'agent_warning', data: { agent: 'strategist', message: 'Failed to parse AI response, using fallback' }, progressPercent: 0, timestamp: Date.now() });
         return null;
       }
 
@@ -122,14 +144,15 @@ export class ExplorationStrategist {
         continueSurvey: result.continueSurvey,
         skipFlows: result.skipFlows.length,
         focusAreas: result.focusAreas,
-        latencyMs: Date.now() - aiStartTime,
+        latencyMs,
       });
 
       return result;
     } catch (error) {
-      logger.warn('[STRATEGIST] AI call failed, using fallback', {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      const errMsg = error instanceof Error ? error.message : String(error);
+      logger.warn('[STRATEGIST] AI call failed, using fallback', { error: errMsg });
+      this.bb.trace?.writeStrategistFallback({ reason: errMsg, flowCount: 0 });
+      this.bb.emitProgress?.({ explorationId: '', phase: 'strategizing', event: 'agent_error', data: { agent: 'strategist', message: `AI call failed: ${errMsg}`, severity: 'warning' }, progressPercent: 0, timestamp: Date.now() });
       return null;
     }
   }

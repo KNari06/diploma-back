@@ -155,6 +155,7 @@ export interface ServerToClientEvents {
   'preview:run:started': (data: PreviewRunStartedPayload) => void;
   'preview:run:step': (data: PreviewRunStepPayload) => void;
   'preview:run:completed': (data: PreviewRunCompletedPayload) => void;
+  'preview:run:cancelled': (data: { previewSessionId: string }) => void;
 
   // Preview DevTools events (server -> client)
   'preview:console:update': (data: PreviewConsoleUpdatePayload) => void;
@@ -810,7 +811,7 @@ export interface RegressionRunProgressPayload {
 
 export interface ExplorationProgressPayload {
   explorationId: string;
-  phase: 'survey' | 'flow' | 'complete';
+  phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
   event: string;
   progressPercent: number;
   data: Record<string, any>;

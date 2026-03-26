@@ -27,8 +27,13 @@ import type { IntentTestCase, Priority } from '@/types/testing.types';
 /** Progress event emitted during exploration for real-time UI updates */
 export type ExplorationProgressEvent = {
   explorationId: string;
-  phase: 'survey' | 'flow' | 'complete';
-  event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found';
+  phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
+  event:
+    | 'page_discovered' | 'survey_complete'
+    | 'strategy_planned'
+    | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found'
+    | 'coverage_evaluated'
+    | 'agent_warning' | 'agent_error';
   data: Record<string, any>;
   progressPercent: number;
   timestamp: number;

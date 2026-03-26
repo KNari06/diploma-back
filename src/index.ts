@@ -1,6 +1,7 @@
 import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
 import emailInboxRoutes from '@/api/email-inbox/email-inbox.routes';
+import explorationsRoutes from '@/api/explorations/explorations.route';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
@@ -1295,6 +1296,7 @@ app.use(`/api/${env.API_VERSION}/flows`, requireAuth, requireApproved, flowsRout
 app.use(`/api/${env.API_VERSION}/schedules`, requireAuth, requireApproved, schedulesRoutes);
 app.use(`/api/${env.API_VERSION}/fixtures`, requireAuth, requireApproved, fixturesRoutes);
 app.use(`/api/${env.API_VERSION}/regression-plans`, requireAuth, requireApproved, regressionPlansRoutes);
+app.use(`/api/${env.API_VERSION}/explorations`, requireAuth, requireApproved, explorationsRoutes);
 // git-integrations: no app-level auth so webhook is public; router applies requireAuth+requireApproved to CRUD only
 app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
 // Fallback when reverse proxy strips /api: accept webhook at /v1/git-integrations/webhook (same handler, no auth on webhook route)

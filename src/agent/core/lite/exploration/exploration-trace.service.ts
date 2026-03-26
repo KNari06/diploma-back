@@ -520,7 +520,82 @@ export class ExplorationTraceService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // ERROR
+  // STRATEGIST EVENTS (Phase 1.5)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeStrategistPrompt(data: {
+    model: string;
+    systemPrompt: string;
+    userPrompt: string;
+    userDirective?: string;
+  }): void {
+    this.writer.write({
+      stage: 'strategy',
+      eventType: 'strategist_prompt',
+      payload: data,
+    });
+  }
+
+  writeStrategistResponse(data: {
+    model: string;
+    rawResponse: string;
+    parsed: { plannedFlows: number; loginFirst: boolean; continueSurvey: boolean; skipFlows: number; focusAreas: string[] } | null;
+    latencyMs: number;
+  }): void {
+    this.writer.write({
+      stage: 'strategy',
+      eventType: 'strategist_response',
+      payload: data,
+    });
+  }
+
+  writeStrategistFallback(data: { reason: string; flowCount: number }): void {
+    this.writer.write({
+      stage: 'strategy',
+      eventType: 'strategist_fallback',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // SENTINEL EVENTS (Phase 2.5)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeSentinelPrompt(data: {
+    model: string;
+    systemPrompt: string;
+    userPrompt: string;
+  }): void {
+    this.writer.write({
+      stage: 'coverage',
+      eventType: 'sentinel_prompt',
+      payload: data,
+    });
+  }
+
+  writeSentinelResponse(data: {
+    model: string;
+    rawResponse: string;
+    parsed: { coverageScore: number; gaps: number; continueExploring: boolean; riskAreas: number } | null;
+    latencyMs: number;
+  }): void {
+    this.writer.write({
+      stage: 'coverage',
+      eventType: 'sentinel_response',
+      payload: data,
+    });
+  }
+
+  writeSentinelFallback(data: { reason: string; coverageScore: number }): void {
+    this.writer.write({
+      stage: 'coverage',
+      eventType: 'sentinel_fallback',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // ERROR & WARNING
   // ─────────────────────────────────────────────────────────────────────────
 
   writeError(error: string, context?: Record<string, any>): void {
@@ -528,6 +603,14 @@ export class ExplorationTraceService {
       stage: 'error',
       eventType: 'error',
       payload: { error, ...context },
+    });
+  }
+
+  writeWarning(warning: string, context?: Record<string, any>): void {
+    this.writer.write({
+      stage: 'warning',
+      eventType: 'warning',
+      payload: { warning, ...context },
     });
   }
 }

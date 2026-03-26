@@ -3128,6 +3128,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       PreviewRunService.cancelRun(previewSessionId, userId);
+
+      // Acknowledge cancellation immediately so frontend can update UI
+      socket.emit('preview:run:cancelled', { previewSessionId });
     } catch (error) {
       logger.error('[WebSocket] Error in preview:run:cancel', {
         socketId: socket.id,
