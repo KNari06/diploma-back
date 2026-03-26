@@ -47,9 +47,7 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
       const platforms = await PlatformService.ensurePlatformsExist(projectId, userId);
       resolvedPlatformId = platformKey === 'web_ui'
         ? platforms.webUi.id
-        : platformKey === 'mobile'
-          ? platforms.mobile.id
-          : platforms.api.id;
+        : platforms.api.id;
     }
 
     const module = await ModuleService.create({
