@@ -223,7 +223,7 @@ export class SurveyAgent {
             continue;
           }
           await this.page.goto(item.url, {
-            waitUntil: 'domcontentloaded',
+            waitUntil: 'load',
             timeout: NAV_TIMEOUT_MS,
           });
           this.rateLimiter.recordSuccess('target_site');
@@ -233,7 +233,7 @@ export class SurveyAgent {
             if (result.shouldRetry) {
               try {
                 await this.page.goto(item.url, {
-                  waitUntil: 'domcontentloaded',
+                  waitUntil: 'load',
                   timeout: NAV_TIMEOUT_MS,
                 });
                 this.rateLimiter.recordSuccess('target_site');
@@ -326,6 +326,18 @@ export class SurveyAgent {
       let snapshot;
       try {
         snapshot = await this.collectFullSnapshot();
+
+        // SPA fallback: if snapshot is empty, wait for React/Vue/Angular hydration and retry
+        if (snapshot.elements.length === 0) {
+          logger.info('[SURVEY] Empty snapshot — waiting for SPA hydration', { url: item.url });
+          await this.page.waitForTimeout(2000);
+          await VisualStability.waitForStable(this.page, { checkInterval: 200, maxAttempts: 5 });
+          snapshot = await this.collectFullSnapshot();
+          logger.info('[SURVEY] SPA retry snapshot', {
+            url: item.url,
+            elementCount: snapshot.elements.length,
+          });
+        }
       } catch (error) {
         logger.warn('[SURVEY] Failed to collect snapshot', {
           url: item.url,

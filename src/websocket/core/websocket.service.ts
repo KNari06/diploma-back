@@ -876,11 +876,15 @@ class WebSocketService {
       'exploration:progress',
       payload,
       () => {
+        // Emit to both chat room AND user room — user may not be on the chat page
         if (payload.chatSessionId) {
           this.emitToChat(payload.chatSessionId, 'exploration:progress', payload);
         }
+        if (payload.userId) {
+          this.emitToUser(payload.userId, 'exploration:progress', payload);
+        }
       },
-      { sessionId: payload.chatSessionId }
+      { sessionId: payload.chatSessionId, userId: payload.userId }
     );
   }
 
@@ -897,8 +901,11 @@ class WebSocketService {
         if (payload.chatSessionId) {
           this.emitToChat(payload.chatSessionId, 'exploration:completed', payload);
         }
+        if (payload.userId) {
+          this.emitToUser(payload.userId, 'exploration:completed', payload);
+        }
       },
-      { sessionId: payload.chatSessionId }
+      { sessionId: payload.chatSessionId, userId: payload.userId }
     );
   }
 
@@ -910,8 +917,11 @@ class WebSocketService {
         if (payload.chatSessionId) {
           this.emitToChat(payload.chatSessionId, 'exploration:clarification:request', payload);
         }
+        if (payload.userId) {
+          this.emitToUser(payload.userId, 'exploration:clarification:request', payload);
+        }
       },
-      { sessionId: payload.chatSessionId }
+      { sessionId: payload.chatSessionId, userId: payload.userId }
     );
   }
 

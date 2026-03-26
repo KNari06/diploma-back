@@ -817,6 +817,7 @@ export interface ExplorationProgressPayload {
   data: Record<string, any>;
   timestamp: string;
   chatSessionId?: string;
+  userId?: string;
 }
 
 export interface ExplorationCompletedPayload {
@@ -827,6 +828,7 @@ export interface ExplorationCompletedPayload {
   errorMessage?: string;
   timestamp: string;
   chatSessionId?: string;
+  userId?: string;
 }
 
 export interface ExplorationClarificationPayload {
@@ -836,6 +838,7 @@ export interface ExplorationClarificationPayload {
   type: 'captcha_solve' | '2fa_code';
   timeout: number;
   chatSessionId: string;
+  userId?: string;
   timestamp: string;
 }
 

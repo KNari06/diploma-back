@@ -238,6 +238,19 @@ class WebSocketRedisSubscriber {
           }
           break;
 
+        // ── Exploration events ──
+        case 'exploration:progress':
+          wsService.emitExplorationProgress(payload);
+          break;
+
+        case 'exploration:completed':
+          wsService.emitExplorationCompleted(payload);
+          break;
+
+        case 'exploration:clarification:request':
+          wsService.emitExplorationClarification(payload);
+          break;
+
         // Unknown event type
         default:
           logger.warn('[WS_REDIS_SUB] Unknown event type received', {

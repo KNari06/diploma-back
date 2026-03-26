@@ -71,15 +71,28 @@ export class ExplorationRunJobHandler {
             errorMessage: 'Max resume attempts exceeded',
             timestamp: new Date().toISOString(),
             chatSessionId,
+            userId,
           });
           return;
         }
         logger.info('[EXPLORATION_JOB] Resuming from checkpoint', { explorationId, resumeCount });
       }
 
-      // Launch browser
+      // Launch dedicated browser for exploration (with anti-detection args matching browser-pool)
       const { chromium } = await import('playwright');
-      browser = await chromium.launch({ headless: true });
+      browser = await chromium.launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-features=IsolateOrigins,site-per-process',
+          '--disable-site-isolation-trials',
+          '--window-size=1920,1080',
+        ],
+      });
 
       // Build exploration config
       const explorationConfig: ExplorationConfig = {
@@ -103,6 +116,7 @@ export class ExplorationRunJobHandler {
             data: event.data,
             timestamp: new Date().toISOString(),
             chatSessionId,
+            userId,
           });
         },
       };
@@ -165,6 +179,7 @@ export class ExplorationRunJobHandler {
         status: 'completed',
         timestamp: new Date().toISOString(),
         chatSessionId,
+        userId,
       });
 
       logger.info('[EXPLORATION_JOB] Exploration completed', {
@@ -194,6 +209,7 @@ export class ExplorationRunJobHandler {
         errorMessage,
         timestamp: new Date().toISOString(),
         chatSessionId,
+        userId,
       });
 
       throw error;

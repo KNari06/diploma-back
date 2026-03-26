@@ -264,7 +264,7 @@ export class ProjectContextService {
    * Find project by URL in workspace
    * FIX #3: Optimized with DB filtering instead of memory filtering
    */
-  private static async findProjectByUrl(
+  static async findProjectByUrl(
     workspaceId: string,
     userId: string,
     baseUrl: string

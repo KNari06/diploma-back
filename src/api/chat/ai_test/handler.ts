@@ -514,18 +514,25 @@ export async function handlePlatformTest(
 
     let project_id: string;
     try {
-      const findOrCreateProjectWithLogging = functionLogger
-        ? withFunctionLogging(ProjectContextService.findOrCreateProject.bind(ProjectContextService), 'ProjectContextService.findOrCreateProject', functionLogger)
-        : ProjectContextService.findOrCreateProject.bind(ProjectContextService);
-      const projectResult = await findOrCreateProjectWithLogging(
-        workspace_id,
-        extractedUrl,
-        userId
-      );
-      project_id = projectResult.project_id;
-
-      if (projectResult.is_new) {
-        logger.info('[PLATFORM_TEST] Created new project', { project_id, url: extractedUrl });
+      // Project must exist — created during onboarding. NEVER create new projects here.
+      if (sessionProject?.id) {
+        project_id = sessionProject.id;
+        logger.info('[PLATFORM_TEST] Using session project', {
+          project_id,
+          projectName: sessionProject.name,
+          extractedUrl,
+        });
+      } else {
+        // No project in session — try to find existing project by URL in workspace
+        const findProjectResult = await ProjectContextService.findProjectByUrl(workspace_id, userId, extractedUrl);
+        if (findProjectResult) {
+          project_id = findProjectResult.id;
+          logger.info('[PLATFORM_TEST] Found existing project by URL', { project_id, url: extractedUrl });
+        } else {
+          // No project found — user must create one via onboarding
+          logger.warn('[PLATFORM_TEST] No project found for URL', { url: extractedUrl, workspace_id });
+          throw new Error('No project found for this URL. Please create a project first in Settings.');
+        }
       }
 
       // Update session with project (non-blocking)
@@ -540,11 +547,11 @@ export async function handlePlatformTest(
         });
       }
     } catch (error) {
-      logger.error('[PLATFORM_TEST] ProjectContextService failed', {
+      logger.error('[PLATFORM_TEST] Project resolution failed', {
         error: error instanceof Error ? error.message : String(error),
         url: extractedUrl,
       });
-      throw new Error(`Failed to initialize project: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to find project: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 
     checkTimeout('find_or_create_project');
