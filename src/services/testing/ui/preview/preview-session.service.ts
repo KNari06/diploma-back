@@ -1091,9 +1091,10 @@ export class PreviewSessionService {
       await session.page.setViewportSize({ width, height });
 
       // Wait for CSS media queries and responsive reflow to complete before returning.
-      // Without this, emitSnapshotAlways() would collect DOM before layout has settled,
-      // returning stale boundingBox values and wrong element visibility flags.
-      await waitForDOMStability(session.page, 1500, 300);
+      // Viewport resize is fast (CSS reflow <100ms), so use shorter timeouts than
+      // navigation (which loads new content). Without this, emitSnapshotAlways()
+      // would collect DOM before layout has settled.
+      await waitForDOMStability(session.page, 800, 150);
 
       session.lastSeenAt = Date.now();
 

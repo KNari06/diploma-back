@@ -2263,13 +2263,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      // First: force snapshot re-collect with the new viewport already reflowed.
+      // Restart video stream so CDP screencast renders at the NEW resolution.
+      // Without this, CDP continues emitting frames at the old viewport size.
+      const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+      const videoReg = getPreviewVideoStreamRegistry();
+      const session = sessionService.getSession(normalizedPreviewSessionId);
+      if (session?.page) {
+        const room = createRoomName('preview', normalizedPreviewSessionId);
+        await videoReg.startStream(normalizedPreviewSessionId, ensuredUserId, room, session.page, socket.nsp);
+      }
+
+      // Force snapshot re-collect with the new viewport already reflowed.
       // This ensures domNodes/boundingBox are correct BEFORE the client rescales.
       await emitSnapshotAlways(socket, normalizedPreviewSessionId, ensuredUserId);
 
-      // Then: emit viewport metadata so client updates coordinate mapping
+      // Emit viewport metadata so client updates coordinate mapping
       // with coordinates that match the freshly-collected snapshot.
-      const room = createRoomName('preview', normalizedPreviewSessionId);
+      const roomName = createRoomName('preview', normalizedPreviewSessionId);
       const viewportPayload = {
         previewSessionId: normalizedPreviewSessionId,
         viewport: { width, height },
@@ -2277,7 +2287,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       };
       socket.emit('preview:viewport', viewportPayload);
-      socket.to(room).emit('preview:viewport', viewportPayload);
+      socket.to(roomName).emit('preview:viewport', viewportPayload);
     } catch (error) {
       logger.error('[WebSocket] Error in preview:viewport:set', {
         socketId: socket.id,
