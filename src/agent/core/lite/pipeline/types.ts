@@ -201,6 +201,8 @@ export interface PipelineConfig {
   skillsContext?: string;
   /** Connected integrations status */
   integrationContext?: string;
+  /** Skip DB-based cancellation checks (exploration flows use non-UUID testIds) */
+  skipDbCancellationCheck?: boolean;
 }
 
 /** Result returned by the pipeline */

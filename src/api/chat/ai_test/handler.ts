@@ -514,7 +514,8 @@ export async function handlePlatformTest(
 
     let project_id: string;
     try {
-      // Project must exist — created during onboarding. NEVER create new projects here.
+      // Use current session project — user can test any URL within their project.
+      // Project is created during onboarding. NEVER create new projects here.
       if (sessionProject?.id) {
         project_id = sessionProject.id;
         logger.info('[PLATFORM_TEST] Using session project', {
@@ -523,15 +524,21 @@ export async function handlePlatformTest(
           extractedUrl,
         });
       } else {
-        // No project in session — try to find existing project by URL in workspace
-        const findProjectResult = await ProjectContextService.findProjectByUrl(workspace_id, userId, extractedUrl);
-        if (findProjectResult) {
-          project_id = findProjectResult.id;
-          logger.info('[PLATFORM_TEST] Found existing project by URL', { project_id, url: extractedUrl });
+        // No project in session — find any project in workspace
+        const { data: projects } = await supabaseAdmin
+          .from('projects')
+          .select('id')
+          .eq('workspace_id', workspace_id)
+          .eq('user_id', userId)
+          .limit(1)
+          .single();
+
+        if (projects?.id) {
+          project_id = projects.id;
+          logger.info('[PLATFORM_TEST] Found workspace project', { project_id, extractedUrl });
         } else {
-          // No project found — user must create one via onboarding
-          logger.warn('[PLATFORM_TEST] No project found for URL', { url: extractedUrl, workspace_id });
-          throw new Error('No project found for this URL. Please create a project first in Settings.');
+          logger.warn('[PLATFORM_TEST] No project in workspace', { workspace_id });
+          throw new Error('No project found. Please complete onboarding first.');
         }
       }
 

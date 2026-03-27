@@ -30,22 +30,37 @@ function handleError(res: Response, error: unknown, message: string): void {
  */
 export async function listExplorations(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId } = req.query;
-
-    if (!projectId || typeof projectId !== 'string') {
-      res.status(400).json({ success: false, error: 'projectId query parameter is required' });
-      return;
-    }
-
+    const { projectId, workspaceId } = req.query;
     const userId = getUserId(req);
 
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('exploration_runs')
-      .select('id, exploration_id, entry_url, status, summary, duration_ms, test_cases_count, started_at, completed_at')
-      .eq('project_id', projectId)
+      .select('id, exploration_id, entry_url, project_id, status, summary, duration_ms, test_cases_count, started_at, completed_at')
       .eq('user_id', userId)
       .order('started_at', { ascending: false })
       .limit(50);
+
+    if (projectId && typeof projectId === 'string') {
+      // Filter by specific project
+      query = query.eq('project_id', projectId);
+    } else if (workspaceId && typeof workspaceId === 'string') {
+      // Filter by workspace — get all projects in workspace, then filter
+      const { data: projects } = await supabaseAdmin
+        .from('projects')
+        .select('id')
+        .eq('workspace_id', workspaceId)
+        .eq('user_id', userId);
+
+      const projectIds = (projects || []).map(p => p.id);
+      if (projectIds.length > 0) {
+        query = query.in('project_id', projectIds);
+      } else {
+        res.json({ success: true, data: [] });
+        return;
+      }
+    }
+
+    const { data, error } = await query;
 
     if (error) {
       logger.error('[EXPLORATIONS_API] DB error listing explorations', { error: error.message });

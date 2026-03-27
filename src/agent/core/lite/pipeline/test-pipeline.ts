@@ -181,7 +181,7 @@ export class TestPipeline {
         // ════════════════════════════════════════════════════════════
         // CANCELLATION CHECK — at the start of each pipeline round
         // ════════════════════════════════════════════════════════════
-        await this.checkCancellation(config.testId, 'pipeline_round_start');
+        await this.checkCancellation(config.testId, 'pipeline_round_start', config.skipDbCancellationCheck);
 
         logger.debug('[PIPELINE] Round start', {
           round: pipelineRound,
@@ -229,7 +229,7 @@ export class TestPipeline {
         // ════════════════════════════════════════════════════════════
         // CANCELLATION CHECK — between Planner and Executor
         // ════════════════════════════════════════════════════════════
-        await this.checkCancellation(config.testId, 'pre_executor');
+        await this.checkCancellation(config.testId, 'pre_executor', config.skipDbCancellationCheck);
 
         // ════════════════════════════════════════════════════════════
         // STEP 2: EXECUTOR
@@ -342,7 +342,7 @@ export class TestPipeline {
         // ════════════════════════════════════════════════════════════
         // CANCELLATION CHECK — between Executor and Reviewer
         // ════════════════════════════════════════════════════════════
-        await this.checkCancellation(config.testId, 'pre_reviewer');
+        await this.checkCancellation(config.testId, 'pre_reviewer', config.skipDbCancellationCheck);
 
         // ════════════════════════════════════════════════════════════
         // STEP 3: REVIEWER (with auditDone validation)
@@ -490,7 +490,8 @@ export class TestPipeline {
    * Uses the same checkTestCancelled() from the main LiteEngine.
    * Throws Error if cancelled (caught by the main try/catch).
    */
-  private async checkCancellation(testId: string, checkpoint: string): Promise<void> {
+  private async checkCancellation(testId: string, checkpoint: string, skipDb?: boolean): Promise<void> {
+    if (skipDb) return; // Exploration flows use non-UUID testIds — skip DB check
     try {
       await checkTestCancelled(testId);
     } catch (error) {

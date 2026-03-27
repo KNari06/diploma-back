@@ -42,7 +42,7 @@ import type { CartographerInput, CartographerOutput } from './agents/agent-types
 const MAX_NAV_LINKS_PER_PAGE = 8;
 
 /** Timeout for page navigation (ms) */
-const NAV_TIMEOUT_MS = 15_000;
+const NAV_TIMEOUT_MS = 30_000;
 
 /** Timeout for AI classification call (ms) */
 const AI_TIMEOUT_MS = 20_000;
@@ -223,7 +223,7 @@ export class SurveyAgent {
             continue;
           }
           await this.page.goto(item.url, {
-            waitUntil: 'load',
+            waitUntil: 'domcontentloaded',
             timeout: NAV_TIMEOUT_MS,
           });
           this.rateLimiter.recordSuccess('target_site');
@@ -233,7 +233,7 @@ export class SurveyAgent {
             if (result.shouldRetry) {
               try {
                 await this.page.goto(item.url, {
-                  waitUntil: 'load',
+                  waitUntil: 'domcontentloaded',
                   timeout: NAV_TIMEOUT_MS,
                 });
                 this.rateLimiter.recordSuccess('target_site');

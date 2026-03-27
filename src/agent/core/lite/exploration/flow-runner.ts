@@ -476,6 +476,7 @@ export class FlowRunner {
         testId: entryPoint.id,
         maxRounds: Math.max(1, allocatedRounds),
         timeoutMs: Math.max(5_000, flowTimeoutMs),
+        skipDbCancellationCheck: true, // Exploration uses non-UUID testIds (ep-0, ep-1)
       };
 
       this.trace?.writeFlowPipelineStart({

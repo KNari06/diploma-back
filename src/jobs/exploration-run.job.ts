@@ -105,7 +105,7 @@ export class ExplorationRunJobHandler {
         scopeHint,
         credentials: credentials || undefined,
         budget: { ...DEFAULT_EXPLORATION_BUDGET, ...budget },
-        maxConcurrency: maxConcurrency || 5,
+        maxConcurrency: maxConcurrency || 2, // Default 2 to avoid OpenAI TPM rate limits
         rateLimiting,
         onProgress: (event) => {
           webSocketService.emitExplorationProgress({
