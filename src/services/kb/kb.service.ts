@@ -545,12 +545,11 @@ export async function searchKB(
       ...new Set(projectChunks.map((c) => c.file_name).filter((s): s is string => !!s)),
     ];
 
-    logger.info('[KB_SERVICE] KB search completed', {
+    logger.debug('[KB_SERVICE] KB search completed', {
       query: query.substring(0, 50),
       globalResults: globalChunks.length,
       projectResults: projectChunks.length,
       totalReturned: uniqueChunks.length,
-      language: language || 'all',
     });
 
     return {

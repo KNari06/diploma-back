@@ -57,7 +57,7 @@ class WebSocketService {
   private static instance: WebSocketService;
 
   private constructor() {
-    logger.info('[WebSocketService] Service initialized');
+    logger.debug('[WebSocketService] Service initialized');
   }
 
   /**

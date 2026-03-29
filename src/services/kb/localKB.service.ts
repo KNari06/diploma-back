@@ -123,12 +123,6 @@ export async function loadGlobalKB(): Promise<LocalKBChunk[]> {
     globalKBCache = validChunks;
     isInitialized = true;
 
-    logger.info('Global KB loaded from local storage', {
-      chunks: kb.chunks.length,
-      version: kb.version,
-      model: kb.model,
-    });
-
     return globalKBCache;
   } catch (error) {
     logger.error('Failed to load global KB', { error });
@@ -337,9 +331,7 @@ export async function getLocalKBStats(): Promise<{
  * Pre-load global KB into memory on startup
  */
 export async function initializeGlobalKB(): Promise<void> {
-  logger.info('Initializing global KB...');
   await loadGlobalKB();
-  logger.info('Global KB initialized successfully');
 }
 
 /**

@@ -43,6 +43,26 @@ if (!env.REDIS_HOST || !env.REDIS_PORT) {
   }
 }
 
+// ── Suppress ioredis "[WARN] password supplied but not required" spam ──
+// ioredis prints one [WARN] per connection when a password is configured but
+// the server has no AUTH requirement. We intercept those and emit one summary.
+let _redisPasswordWarnCount = 0;
+const _origConsoleWarn = console.warn;
+console.warn = (...args: any[]) => {
+  if (typeof args[0] === 'string' && args[0].includes('does not require a password')) {
+    _redisPasswordWarnCount++;
+    return; // swallow
+  }
+  _origConsoleWarn.apply(console, args);
+};
+// After event loop settles (all connections opened), emit one summary and restore
+setTimeout(() => {
+  console.warn = _origConsoleWarn;
+  if (_redisPasswordWarnCount > 0) {
+    logger.warn(`Redis server does not require a password, but REDIS_PASSWORD is set (${_redisPasswordWarnCount} connections). Consider removing it from .env for local dev.`);
+  }
+}, 5000);
+
 // Redis connection configuration
 const redisConnection = new IORedis(env.REDIS_URL, {
   password: env.REDIS_PASSWORD || undefined,

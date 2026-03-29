@@ -67,9 +67,8 @@ export async function generateEmbedding(text: string): Promise<number[]> {
       cleanedText = cleanedText.substring(0, MAX_TEXT_LENGTH);
     }
 
-    logger.info('[EMBEDDING] Generating embedding', {
+    logger.debug('[EMBEDDING] Generating embedding', {
       textLength: cleanedText.length,
-      originalLength: trimmedText.length,
       model: EMBEDDING_MODEL,
     });
 
@@ -143,7 +142,7 @@ export async function generateEmbedding(text: string): Promise<number[]> {
       throw new Error(`Embedding contains ${invalidValues.length} invalid numbers (NaN or non-finite)`);
     }
 
-    logger.info('[EMBEDDING] Embedding generated successfully', {
+    logger.debug('[EMBEDDING] Embedding generated successfully', {
       textLength: cleanedText.length,
       dimensions: embedding.length,
     });

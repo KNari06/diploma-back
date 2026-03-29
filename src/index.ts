@@ -1408,7 +1408,6 @@ const startServer = async () => {
     try {
       const { registerAllSkills } = await import('@/services/skills');
       await registerAllSkills();
-      logger.info('✓ Skills registered successfully');
     } catch (skillsError) {
       logger.warn('[SERVER] Failed to register skills, continuing without them', {
         error: skillsError instanceof Error ? skillsError.message : String(skillsError),
@@ -1473,11 +1472,7 @@ const startServer = async () => {
     // Start HTTP server
     try {
       server = app.listen(env.PORT, async () => {
-        logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
-        logger.info(`📊 Environment: ${env.NODE_ENV}`);
-        logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
-        logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
-        logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
+        logger.info(`QAIT Backend started | port=${env.PORT} env=${env.NODE_ENV}`);
 
         // Cleanup zombie regression runs from previous server crashes
         try {
@@ -1536,14 +1531,11 @@ const startServer = async () => {
       const { initializeWebSocket } = await import('@/websocket/core/server');
       if (server) {
         initializeWebSocket(server);
-        logger.info('🌐 WebSocket server initialized');
 
-        // ✅ NEW: Start Redis subscriber for worker events
-        // This bridges worker process events to WebSocket clients
+        // Start Redis subscriber for worker events (bridges worker → WebSocket clients)
         try {
           const { webSocketRedisSubscriber } = await import('@/websocket/infrastructure/redis-subscriber');
           await webSocketRedisSubscriber.start();
-          logger.info('📡 WebSocket Redis subscriber started (worker → WebSocket bridge)');
         } catch (subError) {
           logger.error('[SERVER] Failed to start WebSocket Redis subscriber:', {
             error: subError instanceof Error ? subError.message : String(subError),

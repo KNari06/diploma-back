@@ -30,7 +30,7 @@ class WebSocketRedisSubscriber {
     }
 
     try {
-      logger.info('[WS_REDIS_SUB] Starting Redis subscriber for WebSocket events...');
+      logger.debug('[WS_REDIS_SUB] Starting Redis subscriber for WebSocket events...');
 
       // Subscribe to Redis channel and handle events
       await redisWebSocketBridge.subscribe((event, payload, target) => {
@@ -38,7 +38,6 @@ class WebSocketRedisSubscriber {
       });
 
       this.isRunning = true;
-      logger.info('[WS_REDIS_SUB] ✅ Redis subscriber started successfully');
     } catch (error) {
       logger.error('[WS_REDIS_SUB] ❌ Failed to start subscriber', {
         error: error instanceof Error ? error.message : String(error),

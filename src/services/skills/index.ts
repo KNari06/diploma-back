@@ -22,10 +22,6 @@ import { logger } from '@/utils/core/logger';
  * Called from src/index.ts during server startup.
  */
 export async function registerAllSkills(): Promise<void> {
-  logger.info('[SKILLS] Registering skills from manifest...', {
-    count: SKILL_MANIFEST.length,
-  });
-
   for (const entry of SKILL_MANIFEST) {
     try {
       const mod = await entry.load();
@@ -45,43 +41,31 @@ export async function registerAllSkills(): Promise<void> {
   }
 
   const registered = SkillRegistry.listSkills();
-  logger.info('[SKILLS] Phase 1 complete — all skills registered', {
-    count: registered.length,
-    skills: registered.map((s) => s.id),
-  });
+  const totalTools = registered.reduce((sum, s) => sum + s.tools.length, 0);
+  logger.info(`✓ Skills registered: ${registered.map((s) => s.id).join(', ')} (${totalTools} tools)`);
 
   // ── Phase 2: Initialize (async, non-fatal) ───────────────────────────
   const skillsWithInit = registered.filter((s) => typeof s.onInit === 'function');
 
   if (skillsWithInit.length > 0) {
-    logger.info('[SKILLS] Phase 2 — running onInit() hooks', {
-      skills: skillsWithInit.map((s) => s.id),
-    });
-
     const initResults = await Promise.allSettled(
       skillsWithInit.map(async (skill) => {
-        const initStart = Date.now();
         try {
           await skill.onInit!();
-          logger.info('[SKILLS] onInit() succeeded', {
-            skillId: skill.id,
-            durationMs: Date.now() - initStart,
-          });
         } catch (err) {
           logger.warn('[SKILLS] onInit() failed (skill remains registered)', {
             skillId: skill.id,
-            durationMs: Date.now() - initStart,
             error: err instanceof Error ? err.message : String(err),
           });
-          throw err; // rethrow so Promise.allSettled marks it as rejected
+          throw err;
         }
       }),
     );
 
-    const succeeded = initResults.filter((r) => r.status === 'fulfilled').length;
     const failed = initResults.filter((r) => r.status === 'rejected').length;
-
-    logger.info('[SKILLS] Phase 2 complete', { total: skillsWithInit.length, succeeded, failed });
+    if (failed > 0) {
+      logger.warn(`[SKILLS] ${failed}/${skillsWithInit.length} onInit() hooks failed`);
+    }
   }
 }
 
