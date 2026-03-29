@@ -2124,7 +2124,7 @@ export class PreviewStepApplyService {
             page,
             stepDraft.compiled,
             stepDraft.type,
-            5000 // 5s timeout
+            3000 // 3s timeout — fast path, if compiled doesn't resolve quickly fall through to lint
           );
 
           if (compiledResult.success && compiledResult.locator) {

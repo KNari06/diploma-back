@@ -1363,25 +1363,8 @@ export class PreviewRunService {
 
       const runSuccess = failedSteps === 0 && !cancelled && !timedOut;
 
-      webSocketService.emitToUser(userId, 'preview:run:completed', {
-        previewSessionId,
-        success: runSuccess,
-        totalSteps: steps.length,
-        passedSteps,
-        failedSteps,
-        skippedSteps,
-        cancelled,
-        timedOut,
-        duration,
-        timestamp: new Date().toISOString(),
-      });
-
-      // NOTE: We do NOT emit chat:processing:step on completion.
-      // The progress:100 signal would trigger the frontend's "API agent finished" handler
-      // (which clears processingSteps, resets isTyping, etc.) — destructive side-effect.
-      // Frontend uses preview:run:completed directly via WebSocket subscription in Chat.jsx.
-
-      // 8b. Batch-persist all enriched steps (single DB round-trip) — with timeout guard
+      // 8b. Batch-persist all enriched steps BEFORE emitting completed event.
+      // Frontend may fetch the test case immediately after completed — steps must be in DB by then.
       if (enrichedSteps.size > 0 && intentTestCaseId) {
         try {
           await withTimeout(
@@ -1405,6 +1388,24 @@ export class PreviewRunService {
           });
         }
       }
+
+      webSocketService.emitToUser(userId, 'preview:run:completed', {
+        previewSessionId,
+        success: runSuccess,
+        totalSteps: steps.length,
+        passedSteps,
+        failedSteps,
+        skippedSteps,
+        cancelled,
+        timedOut,
+        duration,
+        timestamp: new Date().toISOString(),
+      });
+
+      // NOTE: We do NOT emit chat:processing:step on completion.
+      // The progress:100 signal would trigger the frontend's "API agent finished" handler
+      // (which clears processingSteps, resets isTyping, etc.) — destructive side-effect.
+      // Frontend uses preview:run:completed directly via WebSocket subscription in Chat.jsx.
 
       // 8c. V12: Cleanup email inbox (non-blocking, best-effort)
       try {

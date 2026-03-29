@@ -321,19 +321,19 @@ async function blindSettle(page: Page, domStableThresholdMs: number): Promise<vo
 // ═══════════════════════════════════════════════════════════════════════════
 
 /** Max time to wait for loading indicators to disappear */
-const LOADING_INDICATOR_TIMEOUT_MS = 8000;
+const LOADING_INDICATOR_TIMEOUT_MS = 3000;
 /** Polling interval for loading indicators */
 const LOADING_POLL_INTERVAL_MS = 150;
 /** Max time to wait for pending API requests to complete */
-const API_IDLE_TIMEOUT_MS = 5000;
+const API_IDLE_TIMEOUT_MS = 2000;
 /** Quiet threshold — no new API activity for this long = idle */
-const API_QUIET_THRESHOLD_MS = 200;
+const API_QUIET_THRESHOLD_MS = 150;
 /** Max time to wait for CSS animation/transition on target element */
-const ANIMATION_WAIT_TIMEOUT_MS = 3000;
+const ANIMATION_WAIT_TIMEOUT_MS = 1500;
 /** Max time to wait for overlay to clear */
-const OVERLAY_WAIT_TIMEOUT_MS = 3000;
+const OVERLAY_WAIT_TIMEOUT_MS = 1500;
 /** Max time to wait for iframe to load */
-const IFRAME_LOAD_TIMEOUT_MS = 4000;
+const IFRAME_LOAD_TIMEOUT_MS = 2000;
 
 /**
  * Check for loading indicators on the page (spinners, skeletons, aria-busy, progressbar).
@@ -979,9 +979,10 @@ export async function waitForStepReadiness(
   const domStableThresholdMs = getDomStableThresholdMs(prevActionType, domStableOverride);
 
   // V14: Inter-step delay floor — if user waited during recording, respect that
-  // Use 70% of recorded delay as minimum wait (capped at 5s, floor at 300ms)
+  // Use 50% of recorded delay as minimum wait (capped at 2s, floor at 200ms)
+  // Lower ratio + cap: most recording pauses are human hesitation, not page load
   const minWaitFromRecording = recordedDelayMs
-    ? Math.min(5000, Math.max(300, Math.round(recordedDelayMs * 0.7)))
+    ? Math.min(2000, Math.max(200, Math.round(recordedDelayMs * 0.5)))
     : 0;
 
   // ─────────────────────────────────────────────────────────────────────────

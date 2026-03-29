@@ -108,10 +108,10 @@ export const STEP_READINESS_CONFIG = {
 
   /** Default values for LookaheadOptions */
   defaults: {
-    maxWaitMs: 10_000,
-    settleMs: 3_000,
-    autoWaitThresholdMs: 2_000,
-    maxRetries: 3,
+    maxWaitMs: 5_000,
+    settleMs: 1_500,
+    autoWaitThresholdMs: 800,
+    maxRetries: 2,
   },
 } as const;
 
