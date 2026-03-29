@@ -121,6 +121,34 @@ export interface InteractiveNode {
   hasAriaHaspopup?: boolean;
   /** Nearby sibling/row text for disambiguation of duplicate elements (e.g. row context in tables) */
   nearText?: string;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V8: Visual properties for LLM element matching
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Named background color (e.g. "red", "grey", "blue", "white", "transparent") */
+  backgroundColor?: string;
+  /** Named text/foreground color (e.g. "black", "white", "red") */
+  textColor?: string;
+  /** Shape hint based on border-radius ("rounded" | "pill" | "circle" | "square") */
+  shapeHint?: string;
+  /** CSS class names related to icons (e.g. "fa-gear material-icons") */
+  iconClasses?: string;
+  /** Semantic size category based on pixel dimensions */
+  sizeHint?: 'small' | 'medium' | 'large';
+}
+
+/**
+ * V15: Tab info for multi-tab preview support
+ */
+export interface PreviewTabInfo {
+  /** Tab index (0 = initial page, 1+ = popups) */
+  tabIndex: number;
+  /** Current URL of the tab */
+  url: string;
+  /** Page title */
+  title?: string;
+  /** Whether this tab is currently active */
+  isActive: boolean;
 }
 
 /**
@@ -177,7 +205,9 @@ export type IntentActionType =
   // V13: Native browser dialog (alert/confirm/prompt/beforeunload)
   | 'dialog'
   // V13: File download verification (auto-recorded when download triggers)
-  | 'download';
+  | 'download'
+  // V15: Multi-tab support — explicit tab switch
+  | 'switch_tab';
 
 /**
  * Binding hints for element resolution
@@ -250,6 +280,8 @@ export interface StepEvidence {
    * the page likely needs at least ~2s to be ready.
    */
   interStepDelayMs?: number;
+  /** V15: Tab index where evidence was captured (multi-tab support) */
+  tabIndex?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -519,6 +551,8 @@ export interface IntentStep {
   expectedOutcome?: ExpectedStepOutcome;
   /** True if this step was auto-injected (e.g., auto wait_for URL change). Soft failure — won't fail the test. */
   isAutoInjected?: boolean;
+  /** V15: Tab index this step targets (0 = initial tab, 1+ = popups). Omit or 0 for single-tab backward compat. */
+  tabIndex?: number;
 }
 
 /**
@@ -586,7 +620,7 @@ export interface LintResult {
   clarificationQuestion?: string;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // V7: LLM-based resolver fields
+  // LLM-based resolver fields
   // ═══════════════════════════════════════════════════════════════════════════
   /** True if LLM resolver failed and rule-based fallback was used */
   degradedMode?: boolean;
@@ -603,7 +637,7 @@ export interface LintResult {
   // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)
   // ═══════════════════════════════════════════════════════════════════════════
   /** @internal Rule trace from buildAllowedSets */
-  _ruleTrace?: Array<{ ruleId: string; version: string; action: 'exclude' | 'boost' | 'penalize' | 'shortcircuit'; evidence: string; affectedRefs: string[] }>;
+  _ruleTrace?: Array<{ ruleId: string; version: string; action: 'exclude' | 'boost' | 'penalize'; evidence: string; affectedRefs: string[] }>;
   /** @internal Hard allowed count */
   _hardAllowedCount?: number;
   /** @internal Soft allowed count */
@@ -704,7 +738,7 @@ export interface StepRuntimeMeta {
   autoWaitMs?: number;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // V7: Resolution path and network correlation
+  // Resolution path and network correlation
   // ═══════════════════════════════════════════════════════════════════════════
   /**
    * Which resolution path was used to find the element

@@ -1449,8 +1449,49 @@ export class PreviewStepApplyService {
     });
 
     try {
-      // Get page from session
       const sessionService = getPreviewSessionService();
+
+      // V15: Handle switch_tab action — switch active tab and return
+      if (stepDraft.type === 'switch_tab') {
+        const targetTab = parseInt(stepDraft.value || '0', 10);
+
+        // Wait for tab to appear if not yet available (popup handler is async)
+        let switched = false;
+        for (let wait = 0; wait < 10; wait++) {
+          switched = await sessionService.switchTab(previewSessionId, userId, targetTab);
+          if (switched) break;
+          await new Promise(r => setTimeout(r, 500)); // 500ms × 10 = 5s max wait
+        }
+
+        return {
+          success: switched,
+          error: switched ? undefined : `Tab ${targetTab} not available after waiting`,
+          url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+          attempts: 1,
+        };
+      }
+
+      // V15: Auto-switch tab if step targets a different tab than currently active
+      const session = sessionService.getSession(previewSessionId);
+      if (session && stepDraft.tabIndex !== undefined && stepDraft.tabIndex !== session.activeTabIndex) {
+        // Wait for tab if not yet available (popup may still be loading)
+        let switched = false;
+        for (let wait = 0; wait < 6; wait++) {
+          switched = await sessionService.switchTab(previewSessionId, userId, stepDraft.tabIndex);
+          if (switched) break;
+          await new Promise(r => setTimeout(r, 500));
+        }
+        if (!switched) {
+          return {
+            success: false,
+            error: `Tab ${stepDraft.tabIndex} no longer available`,
+            url: session.page?.url() || '',
+            attempts: 0,
+          };
+        }
+      }
+
+      // Get page from session (may have changed after tab switch)
       const page = sessionService.getPage(previewSessionId, userId);
 
       if (!page) {
@@ -2124,7 +2165,7 @@ export class PreviewStepApplyService {
             page,
             stepDraft.compiled,
             stepDraft.type,
-            5000 // 5s timeout
+            3000 // 3s timeout — fast path, if compiled doesn't resolve quickly fall through to lint
           );
 
           if (compiledResult.success && compiledResult.locator) {

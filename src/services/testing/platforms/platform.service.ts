@@ -108,15 +108,14 @@ export class PlatformService {
   static async ensurePlatformsExist(
     projectId: string,
     userId: string
-  ): Promise<{ webUi: TestPlatform; api: TestPlatform; mobile: TestPlatform }> {
+  ): Promise<{ webUi: TestPlatform; api: TestPlatform }> {
     // Try to get existing platforms
     const existing = await this.listByProject(projectId, userId);
 
     let webUi = existing.find(p => p.platformKey === 'web_ui');
     let api = existing.find(p => p.platformKey === 'api');
-    let mobile = existing.find(p => p.platformKey === 'mobile');
 
-    // Create missing platforms
+    // Create missing platforms (only web_ui and api — DB CHECK constraint)
     if (!webUi) {
       webUi = await this.create({
         projectId,
@@ -137,17 +136,7 @@ export class PlatformService {
       });
     }
 
-    if (!mobile) {
-      mobile = await this.create({
-        projectId,
-        userId,
-        platformKey: 'mobile',
-        name: 'Mobile UI tests',
-        description: 'Mobile UI test modules (Android & iOS)',
-      });
-    }
-
-    return { webUi, api, mobile };
+    return { webUi, api };
   }
 
   /**

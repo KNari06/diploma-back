@@ -206,10 +206,10 @@ export class OverlayDismisser {
 
         // Classify each obstacle
         const classified = this.classifyObstacles(obstacles);
-        totalDetected += classified.length;
 
-        // Filter to dismissible obstacles
+        // Filter to dismissible obstacles (only count real overlays, not unknown/permanent)
         const dismissible = this.filterDismissible(classified, mode);
+        totalDetected += dismissible.length;
         if (dismissible.length === 0) break;
 
         // Sort by z-index DESC (topmost first)
@@ -220,15 +220,25 @@ export class OverlayDismisser {
         for (const { fact, type } of dismissible) {
           if (Date.now() - startTime > maxTimeMs) break;
 
-          // Destructive guard
+          // Destructive guard: if overlay contains destructive text,
+          // try safe dismissal (Escape/Cancel) instead of skipping entirely.
+          // This handles confirmation dialogs like "Delete item? [Cancel] [Delete]"
           if (isDestructiveOverlay(fact.textPreview)) {
+            // Try Escape first — safest way to dismiss confirmation dialogs
+            const escResult = await this.executeRecovery(page, fact, type, 'dismiss_escape');
+            if (escResult.dismissed) {
+              attempts.push(escResult);
+              anyDismissed = true;
+              continue;
+            }
+            // Escape didn't work — skip (don't risk clicking destructive button)
             attempts.push({
               ref: fact.ref,
               obstacleType: type,
               recovery: 'skipped',
               dismissed: false,
               skipped: true,
-              skipReason: 'potentially destructive content',
+              skipReason: 'destructive content — Escape failed, skipping to avoid data loss',
             });
             continue;
           }
@@ -362,6 +372,9 @@ export class OverlayDismisser {
     /** Permanent elements that should never be dismissed */
     const PERMANENT_TYPES: ObstacleType[] = ['sticky_header', 'sticky_footer'];
 
+    /** Unknown obstacles are likely nav bars, headers, or framework containers — not real overlays */
+    const UNCLASSIFIED_TYPES: ObstacleType[] = ['unknown'];
+
     /** In flow mode, only dismiss these blocking types (pipeline handles the rest) */
     const FLOW_BLOCKING_TYPES: ObstacleType[] = [
       'modal', 'cookie_consent', 'loading_overlay', 'onboarding', 'paywall',
@@ -370,6 +383,9 @@ export class OverlayDismisser {
     return classified.filter(({ type }) => {
       // Never dismiss permanent elements
       if (PERMANENT_TYPES.includes(type)) return false;
+
+      // Skip unclassified elements — they are usually navbars or framework containers, not overlays
+      if (UNCLASSIFIED_TYPES.includes(type)) return false;
 
       // In flow mode, only dismiss blocking overlays
       if (mode === 'flow' && !FLOW_BLOCKING_TYPES.includes(type)) return false;

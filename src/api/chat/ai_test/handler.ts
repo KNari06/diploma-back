@@ -514,18 +514,32 @@ export async function handlePlatformTest(
 
     let project_id: string;
     try {
-      const findOrCreateProjectWithLogging = functionLogger
-        ? withFunctionLogging(ProjectContextService.findOrCreateProject.bind(ProjectContextService), 'ProjectContextService.findOrCreateProject', functionLogger)
-        : ProjectContextService.findOrCreateProject.bind(ProjectContextService);
-      const projectResult = await findOrCreateProjectWithLogging(
-        workspace_id,
-        extractedUrl,
-        userId
-      );
-      project_id = projectResult.project_id;
+      // Use current session project — user can test any URL within their project.
+      // Project is created during onboarding. NEVER create new projects here.
+      if (sessionProject?.id) {
+        project_id = sessionProject.id;
+        logger.info('[PLATFORM_TEST] Using session project', {
+          project_id,
+          projectName: sessionProject.name,
+          extractedUrl,
+        });
+      } else {
+        // No project in session — find any project in workspace
+        const { data: projects } = await supabaseAdmin
+          .from('projects')
+          .select('id')
+          .eq('workspace_id', workspace_id)
+          .eq('user_id', userId)
+          .limit(1)
+          .single();
 
-      if (projectResult.is_new) {
-        logger.info('[PLATFORM_TEST] Created new project', { project_id, url: extractedUrl });
+        if (projects?.id) {
+          project_id = projects.id;
+          logger.info('[PLATFORM_TEST] Found workspace project', { project_id, extractedUrl });
+        } else {
+          logger.warn('[PLATFORM_TEST] No project in workspace', { workspace_id });
+          throw new Error('No project found. Please complete onboarding first.');
+        }
       }
 
       // Update session with project (non-blocking)
@@ -540,11 +554,11 @@ export async function handlePlatformTest(
         });
       }
     } catch (error) {
-      logger.error('[PLATFORM_TEST] ProjectContextService failed', {
+      logger.error('[PLATFORM_TEST] Project resolution failed', {
         error: error instanceof Error ? error.message : String(error),
         url: extractedUrl,
       });
-      throw new Error(`Failed to initialize project: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      throw new Error(`Failed to find project: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 
     checkTimeout('find_or_create_project');

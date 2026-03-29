@@ -27,8 +27,13 @@ import type { IntentTestCase, Priority } from '@/types/testing.types';
 /** Progress event emitted during exploration for real-time UI updates */
 export type ExplorationProgressEvent = {
   explorationId: string;
-  phase: 'survey' | 'flow' | 'complete';
-  event: 'page_discovered' | 'survey_complete' | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found';
+  phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
+  event:
+    | 'page_discovered' | 'survey_complete'
+    | 'strategy_planned'
+    | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'flow_step' | 'branch_found'
+    | 'coverage_evaluated'
+    | 'agent_warning' | 'agent_error';
   data: Record<string, any>;
   progressPercent: number;
   timestamp: number;
@@ -548,6 +553,16 @@ export interface ExplorationSummary {
   uniquePages: number;
   /** Categories discovered */
   categories: TestFlowCategory[];
+  /** Sentinel coverage score (0-100), set after Phase 2.5 */
+  coverageScore?: number;
+  /** Sentinel quality summary, set after Phase 2.5 */
+  qualitySummary?: string;
+  /** Sentinel coverage gaps, set after Phase 2.5 */
+  gaps?: string[];
+  /** Sentinel recommendations, set after Phase 2.5 */
+  recommendations?: string[];
+  /** Sentinel risk areas, set after Phase 2.5 */
+  riskAreas?: string[];
 }
 
 export interface BudgetUsage {
@@ -582,6 +597,9 @@ export interface ExplorationCheckpoint {
 
   /** Auth state (cached storageState JSON) */
   authState?: object;
+
+  /** Cartographer page insights (serialized from Map) */
+  pageInsights?: Array<[string, any]>;
 }
 
 export interface TreeCheckpoint {
@@ -603,6 +621,7 @@ export interface QueueCheckpoint {
   queue: EntryPoint[];
   completed: string[];
   allGoals: Array<[string, string]>;
+  allNames?: string[]; // normalized names for dedup — optional for backward compat
 }
 
 export interface FlowRunnerCheckpoint {

@@ -301,13 +301,19 @@ export class ExplorationTree {
     const result: EntryPoint[] = [];
 
     for (const point of newPoints) {
-      const isDuplicate = Array.from(this.allEntryPoints.values()).some(
+      // Fast path: exact name match
+      const nameMatch = Array.from(this.allEntryPoints.values()).some(
+        (existing) => existing.name.toLowerCase().trim() === point.name.toLowerCase().trim(),
+      );
+      if (nameMatch) continue;
+
+      // Semantic dedup: Jaccard similarity on goal text
+      const goalMatch = Array.from(this.allEntryPoints.values()).some(
         (existing) => this.jaccardSimilarity(existing.goal, point.goal) >= ENTRY_POINT_DEDUP_THRESHOLD,
       );
+      if (goalMatch) continue;
 
-      if (!isDuplicate) {
-        result.push(point);
-      }
+      result.push(point);
     }
 
     return result;

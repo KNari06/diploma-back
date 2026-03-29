@@ -63,13 +63,6 @@ class SkillRegistryClass {
         this.toolsWithConfirm.add(toolName);
       }
     });
-
-    logger.info('[SKILL_REGISTRY] Skill registered', {
-      skillId: skill.id,
-      skillName: skill.name,
-      toolsCount: skill.tools.length,
-      toolNames: skill.tools.map((t) => t.function.name),
-    });
   }
 
   /**

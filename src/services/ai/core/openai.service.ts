@@ -90,10 +90,20 @@ export async function getChatCompletionWithMessages(
         })
       : null;
 
+    // Newer OpenAI models require max_completion_tokens instead of max_tokens.
+    // Safe approach: use max_completion_tokens for all models that reject max_tokens.
+    // Known: o1, o3, gpt-4o (non-mini), gpt-4.1, gpt-5.x
+    // Models that still need max_tokens: gpt-3.5-turbo, gpt-4o-mini, gpt-4.1-mini, gpt-5.4-mini (mini variants)
+    const maxTokensValue = options?.max_tokens || env.OPENAI_MAX_TOKENS || 1000;
+    const isMinimalModel = /mini/i.test(model) || /gpt-3\.5/i.test(model);
+    const tokenParam = isMinimalModel
+      ? { max_tokens: maxTokensValue }
+      : { max_completion_tokens: maxTokensValue };
+
     const requestPromise = openai.chat.completions.create({
       model,
       messages,
-      max_tokens: options?.max_tokens || env.OPENAI_MAX_TOKENS || 1000,
+      ...tokenParam,
       temperature: options?.temperature ?? 0.5,
       ...(options?.response_format && { response_format: options.response_format }),
       ...(options?.tools && { tools: options.tools }),

@@ -29,27 +29,23 @@ import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory,
 import { ExplorationTree } from './exploration-tree';
 import { BudgetTracker } from './budget-tracker';
 import { RateLimiter } from './rate-limiter';
-import {
-  buildPageClassificationPrompt,
-  parsePageClassificationResponse,
-} from './prompts';
+import { parsePageClassificationResponse } from './prompts';
 import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser';
 import type { ExplorationTraceService } from './exploration-trace.service';
+import { Cartographer } from './agents/cartographer';
+import type { CartographerInput, CartographerOutput } from './agents/agent-types';
 
-/** Max navigation links to follow per page */
-const MAX_NAV_LINKS_PER_PAGE = 8;
+/** Max hidden navigation links to follow per page (Cartographer-discovered links have no limit) */
+const MAX_NAV_LINKS_PER_PAGE = 15;
 
 /** Timeout for page navigation (ms) */
-const NAV_TIMEOUT_MS = 15_000;
+const NAV_TIMEOUT_MS = 30_000;
 
-/** Timeout for AI classification call (ms) */
-const AI_TIMEOUT_MS = 20_000;
+/** Max fallback entry points when AI returns 0 (raised from 8 for form-heavy pages) */
+const MAX_FALLBACK_ENTRY_POINTS = 20;
 
-/** Max fallback entry points when AI returns 0 */
-const MAX_FALLBACK_ENTRY_POINTS = 8;
-
-/** Max SPA route clicks per page during BFS */
-const MAX_SPA_CLICKS_PER_PAGE = 5;
+/** Max SPA route clicks per page during BFS (raised from 5 for tab-heavy SPAs) */
+const MAX_SPA_CLICKS_PER_PAGE = 10;
 
 /** Common login URL patterns */
 const LOGIN_URL_PATTERNS = [
@@ -60,6 +56,9 @@ const LOGIN_URL_PATTERNS = [
 export class SurveyAgent {
   private tree: ExplorationTree;
   private entryPointCounter: number = 0;
+  private readonly cartographer: Cartographer;
+  /** Track page types seen for Cartographer exploration context */
+  private pageTypesSeen: string[] = [];
 
   constructor(
     private readonly page: Page,
@@ -69,6 +68,7 @@ export class SurveyAgent {
     private readonly trace?: ExplorationTraceService,
   ) {
     this.tree = new ExplorationTree();
+    this.cartographer = new Cartographer(rateLimiter, trace);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -85,6 +85,72 @@ export class SurveyAgent {
       return await this.page.evaluate(() => (globalThis as any).window.location.href);
     } catch {
       return this.page.url(); // Fallback
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PRODUCT CONTEXT COLLECTION
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Collect high-level product context from the DOM to help Cartographer
+   * understand the type of application and discover navigation paths.
+   */
+  private async collectProductContext(): Promise<string> {
+    try {
+      const context = await this.page.evaluate(() => {
+        const doc = (globalThis as any).document;
+        const parts: string[] = [];
+
+        // Document title
+        const title = doc.title?.trim();
+        if (title) parts.push(`Title: ${title}`);
+
+        // Meta description
+        const metaDesc = doc.querySelector('meta[name="description"]')?.getAttribute('content')?.trim();
+        if (metaDesc) parts.push(`Description: ${metaDesc.substring(0, 200)}`);
+
+        // All H1 headings
+        const h1s = Array.from(doc.querySelectorAll('h1')).map((h: any) => h.textContent?.trim()).filter((t: any) => t && t.length > 0 && t.length < 100);
+        if (h1s.length > 0) parts.push(`H1 headings: ${h1s.slice(0, 5).join(', ')}`);
+
+        // Nav/header links
+        const navLinks: string[] = [];
+        const navEls = doc.querySelectorAll('nav a[href], header a[href], [role="navigation"] a[href]');
+        navEls.forEach((a: any) => {
+          const text = (a.textContent || '').trim();
+          const href = a.href || '';
+          if (text && text.length > 0 && text.length < 50 && href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+            navLinks.push(`${text} (${href})`);
+          }
+        });
+        if (navLinks.length > 0) parts.push(`Navigation links: ${[...new Set(navLinks)].slice(0, 20).join(', ')}`);
+
+        // Prominent buttons (Sign Up, Login, Contact, etc.)
+        const prominentButtons: string[] = [];
+        const buttons = doc.querySelectorAll('button, [role="button"], a.btn, a.button, .cta');
+        buttons.forEach((btn: any) => {
+          const text = (btn.textContent || '').trim();
+          if (text && text.length > 1 && text.length < 40 && /sign\s*up|log\s*in|register|contact|get\s*started|try|demo|free\s*trial|subscribe|learn\s*more/i.test(text)) {
+            prominentButtons.push(text);
+          }
+        });
+        if (prominentButtons.length > 0) parts.push(`Prominent CTAs: ${[...new Set(prominentButtons)].slice(0, 10).join(', ')}`);
+
+        // URL patterns inference
+        const path = (globalThis as any).window.location.pathname;
+        const origin = (globalThis as any).window.location.origin;
+        parts.push(`URL path: ${path}`);
+        parts.push(`Origin: ${origin}`);
+
+        return parts.join('\n');
+      });
+      return context || '';
+    } catch (error) {
+      logger.debug('[SURVEY] Failed to collect product context', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return '';
     }
   }
 
@@ -112,7 +178,7 @@ export class SurveyAgent {
         return this.tree;
       }
       await this.page.goto(this.config.entryUrl, {
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'load',
         timeout: NAV_TIMEOUT_MS,
       });
       this.rateLimiter.recordSuccess('target_site');
@@ -122,7 +188,7 @@ export class SurveyAgent {
         if (result.shouldRetry) {
           try {
             await this.page.goto(this.config.entryUrl, {
-              waitUntil: 'domcontentloaded',
+              waitUntil: 'load',
               timeout: NAV_TIMEOUT_MS,
             });
             this.rateLimiter.recordSuccess('target_site');
@@ -178,6 +244,38 @@ export class SurveyAgent {
     return this.tree;
   }
 
+  /**
+   * Targeted survey: visit specific URLs requested by Strategist.
+   * Reuses existing tree for dedup — only visits unvisited URLs.
+   */
+  async surveyTargets(urls: string[], existingTree: ExplorationTree): Promise<ExplorationTree> {
+    this.tree = existingTree;
+
+    for (const url of urls) {
+      if (this.tree.isVisited(url) || !this.budget.canSurveyMorePages()) {
+        logger.info('[SURVEY] Skipping target (already visited or budget)', { url });
+        continue;
+      }
+
+      try {
+        await this.page.goto(url, {
+          waitUntil: 'load',
+          timeout: NAV_TIMEOUT_MS,
+        });
+
+        // Process this page like bfsSurvey does for a single page
+        await this.bfsSurvey(0, false);
+      } catch (err) {
+        logger.warn('[SURVEY] Targeted survey failed for URL', {
+          url,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return this.tree;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // BFS TRAVERSAL
   // ═══════════════════════════════════════════════════════════════════════
@@ -195,6 +293,9 @@ export class SurveyAgent {
       parentNodeId: null,
       navAction: null,
     }];
+
+    // Track URLs already in queue to prevent duplicate enqueue before they are visited
+    const enqueuedUrls: Set<string> = new Set([this.page.url()]);
 
     while (queue.length > 0 && this.budget.canSurveyMorePages()) {
       const item = queue.shift()!;
@@ -217,7 +318,7 @@ export class SurveyAgent {
             continue;
           }
           await this.page.goto(item.url, {
-            waitUntil: 'domcontentloaded',
+            waitUntil: 'load',
             timeout: NAV_TIMEOUT_MS,
           });
           this.rateLimiter.recordSuccess('target_site');
@@ -227,7 +328,7 @@ export class SurveyAgent {
             if (result.shouldRetry) {
               try {
                 await this.page.goto(item.url, {
-                  waitUntil: 'domcontentloaded',
+                  waitUntil: 'load',
                   timeout: NAV_TIMEOUT_MS,
                 });
                 this.rateLimiter.recordSuccess('target_site');
@@ -320,6 +421,18 @@ export class SurveyAgent {
       let snapshot;
       try {
         snapshot = await this.collectFullSnapshot();
+
+        // SPA fallback: if snapshot is empty, wait for React/Vue/Angular hydration and retry
+        if (snapshot.elements.length === 0) {
+          logger.info('[SURVEY] Empty snapshot — waiting for SPA hydration', { url: item.url });
+          await this.page.waitForTimeout(2000);
+          await VisualStability.waitForStable(this.page, { checkInterval: 200, maxAttempts: 5 });
+          snapshot = await this.collectFullSnapshot();
+          logger.info('[SURVEY] SPA retry snapshot', {
+            url: item.url,
+            elementCount: snapshot.elements.length,
+          });
+        }
       } catch (error) {
         logger.warn('[SURVEY] Failed to collect snapshot', {
           url: item.url,
@@ -349,14 +462,25 @@ export class SurveyAgent {
       this.trace?.writePageSnapshot({
         url: item.url,
         elementCount: snapshot.elements.length,
-        interactiveCount: snapshot.elements.filter(e => ['textbox', 'button', 'link', 'checkbox', 'combobox'].includes(e.role)).length,
+        interactiveCount: snapshot.elements.filter(e =>
+          ['textbox', 'button', 'link', 'checkbox', 'combobox', 'radio', 'menuitem', 'tab', 'switch', 'slider', 'spinbutton'].includes(e.role) ||
+          ['input', 'textarea', 'select', 'a', 'button'].includes(e.tag),
+        ).length,
         hasScreenshot: false, // updated below
       });
 
-      // Take screenshot for vision
+      // Take screenshot for vision (fullPage for better context, with size fallback)
       let screenshotBase64: string | undefined;
       try {
-        const screenshotBuffer = await this.page.screenshot({ type: 'png', fullPage: false });
+        let screenshotBuffer = await this.page.screenshot({ type: 'png', fullPage: true });
+        // If fullPage screenshot is >2MB, fall back to viewport-only
+        if (screenshotBuffer.length > 2 * 1024 * 1024) {
+          logger.debug('[SURVEY] Full-page screenshot too large, falling back to viewport', {
+            url: item.url,
+            sizeBytes: screenshotBuffer.length,
+          });
+          screenshotBuffer = await this.page.screenshot({ type: 'png', fullPage: false });
+        }
         screenshotBase64 = screenshotBuffer.toString('base64');
       } catch (error) {
         logger.warn('[SURVEY] Failed to take screenshot', {
@@ -395,8 +519,8 @@ export class SurveyAgent {
         // Non-critical
       }
 
-      // AI classification
-      const classification = await this.classifyPage(
+      // AI classification via Cartographer agent
+      const classification = await this.classifyWithCartographer(
         formattedSnapshot,
         screenshotBase64,
         this.page.url(),
@@ -404,7 +528,6 @@ export class SurveyAgent {
         item.depth,
         snapshot,
         overlayCleanupResult?.overlaySummary ?? undefined,
-        pageHealth,
       );
 
       // Log discovered entry points & nav links
@@ -460,12 +583,34 @@ export class SurveyAgent {
 
         await this.budget.recordPageSurvey();
 
-        // Enqueue navigation links (BFS children)
-        const navLinks = classification.navigationLinks.slice(0, MAX_NAV_LINKS_PER_PAGE);
+        // Emit page_discovered event for real-time frontend update
+        this.config.onProgress?.({
+          explorationId: this.config.explorationId,
+          phase: 'survey',
+          event: 'page_discovered',
+          data: {
+            pageId: nodeId,
+            url: this.page.url(),
+            title: await this.page.title(),
+            pageType: classification.pageType,
+            entryPointsFound: entryPoints.length,
+            depth: item.depth,
+            parentPageId: item.parentNodeId,
+            isAuthGated: isAuthZone || false,
+            isLoginPage: this.isLoginUrl(this.page.url()),
+            complexity: 'medium',
+          },
+          progressPercent: 0,
+          timestamp: Date.now(),
+        });
+
+        // Enqueue navigation links (BFS children) — no hardcoded cap, AI decides relevance
+        const navLinks = classification.navigationLinks;
         for (const link of navLinks) {
           // Resolve link URL from element ref
           const linkUrl = await this.resolveLinkUrl(link.ref, snapshot);
-          if (linkUrl && !this.tree.isVisited(linkUrl) && this.isSameOrigin(linkUrl)) {
+          if (linkUrl && !this.tree.isVisited(linkUrl) && !enqueuedUrls.has(linkUrl) && this.isSameOrigin(linkUrl)) {
+            enqueuedUrls.add(linkUrl);
             queue.push({
               url: linkUrl,
               depth: item.depth + 1,
@@ -497,7 +642,8 @@ export class SurveyAgent {
 
         const allHiddenLinks = [...hiddenDomLinks, ...hiddenNavLinks].slice(0, MAX_NAV_LINKS_PER_PAGE);
         for (const link of allHiddenLinks) {
-          if (!this.tree.isVisited(link.url) && this.isSameOrigin(link.url)) {
+          if (!this.tree.isVisited(link.url) && !enqueuedUrls.has(link.url) && this.isSameOrigin(link.url)) {
+            enqueuedUrls.add(link.url);
             queue.push({
               url: link.url,
               depth: item.depth + 1,
@@ -508,7 +654,7 @@ export class SurveyAgent {
         }
 
         // SPA navigation: click elements that may trigger client-side route changes
-        await this.discoverSpaRoutes(snapshot, queue, item, nodeId);
+        await this.discoverSpaRoutes(snapshot, queue, item, nodeId, enqueuedUrls);
       }
     }
   }
@@ -694,10 +840,14 @@ export class SurveyAgent {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // AI CLASSIFICATION
+  // CARTOGRAPHER AGENT — AI-driven page classification (v2)
   // ═══════════════════════════════════════════════════════════════════════
 
-  private async classifyPage(
+  /**
+   * Classify a page using the Cartographer agent.
+   * Falls back to heuristic buildFallbackEntryPoints() if Cartographer returns empty.
+   */
+  private async classifyWithCartographer(
     formattedSnapshot: string,
     screenshotBase64: string | undefined,
     url: string,
@@ -705,180 +855,117 @@ export class SurveyAgent {
     depth: number,
     snapshot?: LiteSnapshot,
     overlaySummary?: string,
-    pageHealth?: string,
   ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
-    // Early exit if AI is degraded — use heuristic fallback
-    if (this.rateLimiter.isDegraded('openai')) {
-      logger.info('[SURVEY] AI degraded, using heuristic fallback', { url });
-      const fallbackEntryPoints = snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [];
-      this.trace?.writePageClassificationFallback({
-        url,
-        reason: 'ai_degraded',
-        entryPointCount: fallbackEntryPoints.length,
-      });
-      return {
-        pageType: this.inferPageTypeFromUrl(url),
-        entryPoints: fallbackEntryPoints,
-        navigationLinks: [],
-      };
-    }
+    // Build Cartographer input with exploration context
+    const categoriesSeen = [...new Set(this.pageTypesSeen)];
+    const recentPageTypes = this.pageTypesSeen.slice(-3);
 
-    const structureSummary = snapshot ? this.buildPageStructureSummary(snapshot) : undefined;
+    // Collect product context from DOM for richer AI understanding
+    const productContext = await this.collectProductContext();
 
-    const prompt = buildPageClassificationPrompt({
-      formattedSnapshot,
+    const cartographerInput: CartographerInput = {
       url,
       title,
+      snapshot: snapshot || ({} as LiteSnapshot),
+      screenshot: screenshotBase64,
       scopeHint: this.config.scopeHint,
       hasCredentials: !!this.config.credentials,
       depth,
-      structureSummary,
-      overlaySummary,
-      pageHealth,
-    });
+      explorationContext: {
+        pagesVisited: this.tree.getNodeCount(),
+        categoriesSeen,
+        entryPointsSoFar: this.tree.getAllEntryPoints().length,
+        recentPageTypes,
+      },
+      overlaysDismissed: overlaySummary ? [overlaySummary] : undefined,
+      productContext: productContext || undefined,
+    };
 
-    try {
-      // Build messages with optional vision
-      const userContent: any[] = [{ type: 'text', text: prompt }];
+    const result = await this.cartographer.analyze(cartographerInput, formattedSnapshot);
 
-      if (screenshotBase64) {
-        userContent.push({
-          type: 'image_url',
-          image_url: {
-            url: `data:image/png;base64,${screenshotBase64}`,
-            detail: 'low', // 'low' is sufficient for page-level classification
-          },
-        });
-      }
+    // Track page type for future context
+    this.pageTypesSeen.push(result.pageType);
 
-      await this.rateLimiter.acquireSlot('ai');
-
-      const systemPrompt = 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.';
-
-      this.trace?.writePageClassificationPrompt({
+    // Store auth detection in tree metadata
+    if (result.authDetection.isLoginPage && result.authDetection.loginUrl) {
+      // Auth detection available for Strategist via blackboard
+      logger.info('[SURVEY] Cartographer detected login page', {
         url,
-        model: AI_MODELS.vision,
-        systemPrompt,
-        userPrompt: typeof prompt === 'string' ? prompt : '[multimodal content with screenshot]',
-        hasScreenshot: !!screenshotBase64,
+        loginFormRef: result.authDetection.loginFormRef,
       });
+    }
 
-      const aiStartTime = Date.now();
-
-      const response = await Promise.race([
-        getChatCompletionWithMessages(
-          [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userContent },
-          ],
-          {
-            model: AI_MODELS.vision,
-            temperature: 0.2,
-            max_tokens: 2000,
-            response_format: { type: 'json_object' },
-          },
-        ),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('AI classification timeout')), AI_TIMEOUT_MS),
-        ),
-      ]);
-
-      this.rateLimiter.recordSuccess('openai');
-      const classification = parsePageClassificationResponse(response.content);
-
-      this.trace?.writePageClassificationResponse({
-        url,
-        model: AI_MODELS.vision,
-        rawResponse: response.content,
-        parsed: {
-          pageType: classification.pageType,
-          entryPointCount: classification.entryPoints.length,
-          navLinkCount: classification.navigationLinks.length,
-        },
-        latencyMs: Date.now() - aiStartTime,
-        tokensUsed: response.usage?.totalTokens,
-      });
-
-      // Fallback: if AI returned 0 entry points, use heuristic discovery
-      if (classification.entryPoints.length === 0 && snapshot) {
-        classification.entryPoints = this.buildFallbackEntryPoints(snapshot, url);
-        if (classification.entryPoints.length > 0) {
-          this.trace?.writePageClassificationFallback({
-            url,
-            reason: 'ai_returned_zero_entry_points',
-            entryPointCount: classification.entryPoints.length,
-          });
-          logger.info('[SURVEY] AI returned 0 entry points, using heuristic fallback', {
-            url,
-            fallbackCount: classification.entryPoints.length,
-          });
-        }
-      }
-
-      return classification;
-    } catch (error) {
-      // Handle rate-limit errors with backoff + retry
-      if (RateLimiter.isRateLimitError(error as Error)) {
-        const result = await this.rateLimiter.recordFailure('openai', error as Error);
-        if (result.shouldRetry) {
-          try {
-            await this.rateLimiter.acquireSlot('ai');
-            const retryContent: any[] = [{ type: 'text', text: prompt }];
-            if (screenshotBase64) {
-              retryContent.push({
-                type: 'image_url',
-                image_url: { url: `data:image/png;base64,${screenshotBase64}`, detail: 'low' },
-              });
-            }
-            const response = await Promise.race([
-              getChatCompletionWithMessages(
-                [
-                  {
-                    role: 'system',
-                    content: 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.',
-                  },
-                  {
-                    role: 'user',
-                    content: retryContent,
-                  },
-                ],
-                {
-                  model: AI_MODELS.vision,
-                  temperature: 0.2,
-                  max_tokens: 2000,
-                  response_format: { type: 'json_object' },
-                },
-              ),
-              new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('AI classification timeout')), AI_TIMEOUT_MS),
-              ),
-            ]);
-            this.rateLimiter.recordSuccess('openai');
-            return parsePageClassificationResponse(response.content);
-          } catch {
-            // Fall through to heuristic fallback
-          }
-        }
-      }
-
-      logger.warn('[SURVEY] AI classification failed, using heuristic fallback', {
-        url,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      // Fallback: return page type + heuristic entry points
-      const fallbackEntryPoints = snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [];
-      this.trace?.writePageClassificationFallback({
-        url,
-        reason: `ai_error: ${error instanceof Error ? error.message : String(error)}`,
-        entryPointCount: fallbackEntryPoints.length,
-      });
+    // If Cartographer returned entry points, use them
+    if (result.entryPoints.length > 0 || result.navigationLinks.length > 0) {
       return {
-        pageType: this.inferPageTypeFromUrl(url),
-        entryPoints: fallbackEntryPoints,
-        navigationLinks: [],
+        pageType: result.pageType,
+        entryPoints: result.entryPoints.map((ep) => ({
+          name: ep.name,
+          goal: ep.goal,
+          category: ep.category,
+          priority: ep.priority,
+          requiresAuth: ep.requiresAuth,
+          estimatedComplexity: ep.estimatedComplexity,
+          relatedElements: ep.relatedElements,
+          dependsOn: ep.dependsOn,
+        })),
+        navigationLinks: result.navigationLinks.map((nl) => ({
+          ref: nl.ref,
+          label: nl.label,
+          estimatedPageType: nl.estimatedPageType,
+        })),
       };
     }
+
+    // Fallback: Cartographer returned empty → use heuristic detection
+    if (snapshot) {
+      const fallbackEntryPoints = this.buildFallbackEntryPoints(snapshot, url);
+
+      // DOM fallback for navigation when Cartographer returns no nav links
+      let fallbackNavLinks: Array<{ ref: string; label: string; estimatedPageType: string }> = [];
+      try {
+        const domNavLinks = await this.page.$$eval(
+          'nav a[href], header a[href], [role="navigation"] a[href], footer a[href]',
+          (links: any[]) => links.map(a => ({
+            href: a.href,
+            text: (a.textContent || '').trim().substring(0, 50),
+            ref: a.getAttribute('data-agent-ref') || '',
+          })).filter(l => l.href && l.text && !l.href.startsWith('javascript:') && !l.href.startsWith('#') && l.ref),
+        );
+        fallbackNavLinks = domNavLinks.slice(0, MAX_NAV_LINKS_PER_PAGE).map(l => ({
+          ref: l.ref,
+          label: l.text,
+          estimatedPageType: 'other',
+        }));
+        if (fallbackNavLinks.length > 0) {
+          logger.info('[SURVEY] DOM fallback navigation links found', {
+            url,
+            count: fallbackNavLinks.length,
+          });
+        }
+      } catch {
+        // Non-fatal: DOM nav fallback is best-effort
+      }
+
+      if (fallbackEntryPoints.length > 0 || fallbackNavLinks.length > 0) {
+        this.trace?.writePageClassificationFallback({
+          url,
+          reason: 'cartographer_returned_empty',
+          entryPointCount: fallbackEntryPoints.length,
+        });
+        return {
+          pageType: result.pageType || this.inferPageTypeFromUrl(url),
+          entryPoints: fallbackEntryPoints,
+          navigationLinks: fallbackNavLinks,
+        };
+      }
+    }
+
+    return {
+      pageType: result.pageType || 'unknown',
+      entryPoints: [],
+      navigationLinks: [],
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -992,6 +1079,7 @@ export class SurveyAgent {
     queue: Array<{ url: string; depth: number; parentNodeId: string | null; navAction: NavigationAction | null }>,
     item: { url: string; depth: number },
     nodeId: string,
+    enqueuedUrls?: Set<string>,
   ): Promise<void> {
     const spaElements = this.findSpaRouteElements(snapshot);
     if (spaElements.length === 0) return;
@@ -1019,7 +1107,8 @@ export class SurveyAgent {
         // Case 1: URL changed (including hash changes like #/route) → queue for BFS, go back
         if (urlAfter !== urlBefore) {
           this.rateLimiter.recordSuccess('target_site');
-          if (!this.tree.isVisited(urlAfter) && this.isSameOrigin(urlAfter)) {
+          if (!this.tree.isVisited(urlAfter) && !enqueuedUrls?.has(urlAfter) && this.isSameOrigin(urlAfter)) {
+            enqueuedUrls?.add(urlAfter);
             queue.push({
               url: urlAfter,
               depth: item.depth + 1,
@@ -1051,7 +1140,7 @@ export class SurveyAgent {
             screenshotBase64 = buf.toString('base64');
           } catch { /* ignore */ }
 
-          const classification = await this.classifyPage(
+          const classification = await this.classifyWithCartographer(
             formattedSnapshot,
             screenshotBase64,
             urlBefore,
@@ -1456,47 +1545,6 @@ export class SurveyAgent {
   // STRUCTURED SUMMARY (for AI prompt optimization)
   // ═══════════════════════════════════════════════════════════════════════
 
-  /**
-   * Build a concise structured summary of page elements for AI classification.
-   * Reduces token usage and improves discovery quality.
-   */
-  private buildPageStructureSummary(snapshot: LiteSnapshot): string {
-    const elements = snapshot.elements;
-    const links = elements.filter(el => el.tag === 'a' && el.href);
-    const buttons = elements.filter(el => el.tag === 'button' || el.role === 'button');
-    const inputs = elements.filter(el => ['input', 'textarea', 'select'].includes(el.tag));
-    const forms = elements.filter(el => el.tag === 'form');
-
-    const sections: string[] = [];
-
-    if (links.length > 0) {
-      sections.push(`LINKS (${links.length}):\n  ${links.slice(0, 25).map(l =>
-        `[${l.ref}] "${l.name}" → ${l.href}`).join('\n  ')}`);
-    }
-    if (buttons.length > 0) {
-      sections.push(`BUTTONS (${buttons.length}): ${buttons.slice(0, 15).map(b =>
-        `[${b.ref}] "${b.name}"`).join(', ')}`);
-    }
-    if (inputs.length > 0) {
-      sections.push(`INPUTS (${inputs.length}): ${inputs.slice(0, 15).map(i =>
-        `[${i.ref}] ${i.tag}${i.type ? `[${i.type}]` : ''} "${i.name || i.placeholder || ''}"`).join(', ')}`);
-    }
-    if (forms.length > 0) {
-      sections.push(`FORMS (${forms.length}): ${forms.slice(0, 5).map(f =>
-        `[${f.ref}] "${f.name}"`).join(', ')}`);
-    }
-
-    // Overlay/obstacle info from snapshot (feeds AI even when overlay cleanup is skipped)
-    if (snapshot.obstacleFacts && snapshot.obstacleFacts.length > 0) {
-      const overlayLines = snapshot.obstacleFacts.slice(0, 8).map(f =>
-        `[${f.ref}] ${f.hintType || 'unknown'} z=${f.zIndex} coverage=${(f.coverage * 100).toFixed(1)}% "${(f.textPreview || '').slice(0, 60)}"`,
-      );
-      sections.push(`POSITIONED OVERLAYS (${snapshot.obstacleFacts.length}):\n  ${overlayLines.join('\n  ')}`);
-    }
-
-    return sections.join('\n');
-  }
-
   // ═══════════════════════════════════════════════════════════════════════
   // FALLBACK ENTRY POINTS (when AI returns 0)
   // ═══════════════════════════════════════════════════════════════════════
@@ -1575,9 +1623,18 @@ export class SurveyAgent {
     if (passwordInputs.length === 0 && inputs.length >= 2) {
       const formInputs = inputs.filter(el => el.type !== 'hidden' && el.type !== 'search');
       if (formInputs.length > 0) {
+        // Derive name from submit button or first input context
+        const formSubmitBtn = buttons.find(b => /submit|send|save|create|add|register|sign\s*up/i.test(b.name || ''));
+        const btnLabel = (formSubmitBtn?.name || '').trim();
+        const fieldLabel = formInputs[0]?.name || formInputs[0]?.placeholder || '';
+        const derivedFormName = btnLabel && !/submit/i.test(btnLabel)
+          ? btnLabel
+          : fieldLabel
+            ? `${fieldLabel} Submission`
+            : 'Form Submission';
         entryPoints.push({
-          name: 'Form Submission',
-          goal: 'Fill out and submit the form on the page',
+          name: derivedFormName,
+          goal: `Fill out and submit the form on the page (fields: ${formInputs.slice(0, 3).map(el => el.name || el.placeholder || el.type).filter(Boolean).join(', ') || 'required fields'})`,
           category: 'form_submission',
           priority: 'high',
           requiresAuth: false,
@@ -1597,8 +1654,8 @@ export class SurveyAgent {
     for (const cta of ctaButtons.slice(0, 2)) {
       if (entryPoints.length >= MAX_FALLBACK_ENTRY_POINTS) break;
       entryPoints.push({
-        name: `CTA: ${cta.name}`,
-        goal: `Click "${cta.name}" and complete the resulting flow`,
+        name: `${cta.name}`,
+        goal: `Click the "${cta.name}" button and complete the resulting flow`,
         category: 'other',
         priority: 'medium',
         requiresAuth: false,

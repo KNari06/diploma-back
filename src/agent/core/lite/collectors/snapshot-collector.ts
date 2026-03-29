@@ -203,9 +203,9 @@ export class SnapshotCollector {
             const elArea = elRect.width * elRect.height;
             const coverage = viewportArea2 > 0 ? elArea / viewportArea2 : 0;
 
-            // Must be meaningful size (>3% viewport) — lowered from 10% to catch
-            // small popups, autocomplete dropdowns, context menus, tooltips with forms
-            if (coverage < 0.03) continue;
+            // Must be meaningful size (>1% viewport) — lowered from 3% to catch
+            // small dropdowns, autocomplete menus, tooltips, mobile modals
+            if (coverage < 0.01) continue;
 
             // ── Q5 FIX: Exclude structural navigation elements (sidebars, headers, footers) ──
             // Sidebars: flush to left/right edge + tall (>70% viewport height)
@@ -546,9 +546,9 @@ export class SnapshotCollector {
             });
           }
 
-          // Sort by z-index descending, take top 8
+          // Sort by z-index descending, take top 15 (raised from 8 to catch stacked modals + widgets)
           facts.sort((a: any, b: any) => b.zIndex - a.zIndex);
-          return facts.slice(0, 8);
+          return facts.slice(0, 15);
         };
 
         const obstacleFacts = collectObstacleFacts();
@@ -819,7 +819,7 @@ export class SnapshotCollector {
          * Scans container (document.body), capped at MAX_SECONDARY_ELEMENTS.
          * Returns Set of added elements for overlay-aware isInsideModal logic.
          */
-        const MAX_SECONDARY_ELEMENTS = 120; // Cap to prevent flooding from global scan
+        const MAX_SECONDARY_ELEMENTS = 300; // Cap to prevent flooding from global scan (raised from 120 for large SPAs)
 
         const collectFrameworkInteractiveElements = (
           container: Element,
@@ -844,9 +844,9 @@ export class SnapshotCollector {
             if (style.display === 'none' || style.visibility === 'hidden') continue;
             if (parseFloat(style.opacity) < 0.1) continue;
 
-            // Skip elements too small to be interactive
+            // Skip elements too small to be interactive (lowered from 10 to catch icon buttons)
             const rect = el.getBoundingClientRect();
-            if (rect.width < 10 || rect.height < 10) continue;
+            if (rect.width < 5 || rect.height < 5) continue;
 
             // Skip structural/container elements that are too large (likely wrappers, not clickables)
             if (rect.width > 600 && rect.height > 600) continue;
@@ -998,32 +998,33 @@ export class SnapshotCollector {
               }
             } catch { /* ignore */ }
 
-            // ── Tier 2: cursor:pointer heuristic (lower confidence, stricter checks) ──
-            // Q2 FIX: Only use cursor:pointer for LEAF-like elements to avoid wrapper divs.
-            // Must be: cursor:pointer + has OWN direct text (not just inherited) + no child elements with cursor:pointer
+            // ── Tier 2: cursor:pointer heuristic (lower confidence) ──
+            // V8: Relaxed from strict leaf-only to allow parent elements with short text.
+            // Old check rejected <div style="cursor:pointer"><span>Click me</span></div>
+            // because child <span> might have cursor:pointer inherited. Now we check:
+            // cursor:pointer + has text (≤200 chars) + not a large layout container
             if (!hasFrameworkBinding && style.cursor === 'pointer') {
-              // Check for direct text content (not inherited from children)
-              let hasOwnText = false;
-              for (const child of el.childNodes) {
-                if (child.nodeType === 3 /* TEXT_NODE */ && (child.textContent || '').trim().length > 0) {
-                  hasOwnText = true;
-                  break;
-                }
-              }
-              // Fallback: if no direct TEXT_NODE, check total textContent for short elements
-              if (!hasOwnText) {
-                const totalText = (el.textContent || '').trim();
-                if (totalText.length > 0 && totalText.length < 100) {
-                  hasOwnText = true;
-                }
-              }
-              // Leaf-check: no child elements that are also cursor:pointer (avoid parent+child duplication)
-              const hasClickableChildren = hasOwnText && el.querySelector(':scope > [style*="cursor"], :scope > [role]') === null;
-              if (hasOwnText && hasClickableChildren) {
-                const text = (el.textContent || '').trim();
-                if (text.length > 0 && text.length < 200) {
+              const totalText = (el.textContent || '').trim();
+              if (totalText.length > 0 && totalText.length < 200) {
+                // Reject large layout containers (nav, main, body, full-width sections)
+                const tag = el.tagName.toLowerCase();
+                const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
+                const rect = el.getBoundingClientRect();
+                const isFullWidth = rect.width > (window.innerWidth * 0.9);
+                if (!isLayoutContainer && !isFullWidth) {
                   hasFrameworkBinding = true;
                 }
+              }
+            }
+
+            // V8: Custom web components — tag name contains '-' (e.g. <my-button>, <x-dialog>)
+            // These are often interactive but have no standard signals.
+            // Collect if: custom tag + has text + reasonable size
+            if (!hasFrameworkBinding && el.tagName.includes('-')) {
+              const totalText = (el.textContent || '').trim();
+              const rect = el.getBoundingClientRect();
+              if (totalText.length > 0 && totalText.length < 200 && rect.width >= 5 && rect.height >= 5) {
+                hasFrameworkBinding = true;
               }
             }
 
@@ -1412,7 +1413,7 @@ export class SnapshotCollector {
                   const alt = (img.getAttribute('alt') || '').trim();
                   if (alt.length > 0 && alt.length <= 100) iconChildLabel = alt;
                 }
-                // Try <svg> <title> (can be nested inside <g>, <defs>, etc.)
+                // Try <svg> <title> or <desc> (can be nested inside <g>, <defs>, etc.)
                 if (!iconChildLabel) {
                   const svg = el.querySelector('svg');
                   if (svg) {
@@ -1420,6 +1421,23 @@ export class SnapshotCollector {
                     if (svgTitle) {
                       const svgText = (svgTitle.textContent || '').trim();
                       if (svgText.length > 0 && svgText.length <= 100) iconChildLabel = svgText;
+                    }
+                    // V8: Fallback to <desc> if no <title>
+                    if (!iconChildLabel) {
+                      const svgDesc = svg.querySelector('desc');
+                      if (svgDesc) {
+                        const descText = (svgDesc.textContent || '').trim();
+                        if (descText.length > 0 && descText.length <= 100) iconChildLabel = descText;
+                      }
+                    }
+                    // V8: Fallback to <use href="#icon-name"> for icon sprite references
+                    if (!iconChildLabel) {
+                      const useEl = svg.querySelector('use');
+                      if (useEl) {
+                        const href = useEl.getAttribute('href') || useEl.getAttribute('xlink:href') || '';
+                        const iconRef = href.replace(/^#/, '').replace(/^icon[-_]/, '').replace(/[-_]/g, ' ').trim();
+                        if (iconRef.length > 0 && iconRef.length <= 50) iconChildLabel = iconRef;
+                      }
                     }
                   }
                 }
@@ -1568,6 +1586,46 @@ export class SnapshotCollector {
               tabIndex: el.getAttribute('tabindex') !== null ? parseInt(el.getAttribute('tabindex') as string, 10) : undefined,
               hasOnclick: el.hasAttribute('onclick') || undefined,
               hasAriaHaspopup: el.hasAttribute('aria-haspopup') || undefined,
+
+              // ═══════════════════════════════════════════════════════════════
+              // V8: Visual properties for LLM element matching
+              // ═══════════════════════════════════════════════════════════════
+              backgroundColor: (() => {
+                try {
+                  const bg = style.backgroundColor;
+                  // Skip transparent/unset — not useful for LLM
+                  if (!bg || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent') return undefined;
+                  return bg;
+                } catch { return undefined; }
+              })(),
+              textColor: (() => {
+                try {
+                  return style.color || undefined;
+                } catch { return undefined; }
+              })(),
+              borderRadius: (() => {
+                try {
+                  const br = style.borderRadius;
+                  if (!br || br === '0px') return undefined;
+                  return br;
+                } catch { return undefined; }
+              })(),
+              iconClasses: (() => {
+                try {
+                  // Extract icon-related class names from element and its icon children
+                  const classStr = el.getAttribute('class') || '';
+                  const iconChild = el.querySelector('i, svg, span[class*="icon"], span[class*="fa-"]');
+                  const childClassStr = iconChild?.getAttribute('class') || '';
+                  const allClasses = `${classStr} ${childClassStr}`.trim();
+                  if (!allClasses) return undefined;
+                  // Filter to icon-relevant classes
+                  const iconMatches = allClasses.split(/\s+/).filter((c: string) =>
+                    /^(fa-|fa[srltdb]-|material-icons|mdi-|bi-|icon-|lucide-|heroicon|ri-|ti-|bx-|ph-)/i.test(c) ||
+                    /icon/i.test(c)
+                  );
+                  return iconMatches.length > 0 ? iconMatches.join(' ') : undefined;
+                } catch { return undefined; }
+              })(),
 
               // Near text: collect text from sibling/row elements for disambiguation
               // When multiple identical buttons exist (e.g. "Delete" in each table row),

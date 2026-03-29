@@ -1,6 +1,7 @@
 import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
 import emailInboxRoutes from '@/api/email-inbox/email-inbox.routes';
+import explorationsRoutes from '@/api/explorations/explorations.route';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
@@ -1295,6 +1296,7 @@ app.use(`/api/${env.API_VERSION}/flows`, requireAuth, requireApproved, flowsRout
 app.use(`/api/${env.API_VERSION}/schedules`, requireAuth, requireApproved, schedulesRoutes);
 app.use(`/api/${env.API_VERSION}/fixtures`, requireAuth, requireApproved, fixturesRoutes);
 app.use(`/api/${env.API_VERSION}/regression-plans`, requireAuth, requireApproved, regressionPlansRoutes);
+app.use(`/api/${env.API_VERSION}/explorations`, requireAuth, requireApproved, explorationsRoutes);
 // git-integrations: no app-level auth so webhook is public; router applies requireAuth+requireApproved to CRUD only
 app.use(`/api/${env.API_VERSION}/git-integrations`, gitIntegrationRoutes);
 // Fallback when reverse proxy strips /api: accept webhook at /v1/git-integrations/webhook (same handler, no auth on webhook route)
@@ -1406,7 +1408,6 @@ const startServer = async () => {
     try {
       const { registerAllSkills } = await import('@/services/skills');
       await registerAllSkills();
-      logger.info('✓ Skills registered successfully');
     } catch (skillsError) {
       logger.warn('[SERVER] Failed to register skills, continuing without them', {
         error: skillsError instanceof Error ? skillsError.message : String(skillsError),
@@ -1471,11 +1472,7 @@ const startServer = async () => {
     // Start HTTP server
     try {
       server = app.listen(env.PORT, async () => {
-        logger.info(`🚀 QAIT Backend API started on port ${env.PORT}`);
-        logger.info(`📊 Environment: ${env.NODE_ENV}`);
-        logger.info(`🏷️ Queue prefix: ${env.QUEUE_PREFIX}`);
-        logger.info(`🔗 Health check: http://localhost:${env.PORT}/health`);
-        logger.info(`📚 API docs: http://localhost:${env.PORT}/api/docs`);
+        logger.info(`QAIT Backend started | port=${env.PORT} env=${env.NODE_ENV}`);
 
         // Cleanup zombie regression runs from previous server crashes
         try {
@@ -1534,14 +1531,11 @@ const startServer = async () => {
       const { initializeWebSocket } = await import('@/websocket/core/server');
       if (server) {
         initializeWebSocket(server);
-        logger.info('🌐 WebSocket server initialized');
 
-        // ✅ NEW: Start Redis subscriber for worker events
-        // This bridges worker process events to WebSocket clients
+        // Start Redis subscriber for worker events (bridges worker → WebSocket clients)
         try {
           const { webSocketRedisSubscriber } = await import('@/websocket/infrastructure/redis-subscriber');
           await webSocketRedisSubscriber.start();
-          logger.info('📡 WebSocket Redis subscriber started (worker → WebSocket bridge)');
         } catch (subError) {
           logger.error('[SERVER] Failed to start WebSocket Redis subscriber:', {
             error: subError instanceof Error ? subError.message : String(subError),

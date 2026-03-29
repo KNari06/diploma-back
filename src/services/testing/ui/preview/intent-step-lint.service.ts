@@ -1,5 +1,5 @@
 /**
- * Intent Step Lint Service V7
+ * Intent Step Lint Service
  * LLM-based linting for step editor (primary) with rule-based fallback
  * Resolves intent steps to candidate elements using LLM semantic matching
  */
@@ -437,7 +437,7 @@ export class IntentStepLintService {
       const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions — page-level steps that don't target a specific DOM element
-      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -703,7 +703,7 @@ export class IntentStepLintService {
   }
 
   /**
-   * V7: Lint step with LLM-based element resolution (PRIMARY)
+   * Lint step with LLM-based element resolution (PRIMARY)
    *
    * Architecture:
    * 1. Evidence shortcut (if enabled) with action-type validation
@@ -722,7 +722,7 @@ export class IntentStepLintService {
   }): Promise<LintResult> {
     const { previewSessionId, stepDraft, userId, includeAlternatives = false } = params;
 
-    logger.debug('[INTENT_LINT_V7] Linting step with LLM resolver', {
+    logger.debug('[INTENT_LINT] Linting step with LLM resolver', {
       previewSessionId,
       stepType: stepDraft.type,
       description: stepDraft.description.slice(0, 50),
@@ -730,7 +730,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -740,7 +740,7 @@ export class IntentStepLintService {
       };
     }
 
-    // Get snapshot
+    // Get snapshot (throttled at 500ms — safe because frontend debounce is 2.5s)
     const sessionService = getPreviewSessionService();
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       includeDomNodes: true, // Always need domNodes for linting
@@ -903,7 +903,7 @@ export class IntentStepLintService {
 
     // Step 2: If LLM resolver failed, fall back to rule-based
     if (resolverResult.degradedMode) {
-      logger.warn('[INTENT_LINT_V7] LLM resolver degraded, falling back to rule-based', {
+      logger.warn('[INTENT_LINT] LLM resolver degraded, falling back to rule-based', {
         previewSessionId,
         degradedReason: resolverResult.degradedReason,
       });

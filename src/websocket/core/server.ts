@@ -21,7 +21,7 @@ let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, Socke
  * Initialize WebSocket server
  */
 export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
-  logger.info('[WebSocket] Initializing WebSocket server...');
+  logger.debug('[WebSocket] Initializing WebSocket server...');
 
   const devAllowedOrigins = [
     'http://localhost:8080',
@@ -158,13 +158,7 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
     });
   });
 
-  logger.info('[WebSocket] WebSocket server initialized successfully', {
-    transports,
-    pingInterval: '60s',
-    pingTimeout: '120s',
-    cors: isDevelopment ? 'enabled (development)' : 'configured',
-    note: 'Polling transport will create HTTP requests every ~60s. WebSocket is preferred for better performance.',
-  });
+  logger.debug('[WebSocket] WebSocket server initialized successfully');
 
   return io;
 };

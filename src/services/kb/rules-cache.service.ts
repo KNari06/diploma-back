@@ -35,42 +35,21 @@ export class RulesCacheService {
       return;
     }
 
-    logger.info('[RULES_CACHE] Initializing rules cache...');
-
-    const startTime = Date.now();
     const results = await Promise.allSettled(
       this.SUPPORTED_LANGUAGES.map((lang) => this.loadRules(lang))
     );
 
-    // Check results
-    let successCount = 0;
     let failCount = 0;
-
     results.forEach((result, index) => {
-      const language = this.SUPPORTED_LANGUAGES[index];
-      if (result.status === 'fulfilled') {
-        successCount++;
-        logger.info(`[RULES_CACHE] ✓ Loaded rules for ${language}`, {
-          chunksCount: result.value.chunks.length,
-          contentLength: result.value.content.length,
-        });
-      } else {
+      if (result.status === 'rejected') {
         failCount++;
-        logger.error(`[RULES_CACHE] ✗ Failed to load rules for ${language}`, {
+        logger.error(`[RULES_CACHE] Failed to load rules for ${this.SUPPORTED_LANGUAGES[index]}`, {
           error: result.reason,
         });
       }
     });
 
     this.isInitialized = true;
-
-    const duration = Date.now() - startTime;
-    logger.info('[RULES_CACHE] Initialization complete', {
-      duration: `${duration}ms`,
-      successCount,
-      failCount,
-      totalLanguages: this.SUPPORTED_LANGUAGES.length,
-    });
   }
 
   /**
@@ -78,8 +57,6 @@ export class RulesCacheService {
    */
   static async loadRules(language: 'en' | 'ru'): Promise<CachedRules> {
     try {
-      logger.info(`[RULES_CACHE] Loading rules for language: ${language}`);
-
       // Search for rules with specific query to find general_ai_rules.md
       const searchResults = await searchKB('AI response guidelines rules communication style', undefined, {
         matchCount: 10, // Get more chunks to ensure we get all rules
@@ -118,12 +95,6 @@ export class RulesCacheService {
       };
 
       this.cache.set(language, cachedRules);
-
-      logger.info(`[RULES_CACHE] Cached rules for ${language}`, {
-        chunksCount: rulesChunks.length,
-        contentLength: content.length,
-        sources: [...new Set(rulesChunks.map((c) => c.source_file))],
-      });
 
       return cachedRules;
     } catch (error) {

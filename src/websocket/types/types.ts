@@ -60,6 +60,9 @@ export interface ClientToServerEvents {
   'preview:page:back': (data: { previewSessionId: string }) => void;
   'preview:page:forward': (data: { previewSessionId: string }) => void;
 
+  // V15: Multi-tab events (client → server)
+  'preview:tab:switch': (data: { previewSessionId: string; tabIndex: number }) => void;
+
   // Preview DevTools (on-demand requests)
   'preview:network:detail:request': (data: PreviewNetworkDetailRequest) => void;
   'preview:network:list:request': (data: PreviewNetworkListRequest) => void;
@@ -155,6 +158,7 @@ export interface ServerToClientEvents {
   'preview:run:started': (data: PreviewRunStartedPayload) => void;
   'preview:run:step': (data: PreviewRunStepPayload) => void;
   'preview:run:completed': (data: PreviewRunCompletedPayload) => void;
+  'preview:run:cancelled': (data: { previewSessionId: string }) => void;
 
   // Preview DevTools events (server -> client)
   'preview:console:update': (data: PreviewConsoleUpdatePayload) => void;
@@ -170,6 +174,12 @@ export interface ServerToClientEvents {
 
   // Preview page switch events (popup/new tab auto-switch)
   'preview:page:navigated': (data: { previewSessionId: string; url: string; previousUrl: string; reason: string; timestamp: string }) => void;
+
+  // V15: Multi-tab events
+  'preview:tab:opened': (data: { previewSessionId: string; tabs: Array<{ tabIndex: number; url: string; title?: string; isActive: boolean }>; activeTabIndex: number; timestamp: string }) => void;
+  'preview:tab:switched': (data: { previewSessionId: string; tabs: Array<{ tabIndex: number; url: string; title?: string; isActive: boolean }>; activeTabIndex: number; timestamp: string }) => void;
+  'preview:tab:closed': (data: { previewSessionId: string; tabs: Array<{ tabIndex: number; url: string; title?: string; isActive: boolean }>; activeTabIndex: number; closedTabIndex: number; timestamp: string }) => void;
+  'preview:tab:list': (data: { previewSessionId: string; tabs: Array<{ tabIndex: number; url: string; title?: string; isActive: boolean }>; activeTabIndex: number; timestamp: string }) => void;
 
   // Preview loading progress (emitted during slow page loads > 5s)
   'preview:loading': (data: {
@@ -810,12 +820,13 @@ export interface RegressionRunProgressPayload {
 
 export interface ExplorationProgressPayload {
   explorationId: string;
-  phase: 'survey' | 'flow' | 'complete';
+  phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
   event: string;
   progressPercent: number;
   data: Record<string, any>;
   timestamp: string;
   chatSessionId?: string;
+  userId?: string;
 }
 
 export interface ExplorationCompletedPayload {
@@ -826,6 +837,7 @@ export interface ExplorationCompletedPayload {
   errorMessage?: string;
   timestamp: string;
   chatSessionId?: string;
+  userId?: string;
 }
 
 export interface ExplorationClarificationPayload {
@@ -835,6 +847,7 @@ export interface ExplorationClarificationPayload {
   type: 'captcha_solve' | '2fa_code';
   timeout: number;
   chatSessionId: string;
+  userId?: string;
   timestamp: string;
 }
 
@@ -891,6 +904,8 @@ export interface PreviewIntentStep {
   options?: StepOptions;
   /** Cached evidence from recording or prior execution (used as evidence shortcut during apply/run) */
   evidence?: StepEvidence;
+  /** V15: Tab index this step targets (0 = initial tab, 1+ = popups) */
+  tabIndex?: number;
 }
 
 /**

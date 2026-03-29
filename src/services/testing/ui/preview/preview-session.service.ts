@@ -194,7 +194,11 @@ function isBenignAlreadyClosedError(error: unknown): boolean {
 interface InternalSession extends PreviewSession {
   browser: Browser;
   context: BrowserContext;
-  page: Page;
+  page: Page; // Active page — always points to pages[activeTabIndex]
+  /** V15: All open tabs. Index 0 = initial page. */
+  pages: Page[];
+  /** V15: Index into pages[] for the currently active tab */
+  activeTabIndex: number;
   lastSnapshotEmit: number;
   lastScreenshotEmitAt: number;  // Last screenshot emission timestamp
   lastPageSignature: string;      // Hash for diff detection (url+domMetrics)
@@ -513,6 +517,8 @@ export class PreviewSessionService {
           browser,
           context,
           page,
+          pages: [page],       // V15: multi-tab — initial page at index 0
+          activeTabIndex: 0,   // V15: active tab is the initial page
           lastSnapshotEmit: 0,
           lastScreenshotEmitAt: 0,
           lastPageSignature: initialSignature,
@@ -544,6 +550,9 @@ export class PreviewSessionService {
 
         // Handle popup / new tab detection
         this.attachPopupHandler(context, sessionId);
+
+        // V15: Track tab close events (site-initiated window.close())
+        this.attachTabCloseListener(page, sessionId);
 
         // Handle page crash (renderer process OOM, infinite loop, etc.)
         this.attachCrashHandler(page, sessionId);
@@ -652,6 +661,9 @@ export class PreviewSessionService {
       // Swap to new resources
       session.context = newContext;
       session.page = newPage;
+      // V15: Reset tabs — new context = fresh single tab
+      session.pages = [newPage];
+      session.activeTabIndex = 0;
 
       // Auto-dismiss native dialogs on the new page
       this.attachDialogHandler(newPage, sessionId);
@@ -660,6 +672,7 @@ export class PreviewSessionService {
       this.attachPopupHandler(newContext, sessionId);
       this.attachCrashHandler(newPage, sessionId);
       this.attachPageDownloadHandler(newPage, sessionId);
+      this.attachTabCloseListener(newPage, sessionId);
 
       // Reset internal timers/state to avoid throttling weirdness after reset
       session.lastSnapshotEmit = 0;
@@ -913,7 +926,12 @@ export class PreviewSessionService {
         }
       } catch (err) { logger.error('[EDITOR_TRACE] Close failed on session cleanup', { sessionId, error: err instanceof Error ? err.message : String(err) }); }
 
-      // Safe cleanup of browser resources
+      // V15: Close all open tabs, then browser resources
+      for (const p of session.pages) {
+        if (p !== session.page) {
+          try { await p.close().catch(() => {}); } catch { /* best effort */ }
+        }
+      }
       await this.safeCloseBrowserResources(session.browser, session.context, session.page);
 
       // Remove from maps
@@ -951,7 +969,13 @@ export class PreviewSessionService {
     } catch (err) { logger.error('[EDITOR_TRACE] Close failed on session destroy', { sessionId, error: err instanceof Error ? err.message : String(err) }); }
 
     try {
-      // Safe cleanup of browser resources
+      // V15: Close all open tabs first
+      for (const p of session.pages) {
+        if (p !== session.page) {
+          try { await p.close().catch(() => {}); } catch { /* best effort */ }
+        }
+      }
+      // Safe cleanup of browser resources (active page + context + browser)
       await this.safeCloseBrowserResources(session.browser, session.context, session.page);
 
       // Fallback force-kill if browser process still alive
@@ -1091,9 +1115,10 @@ export class PreviewSessionService {
       await session.page.setViewportSize({ width, height });
 
       // Wait for CSS media queries and responsive reflow to complete before returning.
-      // Without this, emitSnapshotAlways() would collect DOM before layout has settled,
-      // returning stale boundingBox values and wrong element visibility flags.
-      await waitForDOMStability(session.page, 1500, 300);
+      // Viewport resize is fast (CSS reflow <100ms), so use shorter timeouts than
+      // navigation (which loads new content). Without this, emitSnapshotAlways()
+      // would collect DOM before layout has settled.
+      await waitForDOMStability(session.page, 800, 150);
 
       session.lastSeenAt = Date.now();
 
@@ -2044,21 +2069,38 @@ export class PreviewSessionService {
         // V11: Block snapshot collection during page switch to prevent stale/empty DOM
         session.pageSwitchInProgress = true;
 
-        // Close old page (best-effort, don't fail if already closed)
+        // V15: Keep old page alive — push new page to tabs array
         const oldPage = session.page;
-        try {
-          await oldPage.close().catch(() => {});
-        } catch {
-          // Already closed — fine
+        const maxTabs = PREVIEW_SESSION_CONFIG.maxTabsPerSession;
+
+        // Evict oldest non-active tab if at max capacity
+        if (session.pages.length >= maxTabs) {
+          const evictIdx = session.pages.findIndex((_, idx) => idx !== session.activeTabIndex);
+          if (evictIdx >= 0) {
+            const evicted = session.pages.splice(evictIdx, 1)[0];
+            // Adjust activeTabIndex if eviction shifted it
+            if (evictIdx < session.activeTabIndex) {
+              session.activeTabIndex--;
+            }
+            try { await evicted.close().catch(() => {}); } catch { /* best effort */ }
+            logger.info('[PREVIEW_SESSION] Evicted tab at max capacity', {
+              previewSessionId,
+              evictedIndex: evictIdx,
+              maxTabs,
+            });
+          }
         }
 
-        // Swap to new page
+        // Add new page to tabs and switch to it
+        session.pages.push(newPage);
+        session.activeTabIndex = session.pages.length - 1;
         session.page = newPage;
 
         // Attach handlers to new page
         this.attachDialogHandler(newPage, previewSessionId);
         this.attachCrashHandler(newPage, previewSessionId);
         this.attachPageDownloadHandler(newPage, previewSessionId);
+        this.attachTabCloseListener(newPage, previewSessionId);
 
         // Wait for new page DOM to be ready before allowing snapshot collection.
         // domcontentloaded is sufficient — 'load' waits for all subresources (images,
@@ -2094,13 +2136,21 @@ export class PreviewSessionService {
           }
         }
 
-        // Notify frontend about page switch
+        // Notify frontend about page switch + tabs list
         try {
+          const tabsInfo = this.buildTabsInfo(session);
           webSocketService.emitToRoom('preview', previewSessionId, 'preview:page:navigated', {
             previewSessionId,
             url: newUrl,
             previousUrl: oldUrl,
             reason: 'popup',
+            timestamp: new Date().toISOString(),
+          });
+          // V15: Emit tab events for multi-tab UI
+          webSocketService.emitToRoom('preview', previewSessionId, 'preview:tab:opened', {
+            previewSessionId,
+            tabs: tabsInfo,
+            activeTabIndex: session.activeTabIndex,
             timestamp: new Date().toISOString(),
           });
         } catch {
@@ -2117,7 +2167,18 @@ export class PreviewSessionService {
           session.pageSwitchInProgress = false;
         }
 
-        // If we can't switch, close the popup to avoid orphaned pages
+        // V15: On error, remove the new page from tabs if it was added
+        if (session && session.pages.includes(newPage)) {
+          const idx = session.pages.indexOf(newPage);
+          session.pages.splice(idx, 1);
+          // Restore active tab to the previous page
+          if (session.activeTabIndex >= session.pages.length) {
+            session.activeTabIndex = Math.max(0, session.pages.length - 1);
+          }
+          session.page = session.pages[session.activeTabIndex];
+        }
+
+        // Close the failed popup
         try {
           if (!newPage.isClosed()) {
             await newPage.close().catch(() => {});
@@ -2138,6 +2199,193 @@ export class PreviewSessionService {
     if (session) {
       session.onPageSwitch = callback;
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V15: Multi-tab management
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Switch active tab to a different index.
+   * Updates session.page, invokes onPageSwitch callback, resets snapshot state.
+   */
+  async switchTab(sessionId: string, userId: string, tabIndex: number): Promise<boolean> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return false;
+
+    if (tabIndex < 0 || tabIndex >= session.pages.length) {
+      logger.warn('[PREVIEW_SESSION] switchTab: invalid tabIndex', { sessionId, tabIndex, totalTabs: session.pages.length });
+      return false;
+    }
+
+    if (tabIndex === session.activeTabIndex) return true; // Already active
+
+    const oldPage = session.page;
+    const oldUrl = oldPage.url();
+    const newPage = session.pages[tabIndex];
+
+    if (newPage.isClosed()) {
+      logger.warn('[PREVIEW_SESSION] switchTab: target tab is closed', { sessionId, tabIndex });
+      // Remove closed tab and adjust
+      session.pages.splice(tabIndex, 1);
+      if (session.activeTabIndex >= session.pages.length) {
+        session.activeTabIndex = Math.max(0, session.pages.length - 1);
+      }
+      session.page = session.pages[session.activeTabIndex];
+      return false;
+    }
+
+    session.pageSwitchInProgress = true;
+
+    session.activeTabIndex = tabIndex;
+    session.page = newPage;
+
+    // Reset snapshot state for fresh collection on new tab
+    session.lastSnapshotEmit = 0;
+    session.lastPageSignature = '';
+
+    session.pageSwitchInProgress = false;
+
+    // Update recording URL baseline
+    if (session.recording) {
+      session.recordingLastUrl = newPage.url();
+    }
+
+    // Invoke page switch callback (video restart, devtools restart)
+    if (session.onPageSwitch) {
+      try {
+        session.onPageSwitch(newPage, oldUrl);
+      } catch (cbError) {
+        logger.warn('[PREVIEW_SESSION] switchTab: onPageSwitch callback error', {
+          sessionId,
+          error: cbError instanceof Error ? cbError.message : String(cbError),
+        });
+      }
+    }
+
+    logger.info('[PREVIEW_SESSION] Switched active tab', {
+      sessionId,
+      fromTabIndex: session.pages.indexOf(oldPage),
+      toTabIndex: tabIndex,
+      newUrl: newPage.url(),
+    });
+
+    return true;
+  }
+
+  /**
+   * Close a specific tab and adjust state.
+   * Cannot close the last remaining tab.
+   */
+  async closeTab(sessionId: string, userId: string, tabIndex: number): Promise<boolean> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return false;
+
+    if (tabIndex < 0 || tabIndex >= session.pages.length) return false;
+    if (session.pages.length <= 1) {
+      logger.warn('[PREVIEW_SESSION] closeTab: cannot close last tab', { sessionId });
+      return false;
+    }
+
+    const closedPage = session.pages.splice(tabIndex, 1)[0];
+
+    // Adjust activeTabIndex
+    if (tabIndex === session.activeTabIndex) {
+      // Closed the active tab — switch to the nearest remaining
+      session.activeTabIndex = Math.min(tabIndex, session.pages.length - 1);
+      session.page = session.pages[session.activeTabIndex];
+
+      // Reset snapshot + invoke callback
+      session.lastSnapshotEmit = 0;
+      session.lastPageSignature = '';
+      if (session.onPageSwitch) {
+        try { session.onPageSwitch(session.page, closedPage.url()); } catch { /* non-critical */ }
+      }
+    } else if (tabIndex < session.activeTabIndex) {
+      session.activeTabIndex--;
+    }
+
+    // Close the actual page
+    try { await closedPage.close().catch(() => {}); } catch { /* best effort */ }
+
+    logger.info('[PREVIEW_SESSION] Tab closed', {
+      sessionId,
+      closedTabIndex: tabIndex,
+      remainingTabs: session.pages.length,
+      activeTabIndex: session.activeTabIndex,
+    });
+
+    return true;
+  }
+
+  /**
+   * Get tab info list for frontend.
+   */
+  getTabsInfo(sessionId: string, userId?: string): import('./preview.types').PreviewTabInfo[] {
+    const session = userId ? this.getAuthorizedSession(sessionId, userId) : this.sessions.get(sessionId);
+    if (!session) return [];
+    return this.buildTabsInfo(session);
+  }
+
+  /**
+   * Build PreviewTabInfo[] from session state (internal helper).
+   */
+  private buildTabsInfo(session: InternalSession): import('./preview.types').PreviewTabInfo[] {
+    return session.pages.map((page, idx) => ({
+      tabIndex: idx,
+      url: page.isClosed() ? '' : (page.url() || ''),
+      title: page.isClosed() ? undefined : undefined, // Title fetched async elsewhere
+      isActive: idx === session.activeTabIndex,
+    }));
+  }
+
+  /**
+   * Attach close listener to a page — removes from tabs array when site closes it.
+   */
+  private attachTabCloseListener(page: Page, previewSessionId: string): void {
+    page.on('close', () => {
+      const session = this.sessions.get(previewSessionId);
+      if (!session) return;
+
+      const idx = session.pages.indexOf(page);
+      if (idx < 0) return; // Already removed
+
+      // Don't auto-remove if it's the last tab
+      if (session.pages.length <= 1) return;
+
+      session.pages.splice(idx, 1);
+
+      // Adjust activeTabIndex
+      if (idx === session.activeTabIndex) {
+        session.activeTabIndex = Math.min(idx, session.pages.length - 1);
+        session.page = session.pages[session.activeTabIndex];
+        session.lastSnapshotEmit = 0;
+        session.lastPageSignature = '';
+        if (session.onPageSwitch) {
+          try { session.onPageSwitch(session.page, ''); } catch { /* non-critical */ }
+        }
+      } else if (idx < session.activeTabIndex) {
+        session.activeTabIndex--;
+      }
+
+      logger.info('[PREVIEW_SESSION] Tab closed by site', {
+        previewSessionId,
+        closedTabIndex: idx,
+        remainingTabs: session.pages.length,
+      });
+
+      // Notify frontend
+      try {
+        const tabsInfo = this.buildTabsInfo(session);
+        webSocketService.emitToRoom('preview', previewSessionId, 'preview:tab:closed', {
+          previewSessionId,
+          tabs: tabsInfo,
+          activeTabIndex: session.activeTabIndex,
+          closedTabIndex: idx,
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* non-critical */ }
+    });
   }
 
   /**

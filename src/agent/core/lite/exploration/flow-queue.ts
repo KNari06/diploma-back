@@ -13,6 +13,7 @@
  */
 
 import type { EntryPoint, FlowPriority, FlowComplexity, QueueCheckpoint } from './types';
+import type { StrategistOutput, StrategistFlowPlan } from './agents/agent-types';
 
 /** Priority weights (higher = explore sooner) */
 const PRIORITY_WEIGHT: Record<FlowPriority, number> = {
@@ -29,13 +30,17 @@ const COMPLEXITY_WEIGHT: Record<FlowComplexity, number> = {
   complex: 1,
 };
 
-/** Jaccard threshold for dedup on enqueue */
-const DEDUP_THRESHOLD = 0.7;
+/** Jaccard threshold for dedup on enqueue (goal text similarity) */
+const DEDUP_THRESHOLD = 0.5;
+
+/** Name similarity threshold — catches near-identical names like "Contact Us" vs "Contact Us Form" */
+const NAME_DEDUP_THRESHOLD = 0.6;
 
 export class FlowQueue {
   private queue: EntryPoint[] = [];
   private completed: Set<string> = new Set();
   private allGoals: Map<string, string> = new Map(); // id → goal (for dedup)
+  private allNames: Set<string> = new Set();          // normalized names — dedup across all enqueued+completed
   private mutexPromise: Promise<void> = Promise.resolve();
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -51,6 +56,59 @@ export class FlowQueue {
       q.enqueueSync(ep, true); // skip sort during batch load
     }
     q.sort(); // sort once at the end
+    return q;
+  }
+
+  /**
+   * Build queue from Strategist output — AI-driven ordering replaces static formula.
+   * Entry points not in the strategy plan are appended after planned ones.
+   * Skipped flows are excluded.
+   */
+  static fromStrategyOutput(
+    entryPoints: EntryPoint[],
+    strategy: StrategistOutput,
+  ): FlowQueue {
+    const q = new FlowQueue();
+    const skipIds = new Set(strategy.skipFlows.map((s) => s.id));
+    const planMap = new Map(strategy.plan.map((p) => [p.entryPointId, p]));
+
+    // Separate into planned (ordered by Strategist) and unplanned
+    const planned: EntryPoint[] = [];
+    const unplanned: EntryPoint[] = [];
+
+    for (const ep of entryPoints) {
+      if (skipIds.has(ep.id)) continue; // Strategist said skip
+      if (planMap.has(ep.id)) {
+        planned.push(ep);
+      } else {
+        unplanned.push(ep);
+      }
+    }
+
+    // Sort planned by Strategist priority (1 = first)
+    planned.sort((a, b) => {
+      const pa = planMap.get(a.id)!.priority;
+      const pb = planMap.get(b.id)!.priority;
+      return pa - pb;
+    });
+
+    // Apply dependency overrides from Strategist
+    for (const ep of planned) {
+      const planEntry = planMap.get(ep.id);
+      if (planEntry?.dependsOn) {
+        ep.dependsOn = planEntry.dependsOn;
+      }
+    }
+
+    // Enqueue: planned first (in Strategist order), then unplanned (in default score order)
+    for (const ep of planned) {
+      q.enqueueSync(ep, true);
+    }
+    for (const ep of unplanned) {
+      q.enqueueSync(ep, true);
+    }
+    // Don't sort — planned order is intentional from Strategist
+
     return q;
   }
 
@@ -121,6 +179,49 @@ export class FlowQueue {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // REORDER (Strategist-driven)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Reorder the queue based on Strategist's updated plan.
+   * Moves planned entries to front in Strategist priority order.
+   * Removes entries marked as skip.
+   */
+  reorder(plan: StrategistFlowPlan[], skipIds?: string[]): void {
+    const skipSet = new Set(skipIds || []);
+    const planMap = new Map(plan.map((p) => [p.entryPointId, p]));
+
+    // Remove skipped entries
+    if (skipSet.size > 0) {
+      this.queue = this.queue.filter((ep) => !skipSet.has(ep.id));
+    }
+
+    // Separate into entries that are in plan vs not
+    const inPlan: EntryPoint[] = [];
+    const notInPlan: EntryPoint[] = [];
+    for (const ep of this.queue) {
+      if (planMap.has(ep.id)) {
+        // Apply dependency overrides
+        const planEntry = planMap.get(ep.id)!;
+        if (planEntry.dependsOn) ep.dependsOn = planEntry.dependsOn;
+        inPlan.push(ep);
+      } else {
+        notInPlan.push(ep);
+      }
+    }
+
+    // Sort in-plan by Strategist priority (1 = first)
+    inPlan.sort((a, b) => {
+      const pa = planMap.get(a.id)?.priority ?? 999;
+      const pb = planMap.get(b.id)?.priority ?? 999;
+      return pa - pb;
+    });
+
+    // Rebuild queue: Strategist-ordered first, then remainder
+    this.queue = [...inPlan, ...notInPlan];
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // CHECKPOINT / RESUME
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -129,6 +230,7 @@ export class FlowQueue {
       queue: [...this.queue],
       completed: Array.from(this.completed),
       allGoals: Array.from(this.allGoals.entries()),
+      allNames: Array.from(this.allNames),
     };
   }
 
@@ -137,6 +239,7 @@ export class FlowQueue {
     q.queue = [...cp.queue];
     for (const id of cp.completed) q.completed.add(id);
     for (const [id, goal] of cp.allGoals) q.allGoals.set(id, goal);
+    for (const name of (cp.allNames ?? [])) q.allNames.add(name);
     return q;
   }
 
@@ -145,13 +248,28 @@ export class FlowQueue {
   // ═══════════════════════════════════════════════════════════════════════
 
   private enqueueSync(entryPoint: EntryPoint, skipSort = false): boolean {
-    // Dedup check: Jaccard similarity on goal text
+    const normalizedName = entryPoint.name.toLowerCase().trim();
+
+    // Dedup check 1: exact name — covers all ever-enqueued (including already dequeued/completed)
+    if (this.allNames.has(normalizedName)) {
+      return false;
+    }
+
+    // Dedup check 2: name similarity — catches "Form Submission" vs "First name Submission"
+    for (const existingName of this.allNames) {
+      if (this.jaccardSimilarity(existingName, normalizedName) >= NAME_DEDUP_THRESHOLD) {
+        return false;
+      }
+    }
+
+    // Dedup check 3: Jaccard similarity on goal text
     for (const [, existingGoal] of this.allGoals) {
       if (this.jaccardSimilarity(existingGoal, entryPoint.goal) >= DEDUP_THRESHOLD) {
         return false;
       }
     }
 
+    this.allNames.add(normalizedName);
     this.allGoals.set(entryPoint.id, entryPoint.goal);
     this.queue.push(entryPoint);
     if (!skipSort) this.sort();

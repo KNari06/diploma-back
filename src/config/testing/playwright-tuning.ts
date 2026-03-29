@@ -51,6 +51,9 @@ export const PREVIEW_SESSION_CONFIG = {
   /** Safety cap for concurrent sessions (memory guard) */
   maxSessions: 20,
 
+  /** V15: Maximum open tabs per preview session (memory guard) */
+  maxTabsPerSession: 8,
+
   /** Viewport dimensions. Override: PREVIEW_VIEWPORT_WIDTH / PREVIEW_VIEWPORT_HEIGHT */
   viewport: {
     width: envNum(process.env.PREVIEW_VIEWPORT_WIDTH, 1280),
@@ -108,10 +111,10 @@ export const STEP_READINESS_CONFIG = {
 
   /** Default values for LookaheadOptions */
   defaults: {
-    maxWaitMs: 10_000,
-    settleMs: 3_000,
-    autoWaitThresholdMs: 2_000,
-    maxRetries: 3,
+    maxWaitMs: 5_000,
+    settleMs: 1_500,
+    autoWaitThresholdMs: 800,
+    maxRetries: 2,
   },
 } as const;
 

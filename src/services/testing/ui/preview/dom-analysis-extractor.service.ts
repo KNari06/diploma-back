@@ -16,6 +16,90 @@ const MAX_TEXT_LENGTH = 100; // Truncate text content
 const MAX_PARENT_CHAIN_LENGTH = 6; // Limit parent chain depth
 const DOM_ANALYSIS_VERSION = '2.0'; // V2: ARIA state, validation, labels, hierarchy
 
+// ═══════════════════════════════════════════════════════════════════════════
+// V8: Visual property helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Convert RGB/RGBA color string to a human-readable named color.
+ * LLM needs "red", "grey", "blue" — not "rgb(220, 53, 69)".
+ */
+function rgbToNamedColor(rgb: string): string | undefined {
+  if (!rgb) return undefined;
+
+  // Parse rgb(r, g, b) or rgba(r, g, b, a)
+  const match = rgb.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (!match) return undefined;
+
+  const r = parseInt(match[1], 10);
+  const g = parseInt(match[2], 10);
+  const b = parseInt(match[3], 10);
+
+  // Map to closest named color (human-recognizable, not CSS named colors)
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const avg = (r + g + b) / 3;
+
+  // White/near-white
+  if (r > 240 && g > 240 && b > 240) return 'white';
+  // Black/near-black
+  if (r < 30 && g < 30 && b < 30) return 'black';
+  // Greys (low saturation)
+  if (max - min < 30 && avg > 30 && avg < 240) return avg > 160 ? 'light-grey' : avg > 80 ? 'grey' : 'dark-grey';
+
+  // Chromatic colors — find dominant channel
+  if (r > g + 40 && r > b + 40) return r > 200 ? 'red' : 'dark-red';
+  if (g > r + 40 && g > b + 40) return g > 200 ? 'green' : 'dark-green';
+  if (b > r + 40 && b > g + 40) return b > 200 ? 'blue' : 'dark-blue';
+
+  // Mixed colors
+  if (r > 200 && g > 200 && b < 100) return 'yellow';
+  if (r > 200 && g > 100 && g < 180 && b < 80) return 'orange';
+  if (r > 150 && b > 150 && g < 100) return 'purple';
+  if (r < 100 && g > 180 && b > 180) return 'teal';
+  if (r > 200 && g < 150 && b > 150) return 'pink';
+
+  return undefined; // Can't classify — omit
+}
+
+/**
+ * Convert border-radius CSS value to a human-readable shape hint.
+ * LLM needs "rounded", "circle", "pill" — not "8px" or "50%".
+ */
+function borderRadiusToShape(
+  borderRadius: string,
+  bounds?: { width: number; height: number }
+): string | undefined {
+  if (!borderRadius || borderRadius === '0px' || /^0(px)?\s/.test(borderRadius)) return undefined;
+
+  // Parse pixel value
+  const pxMatch = borderRadius.match(/^(\d+(?:\.\d+)?)px$/);
+  const percentMatch = borderRadius.match(/^(\d+(?:\.\d+)?)%$/);
+
+  if (percentMatch) {
+    const pct = parseFloat(percentMatch[1]);
+    if (pct >= 50) return 'circle';
+    if (pct >= 20) return 'rounded';
+    return undefined;
+  }
+
+  if (pxMatch) {
+    const px = parseFloat(pxMatch[1]);
+    if (px < 3) return undefined; // Too small to notice
+    if (bounds) {
+      const minDim = Math.min(bounds.width, bounds.height);
+      // If radius >= half the smaller dimension → circle/pill
+      if (px >= minDim / 2) {
+        return bounds.width === bounds.height ? 'circle' : 'pill';
+      }
+    }
+    if (px >= 16) return 'rounded';
+    return 'slightly-rounded';
+  }
+
+  return 'rounded'; // Complex values like "8px 16px 8px 16px"
+}
+
 // Dynamic ID patterns (UUIDs, random strings, timestamps)
 const DYNAMIC_ID_PATTERNS = [
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i, // UUID
@@ -215,6 +299,33 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   }
   if (element.containerTitles && element.containerTitles.length > 0) {
     node.containerTitles = element.containerTitles.map(t => truncateText(t, 50)).filter(Boolean) as string[];
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V8: Visual properties for LLM element matching
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (element.backgroundColor) {
+    node.backgroundColor = rgbToNamedColor(element.backgroundColor);
+  }
+  if (element.textColor) {
+    node.textColor = rgbToNamedColor(element.textColor);
+  }
+  if (element.borderRadius) {
+    node.shapeHint = borderRadiusToShape(element.borderRadius, element.bounds);
+  }
+  if (element.iconClasses) {
+    node.iconClasses = element.iconClasses;
+  }
+  // V8: Semantic size from bounding box dimensions
+  if (element.bounds && element.bounds.width > 0 && element.bounds.height > 0) {
+    const area = element.bounds.width * element.bounds.height;
+    const maxDim = Math.max(element.bounds.width, element.bounds.height);
+    if (maxDim <= 32 || area <= 900) {
+      node.sizeHint = 'small';
+    } else if (maxDim >= 150 || area >= 15000) {
+      node.sizeHint = 'large';
+    }
+    // 'medium' is default — omit to save payload size
   }
 
   return node;
