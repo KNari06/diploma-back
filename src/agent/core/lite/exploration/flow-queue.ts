@@ -30,13 +30,17 @@ const COMPLEXITY_WEIGHT: Record<FlowComplexity, number> = {
   complex: 1,
 };
 
-/** Jaccard threshold for dedup on enqueue */
-const DEDUP_THRESHOLD = 0.7;
+/** Jaccard threshold for dedup on enqueue (goal text similarity) */
+const DEDUP_THRESHOLD = 0.5;
+
+/** Name similarity threshold — catches near-identical names like "Contact Us" vs "Contact Us Form" */
+const NAME_DEDUP_THRESHOLD = 0.6;
 
 export class FlowQueue {
   private queue: EntryPoint[] = [];
   private completed: Set<string> = new Set();
   private allGoals: Map<string, string> = new Map(); // id → goal (for dedup)
+  private allNames: Set<string> = new Set();          // normalized names — dedup across all enqueued+completed
   private mutexPromise: Promise<void> = Promise.resolve();
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -226,6 +230,7 @@ export class FlowQueue {
       queue: [...this.queue],
       completed: Array.from(this.completed),
       allGoals: Array.from(this.allGoals.entries()),
+      allNames: Array.from(this.allNames),
     };
   }
 
@@ -234,6 +239,7 @@ export class FlowQueue {
     q.queue = [...cp.queue];
     for (const id of cp.completed) q.completed.add(id);
     for (const [id, goal] of cp.allGoals) q.allGoals.set(id, goal);
+    for (const name of (cp.allNames ?? [])) q.allNames.add(name);
     return q;
   }
 
@@ -242,13 +248,28 @@ export class FlowQueue {
   // ═══════════════════════════════════════════════════════════════════════
 
   private enqueueSync(entryPoint: EntryPoint, skipSort = false): boolean {
-    // Dedup check: Jaccard similarity on goal text
+    const normalizedName = entryPoint.name.toLowerCase().trim();
+
+    // Dedup check 1: exact name — covers all ever-enqueued (including already dequeued/completed)
+    if (this.allNames.has(normalizedName)) {
+      return false;
+    }
+
+    // Dedup check 2: name similarity — catches "Form Submission" vs "First name Submission"
+    for (const existingName of this.allNames) {
+      if (this.jaccardSimilarity(existingName, normalizedName) >= NAME_DEDUP_THRESHOLD) {
+        return false;
+      }
+    }
+
+    // Dedup check 3: Jaccard similarity on goal text
     for (const [, existingGoal] of this.allGoals) {
       if (this.jaccardSimilarity(existingGoal, entryPoint.goal) >= DEDUP_THRESHOLD) {
         return false;
       }
     }
 
+    this.allNames.add(normalizedName);
     this.allGoals.set(entryPoint.id, entryPoint.goal);
     this.queue.push(entryPoint);
     if (!skipSort) this.sort();

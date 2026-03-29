@@ -51,6 +51,9 @@ export const PREVIEW_SESSION_CONFIG = {
   /** Safety cap for concurrent sessions (memory guard) */
   maxSessions: 20,
 
+  /** V15: Maximum open tabs per preview session (memory guard) */
+  maxTabsPerSession: 8,
+
   /** Viewport dimensions. Override: PREVIEW_VIEWPORT_WIDTH / PREVIEW_VIEWPORT_HEIGHT */
   viewport: {
     width: envNum(process.env.PREVIEW_VIEWPORT_WIDTH, 1280),

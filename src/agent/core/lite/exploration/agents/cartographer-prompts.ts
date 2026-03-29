@@ -41,6 +41,8 @@ RULES:
 - Do NOT list pure UI noise: cookie banners, generic chat widget openers, "close modal" buttons
 - Do NOT include duplicate flows
 - Goals must be SPECIFIC — bad: "Use the search", good: "Search for a product by keyword and verify results appear"
+- ONE goal per entry point — do NOT combine multiple scenarios into one entry point. Bad: "validate positive AND negative login". Good: separate entry points for "Login with valid credentials" and "Attempt login with invalid credentials and verify error"
+- Entry point names must be descriptive and unique — avoid generic names like "Form Submission" or "CTA: Submit". Use the page context: "Contact Form Submission", "Registration Form", "Newsletter Signup"
 - Set recommendDeeper: true if the page has multiple unexplored sections, tabs, or sub-navigation
 - Consider the exploration context — avoid duplicating what's already been discovered on other pages
 

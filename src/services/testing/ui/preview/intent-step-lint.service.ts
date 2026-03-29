@@ -437,7 +437,7 @@ export class IntentStepLintService {
       const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions — page-level steps that don't target a specific DOM element
-      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -730,7 +730,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,

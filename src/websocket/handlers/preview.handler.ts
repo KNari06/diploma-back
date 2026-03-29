@@ -67,6 +67,15 @@ function emitRecordingStep(
   try {
     sessionService.stampInterStepDelay(previewSessionId, userId, payload.step);
   } catch { /* non-critical — don't break recording */ }
+
+  // V15: Stamp tabIndex on every recording step so run mode knows which tab to target
+  try {
+    const session = sessionService.getSession(previewSessionId);
+    if (session && payload.step && payload.step.tabIndex === undefined) {
+      payload.step.tabIndex = session.activeTabIndex;
+    }
+  } catch { /* non-critical */ }
+
   socket.nsp.to(room).emit('preview:recording:step', {
     previewSessionId,
     ...payload,
@@ -312,6 +321,18 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
     // Start DevTools collectors (console/network push)
     devtoolsRegistry.start(previewSessionId, room, page, nsp);
 
+    // V15: Emit initial tab list so frontend can render tab bar
+    try {
+      const tabsInfo = sessionService.getTabsInfo(previewSessionId, userId);
+      const session = sessionService.getSession(previewSessionId);
+      nsp.to(room).emit('preview:tab:list', {
+        previewSessionId,
+        tabs: tabsInfo,
+        activeTabIndex: session?.activeTabIndex ?? 0,
+        timestamp: new Date().toISOString(),
+      });
+    } catch { /* non-critical */ }
+
     // Start DOM update interval (emit preview:page only on change)
     const domInterval = setInterval(async () => {
       if (!acquireDomTickGuard(previewSessionId, activeDomUpdateTicks)) {
@@ -376,6 +397,29 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           devtoolsRegistry.start(previewSessionId, room, newPage, nsp);
 
           logger.info('[PREVIEW_STREAM] Streams restarted after page switch', { previewSessionId });
+
+          // V15: If recording, emit switch_tab step automatically
+          try {
+            const session = sessionService.getSession(previewSessionId);
+            if (session?.recording) {
+              const newTabIndex = session.activeTabIndex;
+              nsp.to(room).emit('preview:recording:step', {
+                previewSessionId,
+                step: {
+                  id: `auto-switch-tab-${Date.now()}`,
+                  type: 'switch_tab',
+                  description: `Switch to tab ${newTabIndex}`,
+                  value: String(newTabIndex),
+                  tabIndex: newTabIndex,
+                  evidence: {
+                    pageUrl: newPage.url(),
+                    tabIndex: newTabIndex,
+                  },
+                },
+                timestamp: new Date().toISOString(),
+              });
+            }
+          } catch { /* non-critical */ }
 
           // V11: Force-emit a fresh DOM snapshot after page switch.
           // DOM tick may have been blocked by pageSwitchInProgress, so we need to send
@@ -2545,6 +2589,77 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (data.previewSessionId) {
         emitPageActionResult(socket, data.previewSessionId, 'forward', false, 'Internal error');
       }
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V15: Multi-tab — switch active tab
+  // ═══════════════════════════════════════════════════════════════════════════
+  socket.on('preview:tab:switch', async (data: { previewSessionId?: string; tabIndex?: number }) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) return;
+
+      const tabIndex = data.tabIndex;
+      if (tabIndex === undefined || tabIndex === null || typeof tabIndex !== 'number') {
+        socket.emit('preview:tab:switched', {
+          previewSessionId,
+          tabs: [],
+          activeTabIndex: 0,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      logger.info('[WebSocket] Tab switch requested', { previewSessionId, tabIndex, userId: ensuredUserId });
+
+      const { getPreviewSessionService: getSessionSvc } = await import('@/services/testing/ui/preview');
+      const sessionService = getSessionSvc();
+      const switched = await sessionService.switchTab(previewSessionId, ensuredUserId, tabIndex);
+
+      if (!switched) {
+        logger.warn('[WebSocket] Tab switch failed', { previewSessionId, tabIndex });
+      }
+
+      // Emit tab list regardless (so frontend stays in sync)
+      const tabsInfo = sessionService.getTabsInfo(previewSessionId, ensuredUserId);
+      const session = sessionService.getSession(previewSessionId);
+
+      socket.emit('preview:tab:switched', {
+        previewSessionId,
+        tabs: tabsInfo,
+        activeTabIndex: session?.activeTabIndex ?? 0,
+        timestamp: new Date().toISOString(),
+      });
+
+      // If recording and switched successfully, emit a switch_tab recording step
+      if (switched && session?.recording) {
+        const newPage = sessionService.getPage(previewSessionId, ensuredUserId);
+        const newUrl = newPage?.url() || '';
+        socket.emit('preview:recording:step', {
+          previewSessionId,
+          step: {
+            id: `switch-tab-${Date.now()}`,
+            type: 'switch_tab',
+            description: `Switch to tab ${tabIndex}`,
+            value: String(tabIndex),
+            tabIndex,
+            evidence: {
+              pageUrl: newUrl,
+              tabIndex,
+            },
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:tab:switch', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   });
 

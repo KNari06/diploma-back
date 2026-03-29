@@ -621,6 +621,7 @@ export interface QueueCheckpoint {
   queue: EntryPoint[];
   completed: string[];
   allGoals: Array<[string, string]>;
+  allNames?: string[]; // normalized names for dedup — optional for backward compat
 }
 
 export interface FlowRunnerCheckpoint {

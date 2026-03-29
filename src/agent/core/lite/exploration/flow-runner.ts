@@ -271,10 +271,10 @@ export class FlowRunner {
       results.push(task);
       this.flowsCompleted++;
 
-      // Mark as completed for dependency tracking
-      if (task.goalAchieved) {
-        queue.markCompleted(entryPoint.id);
-      }
+      // Mark as completed for dependency tracking — always, even on failure/blocked.
+      // A failed auth flow should not deadlock all auth-gated flows forever;
+      // dependents will run (and likely fail on their own if auth is truly needed).
+      queue.markCompleted(entryPoint.id);
 
       // Enqueue newly discovered branch points
       for (const branch of task.branchPoints) {

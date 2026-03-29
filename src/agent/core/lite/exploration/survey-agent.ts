@@ -29,10 +29,7 @@ import type { ExplorationConfig, EntryPoint, NavigationAction, TestFlowCategory,
 import { ExplorationTree } from './exploration-tree';
 import { BudgetTracker } from './budget-tracker';
 import { RateLimiter } from './rate-limiter';
-import {
-  buildPageClassificationPrompt,
-  parsePageClassificationResponse,
-} from './prompts';
+import { parsePageClassificationResponse } from './prompts';
 import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser';
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Cartographer } from './agents/cartographer';
@@ -43,9 +40,6 @@ const MAX_NAV_LINKS_PER_PAGE = 15;
 
 /** Timeout for page navigation (ms) */
 const NAV_TIMEOUT_MS = 30_000;
-
-/** Timeout for AI classification call (ms) */
-const AI_TIMEOUT_MS = 20_000;
 
 /** Max fallback entry points when AI returns 0 (raised from 8 for form-heavy pages) */
 const MAX_FALLBACK_ENTRY_POINTS = 20;
@@ -300,6 +294,9 @@ export class SurveyAgent {
       navAction: null,
     }];
 
+    // Track URLs already in queue to prevent duplicate enqueue before they are visited
+    const enqueuedUrls: Set<string> = new Set([this.page.url()]);
+
     while (queue.length > 0 && this.budget.canSurveyMorePages()) {
       const item = queue.shift()!;
 
@@ -465,7 +462,10 @@ export class SurveyAgent {
       this.trace?.writePageSnapshot({
         url: item.url,
         elementCount: snapshot.elements.length,
-        interactiveCount: snapshot.elements.filter(e => ['textbox', 'button', 'link', 'checkbox', 'combobox'].includes(e.role)).length,
+        interactiveCount: snapshot.elements.filter(e =>
+          ['textbox', 'button', 'link', 'checkbox', 'combobox', 'radio', 'menuitem', 'tab', 'switch', 'slider', 'spinbutton'].includes(e.role) ||
+          ['input', 'textarea', 'select', 'a', 'button'].includes(e.tag),
+        ).length,
         hasScreenshot: false, // updated below
       });
 
@@ -609,7 +609,8 @@ export class SurveyAgent {
         for (const link of navLinks) {
           // Resolve link URL from element ref
           const linkUrl = await this.resolveLinkUrl(link.ref, snapshot);
-          if (linkUrl && !this.tree.isVisited(linkUrl) && this.isSameOrigin(linkUrl)) {
+          if (linkUrl && !this.tree.isVisited(linkUrl) && !enqueuedUrls.has(linkUrl) && this.isSameOrigin(linkUrl)) {
+            enqueuedUrls.add(linkUrl);
             queue.push({
               url: linkUrl,
               depth: item.depth + 1,
@@ -641,7 +642,8 @@ export class SurveyAgent {
 
         const allHiddenLinks = [...hiddenDomLinks, ...hiddenNavLinks].slice(0, MAX_NAV_LINKS_PER_PAGE);
         for (const link of allHiddenLinks) {
-          if (!this.tree.isVisited(link.url) && this.isSameOrigin(link.url)) {
+          if (!this.tree.isVisited(link.url) && !enqueuedUrls.has(link.url) && this.isSameOrigin(link.url)) {
+            enqueuedUrls.add(link.url);
             queue.push({
               url: link.url,
               depth: item.depth + 1,
@@ -652,7 +654,7 @@ export class SurveyAgent {
         }
 
         // SPA navigation: click elements that may trigger client-side route changes
-        await this.discoverSpaRoutes(snapshot, queue, item, nodeId);
+        await this.discoverSpaRoutes(snapshot, queue, item, nodeId, enqueuedUrls);
       }
     }
   }
@@ -843,8 +845,7 @@ export class SurveyAgent {
 
   /**
    * Classify a page using the Cartographer agent.
-   * Returns the same format as the legacy classifyPage() for backward compatibility.
-   * Falls back to legacy classifyPage() if Cartographer returns empty.
+   * Falls back to heuristic buildFallbackEntryPoints() if Cartographer returns empty.
    */
   private async classifyWithCartographer(
     formattedSnapshot: string,
@@ -968,194 +969,6 @@ export class SurveyAgent {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // LEGACY AI CLASSIFICATION (kept as fallback)
-  // ═══════════════════════════════════════════════════════════════════════
-
-  private async classifyPage(
-    formattedSnapshot: string,
-    screenshotBase64: string | undefined,
-    url: string,
-    title: string,
-    depth: number,
-    snapshot?: LiteSnapshot,
-    overlaySummary?: string,
-    pageHealth?: string,
-  ): Promise<ReturnType<typeof parsePageClassificationResponse>> {
-    // Early exit if AI is degraded — use heuristic fallback
-    if (this.rateLimiter.isDegraded('openai')) {
-      logger.info('[SURVEY] AI degraded, using heuristic fallback', { url });
-      const fallbackEntryPoints = snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [];
-      this.trace?.writePageClassificationFallback({
-        url,
-        reason: 'ai_degraded',
-        entryPointCount: fallbackEntryPoints.length,
-      });
-      return {
-        pageType: this.inferPageTypeFromUrl(url),
-        entryPoints: fallbackEntryPoints,
-        navigationLinks: [],
-      };
-    }
-
-    const structureSummary = snapshot ? this.buildPageStructureSummary(snapshot) : undefined;
-
-    const prompt = buildPageClassificationPrompt({
-      formattedSnapshot,
-      url,
-      title,
-      scopeHint: this.config.scopeHint,
-      hasCredentials: !!this.config.credentials,
-      depth,
-      structureSummary,
-      overlaySummary,
-      pageHealth,
-    });
-
-    try {
-      // Build messages with optional vision
-      const userContent: any[] = [{ type: 'text', text: prompt }];
-
-      if (screenshotBase64) {
-        userContent.push({
-          type: 'image_url',
-          image_url: {
-            url: `data:image/png;base64,${screenshotBase64}`,
-            detail: 'low', // 'low' is sufficient for page-level classification
-          },
-        });
-      }
-
-      await this.rateLimiter.acquireSlot('ai');
-
-      const systemPrompt = 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.';
-
-      this.trace?.writePageClassificationPrompt({
-        url,
-        model: AI_MODELS.vision,
-        systemPrompt,
-        userPrompt: typeof prompt === 'string' ? prompt : '[multimodal content with screenshot]',
-        hasScreenshot: !!screenshotBase64,
-      });
-
-      const aiStartTime = Date.now();
-
-      const response = await Promise.race([
-        getChatCompletionWithMessages(
-          [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userContent },
-          ],
-          {
-            model: AI_MODELS.vision,
-            temperature: 0.2,
-            max_tokens: 2000,
-            response_format: { type: 'json_object' },
-          },
-        ),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('AI classification timeout')), AI_TIMEOUT_MS),
-        ),
-      ]);
-
-      this.rateLimiter.recordSuccess('openai');
-      const classification = parsePageClassificationResponse(response.content);
-
-      this.trace?.writePageClassificationResponse({
-        url,
-        model: AI_MODELS.vision,
-        rawResponse: response.content,
-        parsed: {
-          pageType: classification.pageType,
-          entryPointCount: classification.entryPoints.length,
-          navLinkCount: classification.navigationLinks.length,
-        },
-        latencyMs: Date.now() - aiStartTime,
-        tokensUsed: response.usage?.totalTokens,
-      });
-
-      // Fallback: if AI returned 0 entry points, use heuristic discovery
-      if (classification.entryPoints.length === 0 && snapshot) {
-        classification.entryPoints = this.buildFallbackEntryPoints(snapshot, url);
-        if (classification.entryPoints.length > 0) {
-          this.trace?.writePageClassificationFallback({
-            url,
-            reason: 'ai_returned_zero_entry_points',
-            entryPointCount: classification.entryPoints.length,
-          });
-          logger.info('[SURVEY] AI returned 0 entry points, using heuristic fallback', {
-            url,
-            fallbackCount: classification.entryPoints.length,
-          });
-        }
-      }
-
-      return classification;
-    } catch (error) {
-      // Handle rate-limit errors with backoff + retry
-      if (RateLimiter.isRateLimitError(error as Error)) {
-        const result = await this.rateLimiter.recordFailure('openai', error as Error);
-        if (result.shouldRetry) {
-          try {
-            await this.rateLimiter.acquireSlot('ai');
-            const retryContent: any[] = [{ type: 'text', text: prompt }];
-            if (screenshotBase64) {
-              retryContent.push({
-                type: 'image_url',
-                image_url: { url: `data:image/png;base64,${screenshotBase64}`, detail: 'low' },
-              });
-            }
-            const response = await Promise.race([
-              getChatCompletionWithMessages(
-                [
-                  {
-                    role: 'system',
-                    content: 'You are a QA test discovery agent. Analyze pages and identify all testable user flows. Respond with valid JSON only.',
-                  },
-                  {
-                    role: 'user',
-                    content: retryContent,
-                  },
-                ],
-                {
-                  model: AI_MODELS.vision,
-                  temperature: 0.2,
-                  max_tokens: 2000,
-                  response_format: { type: 'json_object' },
-                },
-              ),
-              new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('AI classification timeout')), AI_TIMEOUT_MS),
-              ),
-            ]);
-            this.rateLimiter.recordSuccess('openai');
-            return parsePageClassificationResponse(response.content);
-          } catch {
-            // Fall through to heuristic fallback
-          }
-        }
-      }
-
-      logger.warn('[SURVEY] AI classification failed, using heuristic fallback', {
-        url,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      // Fallback: return page type + heuristic entry points
-      const fallbackEntryPoints = snapshot ? this.buildFallbackEntryPoints(snapshot, url) : [];
-      this.trace?.writePageClassificationFallback({
-        url,
-        reason: `ai_error: ${error instanceof Error ? error.message : String(error)}`,
-        entryPointCount: fallbackEntryPoints.length,
-      });
-      return {
-        pageType: this.inferPageTypeFromUrl(url),
-        entryPoints: fallbackEntryPoints,
-        navigationLinks: [],
-      };
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════════════════
   // HELPERS
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -1266,6 +1079,7 @@ export class SurveyAgent {
     queue: Array<{ url: string; depth: number; parentNodeId: string | null; navAction: NavigationAction | null }>,
     item: { url: string; depth: number },
     nodeId: string,
+    enqueuedUrls?: Set<string>,
   ): Promise<void> {
     const spaElements = this.findSpaRouteElements(snapshot);
     if (spaElements.length === 0) return;
@@ -1293,7 +1107,8 @@ export class SurveyAgent {
         // Case 1: URL changed (including hash changes like #/route) → queue for BFS, go back
         if (urlAfter !== urlBefore) {
           this.rateLimiter.recordSuccess('target_site');
-          if (!this.tree.isVisited(urlAfter) && this.isSameOrigin(urlAfter)) {
+          if (!this.tree.isVisited(urlAfter) && !enqueuedUrls?.has(urlAfter) && this.isSameOrigin(urlAfter)) {
+            enqueuedUrls?.add(urlAfter);
             queue.push({
               url: urlAfter,
               depth: item.depth + 1,
@@ -1730,47 +1545,6 @@ export class SurveyAgent {
   // STRUCTURED SUMMARY (for AI prompt optimization)
   // ═══════════════════════════════════════════════════════════════════════
 
-  /**
-   * Build a concise structured summary of page elements for AI classification.
-   * Reduces token usage and improves discovery quality.
-   */
-  private buildPageStructureSummary(snapshot: LiteSnapshot): string {
-    const elements = snapshot.elements;
-    const links = elements.filter(el => el.tag === 'a' && el.href);
-    const buttons = elements.filter(el => el.tag === 'button' || el.role === 'button');
-    const inputs = elements.filter(el => ['input', 'textarea', 'select'].includes(el.tag));
-    const forms = elements.filter(el => el.tag === 'form');
-
-    const sections: string[] = [];
-
-    if (links.length > 0) {
-      sections.push(`LINKS (${links.length}):\n  ${links.slice(0, 25).map(l =>
-        `[${l.ref}] "${l.name}" → ${l.href}`).join('\n  ')}`);
-    }
-    if (buttons.length > 0) {
-      sections.push(`BUTTONS (${buttons.length}): ${buttons.slice(0, 15).map(b =>
-        `[${b.ref}] "${b.name}"`).join(', ')}`);
-    }
-    if (inputs.length > 0) {
-      sections.push(`INPUTS (${inputs.length}): ${inputs.slice(0, 15).map(i =>
-        `[${i.ref}] ${i.tag}${i.type ? `[${i.type}]` : ''} "${i.name || i.placeholder || ''}"`).join(', ')}`);
-    }
-    if (forms.length > 0) {
-      sections.push(`FORMS (${forms.length}): ${forms.slice(0, 5).map(f =>
-        `[${f.ref}] "${f.name}"`).join(', ')}`);
-    }
-
-    // Overlay/obstacle info from snapshot (feeds AI even when overlay cleanup is skipped)
-    if (snapshot.obstacleFacts && snapshot.obstacleFacts.length > 0) {
-      const overlayLines = snapshot.obstacleFacts.slice(0, 8).map(f =>
-        `[${f.ref}] ${f.hintType || 'unknown'} z=${f.zIndex} coverage=${(f.coverage * 100).toFixed(1)}% "${(f.textPreview || '').slice(0, 60)}"`,
-      );
-      sections.push(`POSITIONED OVERLAYS (${snapshot.obstacleFacts.length}):\n  ${overlayLines.join('\n  ')}`);
-    }
-
-    return sections.join('\n');
-  }
-
   // ═══════════════════════════════════════════════════════════════════════
   // FALLBACK ENTRY POINTS (when AI returns 0)
   // ═══════════════════════════════════════════════════════════════════════
@@ -1849,9 +1623,18 @@ export class SurveyAgent {
     if (passwordInputs.length === 0 && inputs.length >= 2) {
       const formInputs = inputs.filter(el => el.type !== 'hidden' && el.type !== 'search');
       if (formInputs.length > 0) {
+        // Derive name from submit button or first input context
+        const formSubmitBtn = buttons.find(b => /submit|send|save|create|add|register|sign\s*up/i.test(b.name || ''));
+        const btnLabel = (formSubmitBtn?.name || '').trim();
+        const fieldLabel = formInputs[0]?.name || formInputs[0]?.placeholder || '';
+        const derivedFormName = btnLabel && !/submit/i.test(btnLabel)
+          ? btnLabel
+          : fieldLabel
+            ? `${fieldLabel} Submission`
+            : 'Form Submission';
         entryPoints.push({
-          name: 'Form Submission',
-          goal: 'Fill out and submit the form on the page',
+          name: derivedFormName,
+          goal: `Fill out and submit the form on the page (fields: ${formInputs.slice(0, 3).map(el => el.name || el.placeholder || el.type).filter(Boolean).join(', ') || 'required fields'})`,
           category: 'form_submission',
           priority: 'high',
           requiresAuth: false,
@@ -1871,8 +1654,8 @@ export class SurveyAgent {
     for (const cta of ctaButtons.slice(0, 2)) {
       if (entryPoints.length >= MAX_FALLBACK_ENTRY_POINTS) break;
       entryPoints.push({
-        name: `CTA: ${cta.name}`,
-        goal: `Click "${cta.name}" and complete the resulting flow`,
+        name: `${cta.name}`,
+        goal: `Click the "${cta.name}" button and complete the resulting flow`,
         category: 'other',
         priority: 'medium',
         requiresAuth: false,

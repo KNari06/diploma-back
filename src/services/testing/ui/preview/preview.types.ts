@@ -138,6 +138,20 @@ export interface InteractiveNode {
 }
 
 /**
+ * V15: Tab info for multi-tab preview support
+ */
+export interface PreviewTabInfo {
+  /** Tab index (0 = initial page, 1+ = popups) */
+  tabIndex: number;
+  /** Current URL of the tab */
+  url: string;
+  /** Page title */
+  title?: string;
+  /** Whether this tab is currently active */
+  isActive: boolean;
+}
+
+/**
  * DOM analysis structure stored in intelligent_page_visits.dom_analysis
  */
 export interface DomAnalysisData {
@@ -191,7 +205,9 @@ export type IntentActionType =
   // V13: Native browser dialog (alert/confirm/prompt/beforeunload)
   | 'dialog'
   // V13: File download verification (auto-recorded when download triggers)
-  | 'download';
+  | 'download'
+  // V15: Multi-tab support — explicit tab switch
+  | 'switch_tab';
 
 /**
  * Binding hints for element resolution
@@ -264,6 +280,8 @@ export interface StepEvidence {
    * the page likely needs at least ~2s to be ready.
    */
   interStepDelayMs?: number;
+  /** V15: Tab index where evidence was captured (multi-tab support) */
+  tabIndex?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -533,6 +551,8 @@ export interface IntentStep {
   expectedOutcome?: ExpectedStepOutcome;
   /** True if this step was auto-injected (e.g., auto wait_for URL change). Soft failure — won't fail the test. */
   isAutoInjected?: boolean;
+  /** V15: Tab index this step targets (0 = initial tab, 1+ = popups). Omit or 0 for single-tab backward compat. */
+  tabIndex?: number;
 }
 
 /**

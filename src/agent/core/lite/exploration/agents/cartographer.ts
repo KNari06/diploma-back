@@ -239,8 +239,13 @@ export class Cartographer {
     if (textInputs.length >= 2 && submitButtons.length > 0 && !hasPasswordField) {
       const submitBtn = submitButtons[0];
       const fieldNames = textInputs.slice(0, 3).map(el => el.name || el.placeholder || el.type).filter(Boolean);
+      // Derive a meaningful name from the submit button text or page context
+      const btnLabel = (submitBtn.name || '').trim();
+      const formName = /submit/i.test(btnLabel) || !btnLabel
+        ? `${fieldNames[0] || 'Form'} Submission`
+        : btnLabel;
       entryPoints.push({
-        name: 'Form Submission',
+        name: formName,
         goal: `Fill in the form fields (${fieldNames.join(', ') || 'required fields'}) with valid test data and click "${submitBtn.name || 'submit'}" to submit`,
         category: 'form_submission',
         priority: 'high',

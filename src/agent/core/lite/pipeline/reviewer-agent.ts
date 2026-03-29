@@ -526,14 +526,37 @@ export class ReviewerAgent {
   }
 
   /**
-   * Safe default: never block the pipeline.
-   * If Reviewer fails, allow execution to continue.
+   * Smart fallback when AI reviewer fails.
+   * Uses deterministic heuristics instead of blindly returning "continue".
    */
   private static safeDefault(blackboard: TestBlackboard): ReviewResult {
+    const progressScore = blackboard.getProgressScore();
+    const totalRounds = blackboard.getRounds().length;
+
+    // High progress — likely done, let executor verify
+    if (progressScore >= 80) {
+      return {
+        verdict: 'continue',
+        reason: `Reviewer fallback: high progress (${progressScore}%), executor should verify`,
+        goalAlignment: progressScore / 100,
+      };
+    }
+
+    // Too many rounds with low progress — stuck, replan
+    if (totalRounds >= 8 && progressScore < 30) {
+      return {
+        verdict: 'replan',
+        reason: `Reviewer fallback: ${totalRounds} rounds but only ${progressScore}% progress — likely stuck`,
+        goalAlignment: progressScore / 100,
+        guidance: 'The current approach is not making progress. Try a different strategy.',
+      };
+    }
+
+    // Default: continue but with reduced alignment to signal caution
     return {
       verdict: 'continue',
-      reason: 'Reviewer defaulted to continue',
-      goalAlignment: blackboard.getProgressScore() / 100,
+      reason: `Reviewer fallback: continuing (${progressScore}% progress, round ${totalRounds})`,
+      goalAlignment: progressScore / 100,
     };
   }
 

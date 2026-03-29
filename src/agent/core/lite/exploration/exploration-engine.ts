@@ -376,6 +376,13 @@ export class ExplorationEngine {
 
       if (bb.queue && !bb.queue.isEmpty()) {
         const extraFlowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace, bb);
+        // Pass accumulated flow names from Phase 2 so Scout knows what's already been tested
+        extraFlowRunner.restoreFromCheckpoint({
+          loginCompleted: flowRunner.isLoginCompleted(),
+          knownFlowNames: flowRunner.getKnownFlowNames(),
+          flowsCompleted: flowTasks.length,
+          completedTasks: flowTasks,
+        });
         try {
           const extraTasks = await extraFlowRunner.runAll(bb.queue);
           flowTasks = [...flowTasks, ...extraTasks];

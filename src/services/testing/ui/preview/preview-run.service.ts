@@ -24,8 +24,12 @@ import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 
-/** Maximum wall-clock time for an entire run (all steps). Prevents infinite hangs. */
-const GLOBAL_RUN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+/** Base timeout for run setup (navigation, init). */
+const BASE_RUN_TIMEOUT_MS = 60 * 1000; // 1 minute for setup
+/** Per-step timeout budget. Total = BASE + (steps × PER_STEP). */
+const PER_STEP_TIMEOUT_MS = 15 * 1000; // 15 seconds per step
+/** Absolute maximum regardless of step count. */
+const MAX_RUN_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes hard cap
 
 /** Maximum time for cleanup operations (batch persist, trace close) in finally block. */
 const CLEANUP_TIMEOUT_MS = 10_000; // 10 seconds
@@ -104,7 +108,7 @@ async function attemptLLMDiagnosisAndRetry(params: {
   const { page, step, error, previewSessionId, userId, stepWithCachePolicy, runStartTime, signal } = params;
 
   const elapsedTotal = Date.now() - runStartTime;
-  if (signal.aborted || elapsedTotal >= GLOBAL_RUN_TIMEOUT_MS - 15000) {
+  if (signal.aborted || elapsedTotal >= MAX_RUN_TIMEOUT_MS - 15000) {
     return { result: null, diagnosed: false, diagnosis: undefined };
   }
 
@@ -225,7 +229,7 @@ function augmentErrorWithPageContext(error: string, pageSummary: PageSummary | n
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'wait_for_email', 'dialog', 'download']);
+const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'wait_for_email', 'dialog', 'download', 'switch_tab']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;
@@ -475,17 +479,27 @@ export class PreviewRunService {
     });
     const rootSpanId = traceWriter.getRootSpanId();
 
-    // Global run timeout — cancels run if total wall-clock exceeds limit
+    // Dynamic timeout: scales with step count, capped at MAX_RUN_TIMEOUT_MS
+    // 5 steps → 1min + 75s = ~2.25 min
+    // 20 steps → 1min + 300s = ~6 min
+    // 50 steps → 1min + 750s = ~13.5 min
+    // 100 steps → capped at 15 min
+    const dynamicTimeoutMs = Math.min(
+      BASE_RUN_TIMEOUT_MS + (steps.length * PER_STEP_TIMEOUT_MS),
+      MAX_RUN_TIMEOUT_MS,
+    );
+
     const globalTimeout = setTimeout(() => {
       timedOut = true;
       runState.cancelled = true;
       runState.abortController.abort();
       logger.error('[PreviewRun] Global timeout exceeded, forcing cancellation', {
         previewSessionId,
-        timeoutMs: GLOBAL_RUN_TIMEOUT_MS,
+        timeoutMs: dynamicTimeoutMs,
+        totalSteps: steps.length,
         currentStepIndex: runState.currentStepIndex,
       });
-    }, GLOBAL_RUN_TIMEOUT_MS);
+    }, dynamicTimeoutMs);
 
     try {
       // 4. Get session page
@@ -567,8 +581,10 @@ export class PreviewRunService {
       // Allow other events (cancel/isRunning) to observe activeRuns state.
       await new Promise<void>((resolve) => setImmediate(resolve));
 
-      // Track URL for evidence shortcut policy (V7)
-      let trackedUrl = session.page.url();
+      // V15: Per-tab URL tracking for evidence shortcut policy
+      const trackedUrls = new Map<number, string>();
+      trackedUrls.set(session.activeTabIndex, session.page.url());
+      let trackedUrl = session.page.url(); // Backward compat alias for current tab
       // Track page summary after navigation for better error context
       let lastNavigationSummary: PageSummary | null = null;
 
@@ -705,10 +721,11 @@ export class PreviewRunService {
           break;
         }
 
-        // V7: URL-based evidence policy instead of blanket disableCaching
-        // If URL hasn't changed since last step, allow evidence shortcut
+        // V7+V15: URL-based evidence policy — per-tab URL tracking
         const currentUrl = session.page.url();
-        const urlChanged = currentUrl !== trackedUrl;
+        const tabTrackedUrl = trackedUrls.get(session.activeTabIndex) || '';
+        trackedUrl = tabTrackedUrl; // Update alias for logging/diagnosis
+        const urlChanged = currentUrl !== tabTrackedUrl;
         const disableCaching = urlChanged;
 
         logger.debug('[PreviewRun] Evidence policy check', {
@@ -881,6 +898,7 @@ export class PreviewRunService {
 
             // Update tracked URL after successful step execution
             trackedUrl = session.page.url();
+            trackedUrls.set(session.activeTabIndex, trackedUrl);
 
             // Collect page summary after navigation for better error context on subsequent failures
             if (step.type === 'navigate' || result.urlChanged) {

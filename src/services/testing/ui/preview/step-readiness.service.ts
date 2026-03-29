@@ -94,6 +94,7 @@ const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
   'wait_for_email',  // V12: Email inbox polling (no element target)
   'dialog',          // V14: Pre-installs handler, no element target
   'download',        // V14: Waits for download event, no element target
+  'switch_tab',      // V15: Tab switch, no element target
 ]);
 
 /**
