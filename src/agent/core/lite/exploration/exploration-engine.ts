@@ -203,6 +203,18 @@ export class ExplorationEngine {
 
     // Build queue from Strategist output (AI-driven order, not static formula)
     bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy);
+    bb.queue.setDedupTrace((data) => trace.writeQueueDedup(data));
+
+    // Log the full queue order for debugging prioritization
+    trace.writeQueueOrder({
+      source: bb.currentStrategy.plan.length > 0 ? 'strategy' : 'fallback',
+      flows: bb.queue.remaining().map((ep) => ({
+        id: ep.id,
+        name: ep.name,
+        category: ep.category,
+        priority: ep.priority,
+      })),
+    });
 
     this.emitProgress('strategizing', 'strategy_planned', {
       totalFlowsPlanned: bb.currentStrategy.plan.length,
@@ -516,6 +528,7 @@ export class ExplorationEngine {
       }
 
       const queue = FlowQueue.fromEntryPoints(allEntryPoints);
+      queue.setDedupTrace((data) => trace.writeQueueDedup(data));
       trace.writePhaseStart('flow');
       const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
 
@@ -567,6 +580,7 @@ export class ExplorationEngine {
     const queue = checkpoint.queue
       ? FlowQueue.fromCheckpoint(checkpoint.queue)
       : FlowQueue.fromEntryPoints(allEntryPoints);
+    queue.setDedupTrace((data) => trace.writeQueueDedup(data));
 
     const previousTasks = checkpoint.flowRunner?.completedTasks || [];
     trace.writePhaseStart('flow');

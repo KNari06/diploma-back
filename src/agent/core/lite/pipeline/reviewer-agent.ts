@@ -30,7 +30,7 @@
 
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
-import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { getChatCompletionWithMessages, type OpenAIResponse } from '@/services/ai/core/openai.service';
 import { buildSnapshotSummary } from '../analysis/ai-goal-evaluator';
 import type { GoalDetector } from '../analysis/goal-detector';
 import type { GoalContext, StuckCheck } from '../lite-types';
@@ -44,6 +44,12 @@ const REVIEWER_CONFIG = {
   temperature: 0.1,
   maxTokens: 300,
   timeoutMs: 8000,
+  /** Max retry attempts on transient AI failures (rate limit, network) */
+  maxRetries: 2,
+  /** Base delay between retries in ms (actual = base + attempt * increment) */
+  retryBaseDelayMs: 1000,
+  /** Delay increment per retry attempt in ms */
+  retryIncrementMs: 500,
   /** Progress score threshold for fast-approve (continue) */
   progressThresholdContinue: 30,
   /** Progress score threshold for fast-approve (done) */
@@ -445,27 +451,47 @@ export class ReviewerAgent {
     const llmStart = Date.now();
 
     try {
-      const aiPromise = getChatCompletionWithMessages(
-        [{ role: 'user', content: prompt }],
-        {
-          model: AI_TASK_MODELS.chatReviewer,
-          temperature: REVIEWER_CONFIG.temperature,
-          max_tokens: REVIEWER_CONFIG.maxTokens,
-          response_format: { type: 'json_object' },
+      // Retry loop with backoff (handles transient rate limits / network errors)
+      let result: OpenAIResponse | null = null;
+      let lastError: string | undefined;
+
+      for (let attempt = 0; attempt < REVIEWER_CONFIG.maxRetries; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, REVIEWER_CONFIG.retryBaseDelayMs + attempt * REVIEWER_CONFIG.retryIncrementMs));
         }
-      );
 
-      const timeoutPromise = new Promise<null>((resolve) =>
-        setTimeout(() => resolve(null), REVIEWER_CONFIG.timeoutMs)
-      );
+        try {
+          const aiPromise = getChatCompletionWithMessages(
+            [{ role: 'user', content: prompt }],
+            {
+              model: AI_TASK_MODELS.chatReviewer,
+              temperature: REVIEWER_CONFIG.temperature,
+              max_tokens: REVIEWER_CONFIG.maxTokens,
+              response_format: { type: 'json_object' },
+            }
+          );
 
-      const result = await Promise.race([aiPromise, timeoutPromise]);
+          const timeoutPromise = new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), REVIEWER_CONFIG.timeoutMs)
+          );
+
+          result = await Promise.race([aiPromise, timeoutPromise]);
+          if (result) break; // success
+          lastError = 'timeout';
+        } catch (retryErr) {
+          lastError = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          // Only retry on transient errors (rate limit, network), not on auth/model errors
+          const status = (retryErr as any)?.status;
+          if (status === 401 || status === 403 || status === 404) break;
+        }
+      }
 
       if (!result) {
-        logger.warn('[REVIEWER] AI timeout — defaulting to continue');
+        logger.warn('[REVIEWER] AI failed after retries — defaulting to heuristic', { lastError });
         ReviewerAgent.trace(traceWriter, 'reviewer_ai_timeout', {
           round,
           timeoutMs: REVIEWER_CONFIG.timeoutMs,
+          lastError,
         });
         return ReviewerAgent.safeDefault(blackboard);
       }
@@ -515,10 +541,18 @@ export class ReviewerAgent {
       return review;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      logger.warn('[REVIEWER] AI review error — defaulting to continue', { error: errorMsg });
+      const httpStatus = (error as any)?.status;
+      const errorCode = (error as any)?.code;
+      logger.warn('[REVIEWER] AI review error — defaulting to heuristic', {
+        error: errorMsg,
+        httpStatus,
+        errorCode,
+      });
       ReviewerAgent.trace(traceWriter, 'reviewer_ai_error', {
         round,
         error: errorMsg,
+        httpStatus,
+        errorCode,
         latencyMs: Date.now() - llmStart,
       });
       return ReviewerAgent.safeDefault(blackboard);

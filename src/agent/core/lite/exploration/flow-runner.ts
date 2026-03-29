@@ -187,6 +187,12 @@ export class FlowRunner {
           name: entryPoint.name,
           category: entryPoint.category,
           priority: entryPoint.priority,
+          budget: {
+            flowsRemaining: this.budget.remainingFlows(),
+            roundsRemaining: this.budget.remainingPipelineRounds(),
+            allocatedRounds: this.budget.roundsPerFlow(),
+            timeRemainingMs: this.budget.remainingTimeMs(),
+          },
         });
 
         // Acquire semaphore before starting (blocks when at max concurrency)
@@ -540,6 +546,7 @@ export class FlowRunner {
         maxRounds: Math.max(1, allocatedRounds),
         timeoutMs: Math.max(5_000, flowTimeoutMs),
         skipDbCancellationCheck: true, // Exploration uses non-UUID testIds (ep-0, ep-1)
+        entryPointId: entryPoint.id,
       };
 
       this.trace?.writeFlowPipelineStart({

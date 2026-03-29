@@ -162,8 +162,21 @@ export class ExplorationTraceService {
     this.writer.write({
       stage: 'survey',
       eventType: 'page_classification_prompt',
-      payload: data,
+      payload: {
+        ...data,
+        // Avoid logging the same system prompt 10 times — log hash + length instead
+        systemPrompt: `[${data.systemPrompt.length} chars, hash=${this.simpleHash(data.systemPrompt)}]`,
+      },
     });
+  }
+
+  /** Fast non-crypto hash for dedup identification in logs */
+  private simpleHash(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
+    }
+    return (hash >>> 0).toString(36);
   }
 
   writePageClassificationResponse(data: {
@@ -435,7 +448,10 @@ export class ExplorationTraceService {
     this.writer.write({
       stage: 'branch',
       eventType: 'branch_detection_prompt',
-      payload: data,
+      payload: {
+        ...data,
+        systemPrompt: `[${data.systemPrompt.length} chars, hash=${this.simpleHash(data.systemPrompt)}]`,
+      },
     });
   }
 
@@ -470,6 +486,19 @@ export class ExplorationTraceService {
   // QUEUE & BUDGET EVENTS
   // ─────────────────────────────────────────────────────────────────────────
 
+  writeQueueDedup(data: {
+    entryPointName: string;
+    reason: 'exact_name' | 'name_similarity' | 'goal_similarity';
+    matchedAgainst?: string;
+    similarity?: number;
+  }): void {
+    this.writer.write({
+      stage: 'queue',
+      eventType: 'queue_dedup_rejected',
+      payload: data,
+    });
+  }
+
   writeQueueState(data: {
     pendingCount: number;
     completedCount: number;
@@ -482,11 +511,30 @@ export class ExplorationTraceService {
     });
   }
 
+  /** Log the full ordered queue so we can see execution priority */
+  writeQueueOrder(data: {
+    source: 'strategy' | 'fallback' | 'reorder';
+    flows: Array<{ id: string; name: string; category: string; priority: string }>;
+  }): void {
+    this.writer.write({
+      stage: 'queue',
+      eventType: 'queue_order',
+      payload: data,
+    });
+  }
+
   writeQueueDequeue(data: {
     entryPointId: string;
     name: string;
     category: string;
     priority: string;
+    /** Budget snapshot at dequeue time — explains why allocatedRounds may be low */
+    budget?: {
+      flowsRemaining: number;
+      roundsRemaining: number;
+      allocatedRounds: number;
+      timeRemainingMs: number;
+    };
   }): void {
     this.writer.write({
       stage: 'queue',
@@ -532,7 +580,11 @@ export class ExplorationTraceService {
     this.writer.write({
       stage: 'strategy',
       eventType: 'strategist_prompt',
-      payload: data,
+      payload: {
+        ...data,
+        // System prompt is static — log hash + length instead of full text
+        systemPrompt: `[${data.systemPrompt.length} chars, hash=${this.simpleHash(data.systemPrompt)}]`,
+      },
     });
   }
 

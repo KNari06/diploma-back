@@ -37,8 +37,8 @@ import {
   parseStrategistResponse,
 } from './strategist-prompts';
 
-/** Timeout for Strategist AI call */
-const STRATEGIST_TIMEOUT_MS = 20_000;
+/** Timeout for Strategist AI call (45s — strategist processes all entry points + page insights) */
+const STRATEGIST_TIMEOUT_MS = 45_000;
 
 export class ExplorationStrategist {
   constructor(private readonly bb: ExplorationBlackboard) {}

@@ -70,7 +70,7 @@ export class BudgetTracker {
    */
   roundsPerFlow(): number {
     const remaining = this.remainingFlows();
-    if (remaining <= 0) return 0;
+    if (remaining <= 0) return 1; // Always give at least 1 round to any started flow
     const perFlow = Math.floor(this.remainingPipelineRounds() / remaining);
     return Math.max(5, Math.min(10, perFlow));
   }

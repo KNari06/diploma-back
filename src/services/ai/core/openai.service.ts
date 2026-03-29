@@ -214,7 +214,11 @@ export async function getChatCompletionWithMessages(
       type: errorType,
       stack: error instanceof Error ? error.stack : undefined,
     });
-    throw new Error('AI chat failed');
+    // Preserve HTTP status/code for callers to make retry decisions
+    const enrichedError = new Error(`AI chat failed: ${errorMessage}`);
+    (enrichedError as any).status = errorStatus;
+    (enrichedError as any).code = errorCode;
+    throw enrichedError;
   }
 }
 

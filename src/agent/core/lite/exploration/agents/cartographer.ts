@@ -35,7 +35,13 @@ import {
 /** Timeout for Cartographer AI call */
 const CARTOGRAPHER_TIMEOUT_MS = 25_000;
 
+/** Min interactive elements to justify a retry when AI returns empty */
+const RETRY_MIN_INTERACTIVE_ELEMENTS = 5;
+
 export class Cartographer {
+  /** Track URLs already retried to prevent infinite retry loops */
+  private retriedUrls = new Set<string>();
+
   constructor(
     private readonly rateLimiter: RateLimiter,
     private readonly trace?: ExplorationTraceService,
@@ -63,6 +69,7 @@ export class Cartographer {
 
     // Build prompt with pre-formatted snapshot (avoids double formatting)
     const prompt = buildCartographerPrompt(input, formattedSnapshot);
+    const aiStartTime = Date.now();
 
     try {
       // Build messages with optional vision (screenshot)
@@ -88,8 +95,6 @@ export class Cartographer {
         hasScreenshot: !!input.screenshot,
       });
 
-      const aiStartTime = Date.now();
-
       const response = await Promise.race([
         getChatCompletionWithMessages(
           [
@@ -112,6 +117,8 @@ export class Cartographer {
 
       const result = parseCartographerResponse(response.content, pageId);
 
+      const latencyMs = Date.now() - aiStartTime;
+
       this.trace?.writePageClassificationResponse({
         url,
         model: AI_MODELS.vision,
@@ -121,9 +128,30 @@ export class Cartographer {
           entryPointCount: result.entryPoints.length,
           navLinkCount: result.navigationLinks.length,
         },
-        latencyMs: Date.now() - aiStartTime,
+        latencyMs,
         tokensUsed: response.usage?.totalTokens,
       });
+
+      // Retry once without screenshot if AI returned empty on a page with interactive elements.
+      // Vision models sometimes hallucinate or get confused by complex screenshots — text-only can work better.
+      if (
+        result.entryPoints.length === 0 &&
+        input.screenshot &&
+        !this.retriedUrls.has(url)
+      ) {
+        const interactiveCount = (input.snapshot?.elements ?? []).filter(
+          (e) => e.role === 'button' || e.role === 'link' || e.role === 'textbox' || e.tag === 'input' || e.tag === 'select',
+        ).length;
+
+        if (interactiveCount >= RETRY_MIN_INTERACTIVE_ELEMENTS) {
+          logger.info('[CARTOGRAPHER] Empty result on interactive page — retrying without screenshot', {
+            url,
+            interactiveCount,
+          });
+          this.retriedUrls.add(url);
+          return this.analyze({ ...input, screenshot: undefined }, formattedSnapshot);
+        }
+      }
 
       logger.info('[CARTOGRAPHER] Page analyzed', {
         url,
@@ -133,7 +161,7 @@ export class Cartographer {
         isLoginPage: result.authDetection.isLoginPage,
         isAuthGated: result.authDetection.isAuthGated,
         recommendDeeper: result.recommendDeeper,
-        latencyMs: Date.now() - aiStartTime,
+        latencyMs,
       });
 
       return result;
@@ -147,9 +175,21 @@ export class Cartographer {
         }
       }
 
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      const httpStatus = (error as any)?.status;
       logger.warn('[CARTOGRAPHER] AI classification failed, returning empty for fallback', {
         url,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMsg,
+        httpStatus,
+      });
+
+      // Log the failure in trace so it's visible alongside successful responses
+      this.trace?.writePageClassificationResponse({
+        url,
+        model: AI_MODELS.vision,
+        rawResponse: `[ERROR: ${errorMsg}]`,
+        parsed: { pageType: 'error', entryPointCount: 0, navLinkCount: 0 },
+        latencyMs: Date.now() - aiStartTime,
       });
 
       return this.emptyOutput(pageId);
