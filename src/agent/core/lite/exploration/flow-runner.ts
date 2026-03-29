@@ -52,7 +52,7 @@ import {
 import { ClarificationService } from '@/agent/utils/context/clarification.service';
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
-import type { ScoutInput, ScoutOutput } from './agents/agent-types';
+import type { ScoutInput, ScoutOutput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -88,6 +88,7 @@ export type CheckpointCallback = (completedTasks: FlowExplorationTask[]) => Prom
 export class FlowRunner {
   private stateManager: StateManager;
   private loginCompleted: boolean = false;
+  private loginMutex: Promise<void> = Promise.resolve();
   private knownFlowNames: string[] = [];
   private flowsCompleted: number = 0;
   private totalFlows: number = 0;
@@ -101,6 +102,7 @@ export class FlowRunner {
     private readonly onProgress?: ExplorationProgressCallback,
     private readonly rateLimiter?: RateLimiter,
     private readonly trace?: ExplorationTraceService,
+    private readonly blackboard?: ExplorationBlackboard,
   ) {
     this.stateManager = new StateManager(browser);
     this.scout = new Scout(rateLimiter, trace);
@@ -129,7 +131,7 @@ export class FlowRunner {
   }
 
   private emitProgress(
-    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found',
+    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found' | 'flow_step',
     data: Record<string, any>,
   ): void {
     if (!this.onProgress) return;
@@ -248,7 +250,17 @@ export class FlowRunner {
     results: FlowExplorationTask[],
     release: () => void,
   ): Promise<void> {
+    // Atomically reserve a flow slot before starting execution
+    const reserved = await this.budget.reserveFlowSlot();
+    if (!reserved) {
+      logger.info('[FLOW_RUNNER] Budget exhausted, skipping flow', { name: entryPoint.name });
+      results.push(this.createSkippedTask(entryPoint, 'Budget exhausted'));
+      release();
+      return;
+    }
+
     this.emitProgress('flow_started', {
+      entryPointId: entryPoint.id,
       name: entryPoint.name,
       category: entryPoint.category,
       priority: entryPoint.priority,
@@ -278,14 +290,15 @@ export class FlowRunner {
           count: task.branchPoints.length,
         });
         this.emitProgress('branch_found', {
-          flow: entryPoint.name,
-          branchCount: task.branchPoints.length,
-          branchNames: task.branchPoints.map(b => b.name),
+          entryPointId: entryPoint.id,
+          sourceFlowName: entryPoint.name,
+          newFlowsCount: task.branchPoints.length,
+          newFlows: task.branchPoints.map(b => b.name),
         });
       }
 
-      // Record budget usage
-      await this.budget.recordFlowCompletion(task.roundsUsed);
+      // Record budget usage (flow slot was already reserved via reserveFlowSlot)
+      await this.budget.recordFlowRounds(task.roundsUsed);
 
       // Trigger checkpoint callback if configured
       if (this.checkpointCallback) {
@@ -300,6 +313,7 @@ export class FlowRunner {
         : 'flow_failed' as const;
 
       this.emitProgress(progressEvent, {
+        entryPointId: entryPoint.id,
         name: entryPoint.name,
         status: task.status,
         steps: task.discoveredSteps.length,
@@ -333,15 +347,59 @@ export class FlowRunner {
       });
     } catch (error) {
       this.flowsCompleted++;
+      const errMsg = error instanceof Error ? error.message : String(error);
       logger.error('[FLOW_RUNNER] Flow execution failed', {
         name: entryPoint.name,
-        error: error instanceof Error ? error.message : String(error),
+        error: errMsg,
       });
-      results.push(this.createFailedTask(entryPoint, error));
+
+      const task = this.createFailedTask(entryPoint, error);
+
+      // Comprehensive blocker classification from error message
+      const lowerErr = errMsg.toLowerCase();
+      if (lowerErr.includes('captcha') || lowerErr.includes('recaptcha') || lowerErr.includes('hcaptcha')) {
+        task.blockerType = 'captcha';
+        task.status = 'blocked';
+        task.blockedReason = 'CAPTCHA required';
+        task.canUserHelp = true;
+      } else if (lowerErr.includes('2fa') || lowerErr.includes('two-factor') || lowerErr.includes('verification code') || lowerErr.includes('otp')) {
+        task.blockerType = '2fa';
+        task.status = 'blocked';
+        task.blockedReason = '2FA verification required';
+        task.canUserHelp = true;
+      } else if (lowerErr.includes('login') || lowerErr.includes('unauthorized') || lowerErr.includes('401') || lowerErr.includes('auth')) {
+        task.blockerType = 'login_wall';
+        task.status = 'blocked';
+        task.blockedReason = 'Authentication required';
+        task.canUserHelp = true;
+      } else if (lowerErr.includes('timeout') || lowerErr.includes('timed out')) {
+        task.blockerType = 'other';
+        task.blockedReason = 'Page load or action timeout';
+      } else if (lowerErr.includes('rate limit') || lowerErr.includes('429') || lowerErr.includes('too many requests')) {
+        task.blockerType = 'external_service';
+        task.status = 'blocked';
+        task.blockedReason = 'Rate limited by target site';
+      } else if (lowerErr.includes('navigation failed') || lowerErr.includes('net::err') || lowerErr.includes('econnrefused') || lowerErr.includes('enotfound')) {
+        task.blockerType = 'external_service';
+        task.status = 'blocked';
+        task.blockedReason = 'Navigation failure';
+      } else if (lowerErr.includes('payment') || lowerErr.includes('credit card') || lowerErr.includes('billing')) {
+        task.blockerType = 'payment';
+        task.status = 'blocked';
+        task.blockedReason = 'Payment information required';
+      } else if (lowerErr.includes('file upload') || lowerErr.includes('file chooser')) {
+        task.blockerType = 'file_upload';
+        task.status = 'blocked';
+        task.blockedReason = 'File upload required';
+      }
+
+      results.push(task);
 
       this.emitProgress('flow_failed', {
+        entryPointId: entryPoint.id,
         name: entryPoint.name,
-        error: error instanceof Error ? error.message : String(error),
+        error: errMsg,
+        blockerType: task.blockerType,
       });
     } finally {
       release();
@@ -376,9 +434,14 @@ export class FlowRunner {
       if (entryPoint.requiresAuth && this.config.credentials) {
         context = await this.stateManager.createAuthenticatedContext();
 
-        // If no cached auth state, we need to login first
+        // Use mutex to prevent concurrent login attempts
         if (!this.stateManager.hasAuthState() && !this.loginCompleted) {
-          await this.performLogin(context);
+          await this.withLoginMutex(async () => {
+            // Double-check after acquiring mutex (another flow may have completed login)
+            if (!this.loginCompleted) {
+              await this.performLogin(context!);
+            }
+          });
         }
       } else {
         context = await this.stateManager.createCleanContext();
@@ -509,6 +572,19 @@ export class FlowRunner {
           steps: discoveredSteps,
           count: discoveredSteps.length,
         });
+
+        // Emit flow_step events for real-time frontend updates
+        for (const step of discoveredSteps) {
+          this.emitProgress('flow_step', {
+            entryPointId: entryPoint.id,
+            name: entryPoint.name,
+            stepNumber: step.stepNumber,
+            action: step.action,
+            description: step.description,
+            value: step.value,
+            pageUrl: step.pageUrl,
+          });
+        }
       }
 
       // 6. Extract errors from pipeline result
@@ -798,6 +874,13 @@ export class FlowRunner {
       await page.close();
 
       if (result.success) {
+        // Validate auth state — verify login actually succeeded
+        const isStillOnLogin = await this.isStillOnLoginPage(page);
+        if (isStillOnLogin) {
+          logger.warn('[FLOW_RUNNER] Pipeline reported success but page is still login form');
+          return false;
+        }
+
         await this.stateManager.saveAuthState(context);
         this.loginCompleted = true;
         logger.info('[FLOW_RUNNER] Login successful, auth state cached');
@@ -811,6 +894,35 @@ export class FlowRunner {
       });
       await page.close().catch(() => {});
       return false;
+    }
+  }
+
+  /**
+   * Check if the page is still on a login form after a login attempt.
+   * Validates that the auth state actually changed.
+   */
+  private async isStillOnLoginPage(page: Page): Promise<boolean> {
+    try {
+      const url = page.url().toLowerCase();
+      if (/\/(login|signin|sign-in|auth|log-in|sso)\b/i.test(url)) {
+        return true;
+      }
+
+      // Check if there's still a visible password field (indicates login form still present)
+      const hasPasswordField = await page.evaluate(() => {
+        const inputs = (globalThis as any).document.querySelectorAll('input[type="password"]');
+        for (const input of inputs) {
+          const style = (globalThis as any).window.getComputedStyle(input);
+          if (style.display !== 'none' && style.visibility !== 'hidden') {
+            return true;
+          }
+        }
+        return false;
+      });
+
+      return hasPasswordField;
+    } catch {
+      return false; // If evaluation fails, assume login succeeded
     }
   }
 
@@ -1136,6 +1248,12 @@ export class FlowRunner {
 
       const snapshot = await SnapshotCollector.collect(page);
 
+      // Collect known pages from blackboard (prevents Scout from re-discovering surveyed pages)
+      const knownPages = this.blackboard?.tree?.getAllNodes?.()?.map((n: any) => n.url) ?? [];
+
+      // Look up Cartographer insight for the current page (enriches Scout's context)
+      const pageInsight = this.findPageInsight(page.url());
+
       const scoutInput: ScoutInput = {
         completedFlow: {
           name: completedEntry.name,
@@ -1148,7 +1266,8 @@ export class FlowRunner {
         },
         snapshot,
         knownFlows: [...this.knownFlowNames],
-        knownPages: [], // TODO: wire from blackboard
+        knownPages,
+        pageInsight,
         flowsRemaining: this.budget.remainingFlows(),
       };
 
@@ -1166,6 +1285,59 @@ export class FlowRunner {
         error: error instanceof Error ? error.message : String(error),
       });
       return [];
+    }
+  }
+
+  /**
+   * Look up Cartographer insight for a given URL from the blackboard.
+   * Used to enrich Scout input with cross-page knowledge.
+   */
+  private findPageInsight(url: string): CartographerInsight | undefined {
+    if (!this.blackboard?.pageInsights) return undefined;
+    const normalized = this.normalizeUrl(url);
+
+    // Direct lookup: match pageInsight key by normalized URL via tree node
+    const nodes = this.blackboard.tree?.getAllNodes?.() ?? [];
+    for (const node of nodes) {
+      if (this.normalizeUrl(node.url) === normalized) {
+        // pageInsights map is keyed by pageId
+        const insight = this.blackboard.pageInsights.get(node.id || '');
+        if (insight) return insight;
+      }
+    }
+
+    // Fallback: iterate all insights and match by related pages
+    for (const [, insight] of this.blackboard.pageInsights) {
+      if (insight.relatedPages?.some(rp => this.normalizeUrl(rp) === normalized)) {
+        return insight;
+      }
+    }
+
+    return undefined;
+  }
+
+  private normalizeUrl(url: string): string {
+    try {
+      const u = new URL(url);
+      return `${u.origin}${u.pathname}`.replace(/\/$/, '');
+    } catch {
+      return url;
+    }
+  }
+
+  /**
+   * Promise-chaining mutex for login — ensures only one login attempt at a time.
+   * Same pattern as BudgetTracker.withMutex.
+   */
+  private async withLoginMutex<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.loginMutex;
+    let resolve: () => void;
+    this.loginMutex = new Promise<void>((r) => { resolve = r; });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      resolve!();
     }
   }
 

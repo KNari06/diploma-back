@@ -169,6 +169,8 @@ export interface CartographerInput {
   };
   /** Overlays that were dismissed on this page */
   overlaysDismissed?: string[];
+  /** Product context collected from DOM (meta tags, headings, nav links, prominent buttons) */
+  productContext?: string;
 }
 
 export interface CartographerOutput {
@@ -212,6 +214,8 @@ export interface AuthDetectionResult {
   isAuthGated: boolean;
   loginFormRef?: string;
   loginUrl?: string;
+  /** Test/demo credentials found displayed on the page */
+  testCredentials?: { username?: string; password?: string };
 }
 
 /** Deep page understanding — stored in blackboard, read by all agents */

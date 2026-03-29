@@ -31,7 +31,7 @@ import {
 } from './scout-prompts';
 
 /** Timeout for Scout AI call */
-const SCOUT_TIMEOUT_MS = 15_000;
+const SCOUT_TIMEOUT_MS = 20_000;
 
 export class Scout {
   constructor(

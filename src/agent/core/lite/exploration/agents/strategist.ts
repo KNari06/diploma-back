@@ -105,7 +105,7 @@ export class ExplorationStrategist {
           {
             model: AI_MODELS.smart,
             temperature: 0.2,
-            max_tokens: 2500,
+            max_tokens: 3500,
             response_format: { type: 'json_object' },
           },
         ),

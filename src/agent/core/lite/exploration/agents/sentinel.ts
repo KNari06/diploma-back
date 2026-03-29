@@ -128,7 +128,7 @@ export class ExplorationSentinel {
       pageInsights: getPageInsightsArray(this.bb),
       completedFlows,
       blockedFlows: buildBlockedFlowSummaries(this.bb.completedFlows),
-      skippedFlows: skippedEntryPoints.map((ep) => ({
+      skippedFlows: skippedEntryPoints.filter((ep) => ep?.name && ep?.category).map((ep) => ({
         name: ep.name,
         category: ep.category,
         reason: 'Budget exhausted',
@@ -145,14 +145,29 @@ export class ExplorationSentinel {
     const completed = this.bb.completedFlows.length;
     const total = this.bb.tree?.getAllEntryPoints()?.length || 0;
     const score = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const budgetExhausted = this.bb.budget?.isExhausted?.() ?? true;
+
+    // Continue exploring if coverage is low and budget allows
+    const shouldContinue = score < 75 && !budgetExhausted;
+    const uncoveredCategories = shouldContinue ? this.identifyUncoveredCategories() : [];
 
     return {
       coverageScore: score,
-      gaps: [],
-      continueExploring: false,
+      gaps: uncoveredCategories.map((c) => `Category "${c}" not yet tested`),
+      continueExploring: shouldContinue,
+      focusNext: uncoveredCategories.length > 0 ? uncoveredCategories : undefined,
       qualitySummary: `Explored ${completed} of ${total} discovered flows (${score}% coverage). AI assessment unavailable.`,
-      recommendations: [],
+      recommendations: uncoveredCategories.length > 0
+        ? [`Test uncovered categories: ${uncoveredCategories.join(', ')}`]
+        : [],
       riskAreas: [],
     };
+  }
+
+  private identifyUncoveredCategories(): string[] {
+    const exploredCategories = new Set(this.bb.completedFlows.map((f) => f.category));
+    const allEntryPoints = this.bb.tree?.getAllEntryPoints() ?? [];
+    const allCategories = new Set(allEntryPoints.map((ep) => ep.category));
+    return [...allCategories].filter((c) => !exploredCategories.has(c));
   }
 }

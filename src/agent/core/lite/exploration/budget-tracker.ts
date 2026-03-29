@@ -87,6 +87,33 @@ export class BudgetTracker {
   // MUTATIONS (async-safe for concurrent sub-agents)
   // ═══════════════════════════════════════════════════════════════════════
 
+  /**
+   * Atomically reserve a flow slot BEFORE starting execution.
+   * Returns true if reserved successfully, false if budget exhausted.
+   * On success, increments flowsCompleted immediately to prevent over-allocation
+   * by concurrent flows. Call recordFlowRounds() after completion to record actual rounds used.
+   */
+  async reserveFlowSlot(): Promise<boolean> {
+    let reserved = false;
+    await this.withMutex(() => {
+      if (this.flowsCompleted < this.budget.maxFlows && !this.isTimedOut()) {
+        this.flowsCompleted++;
+        reserved = true;
+      }
+    });
+    return reserved;
+  }
+
+  /**
+   * Record rounds used after a flow completes.
+   * Called after reserveFlowSlot() + flow execution.
+   */
+  async recordFlowRounds(roundsUsed: number): Promise<void> {
+    await this.withMutex(() => {
+      this.pipelineRoundsUsed += roundsUsed;
+    });
+  }
+
   async recordFlowCompletion(roundsUsed: number): Promise<void> {
     await this.withMutex(() => {
       this.flowsCompleted++;

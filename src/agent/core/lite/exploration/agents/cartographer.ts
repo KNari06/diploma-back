@@ -25,7 +25,7 @@ import { AI_MODELS } from '@/config/ai/ai-models.config';
 import type { LiteSnapshot } from '../../lite-types';
 import { RateLimiter } from '../rate-limiter';
 import type { ExplorationTraceService } from '../exploration-trace.service';
-import type { CartographerInput, CartographerOutput } from './agent-types';
+import type { CartographerInput, CartographerOutput, CartographerEntryPoint } from './agent-types';
 import {
   CARTOGRAPHER_SYSTEM_PROMPT,
   buildCartographerPrompt,
@@ -55,10 +55,10 @@ export class Cartographer {
     const { url } = input;
     const pageId = `page-${Date.now()}`;
 
-    // If AI is degraded, return empty result (SurveyAgent will use fallback)
+    // If AI is degraded, collect basic entry points from DOM heuristics
     if (this.rateLimiter.isDegraded('openai')) {
-      logger.info('[CARTOGRAPHER] AI degraded, returning empty result for fallback', { url });
-      return this.emptyOutput(pageId);
+      logger.info('[CARTOGRAPHER] AI degraded, using DOM heuristic fallback', { url });
+      return this.domFallbackOutput(pageId, input);
     }
 
     // Build prompt with pre-formatted snapshot (avoids double formatting)
@@ -73,7 +73,7 @@ export class Cartographer {
           type: 'image_url',
           image_url: {
             url: `data:image/png;base64,${input.screenshot}`,
-            detail: 'low',
+            detail: 'high',
           },
         });
       }
@@ -99,7 +99,7 @@ export class Cartographer {
           {
             model: AI_MODELS.vision,
             temperature: 0.1,
-            max_tokens: 3000,
+            max_tokens: 4000,
             response_format: { type: 'json_object' },
           },
         ),
@@ -173,6 +173,132 @@ export class Cartographer {
         relatedPages: [],
       },
       recommendDeeper: false,
+    };
+  }
+
+  /**
+   * DOM heuristic fallback when AI is degraded.
+   * Collects entry points from buttons, forms, and links in the snapshot.
+   */
+  private domFallbackOutput(pageId: string, input: CartographerInput): CartographerOutput {
+    const elements = input.snapshot?.elements ?? [];
+    const entryPoints: CartographerEntryPoint[] = [];
+
+    // Detect forms (look for password fields → login form)
+    const hasPasswordField = elements.some(el => el.type === 'password');
+    if (hasPasswordField) {
+      const emailField = elements.find(el => el.type === 'email' || /email/i.test(el.name || el.placeholder || ''));
+      const usernameField = elements.find(el => /username|login|user/i.test(el.name || el.placeholder || ''));
+      const fieldDesc = emailField
+        ? `email field "${emailField.name || emailField.placeholder || 'email'}"`
+        : usernameField
+          ? `username field "${usernameField.name || usernameField.placeholder || 'username'}"`
+          : 'credentials fields';
+      entryPoints.push({
+        name: 'User Login',
+        goal: `Fill in the ${fieldDesc} and password field, then click the login/submit button to authenticate`,
+        category: 'authentication',
+        priority: 'critical',
+        requiresAuth: false,
+        estimatedComplexity: 'simple',
+        relatedElements: elements
+          .filter(el => el.type === 'password' || el.type === 'email' || /email|username|login/i.test(el.name || el.placeholder || ''))
+          .slice(0, 5).map(el => ({ ref: el.ref, role: el.role, name: el.name, tag: el.tag })),
+      });
+    }
+
+    // Detect search inputs
+    const searchInputs = elements.filter(el =>
+      el.type === 'search' || /search/i.test(el.name || el.placeholder || el.role || ''),
+    );
+    if (searchInputs.length > 0) {
+      const searchEl = searchInputs[0];
+      entryPoints.push({
+        name: 'Search Functionality',
+        goal: `Click the search input "${searchEl.name || searchEl.placeholder || 'search box'}", type a relevant search query, and verify results appear`,
+        category: 'search',
+        priority: 'high',
+        requiresAuth: false,
+        estimatedComplexity: 'simple',
+        relatedElements: searchInputs.slice(0, 3).map(el => ({
+          ref: el.ref, role: el.role, name: el.name, tag: el.tag,
+        })),
+      });
+    }
+
+    // Detect form submissions (non-auth forms with multiple inputs)
+    const textInputs = elements.filter(el =>
+      (el.tag === 'input' || el.tag === 'textarea') &&
+      el.type !== 'password' && el.type !== 'hidden' && el.type !== 'search' &&
+      !el.disabled,
+    );
+    const submitButtons = elements.filter(el =>
+      (el.tag === 'button' || el.role === 'button') &&
+      /submit|send|save|create|add|register|sign\s*up/i.test(el.name || ''),
+    );
+    if (textInputs.length >= 2 && submitButtons.length > 0 && !hasPasswordField) {
+      const submitBtn = submitButtons[0];
+      const fieldNames = textInputs.slice(0, 3).map(el => el.name || el.placeholder || el.type).filter(Boolean);
+      entryPoints.push({
+        name: 'Form Submission',
+        goal: `Fill in the form fields (${fieldNames.join(', ') || 'required fields'}) with valid test data and click "${submitBtn.name || 'submit'}" to submit`,
+        category: 'form_submission',
+        priority: 'high',
+        requiresAuth: false,
+        estimatedComplexity: 'medium',
+        relatedElements: [...textInputs.slice(0, 4), ...submitButtons.slice(0, 1)].map(el => ({
+          ref: el.ref, role: el.role, name: el.name, tag: el.tag,
+        })),
+      });
+    }
+
+    // Detect prominent CTA buttons
+    const ctaButtons = elements.filter(el =>
+      (el.tag === 'button' || el.role === 'button' || (el.tag === 'a' && el.role === 'link')) &&
+      el.visible && !el.disabled &&
+      /get\s*started|try|demo|sign\s*up|register|contact|learn/i.test(el.name || ''),
+    );
+    for (const btn of ctaButtons.slice(0, 3)) {
+      entryPoints.push({
+        name: `${btn.name || 'CTA'} Flow`,
+        goal: `Click the "${btn.name || 'CTA button'}" button and complete any resulting form or redirect flow`,
+        category: 'navigation',
+        priority: 'medium',
+        requiresAuth: false,
+        estimatedComplexity: 'simple',
+        relatedElements: [{ ref: btn.ref, role: btn.role, name: btn.name, tag: btn.tag }],
+      });
+    }
+
+    // Detect navigation links from snapshot
+    const navLinks = elements.filter(el =>
+      el.tag === 'a' && el.href && el.visible && !el.disabled &&
+      el.name && el.name.length > 1 && el.name.length < 50,
+    );
+    const navigationLinks = navLinks.slice(0, 10).map(el => ({
+      ref: el.ref,
+      label: el.name || '',
+      estimatedPageType: 'other' as string,
+    }));
+
+    const isLoginPage = hasPasswordField || /login|signin|sign-in/i.test(input.url);
+
+    return {
+      pageType: isLoginPage ? 'login' : 'unknown',
+      entryPoints,
+      navigationLinks,
+      authDetection: { isLoginPage, isAuthGated: false },
+      pageInsight: {
+        pageId,
+        pageType: isLoginPage ? 'login' : 'unknown',
+        forms: [],
+        interactiveAreas: [],
+        dataEntities: [],
+        stateIndicators: [],
+        complexity: 'unknown',
+        relatedPages: [],
+      },
+      recommendDeeper: true,
     };
   }
 }

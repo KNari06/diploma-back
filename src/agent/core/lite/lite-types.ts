@@ -115,6 +115,18 @@ export interface LiteElement {
   hasAriaHaspopup?: boolean;
   /** Resolved href for <a> elements (absolute URL) */
   href?: string;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V8: Visual properties for LLM element matching
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Computed background color (e.g. "rgb(255, 0, 0)") */
+  backgroundColor?: string;
+  /** Computed text/foreground color (e.g. "rgb(0, 0, 0)") */
+  textColor?: string;
+  /** Computed border radius (e.g. "4px", "50%") */
+  borderRadius?: string;
+  /** CSS class names related to icons (e.g. ["fa-gear", "material-icons"]) */
+  iconClasses?: string;
 }
 
 /**

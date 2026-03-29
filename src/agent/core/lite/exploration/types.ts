@@ -31,7 +31,7 @@ export type ExplorationProgressEvent = {
   event:
     | 'page_discovered' | 'survey_complete'
     | 'strategy_planned'
-    | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found'
+    | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'flow_step' | 'branch_found'
     | 'coverage_evaluated'
     | 'agent_warning' | 'agent_error';
   data: Record<string, any>;
@@ -597,6 +597,9 @@ export interface ExplorationCheckpoint {
 
   /** Auth state (cached storageState JSON) */
   authState?: object;
+
+  /** Cartographer page insights (serialized from Map) */
+  pageInsights?: Array<[string, any]>;
 }
 
 export interface TreeCheckpoint {

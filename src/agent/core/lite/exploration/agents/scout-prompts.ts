@@ -28,11 +28,15 @@ For example:
 RULES:
 - Only discover flows that are NEW — not already in the known list
 - Only flows visible on the current page (not hypothetical)
-- Do NOT list destructive flows (delete, cancel, remove)
+- Do NOT list destructive flows that permanently destroy accounts or all data
 - Do NOT list overlay noise (close modal, dismiss, OK, got it)
-- Do NOT list success confirmations or post-action popups as flows
-- Goals must be specific and actionable
-- Consider what the app state is after the completed flow
+- Confirmation pages CAN contain real flows — "Verify Email", "Complete Profile", "Download Receipt" are valid
+- Goals must be SPECIFIC — bad: "Use the settings", good: "Update notification preferences in account settings"
+- If the flow failed or was blocked, focus on what error recovery flows are visible (retry, contact support, etc.)
+
+BUDGET AWARENESS:
+- If budget is HIGH (10+ flows remaining): be thorough, discover everything visible
+- If budget is LOW (≤3 flows): only report critical/high priority flows, skip medium/low
 
 Also identify new pages worth exploring (URLs not yet visited).
 
@@ -62,9 +66,25 @@ export function buildScoutPrompt(input: ScoutInput): string {
 
   sections.push(`CURRENT PAGE URL: ${input.completedFlow.finalUrl}`);
 
-  // Known flows (dedup)
+  // Cartographer insight for context — put before known flows so AI has page context early
+  if (input.pageInsight) {
+    sections.push(`CURRENT PAGE CONTEXT (from Cartographer analysis):
+- Page type: ${input.pageInsight.pageType}
+- Interactive areas: ${input.pageInsight.interactiveAreas.join(', ') || 'none'}
+- Data entities: ${input.pageInsight.dataEntities.join(', ') || 'none'}
+- State indicators: ${input.pageInsight.stateIndicators.join(', ') || 'none'}
+- Complexity: ${input.pageInsight.complexity}`);
+  }
+
+  // Known flows (dedup) — show as count summary if large list to save tokens
   if (input.knownFlows.length > 0) {
-    sections.push(`ALREADY DISCOVERED FLOWS (do NOT duplicate these):\n${input.knownFlows.map((n) => `- ${n}`).join('\n')}`);
+    if (input.knownFlows.length <= 20) {
+      sections.push(`ALREADY DISCOVERED FLOWS (do NOT duplicate):\n${input.knownFlows.map((n) => `- ${n}`).join('\n')}`);
+    } else {
+      // Show first 15 + count to avoid token bloat
+      const shown = input.knownFlows.slice(0, 15);
+      sections.push(`ALREADY DISCOVERED FLOWS (${input.knownFlows.length} total, showing first 15 — avoid duplicating any):\n${shown.map((n) => `- ${n}`).join('\n')}\n... and ${input.knownFlows.length - 15} more`);
+    }
   }
 
   // Known pages
@@ -72,17 +92,9 @@ export function buildScoutPrompt(input: ScoutInput): string {
     sections.push(`ALREADY VISITED PAGES:\n${input.knownPages.map((u) => `- ${u}`).join('\n')}`);
   }
 
-  // Cartographer insight for context
-  if (input.pageInsight) {
-    sections.push(`PAGE INSIGHT (from previous analysis):
-- Page type: ${input.pageInsight.pageType}
-- Interactive areas: ${input.pageInsight.interactiveAreas.join(', ') || 'none'}
-- Data entities: ${input.pageInsight.dataEntities.join(', ') || 'none'}
-- State indicators: ${input.pageInsight.stateIndicators.join(', ') || 'none'}`);
-  }
-
-  // Budget context
-  sections.push(`BUDGET: ${input.flowsRemaining} flows remaining to explore.`);
+  // Budget context with guidance
+  const budgetLevel = input.flowsRemaining > 10 ? 'HIGH' : input.flowsRemaining > 3 ? 'MEDIUM' : 'LOW';
+  sections.push(`BUDGET: ${input.flowsRemaining} flows remaining (${budgetLevel}). ${budgetLevel === 'LOW' ? 'Report only critical/high priority flows.' : 'Be thorough.'}`);
 
   // Current page snapshot
   sections.push(`CURRENT PAGE STATE:\n${formatSnapshotForScout(input.snapshot)}`);
@@ -131,10 +143,17 @@ function formatSnapshotForScout(snapshot: any): string {
       if (el.role) parts.push(el.role);
       if (el.tag) parts.push(`<${el.tag}>`);
       if (el.name) parts.push(`"${el.name}"`);
+      if (el.type) parts.push(`type=${el.type}`);
       if (el.disabled) parts.push('[disabled]');
+      if (el.ariaExpanded) parts.push(`[expanded=${el.ariaExpanded}]`);
+      if (el.isInsideActiveModal) parts.push('[in-modal]');
       if (el.context) parts.push(`ctx="${el.context}"`);
       lines.push('  ' + parts.join(' '));
     }
+  }
+
+  if (snapshot.pageAlerts && snapshot.pageAlerts.length > 0) {
+    lines.push(`\nPage Alerts: ${snapshot.pageAlerts.join('; ')}`);
   }
 
   return lines.join('\n');

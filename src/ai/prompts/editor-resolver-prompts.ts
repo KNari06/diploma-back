@@ -8,7 +8,7 @@
 // ============================================================================
 
 /**
- * V7: Prompt for rule-based fallback mode
+ * Prompt for rule-based fallback mode
  * Primary matching is done via LLM resolver (Gemini Flash Lite)
  * This prompt is used for: clarification text generation in fallback mode
  */

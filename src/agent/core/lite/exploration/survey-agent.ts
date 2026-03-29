@@ -38,8 +38,8 @@ import type { ExplorationTraceService } from './exploration-trace.service';
 import { Cartographer } from './agents/cartographer';
 import type { CartographerInput, CartographerOutput } from './agents/agent-types';
 
-/** Max navigation links to follow per page */
-const MAX_NAV_LINKS_PER_PAGE = 8;
+/** Max hidden navigation links to follow per page (Cartographer-discovered links have no limit) */
+const MAX_NAV_LINKS_PER_PAGE = 15;
 
 /** Timeout for page navigation (ms) */
 const NAV_TIMEOUT_MS = 30_000;
@@ -95,6 +95,72 @@ export class SurveyAgent {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // PRODUCT CONTEXT COLLECTION
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Collect high-level product context from the DOM to help Cartographer
+   * understand the type of application and discover navigation paths.
+   */
+  private async collectProductContext(): Promise<string> {
+    try {
+      const context = await this.page.evaluate(() => {
+        const doc = (globalThis as any).document;
+        const parts: string[] = [];
+
+        // Document title
+        const title = doc.title?.trim();
+        if (title) parts.push(`Title: ${title}`);
+
+        // Meta description
+        const metaDesc = doc.querySelector('meta[name="description"]')?.getAttribute('content')?.trim();
+        if (metaDesc) parts.push(`Description: ${metaDesc.substring(0, 200)}`);
+
+        // All H1 headings
+        const h1s = Array.from(doc.querySelectorAll('h1')).map((h: any) => h.textContent?.trim()).filter((t: any) => t && t.length > 0 && t.length < 100);
+        if (h1s.length > 0) parts.push(`H1 headings: ${h1s.slice(0, 5).join(', ')}`);
+
+        // Nav/header links
+        const navLinks: string[] = [];
+        const navEls = doc.querySelectorAll('nav a[href], header a[href], [role="navigation"] a[href]');
+        navEls.forEach((a: any) => {
+          const text = (a.textContent || '').trim();
+          const href = a.href || '';
+          if (text && text.length > 0 && text.length < 50 && href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+            navLinks.push(`${text} (${href})`);
+          }
+        });
+        if (navLinks.length > 0) parts.push(`Navigation links: ${[...new Set(navLinks)].slice(0, 20).join(', ')}`);
+
+        // Prominent buttons (Sign Up, Login, Contact, etc.)
+        const prominentButtons: string[] = [];
+        const buttons = doc.querySelectorAll('button, [role="button"], a.btn, a.button, .cta');
+        buttons.forEach((btn: any) => {
+          const text = (btn.textContent || '').trim();
+          if (text && text.length > 1 && text.length < 40 && /sign\s*up|log\s*in|register|contact|get\s*started|try|demo|free\s*trial|subscribe|learn\s*more/i.test(text)) {
+            prominentButtons.push(text);
+          }
+        });
+        if (prominentButtons.length > 0) parts.push(`Prominent CTAs: ${[...new Set(prominentButtons)].slice(0, 10).join(', ')}`);
+
+        // URL patterns inference
+        const path = (globalThis as any).window.location.pathname;
+        const origin = (globalThis as any).window.location.origin;
+        parts.push(`URL path: ${path}`);
+        parts.push(`Origin: ${origin}`);
+
+        return parts.join('\n');
+      });
+      return context || '';
+    } catch (error) {
+      logger.debug('[SURVEY] Failed to collect product context', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return '';
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // MAIN SURVEY LOOP
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -118,7 +184,7 @@ export class SurveyAgent {
         return this.tree;
       }
       await this.page.goto(this.config.entryUrl, {
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'load',
         timeout: NAV_TIMEOUT_MS,
       });
       this.rateLimiter.recordSuccess('target_site');
@@ -128,7 +194,7 @@ export class SurveyAgent {
         if (result.shouldRetry) {
           try {
             await this.page.goto(this.config.entryUrl, {
-              waitUntil: 'domcontentloaded',
+              waitUntil: 'load',
               timeout: NAV_TIMEOUT_MS,
             });
             this.rateLimiter.recordSuccess('target_site');
@@ -184,6 +250,38 @@ export class SurveyAgent {
     return this.tree;
   }
 
+  /**
+   * Targeted survey: visit specific URLs requested by Strategist.
+   * Reuses existing tree for dedup — only visits unvisited URLs.
+   */
+  async surveyTargets(urls: string[], existingTree: ExplorationTree): Promise<ExplorationTree> {
+    this.tree = existingTree;
+
+    for (const url of urls) {
+      if (this.tree.isVisited(url) || !this.budget.canSurveyMorePages()) {
+        logger.info('[SURVEY] Skipping target (already visited or budget)', { url });
+        continue;
+      }
+
+      try {
+        await this.page.goto(url, {
+          waitUntil: 'load',
+          timeout: NAV_TIMEOUT_MS,
+        });
+
+        // Process this page like bfsSurvey does for a single page
+        await this.bfsSurvey(0, false);
+      } catch (err) {
+        logger.warn('[SURVEY] Targeted survey failed for URL', {
+          url,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return this.tree;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // BFS TRAVERSAL
   // ═══════════════════════════════════════════════════════════════════════
@@ -223,7 +321,7 @@ export class SurveyAgent {
             continue;
           }
           await this.page.goto(item.url, {
-            waitUntil: 'domcontentloaded',
+            waitUntil: 'load',
             timeout: NAV_TIMEOUT_MS,
           });
           this.rateLimiter.recordSuccess('target_site');
@@ -233,7 +331,7 @@ export class SurveyAgent {
             if (result.shouldRetry) {
               try {
                 await this.page.goto(item.url, {
-                  waitUntil: 'domcontentloaded',
+                  waitUntil: 'load',
                   timeout: NAV_TIMEOUT_MS,
                 });
                 this.rateLimiter.recordSuccess('target_site');
@@ -371,10 +469,18 @@ export class SurveyAgent {
         hasScreenshot: false, // updated below
       });
 
-      // Take screenshot for vision
+      // Take screenshot for vision (fullPage for better context, with size fallback)
       let screenshotBase64: string | undefined;
       try {
-        const screenshotBuffer = await this.page.screenshot({ type: 'png', fullPage: false });
+        let screenshotBuffer = await this.page.screenshot({ type: 'png', fullPage: true });
+        // If fullPage screenshot is >2MB, fall back to viewport-only
+        if (screenshotBuffer.length > 2 * 1024 * 1024) {
+          logger.debug('[SURVEY] Full-page screenshot too large, falling back to viewport', {
+            url: item.url,
+            sizeBytes: screenshotBuffer.length,
+          });
+          screenshotBuffer = await this.page.screenshot({ type: 'png', fullPage: false });
+        }
         screenshotBase64 = screenshotBuffer.toString('base64');
       } catch (error) {
         logger.warn('[SURVEY] Failed to take screenshot', {
@@ -476,6 +582,27 @@ export class SurveyAgent {
         }
 
         await this.budget.recordPageSurvey();
+
+        // Emit page_discovered event for real-time frontend update
+        this.config.onProgress?.({
+          explorationId: this.config.explorationId,
+          phase: 'survey',
+          event: 'page_discovered',
+          data: {
+            pageId: nodeId,
+            url: this.page.url(),
+            title: await this.page.title(),
+            pageType: classification.pageType,
+            entryPointsFound: entryPoints.length,
+            depth: item.depth,
+            parentPageId: item.parentNodeId,
+            isAuthGated: isAuthZone || false,
+            isLoginPage: this.isLoginUrl(this.page.url()),
+            complexity: 'medium',
+          },
+          progressPercent: 0,
+          timestamp: Date.now(),
+        });
 
         // Enqueue navigation links (BFS children) — no hardcoded cap, AI decides relevance
         const navLinks = classification.navigationLinks;
@@ -732,6 +859,9 @@ export class SurveyAgent {
     const categoriesSeen = [...new Set(this.pageTypesSeen)];
     const recentPageTypes = this.pageTypesSeen.slice(-3);
 
+    // Collect product context from DOM for richer AI understanding
+    const productContext = await this.collectProductContext();
+
     const cartographerInput: CartographerInput = {
       url,
       title,
@@ -747,6 +877,7 @@ export class SurveyAgent {
         recentPageTypes,
       },
       overlaysDismissed: overlaySummary ? [overlaySummary] : undefined,
+      productContext: productContext || undefined,
     };
 
     const result = await this.cartographer.analyze(cartographerInput, formattedSnapshot);
@@ -788,7 +919,34 @@ export class SurveyAgent {
     // Fallback: Cartographer returned empty → use heuristic detection
     if (snapshot) {
       const fallbackEntryPoints = this.buildFallbackEntryPoints(snapshot, url);
-      if (fallbackEntryPoints.length > 0) {
+
+      // DOM fallback for navigation when Cartographer returns no nav links
+      let fallbackNavLinks: Array<{ ref: string; label: string; estimatedPageType: string }> = [];
+      try {
+        const domNavLinks = await this.page.$$eval(
+          'nav a[href], header a[href], [role="navigation"] a[href], footer a[href]',
+          (links: any[]) => links.map(a => ({
+            href: a.href,
+            text: (a.textContent || '').trim().substring(0, 50),
+            ref: a.getAttribute('data-agent-ref') || '',
+          })).filter(l => l.href && l.text && !l.href.startsWith('javascript:') && !l.href.startsWith('#') && l.ref),
+        );
+        fallbackNavLinks = domNavLinks.slice(0, MAX_NAV_LINKS_PER_PAGE).map(l => ({
+          ref: l.ref,
+          label: l.text,
+          estimatedPageType: 'other',
+        }));
+        if (fallbackNavLinks.length > 0) {
+          logger.info('[SURVEY] DOM fallback navigation links found', {
+            url,
+            count: fallbackNavLinks.length,
+          });
+        }
+      } catch {
+        // Non-fatal: DOM nav fallback is best-effort
+      }
+
+      if (fallbackEntryPoints.length > 0 || fallbackNavLinks.length > 0) {
         this.trace?.writePageClassificationFallback({
           url,
           reason: 'cartographer_returned_empty',
@@ -797,7 +955,7 @@ export class SurveyAgent {
         return {
           pageType: result.pageType || this.inferPageTypeFromUrl(url),
           entryPoints: fallbackEntryPoints,
-          navigationLinks: [],
+          navigationLinks: fallbackNavLinks,
         };
       }
     }

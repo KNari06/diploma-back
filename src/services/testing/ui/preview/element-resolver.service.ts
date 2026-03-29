@@ -1,19 +1,19 @@
 /**
- * Element Resolver Service V7
+ * Element Resolver Service V8
  * Language-agnostic element resolution using LLM-first selection
  *
- * Architecture (V7 — LLM-only, no embeddings):
+ * Architecture:
  * 1. Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync, fast)
- * 2. Check for exact quoted text short-circuit ('Login', "Submit")
- * 3. Count-based decision:
- *    - 0 allowed → Gemini Flash rescue (last-resort AI with optional vision)
- *    - 1 allowed → resolved
- *    - >1 allowed → LLM selection (gemini-2.5-flash-lite)
+ *    - Only hard exclude: isVisible=false
+ *    - Everything else: soft penalty → LLM decides
+ * 2. Count-based decision:
+ *    - 0 allowed → Gemini Flash rescue (AI with optional vision)
+ *    - 1+ allowed → LLM selection (gemini-2.5-flash-lite)
+ * 3. Vision second opinion for visual elements (img/svg/canvas) when LLM can't match by text
  *
- * Philosophy: DOM-structural rules only (tag, type, visibility, state).
- * All text-based matching (typos, spaces, multilingual) is handled by LLM.
- * No hardcoded keyword lists, no fuzzy matching, no space-stripping heuristics.
- * No embeddings — LLM handles semantic matching natively.
+ * Philosophy: Zero hardcoded text matching. All semantic decisions delegated to LLM.
+ * DOM-structural rules only filter by visibility, tag/role compatibility, state.
+ * Visual properties (color, shape, icon classes, size) passed to LLM for matching.
  */
 
 import { generateText } from '@/services/ai/core/ai-provider.service';
@@ -55,7 +55,7 @@ const ACTION_TO_TAGS: Record<string, string[]> = {
   toggle: ['input', 'button', 'div', 'span'],
   open: ['button', 'div', 'select', 'summary', 'details'],
   close: ['button', 'div', 'summary', 'details'],
-  hover: ['button', 'a', 'div', 'span', 'img'],
+  hover: ['button', 'a', 'div', 'span', 'img', 'li', 'td', 'th', 'svg', 'label', 'nav', 'header', 'footer', 'section', 'summary'],
   scroll: ['div', 'section', 'main', 'body', 'html'],
   press: ['input', 'textarea', 'button', 'div', 'span'], // FIX #4: contenteditable + role=textbox divs
   upload: ['input', 'button', 'label', 'div', 'span'], // File inputs are often hidden; trigger is a button/label/div
@@ -129,7 +129,7 @@ const STATE_AWARE_ACTIONS: Record<string, { requiredState: string; field: keyof 
 export interface RuleTraceEntry {
   ruleId: string;
   version: string;
-  action: 'exclude' | 'boost' | 'penalize' | 'shortcircuit';
+  action: 'exclude' | 'boost' | 'penalize';
   evidence: string;
   affectedRefs: string[];
 }
@@ -144,8 +144,6 @@ export interface AllowedSetResult {
   softAllowed: InteractiveNode[];
   /** Rule trace for debugging */
   ruleTrace: RuleTraceEntry[];
-  /** If true, a single element matched exactly (short-circuit to resolved) */
-  shortCircuitRef?: string;
 }
 
 /**
@@ -187,55 +185,25 @@ function isFillCompatibleTextField(node: InteractiveNode): boolean {
 }
 
 /**
- * Check if node label/aria/placeholder contains exact quoted text from intent
- * Supports: 'exact text' or "exact text" patterns
- */
-function matchesExactQuotedText(node: InteractiveNode, intentText: string): boolean {
-  // Extract quoted strings from intent
-  const singleQuoteMatch = intentText.match(/'([^']+)'/);
-  const doubleQuoteMatch = intentText.match(/"([^"]+)"/);
-  const quotedText = singleQuoteMatch?.[1] || doubleQuoteMatch?.[1];
-  
-  if (!quotedText) return false;
-  
-  const quotedLower = quotedText.toLowerCase();
-  const nodeTexts = [
-    node.labelText,
-    node.ariaLabel,
-    node.placeholder,
-    node.text,
-    node.name,
-  ].filter(Boolean).map(t => t!.toLowerCase());
-  
-  return nodeTexts.some(t => t === quotedLower || t.includes(quotedLower));
-}
-
-/**
  * Build HardAllowed and SoftAllowed sets based on deterministic DOM-structural rules.
- * V7: Synchronous — no AI calls. All text-based matching delegated to LLM.
+ * Synchronous — no AI calls. All semantic matching delegated to LLM.
  *
- * Rules applied (in order):
- * 1. Visibility (isVisible=false → hard exclude)
- * 2. Disabled (isDisabled=true → hard exclude)
- * 3. Readonly for writable actions → hard exclude
- * 3b. Tag/type compatibility for `type` action → hard exclude
- * 4. State-aware action checks (check/uncheck/open/close) → hard exclude
- * 5. Tag/role compatibility for action → hard exclude or soft penalize
+ * Rules:
+ * 1. Visibility (isVisible=false → hard exclude — only hard exclude)
+ * 2. Disabled → soft penalty (LLM decides)
+ * 3. Readonly for writable actions → soft penalty
+ * 3b. Tag/type compatibility → soft penalty
+ * 4. State-aware checks (check/uncheck/open/close) → soft penalty
+ * 5. Tag/role compatibility → soft penalty
  * Soft: covered by overlay, dynamic ID
- * Short-circuit: exact quoted text match ('Login', "Submit")
  */
 export function buildAllowedSets(
   nodes: InteractiveNode[],
   actionType: IntentActionType,
-  intentText: string
 ): AllowedSetResult {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
   const ruleTrace: RuleTraceEntry[] = [];
-  let shortCircuitRef: string | undefined;
-
-  // Track exact quote match candidates for potential short-circuit
-  const exactMatchRefs: string[] = [];
 
   // P1+P2 CRITICAL: Position-aware modal/dialog/popup layer detection
   // If a modal is present, visible, AND covers a significant portion of the viewport,
@@ -449,6 +417,20 @@ export function buildAllowedSets(
             node.hasAriaHaspopup
           );
 
+        // Phase 4: Soft-allow framework-bound/interactive elements for hover action.
+        // Hover can target anything that is interactive — same signals as click.
+        const hasHoverSignal =
+          actionType === 'hover' &&
+          !tagMatches &&
+          !roleMatches &&
+          (
+            !!node.frameworkClickable ||
+            !!node.hasOnclick ||
+            (node.tabIndex !== undefined && node.tabIndex >= 0) ||
+            node.ariaExpanded !== undefined ||
+            node.hasAriaHaspopup
+          );
+
         // Phase 4: Soft-allow contenteditable elements for type action.
         const isContentEditable =
           actionType === 'type' &&
@@ -458,7 +440,7 @@ export function buildAllowedSets(
           !!node.isContentEditable;
 
         // Exception: allow non-standard textbox components for type as SoftAllowed.
-        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag && !hasClickSignal && !isContentEditable) {
+        if (!tagMatches && !isNonStandardTextbox && !roleMatches && !isSelectSoftTag && !hasClickSignal && !hasHoverSignal && !isContentEditable) {
           isSoft = true;
           nodeRules.push({
             ruleId: 'tag.incompatible',
@@ -515,6 +497,17 @@ export function buildAllowedSets(
             version: 'v4',
             action: 'penalize',
             evidence: `tag=${node.tag} soft-allowed for click: frameworkClickable=${node.frameworkClickable || false}, onclick=${!!node.hasOnclick}, tabIndex=${node.tabIndex}, ariaExpanded=${node.ariaExpanded}, ariaHaspopup=${!!node.hasAriaHaspopup}`,
+            affectedRefs: [node.ref],
+          });
+        } else if (hasHoverSignal) {
+          // V8: Framework-bound or explicitly interactive element for hover action.
+          // Same rationale as click — custom elements with JS handlers can be hover targets.
+          isSoft = true;
+          nodeRules.push({
+            ruleId: 'structure.framework_hoverable',
+            version: 'v8',
+            action: 'penalize',
+            evidence: `tag=${node.tag} soft-allowed for hover: frameworkClickable=${node.frameworkClickable || false}, onclick=${!!node.hasOnclick}, tabIndex=${node.tabIndex}`,
             affectedRefs: [node.ref],
           });
         } else if (isContentEditable) {
@@ -584,53 +577,6 @@ export function buildAllowedSets(
       // Handled earlier (Rule 5 exception) to avoid being excluded by tag checks.
     }
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // SHORT-CIRCUIT: Check for exact quoted text match
-    // ═══════════════════════════════════════════════════════════════════════
-    
-    if (!excluded && matchesExactQuotedText(node, intentText)) {
-      exactMatchRefs.push(node.ref);
-      nodeRules.push({
-        ruleId: 'match.exact_quote',
-        version: 'v1',
-        action: 'shortcircuit',
-        evidence: 'Node matches quoted text in intent',
-        affectedRefs: [node.ref],
-      });
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════
-    // TEXT-MATCH RESCUE: If user typed text that is visibly present on the
-    // element, it MUST reach the LLM — the user can only type what they see.
-    // This rescues elements excluded by tag.incompatible, visibility.covered,
-    // or other structural rules that don't account for visible text matching.
-    // ═══════════════════════════════════════════════════════════════════════
-    if (excluded && node.isVisible !== false && intentText.length > 0) {
-      const intentLower = intentText.toLowerCase();
-      const visibleTexts = [
-        node.text,
-        node.labelText,
-        node.ariaLabel,
-        node.placeholder,
-      ].filter(Boolean).map(t => t!.toLowerCase());
-
-      const hasTextMatch = visibleTexts.some(t =>
-        t.includes(intentLower) || intentLower.includes(t)
-      );
-
-      if (hasTextMatch) {
-        excluded = false;
-        isSoft = true;
-        nodeRules.push({
-          ruleId: 'rescue.visible_text_match',
-          version: 'v1',
-          action: 'penalize',
-          evidence: `Element excluded by [${nodeRules.map(r => r.ruleId).join(', ')}] but contains user-visible text matching intent "${intentText}"`,
-          affectedRefs: [node.ref],
-        });
-      }
-    }
-
     // Add to appropriate set
     if (!excluded) {
       if (isSoft) {
@@ -644,18 +590,6 @@ export function buildAllowedSets(
     ruleTrace.push(...nodeRules);
   }
   
-  // If exactly one element matches quoted text, short-circuit to resolved
-  if (exactMatchRefs.length === 1) {
-    shortCircuitRef = exactMatchRefs[0];
-    ruleTrace.push({
-      ruleId: 'decision.shortcircuit',
-      version: 'v1',
-      action: 'shortcircuit',
-      evidence: `Single exact quote match: ${shortCircuitRef}`,
-      affectedRefs: [shortCircuitRef],
-    });
-  }
-
   // Log rule trace summary
   const modalElementCount = hasVisibleModal
     ? [...hardAllowed, ...softAllowed].filter(n => n.isInsideActiveModal).length
@@ -664,12 +598,11 @@ export function buildAllowedSets(
     hardAllowedCount: hardAllowed.length,
     softAllowedCount: softAllowed.length,
     rulesApplied: ruleTrace.length,
-    shortCircuitRef,
     hasVisibleModal,
     modalElementCount,
   });
-  
-  return { hardAllowed, softAllowed, ruleTrace, shortCircuitRef };
+
+  return { hardAllowed, softAllowed, ruleTrace };
 }
 
 /**
@@ -686,13 +619,18 @@ function computeTextHash(text: string): string {
 }
 
 /**
- * Compute page signature for cache key
- * Based on URL and DOM node refs
+ * Compute page signature for cache key.
+ * V8: Added content hash (first 10 node texts) to detect DOM mutations
+ * that preserve refs but change element content.
  */
 function computePageSignature(url: string, nodes: InteractiveNode[]): string {
   const refs = nodes.map(n => n.ref || '').join(',');
-  const data = `${url}|${nodes.length}|${refs}`;
-  return Buffer.from(data).toString('base64');
+  // V8: Include content hash — detect text changes within same ref structure
+  const contentSample = nodes.slice(0, 10)
+    .map(n => (n.text || n.labelText || n.ariaLabel || '').slice(0, 20))
+    .join('|');
+  const data = `${url}|${nodes.length}|${refs}|${contentSample}`;
+  return computeTextHash(data);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -782,6 +720,24 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Active layer hint (element is inside the foreground modal/popup/dropdown overlay)
   if (node.isInsideActiveModal) {
     parts.push('[active-layer]');
+  }
+
+  // V8: Visual properties — enables "grey button", "rounded icon", "red cancel"
+  const visualHints: string[] = [];
+  if (node.backgroundColor && node.backgroundColor !== 'white' && node.backgroundColor !== 'transparent') {
+    visualHints.push(node.backgroundColor);
+  }
+  if (node.shapeHint) {
+    visualHints.push(node.shapeHint);
+  }
+  if (node.iconClasses) {
+    visualHints.push(`icon: ${node.iconClasses}`);
+  }
+  if (node.sizeHint) {
+    visualHints.push(node.sizeHint);
+  }
+  if (visualHints.length > 0) {
+    parts.push(`[${visualHints.join(', ')}]`);
   }
 
   // Position hint — lets LLM understand spatial layout (overlays, drawers, dropdowns)
@@ -917,7 +873,7 @@ function extractFirstJsonObject(text: string): string | null {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * V7 (Phase 6): Vision-enhanced rescue when deterministic rules excluded ALL elements.
+ * Vision-enhanced rescue when deterministic rules excluded ALL elements.
  * When screenshot is available, sends it to Gemini 2.0 Flash Vision for visual identification.
  * Falls back to text-only Gemini Flash when no screenshot is available.
  *
@@ -936,19 +892,20 @@ async function rescueWithGeminiFlash(params: {
 }): Promise<{ ref: string; confidence: number; reason: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null> {
   const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport } = params;
 
-  // V14: Prioritize candidates by relevance (label/aria/text match) instead of DOM order
-  // Note: disabled elements NOT filtered out — buildAllowedSets treats disabled as soft penalty,
-  // so rescue should be equally lenient. LLM decides if a disabled element is the right target.
-  const intentLower = intentText.toLowerCase();
+  // V8: Prioritize candidates by a11y richness (no hardcoded text matching — LLM decides).
+  // Elements with more semantic info (labels, roles) are more useful for LLM to evaluate.
   const rescueCandidates = excludedNodes
     .filter(n => n.ref && n.isVisible !== false)
     .sort((a, b) => {
       const scoreNode = (n: InteractiveNode): number => {
-        const texts = [n.labelText, n.ariaLabel, n.text, n.placeholder, n.title].filter(Boolean).map(t => t!.toLowerCase());
-        if (texts.some(t => t === intentLower)) return 3;           // exact match
-        if (texts.some(t => t.includes(intentLower) || intentLower.includes(t))) return 2; // partial match
-        if (n.role || n.ariaLabel) return 1;                       // has a11y info
-        return 0;
+        let score = 0;
+        if (n.ariaLabel) score += 2;
+        if (n.labelText) score += 2;
+        if (n.title) score += 1;
+        if (n.text) score += 1;
+        if (n.role) score += 1;
+        if (n.placeholder) score += 1;
+        return score;
       };
       return scoreNode(b) - scoreNode(a);
     })
@@ -1165,7 +1122,12 @@ RULES:
    - "arrow" / "back" = "go back" / "navigate back"
    - "trash" / "delete icon" = "remove" / "delete item"
    - "pencil" / "edit icon" = "edit" / "modify"
-5. SPATIAL LAYOUT AWARENESS: Each element has position @(x,y,widthxheight).
+5. VISUAL PROPERTIES: Elements may include [color, shape, icon: class] hints in square brackets.
+   - "серая кнопка" / "grey button" → match [grey] or [light-grey] color
+   - "круглая иконка" / "round icon" → match [circle] or [rounded] shape
+   - "иконка шестерёнки" / "gear icon" → match [icon: fa-gear] or [icon: settings]
+   - If no visual hints are present, rely on text/semantic matching only
+6. SPATIAL LAYOUT AWARENESS: Each element has position @(x,y,widthxheight).
    Use positions to understand the page layout and detect overlay layers:
    - MODAL/DIALOG: group of elements clustered in the CENTER of the viewport
    - DRAWER/SIDEBAR: group of elements clustered on the RIGHT or LEFT edge
@@ -1404,15 +1366,14 @@ Select the single best matching element.`;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * V7: Resolve step using LLM-first element selection with deterministic rules
+ * Resolve step using LLM-first element selection with deterministic pre-filter.
  *
  * Pipeline:
- * 1. Build HardAllowed/SoftAllowed sets via deterministic rules
- * 2. Check for short-circuit (exact quoted match)
- * 3. Count-based decision:
+ * 1. Build HardAllowed/SoftAllowed sets via structural rules (visibility, tag/role)
+ * 2. Count-based decision:
  *    - 0 allowed → Gemini Flash rescue (vision-enhanced)
- *    - 1 allowed → resolved
- *    - >1 allowed → LLM selection
+ *    - 1+ allowed → LLM selection (gemini-2.5-flash-lite)
+ * 3. Vision second opinion for visual elements (img/svg/canvas) if LLM can't match
  *
  * @returns LintResult with resolution metrics
  */
@@ -1472,8 +1433,8 @@ export async function resolveElement(params: {
   const intentText = sanitizeIntent(stepDraft);
 
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
-  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, intentText);
-  const { hardAllowed, softAllowed, ruleTrace, shortCircuitRef } = allowedResult;
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type);
+  const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
   
   // Diagnostic fields for trace logging
   const _diag = {
@@ -1491,49 +1452,9 @@ export async function resolveElement(params: {
     hardAllowedCount: hardAllowed.length,
     softAllowedCount: softAllowed.length,
     totalAllowed: allowedCount,
-    shortCircuitRef,
   });
 
-  // Step 3: Handle short-circuit case (exact quoted match)
-  if (shortCircuitRef) {
-    const shortCircuitNode = allAllowed.find(n => n.ref === shortCircuitRef);
-    if (shortCircuitNode) {
-      const lintCandidate: LintCandidate = {
-        ref: shortCircuitNode.ref,
-        label: shortCircuitNode.labelText || shortCircuitNode.ariaLabel || shortCircuitNode.text || shortCircuitNode.placeholder || `<${shortCircuitNode.tag}>`,
-        reason: 'Exact match',
-        confidence: 1.0,
-        boundingBox: shortCircuitNode.boundingBox,
-        node: shortCircuitNode,
-      };
-
-      logger.info('[ELEMENT_RESOLVER] Short-circuit resolved', {
-        event: 'lint_decision',
-        previewSessionId,
-        stepType: stepDraft.type,
-        status: 'resolved',
-        shortCircuitRef,
-        totalLatencyMs: Date.now() - startTime,
-      });
-
-      return {
-        status: 'resolved',
-        message: 'Element found by exact match',
-        confidence: 1.0,
-        candidates: [lintCandidate],
-        highlight: [{
-          ref: shortCircuitNode.ref,
-          boundingBox: shortCircuitNode.boundingBox,
-          type: 'success',
-        }],
-        cacheHit: false,
-        degradedMode: false,
-        ..._diag,
-      };
-    }
-  }
-
-  // Step 4: Handle case of 0 allowed elements
+  // Step 3: Handle case of 0 allowed elements
   // V5: Before giving up, try Gemini Flash rescue on excluded-but-visible nodes
   if (allowedCount === 0) {
     const allowedRefs = new Set([...hardAllowed, ...softAllowed].map(n => n.ref));
@@ -1598,6 +1519,7 @@ export async function resolveElement(params: {
 
         let bestNode: InteractiveNode | undefined;
         let bestDist = Infinity;
+        let isContainmentMatch = false;
 
         for (const node of domNodes) {
           if (!node.ref || !node.boundingBox || node.isVisible === false) continue;
@@ -1607,13 +1529,14 @@ export async function resolveElement(params: {
               bbCenterY >= nb.y && bbCenterY <= nb.y + nb.height) {
             // Prefer smallest element that contains the point (most specific)
             const area = nb.width * nb.height;
-            if (area < bestDist) { bestDist = area; bestNode = node; }
+            if (area < bestDist) { bestDist = area; bestNode = node; isContainmentMatch = true; }
           }
         }
 
         // Fallback: nearest center-to-center if no containment match (100px threshold)
         if (!bestNode) {
           bestDist = Infinity;
+          isContainmentMatch = false;
           for (const node of domNodes) {
             if (!node.ref || !node.boundingBox || node.isVisible === false) continue;
             const nb = node.boundingBox;
@@ -1625,35 +1548,62 @@ export async function resolveElement(params: {
         }
 
         if (bestNode) {
-          logger.info('[ELEMENT_RESOLVER] Vision rescue: matched by bounding box', {
-            event: 'gemini_rescue_bbox',
+          // V8: Vision already did semantic matching (Gemini saw the screenshot and
+          // identified the element). The coordinate mapping to DOM is a spatial lookup.
+          // Penalize confidence based on distance — farther = less reliable mapping.
+          // Containment match = reliable (vision center inside element). Center-to-center = less reliable.
+          const distancePenalty = isContainmentMatch ? 0 : Math.min(0.3, bestDist / 300);
+          const adjustedConfidence = Math.min(rescueResult.confidence, 0.85) - distancePenalty;
+
+          if (adjustedConfidence >= 0.3) {
+            logger.info('[ELEMENT_RESOLVER] Vision rescue: matched by bounding box', {
+              event: 'gemini_rescue_bbox',
+              previewSessionId,
+              ref: bestNode.ref,
+              visionBBox: bb,
+              nodeBBox: bestNode.boundingBox,
+              distance: bestDist,
+              isContainmentMatch,
+              adjustedConfidence,
+              totalLatencyMs: Date.now() - startTime,
+            });
+
+            const lintCandidate: LintCandidate = {
+              ref: bestNode.ref,
+              label: bestNode.labelText || bestNode.ariaLabel || bestNode.text || bestNode.placeholder || `<${bestNode.tag}>`,
+              reason: `Vision rescue (coordinates): ${rescueResult.reason}`,
+              confidence: adjustedConfidence,
+              boundingBox: bestNode.boundingBox,
+              node: bestNode,
+            };
+
+            // High distance = low confidence → return as needs_clarification instead of resolved
+            const status: LintStatus = adjustedConfidence >= 0.5 ? 'resolved' : 'needs_clarification';
+
+            return {
+              status,
+              message: status === 'resolved'
+                ? `Element found by vision coordinates: ${rescueResult.reason}`
+                : `Vision found a possible match but confidence is low. Is this the right element?`,
+              confidence: adjustedConfidence,
+              candidates: [lintCandidate],
+              highlight: [{ ref: bestNode.ref, boundingBox: bestNode.boundingBox, type: status === 'resolved' ? 'success' : 'warning' }],
+              cacheHit: false,
+              degradedMode: false,
+              ...(status === 'needs_clarification' ? { alternativesIncluded: true } : {}),
+              ..._diag,
+            };
+          }
+
+          // Too far from vision target — unreliable coordinate mapping
+          logger.info('[ELEMENT_RESOLVER] Vision rescue: bbox match rejected (low confidence after distance penalty)', {
+            event: 'gemini_rescue_bbox_rejected',
             previewSessionId,
             ref: bestNode.ref,
-            visionBBox: bb,
-            nodeBBox: bestNode.boundingBox,
             distance: bestDist,
+            adjustedConfidence,
             totalLatencyMs: Date.now() - startTime,
           });
-
-          const lintCandidate: LintCandidate = {
-            ref: bestNode.ref,
-            label: bestNode.labelText || bestNode.ariaLabel || bestNode.text || bestNode.placeholder || `<${bestNode.tag}>`,
-            reason: `Vision rescue (coordinates): ${rescueResult.reason}`,
-            confidence: Math.min(rescueResult.confidence, 0.85),
-            boundingBox: bestNode.boundingBox,
-            node: bestNode,
-          };
-
-          return {
-            status: 'resolved',
-            message: `Element found by vision coordinates: ${rescueResult.reason}`,
-            confidence: lintCandidate.confidence,
-            candidates: [lintCandidate],
-            highlight: [{ ref: bestNode.ref, boundingBox: bestNode.boundingBox, type: 'success' }],
-            cacheHit: false,
-            degradedMode: false,
-            ..._diag,
-          };
         }
       }
     }
@@ -1667,53 +1617,49 @@ export async function resolveElement(params: {
       totalLatencyMs: Date.now() - startTime,
     });
 
+    // V8: Include nearby suggestions so the user sees "Did you mean?" instead of dead end.
+    // Gather visible elements with labels as suggestions (regardless of tag compatibility).
+    const suggestions: LintCandidate[] = domNodes
+      .filter(n => n.ref && n.isVisible !== false && (n.labelText || n.ariaLabel || n.text))
+      .slice(0, 5)
+      .map(n => ({
+        ref: n.ref,
+        label: n.labelText || n.ariaLabel || n.text || n.placeholder || `<${n.tag}>`,
+        reason: 'Visible element on page',
+        confidence: 0,
+        boundingBox: n.boundingBox,
+        node: n,
+      }));
+
     return {
       status: 'not_found',
       message: 'No elements match your description on this page',
       confidence: 0,
-      candidates: [],
+      candidates: suggestions,
       highlight: [],
       needsAiFallback: true,
       degradedMode: false,
+      // V8: Signal to frontend to show suggestions as "Did you mean?" list
+      ...(suggestions.length > 0 ? { alternativesIncluded: true } : {}),
       ..._diag,
     };
   }
 
-  // Step 5: Handle case of exactly 1 allowed element → auto-resolve
+  // Step 5: Handle case of exactly 1 allowed element
+  // V8 FIX: Do NOT auto-resolve — always send to LLM for semantic verification.
+  // Without this, user types "login" but only 1 element passes tag filter (e.g. logo <a>)
+  // → system returns "Found element" with 0.9 confidence on a completely wrong element.
+  // LLM call is fast (~200ms via gemini-2.5-flash-lite) and can:
+  //   - Confirm match (including cross-language: "войти" = "login")
+  //   - Return not_found if the single element truly doesn't match
   if (allowedCount === 1) {
-    const singleNode = allAllowed[0];
-    const lintCandidate: LintCandidate = {
-      ref: singleNode.ref,
-      label: singleNode.labelText || singleNode.ariaLabel || singleNode.text || singleNode.placeholder || `<${singleNode.tag}>`,
-      reason: 'Single match',
-      confidence: 0.9,
-      boundingBox: singleNode.boundingBox,
-      node: singleNode,
-    };
-
-    logger.info('[ELEMENT_RESOLVER] Single allowed element', {
-      event: 'lint_decision',
+    logger.debug('[ELEMENT_RESOLVER] Single allowed element — sending to LLM for verification', {
       previewSessionId,
-      stepType: stepDraft.type,
-      status: 'resolved',
-      ref: singleNode.ref,
-      totalLatencyMs: Date.now() - startTime,
+      ref: allAllowed[0].ref,
+      intentText: intentText.slice(0, 50),
+      nodeLabel: (allAllowed[0].labelText || allAllowed[0].ariaLabel || allAllowed[0].text || '').slice(0, 50),
     });
-
-    return {
-      status: 'resolved',
-      message: 'Element found',
-      confidence: 0.9,
-      candidates: [lintCandidate],
-      highlight: [{
-        ref: singleNode.ref,
-        boundingBox: singleNode.boundingBox,
-        type: 'success',
-      }],
-      cacheHit: false,
-      degradedMode: false,
-      ..._diag,
-    };
+    // Falls through to Step 6 (LLM selection) below
   }
 
   // Step 6: Multiple allowed elements → LLM selection
@@ -1864,7 +1810,90 @@ export async function resolveElement(params: {
         }
       }
 
-      // LLM returned not_found
+      // LLM returned not_found — try Vision rescue as second opinion
+      // V8: When LLM can't match by text (e.g. user says "image with apple" but <img> has no alt),
+      // Vision can look at the actual screenshot and identify visual content.
+      if (llmResult.status === 'not_found' || (llmResult.status === 'resolved' && llmResult.confidence < 0.5)) {
+        // Check if candidates include visual elements that might need screenshot analysis
+        const VISUAL_TAGS = new Set(['img', 'canvas', 'svg', 'video', 'picture']);
+        const hasVisualCandidates = candidatesToProcess.some(
+          c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton
+        );
+
+        if (hasVisualCandidates && screenshotOrFn) {
+          logger.debug('[ELEMENT_RESOLVER] LLM inconclusive with visual elements — trying Vision rescue', {
+            previewSessionId,
+            llmStatus: llmResult.status,
+            llmConfidence: llmResult.confidence,
+            visualCandidateCount: candidatesToProcess.filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton).length,
+          });
+
+          // Capture screenshot for vision analysis
+          let visionScreenshot: string | undefined;
+          if (typeof screenshotOrFn === 'function') {
+            try { visionScreenshot = (await screenshotOrFn()) ?? undefined; } catch { /* non-critical */ }
+          } else {
+            visionScreenshot = screenshotOrFn;
+          }
+
+          if (visionScreenshot) {
+            // Pass visual candidates as the node list for vision to match against
+            const visualNodes = candidatesToProcess
+              .filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton)
+              .map(c => c.node);
+
+            const visionResult = await rescueWithGeminiFlash({
+              intentText,
+              actionType: stepDraft.type,
+              excludedNodes: visualNodes.length > 0 ? visualNodes : allAllowed,
+              pageUrl,
+              screenshot: visionScreenshot,
+            });
+
+            if (visionResult && visionResult.ref) {
+              // Search in candidatesToProcess first, then fall back to allAllowed
+              const visionNode = candidatesToProcess.find(c => c.node.ref === visionResult.ref)
+                || (allAllowed.find(n => n.ref === visionResult.ref) ? { node: allAllowed.find(n => n.ref === visionResult.ref)!, candidateText: '' } : undefined);
+              if (visionNode) {
+                logger.info('[ELEMENT_RESOLVER] Vision second opinion resolved visual element', {
+                  event: 'vision_second_opinion',
+                  previewSessionId,
+                  ref: visionResult.ref,
+                  confidence: visionResult.confidence,
+                  reason: visionResult.reason,
+                  totalLatencyMs: Date.now() - startTime,
+                });
+
+                const lintCandidate: LintCandidate = {
+                  ref: visionNode.node.ref,
+                  label: visionNode.node.labelText || visionNode.node.ariaLabel || visionNode.node.text || visionNode.node.placeholder || `<${visionNode.node.tag}>`,
+                  reason: `Vision match: ${visionResult.reason}`,
+                  confidence: visionResult.confidence,
+                  boundingBox: visionNode.node.boundingBox,
+                  node: visionNode.node,
+                };
+
+                return {
+                  status: visionResult.confidence >= 0.5 ? 'resolved' as LintStatus : 'needs_clarification' as LintStatus,
+                  message: `Element found by visual analysis: ${visionResult.reason}`,
+                  confidence: visionResult.confidence,
+                  candidates: [lintCandidate],
+                  highlight: [{
+                    ref: visionNode.node.ref,
+                    boundingBox: visionNode.node.boundingBox,
+                    type: visionResult.confidence >= 0.5 ? 'success' : 'warning',
+                  }],
+                  cacheHit: false,
+                  degradedMode: false,
+                  ..._diag,
+                };
+              }
+            }
+          }
+        }
+      }
+
+      // LLM returned not_found (and vision didn't help)
       if (llmResult.status === 'not_found') {
         const totalLatencyMs = Date.now() - startTime;
         logger.info('[ELEMENT_RESOLVER] LLM selection returned not_found', {
@@ -1877,15 +1906,28 @@ export async function resolveElement(params: {
           totalLatencyMs,
         });
 
+        // V8: Include top candidates as suggestions so user sees "Did you mean?"
+        const llmNotFoundSuggestions: LintCandidate[] = candidatesToProcess
+          .slice(0, 5)
+          .map(c => ({
+            ref: c.node.ref,
+            label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+            reason: 'Available on page',
+            confidence: 0,
+            boundingBox: c.node.boundingBox,
+            node: c.node,
+          }));
+
         return {
           status: 'not_found',
           message: llmResult.reason || 'No matching element found by AI',
           confidence: 0,
-          candidates: [],
+          candidates: llmNotFoundSuggestions,
           highlight: [],
           cacheHit,
           degradedMode: false,
           needsAiFallback: true,
+          ...(llmNotFoundSuggestions.length > 0 ? { alternativesIncluded: true } : {}),
           ..._diag,
           _llmTrace: llmTrace,
         };

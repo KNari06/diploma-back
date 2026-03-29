@@ -39,12 +39,26 @@ Your responsibilities:
 6. RESPOND to user directives (focus areas, skip requests)
 
 PRINCIPLES:
-- Auth flows must run BEFORE auth-gated flows
-- Prioritize diverse category coverage over depth in one category
+- Auth flows must run BEFORE auth-gated flows — always place login at priority 1
+- Prioritize DIVERSE category coverage over depth in one category (1 checkout + 1 search beats 3 checkout)
 - Critical business flows (login, checkout, registration) before secondary features
-- Consider page insights — pages with more interactive areas deserve more flows
-- Respect the user's scope hint
-- Be budget-aware — if only 5 flows remain, pick the 5 most valuable
+- Pages with more interactive areas deserve more flows allocated to them
+- Respect the user's scope hint — flows matching scope get priority boost
+- Be budget-aware — if only 5 flows remain, pick the 5 most valuable across different categories
+
+WHEN TO continueSurvey:
+- Set continueSurvey: true ONLY if: fewer than 3 pages discovered AND discovered pages reference unexplored sections, OR a specific unexplored URL was mentioned in page insights
+- Do NOT set continueSurvey: true just because coverage is low — explore what's already discovered first
+
+WHEN TO skipFlows:
+- Skip if same category has 3+ completed flows and coverage there is already good
+- Skip navigation-only flows (just clicking a link) if deeper flows on that page exist
+- Skip if budget is critically low (≤2 flows) — save for highest priority only
+
+strategyReasoning MUST explain:
+1. Why auth flows are ordered first (if applicable)
+2. Which categories you're prioritizing and why
+3. What you're skipping and the reason
 
 Respond with valid JSON only.`;
 
@@ -84,24 +98,28 @@ Apply this directive to your planning decisions.`);
     sections.push(`  [${page.id}] ${page.url} — ${page.pageType}, ${page.entryPointCount} entry points${page.requiresAuth ? ' [AUTH REQUIRED]' : ''}, depth=${page.depth}`);
   }
 
-  // Page insights (condensed)
+  // Page insights (condensed summary to save tokens)
   if (input.pageInsights.length > 0) {
     sections.push(`\nPAGE INSIGHTS:`);
     for (const insight of input.pageInsights) {
-      const parts: string[] = [`  ${insight.pageId} (${insight.pageType}):`];
-      if (insight.interactiveAreas.length > 0) parts.push(`    Areas: ${insight.interactiveAreas.join(', ')}`);
-      if (insight.dataEntities.length > 0) parts.push(`    Data: ${insight.dataEntities.join(', ')}`);
-      if (insight.stateIndicators.length > 0) parts.push(`    State: ${insight.stateIndicators.join(', ')}`);
-      parts.push(`    Complexity: ${insight.complexity}`);
-      sections.push(parts.join('\n'));
+      const summary: string[] = [];
+      if (insight.interactiveAreas.length > 0) summary.push(`${insight.interactiveAreas.length} interactive areas`);
+      if (insight.forms?.length > 0) summary.push(`${insight.forms.length} forms`);
+      if (insight.dataEntities.length > 0) summary.push(`data: ${insight.dataEntities.slice(0, 3).join(', ')}${insight.dataEntities.length > 3 ? '...' : ''}`);
+      if (insight.stateIndicators.length > 0) summary.push(`state: ${insight.stateIndicators.slice(0, 2).join(', ')}${insight.stateIndicators.length > 2 ? '...' : ''}`);
+      summary.push(insight.complexity);
+      sections.push(`  ${insight.pageId} (${insight.pageType}): ${summary.join(' | ')}`);
     }
   }
 
-  // All entry points
+  // All entry points — condense goal for large lists to save tokens
   sections.push(`\nALL ENTRY POINTS (${input.allEntryPoints.length}):`);
+  const showFullGoal = input.allEntryPoints.length <= 20;
   for (const ep of input.allEntryPoints) {
-    sections.push(`  [${ep.id}] "${ep.name}" — ${ep.category}, ${ep.priority}, ${ep.estimatedComplexity}${ep.requiresAuth ? ' [AUTH]' : ''}${ep.dependsOn ? ` [depends on: ${ep.dependsOn}]` : ''}`);
-    sections.push(`    Goal: ${ep.goal}`);
+    const goalText = showFullGoal
+      ? `\n    Goal: ${ep.goal}`
+      : `  | goal: ${ep.goal.slice(0, 60)}${ep.goal.length > 60 ? '…' : ''}`;
+    sections.push(`  [${ep.id}] "${ep.name}" — ${ep.category}, ${ep.priority}${ep.requiresAuth ? ' [AUTH]' : ''}${ep.dependsOn ? ` [depends: ${ep.dependsOn}]` : ''}${goalText}`);
   }
 
   // Completed flows (if re-evaluating)

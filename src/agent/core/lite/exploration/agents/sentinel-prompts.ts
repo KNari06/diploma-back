@@ -24,11 +24,11 @@ export const SENTINEL_SYSTEM_PROMPT = `You are a QA coverage evaluator (Sentinel
 
 Your job is to:
 1. ESTIMATE coverage score (0-100) based on what was tested vs what exists
-2. IDENTIFY gaps — areas that exist but weren't tested
+2. IDENTIFY gaps — areas that exist but weren't tested (max 5 gaps, most important only)
 3. DECIDE whether to continue exploring or stop
-4. PRODUCE a user-facing quality summary
-5. FLAG risk areas where errors were found
-6. RECOMMEND actionable improvements
+4. PRODUCE a user-facing quality summary (2-3 sentences, plain language, no jargon)
+5. FLAG risk areas where errors were found, with severity: "warning" or "error"
+6. RECOMMEND actionable improvements (max 3 recommendations)
 
 COVERAGE SCORING GUIDELINES:
 - 90-100: Excellent — all major flows tested, all categories covered
@@ -37,16 +37,24 @@ COVERAGE SCORING GUIDELINES:
 - 30-49: Partial — only some areas covered, important gaps
 - 0-29: Minimal — very few flows tested
 
-CONTINUE EXPLORING when:
-- Coverage score < 70 AND budget allows
-- Critical categories (auth, checkout) haven't been tested
-- Pages with many entry points were discovered but not explored
+SCORING CALIBRATION:
+- Each distinct category tested = +15 pts base
+- Each critical/high flow passing = +5 pts
+- Blocked or failed critical flows = -10 pts each
+- Pages discovered but 0 flows tested = -5 pts each
 
-STOP EXPLORING when:
-- Coverage score >= 80
-- Budget is nearly exhausted
-- Remaining flows are low-priority
+CONTINUE EXPLORING when (ALL must be true):
+- Coverage score < 75
+- Budget allows (2+ flows remaining)
+- There are specific untested categories or high-priority flows still in queue
+
+STOP EXPLORING when (ANY is true):
+- Coverage score >= 75
+- Budget is nearly exhausted (≤1 flow remaining)
 - All critical and high-priority flows have been tested
+- Remaining flows are only low-priority or already-covered categories
+
+riskAreas format: "severity:area — description", e.g. "error:checkout — 3 console errors during payment"
 
 Respond with valid JSON only.`;
 
@@ -118,10 +126,10 @@ export function buildSentinelPrompt(input: SentinelInput): string {
   "coverageScore": 72,
   "gaps": ["Search functionality not tested", "Settings page has 5 flows, none explored"],
   "continueExploring": true,
-  "focusNext": ["search", "settings"],
-  "qualitySummary": "Good coverage of authentication and e-commerce flows. Missing: search functionality and user settings. 3 console errors found in checkout.",
-  "recommendations": ["Test search with various query types", "Explore settings page — 5 entry points found but none tested"],
-  "riskAreas": ["Checkout page has 3 console errors", "Login fails intermittently"]
+  "focusNext": ["search", "user_management"],
+  "qualitySummary": "Good coverage of login and product browsing. Missing search and account settings — both have multiple interactive areas. Checkout has console errors that need investigation.",
+  "recommendations": ["Test search with product keywords", "Explore settings — 5 entry points found but none tested", "Retry checkout flow — 3 errors indicate potential payment issues"],
+  "riskAreas": ["error:checkout — 3 console errors during payment step", "warning:login — intermittent navigation timeout"]
 }`);
 
   return sections.join('\n');

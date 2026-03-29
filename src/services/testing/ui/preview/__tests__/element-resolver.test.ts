@@ -304,7 +304,7 @@ describe('ElementResolverService', () => {
         { tag: 'input', ref: 'e2', isVisible: true },
       ];
 
-      const { hardAllowed } = buildAllowedSets(nodes, 'type', 'username');
+      const { hardAllowed } = buildAllowedSets(nodes, 'type');
       expect(hardAllowed.map(n => n.ref)).toEqual(['e2']);
     });
 
@@ -314,7 +314,7 @@ describe('ElementResolverService', () => {
         { tag: 'input', ref: 'e2', isVisible: true, isDisabled: false },
       ];
 
-      const { hardAllowed } = buildAllowedSets(nodes, 'type', 'username');
+      const { hardAllowed } = buildAllowedSets(nodes, 'type');
       expect(hardAllowed.map(n => n.ref)).toEqual(['e2']);
     });
 
@@ -324,18 +324,19 @@ describe('ElementResolverService', () => {
         { tag: 'input', ref: 'e2', isVisible: true },
       ];
 
-      const { hardAllowed } = buildAllowedSets(nodes, 'type', 'username');
+      const { hardAllowed } = buildAllowedSets(nodes, 'type');
       expect(hardAllowed.map(n => n.ref)).toEqual(['e2']);
     });
 
-    it('should short-circuit on exact quoted match', () => {
+    it('should NOT short-circuit on quoted match — all text matching delegated to LLM (V8)', () => {
       const nodes: InteractiveNode[] = [
         { tag: 'button', ref: 'e1', isVisible: true, text: 'Login' },
         { tag: 'button', ref: 'e2', isVisible: true, text: 'Register' },
       ];
 
-      const { shortCircuitRef } = buildAllowedSets(nodes, 'click', "click 'Login'");
-      expect(shortCircuitRef).toBe('e1');
+      const result = buildAllowedSets(nodes, 'click');
+      // Both elements should be in allowed sets for LLM (no short-circuit, no text matching)
+      expect(result.hardAllowed.length + result.softAllowed.length).toBe(2);
     });
   });
 

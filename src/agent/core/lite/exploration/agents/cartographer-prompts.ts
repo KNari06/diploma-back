@@ -37,11 +37,26 @@ RULES:
 - Be comprehensive — find ALL real user journeys, not just obvious ones
 - Prioritize interactive flows (forms, CTAs, buttons) over passive content
 - Authentication flows are always critical priority
-- Do NOT list destructive flows (delete account, cancel subscription)
-- Do NOT list overlay/popup noise (cookie consent, newsletter signups, chat widgets)
+- Do NOT list truly destructive flows only (delete account, wipe all data, permanently ban user) — other delete/cancel actions like "cancel order", "remove from cart", "delete review" ARE valid test flows
+- Do NOT list pure UI noise: cookie banners, generic chat widget openers, "close modal" buttons
 - Do NOT include duplicate flows
-- Goals must be specific and actionable for automated execution
-- Consider the exploration context — avoid duplicating what's already been discovered
+- Goals must be SPECIFIC — bad: "Use the search", good: "Search for a product by keyword and verify results appear"
+- Set recommendDeeper: true if the page has multiple unexplored sections, tabs, or sub-navigation
+- Consider the exploration context — avoid duplicating what's already been discovered on other pages
+
+VISUAL ANALYSIS (when screenshot is provided):
+- Use the screenshot to confirm layout structure and identify visual interactive areas
+- Detect navigation patterns (sidebar, top nav, breadcrumbs, hamburger menu) from visual layout
+- Identify forms, CTAs, and interactive components that may not have semantic HTML markup
+- Use visual hierarchy to inform priority — prominent/large CTAs are higher priority
+- Detect visual indicators of auth state (user avatar, logout button, login link)
+- Look for tabbed interfaces, accordions, carousels that may hide interactive content
+- If the screenshot shows a mostly blank or loading page, set skipReason accordingly
+
+CREDENTIAL DETECTION:
+- Look for test credentials, demo accounts, or sample login info displayed on the page
+- Common patterns: "Username: ...", "Password: ...", "Demo account:", "Test credentials:"
+- Report any found in authDetection.testCredentials field
 
 Respond with valid JSON only.`;
 
@@ -60,6 +75,10 @@ export function buildCartographerPrompt(input: CartographerInput, preFormattedSn
   sections.push(`PAGE URL: ${input.url}`);
   sections.push(`PAGE TITLE: ${input.title}`);
   sections.push(`BFS DEPTH: ${input.depth}`);
+
+  if (input.productContext) {
+    sections.push(`PRODUCT CONTEXT:\n${input.productContext}`);
+  }
 
   if (input.scopeHint) {
     sections.push(`SCOPE HINT: Focus on "${input.scopeHint}" related flows, but also identify other important flows.`);
@@ -233,6 +252,14 @@ export function parseCartographerResponse(raw: string, pageId: string): Cartogra
             ? parsed.authDetection.loginFormRef : undefined,
           loginUrl: typeof parsed.authDetection.loginUrl === 'string'
             ? parsed.authDetection.loginUrl : undefined,
+          testCredentials: parsed.authDetection.testCredentials && typeof parsed.authDetection.testCredentials === 'object'
+            ? {
+                username: typeof parsed.authDetection.testCredentials.username === 'string'
+                  ? parsed.authDetection.testCredentials.username : undefined,
+                password: typeof parsed.authDetection.testCredentials.password === 'string'
+                  ? parsed.authDetection.testCredentials.password : undefined,
+              }
+            : undefined,
         }
       : { isLoginPage: false, isAuthGated: false };
 

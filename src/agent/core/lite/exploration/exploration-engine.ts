@@ -174,6 +174,7 @@ export class ExplorationEngine {
       timestamp: Date.now(),
       tree: bb.tree.toCheckpoint(),
       budget: budget.toCheckpoint(),
+      pageInsights: Array.from(bb.pageInsights.entries()),
     });
 
     if (allEntryPoints.length === 0) {
@@ -218,8 +219,51 @@ export class ExplorationEngine {
       focusAreas: bb.currentStrategy.focusAreas,
     });
 
-    // TODO: If Strategist wants more survey, run targeted survey here
-    // if (bb.currentStrategy.continueSurvey && bb.currentStrategy.surveyTargets?.length) { ... }
+    // If Strategist wants more survey, run targeted survey on specific URLs
+    if (bb.currentStrategy.continueSurvey && bb.currentStrategy.surveyTargets?.length) {
+      logger.info('[EXPLORATION] Strategist requested targeted survey', {
+        targets: bb.currentStrategy.surveyTargets,
+      });
+
+      try {
+        const targetedSurveyContext = await this.browser.newContext({
+          viewport: { width: 1280, height: 720 },
+          ignoreHTTPSErrors: true,
+        });
+
+        try {
+          const targetedPage = await targetedSurveyContext.newPage();
+          try {
+            const { setupThirdPartyBlocker } = await import('@/agent/playwright/execution/third-party-blocker');
+            await setupThirdPartyBlocker(targetedPage);
+          } catch { /* non-fatal */ }
+
+          const targetedSurvey = new SurveyAgent(targetedPage, this.config, budget, rateLimiter, trace);
+          const updatedTree = await targetedSurvey.surveyTargets(
+            bb.currentStrategy.surveyTargets,
+            bb.tree!,
+          );
+          bb.tree = updatedTree;
+
+          // Rebuild queue with new entry points from targeted survey
+          const updatedEntryPoints = bb.tree.getAllEntryPoints();
+          bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, bb.currentStrategy);
+
+          logger.info('[EXPLORATION] Targeted survey complete', {
+            newPages: updatedTree.getNodeCount(),
+            newEntryPoints: updatedEntryPoints.length,
+          });
+
+          await targetedPage.close();
+        } finally {
+          await targetedSurveyContext.close();
+        }
+      } catch (err) {
+        logger.warn('[EXPLORATION] Targeted survey failed, continuing with existing queue', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     // ════════════════════════════════════════════════════════════════════
     // PHASE 2: FLOW EXPLORATION
@@ -228,6 +272,10 @@ export class ExplorationEngine {
     // ════════════════════════════════════════════════════════════════════
 
     logger.info('[EXPLORATION] Phase 2: Starting flow exploration');
+    this.emitProgress('flow', 'strategy_planned', {
+      phase: 'executing',
+      totalFlowsPlanned: bb.queue?.size() ?? 0,
+    }, 30);
     trace.writePhaseStart('flow');
     trace.writeQueueState({
       pendingCount: bb.queue.size(),
@@ -235,7 +283,7 @@ export class ExplorationEngine {
       totalEnqueued: bb.queue.size(),
     });
 
-    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace);
+    const flowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace, bb);
 
     // Periodic checkpoint callback
     let lastCheckpointFlows = 0;
@@ -256,6 +304,7 @@ export class ExplorationEngine {
             flowsCompleted: completedTasks.length,
             completedTasks,
           },
+          pageInsights: Array.from(bb.pageInsights.entries()),
         });
       }
     });
@@ -326,7 +375,7 @@ export class ExplorationEngine {
       }
 
       if (bb.queue && !bb.queue.isEmpty()) {
-        const extraFlowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace);
+        const extraFlowRunner = new FlowRunner(this.browser, this.config, budget, this.onProgress, rateLimiter, trace, bb);
         try {
           const extraTasks = await extraFlowRunner.runAll(bb.queue);
           flowTasks = [...flowTasks, ...extraTasks];
@@ -344,7 +393,7 @@ export class ExplorationEngine {
     // BUILD RESULT
     // ════════════════════════════════════════════════════════════════════
 
-    const skippedEntryPoints = bb.queue.remaining();
+    const skippedEntryPoints = bb.queue?.remaining() ?? [];
 
     const builder = new TestCaseBuilder();
     const result = builder.build(bb.tree, flowTasks, budget, this.config, startTime, skippedEntryPoints);
@@ -360,14 +409,18 @@ export class ExplorationEngine {
 
     await ExplorationStorageService.clearCheckpoint(this.config.explorationId);
 
-    this.emitProgress('complete', 'survey_complete', {
+    this.emitProgress('complete', 'coverage_evaluated', {
       testCases: result.testCases.length,
       flowsPassed: result.summary.flowsPassed,
       flowsFailed: result.summary.flowsFailed,
       flowsBlocked: result.summary.flowsBlocked,
       totalSteps: result.summary.totalStepsDiscovered,
-      coverageScore: bb.coverageAssessment?.coverageScore,
-      qualitySummary: bb.coverageAssessment?.qualitySummary,
+      coverageScore: bb.coverageAssessment?.coverageScore ?? 0,
+      qualitySummary: bb.coverageAssessment?.qualitySummary ?? '',
+      gaps: bb.coverageAssessment?.gaps ?? [],
+      recommendations: bb.coverageAssessment?.recommendations ?? [],
+      riskAreas: bb.coverageAssessment?.riskAreas ?? [],
+      continueExploring: false,
     }, 100);
 
     trace.writeExplorationEnd({

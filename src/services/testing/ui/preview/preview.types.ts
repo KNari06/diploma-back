@@ -121,6 +121,20 @@ export interface InteractiveNode {
   hasAriaHaspopup?: boolean;
   /** Nearby sibling/row text for disambiguation of duplicate elements (e.g. row context in tables) */
   nearText?: string;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V8: Visual properties for LLM element matching
+  // ═══════════════════════════════════════════════════════════════════════════
+  /** Named background color (e.g. "red", "grey", "blue", "white", "transparent") */
+  backgroundColor?: string;
+  /** Named text/foreground color (e.g. "black", "white", "red") */
+  textColor?: string;
+  /** Shape hint based on border-radius ("rounded" | "pill" | "circle" | "square") */
+  shapeHint?: string;
+  /** CSS class names related to icons (e.g. "fa-gear material-icons") */
+  iconClasses?: string;
+  /** Semantic size category based on pixel dimensions */
+  sizeHint?: 'small' | 'medium' | 'large';
 }
 
 /**
@@ -586,7 +600,7 @@ export interface LintResult {
   clarificationQuestion?: string;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // V7: LLM-based resolver fields
+  // LLM-based resolver fields
   // ═══════════════════════════════════════════════════════════════════════════
   /** True if LLM resolver failed and rule-based fallback was used */
   degradedMode?: boolean;
@@ -603,7 +617,7 @@ export interface LintResult {
   // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)
   // ═══════════════════════════════════════════════════════════════════════════
   /** @internal Rule trace from buildAllowedSets */
-  _ruleTrace?: Array<{ ruleId: string; version: string; action: 'exclude' | 'boost' | 'penalize' | 'shortcircuit'; evidence: string; affectedRefs: string[] }>;
+  _ruleTrace?: Array<{ ruleId: string; version: string; action: 'exclude' | 'boost' | 'penalize'; evidence: string; affectedRefs: string[] }>;
   /** @internal Hard allowed count */
   _hardAllowedCount?: number;
   /** @internal Soft allowed count */
@@ -704,7 +718,7 @@ export interface StepRuntimeMeta {
   autoWaitMs?: number;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // V7: Resolution path and network correlation
+  // Resolution path and network correlation
   // ═══════════════════════════════════════════════════════════════════════════
   /**
    * Which resolution path was used to find the element
