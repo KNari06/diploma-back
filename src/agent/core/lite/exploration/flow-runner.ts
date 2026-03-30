@@ -1287,6 +1287,21 @@ export class FlowRunner {
 
       const scoutResult = await this.scout.detect(scoutInput);
 
+      // Filter out branches discovered on external domains
+      const currentOrigin = new URL(page.url()).origin;
+      const entryOrigin = new URL(this.config.entryUrl).origin;
+      const isExternalPage = currentOrigin !== entryOrigin;
+
+      if (isExternalPage) {
+        logger.info('[FLOW_RUNNER] Skipping Scout branches — flow ended on external domain', {
+          flow: completedEntry.name,
+          pageOrigin: currentOrigin,
+          entryOrigin,
+          branchesSkipped: scoutResult.newEntryPoints.length,
+        });
+        return [];
+      }
+
       return scoutResult.newEntryPoints.map((bp, index) => ({
         ...bp,
         id: `ep-scout-${completedEntry.id}-${index}`,
