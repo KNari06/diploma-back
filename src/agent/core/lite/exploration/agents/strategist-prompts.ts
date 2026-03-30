@@ -56,6 +56,7 @@ WHEN TO skipFlows:
 - Skip if same category has 3+ completed flows and coverage there is already good
 - Skip navigation-only flows (just clicking a link) if deeper flows on that page exist
 - Skip if budget is critically low (≤2 flows) — save for highest priority only
+- Skip flows that reference external/third-party services (e.g., "Log in to Udemy", "Buy on Amazon") — these navigate away from the app under test and waste budget
 
 strategyReasoning MUST explain:
 1. Why auth flows are ordered first (if applicable)

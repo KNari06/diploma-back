@@ -592,7 +592,25 @@ export class ActionExecutor {
         ).catch(() => false);
 
         if (isNativeSelect) {
-          await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+          try {
+            await locator.selectOption(cmd.value, { timeout: 5000 });
+          } catch {
+            // Fallback: set value directly via DOM when Playwright selectOption hangs
+            await this.page.evaluate(
+              ({ ref, value }) => {
+                const select = document.querySelector(`[data-agent-ref="${ref}"]`) as HTMLSelectElement | null;
+                if (!select) return;
+                for (const opt of Array.from(select.options)) {
+                  if (opt.text.trim().toLowerCase() === value.toLowerCase() || opt.value === value) {
+                    select.value = opt.value;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                  }
+                }
+              },
+              { ref: cmd.ref, value: cmd.value },
+            );
+          }
         } else {
           await this.selectFromCustomDropdown(locator, cmd.value || '', this.DEFAULT_TIMEOUT);
         }
@@ -1075,7 +1093,24 @@ export class ActionExecutor {
           ).catch(() => false);
 
           if (isNativeFallback) {
-            await locator.selectOption(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
+            try {
+              await locator.selectOption(cmd.value, { timeout: 5000 });
+            } catch {
+              await this.page.evaluate(
+                ({ ref, value }) => {
+                  const select = document.querySelector(`[data-agent-ref="${ref}"]`) as HTMLSelectElement | null;
+                  if (!select) return;
+                  for (const opt of Array.from(select.options)) {
+                    if (opt.text.trim().toLowerCase() === value.toLowerCase() || opt.value === value) {
+                      select.value = opt.value;
+                      select.dispatchEvent(new Event('change', { bubbles: true }));
+                      return;
+                    }
+                  }
+                },
+                { ref: cmd.ref, value: cmd.value },
+              );
+            }
           } else {
             await this.selectFromCustomDropdown(locator, cmd.value, this.FALLBACK_TIMEOUT);
           }
