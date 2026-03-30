@@ -608,6 +608,7 @@ export interface TreeCheckpoint {
   visitedContentHashes: string[];
   allEntryPoints: Array<[string, EntryPoint]>;
   nodeIdCounter: number;
+  discoveredNavLinks?: Array<[string, { url: string; label: string; sourcePageUrl: string }]>;
 }
 
 export interface BudgetCheckpoint {

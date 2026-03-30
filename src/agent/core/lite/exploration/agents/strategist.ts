@@ -170,6 +170,7 @@ export class ExplorationStrategist {
       hasCredentials: this.bb.hasCredentials,
       scopeHint: this.bb.scopeHint,
       userDirective,
+      unvisitedNavLinks: this.bb.tree?.getUnvisitedNavLinks() ?? [],
     };
   }
 

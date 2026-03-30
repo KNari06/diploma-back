@@ -609,19 +609,24 @@ export class SurveyAgent {
         for (const link of navLinks) {
           // Resolve link URL from element ref
           const linkUrl = await this.resolveLinkUrl(link.ref, snapshot);
-          if (linkUrl && !this.tree.isVisited(linkUrl) && !enqueuedUrls.has(linkUrl) && this.isSameOrigin(linkUrl)) {
-            enqueuedUrls.add(linkUrl);
-            queue.push({
-              url: linkUrl,
-              depth: item.depth + 1,
-              parentNodeId: nodeId,
-              navAction: {
-                type: 'click_link',
-                ref: link.ref,
-                label: link.label,
-                targetUrl: linkUrl,
-              },
-            });
+          if (linkUrl && this.isSameOrigin(linkUrl)) {
+            // Register ALL discovered nav links so Strategist can see unvisited ones
+            this.tree.registerNavLink(linkUrl, link.label, this.page.url());
+
+            if (!this.tree.isVisited(linkUrl) && !enqueuedUrls.has(linkUrl)) {
+              enqueuedUrls.add(linkUrl);
+              queue.push({
+                url: linkUrl,
+                depth: item.depth + 1,
+                parentNodeId: nodeId,
+                navAction: {
+                  type: 'click_link',
+                  ref: link.ref,
+                  label: link.label,
+                  targetUrl: linkUrl,
+                },
+              });
+            }
           }
         }
 
@@ -932,6 +937,12 @@ export class SurveyAgent {
             ref: a.getAttribute('data-agent-ref') || '',
           })).filter(l => l.href && l.text && !l.href.startsWith('javascript:') && !l.href.startsWith('#') && l.ref),
         );
+        // Register discovered nav link URLs in the tree so Strategist knows about them
+        for (const l of domNavLinks) {
+          if (l.href && this.isSameOrigin(l.href)) {
+            this.tree.registerNavLink(l.href, l.text, url);
+          }
+        }
         fallbackNavLinks = domNavLinks.slice(0, MAX_NAV_LINKS_PER_PAGE).map(l => ({
           ref: l.ref,
           label: l.text,

@@ -47,8 +47,10 @@ PRINCIPLES:
 - Be budget-aware — if only 5 flows remain, pick the 5 most valuable across different categories
 
 WHEN TO continueSurvey:
-- Set continueSurvey: true ONLY if: fewer than 3 pages discovered AND discovered pages reference unexplored sections, OR a specific unexplored URL was mentioned in page insights
+- Set continueSurvey: true if: fewer than 3 pages discovered AND there are UNVISITED NAV LINKS available, OR a specific unexplored URL was mentioned in page insights
+- When setting continueSurvey: true, populate surveyTargets with SPECIFIC URLs from the UNVISITED NAV LINKS section — never use already-visited page URLs
 - Do NOT set continueSurvey: true just because coverage is low — explore what's already discovered first
+- Do NOT put already-visited URLs in surveyTargets — they will be skipped
 
 WHEN TO skipFlows:
 - Skip if same category has 3+ completed flows and coverage there is already good
@@ -109,6 +111,17 @@ Apply this directive to your planning decisions.`);
       if (insight.stateIndicators.length > 0) summary.push(`state: ${insight.stateIndicators.slice(0, 2).join(', ')}${insight.stateIndicators.length > 2 ? '...' : ''}`);
       summary.push(insight.complexity);
       sections.push(`  ${insight.pageId} (${insight.pageType}): ${summary.join(' | ')}`);
+    }
+  }
+
+  // Unvisited nav links — concrete URLs the Strategist can suggest as surveyTargets
+  if (input.unvisitedNavLinks.length > 0) {
+    sections.push(`\nUNVISITED NAV LINKS (${input.unvisitedNavLinks.length} — discovered but not yet surveyed):`);
+    for (const link of input.unvisitedNavLinks.slice(0, 15)) {
+      sections.push(`  "${link.label}" → ${link.url} (found on ${link.sourcePageUrl})`);
+    }
+    if (input.unvisitedNavLinks.length > 15) {
+      sections.push(`  ... and ${input.unvisitedNavLinks.length - 15} more`);
     }
   }
 
