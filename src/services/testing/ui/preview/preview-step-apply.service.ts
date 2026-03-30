@@ -964,6 +964,45 @@ async function executeAction(
         const value = normalizeTypeActionValue(step.value);
         const humanLike = step.options?.humanLike === true;
 
+        // ═══════════════ V9: Special input detection ═══════════════
+        // Range sliders, color pickers, date/time inputs, and custom ARIA sliders
+        // need nativeInputValueSetter — fill()/pressSequentially() fail on these.
+        {
+          const { detectSpecialInput, setNativeInputValue, setAriaSliderValue, validateInputValue } =
+            await import('@/agent/playwright/core/native-input-helpers');
+
+          // Fast-path: check binding hints from recording layer (no DOM query needed)
+          const hintType = step.bindingHints?.type?.toLowerCase() || '';
+          const specialHintTypes = ['range', 'color', 'date', 'time', 'datetime-local', 'month', 'week'];
+          const isSpecialByHint = specialHintTypes.includes(hintType);
+
+          // Slow-path: runtime DOM detection (only if hint didn't match)
+          const specialInput = isSpecialByHint
+            ? { isSpecialInput: true as const, strategy: 'nativeValueSetter' as const, inputType: hintType }
+            : await detectSpecialInput(locator).catch((): { isSpecialInput: false; strategy: 'default'; inputType?: undefined } =>
+                ({ isSpecialInput: false, strategy: 'default', inputType: undefined }));
+
+          if (specialInput.isSpecialInput) {
+            const detectedType = specialInput.inputType || hintType;
+            const validation = validateInputValue(detectedType, value);
+            if (validation.warning) {
+              logger.warn('[EXECUTE_ACTION] Input value format warning', { warning: validation.warning, value, inputType: detectedType });
+            }
+
+            if (specialInput.strategy === 'ariaSlider') {
+              await setAriaSliderValue(page, locator, value);
+            } else {
+              await setNativeInputValue(locator, value);
+            }
+
+            if (step.options?.pressEnter) {
+              await locator.press('Enter', { timeout });
+            }
+            break;
+          }
+        }
+        // ═══════════════ END V9 ═══════════════
+
         // V13: Paste mode — write to clipboard then dispatch paste via keyboard shortcut.
         // Web apps that listen for 'paste' events (OTP fields, code editors) won't trigger with fill().
         if (step.options?.isPaste) {
@@ -1275,6 +1314,29 @@ async function executeAction(
         } else {
           throw new Error('drag_and_drop requires coordinate data (value) or a dropTarget option');
         }
+        break;
+      }
+
+      // V16: Swipe gesture — for carousels (Swiper, Slick, Embla), mobile-like interactions
+      case 'swipe': {
+        if (!locator) throw new Error('No selector for swipe action');
+        const { executeSwipe } = await import('@/agent/playwright/core/native-input-helpers');
+        const swipeDir = (step.value?.toLowerCase() || 'left') as 'left' | 'right' | 'up' | 'down';
+        if (!['left', 'right', 'up', 'down'].includes(swipeDir)) {
+          throw new Error(`Invalid swipe direction: "${step.value}" — must be left, right, up, or down`);
+        }
+        await executeSwipe(page, locator, swipeDir);
+        break;
+      }
+
+      // V16: Click at coordinates — for canvas, maps, charts (elements without DOM targets)
+      case 'click_at': {
+        const { parseClickAtCoordinates, clickAtCoordinates } = await import('@/agent/playwright/core/native-input-helpers');
+        const coords = parseClickAtCoordinates(step.value);
+        if (!coords) {
+          throw new Error(`Invalid coordinates: "${step.value}" — use "x,y" format (e.g., "500,300")`);
+        }
+        await clickAtCoordinates(page, coords);
         break;
       }
 

@@ -49,7 +49,7 @@ const TELEGRAM_TOOLS: ChatCompletionTool[] = [
             description: 'Optional label for this bot (e.g. "QA Notifications")',
           },
         },
-        required: ['bot_token'],
+        required: ['bot_token', 'chat_id'],
       },
     },
   },
@@ -325,6 +325,14 @@ async function handleConnect(
     };
   }
 
+  if (!chat_id) {
+    return {
+      success: false,
+      message: 'chat_id is required for notifications to work. Ask user to send a message to the bot, then get their chat ID from @userinfobot or @getidsbot.',
+      displayToUser: true,
+    };
+  }
+
   // Validate token format
   if (!/^\d+:[\w-]+$/.test(bot_token)) {
     return {
@@ -361,7 +369,7 @@ async function handleConnect(
     await IntegrationTokenService.saveToken(context.userId, context.workspaceId, 'telegram', {
       access_token: bot_token,
       token_type: 'Bot',
-      external_id: chat_id ? String(chat_id) : botInfo.username,
+      external_id: String(chat_id),
       external_url: `https://t.me/${botInfo.username}`,
       metadata: {
         bot_id: botInfo.id,
@@ -392,9 +400,9 @@ async function handleConnect(
     data: {
       botUsername: botInfo.username,
       botName: botInfo.first_name,
-      chatId: chat_id || null,
+      chatId: chat_id,
     },
-    message: `Telegram bot @${botInfo.username} connected successfully.${chat_id ? ` Default chat set to ${chat_id}.` : ' You can now send messages by providing a chat_id.'}`,
+    message: `Telegram bot @${botInfo.username} connected successfully. Default chat set to ${chat_id}.`,
     displayToUser: true,
   };
 }

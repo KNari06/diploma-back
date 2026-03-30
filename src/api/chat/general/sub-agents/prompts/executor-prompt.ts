@@ -35,7 +35,7 @@ When user asks to "integrate X", "connect X", "set up X", "подключить 
 1. Call {service}_status FIRST to check if already connected
 2. If already connected → tell user it's connected, show details
 3. If NOT connected → do NOT call {service}_connect yet (you don't have the credentials). Instead, respond with CLEAR step-by-step setup instructions:
-   - Telegram: "To connect Telegram: 1) Open Telegram, find @BotFather 2) Send /newbot and follow the prompts 3) Copy the bot token (looks like 123456789:ABCdef...) 4) Paste it here and I'll connect it"
+   - Telegram: "To connect Telegram: 1) Open Telegram, find @BotFather 2) Send /newbot and follow the prompts 3) Copy the bot token (looks like 123456789:ABCdef...) 4) Get your Chat ID — send any message to @userinfobot or @getidsbot and it will reply with your ID 5) Paste both the bot token and chat ID here"
    - Slack: "To connect Slack: 1) Go to api.slack.com/apps 2) Create or select your app 3) Enable Incoming Webhooks 4) Copy the Webhook URL 5) Paste it here"
    - Jira: "I'll generate an authorization link for you" → call jira_connect immediately (OAuth flow)
    - GitHub: "I'll generate an authorization link for you" → call github_connect immediately (OAuth flow)

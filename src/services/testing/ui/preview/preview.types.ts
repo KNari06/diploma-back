@@ -209,7 +209,10 @@ export type IntentActionType =
   // V13: File download verification (auto-recorded when download triggers)
   | 'download'
   // V15: Multi-tab support — explicit tab switch
-  | 'switch_tab';
+  | 'switch_tab'
+  // V16: Gesture and coordinate actions (carousels, canvas, maps)
+  | 'swipe'
+  | 'click_at';
 
 /**
  * Binding hints for element resolution
