@@ -135,6 +135,8 @@ export interface InteractiveNode {
   iconClasses?: string;
   /** Semantic size category based on pixel dimensions */
   sizeHint?: 'small' | 'medium' | 'large';
+  /** Source iframe name/id if element is inside a same-origin iframe */
+  iframeSource?: string;
 }
 
 /**
@@ -610,10 +612,6 @@ export interface LintResult {
   needsAiFallback?: boolean;
   /** V2: Reason for AI fallback (semantic_zero, ambiguous, low_confidence) */
   aiFallbackReason?: 'semantic_zero' | 'ambiguous' | 'low_confidence';
-  /** V2: AI resolved ref (if AI fallback was used) */
-  aiResolvedRef?: string;
-  /** V2: AI reasoning (if AI fallback was used) */
-  aiReason?: string;
   /** V3: AI interpretation of user intent */
   interpretation?: string;
   /** V3: Clarification question for user (in user's language) */
@@ -628,8 +626,6 @@ export interface LintResult {
   degradedReason?: string;
   /** Top similarity score from LLM resolution */
   topSimilarity?: number;
-  /** Delta between top and second similarity */
-  similarityDelta?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
 

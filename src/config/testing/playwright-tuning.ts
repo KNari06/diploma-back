@@ -121,8 +121,8 @@ export const STEP_READINESS_CONFIG = {
 // ─── Element Resolver ─────────────────────────────────────────────────────────
 
 export const ELEMENT_RESOLVER_CONFIG = {
-  /** Max chars per candidate text sent to LLM */
-  maxCandidateTextLength: 200,
+  /** Max chars per candidate text sent to LLM (increased from 200 for V8 visual/state/iframe hints) */
+  maxCandidateTextLength: 300,
 
   /** Max chars for intent text sent to LLM */
   maxIntentTextLength: 500,
@@ -148,7 +148,8 @@ export const ELEMENT_RESOLVER_CONFIG = {
 
   /** LLM result cache */
   llmCache: {
-    ttlMs: 30 * 60 * 1000,
+    /** 5s TTL — prevents double-click duplicate calls but ensures fresh results on retry */
+    ttlMs: 5 * 1000,
     maxSize: 100,
   },
 
