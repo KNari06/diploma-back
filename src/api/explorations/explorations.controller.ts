@@ -251,7 +251,7 @@ export async function getExplorationState(req: AuthenticatedRequest, res: Respon
 
     const { data, error } = await supabaseAdmin
       .from('exploration_runs')
-      .select('exploration_id, status, config, summary, budget_used, duration_ms, test_cases_count, error_message, checkpoint, started_at, completed_at')
+      .select('exploration_id, entry_url, status, config, summary, budget_used, duration_ms, test_cases_count, error_message, checkpoint, started_at, completed_at')
       .eq('exploration_id', explorationId)
       .eq('user_id', userId)
       .single();
@@ -264,6 +264,7 @@ export async function getExplorationState(req: AuthenticatedRequest, res: Respon
     // Build state overview
     const state: Record<string, any> = {
       explorationId: data.exploration_id,
+      entryUrl: data.entry_url,
       status: data.status,
       startedAt: data.started_at,
       completedAt: data.completed_at,
