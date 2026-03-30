@@ -117,6 +117,7 @@ export class ExplorationRunJobHandler {
             timestamp: new Date().toISOString(),
             chatSessionId,
             userId,
+            budgetMs: explorationConfig.budget?.totalTimeoutMs,
           });
         },
       };

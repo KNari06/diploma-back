@@ -951,8 +951,12 @@ export class FlowRunner {
       const roundPageUrl = this.extractUrlFromSnapshot(round.pageSnapshotBefore);
 
       for (const executed of round.commands) {
-        const step = this.commandToStep(executed, ++stepNumber, roundPageUrl);
+        // Skip failed commands — they produce noise in the final test case
+        if (!executed.result.success) continue;
+
+        const step = this.commandToStep(executed, stepNumber + 1, roundPageUrl);
         if (step) {
+          step.stepNumber = ++stepNumber;
           steps.push(step);
         }
       }
@@ -976,12 +980,15 @@ export class FlowRunner {
    */
   private commandToStep(executed: ExecutedCommand, stepNumber: number, pageUrl: string): DiscoveredStep | null {
     const cmd = executed.command;
+    // Use result.output for human-readable descriptions (e.g. 'Clicked "CONTACT" (a)')
+    // Strip [POST-ACTION: ...] suffix — it's internal context, not user-facing
+    const output = (executed.result.output || '').replace(/\s*\[POST-ACTION:.*$/s, '').trim();
 
     switch (cmd.name) {
       case 'fill_field':
         return {
           stepNumber,
-          description: `Fill "${cmd.args.ref}" with ${cmd.args.is_sensitive ? '[credential]' : `"${cmd.args.value}"`}`,
+          description: output || `Fill "${cmd.args.ref}" with ${cmd.args.is_sensitive ? '[credential]' : `"${cmd.args.value}"`}`,
           action: 'fill',
           ref: cmd.args.ref,
           value: cmd.args.is_sensitive ? undefined : cmd.args.value,
@@ -993,7 +1000,7 @@ export class FlowRunner {
       case 'click_element':
         return {
           stepNumber,
-          description: `Click "${cmd.args.ref}"`,
+          description: output || `Click "${cmd.args.ref}"`,
           action: 'click',
           ref: cmd.args.ref,
           pageUrl,
@@ -1003,7 +1010,7 @@ export class FlowRunner {
       case 'select_option':
         return {
           stepNumber,
-          description: `Select option "${cmd.args.value}" in "${cmd.args.ref}"`,
+          description: output || `Select option "${cmd.args.value}" in "${cmd.args.ref}"`,
           action: 'select',
           ref: cmd.args.ref,
           value: cmd.args.value,
@@ -1013,7 +1020,7 @@ export class FlowRunner {
       case 'press_key':
         return {
           stepNumber,
-          description: `Press key "${cmd.args.key}"`,
+          description: output || `Press key "${cmd.args.key}"`,
           action: 'press',
           value: cmd.args.key,
           pageUrl,
@@ -1022,7 +1029,7 @@ export class FlowRunner {
       case 'hover_element':
         return {
           stepNumber,
-          description: `Hover over "${cmd.args.ref}"`,
+          description: output || `Hover over "${cmd.args.ref}"`,
           action: 'hover',
           ref: cmd.args.ref,
           pageUrl,
@@ -1032,9 +1039,9 @@ export class FlowRunner {
       case 'scroll_to_element':
         return {
           stepNumber,
-          description: cmd.name === 'scroll_to_element'
+          description: output || (cmd.name === 'scroll_to_element'
             ? `Scroll to element "${cmd.args.ref}"`
-            : `Scroll ${cmd.args.direction || 'down'}`,
+            : `Scroll ${cmd.args.direction || 'down'}`),
           action: 'scroll',
           ref: cmd.args.ref,
           pageUrl,
@@ -1043,7 +1050,7 @@ export class FlowRunner {
       case 'navigate_to':
         return {
           stepNumber,
-          description: `Navigate to ${cmd.args.url}`,
+          description: output || `Navigate to ${cmd.args.url}`,
           action: 'navigate',
           value: cmd.args.url,
           pageUrl,
@@ -1052,7 +1059,7 @@ export class FlowRunner {
       case 'toggle_element':
         return {
           stepNumber,
-          description: `Toggle "${cmd.args.ref}"`,
+          description: output || `Toggle "${cmd.args.ref}"`,
           action: 'toggle',
           ref: cmd.args.ref,
           pageUrl,
@@ -1062,7 +1069,7 @@ export class FlowRunner {
       case 'set_range':
         return {
           stepNumber,
-          description: `Set range "${cmd.args.ref}" to "${cmd.args.value}"`,
+          description: output || `Set range "${cmd.args.ref}" to "${cmd.args.value}"`,
           action: 'setRange',
           ref: cmd.args.ref,
           value: cmd.args.value,
@@ -1072,7 +1079,7 @@ export class FlowRunner {
       case 'select_date':
         return {
           stepNumber,
-          description: `Set date "${cmd.args.ref}" to "${cmd.args.value}"`,
+          description: output || `Set date "${cmd.args.ref}" to "${cmd.args.value}"`,
           action: 'selectDate',
           ref: cmd.args.ref,
           value: cmd.args.value,
@@ -1082,7 +1089,7 @@ export class FlowRunner {
       case 'clear_field':
         return {
           stepNumber,
-          description: `Clear field "${cmd.args.ref}"`,
+          description: output || `Clear field "${cmd.args.ref}"`,
           action: 'clear',
           ref: cmd.args.ref,
           pageUrl,
