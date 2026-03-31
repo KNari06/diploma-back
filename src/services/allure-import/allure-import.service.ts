@@ -458,6 +458,8 @@ export async function processAllureImport(
   await updateImportRecord(importId, {
     status: 'completed',
     stats,
+    file_name: jobData.originalFileName,
+    file_size: jobData.originalFileSize,
   });
 
   await cleanupTempFile();
@@ -733,7 +735,12 @@ async function processCsvPdfImport(
     } satisfies AllureImportCompletedPayload);
   } catch (_) { /* ignore */ }
 
-  await updateImportRecord(importId, { status: 'completed', stats });
+  await updateImportRecord(importId, {
+    status: 'completed',
+    stats,
+    file_name: jobData.originalFileName,
+    file_size: jobData.originalFileSize,
+  });
   await cleanupTempFile();
 
   return { stats, hierarchy };

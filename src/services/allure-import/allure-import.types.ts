@@ -335,6 +335,10 @@ export interface AllureImportJobData {
   sourceFormat: AllureSourceFormat;
   /** Path to the uploaded file on disk (temp file). Cleaned up after processing. */
   filePath: string;
+  /** Original filename from the upload (for display in UI). */
+  originalFileName?: string;
+  /** Original file size in bytes. */
+  originalFileSize?: number;
   /** @deprecated Use filePath. Kept for backward compat with in-flight jobs. */
   zipFilePath?: string;
   options: ResolvedAllureImportOptions;

@@ -1,13 +1,14 @@
 /**
  * Allure Import Routes
  *
- * POST /api/v1/allure-import/upload   — Upload a ZIP file and start import
- * GET  /api/v1/allure-import/status/:importId — Check import status
+ * POST /api/v1/allure-import/upload                — Upload a .zip, .csv, or .pdf file and start import
+ * GET  /api/v1/allure-import/status/:importId      — Check import status + stats
+ * GET  /api/v1/allure-import/status/:importId/details — Full import details + test cases
  */
 
 import { Router } from 'express';
 import multer from 'multer';
-import { uploadAllure, getImportStatus } from './allure-import.controller';
+import { uploadAllure, getImportStatus, getImportDetails } from './allure-import.controller';
 
 const router = Router();
 
@@ -49,5 +50,8 @@ router.post('/upload', allureUpload.single('file'), uploadAllure);
 
 // GET  /api/v1/allure-import/status/:importId
 router.get('/status/:importId', getImportStatus);
+
+// GET  /api/v1/allure-import/status/:importId/details
+router.get('/status/:importId/details', getImportDetails);
 
 export default router;
