@@ -432,6 +432,8 @@ export interface IntentTestCase {
   // Lifecycle
   status: IntentTestCaseStatus;
   kind: 'standalone' | 'regression_member';
+  /** Test platform — used to route mobile tests to the mobile runner */
+  platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
   
   // Replay data
   replayStrategy?: 'commands' | 'graph_extract';

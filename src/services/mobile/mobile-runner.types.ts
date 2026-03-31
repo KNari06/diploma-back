@@ -133,18 +133,25 @@ export interface MobileTestMetadata {
   tags?: string[];
 }
 
-/** Build MobileTestMetadata from an IntentTestCase (camelCase fields). Returns undefined if empty. */
+/**
+ * Build MobileTestMetadata from an IntentTestCase.
+ * Supports both camelCase (mapped objects) and snake_case (raw DB rows).
+ * Returns undefined if all fields are empty.
+ */
 export function buildMetadataFromTestCase(tc: {
   goal?: string;
   description?: string;
   expectedResult?: string;
+  expected_result?: string;
   priority?: string;
   tags?: string[];
 }): MobileTestMetadata | undefined {
   const m: MobileTestMetadata = {};
   if (tc.goal) m.goal = tc.goal;
   if (tc.description) m.description = tc.description;
-  if (tc.expectedResult) m.expectedResult = tc.expectedResult;
+  // Support both camelCase (mapped) and snake_case (raw DB row)
+  const expectedResult = tc.expectedResult || tc.expected_result;
+  if (expectedResult) m.expectedResult = expectedResult;
   if (tc.priority) m.priority = tc.priority as MobileTestMetadata['priority'];
   if (tc.tags?.length) m.tags = tc.tags;
   return Object.keys(m).length > 0 ? m : undefined;
