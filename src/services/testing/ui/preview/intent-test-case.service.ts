@@ -410,6 +410,7 @@ export class IntentTestCaseService {
       dependsOn: row.depends_on || undefined,
 
       // Metadata
+      goal: row.goal || undefined,
       tags: row.tags || undefined,
       priority: row.priority || undefined,
       preconditions: row.preconditions || undefined,

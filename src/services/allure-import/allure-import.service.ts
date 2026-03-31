@@ -15,17 +15,22 @@
  *  - Never throws from the top-level processImport() method.
  */
 
+import fs from 'fs/promises';
+import path from 'path';
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { parseAllureZip } from './allure-parser';
 import {
   mapAllureResult,
-  mapAllureResultLabelsOnly,
   getWebUiPlatformId,
+  resolveHierarchy,
+  convertImportedStepsWithAI,
   HierarchyCache,
 } from './allure-mapper';
 import { processAllureDocumentation } from './allure-kb-processor';
+import { parseAllureCsv } from './allure-csv-parser';
+import { parseAllurePdf } from './allure-pdf-parser';
 import type {
   AllureImportJobData,
   AllureImportStats,
@@ -34,6 +39,7 @@ import type {
   AllureImportCompletedPayload,
   AllureImportFailedPayload,
   AllureImportResultHierarchy,
+  ParsedTestCaseFromLLM,
 } from './allure-import.types';
 import { emptyStats } from './allure-import.types';
 
@@ -155,7 +161,7 @@ export interface AllureImportResult {
 /**
  * Process a full Allure ZIP import.
  *
- * @param jobData       - BullMQ job data (importId, projectId, userId, zipBase64, options)
+ * @param jobData       - BullMQ job data (importId, projectId, userId, zipFilePath, options)
  * @param emitProgress  - Callback for WebSocket progress events
  * @returns Final stats + hierarchy tree (always — never throws)
  */
@@ -163,7 +169,8 @@ export async function processAllureImport(
   jobData: AllureImportJobData,
   emitProgress: ProgressEmitter,
 ): Promise<AllureImportResult> {
-  const { importId, projectId, userId, workspaceId, zipBase64, options } = jobData;
+  const { importId, projectId, userId, workspaceId, options } = jobData;
+  const filePath = jobData.filePath ?? jobData.zipFilePath!;
   const stats = emptyStats();
   const startTime = Date.now();
 
@@ -191,6 +198,23 @@ export async function processAllureImport(
     }
   };
 
+  /**
+   * Clean up the temp ZIP file and its parent directory.
+   * Fire-and-forget — failures are logged but don't affect the import result.
+   */
+  const cleanupTempFile = async (): Promise<void> => {
+    try {
+      const dir = path.dirname(filePath);
+      await fs.rm(dir, { recursive: true, force: true });
+      logger.debug('[AllureImport] Cleaned up temp file', { filePath });
+    } catch (e) {
+      logger.warn('[AllureImport] Failed to clean up temp file (non-fatal)', {
+        filePath,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
   // ── Bootstrap ────────────────────────────────────────────────────────────
   await createImportRecord({ importId, projectId, userId, workspaceId });
 
@@ -200,7 +224,7 @@ export async function processAllureImport(
   let parsedData: Awaited<ReturnType<typeof parseAllureZip>>;
 
   try {
-    const zipBuffer = Buffer.from(zipBase64, 'base64');
+    const zipBuffer = await fs.readFile(filePath);
     parsedData = await parseAllureZip(zipBuffer);
 
     stats.totalFiles =
@@ -237,6 +261,8 @@ export async function processAllureImport(
       error_message: message,
     });
 
+    await cleanupTempFile();
+
     // Only phase where we propagate — caller (job handler) decides whether to retry
     throw err;
   }
@@ -261,34 +287,14 @@ export async function processAllureImport(
         emitPhase('tests', i, parsedData.results.length, `Importing: ${result.name}`);
 
         try {
-          // Dedup check
+          // Dedup check — skip entirely without resolving hierarchy.
+          // We must NOT call resolveHierarchy here because it would create
+          // modules/flows for tests that won't actually be imported.
           if (options.deduplicateTests && existingNames.has(result.name.toLowerCase())) {
             logger.debug('[AllureImport] Skipping duplicate test case', {
               name: result.name,
             });
             stats.testsSkipped++;
-
-            // Lightweight label-only mapping — no AI call needed for duplicates.
-            // Only resolves module/flow hierarchy for correct tree placement.
-            const skippedLabels = await mapAllureResultLabelsOnly(
-              result,
-              hierarchyCache,
-              webUiPlatformId,
-              { projectId, userId, autoCreateModules: options.autoCreateModules, autoCreateFlows: options.autoCreateFlows },
-            );
-
-            hierarchyCache.addTestNode(
-              {
-                id: '',
-                name: result.name,
-                status: result.status,
-                priority: skippedLabels.priority,
-                stepsCount: 0,
-                skipped: true,
-              },
-              skippedLabels.flowId,
-              skippedLabels.moduleId,
-            );
             continue;
           }
 
@@ -454,5 +460,304 @@ export async function processAllureImport(
     stats,
   });
 
+  await cleanupTempFile();
+
   return { stats, hierarchy };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV / PDF Import Processor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Process a CSV or PDF file exported from Allure TestOps.
+ *
+ * Simplified pipeline compared to ZIP:
+ *   PARSING → Deterministic CSV parsing / LLM-based PDF text extraction → ParsedTestCaseFromLLM[]
+ *   TESTS   → AI step conversion + IntentTestCase creation (reuses HierarchyCache, dedup, etc.)
+ *   DONE    → Emit final stats
+ *
+ * No file classification or KB processing — CSV/PDF contain only test case definitions.
+ */
+async function processCsvPdfImport(
+  jobData: AllureImportJobData,
+  emitProgress: ProgressEmitter,
+): Promise<AllureImportResult> {
+  const { importId, projectId, userId, workspaceId, options } = jobData;
+  const filePath = jobData.filePath ?? jobData.zipFilePath!;
+  const sourceFormat = jobData.sourceFormat ?? 'csv';
+  const stats = emptyStats();
+  const startTime = Date.now();
+
+  const emitPhase = (
+    phase: AllureImportPhase,
+    current: number,
+    total: number,
+    message: string,
+  ): void => {
+    try {
+      emitProgress({
+        importId,
+        phase,
+        current,
+        total,
+        message,
+        stats: { ...stats },
+        timestamp: new Date().toISOString(),
+      } satisfies AllureImportProgressPayload);
+    } catch (e) {
+      logger.warn('[AllureCsvPdfImport] Progress emit failed', {
+        phase,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  const cleanupTempFile = async (): Promise<void> => {
+    try {
+      const dir = path.dirname(filePath);
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch (e) {
+      logger.warn('[AllureCsvPdfImport] Failed to clean up temp file (non-fatal)', {
+        filePath,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  };
+
+  // ── Bootstrap ────────────────────────────────────────────────────────────
+  await createImportRecord({ importId, projectId, userId, workspaceId });
+
+  // ── Phase: PARSING ───────────────────────────────────────────────────────
+  emitPhase('parsing', 0, 1, `Parsing ${sourceFormat.toUpperCase()} file…`);
+
+  let parsedTestCases: ParsedTestCaseFromLLM[];
+
+  try {
+    if (sourceFormat === 'csv') {
+      const csvContent = await fs.readFile(filePath, 'utf-8');
+      const csvResult = await parseAllureCsv(csvContent, (current, total) => {
+        emitPhase('parsing', current, total, `Parsing CSV rows (batch ${current}/${total})…`);
+      });
+      parsedTestCases = csvResult.testCases;
+      stats.errors.push(...csvResult.errors);
+    } else {
+      const pdfResult = await parseAllurePdf(filePath, (current, total) => {
+        emitPhase('parsing', current, total, `Parsing PDF pages (chunk ${current}/${total})…`);
+      });
+      parsedTestCases = pdfResult.testCases;
+      stats.errors.push(...pdfResult.errors);
+    }
+
+    stats.totalFiles = 1;
+    stats.testsFound = parsedTestCases.length;
+
+    emitPhase('parsing', 1, 1, `Found ${stats.testsFound} test cases`);
+
+    logger.info('[AllureCsvPdfImport] Parsing complete', {
+      importId,
+      sourceFormat,
+      testsFound: stats.testsFound,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error('[AllureCsvPdfImport] Parsing failed (fatal)', { importId, error: message });
+
+    try {
+      emitProgress({
+        importId,
+        error: message,
+        timestamp: new Date().toISOString(),
+      } satisfies AllureImportFailedPayload);
+    } catch (_) { /* ignore */ }
+
+    await updateImportRecord(importId, { status: 'failed', stats, error_message: message });
+    await cleanupTempFile();
+    throw err;
+  }
+
+  // ── Phase: TESTS ─────────────────────────────────────────────────────────
+  const hierarchyCache = new HierarchyCache();
+
+  if (parsedTestCases.length > 0) {
+    emitPhase('tests', 0, parsedTestCases.length, 'Creating test cases…');
+
+    try {
+      const webUiPlatformId = await getWebUiPlatformId(projectId, userId);
+
+      const existingNames = options.deduplicateTests
+        ? await getExistingTestCaseNames(projectId, userId)
+        : new Set<string>();
+
+      for (let i = 0; i < parsedTestCases.length; i++) {
+        const tc = parsedTestCases[i];
+
+        emitPhase('tests', i, parsedTestCases.length, `Creating: ${tc.name}`);
+
+        try {
+          // Dedup check
+          if (options.deduplicateTests && existingNames.has(tc.name.toLowerCase())) {
+            stats.testsSkipped++;
+            continue;
+          }
+
+          // Convert steps using AI (determines correct action types, cleans descriptions)
+          // Falls back to 'click' type for all steps if AI fails
+          const steps = await convertImportedStepsWithAI(tc.name, tc.steps);
+
+          // Resolve hierarchy (module + flow) via cache
+          const { moduleId, flowId } = await resolveHierarchy(
+            hierarchyCache,
+            webUiPlatformId,
+            {
+              projectId,
+              userId,
+              autoCreateModules: options.autoCreateModules,
+              autoCreateFlows: options.autoCreateFlows,
+            },
+            tc.moduleName,
+            tc.flowName,
+          );
+
+          // Build description
+          const descParts: string[] = [];
+          if (tc.description) descParts.push(tc.description);
+          if (tc.preconditions?.length) {
+            descParts.push(`**Preconditions:**\n${tc.preconditions.map((p) => `- ${p}`).join('\n')}`);
+          }
+          if (tc.links?.length) {
+            descParts.push(`**Links:**\n${tc.links.map((l) => `- ${l}`).join('\n')}`);
+          }
+          if (tc.owner) descParts.push(`**Owner:** ${tc.owner}`);
+          const description = descParts.join('\n\n');
+
+          // Create test case
+          const created = await IntentTestCaseService.create({
+            projectId,
+            userId,
+            name: tc.name,
+            description: description || undefined,
+            steps,
+            ...(flowId && { flowId }),
+            status: 'draft',
+            kind: 'standalone',
+            platform: 'web',
+          });
+
+          // Update tags/priority via update()
+          const tags = tc.tags ?? [];
+          const priority = tc.priority ?? 'medium';
+          if (tags.length > 0 || priority !== 'medium') {
+            try {
+              await IntentTestCaseService.update({
+                id: created.id,
+                userId,
+                tags: tags.length > 0 ? tags : undefined,
+                priority,
+              });
+            } catch (updateErr) {
+              logger.warn('[AllureCsvPdfImport] Could not update tags/priority', {
+                testCaseId: created.id,
+                error: updateErr instanceof Error ? updateErr.message : String(updateErr),
+              });
+            }
+          }
+
+          existingNames.add(tc.name.toLowerCase());
+          stats.testsImported++;
+
+          hierarchyCache.addTestNode(
+            {
+              id: created.id,
+              name: created.name,
+              status: 'passed', // CSV/PDF have design-time status, use 'passed' as neutral
+              priority,
+              stepsCount: steps.length,
+            },
+            flowId,
+            moduleId,
+          );
+        } catch (testErr) {
+          const msg = `Failed to import "${tc.name}": ${testErr instanceof Error ? testErr.message : String(testErr)}`;
+          stats.errors.push(msg);
+          stats.testsSkipped++;
+          logger.error('[AllureCsvPdfImport] Test case import failed', {
+            testName: tc.name,
+            error: msg,
+          });
+        }
+
+        // Rate-limit protection between AI calls (skip after last item)
+        if (i < parsedTestCases.length - 1) {
+          await new Promise((r) => setTimeout(r, 150));
+        }
+      }
+
+      stats.modulesCreated = hierarchyCache.modulesCreated;
+      stats.flowsCreated = hierarchyCache.flowsCreated;
+
+      logger.info('[AllureCsvPdfImport] Test case import phase complete', {
+        imported: stats.testsImported,
+        skipped: stats.testsSkipped,
+        modulesCreated: stats.modulesCreated,
+        flowsCreated: stats.flowsCreated,
+      });
+    } catch (phaseErr) {
+      const msg = `Test case import phase failed: ${phaseErr instanceof Error ? phaseErr.message : String(phaseErr)}`;
+      stats.errors.push(msg);
+      logger.error('[AllureCsvPdfImport] Tests phase error', { importId, error: msg });
+    }
+  }
+
+  emitPhase('tests', parsedTestCases.length, parsedTestCases.length, `${stats.testsImported} test cases imported`);
+
+  // ── Phase: DONE ──────────────────────────────────────────────────────────
+  const durationMs = Date.now() - startTime;
+  const hierarchy = hierarchyCache.buildHierarchy();
+
+  logger.info('[AllureCsvPdfImport] Import complete', {
+    importId,
+    sourceFormat,
+    durationMs,
+    stats,
+  });
+
+  try {
+    emitProgress({
+      importId,
+      success: stats.errors.length === 0,
+      stats: { ...stats },
+      hierarchy,
+      durationMs,
+      timestamp: new Date().toISOString(),
+    } satisfies AllureImportCompletedPayload);
+  } catch (_) { /* ignore */ }
+
+  await updateImportRecord(importId, { status: 'completed', stats });
+  await cleanupTempFile();
+
+  return { stats, hierarchy };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unified Dispatcher
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Dispatch an Allure import job to the appropriate processor based on source format.
+ *
+ * - 'zip' → existing processAllureImport (ZIP with *-result.json)
+ * - 'csv' / 'pdf' → processCsvPdfImport (Allure TestOps export)
+ */
+export async function processAllureImportDispatch(
+  jobData: AllureImportJobData,
+  emitProgress: ProgressEmitter,
+): Promise<AllureImportResult> {
+  const format = jobData.sourceFormat ?? 'zip';
+
+  if (format === 'csv' || format === 'pdf') {
+    return processCsvPdfImport(jobData, emitProgress);
+  }
+
+  return processAllureImport(jobData, emitProgress);
 }

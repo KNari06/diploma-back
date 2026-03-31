@@ -76,7 +76,6 @@ export class MobileTestRunJobHandler {
       appStoragePath,
       appOriginalName,
       ciRunId,
-      testCaseName,
       metadata,
     } = job.data;
 
@@ -394,6 +393,19 @@ export class MobileTestRunJobHandler {
         }
       }
 
+      // ── Phase 9: Post-completion handler (regression tracking) ──
+      try {
+        const { TestCompletionHandlerService } = await import(
+          '@/services/testing/results/test-completion-handler.service'
+        );
+        await TestCompletionHandlerService.handleTestCompletion(testId);
+      } catch (completionError) {
+        logger.warn('[MOBILE-TEST] Post-completion handler failed (non-fatal)', {
+          testId,
+          error: completionError instanceof Error ? completionError.message : String(completionError),
+        });
+      }
+
       logger.info('[MOBILE-TEST] Job completed successfully', {
         testId,
         browser,
@@ -425,6 +437,14 @@ export class MobileTestRunJobHandler {
           error: errorMessage,
           timestamp: new Date().toISOString(),
         });
+      } catch { /* non-fatal */ }
+
+      // Post-completion handler on failure (regression tracking)
+      try {
+        const { TestCompletionHandlerService } = await import(
+          '@/services/testing/results/test-completion-handler.service'
+        );
+        await TestCompletionHandlerService.handleTestCompletion(testId);
       } catch { /* non-fatal */ }
 
       // CI run tracking on failure

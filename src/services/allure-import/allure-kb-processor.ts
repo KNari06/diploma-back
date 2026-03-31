@@ -181,33 +181,43 @@ Clean the file content so it's useful for future retrieval. The cleaned content 
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Return a set of file_name values that already exist in the project KB.
- * Paginates in chunks of KB_FILES_PAGE_SIZE to handle large projects.
+ * Return a set of unique file_name values that already exist in the project KB.
+ *
+ * Uses a Supabase RPC-style approach to avoid fetching one row per chunk
+ * (a single document with 50 chunks would return 50 rows with the same name).
+ * We use a simple query with LIMIT/OFFSET but build a Set to deduplicate.
+ *
+ * For Allure imports, the number of distinct file_name values is small
+ * (one per doc group per import run), so we only need the distinct names
+ * that match the "Allure" prefix to keep the result set minimal.
  */
 async function getExistingKBFileNames(projectId: string): Promise<Set<string>> {
   const names = new Set<string>();
-  let offset = 0;
 
-  while (true) {
+  try {
+    // Fetch only file names that start with "Allure" — the only ones this
+    // processor creates. This avoids scanning the entire KB.
     const { data, error } = await supabaseAdmin
       .from('project_kb_chunks')
       .select('file_name')
       .eq('project_id', projectId)
-      .range(offset, offset + KB_FILES_PAGE_SIZE - 1);
+      .like('file_name', 'Allure%')
+      .limit(KB_FILES_PAGE_SIZE);
 
     if (error) {
       logger.warn('[AllureKBProcessor] Could not fetch existing KB files', {
         error: error.message,
       });
-      break;
+      return names;
     }
 
     for (const row of data ?? []) {
       names.add(row.file_name as string);
     }
-
-    if ((data ?? []).length < KB_FILES_PAGE_SIZE) break;
-    offset += KB_FILES_PAGE_SIZE;
+  } catch (err) {
+    logger.warn('[AllureKBProcessor] KB file name fetch error', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 
   return names;
@@ -460,7 +470,7 @@ export async function processAllureDocumentation(
     const isMarkdown = mergedContent.trimStart().startsWith('#');
     const chunks = isMarkdown
       ? chunkMarkdown(mergedContent, kbFileName)
-      : chunkText(mergedContent);
+      : chunkText(mergedContent, { fileName: kbFileName });
 
     if (chunks.length === 0) {
       result.filesSkipped += groupDocs.length;

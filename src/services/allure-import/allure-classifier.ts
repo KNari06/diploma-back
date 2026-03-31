@@ -189,7 +189,8 @@ function classifyDeterministic(
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface AIFileClassification {
-  filename: string;
+  /** Full path inside the ZIP (used as unique key for lookups). */
+  file_path: string;
   /**
    * Category:
    * - documentation  → goes to KB (markdown docs, API refs, test plans, readmes)
@@ -215,7 +216,7 @@ interface AIBatchResponse {
  * Returns a map from filename → classification result.
  */
 async function classifyBatchWithAI(
-  files: Array<{ filename: string; textPreview: string }>,
+  files: Array<{ filePath: string; filename: string; textPreview: string }>,
 ): Promise<Map<string, AIFileClassification>> {
   const results = new Map<string, AIFileClassification>();
 
@@ -224,7 +225,7 @@ async function classifyBatchWithAI(
   const fileList = files
     .map((f, i) => {
       const preview = f.textPreview.slice(0, AI_PREVIEW_CHARS);
-      return `### File ${i + 1}: ${f.filename}\n\`\`\`\n${preview}\n\`\`\``;
+      return `### File ${i + 1}: ${f.filePath}\n\`\`\`\n${preview}\n\`\`\``;
     })
     .join('\n\n');
 
@@ -260,14 +261,14 @@ Respond with ONLY this JSON object:
 {
   "files": [
     {
-      "filename": "<exact filename from input>",
+      "file_path": "<exact file path from input>",
       "category": "<documentation|test_log|api_response|page_snapshot|config|noise>",
       "kb_worthy": true/false,
       "summary": "<10 words max>"
     }
   ]
 }
-Return one entry per input file. The "filename" must match EXACTLY.`;
+Return one entry per input file. The "file_path" must match EXACTLY.`;
 
   const userPrompt = `Classify these ${files.length} files:\n\n${fileList}`;
 
@@ -300,8 +301,8 @@ Return one entry per input file. The "filename" must match EXACTLY.`;
 
     if (Array.isArray(parsed.files)) {
       for (const item of parsed.files) {
-        if (item.filename) {
-          results.set(item.filename, item);
+        if (item.file_path) {
+          results.set(item.file_path, item);
         }
       }
     }
@@ -389,6 +390,7 @@ export async function classifyAllureFiles(
 
   for (const batch of batches) {
     const aiInputs = batch.map(({ input }) => ({
+      filePath: input.path,
       filename: input.filename,
       textPreview: input.textContent?.slice(0, AI_PREVIEW_CHARS) ?? '',
     }));
@@ -396,7 +398,8 @@ export async function classifyAllureFiles(
     const aiResults = await classifyBatchWithAI(aiInputs);
 
     for (const { input, index } of batch) {
-      const aiResult = aiResults.get(input.filename);
+      // Use full path as key to avoid collisions between files with the same basename
+      const aiResult = aiResults.get(input.path);
 
       if (!aiResult) {
         // AI didn't return a result for this file — treat as skip

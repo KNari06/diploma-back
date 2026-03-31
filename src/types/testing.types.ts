@@ -1007,6 +1007,8 @@ export interface ExpandedTestCase {
   moduleId?: string;
   flowId?: string;
   name: string;
+  /** Test case platform — used to route mobile tests to the mobile runner */
+  platform?: string;
   parameters?: Record<string, any>;
   isNegative?: boolean;
   sourceTestCaseId?: string;
@@ -1024,6 +1026,8 @@ export interface ExecutableTestCase {
   flowId?: string;
   dependsOn: string[];
   isNegative?: boolean;
+  /** Test case platform — used to route mobile tests to the mobile runner */
+  platform?: string;
 }
 
 /**

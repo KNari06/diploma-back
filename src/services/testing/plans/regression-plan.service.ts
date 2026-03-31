@@ -1005,7 +1005,7 @@ export class RegressionPlanService {
     // Include cases that have replay data: commands, graph_ref, OR steps_json
     const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name')
+      .select('id, name, platform')
       .eq('flow_id', flowId)
       .not('status', 'eq', 'archived');
 
@@ -1020,6 +1020,7 @@ export class RegressionPlanService {
         moduleId,
         flowId,
         name: tc.name,
+        platform: tc.platform || undefined,
       });
     }
 
@@ -1053,36 +1054,55 @@ export class RegressionPlanService {
     testCaseId: string,
     testType: 'ui' | 'api'
   ): Promise<ExpandedTestCase | null> {
-    // UI test cases now in intent_test_cases (unified table)
-    const table = testType === 'ui' ? 'intent_test_cases' : 'api_test_configs';
+    // Split query by test type to satisfy Supabase typed client
+    let id: string | undefined;
+    let name: string | undefined;
+    let flowId: string | undefined;
+    let platform: string | undefined;
 
-    const { data } = await supabaseAdmin
-      .from(table)
-      .select('id, name, flow_id')
-      .eq('id', testCaseId)
-      .maybeSingle();
-
-    if (!data) return null;
+    if (testType === 'ui') {
+      const { data } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, name, flow_id, platform')
+        .eq('id', testCaseId)
+        .maybeSingle();
+      if (!data) return null;
+      id = data.id;
+      name = data.name;
+      flowId = data.flow_id || undefined;
+      platform = data.platform || undefined;
+    } else {
+      const { data } = await supabaseAdmin
+        .from('api_test_configs')
+        .select('id, name, flow_id')
+        .eq('id', testCaseId)
+        .maybeSingle();
+      if (!data) return null;
+      id = data.id;
+      name = data.name;
+      flowId = data.flow_id || undefined;
+    }
 
     // Get module_id from flow
     let moduleId: string | undefined;
 
-    if (data.flow_id) {
+    if (flowId) {
       const { data: flow } = await supabaseAdmin
         .from('test_flows')
         .select('module_id')
-        .eq('id', data.flow_id)
+        .eq('id', flowId)
         .maybeSingle();
 
       moduleId = flow?.module_id;
     }
 
     return {
-      testCaseId: data.id,
+      testCaseId: id!,
       testType,
       moduleId,
-      flowId: data.flow_id,
-      name: data.name,
+      flowId,
+      name: name!,
+      platform,
     };
   }
 

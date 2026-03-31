@@ -133,6 +133,23 @@ export interface MobileTestMetadata {
   tags?: string[];
 }
 
+/** Build MobileTestMetadata from an IntentTestCase (camelCase fields). Returns undefined if empty. */
+export function buildMetadataFromTestCase(tc: {
+  goal?: string;
+  description?: string;
+  expectedResult?: string;
+  priority?: string;
+  tags?: string[];
+}): MobileTestMetadata | undefined {
+  const m: MobileTestMetadata = {};
+  if (tc.goal) m.goal = tc.goal;
+  if (tc.description) m.description = tc.description;
+  if (tc.expectedResult) m.expectedResult = tc.expectedResult;
+  if (tc.priority) m.priority = tc.priority as MobileTestMetadata['priority'];
+  if (tc.tags?.length) m.tags = tc.tags;
+  return Object.keys(m).length > 0 ? m : undefined;
+}
+
 // ── Run Steps ────────────────────────────────────────────────────
 
 export interface MobileRunStepsRequest {

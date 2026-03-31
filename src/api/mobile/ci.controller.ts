@@ -219,6 +219,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
       id: string;
       name: string;
       intentSteps: MobileIntentStep[];
+      metadata?: MobileTestMetadata;
     }> = [];
 
     if (savedTestCaseIds && savedTestCaseIds.length > 0) {

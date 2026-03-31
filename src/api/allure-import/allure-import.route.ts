@@ -11,7 +11,7 @@ import { uploadAllure, getImportStatus } from './allure-import.controller';
 
 const router = Router();
 
-// ── Multer: memory storage, ZIP only, 100 MB limit ───────────────────────────
+// ── Multer: memory storage, ZIP/CSV/PDF, 100 MB limit ────────────────────────
 const allureUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -19,16 +19,27 @@ const allureUpload = multer({
     files: 1,
   },
   fileFilter: (_req, file, cb) => {
+    const lowerName = file.originalname.toLowerCase();
+
     const isZip =
       file.mimetype === 'application/zip' ||
       file.mimetype === 'application/x-zip-compressed' ||
-      file.mimetype === 'application/octet-stream' || // some OS report ZIP as this
-      file.originalname.toLowerCase().endsWith('.zip');
+      file.mimetype === 'application/octet-stream' ||
+      lowerName.endsWith('.zip');
 
-    if (isZip) {
+    const isCsv =
+      file.mimetype === 'text/csv' ||
+      file.mimetype === 'application/vnd.ms-excel' ||
+      lowerName.endsWith('.csv');
+
+    const isPdf =
+      file.mimetype === 'application/pdf' ||
+      lowerName.endsWith('.pdf');
+
+    if (isZip || isCsv || isPdf) {
       cb(null, true);
     } else {
-      cb(new Error('Only .zip files are accepted for Allure import'));
+      cb(new Error('Only .zip, .csv, and .pdf files are accepted for Allure import'));
     }
   },
 });

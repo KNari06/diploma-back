@@ -77,8 +77,8 @@ function flattenRawSteps(allureSteps: AllureStep[], parentName?: string): Flatte
 // AI step conversion
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Valid action types for the AI prompt */
-const VALID_ACTION_TYPES: IntentActionType[] = [
+/** Valid action types for the AI prompt. Exported for reuse in CSV/PDF parsers. */
+export const VALID_ACTION_TYPES: IntentActionType[] = [
   'navigate', 'click', 'type', 'select', 'hover', 'scroll', 'press',
   'assert', 'wait', 'check', 'uncheck', 'upload', 'dblclick', 'drag_and_drop',
 ];
@@ -255,6 +255,112 @@ async function convertStepsWithAI(
           type: 'click', // safe default
           description: raw.name.slice(0, 120),
           ...(raw.value !== undefined && { value: raw.value }),
+        });
+      }
+    }
+  }
+
+  return allResults;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV/PDF step conversion (exported for use by processCsvPdfImport)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Convert simple step descriptions (from CSV/PDF parser) into proper IntentSteps
+ * using AI. The AI determines the correct action type, cleans up descriptions,
+ * splits composite steps, and extracts values.
+ *
+ * If AI fails, falls back to deterministic mapping (all steps → type 'click').
+ *
+ * @param testName - Test case name (context for AI)
+ * @param rawSteps - Steps from the deterministic CSV/PDF parser
+ * @returns IntentStep[] with correct types, clean descriptions, and UUIDs
+ */
+export async function convertImportedStepsWithAI(
+  testName: string,
+  rawSteps: Array<{ type: string; description: string; value?: string }>,
+): Promise<IntentStep[]> {
+  if (rawSteps.length === 0) return [];
+
+  const allResults: IntentStep[] = [];
+
+  // Process in batches (same limit as ZIP path) to avoid context overflow
+  for (let i = 0; i < rawSteps.length; i += AI_STEP_BATCH_SIZE) {
+    const batch = rawSteps.slice(i, i + AI_STEP_BATCH_SIZE);
+    const batchNum = Math.floor(i / AI_STEP_BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(rawSteps.length / AI_STEP_BATCH_SIZE);
+
+    const stepsText = batch
+      .map((s, idx) => {
+        const parts = [`${i + idx + 1}. "${s.description}"`];
+        if (s.value) parts.push(`value="${s.value}"`);
+        return parts.join(' ');
+      })
+      .join('\n');
+
+    const batchContext = totalBatches > 1
+      ? ` (batch ${batchNum}/${totalBatches})`
+      : '';
+
+    const userPrompt = `Test: "${testName}"${batchContext}\n\nSteps:\n${stepsText}`;
+
+    try {
+      const response = await getChatCompletionWithMessages(
+        [
+          { role: 'system', content: STEP_CONVERSION_SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        {
+          model: AI_TASK_MODELS.allureStepConvert,
+          temperature: 0,
+          max_tokens: 8192,
+          response_format: { type: 'json_object' },
+        },
+      );
+
+      const rawContent = response.content?.trim() ?? '{"steps":[]}';
+
+      let parsed: AIStepResult[];
+      try {
+        const json = JSON.parse(rawContent);
+        parsed = Array.isArray(json) ? json : Array.isArray(json.steps) ? json.steps : [];
+      } catch {
+        logger.warn('[AllureMapper] AI step conversion JSON parse failed', { testName, batch: batchNum });
+        parsed = [];
+      }
+
+      // Trust AI result — even if empty (AI determined no meaningful UI steps)
+      for (const s of parsed) {
+        if (!s || typeof s !== 'object') continue;
+        const desc = typeof s.description === 'string' ? s.description.trim() : '';
+        if (!desc) continue;
+
+        allResults.push({
+          id: randomUUID(),
+          type: VALID_ACTION_TYPES.includes(s.type as IntentActionType)
+            ? (s.type as IntentActionType)
+            : 'click',
+          description: desc.slice(0, 120),
+          ...(s.value != null && s.value !== '' && { value: String(s.value) }),
+        });
+      }
+    } catch (err) {
+      logger.warn('[AllureMapper] AI step conversion failed, using fallback for batch', {
+        testName,
+        batch: batchNum,
+        stepsCount: batch.length,
+        error: err instanceof Error ? err.message : String(err),
+      });
+
+      // Fallback for this batch only — keep original descriptions, default type
+      for (const s of batch) {
+        allResults.push({
+          id: randomUUID(),
+          type: 'click',
+          description: (s.description ?? '').slice(0, 120),
+          ...(s.value ? { value: s.value } : {}),
         });
       }
     }
@@ -525,6 +631,45 @@ export class HierarchyCache {
   }
 
   /**
+   * Prefetched module list for a project (fetched once, reused for all lookups).
+   * Key: `${projectId}::${platformId}` — ensures one fetch per project+platform.
+   */
+  private readonly prefetchedModules = new Map<string, Map<string, { id: string; name: string }>>();
+
+  /**
+   * Fetch all modules for a project once and cache by lowercase name.
+   * Subsequent calls with the same projectId+platformId return the cached map.
+   */
+  private async getModulesByName(
+    projectId: string,
+    userId: string,
+    platformId: string,
+  ): Promise<Map<string, { id: string; name: string }>> {
+    const pfKey = `${projectId}::${platformId}`;
+    if (this.prefetchedModules.has(pfKey)) {
+      return this.prefetchedModules.get(pfKey)!;
+    }
+
+    const map = new Map<string, { id: string; name: string }>();
+    try {
+      const { items } = await ModuleService.listByProject(projectId, userId, {
+        limit: 1000,
+        platformId,
+      });
+      for (const m of items) {
+        map.set(m.name.toLowerCase(), { id: m.id, name: m.name });
+      }
+    } catch (err) {
+      logger.warn('[AllureMapper] Failed to prefetch modules', {
+        projectId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    this.prefetchedModules.set(pfKey, map);
+    return map;
+  }
+
+  /**
    * Resolve (or create) a Module for the given epic label.
    * Returns the module ID, or null if not applicable / creation fails.
    */
@@ -543,15 +688,9 @@ export class HierarchyCache {
     }
 
     try {
-      // Fetch all modules for this project and find by name (case-insensitive)
-      const { items } = await ModuleService.listByProject(projectId, userId, {
-        limit: 1000,
-        platformId,
-      });
-
-      const existing = items.find(
-        (m) => m.name.toLowerCase() === epicName.toLowerCase(),
-      );
+      // Single prefetch for all modules — reused across all resolveModule calls
+      const modulesByName = await this.getModulesByName(projectId, userId, platformId);
+      const existing = modulesByName.get(epicName.toLowerCase());
 
       if (existing) {
         this.moduleCache.set(cacheKey, existing.id);
@@ -582,6 +721,8 @@ export class HierarchyCache {
       this.modulesCreated++;
       this.moduleCache.set(cacheKey, created.id);
       this.moduleInfo.set(created.id, { name: epicName, isNew: true });
+      // Also add to prefetched map so subsequent lookups find it
+      modulesByName.set(epicName.toLowerCase(), { id: created.id, name: epicName });
       return created.id;
     } catch (err) {
       logger.warn('[AllureMapper] Failed to resolve/create module', {
@@ -591,6 +732,38 @@ export class HierarchyCache {
       this.moduleCache.set(cacheKey, null);
       return null;
     }
+  }
+
+  /**
+   * Prefetched flow list per module (fetched once per moduleId, reused).
+   */
+  private readonly prefetchedFlows = new Map<string, Map<string, { id: string; name: string }>>();
+
+  /**
+   * Fetch all flows for a module once and cache by lowercase name.
+   */
+  private async getFlowsByName(
+    moduleId: string,
+    userId: string,
+  ): Promise<Map<string, { id: string; name: string }>> {
+    if (this.prefetchedFlows.has(moduleId)) {
+      return this.prefetchedFlows.get(moduleId)!;
+    }
+
+    const map = new Map<string, { id: string; name: string }>();
+    try {
+      const flows = await FlowService.listByModule(moduleId, userId);
+      for (const f of flows) {
+        map.set(f.name.toLowerCase(), { id: f.id, name: f.name });
+      }
+    } catch (err) {
+      logger.warn('[AllureMapper] Failed to prefetch flows', {
+        moduleId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    this.prefetchedFlows.set(moduleId, map);
+    return map;
   }
 
   /**
@@ -611,11 +784,9 @@ export class HierarchyCache {
     }
 
     try {
-      const flows = await FlowService.listByModule(moduleId, userId);
-
-      const existing = flows.find(
-        (f) => f.name.toLowerCase() === featureName.toLowerCase(),
-      );
+      // Single prefetch per module — reused for all resolveFlow calls
+      const flowsByName = await this.getFlowsByName(moduleId, userId);
+      const existing = flowsByName.get(featureName.toLowerCase());
 
       if (existing) {
         this.flowCache.set(cacheKey, existing.id);
@@ -648,6 +819,8 @@ export class HierarchyCache {
       this.flowInfo.set(created.id, { name: featureName, isNew: true, moduleId });
       if (!this.flowsByModule.has(moduleId)) this.flowsByModule.set(moduleId, new Set());
       this.flowsByModule.get(moduleId)!.add(created.id);
+      // Add to prefetched map so subsequent lookups find it
+      flowsByName.set(featureName.toLowerCase(), { id: created.id, name: featureName });
       return created.id;
     } catch (err) {
       logger.warn('[AllureMapper] Failed to resolve/create flow', {
@@ -697,9 +870,9 @@ export interface MapperOptions {
 
 /**
  * Resolve module + flow from label names using the HierarchyCache.
- * Shared by both mapAllureResult (full mapping) and mapAllureResultLabelsOnly (dedup).
+ * Shared hierarchy resolution logic used by mapAllureResult.
  */
-async function resolveHierarchy(
+export async function resolveHierarchy(
   cache: HierarchyCache,
   webUiPlatformId: string,
   opts: MapperOptions,

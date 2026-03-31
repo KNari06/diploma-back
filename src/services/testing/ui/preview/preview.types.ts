@@ -987,6 +987,8 @@ export interface IntentTestCase {
   resolvedDependencies?: Array<{ id: string; name: string }>;
 
   // Metadata
+  /** Natural language description of the test's purpose/intent */
+  goal?: string;
   tags?: string[];
   priority?: 'critical' | 'high' | 'medium' | 'low';
   preconditions?: string[];

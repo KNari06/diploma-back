@@ -11,7 +11,7 @@
 import { Job } from 'bullmq';
 import { logger, logQueueEvent } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
-import { processAllureImport } from '@/services/allure-import/allure-import.service';
+import { processAllureImportDispatch } from '@/services/allure-import/allure-import.service';
 import type { AllureImportJobData } from '@/services/allure-import/allure-import.types';
 import type { ProgressEmitter, AllureImportResult } from '@/services/allure-import/allure-import.service';
 
@@ -60,7 +60,7 @@ export class AllureImportJobHandler {
     };
 
     try {
-      const result = await processAllureImport(job.data, emitProgress);
+      const result = await processAllureImportDispatch(job.data, emitProgress);
 
       logQueueEvent('completed', job.id!, {
         importId,

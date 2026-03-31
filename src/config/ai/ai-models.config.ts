@@ -178,4 +178,9 @@ export const AI_TASK_MODELS = {
    * Understands UI action context, splits composite steps, filters non-UI steps.
    */
   allureStepConvert: AI_MODELS.classify,
+  /**
+   * Parses structured test case data from Allure TestOps CSV rows or PDF text.
+   * Handles column mapping, scenario parsing, hierarchy resolution, step conversion.
+   */
+  allureCsvPdfParse: AI_MODELS.classify,
 } as const;
