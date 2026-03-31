@@ -44,7 +44,7 @@ const SPECIAL_INPUT_TYPES = new Set([
 export async function detectSpecialInput(locator: Locator): Promise<NativeInputDetection> {
   const detection = await locator.evaluate((el) => {
     const tag = el.tagName.toLowerCase();
-    const type = (el as HTMLInputElement).type?.toLowerCase() || '';
+    const type = ((el as { type?: string }).type || '').toLowerCase();
     const role = el.getAttribute('role') || '';
     return { tag, type, role };
   });
@@ -87,14 +87,22 @@ export async function detectSpecialInput(locator: Locator): Promise<NativeInputD
  */
 export async function setNativeInputValue(locator: Locator, value: string): Promise<void> {
   await locator.evaluate((el, val) => {
-    const input = el as HTMLInputElement;
+    const input = el as {
+      focus?: () => void;
+      value?: string;
+      dispatchEvent: (event: Event) => boolean;
+    };
+    const domGlobals = globalThis as {
+      HTMLInputElement?: { prototype: object };
+      InputEvent?: new (type: string, init?: Record<string, unknown>) => Event;
+    };
 
     // 1. Focus the element first (some frameworks only listen when focused)
     if (typeof input.focus === 'function') input.focus();
 
     // 2. Use native prototype setter to bypass React/Vue/Angular value tracking
     const nativeSetter = Object.getOwnPropertyDescriptor(
-      window.HTMLInputElement.prototype, 'value',
+      domGlobals.HTMLInputElement?.prototype || {}, 'value',
     )?.set;
     if (nativeSetter) {
       nativeSetter.call(input, val);
@@ -107,7 +115,8 @@ export async function setNativeInputValue(locator: Locator, value: string): Prom
     //    - composed: true so events cross Shadow DOM boundaries
     const eventOpts = { bubbles: true, cancelable: true, composed: true };
     try {
-      input.dispatchEvent(new InputEvent('input', { ...eventOpts, data: val, inputType: 'insertText' }));
+      if (!domGlobals.InputEvent) throw new Error('InputEvent constructor unavailable');
+      input.dispatchEvent(new domGlobals.InputEvent('input', { ...eventOpts, data: val, inputType: 'insertText' }));
     } catch {
       // Fallback: some older browsers don't support InputEvent constructor
       input.dispatchEvent(new Event('input', eventOpts));
@@ -144,18 +153,22 @@ export async function setAriaSliderValue(page: Page, locator: Locator, value: st
   // We always use the PARENT/TRACK bounding box for coordinate calculation,
   // because the thumb is a small handle (~20px) while the track spans the full range.
   const sliderInfo = await locator.evaluate((el) => {
+    const domGlobals = globalThis as {
+      getComputedStyle?: (node: unknown) => { direction?: string };
+      document?: { body?: unknown };
+    };
     const min = parseFloat(el.getAttribute('aria-valuemin') || '0');
     const max = parseFloat(el.getAttribute('aria-valuemax') || '100');
     const current = parseFloat(el.getAttribute('aria-valuenow') || String(min));
     const orientation = el.getAttribute('aria-orientation') || 'horizontal';
-    const isRTL = getComputedStyle(el).direction === 'rtl';
+    const isRTL = domGlobals.getComputedStyle?.(el).direction === 'rtl';
 
     // Find the track element: the slider thumb's parent/grandparent that represents the full range.
     // Heuristic: walk up until we find an element significantly wider/taller than the thumb.
     let track = el;
     const thumbRect = el.getBoundingClientRect();
     const isHorizontal = orientation === 'horizontal';
-    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+    for (let p = el.parentElement; p && p !== domGlobals.document?.body; p = p.parentElement) {
       const pRect = p.getBoundingClientRect();
       // Track is wider (horizontal) or taller (vertical) than the thumb
       if (isHorizontal ? pRect.width > thumbRect.width * 2 : pRect.height > thumbRect.height * 2) {
@@ -280,20 +293,27 @@ export async function executeSwipe(
   // Strategy 2: Dispatch touch events for touch-only carousels
   // Some libraries (Swiper with simulateTouch:false) ignore mouse/pointer events
   await locator.evaluate((el, coords) => {
+    const domGlobals = globalThis as {
+      Touch?: new (init: Record<string, unknown>) => unknown;
+      TouchEvent?: new (type: string, init?: Record<string, unknown>) => Event;
+    };
     const touch = (x: number, y: number) =>
-      new Touch({ identifier: Date.now(), target: el, clientX: x, clientY: y });
+      domGlobals.Touch
+        ? new domGlobals.Touch({ identifier: Date.now(), target: el, clientX: x, clientY: y })
+        : { identifier: Date.now(), target: el, clientX: x, clientY: y };
     try {
-      el.dispatchEvent(new TouchEvent('touchstart', {
+      if (!domGlobals.TouchEvent) throw new Error('TouchEvent constructor unavailable');
+      el.dispatchEvent(new domGlobals.TouchEvent('touchstart', {
         bubbles: true, cancelable: true,
         touches: [touch(coords.fromX, coords.fromY)],
         changedTouches: [touch(coords.fromX, coords.fromY)],
       }));
-      el.dispatchEvent(new TouchEvent('touchmove', {
+      el.dispatchEvent(new domGlobals.TouchEvent('touchmove', {
         bubbles: true, cancelable: true,
         touches: [touch(coords.toX, coords.toY)],
         changedTouches: [touch(coords.toX, coords.toY)],
       }));
-      el.dispatchEvent(new TouchEvent('touchend', {
+      el.dispatchEvent(new domGlobals.TouchEvent('touchend', {
         bubbles: true, cancelable: true,
         touches: [],
         changedTouches: [touch(coords.toX, coords.toY)],
