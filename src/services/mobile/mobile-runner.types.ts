@@ -117,6 +117,22 @@ export interface MobileStepResult {
   durationMs: number;
 }
 
+// ── Test Metadata ────────────────────────────────────────────────
+
+/** Test-level metadata forwarded to the mobile runner. All fields optional. */
+export interface MobileTestMetadata {
+  /** Natural language description of the test's purpose/intent */
+  goal?: string;
+  /** Detailed test description */
+  description?: string;
+  /** What the test should verify */
+  expectedResult?: string;
+  /** Test priority level */
+  priority?: 'critical' | 'high' | 'medium' | 'low';
+  /** Freeform tags for filtering/grouping */
+  tags?: string[];
+}
+
 // ── Run Steps ────────────────────────────────────────────────────
 
 export interface MobileRunStepsRequest {
@@ -126,6 +142,8 @@ export interface MobileRunStepsRequest {
   testName?: string;
   screenshotEachStep?: boolean;
   stopOnFailure?: boolean;
+  /** Test-level metadata (goal, description, priority, tags, etc.) */
+  metadata?: MobileTestMetadata;
 }
 
 export interface MobileRunStepsResponse {
@@ -138,6 +156,8 @@ export interface MobileRunStepsResponse {
   steps: MobileStepResult[];
   durationMs: number;
   status: 'passed' | 'failed' | 'partial';
+  /** Test-level metadata echoed from the request */
+  metadata?: MobileTestMetadata;
 }
 
 // ── Artifacts ────────────────────────────────────────────────────
@@ -193,6 +213,8 @@ export interface MobileTestJobData {
   testCaseId?: string;
   /** Saved test case name (for display in results) */
   testCaseName?: string;
+  /** Test-level metadata forwarded to the mobile runner */
+  metadata?: MobileTestMetadata;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

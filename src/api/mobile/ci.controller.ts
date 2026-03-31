@@ -12,7 +12,7 @@ import { env } from '@/config/environment/env';
 import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
-import type { MobileIntentStep, MobilePlatform, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import type { MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService, MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
 import { ProjectService } from '@/services/core/project.service';
@@ -302,6 +302,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         callbackUrl,
         testCaseId: tc.id,
         testCaseName: tc.name,
+        metadata: tc.metadata,
       };
 
       await QueueManager.addMobileTestRunJob(jobData);
@@ -392,10 +393,10 @@ export async function getCiRunStatus(req: Request, res: Response): Promise<void>
 async function fetchTestCaseSteps(
   testCaseIds: string[],
   projectId: string,
-): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[] }>> {
+): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, platform, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, description, expected_result, priority, tags, goal, platform, steps_json, commands, graph_ref, replay_strategy')
     .in('id', testCaseIds)
     .eq('project_id', projectId)
     .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter']);
@@ -410,8 +411,20 @@ async function fetchTestCaseSteps(
       id: row.id,
       name: row.name || `Test Case ${row.id.slice(0, 8)}`,
       intentSteps: extractIntentSteps(row),
+      metadata: buildTestMetadata(row),
     }))
     .filter((tc) => tc.intentSteps.length > 0);
+}
+
+/** Build metadata object from DB row, omitting undefined/null fields */
+function buildTestMetadata(row: any): MobileTestMetadata | undefined {
+  const m: MobileTestMetadata = {};
+  if (row.goal) m.goal = row.goal;
+  if (row.description) m.description = row.description;
+  if (row.expected_result) m.expectedResult = row.expected_result;
+  if (row.priority) m.priority = row.priority;
+  if (row.tags?.length) m.tags = row.tags;
+  return Object.keys(m).length > 0 ? m : undefined;
 }
 
 /**
@@ -419,10 +432,10 @@ async function fetchTestCaseSteps(
  */
 async function fetchAllProjectTestCases(
   projectId: string,
-): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[] }>> {
+): Promise<Array<{ id: string; name: string; intentSteps: MobileIntentStep[]; metadata?: MobileTestMetadata }>> {
   const { data: rows, error } = await supabaseAdmin
     .from('intent_test_cases')
-    .select('id, name, platform, steps_json, commands, graph_ref, replay_strategy')
+    .select('id, name, description, expected_result, priority, tags, goal, platform, steps_json, commands, graph_ref, replay_strategy')
     .eq('project_id', projectId)
     .in('platform', ['mobile_android', 'mobile_ios', 'mobile_flutter'])
     .neq('status', 'archived')
@@ -438,6 +451,7 @@ async function fetchAllProjectTestCases(
       id: row.id,
       name: row.name || `Test Case ${row.id.slice(0, 8)}`,
       intentSteps: extractIntentSteps(row),
+      metadata: buildTestMetadata(row),
     }))
     .filter((tc) => tc.intentSteps.length > 0);
 }

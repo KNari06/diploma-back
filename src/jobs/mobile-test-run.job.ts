@@ -76,6 +76,8 @@ export class MobileTestRunJobHandler {
       appStoragePath,
       appOriginalName,
       ciRunId,
+      testCaseName,
+      metadata,
     } = job.data;
 
     // Validate
@@ -277,6 +279,7 @@ export class MobileTestRunJobHandler {
 
       const runResult = await client.runSteps(sessionId, intentSteps, {
         screenshotEachStep: true,
+        metadata,
       });
 
       logger.info('[MOBILE-TEST] Steps executed', {

@@ -17,6 +17,7 @@ import type {
   MobileArtifactBundle,
   MobileHealthResponse,
   MobileIntentStep,
+  MobileTestMetadata,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 
@@ -172,12 +173,14 @@ export class MobileRunnerClient {
     opts?: {
       screenshotEachStep?: boolean;
       stopOnFailure?: boolean;
+      metadata?: MobileTestMetadata;
     },
   ): Promise<MobileRunStepsResponse> {
     const body: MobileRunStepsRequest = {
       steps: intentSteps,
       screenshotEachStep: opts?.screenshotEachStep ?? true,
       stopOnFailure: opts?.stopOnFailure,
+      metadata: opts?.metadata,
     };
 
     return this.request<MobileRunStepsResponse>(

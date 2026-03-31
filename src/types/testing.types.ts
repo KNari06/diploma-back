@@ -447,6 +447,8 @@ export interface IntentTestCase {
   dependsOn?: string[];
   
   // Metadata
+  /** Natural language description of the test's purpose/intent */
+  goal?: string;
   tags?: string[];
   priority?: Priority;
   preconditions?: any[];
