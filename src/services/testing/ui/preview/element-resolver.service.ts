@@ -1206,6 +1206,13 @@ RULES:
    - below 0.5: weak guess — return alternatives instead
    NEVER return confidence > 0.8 when guessing between duplicates without distinguishing context
 13. If 2+ elements are equally valid, return alternatives (not a single pick)
+16. NONSENSE / IRRELEVANT DESCRIPTIONS — if the intent text has NO meaningful semantic connection
+   to ANY candidate element, return ref=null with confidence=0. Examples of nonsense:
+   - Random characters: "asdfgh", "ываыва", "xyzabc"
+   - Text that is clearly not an element description: random words, sentences copied from elsewhere
+   - Description that doesn't match any element's label, placeholder, text, role, or visual appearance
+   Do NOT force-match to the "closest" element when the description is clearly irrelevant.
+   Return: {"ref":null,"confidence":0,"reason":"description does not match any element"}
 14. ONLY use refs from the provided list — never invent refs
 15. Respond ONLY with valid JSON, no markdown
 
@@ -1303,15 +1310,28 @@ Select the single best matching element.`;
     let result: LlmSelectResult;
 
     if (parsed.ref && validRefs.has(parsed.ref)) {
-      // Single element selected
-      result = {
-        status: 'resolved',
-        selectedRef: parsed.ref,
-        confidence: Math.min(1, Math.max(0, parsed.confidence ?? 0.8)),
-        reason: (parsed.reason || '').slice(0, 200),
-        latencyMs: Date.now() - startTime,
-        cacheHit: false,
-      };
+      const confidence = Math.min(1, Math.max(0, parsed.confidence ?? 0.8));
+      // Reject low-confidence matches — likely nonsense/irrelevant descriptions
+      if (confidence < 0.4) {
+        result = {
+          status: 'not_found',
+          selectedRef: null,
+          confidence: 0,
+          reason: (parsed.reason || 'description does not match any element').slice(0, 200),
+          latencyMs: Date.now() - startTime,
+          cacheHit: false,
+        };
+      } else {
+        // Single element selected with sufficient confidence
+        result = {
+          status: 'resolved',
+          selectedRef: parsed.ref,
+          confidence,
+          reason: (parsed.reason || '').slice(0, 200),
+          latencyMs: Date.now() - startTime,
+          cacheHit: false,
+        };
+      }
     } else if (parsed.alternatives && Array.isArray(parsed.alternatives) && parsed.alternatives.length > 0) {
       // Ambiguous — multiple valid options
       const validAlts = parsed.alternatives.filter(r => validRefs.has(r));
