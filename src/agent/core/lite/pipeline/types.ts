@@ -203,6 +203,8 @@ export interface PipelineConfig {
   integrationContext?: string;
   /** Skip DB-based cancellation checks (exploration flows use non-UUID testIds) */
   skipDbCancellationCheck?: boolean;
+  /** Entry point ID for exploration flows — propagated to pipeline trace events for log correlation */
+  entryPointId?: string;
 }
 
 /** Result returned by the pipeline */

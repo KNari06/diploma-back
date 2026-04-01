@@ -263,6 +263,8 @@ export interface StrategistInput {
   scopeHint?: string;
   /** User directive from WebSocket */
   userDirective?: string;
+  /** Nav link URLs discovered during survey but not yet visited — concrete targets for continueSurvey */
+  unvisitedNavLinks: Array<{ url: string; label: string; sourcePageUrl: string }>;
 }
 
 export interface StrategistOutput {

@@ -38,6 +38,8 @@ export class ExplorationTree {
   private allEntryPoints: Map<string, EntryPoint> = new Map();
   private consecutiveTemplateCount: Map<string, number> = new Map();
   private nodeIdCounter: number = 0;
+  /** Nav link URLs discovered during BFS that have NOT been visited yet */
+  private discoveredNavLinks: Map<string, { url: string; label: string; sourcePageUrl: string }> = new Map();
 
   // ═══════════════════════════════════════════════════════════════════════
   // NODE MANAGEMENT
@@ -144,6 +146,31 @@ export class ExplorationTree {
     return this.visitedUrls.has(this.normalizeUrl(url));
   }
 
+  /**
+   * Register a nav link URL discovered during BFS.
+   * The link will appear in getUnvisitedNavLinks() until its URL is visited.
+   */
+  registerNavLink(url: string, label: string, sourcePageUrl: string): void {
+    const normalizedUrl = this.normalizeUrl(url);
+    if (!this.discoveredNavLinks.has(normalizedUrl)) {
+      this.discoveredNavLinks.set(normalizedUrl, { url, label, sourcePageUrl });
+    }
+  }
+
+  /**
+   * Get all nav link URLs that were discovered but never visited during survey.
+   * Used by Strategist to suggest concrete surveyTargets.
+   */
+  getUnvisitedNavLinks(): Array<{ url: string; label: string; sourcePageUrl: string }> {
+    const result: Array<{ url: string; label: string; sourcePageUrl: string }> = [];
+    for (const [normalizedUrl, link] of this.discoveredNavLinks) {
+      if (!this.visitedUrls.has(normalizedUrl)) {
+        result.push(link);
+      }
+    }
+    return result;
+  }
+
   isContentVisited(snapshot: LiteSnapshot): boolean {
     const hash = this.computeContentHash(snapshot);
     return this.visitedContentHashes.has(hash);
@@ -202,6 +229,7 @@ export class ExplorationTree {
       visitedContentHashes: Array.from(this.visitedContentHashes),
       allEntryPoints: Array.from(this.allEntryPoints.entries()),
       nodeIdCounter: this.nodeIdCounter,
+      discoveredNavLinks: Array.from(this.discoveredNavLinks.entries()),
     };
   }
 
@@ -212,6 +240,9 @@ export class ExplorationTree {
     for (const hash of cp.visitedContentHashes) tree.visitedContentHashes.add(hash);
     for (const [id, ep] of cp.allEntryPoints) tree.allEntryPoints.set(id, ep);
     tree.nodeIdCounter = cp.nodeIdCounter;
+    if (cp.discoveredNavLinks) {
+      for (const [key, link] of cp.discoveredNavLinks) tree.discoveredNavLinks.set(key, link);
+    }
     return tree;
   }
 

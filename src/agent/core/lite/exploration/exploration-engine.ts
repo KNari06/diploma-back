@@ -203,6 +203,18 @@ export class ExplorationEngine {
 
     // Build queue from Strategist output (AI-driven order, not static formula)
     bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy);
+    bb.queue.setDedupTrace((data) => trace.writeQueueDedup(data));
+
+    // Log the full queue order for debugging prioritization
+    trace.writeQueueOrder({
+      source: bb.currentStrategy.plan.length > 0 ? 'strategy' : 'fallback',
+      flows: bb.queue.remaining().map((ep) => ({
+        id: ep.id,
+        name: ep.name,
+        category: ep.category,
+        priority: ep.priority,
+      })),
+    });
 
     this.emitProgress('strategizing', 'strategy_planned', {
       totalFlowsPlanned: bb.currentStrategy.plan.length,
@@ -370,6 +382,53 @@ export class ExplorationEngine {
       });
 
       const focused = await strategist.planFocused(bb.coverageAssessment.focusNext);
+
+      // If Strategist says to continue surveying, run targeted survey to discover new pages/flows
+      if (focused.continueSurvey && focused.surveyTargets?.length && budget.canSurveyMorePages()) {
+        logger.info('[EXPLORATION] Phase 2.5: Strategist requested targeted survey', {
+          targets: focused.surveyTargets,
+        });
+
+        try {
+          const targetedSurveyContext = await this.browser.newContext({
+            viewport: { width: 1280, height: 720 },
+            ignoreHTTPSErrors: true,
+          });
+
+          try {
+            const targetedPage = await targetedSurveyContext.newPage();
+            try {
+              const { setupThirdPartyBlocker } = await import('@/agent/playwright/execution/third-party-blocker');
+              await setupThirdPartyBlocker(targetedPage);
+            } catch { /* non-fatal */ }
+
+            const targetedSurvey = new SurveyAgent(targetedPage, this.config, budget, rateLimiter, trace);
+            const updatedTree = await targetedSurvey.surveyTargets(
+              focused.surveyTargets,
+              bb.tree!,
+            );
+            bb.tree = updatedTree;
+
+            // Rebuild queue with newly discovered entry points
+            const updatedEntryPoints = bb.tree.getAllEntryPoints();
+            bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, focused);
+
+            logger.info('[EXPLORATION] Phase 2.5: Targeted survey complete', {
+              newPages: updatedTree.getNodeCount(),
+              newEntryPoints: updatedEntryPoints.length,
+            });
+
+            await targetedPage.close();
+          } finally {
+            await targetedSurveyContext.close();
+          }
+        } catch (err) {
+          logger.warn('[EXPLORATION] Phase 2.5: Targeted survey failed, continuing with existing queue', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
       if (bb.queue) {
         bb.queue.reorder(focused.plan, focused.skipFlows.map((s) => s.id));
       }
@@ -516,6 +575,7 @@ export class ExplorationEngine {
       }
 
       const queue = FlowQueue.fromEntryPoints(allEntryPoints);
+      queue.setDedupTrace((data) => trace.writeQueueDedup(data));
       trace.writePhaseStart('flow');
       const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
 
@@ -567,6 +627,7 @@ export class ExplorationEngine {
     const queue = checkpoint.queue
       ? FlowQueue.fromCheckpoint(checkpoint.queue)
       : FlowQueue.fromEntryPoints(allEntryPoints);
+    queue.setDedupTrace((data) => trace.writeQueueDedup(data));
 
     const previousTasks = checkpoint.flowRunner?.completedTasks || [];
     trace.writePhaseStart('flow');

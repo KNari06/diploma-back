@@ -13,6 +13,7 @@ import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-
 import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-session.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
 import { cancelTest } from '@/services/testing/ui/manual/test-cancellation';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
@@ -644,6 +645,7 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         appPackage: mobileApp?.packageName,
         testCaseId: id,
         testCaseName: testCase.name,
+        metadata: buildMetadataFromTestCase(testCase),
       };
 
       await QueueManager.addMobileTestRunJob(jobData);

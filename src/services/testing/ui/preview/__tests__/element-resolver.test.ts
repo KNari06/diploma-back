@@ -1,14 +1,26 @@
 /**
  * Unit tests for Element Resolver Service V7
- * Tests candidate text building, intent sanitization, and buildAllowedSets
+ * Tests candidate text building, intent sanitization, buildAllowedSets,
+ * and LLM-based element resolution (nonsense/irrelevant description rejection).
  */
 
 import {
     buildCandidateText,
     sanitizeIntent,
     buildAllowedSets,
+    resolveElement,
 } from '../element-resolver.service';
 import type { IntentStep, InteractiveNode } from '../preview.types';
+
+// Mock LLM services used by selectElementWithLLM / rescueWithGeminiFlash
+jest.mock('@/services/ai/core/openai.service');
+jest.mock('@/services/ai/core/gemini.service');
+
+import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
+
+const mockGetChatCompletion = getChatCompletionWithMessages as jest.MockedFunction<typeof getChatCompletionWithMessages>;
+const mockGeminiVision = generateTextWithGeminiVision as jest.MockedFunction<typeof generateTextWithGeminiVision>;
 
 describe('ElementResolverService', () => {
   // ═══════════════════════════════════════════════════════════════════════════
@@ -418,6 +430,138 @@ describe('ElementResolverService', () => {
       };
       expect(node.type).not.toBe('password');
       expect(node.autocomplete).toBeUndefined();
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // resolveElement — LLM low-confidence / nonsense rejection
+  // ═══════════════════════════════════════════════════════════════════════════
+  describe('resolveElement — nonsense and no-match descriptions', () => {
+    const domNodes: InteractiveNode[] = [
+      { tag: 'input', ref: 'e1', isVisible: true, labelText: 'Username', placeholder: 'Enter username', type: 'text' },
+      { tag: 'input', ref: 'e2', isVisible: true, labelText: 'Password', type: 'password' },
+      { tag: 'button', ref: 'e3', isVisible: true, text: 'Login' },
+    ];
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      // Default: Gemini vision not called
+      mockGeminiVision.mockResolvedValue({ content: '', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, model: 'mock' } });
+    });
+
+    it('should return not_found when LLM returns low confidence (<0.4) for nonsense text', async () => {
+      // LLM tries to match but returns very low confidence
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e1', confidence: 0.2, reason: 'no semantic match' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'ываыва' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('not_found');
+      expect(result.confidence).toBe(0);
+    });
+
+    it('should return not_found when LLM returns ref=null for gibberish', async () => {
+      // LLM correctly rejects nonsense
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: null, confidence: 0, reason: 'description does not match any element' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'asdfghjkl' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('not_found');
+      expect(result.confidence).toBe(0);
+    });
+
+    it('should return not_found for valid description with no matching element', async () => {
+      // "Delete account button" doesn't exist on a login page
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: null, confidence: 0, reason: 'no delete account button on this page' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'Delete account button' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('not_found');
+      expect(result.confidence).toBe(0);
+    });
+
+    it('should return resolved when LLM returns high confidence for valid description', async () => {
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e3', confidence: 0.95, reason: 'Login button matches' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'Login button' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('should return not_found when LLM returns borderline confidence (0.35) — below threshold', async () => {
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e1', confidence: 0.35, reason: 'weak match' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'type', description: 'random words here' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('not_found');
+    });
+
+    it('should return resolved when LLM returns confidence at threshold (0.4)', async () => {
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e2', confidence: 0.4, reason: 'partial match — password field' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'type', description: 'Password' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.4);
+    });
+
+    it('should return resolved for cross-language match when LLM correctly identifies element', async () => {
+      // "Войти" = "Login" — LLM handles cross-language matching
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e3', confidence: 0.9, reason: 'Войти matches Login button' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'Войти' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
     });
   });
 });

@@ -75,7 +75,8 @@ export class IntegrationTokenService {
       }
 
       if (workspaceId) {
-        query = query.eq('workspace_id', workspaceId);
+        // Match workspace-scoped tokens OR global tokens (workspace_id IS NULL)
+        query = query.or(`workspace_id.eq.${workspaceId},workspace_id.is.null`);
       }
 
       const { data, error } = await query
@@ -353,17 +354,30 @@ export class IntegrationTokenService {
         workspaceId,
       });
 
-      let query = supabaseAdmin
-        .from('integration_tokens')
-        .select('*')
-        .eq('user_id', userId)
-        .eq('enabled', true);
+      let data: any[];
+      let error: any;
 
       if (workspaceId) {
-        query = query.eq('workspace_id', workspaceId);
+        // Return tokens scoped to this workspace OR global tokens (workspace_id IS NULL)
+        const result = await supabaseAdmin
+          .from('integration_tokens')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('enabled', true)
+          .or(`workspace_id.eq.${workspaceId},workspace_id.is.null`)
+          .order('created_at', { ascending: false });
+        data = result.data || [];
+        error = result.error;
+      } else {
+        const result = await supabaseAdmin
+          .from('integration_tokens')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('enabled', true)
+          .order('created_at', { ascending: false });
+        data = result.data || [];
+        error = result.error;
       }
-
-      const { data, error } = await query.order('created_at', { ascending: false });
 
       if (error) {
         logger.error('[INTEGRATION_TOKEN] Failed to list integrations', {

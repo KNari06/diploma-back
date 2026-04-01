@@ -36,12 +36,21 @@ const DEDUP_THRESHOLD = 0.5;
 /** Name similarity threshold — catches near-identical names like "Contact Us" vs "Contact Us Form" */
 const NAME_DEDUP_THRESHOLD = 0.6;
 
+/** Optional callback for dedup decision tracing */
+export type DedupTraceCallback = (data: {
+  entryPointName: string;
+  reason: 'exact_name' | 'name_similarity' | 'goal_similarity';
+  matchedAgainst?: string;
+  similarity?: number;
+}) => void;
+
 export class FlowQueue {
   private queue: EntryPoint[] = [];
   private completed: Set<string> = new Set();
   private allGoals: Map<string, string> = new Map(); // id → goal (for dedup)
   private allNames: Set<string> = new Set();          // normalized names — dedup across all enqueued+completed
   private mutexPromise: Promise<void> = Promise.resolve();
+  private dedupTrace?: DedupTraceCallback;
 
   // ═══════════════════════════════════════════════════════════════════════
   // CONSTRUCTION
@@ -110,6 +119,11 @@ export class FlowQueue {
     // Don't sort — planned order is intentional from Strategist
 
     return q;
+  }
+
+  /** Set optional trace callback for dedup decisions */
+  setDedupTrace(cb: DedupTraceCallback): void {
+    this.dedupTrace = cb;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -252,19 +266,24 @@ export class FlowQueue {
 
     // Dedup check 1: exact name — covers all ever-enqueued (including already dequeued/completed)
     if (this.allNames.has(normalizedName)) {
+      this.dedupTrace?.({ entryPointName: entryPoint.name, reason: 'exact_name', matchedAgainst: normalizedName });
       return false;
     }
 
     // Dedup check 2: name similarity — catches "Form Submission" vs "First name Submission"
     for (const existingName of this.allNames) {
-      if (this.jaccardSimilarity(existingName, normalizedName) >= NAME_DEDUP_THRESHOLD) {
+      const sim = this.jaccardSimilarity(existingName, normalizedName);
+      if (sim >= NAME_DEDUP_THRESHOLD) {
+        this.dedupTrace?.({ entryPointName: entryPoint.name, reason: 'name_similarity', matchedAgainst: existingName, similarity: sim });
         return false;
       }
     }
 
     // Dedup check 3: Jaccard similarity on goal text
     for (const [, existingGoal] of this.allGoals) {
-      if (this.jaccardSimilarity(existingGoal, entryPoint.goal) >= DEDUP_THRESHOLD) {
+      const sim = this.jaccardSimilarity(existingGoal, entryPoint.goal);
+      if (sim >= DEDUP_THRESHOLD) {
+        this.dedupTrace?.({ entryPointName: entryPoint.name, reason: 'goal_similarity', matchedAgainst: existingGoal.slice(0, 80), similarity: sim });
         return false;
       }
     }

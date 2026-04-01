@@ -40,6 +40,7 @@ RULES:
 - Do NOT list truly destructive flows only (delete account, wipe all data, permanently ban user) — other delete/cancel actions like "cancel order", "remove from cart", "delete review" ARE valid test flows
 - Do NOT list pure UI noise: cookie banners, generic chat widget openers, "close modal" buttons
 - Do NOT include duplicate flows
+- Do NOT create entry points for actions that navigate to EXTERNAL/third-party domains (e.g., "Log in to Udemy", "Buy on Amazon", "Share on Twitter"). Only include flows that stay within the application under test. SSO buttons (Google, GitHub) that are part of the app's own auth flow ARE valid.
 - Goals must be SPECIFIC — bad: "Use the search", good: "Search for a product by keyword and verify results appear"
 - ONE goal per entry point — do NOT combine multiple scenarios into one entry point. Bad: "validate positive AND negative login". Good: separate entry points for "Login with valid credentials" and "Attempt login with invalid credentials and verify error"
 - Entry point names must be descriptive and unique — avoid generic names like "Form Submission" or "CTA: Submit". Use the page context: "Contact Form Submission", "Registration Form", "Newsletter Signup"

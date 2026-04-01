@@ -113,33 +113,6 @@ export function truncateString(str: string, maxChars: number): string {
 }
 
 /**
- * ✅ FIX 2: Truncate object keys to limit context size
- * @param obj - Object to truncate
- * @param maxLength - Maximum length per string value
- * @returns Truncated object
- */
-export function truncateObject(obj: any, maxLength: number = 1000): any {
-  if (!obj) return obj;
-  if (typeof obj === 'string') return truncateString(obj, maxLength);
-  if (typeof obj !== 'object') return obj;
-  if (Array.isArray(obj)) {
-    return obj.map(item => truncateObject(item, maxLength));
-  }
-
-  const result: any = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (typeof value === 'string') {
-      result[key] = truncateString(value, maxLength);
-    } else if (typeof value === 'object') {
-      result[key] = truncateObject(value, maxLength);
-    } else {
-      result[key] = value;
-    }
-  }
-  return result;
-}
-
-/**
  * ✅ FIX 2: Estimate token count (rough approximation)
  * @param text - Text to estimate
  * @returns Estimated token count
@@ -149,29 +122,6 @@ export function estimateTokens(text: string): number {
   // Rough approximation: 1 token ≈ 4 characters
   // More accurate for English, less for other languages
   return Math.ceil(text.length / 4);
-}
-
-/**
- * ✅ FIX 2: Filter elements by priority
- * @param elements - Array of elements with priority field
- * @param maxCount - Maximum number of elements to return
- * @returns Filtered elements (priority order: critical > high > medium > low)
- */
-export function filterByPriority<T extends { priority?: string }>(
-  elements: T[],
-  maxCount: number
-): T[] {
-  if (!elements || elements.length <= maxCount) return elements;
-
-  const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3, unknown: 4 };
-
-  const sorted = [...elements].sort((a, b) => {
-    const aPriority = priorityOrder[a.priority as keyof typeof priorityOrder] ?? priorityOrder.unknown;
-    const bPriority = priorityOrder[b.priority as keyof typeof priorityOrder] ?? priorityOrder.unknown;
-    return aPriority - bPriority;
-  });
-
-  return sorted.slice(0, maxCount);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -209,39 +159,3 @@ export function maskPII(text: string): string {
   return masked;
 }
 
-/**
- * ✅ FIX 4: Redact PII from vision context (screenshots + HTML)
- * @param visionContext - Vision analysis context
- * @returns Redacted context
- */
-export function redactVisionPII(visionContext: {
-  html?: string;
-  screenshot?: string; // base64 or URL
-  description?: string;
-}): typeof visionContext {
-  return {
-    html: visionContext.html ? maskPII(visionContext.html) : undefined,
-    screenshot: visionContext.screenshot, // Keep screenshot as-is (visual PII harder to mask programmatically)
-    description: visionContext.description ? maskPII(visionContext.description) : undefined,
-  };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// RETRY LOGIC
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * ✅ FIX 1: Build retry prompt for invalid JSON responses
- * @param originalPrompt - Original prompt that failed
- * @param errorMessage - Error message from parsing
- * @returns Retry prompt
- */
-export function buildRetryPrompt(originalPrompt: string, errorMessage: string): string {
-  return `${originalPrompt}
-
-IMPORTANT: Your previous response was invalid JSON.
-Error: ${errorMessage}
-
-Please return ONLY valid JSON now. Do not add any extra text, explanations, or markdown formatting.
-Just return the raw JSON object.`;
-}

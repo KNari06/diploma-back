@@ -592,7 +592,25 @@ export class ActionExecutor {
         ).catch(() => false);
 
         if (isNativeSelect) {
-          await locator.selectOption(cmd.value, { timeout: this.DEFAULT_TIMEOUT });
+          try {
+            await locator.selectOption(cmd.value, { timeout: 5000 });
+          } catch {
+            // Fallback: set value directly via DOM when Playwright selectOption hangs
+            await this.page.evaluate(
+              ({ ref, value }) => {
+                const select = document.querySelector(`[data-agent-ref="${ref}"]`) as HTMLSelectElement | null;
+                if (!select) return;
+                for (const opt of Array.from(select.options)) {
+                  if (opt.text.trim().toLowerCase() === value.toLowerCase() || opt.value === value) {
+                    select.value = opt.value;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    return;
+                  }
+                }
+              },
+              { ref: cmd.ref, value: cmd.value },
+            );
+          }
         } else {
           await this.selectFromCustomDropdown(locator, cmd.value || '', this.DEFAULT_TIMEOUT);
         }
@@ -628,24 +646,8 @@ export class ActionExecutor {
       case 'setRange':
         if (!locator || cmd.value === undefined) throw new Error('setRange requires ref and value');
         await this.ensureElementVisible(locator);
-        // Set value on range/slider input using page.evaluate for reliable operation
-        // fill() and pressSequentially() don't work on <input type="range">
-        await locator.evaluate((el, val) => {
-          const input = el as HTMLInputElement;
-          // Use nativeInputValueSetter to trigger React/Vue change events
-          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          )?.set;
-          if (nativeInputValueSetter) {
-            nativeInputValueSetter.call(input, val);
-          } else {
-            input.value = val;
-          }
-          // Dispatch input, change, and blur (Angular validators fire on blur)
-          input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        }, cmd.value);
+        // V9: Uses shared native input helper (deduplicates nativeInputValueSetter pattern)
+        await (await import('@/agent/playwright/core/native-input-helpers')).setNativeInputValue(locator, cmd.value);
         break;
 
       case 'clear':
@@ -675,23 +677,8 @@ export class ActionExecutor {
       case 'selectDate':
         if (!locator || !cmd.value) throw new Error('selectDate requires ref and value');
         await this.ensureElementVisible(locator);
-        // Date inputs require special handling: fill() is most reliable for type="date"
-        // because pressSequentially doesn't work (browser opens calendar UI).
-        // We use evaluate to set the value directly and trigger change events.
-        await locator.evaluate((el, dateStr) => {
-          const input = el as HTMLInputElement;
-          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          )?.set;
-          if (nativeInputValueSetter) {
-            nativeInputValueSetter.call(input, dateStr);
-          } else {
-            input.value = dateStr;
-          }
-          input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          input.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        }, cmd.value);
+        // V9: Uses shared native input helper (deduplicates nativeInputValueSetter pattern)
+        await (await import('@/agent/playwright/core/native-input-helpers')).setNativeInputValue(locator, cmd.value);
         break;
 
       default:
@@ -1106,7 +1093,24 @@ export class ActionExecutor {
           ).catch(() => false);
 
           if (isNativeFallback) {
-            await locator.selectOption(cmd.value, { timeout: this.FALLBACK_TIMEOUT });
+            try {
+              await locator.selectOption(cmd.value, { timeout: 5000 });
+            } catch {
+              await this.page.evaluate(
+                ({ ref, value }) => {
+                  const select = document.querySelector(`[data-agent-ref="${ref}"]`) as HTMLSelectElement | null;
+                  if (!select) return;
+                  for (const opt of Array.from(select.options)) {
+                    if (opt.text.trim().toLowerCase() === value.toLowerCase() || opt.value === value) {
+                      select.value = opt.value;
+                      select.dispatchEvent(new Event('change', { bubbles: true }));
+                      return;
+                    }
+                  }
+                },
+                { ref: cmd.ref, value: cmd.value },
+              );
+            }
           } else {
             await this.selectFromCustomDropdown(locator, cmd.value, this.FALLBACK_TIMEOUT);
           }

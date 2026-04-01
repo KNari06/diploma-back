@@ -113,8 +113,72 @@ export interface MobileStepResult {
   success: boolean;
   error?: string;
   screenshot?: string; // base64
-  resolvedVia?: 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'skipped';
+  resolvedVia?: 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
   durationMs: number;
+  /** Error evidence collected during/after this step */
+  evidence?: {
+    logErrors?: string[];
+    consoleErrors?: Array<{ type: string; message: string; source?: string; line?: number; timestamp: number }>;
+    networkErrors?: Array<{ url: string; method: string; error?: string; status?: number; statusText?: string; timestamp: number }>;
+    systemAlert?: { text: string; isError: boolean };
+  };
+  /** Automatic error classification */
+  errorClassification?: {
+    type: string;
+    confidence: number;
+    summary: string;
+  };
+  /** Structured bug report for this failed step */
+  bugReport?: {
+    type: string;
+    title: string;
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    description: string;
+    stepsToReproduce: Array<{ stepNumber: number; action: string; result: string }>;
+    evidence: Record<string, unknown>;
+    environment: Record<string, unknown>;
+    detectedAt: number;
+  };
+}
+
+// ── Test Metadata ────────────────────────────────────────────────
+
+/** Test-level metadata forwarded to the mobile runner. All fields optional. */
+export interface MobileTestMetadata {
+  /** Natural language description of the test's purpose/intent */
+  goal?: string;
+  /** Detailed test description */
+  description?: string;
+  /** What the test should verify */
+  expectedResult?: string;
+  /** Test priority level */
+  priority?: 'critical' | 'high' | 'medium' | 'low';
+  /** Freeform tags for filtering/grouping */
+  tags?: string[];
+}
+
+/**
+ * Build MobileTestMetadata from an IntentTestCase.
+ * Supports both camelCase (mapped objects) and snake_case (raw DB rows).
+ * Returns undefined if all fields are empty.
+ */
+export function buildMetadataFromTestCase(tc: {
+  goal?: string;
+  description?: string;
+  expectedResult?: string;
+  expected_result?: string;
+  priority?: string;
+  tags?: string[];
+}): MobileTestMetadata | undefined {
+  const m: MobileTestMetadata = {};
+  if (tc.goal) m.goal = tc.goal;
+  if (tc.description) m.description = tc.description;
+  // Support both camelCase (mapped) and snake_case (raw DB row)
+  const expectedResult = tc.expectedResult || tc.expected_result;
+  if (expectedResult) m.expectedResult = expectedResult;
+  if (tc.priority) m.priority = tc.priority as MobileTestMetadata['priority'];
+  if (tc.tags?.length) m.tags = tc.tags;
+  return Object.keys(m).length > 0 ? m : undefined;
 }
 
 // ── Run Steps ────────────────────────────────────────────────────
@@ -126,6 +190,8 @@ export interface MobileRunStepsRequest {
   testName?: string;
   screenshotEachStep?: boolean;
   stopOnFailure?: boolean;
+  /** Test-level metadata (goal, description, priority, tags, etc.) */
+  metadata?: MobileTestMetadata;
 }
 
 export interface MobileRunStepsResponse {
@@ -138,6 +204,16 @@ export interface MobileRunStepsResponse {
   steps: MobileStepResult[];
   durationMs: number;
   status: 'passed' | 'failed' | 'partial';
+  /** Test-level metadata echoed from the request */
+  metadata?: MobileTestMetadata;
+  /** Aggregated errors from all failed steps */
+  errors?: Array<{ type: string; message: string; stepId?: string; timestamp: number }>;
+  /** Device log errors (logcat/syslog) collected during the run */
+  logs?: string[];
+  /** Network errors captured during the run (WebView only) */
+  networkLogs?: Array<{ url: string; method: string; status?: number; error?: string; timestamp: number }>;
+  /** Bug reports from failed steps — ready for UI display */
+  bugReports?: Array<MobileStepResult['bugReport']>;
 }
 
 // ── Artifacts ────────────────────────────────────────────────────
@@ -193,6 +269,8 @@ export interface MobileTestJobData {
   testCaseId?: string;
   /** Saved test case name (for display in results) */
   testCaseName?: string;
+  /** Test-level metadata forwarded to the mobile runner */
+  metadata?: MobileTestMetadata;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

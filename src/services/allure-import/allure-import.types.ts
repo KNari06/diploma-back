@@ -316,17 +316,31 @@ export function resolveImportOptions(
 // BULLMQ JOB DATA
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Source file format for Allure imports. */
+export type AllureSourceFormat = 'zip' | 'csv' | 'pdf';
+
 /**
  * Data stored in the BullMQ job for async Allure imports.
- * The ZIP is base64-encoded so it can be serialised into Redis.
+ *
+ * The uploaded file is written to a temp file on disk and only the file path
+ * is stored in Redis. This avoids base64-encoding (133% size expansion) into
+ * Redis memory, which would cause OOM for large files or concurrent imports.
  */
 export interface AllureImportJobData {
   importId: string;
   projectId: string;
   userId: string;
   workspaceId: string;
-  /** Base64-encoded ZIP buffer. */
-  zipBase64: string;
+  /** Source file format: 'zip' (Allure results), 'csv' or 'pdf' (Allure TestOps export). */
+  sourceFormat: AllureSourceFormat;
+  /** Path to the uploaded file on disk (temp file). Cleaned up after processing. */
+  filePath: string;
+  /** Original filename from the upload (for display in UI). */
+  originalFileName?: string;
+  /** Original file size in bytes. */
+  originalFileSize?: number;
+  /** @deprecated Use filePath. Kept for backward compat with in-flight jobs. */
+  zipFilePath?: string;
   options: ResolvedAllureImportOptions;
 }
 
@@ -341,6 +355,7 @@ export interface AllureImportJobData {
 export type AllureImportPhase =
   | 'scanning'    // Unzipping + deterministic classification
   | 'classifying' // AI classification of ambiguous files
+  | 'parsing'     // LLM parsing CSV/PDF content
   | 'tests'       // Creating IntentTestCase records
   | 'kb'          // Pushing documentation to Knowledge Base
   | 'done';       // Import complete
@@ -413,4 +428,35 @@ export function emptyStats(): AllureImportStats {
     videosSkipped: 0,
     errors: [],
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CSV / PDF LLM PARSER OUTPUT
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Shared output type from LLM-based CSV/PDF parsers.
+ * Both parsers produce this same shape, which is then converted to
+ * IntentTestCase create params by the orchestration service.
+ */
+export interface ParsedTestCaseFromLLM {
+  name: string;
+  description: string;
+  preconditions: string[];
+  steps: Array<{
+    type: string;         // LLM picks from IntentActionType values
+    description: string;
+    value?: string;
+  }>;
+  /** Module name — resolved from Epic > Story > Suite fallback chain. */
+  moduleName?: string;
+  /** Flow name — from Feature column. */
+  flowName?: string;
+  tags: string[];
+  priority: 'critical' | 'high' | 'medium' | 'low';
+  /** Merged from JIRA-Latest + link columns. */
+  links: string[];
+  /** Allure TestOps status: Active / Draft / Deprecated. */
+  status: string;
+  owner?: string;
 }

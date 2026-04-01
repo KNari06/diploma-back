@@ -432,6 +432,8 @@ export interface IntentTestCase {
   // Lifecycle
   status: IntentTestCaseStatus;
   kind: 'standalone' | 'regression_member';
+  /** Test platform — used to route mobile tests to the mobile runner */
+  platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
   
   // Replay data
   replayStrategy?: 'commands' | 'graph_extract';
@@ -447,6 +449,8 @@ export interface IntentTestCase {
   dependsOn?: string[];
   
   // Metadata
+  /** Natural language description of the test's purpose/intent */
+  goal?: string;
   tags?: string[];
   priority?: Priority;
   preconditions?: any[];
@@ -1005,6 +1009,8 @@ export interface ExpandedTestCase {
   moduleId?: string;
   flowId?: string;
   name: string;
+  /** Test case platform — used to route mobile tests to the mobile runner */
+  platform?: string;
   parameters?: Record<string, any>;
   isNegative?: boolean;
   sourceTestCaseId?: string;
@@ -1022,6 +1028,8 @@ export interface ExecutableTestCase {
   flowId?: string;
   dependsOn: string[];
   isNegative?: boolean;
+  /** Test case platform — used to route mobile tests to the mobile runner */
+  platform?: string;
 }
 
 /**

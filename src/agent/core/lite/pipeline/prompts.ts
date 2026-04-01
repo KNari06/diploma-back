@@ -114,6 +114,7 @@ RULES:
 - For checkboxes and radio buttons: use toggle_element to check/uncheck them
 - Maximum 8 steps per plan
 - If goal seems already achieved, create a single step: "Verify goal is complete"
+- CAPTCHA DETECTION: If the page has a checkbox inside an [IFRAME] with an empty or generic name (reCAPTCHA/hCaptcha/Turnstile widget), or if PAGE ALERTS mention "CAPTCHA", "reCAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — plan a single step: report_blocked with blocker_type="captcha". Do NOT attempt to fill or submit the form — it will fail.
 - IMPORTANT: If PAGE ALERTS show authentication errors (e.g. "Invalid email or password", "Wrong credentials", "Account locked") after a login attempt:
   The user-provided credentials are likely wrong. Plan a single step: "Report blocked: invalid credentials provided by user".
   Do NOT retry the same credentials — the agent cannot fix wrong user-provided data.`;
@@ -181,7 +182,8 @@ EXECUTION RULES:
 11. Use scroll_to_element(ref) to bring off-screen elements into view
 12. report_blocked should include blocker_type and can_user_help when possible
 13. If [POST-ACTION] shows PAGE ALERTS with errors — call observe_page to get full page state before deciding next action
-14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.`;
+14. CRITICAL: If observe_page shows PAGE ALERTS with authentication errors like "Invalid email or password", "Wrong credentials", "Incorrect password", or "Account locked" after a login attempt: call report_blocked with reason="credentials_invalid", blocker_type="auth_failure", can_user_help=true. Do NOT retry — the user-provided credentials are wrong.
+15. CAPTCHA DETECTION: If observe_page shows a checkbox inside an [IFRAME] with empty name (CAPTCHA widget), or if PAGE ALERTS mention "reCAPTCHA", "CAPTCHA", "hCaptcha", "Turnstile", or "bot verification" — immediately call report_blocked with blocker_type="captcha". Do NOT retry form submission.`;
 }
 
 /**
@@ -237,7 +239,8 @@ Analyze:
 1. Did the executed commands make progress toward the goal?
 2. Is the current page state consistent with goal achievement?
 3. Are there errors or unexpected states on the page (check PAGE ALERTS section)?
-4. If credentials were used and page shows authentication errors (invalid, wrong, incorrect), the verdict should be "blocked" — user-provided credentials appear wrong.
+4. If PAGE ALERTS mention CAPTCHA/reCAPTCHA/hCaptcha/Turnstile/bot verification, the verdict should be "blocked" — CAPTCHAs cannot be automated.
+5. If credentials were used and page shows authentication errors (invalid, wrong, incorrect), the verdict should be "blocked" — user-provided credentials appear wrong.
 
 Respond with JSON:
 {

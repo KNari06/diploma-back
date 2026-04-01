@@ -295,6 +295,35 @@ export class TestCaseBuilder {
     // Branch-detected entry points during flow exploration are additive.
     const branchPointCount = flowTasks.reduce((sum, t) => sum + t.branchPoints.length, 0);
 
+    // Build discovered pages for history view
+    const pages = tree.getAllNodes().map((node) => ({
+      url: node.url,
+      title: node.title,
+      pageType: node.pageType,
+      entryPointCount: node.entryPoints.length,
+      depth: node.depth,
+    }));
+
+    // Build individual flow results for history view
+    const flows = testCases
+      .filter((tc) => tc.explored)
+      .map((tc) => ({
+        name: tc.name,
+        category: tc.category,
+        status: tc.status,
+        durationMs: tc.estimatedDurationMs,
+        stepsCount: tc.steps.length,
+        blockerType: tc.blocker?.type,
+        errorMessage: tc.blocker?.reason || tc.errors?.[0]?.message,
+        steps: tc.steps.map((s) => ({
+          stepNumber: s.stepNumber,
+          action: s.action,
+          description: s.description,
+          value: s.isSensitive ? undefined : s.value,
+          pageUrl: s.pageUrl,
+        })),
+      }));
+
     return {
       pagesSurveyed: tree.getNodeCount(),
       entryPointsDiscovered: tree.getAllEntryPoints().length + branchPointCount,
@@ -308,6 +337,8 @@ export class TestCaseBuilder {
       totalStepsDiscovered: testCases.reduce((sum, tc) => sum + tc.steps.length, 0),
       uniquePages: uniquePages.size,
       categories: Array.from(categories),
+      pages,
+      flows,
     };
   }
 }

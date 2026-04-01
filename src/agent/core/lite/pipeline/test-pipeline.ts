@@ -89,6 +89,8 @@ export class TestPipeline {
   private static readonly MAX_EMPTY_ROUNDS = 2;
   /** Track last error collection timestamp for per-round error collection */
   private lastErrorCollectionTime: number = 0;
+  /** Entry point ID for exploration flow log correlation */
+  private entryPointId?: string;
   /** Track page state hash for same-state stuck detection */
   private previousSnapshotHash: string = '';
   /** Track consecutive rounds with identical page state */
@@ -111,6 +113,7 @@ export class TestPipeline {
     const timeoutMs = config.timeoutMs || PIPELINE_DEFAULTS.timeoutMs;
     this.actualTimeoutMs = timeoutMs;
     this.abortController = new AbortController();
+    this.entryPointId = config.entryPointId;
 
     // ── Initialize Blackboard (shared state for all agents) ──
     this.blackboard = new TestBlackboard(
@@ -183,10 +186,17 @@ export class TestPipeline {
         // ════════════════════════════════════════════════════════════
         await this.checkCancellation(config.testId, 'pipeline_round_start', config.skipDbCancellationCheck);
 
+        const roundUrl = this.integrations.page.url();
         logger.debug('[PIPELINE] Round start', {
           round: pipelineRound,
           phase: this.blackboard.getPhase(),
           progress: this.blackboard.getProgressScore(),
+          url: roundUrl,
+        });
+        this.trace('round_start', {
+          round: pipelineRound,
+          url: roundUrl,
+          progressScore: this.blackboard.getProgressScore(),
         });
 
         // ════════════════════════════════════════════════════════════
@@ -838,12 +848,16 @@ export class TestPipeline {
    */
   private trace(eventType: string, payload: Record<string, any>): void {
     try {
+      // Include entryPointId so pipeline rounds can be correlated with exploration flows
+      const enrichedPayload = this.entryPointId
+        ? { entryPointId: this.entryPointId, ...payload }
+        : payload;
       this.integrations.traceWriter?.write({
         iteration: payload.round || 0,
         stage: 'pipeline',
         eventType,
         spanId: this.integrations.traceWriter.generateSpanId(),
-        payload,
+        payload: enrichedPayload,
       });
     } catch {
       // Never break pipeline for trace failures

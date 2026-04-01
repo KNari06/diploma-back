@@ -316,6 +316,9 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if (element.iconClasses) {
     node.iconClasses = element.iconClasses;
   }
+  if (element.iframeSource) {
+    node.iframeSource = element.iframeSource;
+  }
   // V8: Semantic size from bounding box dimensions
   if (element.bounds && element.bounds.width > 0 && element.bounds.height > 0) {
     const area = element.bounds.width * element.bounds.height;

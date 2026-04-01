@@ -277,87 +277,58 @@ export class ShadowDOMHandler {
    * Set range/slider value on element that may be inside Shadow DOM
    */
   static async setRange(page: Page, ref: string, value: string): Promise<boolean> {
-    try {
-      const locator = await this.findInShadowDOM(page, ref);
-      if (locator) {
-        await locator.evaluate((el: HTMLInputElement, val: string) => {
-          const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          )?.set;
-          if (nativeSetter) nativeSetter.call(el, val); else el.value = val;
-          el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        }, value);
-        logger.debug('[SHADOW_DOM] Set range value via locator', { ref, value });
-        return true;
-      }
-
-      // ✅ FIX: ElementHandle fallback
-      const element = await this.findElementHandle(page, ref);
-      if (element) {
-        await element.evaluate((el: any, val: string) => {
-          const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          )?.set;
-          if (nativeSetter) nativeSetter.call(el, val); else el.value = val;
-          el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        }, value);
-        logger.debug('[SHADOW_DOM] Set range value via ElementHandle', { ref, value });
-        return true;
-      }
-
-      return false;
-    } catch (error) {
-      logger.error('[SHADOW_DOM] Failed to set range value', {
-        ref,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return false;
-    }
+    return this.setNativeValue(page, ref, value, 'range');
   }
 
   /**
    * Set date/time value on element that may be inside Shadow DOM
    */
   static async selectDate(page: Page, ref: string, value: string): Promise<boolean> {
+    return this.setNativeValue(page, ref, value, 'date');
+  }
+
+  /**
+   * V9: Shared implementation for setRange/selectDate.
+   * Uses shared native-input-helpers utility to avoid 4× code duplication.
+   */
+  private static async setNativeValue(
+    page: Page, ref: string, value: string, label: string,
+  ): Promise<boolean> {
     try {
+      const { setNativeInputValue } = await import('@/agent/playwright/core/native-input-helpers');
+
       const locator = await this.findInShadowDOM(page, ref);
       if (locator) {
-        await locator.evaluate((el: HTMLInputElement, val: string) => {
-          const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          )?.set;
-          if (nativeSetter) nativeSetter.call(el, val); else el.value = val;
-          el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
-        }, value);
-        logger.debug('[SHADOW_DOM] Set date value via locator', { ref, value });
+        await setNativeInputValue(locator, value);
+        logger.debug(`[SHADOW_DOM] Set ${label} value via locator`, { ref, value });
         return true;
       }
 
-      // ✅ FIX: ElementHandle fallback
+      // ElementHandle fallback: evaluate inline (ElementHandle.evaluate has different signature than Locator)
       const element = await this.findElementHandle(page, ref);
       if (element) {
         await element.evaluate((el: any, val: string) => {
           const nativeSetter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
+            window.HTMLInputElement.prototype, 'value',
           )?.set;
           if (nativeSetter) nativeSetter.call(el, val); else el.value = val;
-          el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-          el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+          if (typeof el.focus === 'function') el.focus();
+          const eventOpts = { bubbles: true, cancelable: true, composed: true };
+          try {
+            el.dispatchEvent(new InputEvent('input', { ...eventOpts, data: val, inputType: 'insertText' }));
+          } catch (_e) {
+            el.dispatchEvent(new Event('input', eventOpts));
+          }
+          el.dispatchEvent(new Event('change', eventOpts));
+          el.dispatchEvent(new Event('blur', eventOpts));
         }, value);
-        logger.debug('[SHADOW_DOM] Set date value via ElementHandle', { ref, value });
+        logger.debug(`[SHADOW_DOM] Set ${label} value via ElementHandle`, { ref, value });
         return true;
       }
 
       return false;
     } catch (error) {
-      logger.error('[SHADOW_DOM] Failed to set date value', {
+      logger.error(`[SHADOW_DOM] Failed to set ${label} value`, {
         ref,
         error: error instanceof Error ? error.message : String(error),
       });

@@ -1,17 +1,18 @@
 /**
  * Allure Import Routes
  *
- * POST /api/v1/allure-import/upload   — Upload a ZIP file and start import
- * GET  /api/v1/allure-import/status/:importId — Check import status
+ * POST /api/v1/allure-import/upload                — Upload a .zip, .csv, or .pdf file and start import
+ * GET  /api/v1/allure-import/status/:importId      — Check import status + stats
+ * GET  /api/v1/allure-import/status/:importId/details — Full import details + test cases
  */
 
 import { Router } from 'express';
 import multer from 'multer';
-import { uploadAllure, getImportStatus } from './allure-import.controller';
+import { uploadAllure, getImportStatus, getImportDetails } from './allure-import.controller';
 
 const router = Router();
 
-// ── Multer: memory storage, ZIP only, 100 MB limit ───────────────────────────
+// ── Multer: memory storage, ZIP/CSV/PDF, 100 MB limit ────────────────────────
 const allureUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -19,16 +20,27 @@ const allureUpload = multer({
     files: 1,
   },
   fileFilter: (_req, file, cb) => {
+    const lowerName = file.originalname.toLowerCase();
+
     const isZip =
       file.mimetype === 'application/zip' ||
       file.mimetype === 'application/x-zip-compressed' ||
-      file.mimetype === 'application/octet-stream' || // some OS report ZIP as this
-      file.originalname.toLowerCase().endsWith('.zip');
+      file.mimetype === 'application/octet-stream' ||
+      lowerName.endsWith('.zip');
 
-    if (isZip) {
+    const isCsv =
+      file.mimetype === 'text/csv' ||
+      file.mimetype === 'application/vnd.ms-excel' ||
+      lowerName.endsWith('.csv');
+
+    const isPdf =
+      file.mimetype === 'application/pdf' ||
+      lowerName.endsWith('.pdf');
+
+    if (isZip || isCsv || isPdf) {
       cb(null, true);
     } else {
-      cb(new Error('Only .zip files are accepted for Allure import'));
+      cb(new Error('Only .zip, .csv, and .pdf files are accepted for Allure import'));
     }
   },
 });
@@ -38,5 +50,8 @@ router.post('/upload', allureUpload.single('file'), uploadAllure);
 
 // GET  /api/v1/allure-import/status/:importId
 router.get('/status/:importId', getImportStatus);
+
+// GET  /api/v1/allure-import/status/:importId/details
+router.get('/status/:importId/details', getImportDetails);
 
 export default router;

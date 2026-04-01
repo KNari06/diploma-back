@@ -707,6 +707,8 @@ export function buildCandidateText(node: InteractiveNode): string {
 
   // ARIA state hints (helps LLM match "selected tab", "expanded menu", "pressed toggle")
   const stateHints: string[] = [];
+  if (node.isDisabled) stateHints.push('disabled');
+  if (node.readOnly) stateHints.push('readonly');
   if (node.ariaSelected === true) stateHints.push('selected');
   if (node.ariaPressed === true) stateHints.push('pressed');
   if (node.ariaExpanded === true) stateHints.push('expanded');
@@ -752,6 +754,11 @@ export function buildCandidateText(node: InteractiveNode): string {
   }
   if (node.frameworkClickable) {
     parts.push('interactive');
+  }
+
+  // V9: iframe context — helps LLM distinguish main page vs embedded content
+  if (node.iframeSource) {
+    parts.push(`[iframe: ${node.iframeSource}]`);
   }
 
   // Tag/role/type (last, for disambiguation)
@@ -1137,7 +1144,7 @@ RULES:
    When an overlay is present, ALWAYS prefer elements INSIDE the overlay over background elements.
    Overlay elements cluster together spatially and appear ON TOP of the main content.
    Background elements are spread across the full page and are NOT the user's target.
-6. PAGE STATE AWARENESS: Use the PAGE STATE line and element state hints to understand the live page:
+7. PAGE STATE AWARENESS: Use the PAGE STATE line and element state hints to understand the live page:
    - [expanded] = container/dropdown/menu is currently OPEN — its children are visible targets
    - [collapsed] = container is CLOSED — its children are NOT the target
    - [selected] = tab/option is currently active — content within is visible
@@ -1146,41 +1153,80 @@ RULES:
    - Find elements that are CHILDREN of an expanded/open container (check [container] prefixes)
    - Prefer [active-layer] elements over background elements
    - The trigger element (the one with [expanded]) is NOT the target — the content INSIDE is
-7. PARTIAL / ABBREVIATED DESCRIPTIONS: Users often shorten element descriptions:
+8. PARTIAL / ABBREVIATED DESCRIPTIONS: Users often shorten element descriptions:
    - Match the MOST SPECIFIC candidate, not the broadest
    - If a keyword appears in both a parent section/tab AND a child element, prefer the CHILD —
      users describe what they want to interact with, using the parent as scope
    - [Section > Subsection] prefixes are LOCATION context: "X inside Y" = find X within Y container
-8. DISAMBIGUATION when 2+ candidates share a keyword:
+9. DISAMBIGUATION when 2+ candidates share a keyword:
    - Prefer candidates with more context overlap with the intent
    - Prefer deeper-nested [A > B > C] elements over shallow [A] — more specific
    - Prefer action-oriented text ("Create", "Add", "Delete", "Edit") for click/hover actions
    - Prefer elements inside overlays or [active-layer] over background elements
    - Use spatial position to disambiguate: if the intent mentions an element visible in an overlay, pick the overlay element
-9. DUPLICATE ELEMENTS: When multiple elements have the same label, they are marked [N of M].
+10. RELATIVE POSITIONING — when the user describes an element by its spatial relationship to another:
+   COORDINATE SYSTEM: @(x,y,wxh) where x=pixels from LEFT, y=pixels from TOP.
+   Negative x or y means the element is partially scrolled off-screen — deprioritize these.
+   DIRECTIONAL:
+   - "above/over/сверху/上面" = SMALLER y value
+   - "below/under/снизу/下面" = LARGER y value
+   - "left of/слева от/左边" = SMALLER x value
+   - "right of/справа от/右边" = LARGER x value
+   - "top-left corner" / "верхний левый" = x < 200 AND y < 100
+   - "top-right corner" / "верхний правый" = x > viewportWidth - 200 AND y < 100
+   - "bottom" / "внизу" = y > viewportHeight - 200
+   PROXIMITY:
+   - "next to/beside/near/рядом с/около" = find the REFERENCE element first by name, then pick the closest candidate by Euclidean distance between bounding box centers
+   - "between X and Y" = find both reference elements, pick candidate whose center is between them
+   CONTAINMENT:
+   - "inside/within/in/внутри/в" = check [Section > Container] prefix — candidate must be a CHILD of named container
+   - "outside/вне" = candidate must NOT have the named container in its prefix
+   ORDINAL:
+   - "first/second/third/nth" / "первый/второй/третий" = sort matching candidates by DOM order (top-to-bottom, left-to-right by position), pick the Nth one
+   - "last/последний" = pick the one with highest index
+   TABLE/GRID (works for <table>, role="grid", and CSS grid/flex layouts):
+   - "row N column M" / "строка N столбец M" / "第N行第M列" = group elements by Y coordinate (same Y ±5px = same row), then by X (left-to-right = column order), pick [row N][col M]
+   - "cell in the Status column for row John" = find element whose near: text contains "John" AND whose X aligns with the "Status" column header
+   - Column headers: elements at the smallest Y value with header-like tags (<th>, role="columnheader") or styling define column positions — match candidate X to header X to determine column
+   - For CSS grid/flex tables (no <td>/<th>): treat elements with identical height, aligned Y as rows, aligned X as columns — same grouping logic applies
+   MULTI-SIGNAL: Combine signals when the user provides multiple hints:
+   - "grey button on the right side" → match [grey] color AND x > viewportWidth/2
+   - "small icon above the search bar" → match [small] size AND y < search_bar.y
+   - "delete button in the third row" → match "delete" text AND near: context of third row
+11. DUPLICATE ELEMENTS: When multiple elements have the same label, they are marked [N of M].
    Each duplicate has "near:" context showing neighboring text (row/card content).
    - If the intent mentions context that matches ONE element's "near:" text → pick THAT one confidently
    - "second delete" / "2nd remove" / "второй удалить" → pick [2 of M]
    - "first/last" → pick [1 of M] / [M of M]
    - If intent has NO context to distinguish duplicates → MUST return alternatives, NEVER guess
-10. HONEST CONFIDENCE — be accurate, not optimistic:
+12. HONEST CONFIDENCE — be accurate, not optimistic:
    - 0.9-1.0: exact or near-exact text/semantic match, no ambiguity
    - 0.7-0.9: strong semantic match but indirect (cross-language, abbreviation, partial match)
    - 0.5-0.7: plausible match but uncertain (multiple candidates could fit)
    - below 0.5: weak guess — return alternatives instead
    NEVER return confidence > 0.8 when guessing between duplicates without distinguishing context
-11. If 2+ elements are equally valid, return alternatives (not a single pick)
-12. ONLY use refs from the provided list — never invent refs
-13. Respond ONLY with valid JSON, no markdown
+13. If 2+ elements are equally valid, return alternatives (not a single pick)
+14. ONLY use refs from the provided list — never invent refs
+15. Respond ONLY with valid JSON, no markdown
+16. CRITICAL — REJECT NON-MATCHING DESCRIPTIONS:
+   You MUST return ref=null when the intent does NOT semantically describe any candidate element.
+   This includes:
+   - Random/gibberish characters: "asdfgh", "ываыва", "xyzabc", "ывавыаывавыаывавыа"
+   - Text that is NOT an element description (copied content, random sentences, test data)
+   - Intent that has no semantic relationship to ANY candidate's label, text, placeholder, role, or appearance
+   You are NOT required to always pick an element. Returning null is the CORRECT answer when nothing matches.
+   Forcing a match on irrelevant input is WORSE than returning null.
 
 OUTPUT FORMAT:
+
+If nothing matches or intent is nonsense/irrelevant (ALWAYS prefer this over a forced low-quality match):
+{"ref":null,"confidence":0,"reason":"description does not match any element"}
+
+If one element clearly matches:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
 
 If ambiguous (2+ equally valid):
-{"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}
-
-If nothing matches:
-{"ref":null,"confidence":0,"reason":"no matching element"}`;
+{"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}`;
 
 /**
  * LLM-based element selection: uses Gemini Flash Lite to pick the best candidate.
@@ -1223,7 +1269,7 @@ VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}
 ELEMENTS (${candidates.length}):
 ${candidateList}
 
-Select the single best matching element.`;
+Select the single best matching element, or return ref=null if the intent does not meaningfully describe any element.`;
 
   // Call LLM with timeout
   const controller = new AbortController();
@@ -1267,15 +1313,28 @@ Select the single best matching element.`;
     let result: LlmSelectResult;
 
     if (parsed.ref && validRefs.has(parsed.ref)) {
-      // Single element selected
-      result = {
-        status: 'resolved',
-        selectedRef: parsed.ref,
-        confidence: Math.min(1, Math.max(0, parsed.confidence ?? 0.8)),
-        reason: (parsed.reason || '').slice(0, 200),
-        latencyMs: Date.now() - startTime,
-        cacheHit: false,
-      };
+      const confidence = Math.min(1, Math.max(0, parsed.confidence ?? 0.8));
+      // Reject low-confidence matches — likely nonsense/irrelevant descriptions
+      if (confidence < 0.4) {
+        result = {
+          status: 'not_found',
+          selectedRef: null,
+          confidence: 0,
+          reason: (parsed.reason || 'description does not match any element').slice(0, 200),
+          latencyMs: Date.now() - startTime,
+          cacheHit: false,
+        };
+      } else {
+        // Single element selected with sufficient confidence
+        result = {
+          status: 'resolved',
+          selectedRef: parsed.ref,
+          confidence,
+          reason: (parsed.reason || '').slice(0, 200),
+          latencyMs: Date.now() - startTime,
+          cacheHit: false,
+        };
+      }
     } else if (parsed.alternatives && Array.isArray(parsed.alternatives) && parsed.alternatives.length > 0) {
       // Ambiguous — multiple valid options
       const validAlts = parsed.alternatives.filter(r => validRefs.has(r));

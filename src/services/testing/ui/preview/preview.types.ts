@@ -135,6 +135,8 @@ export interface InteractiveNode {
   iconClasses?: string;
   /** Semantic size category based on pixel dimensions */
   sizeHint?: 'small' | 'medium' | 'large';
+  /** Source iframe name/id if element is inside a same-origin iframe */
+  iframeSource?: string;
 }
 
 /**
@@ -207,7 +209,12 @@ export type IntentActionType =
   // V13: File download verification (auto-recorded when download triggers)
   | 'download'
   // V15: Multi-tab support — explicit tab switch
-  | 'switch_tab';
+  | 'switch_tab'
+  // V16: Gesture and coordinate actions (carousels, canvas, maps)
+  | 'swipe'
+  | 'click_at'
+  // V17: Meta / Scratchpad — store a key-value pair for cross-step memory
+  | 'store';
 
 /**
  * Binding hints for element resolution
@@ -610,10 +617,6 @@ export interface LintResult {
   needsAiFallback?: boolean;
   /** V2: Reason for AI fallback (semantic_zero, ambiguous, low_confidence) */
   aiFallbackReason?: 'semantic_zero' | 'ambiguous' | 'low_confidence';
-  /** V2: AI resolved ref (if AI fallback was used) */
-  aiResolvedRef?: string;
-  /** V2: AI reasoning (if AI fallback was used) */
-  aiReason?: string;
   /** V3: AI interpretation of user intent */
   interpretation?: string;
   /** V3: Clarification question for user (in user's language) */
@@ -628,8 +631,6 @@ export interface LintResult {
   degradedReason?: string;
   /** Top similarity score from LLM resolution */
   topSimilarity?: number;
-  /** Delta between top and second similarity */
-  similarityDelta?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
 
@@ -988,6 +989,8 @@ export interface IntentTestCase {
   resolvedDependencies?: Array<{ id: string; name: string }>;
 
   // Metadata
+  /** Natural language description of the test's purpose/intent */
+  goal?: string;
   tags?: string[];
   priority?: 'critical' | 'high' | 'medium' | 'low';
   preconditions?: string[];

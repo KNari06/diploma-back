@@ -2843,10 +2843,20 @@ export class CommandExecutor {
   }
 
   /**
-   * Get extracted data
+   * Get extracted data (cross-step scratchpad)
    */
   getExtractedData(): Map<string, any> {
     return this.extractedData;
+  }
+
+  /**
+   * Set extracted data from external callers (e.g., auto-populate from step results).
+   * Used by test-executor.ts to store values for cross-step interpolation.
+   */
+  setExtractedData(key: string, value: any): void {
+    if (key && value != null) {
+      this.extractedData.set(key, value);
+    }
   }
 
   /**

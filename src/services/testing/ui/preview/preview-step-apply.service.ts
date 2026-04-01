@@ -964,6 +964,45 @@ async function executeAction(
         const value = normalizeTypeActionValue(step.value);
         const humanLike = step.options?.humanLike === true;
 
+        // ═══════════════ V9: Special input detection ═══════════════
+        // Range sliders, color pickers, date/time inputs, and custom ARIA sliders
+        // need nativeInputValueSetter — fill()/pressSequentially() fail on these.
+        {
+          const { detectSpecialInput, setNativeInputValue, setAriaSliderValue, validateInputValue } =
+            await import('@/agent/playwright/core/native-input-helpers');
+
+          // Fast-path: check binding hints from recording layer (no DOM query needed)
+          const hintType = step.bindingHints?.type?.toLowerCase() || '';
+          const specialHintTypes = ['range', 'color', 'date', 'time', 'datetime-local', 'month', 'week'];
+          const isSpecialByHint = specialHintTypes.includes(hintType);
+
+          // Slow-path: runtime DOM detection (only if hint didn't match)
+          const specialInput = isSpecialByHint
+            ? { isSpecialInput: true as const, strategy: 'nativeValueSetter' as const, inputType: hintType }
+            : await detectSpecialInput(locator).catch((): { isSpecialInput: false; strategy: 'default'; inputType?: undefined } =>
+                ({ isSpecialInput: false, strategy: 'default', inputType: undefined }));
+
+          if (specialInput.isSpecialInput) {
+            const detectedType = specialInput.inputType || hintType;
+            const validation = validateInputValue(detectedType, value);
+            if (validation.warning) {
+              logger.warn('[EXECUTE_ACTION] Input value format warning', { warning: validation.warning, value, inputType: detectedType });
+            }
+
+            if (specialInput.strategy === 'ariaSlider') {
+              await setAriaSliderValue(page, locator, value);
+            } else {
+              await setNativeInputValue(locator, value);
+            }
+
+            if (step.options?.pressEnter) {
+              await locator.press('Enter', { timeout });
+            }
+            break;
+          }
+        }
+        // ═══════════════ END V9 ═══════════════
+
         // V13: Paste mode — write to clipboard then dispatch paste via keyboard shortcut.
         // Web apps that listen for 'paste' events (OTP fields, code editors) won't trigger with fill().
         if (step.options?.isPaste) {
@@ -1278,6 +1317,29 @@ async function executeAction(
         break;
       }
 
+      // V16: Swipe gesture — for carousels (Swiper, Slick, Embla), mobile-like interactions
+      case 'swipe': {
+        if (!locator) throw new Error('No selector for swipe action');
+        const { executeSwipe } = await import('@/agent/playwright/core/native-input-helpers');
+        const swipeDir = (step.value?.toLowerCase() || 'left') as 'left' | 'right' | 'up' | 'down';
+        if (!['left', 'right', 'up', 'down'].includes(swipeDir)) {
+          throw new Error(`Invalid swipe direction: "${step.value}" — must be left, right, up, or down`);
+        }
+        await executeSwipe(page, locator, swipeDir);
+        break;
+      }
+
+      // V16: Click at coordinates — for canvas, maps, charts (elements without DOM targets)
+      case 'click_at': {
+        const { parseClickAtCoordinates, clickAtCoordinates } = await import('@/agent/playwright/core/native-input-helpers');
+        const coords = parseClickAtCoordinates(step.value);
+        if (!coords) {
+          throw new Error(`Invalid coordinates: "${step.value}" — use "x,y" format (e.g., "500,300")`);
+        }
+        await clickAtCoordinates(page, coords);
+        break;
+      }
+
       // V6: File upload — supports both native <input type="file"> and trigger-button patterns
       case 'upload': {
         if (!locator) throw new Error('No selector for upload action');
@@ -1439,7 +1501,33 @@ export class PreviewStepApplyService {
     skipPostActionWait?: boolean; // V12: Skip post-action settle when caller uses lookahead (e.g. Run mode)
     expectsNavigation?: boolean; // V13: Next step is wait_for with changedFrom — wrap click with waitForNavigation
   }): Promise<ApplyResult> {
-    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
+    const { previewSessionId, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
+    let { stepDraft } = params;
+
+    // ── Scratchpad: interpolate {{key}} context variable placeholders ──
+    // Resolves cross-step data (OTP codes, stored values, extracted text) before
+    // locator resolution. Same mechanism as preview-run.service.ts but for
+    // single-step applies (editor "Apply" button).
+    try {
+      const sessionService = getPreviewSessionService();
+      const session = sessionService.getSession(previewSessionId);
+      const contextData = session?.contextData;
+      if (contextData && Object.keys(contextData).length > 0) {
+        const resolve = (s: string): string => {
+          if (!s.includes('{{')) return s;
+          return s.replace(/\{\{([\w.-]+)\}\}/g, (match, key) => {
+            const replacement = contextData[key];
+            return typeof replacement === 'string' ? replacement : match;
+          });
+        };
+        const resolved = { ...stepDraft };
+        if (resolved.value) resolved.value = resolve(resolved.value);
+        if (resolved.assertionText) resolved.assertionText = resolve(resolved.assertionText);
+        stepDraft = resolved;
+      }
+    } catch {
+      // Non-critical — proceed without interpolation
+    }
 
     logger.info('[PREVIEW_APPLY] Applying step', {
       previewSessionId,
@@ -1450,6 +1538,22 @@ export class PreviewStepApplyService {
 
     try {
       const sessionService = getPreviewSessionService();
+
+      // ── Scratchpad: handle 'store' meta-step ──
+      if (stepDraft.type === 'store') {
+        const storeKey = stepDraft.description?.trim();
+        const storeValue = stepDraft.value;
+        if (storeKey && storeValue) {
+          // Merge into existing contextData (setContextData replaces the full object)
+          const session = sessionService.getSession(previewSessionId);
+          const existingData = session?.contextData || {};
+          sessionService.setContextData(previewSessionId, userId, { ...existingData, [storeKey]: storeValue });
+        }
+        return {
+          success: true,
+          appliedStep: stepDraft,
+        };
+      }
 
       // V15: Handle switch_tab action — switch active tab and return
       if (stepDraft.type === 'switch_tab') {

@@ -10,6 +10,7 @@ import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { ChatService } from '@/services/utils/chat.service';
 import { generateTextWithGemini } from '@/services/ai/core/gemini.service';
 import { logger } from '@/utils/core/logger';
+import { DEFAULT_EXPLORATION_BUDGET } from '@/agent/core/lite/exploration/types';
 
 const PENDING_EXPLORATION_PREFIX = 'pending_exploration:';
 
@@ -142,7 +143,8 @@ export async function handlePendingExplorationConfirmation(
         maxConcurrency: 5,
       });
 
-      const replyMessage = `Exploration started for **${pending.entryUrl}**. I'll notify you when test cases are discovered.`;
+      const budgetMinutes = Math.round((DEFAULT_EXPLORATION_BUDGET.totalTimeoutMs) / 60000);
+      const replyMessage = `Exploration started for **${pending.entryUrl}**.\n\n⏱ Budget: up to **${budgetMinutes} minutes** and **${DEFAULT_EXPLORATION_BUDGET.maxFlows} test flows**. I'll notify you when test cases are discovered.`;
 
       if (chatSessionId) {
         ChatService.saveChatMessages(chatSessionId, [

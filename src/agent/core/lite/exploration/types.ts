@@ -104,8 +104,8 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
   totalTimeoutMs: 15 * 60 * 1000,
   perFlowTimeoutMs: 3 * 60 * 1000,
   maxSurveyPages: 10,
-  maxFlows: 20,
-  maxTotalPipelineRounds: 100,
+  maxFlows: 30,
+  maxTotalPipelineRounds: 150,
 };
 
 export const DEFAULT_MAX_CONCURRENCY = 5;
@@ -563,6 +563,31 @@ export interface ExplorationSummary {
   recommendations?: string[];
   /** Sentinel risk areas, set after Phase 2.5 */
   riskAreas?: string[];
+  /** Discovered pages for history view */
+  pages?: Array<{
+    url: string;
+    title: string;
+    pageType: string;
+    entryPointCount: number;
+    depth: number;
+  }>;
+  /** Individual flow results for history view (populated on completeRun) */
+  flows?: Array<{
+    name: string;
+    category: string;
+    status: string;
+    durationMs?: number;
+    stepsCount: number;
+    blockerType?: string;
+    errorMessage?: string;
+    steps: Array<{
+      stepNumber: number;
+      action: string;
+      description: string;
+      value?: string;
+      pageUrl?: string;
+    }>;
+  }>;
 }
 
 export interface BudgetUsage {
@@ -608,6 +633,7 @@ export interface TreeCheckpoint {
   visitedContentHashes: string[];
   allEntryPoints: Array<[string, EntryPoint]>;
   nodeIdCounter: number;
+  discoveredNavLinks?: Array<[string, { url: string; label: string; sourcePageUrl: string }]>;
 }
 
 export interface BudgetCheckpoint {

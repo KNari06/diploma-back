@@ -28,6 +28,12 @@ import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
+import { env } from '@/config/environment/env';
+import { QueueManager } from '@/config/infrastructure/queues';
+import { dbAdminService } from '@/db/supabase';
+import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
+import { v4 as uuidv4 } from 'uuid';
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -147,13 +153,25 @@ export class RegressionRunService {
         throw new Error(`Failed to create regression run: ${runError?.message}`);
       }
 
-      // 3. Build test request from intent case
-      const testRequest = await this.buildTestRequest(intentCase, userId, parameters);
+      // 3. Route mobile vs web test
+      const isMobile = intentCase.platform?.startsWith('mobile_');
+      let testId: string;
 
-      // 4. Execute test using existing test service
-      let testResult;
       try {
-        testResult = await ManualTestService.runTest(testRequest);
+        if (isMobile) {
+          // Mobile test → dispatch to mobile runner queue
+          const mobileResult = await this.dispatchMobileTest(intentCase, userId, trigger);
+          testId = mobileResult.testId;
+        } else {
+          // Web test → dispatch to Playwright queue
+          const testRequest = await this.buildTestRequest(intentCase, userId, parameters);
+          const testResult = await ManualTestService.runTest(testRequest);
+
+          if (!testResult.success || !testResult.data?.id) {
+            throw new Error('Failed to start test execution');
+          }
+          testId = testResult.data.id;
+        }
       } catch (execError) {
         // Mark run as failed — it was already created with 'running' status
         await supabaseAdmin
@@ -162,17 +180,6 @@ export class RegressionRunService {
           .eq('id', run.id);
         throw execError;
       }
-
-      if (!testResult.success || !testResult.data?.id) {
-        // Mark run as failed — test could not start
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({ status: 'failed', completed_at: new Date().toISOString() })
-          .eq('id', run.id);
-        throw new Error('Failed to start test execution');
-      }
-
-      const testId = testResult.data.id;
 
       // 5. Update regression run with test_id for status tracking
       const { error: updateError } = await supabaseAdmin
@@ -408,6 +415,115 @@ export class RegressionRunService {
         source: 'intent_test_case',
       },
     };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MOBILE TEST DISPATCH
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Dispatch a mobile test case to the mobile runner queue.
+   * Mirrors the pattern from ci.controller.ts and preview.controller.ts.
+   *
+   * Creates a `tests` DB record + queues a `MobileTestJobData` job.
+   * The existing test-completion-handler will track completion.
+   */
+  private static async dispatchMobileTest(
+    intentCase: any,
+    userId: string,
+    trigger: string,
+  ): Promise<{ testId: string }> {
+    // 1. Resolve platform and browser
+    const PLATFORM_MAP: Record<string, MobilePlatform> = {
+      mobile_ios: 'ios',
+      mobile_flutter: 'flutter',
+    };
+    const platform: MobilePlatform = PLATFORM_MAP[intentCase.platform] ?? 'android';
+
+    const BROWSER_MAP: Record<string, 'mobile-android' | 'mobile-ios' | 'mobile-flutter'> = {
+      mobile_ios: 'mobile-ios',
+      mobile_flutter: 'mobile-flutter',
+    };
+    const browser = BROWSER_MAP[intentCase.platform] ?? 'mobile-android';
+
+    // 2. Fetch project settings for mobile app metadata
+    const { data: project } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id, settings')
+      .eq('id', intentCase.project_id)
+      .single();
+
+    const mobileApp = (project?.settings as any)?.mobileApp;
+
+    // 3. Extract intent steps from steps_json
+    const intentSteps = (intentCase.steps_json || []).map((step: any, index: number) => ({
+      id: step.id || `step_${index}`,
+      type: step.type || 'click',
+      description: step.description || `Step ${index + 1}`,
+      value: step.value,
+      assertionText: step.assertionText,
+      bindingHints: step.bindingHints,
+      options: step.options,
+      isAutoInjected: step.isAutoInjected,
+      expectedOutcome: step.expectedOutcome,
+    }));
+
+    if (intentSteps.length === 0) {
+      throw new ValidationError(
+        `Mobile test case "${intentCase.name}" has no steps (steps_json is empty)`,
+      );
+    }
+
+    // 4. Create test record in DB (same pattern as ci.controller.ts)
+    const testId = uuidv4();
+    await dbAdminService.createTest({
+      id: testId,
+      url: `mobile://${platform}`,
+      project_id: intentCase.project_id,
+      user_id: userId,
+      status: 'pending',
+      browsers: [browser as any],
+      options: {
+        mode: 'lite',
+        platform,
+        trigger,
+        appPackage: mobileApp?.packageName,
+      },
+      intelligent_mode: false,
+      test_goal: `Regression: ${intentCase.name} (${platform})`,
+      commands: [],
+    });
+
+    // 5. Build and queue mobile job
+    const jobData: MobileTestJobData = {
+      testId,
+      userId,
+      workspaceId: project?.workspace_id || '',
+      projectId: intentCase.project_id,
+      platform,
+      browser,
+      intentSteps,
+      runnerUrl: env.MOBILE_RUNNER_URL,
+      runnerApiKey: env.MOBILE_RUNNER_API_KEY,
+      appStoragePath: mobileApp?.storagePath,
+      appOriginalName: mobileApp?.originalName,
+      appPackage: mobileApp?.packageName,
+      testCaseId: intentCase.id,
+      testCaseName: intentCase.name,
+      metadata: buildMetadataFromTestCase(intentCase),
+    };
+
+    await QueueManager.addMobileTestRunJob(jobData);
+
+    logger.info('[REGRESSION_RUN] Mobile test dispatched', {
+      testId,
+      platform,
+      testCaseId: intentCase.id,
+      testCaseName: intentCase.name,
+      stepsCount: intentSteps.length,
+    });
+
+    return { testId };
   }
 
   /**
@@ -712,6 +828,7 @@ export class RegressionRunService {
           flowId: tc.flowId,
           dependsOn: validDeps,
           ...(tc.isNegative && { isNegative: true }),
+          ...(tc.platform && { platform: tc.platform }),
         };
       });
 
@@ -1057,7 +1174,7 @@ export class RegressionRunService {
       // Get UI test cases with tag from intent_test_cases (unified table)
       const { data: uiCases } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, flow_id, depends_on')
+        .select('id, flow_id, depends_on, platform')
         .eq('project_id', projectId)
         .contains('tags', [tag]);
 
@@ -1070,6 +1187,7 @@ export class RegressionRunService {
           testType: 'ui' as const,
           flowId: tc.flow_id || undefined,
           dependsOn: tc.depends_on || [],
+          platform: tc.platform || undefined,
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
@@ -1168,7 +1286,7 @@ export class RegressionRunService {
       // Get UI test cases with priority from intent_test_cases (unified table)
       const { data: uiCases } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, flow_id, depends_on')
+        .select('id, flow_id, depends_on, platform')
         .eq('project_id', projectId)
         .eq('priority', priority);
 
@@ -1181,6 +1299,7 @@ export class RegressionRunService {
           testType: 'ui' as const,
           flowId: tc.flow_id || undefined,
           dependsOn: tc.depends_on || [],
+          platform: tc.platform || undefined,
         })),
         ...(apiCases || []).map((tc: any) => ({
           testCaseId: tc.id,
@@ -1288,7 +1407,7 @@ export class RegressionRunService {
     // UI test cases from intent_test_cases (unified table)
     const { data: uiCases, error: uiError } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, flow_id, depends_on')
+      .select('id, flow_id, depends_on, platform')
       .in('flow_id', flowIds);
 
     if (uiError) {
@@ -1304,6 +1423,7 @@ export class RegressionRunService {
         moduleId,
         flowId,
         dependsOn: tc.depends_on || [],
+        platform: tc.platform || undefined,
       });
     }
 
@@ -1503,18 +1623,24 @@ export class RegressionRunService {
           if (testCase.testType === 'ui') {
             // Run UI test without creating nested regression_runs
             const savedCase = await this.getSavedTestCase(testCase.testCaseId, userId);
-            const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
 
-            // Write result.testId BEFORE dispatching the BullMQ job so the
-            // completion handler can always find this execution via
-            // result->>testId, even if the job finishes instantly.
-            const testResult = await ManualTestService.runTest(testRequest);
+            // Route: mobile tests → mobile runner queue, web tests → Playwright queue
+            const isMobile = savedCase.platform?.startsWith('mobile_');
+            let testId: string;
 
-            if (!testResult.success || !testResult.data?.id) {
-              throw new Error('Failed to start UI test execution');
+            if (isMobile) {
+              const mobileResult = await this.dispatchMobileTest(savedCase, userId, trigger);
+              testId = mobileResult.testId;
+            } else {
+              const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
+              const testResult = await ManualTestService.runTest(testRequest);
+
+              if (!testResult.success || !testResult.data?.id) {
+                throw new Error('Failed to start UI test execution');
+              }
+              testId = testResult.data.id;
             }
 
-            const testId = testResult.data.id;
             uiTestIds.push(testId);
 
             if (execId) {

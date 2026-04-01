@@ -33,6 +33,7 @@ RULES:
 - Confirmation pages CAN contain real flows — "Verify Email", "Complete Profile", "Download Receipt" are valid
 - Goals must be SPECIFIC — bad: "Use the settings", good: "Update notification preferences in account settings"
 - If the flow failed or was blocked, focus on what error recovery flows are visible (retry, contact support, etc.)
+- Do NOT discover flows on EXTERNAL/third-party domains. If the flow navigated to a different site (e.g., udemy.com, amazon.com, google.com), do NOT create entry points for that external page — they are outside the application under test.
 
 BUDGET AWARENESS:
 - If budget is HIGH (10+ flows remaining): be thorough, discover everything visible

@@ -827,6 +827,8 @@ export interface ExplorationProgressPayload {
   timestamp: string;
   chatSessionId?: string;
   userId?: string;
+  /** Total exploration budget in ms — frontend uses for timer display */
+  budgetMs?: number;
 }
 
 export interface ExplorationCompletedPayload {

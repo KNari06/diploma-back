@@ -946,7 +946,7 @@ function decodeState(state: string): { userId: string; workspaceId?: string } {
 export async function setupSlack(req: Request, res: Response): Promise<void> {
   try {
     const userId = req.user!.id;
-    const workspaceId = (req.query.workspace_id as string) || undefined;
+    const workspaceId = (req.query.workspace_id as string) || (req.body.workspace_id as string) || undefined;
     const { webhook_url, channel, description } = req.body;
 
     if (!webhook_url || typeof webhook_url !== 'string') {
@@ -1023,7 +1023,7 @@ export async function setupSlack(req: Request, res: Response): Promise<void> {
 export async function setupTelegram(req: Request, res: Response) {
   try {
     const userId = req.user!.id;
-    const workspaceId = (req.query.workspace_id as string) || undefined;
+    const workspaceId = (req.query.workspace_id as string) || (req.body.workspace_id as string) || undefined;
     const { bot_token, chat_id, description } = req.body;
 
     // Validate required fields
@@ -1070,15 +1070,21 @@ export async function setupTelegram(req: Request, res: Response) {
       return;
     }
 
-    // Validate chat_id if provided
-    if (chat_id !== undefined && chat_id !== null && chat_id !== '') {
-      if (typeof chat_id !== 'string' && typeof chat_id !== 'number') {
-        res.status(400).json({
-          success: false,
-          error: 'chat_id must be a string or number',
-        });
-        return;
-      }
+    // Validate chat_id (required — notifications won't work without it)
+    if (!chat_id && chat_id !== 0) {
+      res.status(400).json({
+        success: false,
+        error: 'chat_id is required. Send a message to your bot, then use https://api.telegram.org/bot<token>/getUpdates to find your chat ID.',
+      });
+      return;
+    }
+
+    if (typeof chat_id !== 'string' && typeof chat_id !== 'number') {
+      res.status(400).json({
+        success: false,
+        error: 'chat_id must be a string or number',
+      });
+      return;
     }
 
     // Save token to integration_tokens table
@@ -1089,7 +1095,7 @@ export async function setupTelegram(req: Request, res: Response) {
       {
         access_token: bot_token,
         token_type: 'Bot',
-        external_id: chat_id ? String(chat_id) : botInfo.username,
+        external_id: String(chat_id),
         external_url: `https://t.me/${botInfo.username}`,
         metadata: {
           bot_id: botInfo.id,

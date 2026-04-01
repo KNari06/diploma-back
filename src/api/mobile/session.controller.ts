@@ -558,65 +558,53 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
 
     const stepType = stepDraft.type || stepDraft.kind || 'click';
-    const description = stepDraft.elementDescription || stepDraft.description || '';
+    const description = (stepDraft.elementDescription || stepDraft.description || '').trim();
 
-    // Lint must be NON-DESTRUCTIVE: verify element presence without performing
-    // the actual action (type, click, etc.). We use 'assert' with no
-    // assertionText so the runner maps it to assert_visible.
-    // For ai_check / assert steps, keep the original type so the runner
-    // evaluates them properly (observe_page or assert_text).
-    const NON_ELEMENT_TYPES = new Set([
-      'navigate', 'wait', 'wait_for', 'screenshot', 'open_app', 'close_app',
-      'go_back', 'go_home', 'open_notifications', 'biometric', 'otp',
-      'permission', 'clipboard', 'network', 'observe_page',
-    ]);
-
-    let lintType: MobileIntentActionType;
-    let lintValue: string | undefined;
-
-    if (stepType === 'ai_check' || stepType === 'assert') {
-      lintType = stepType;
-      lintValue = stepDraft.assertionText ?? stepDraft.value;
-    } else if (NON_ELEMENT_TYPES.has(stepType)) {
-      lintType = stepType as MobileIntentActionType;
-      lintValue = stepDraft.value;
-    } else {
-      // Element-based action (click, type, etc.) → assert_visible only
-      lintType = 'assert';
-      lintValue = undefined;
+    if (!description) {
+      res.json({ success: true, status: 'not_found', message: 'No element description provided' });
+      return;
     }
 
-    const intentStep = {
-      id: stepDraft.id || `lint_${Date.now()}`,
-      type: lintType,
-      description,
-      value: lintValue,
-      assertionText: stepDraft.assertionText ?? lintValue,
-      bindingHints: stepDraft.bindingHints || {},
+    // Map step type to action type for element resolution context
+    const ACTION_TYPE_MAP: Record<string, string> = {
+      click: 'tap', type: 'type_text', fill: 'type_text',
+      assert: 'assert_visible', ai_check: 'assert_visible',
+      scroll: 'tap', swipe: 'tap', long_press: 'tap', double_tap: 'tap',
     };
+    const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
 
-    // Run with screenshotEachStep to verify element resolution
-    const result = await client.runSteps(sessionId, [intentStep], {
-      screenshotEachStep: true,
-      stopOnFailure: true,
+    // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
+    // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
+    const lintResult = await client.lintElement(sessionId, description, actionType);
+
+    // Map to frontend-compatible response with highlight data
+    const highlight = lintResult.boundingBox && lintResult.screenSize
+      ? [{
+        boundingBox: lintResult.boundingBox,
+        type: lintResult.status === 'resolved' ? 'success'
+          : lintResult.status === 'low_confidence' ? 'warning'
+          : undefined,
+      }]
+      : undefined;
+
+    res.json({
+      success: true,
+      status: lintResult.status,
+      message: lintResult.message || (
+        lintResult.status === 'resolved' ? `Found: "${lintResult.elementText || description}"`
+        : lintResult.status === 'low_confidence' ? `Weak match: "${lintResult.elementText}" (confidence: ${lintResult.confidence?.toFixed(2)})`
+        : 'Element not found on mobile screen'
+      ),
+      screenshot: lintResult.screenshot,
+      // Frontend highlight overlay data (same format as web lint)
+      boundingBox: lintResult.boundingBox,
+      screenSize: lintResult.screenSize,
+      highlight,
+      confidence: lintResult.confidence,
+      resolvedVia: lintResult.resolvedVia,
+      elementText: lintResult.elementText,
+      elementType: lintResult.elementType,
     });
-
-    const stepResult = result.steps?.[0];
-
-    if (stepResult?.success) {
-      res.json({
-        success: true,
-        status: 'resolved',
-        message: 'Element found on mobile screen',
-        screenshot: stepResult.screenshot,
-      });
-    } else {
-      res.json({
-        success: true,
-        status: 'not_found',
-        message: stepResult?.error || 'Element not found on mobile screen',
-      });
-    }
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Lint failed', {
       sessionId,
