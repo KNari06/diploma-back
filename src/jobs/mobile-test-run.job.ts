@@ -21,7 +21,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
 import { Job } from 'bullmq';
-import type { MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import type { MobileTestJobData, MobileRunStepsResponse } from '@/services/mobile/mobile-runner.types';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
@@ -513,16 +513,39 @@ export class MobileTestRunJobHandler {
   private static async createTestResult(
     testId: string,
     browser: string,
-    runResult: { totalSteps: number; passedSteps: number; failedSteps: number; passRate: number; status: string; durationMs: number; steps: Array<{ stepId: string; success: boolean; error?: string; screenshot?: string; durationMs: number }> },
+    runResult: MobileRunStepsResponse,
     userId: string,
     workspaceId: string,
   ): Promise<string | null> {
     try {
+      // Find last screenshot for the test result (prefer failed step, fallback to last step)
+      const failedStepWithScreenshot = runResult.steps.find((s) => !s.success && s.screenshot);
+      const lastStepWithScreenshot = [...runResult.steps].reverse().find((s) => s.screenshot);
+      const resultScreenshot = failedStepWithScreenshot?.screenshot || lastStepWithScreenshot?.screenshot;
+
+      // Map runner errors to the TestError[] format expected by AI analysis
+      const errors = (runResult.errors || []).map((e) => ({
+        type: e.type === 'app_crash' || e.type === 'anr' ? 'crash'
+          : e.type === 'network_error' ? 'network'
+          : e.type === 'js_exception' ? 'javascript'
+          : e.type === 'assertion_failure' ? 'assertion'
+          : 'other',
+        message: e.message,
+        timestamp: new Date(e.timestamp).toISOString(),
+      }));
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result: any = await dbAdminService.createTestResult({
         test_id: testId,
         browser,
-        status: runResult.status === 'passed' ? 'passed' : 'failed',
+        // FIX: 'completed' not 'passed' — consistent with web tests and TestStatus type
+        status: runResult.status === 'passed' ? 'completed' : 'failed',
+        screenshot: resultScreenshot,
+        // Populate columns that were previously empty for mobile:
+        errors: errors.length > 0 ? errors : [],
+        logs: runResult.logs || [],
+        network_logs: runResult.networkLogs || [],
+        completed_at: new Date().toISOString(),
         duration: Math.round(runResult.durationMs / 1000),
         steps_total: runResult.totalSteps,
         steps_passed: runResult.passedSteps,
@@ -536,8 +559,14 @@ export class MobileTestRunJobHandler {
             stepId: s.stepId,
             success: s.success,
             error: s.error,
+            screenshot: s.screenshot,
             durationMs: s.durationMs,
+            resolvedVia: s.resolvedVia,
+            evidence: s.evidence,
+            errorClassification: s.errorClassification,
+            bugReport: s.bugReport,
           })),
+          bugReports: runResult.bugReports,
         },
       });
 

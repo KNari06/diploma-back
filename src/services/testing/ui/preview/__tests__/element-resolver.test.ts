@@ -538,13 +538,30 @@ describe('ElementResolverService', () => {
 
       const result = await resolveElement({
         previewSessionId: 'test-session',
-        stepDraft: { id: 'step1', type: 'type', description: 'secret field' } as IntentStep,
+        stepDraft: { id: 'step1', type: 'type', description: 'Password' } as IntentStep,
         domNodes,
         pageUrl: 'https://example.com/login',
       });
 
       expect(result.status).toBe('resolved');
       expect(result.confidence).toBeGreaterThanOrEqual(0.4);
+    });
+
+    it('should return resolved for cross-language match when LLM correctly identifies element', async () => {
+      // "Войти" = "Login" — LLM handles cross-language matching
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e3', confidence: 0.9, reason: 'Войти matches Login button' }),
+      } as any);
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'Войти' } as IntentStep,
+        domNodes,
+        pageUrl: 'https://example.com/login',
+      });
+
+      expect(result.status).toBe('resolved');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
     });
   });
 });

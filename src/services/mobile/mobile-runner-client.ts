@@ -266,6 +266,36 @@ export class MobileRunnerClient {
     }
   }
 
+  // ── Element Lint (non-destructive resolve for editor preview) ──
+
+  /**
+   * Lint an element on the mobile device — find element by intent without
+   * dispatching any action. Returns bounding box for frontend overlay.
+   *
+   * Calls the runner's dedicated lint endpoint (fast, ~1-2s) instead of
+   * the full run-steps pipeline (slow, ~3-5s with command dispatch).
+   */
+  async lintElement(
+    sessionId: string,
+    intent: string,
+    actionType: string = 'tap',
+  ): Promise<{
+    status: 'resolved' | 'not_found' | 'low_confidence' | 'error';
+    boundingBox?: { x: number; y: number; width: number; height: number };
+    screenSize?: { width: number; height: number };
+    confidence?: number;
+    resolvedVia?: string;
+    elementText?: string;
+    elementType?: string;
+    screenshot?: string;
+    message?: string;
+  }> {
+    return this.request('POST', `/api/commands/${sessionId}/lint`, {
+      body: { intent, actionType },
+      timeoutMs: 15_000, // LLM resolve can take a few seconds
+    });
+  }
+
   // ── Artifacts ───────────────────────────────────────────────────
 
   async getArtifacts(sessionId: string): Promise<MobileArtifactBundle> {

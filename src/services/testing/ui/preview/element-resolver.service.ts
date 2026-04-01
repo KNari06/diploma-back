@@ -1206,24 +1206,27 @@ RULES:
    - below 0.5: weak guess — return alternatives instead
    NEVER return confidence > 0.8 when guessing between duplicates without distinguishing context
 13. If 2+ elements are equally valid, return alternatives (not a single pick)
-16. NONSENSE / IRRELEVANT DESCRIPTIONS — if the intent text has NO meaningful semantic connection
-   to ANY candidate element, return ref=null with confidence=0. Examples of nonsense:
-   - Random characters: "asdfgh", "ываыва", "xyzabc"
-   - Text that is clearly not an element description: random words, sentences copied from elsewhere
-   - Description that doesn't match any element's label, placeholder, text, role, or visual appearance
-   Do NOT force-match to the "closest" element when the description is clearly irrelevant.
-   Return: {"ref":null,"confidence":0,"reason":"description does not match any element"}
 14. ONLY use refs from the provided list — never invent refs
 15. Respond ONLY with valid JSON, no markdown
+16. CRITICAL — REJECT NON-MATCHING DESCRIPTIONS:
+   You MUST return ref=null when the intent does NOT semantically describe any candidate element.
+   This includes:
+   - Random/gibberish characters: "asdfgh", "ываыва", "xyzabc", "ывавыаывавыаывавыа"
+   - Text that is NOT an element description (copied content, random sentences, test data)
+   - Intent that has no semantic relationship to ANY candidate's label, text, placeholder, role, or appearance
+   You are NOT required to always pick an element. Returning null is the CORRECT answer when nothing matches.
+   Forcing a match on irrelevant input is WORSE than returning null.
 
 OUTPUT FORMAT:
+
+If nothing matches or intent is nonsense/irrelevant (ALWAYS prefer this over a forced low-quality match):
+{"ref":null,"confidence":0,"reason":"description does not match any element"}
+
+If one element clearly matches:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
 
 If ambiguous (2+ equally valid):
-{"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}
-
-If nothing matches:
-{"ref":null,"confidence":0,"reason":"no matching element"}`;
+{"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}`;
 
 /**
  * LLM-based element selection: uses Gemini Flash Lite to pick the best candidate.
@@ -1266,7 +1269,7 @@ VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}
 ELEMENTS (${candidates.length}):
 ${candidateList}
 
-Select the single best matching element.`;
+Select the single best matching element, or return ref=null if the intent does not meaningfully describe any element.`;
 
   // Call LLM with timeout
   const controller = new AbortController();
