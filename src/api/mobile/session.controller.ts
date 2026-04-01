@@ -541,7 +541,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
  * Body: { type: string, params?: object }
  */
 export async function commandSession(req: Request, res: Response): Promise<void> {
-  if (\!req.user?.id) {
+  if (!req.user?.id) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
     return;
   }
@@ -549,7 +549,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
   const { sessionId } = req.params;
   const { type, params } = req.body as { type?: string; params?: Record<string, unknown> };
 
-  if (\!sessionId || typeof type \!== 'string' || type.length === 0) {
+  if (!sessionId || typeof type !== 'string' || type.length === 0) {
     res.status(400).json({ success: false, error: 'sessionId and command type are required' });
     return;
   }
