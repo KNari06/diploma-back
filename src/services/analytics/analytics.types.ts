@@ -21,7 +21,7 @@ export interface SummaryData {
     testStepsRun: number;
     totalRuns: number;
     tokensSpent: number;
-    errorSteps: number;
+    failedRuns: number;
     flakySteps: number;
     passRate: number;
     apiTestsRun?: number;

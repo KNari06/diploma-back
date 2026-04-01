@@ -321,7 +321,11 @@ export class AnalyticsQueryService {
       const testStepsRun = executions.length;
       const totalRuns = runs.length;
       const tokensSpent = Math.round(tokens.totalTokens);
-      const errorSteps = executions.filter((e) => e.status === 'failed').length;
+      // Count runs that have at least one failed status (not individual failed steps)
+      const failedRunIds = new Set(
+        executions.filter((e) => e.status === 'failed').map((e) => e.run_id)
+      );
+      const failedRunsCount = failedRunIds.size;
 
       // Flaky detection: find test cases with multiple executions in same run with mixed results
       const flakySteps = this.calculateFlakySteps(executions as any[]);
@@ -384,7 +388,7 @@ export class AnalyticsQueryService {
           testStepsRun,
           totalRuns,
           tokensSpent,
-          errorSteps,
+          failedRuns: failedRunsCount,
           flakySteps,
           passRate,
           apiTestsRun: apiTestsRun > 0 ? apiTestsRun : undefined,
@@ -457,7 +461,7 @@ export class AnalyticsQueryService {
         testStepsRun: 0,
         totalRuns: 0,
         tokensSpent: 0,
-        errorSteps: 0,
+        failedRuns: 0,
         flakySteps: 0,
         passRate: 0,
       },
@@ -508,7 +512,11 @@ export class AnalyticsQueryService {
 
       const execs = execResult.data || [];
       const passed = execs.filter((e) => e.status === 'passed').length;
-      const failed = execs.filter((e) => e.status === 'failed').length;
+      // Count unique test_case_ids that have at least one failed execution
+      const failedTestCaseIds = new Set(
+        execs.filter((e) => e.status === 'failed').map((e) => e.test_case_id)
+      );
+      const failed = failedTestCaseIds.size;
       const skipped = execs.filter((e) => e.status === 'skipped').length;
       const flaky = this.calculateFlakySteps(execs as any[]);
       const total = execs.length;

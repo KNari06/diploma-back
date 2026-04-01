@@ -19,7 +19,7 @@ import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentStep } from './preview.types';
-import { shouldSkipLookaheadAfter, waitForStepReadiness } from './step-readiness.service';
+import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
@@ -1360,6 +1360,23 @@ export class PreviewRunService {
             skippedSteps++;
           }
           break;
+        }
+      }
+
+      // Post-final-step settle: ensure last step's API calls complete before marking run as done.
+      // Lookahead only runs between steps — the last step gets skipPostActionWait=true with no next
+      // step to trigger lookahead, so its network effects would otherwise be lost.
+      if (passedSteps > 0 && !runState.cancelled) {
+        try {
+          await raceAbort(
+            Promise.all([
+              waitForApiIdle(session.page, 3000),
+              waitForDOMStability(session.page, 3000, 500),
+            ]),
+            signal,
+          );
+        } catch {
+          // Non-fatal — AbortError or timeout, proceed to completion
         }
       }
     } finally {
