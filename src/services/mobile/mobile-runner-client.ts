@@ -28,6 +28,8 @@ import { MobileRunnerError } from './mobile-runner.types';
 const CLIENT_CONFIG = {
   /** Default timeout for most requests */
   defaultTimeoutMs: 30_000,
+  /** Timeout for interactive preview commands (tap, swipe, etc.) — fail fast */
+  interactiveTimeoutMs: 8_000,
   /** Extended timeout for step execution (steps can take minutes) */
   runStepsTimeoutMs: 300_000, // 5 minutes
   /** Retry count for 5xx errors */
@@ -157,11 +159,20 @@ export class MobileRunnerClient {
   async executeBatchCommands(
     sessionId: string,
     commands: unknown[],
+    opts?: { interactive?: boolean },
   ): Promise<{ results: unknown[] }> {
     return this.request<{ results: unknown[] }>(
       'POST',
       `/api/commands/${sessionId}/batch`,
-      { body: { commands } },
+      {
+        body: { commands },
+        timeoutMs: opts?.interactive
+          ? CLIENT_CONFIG.interactiveTimeoutMs
+          : CLIENT_CONFIG.defaultTimeoutMs,
+        // Interactive commands must not retry — a failed tap should not
+        // be silently retried (user may have already moved on).
+        noRetry: opts?.interactive,
+      },
     );
   }
 

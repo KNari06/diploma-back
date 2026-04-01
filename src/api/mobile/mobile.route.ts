@@ -17,7 +17,7 @@ import multer from 'multer';
 import { deleteMobileApp, getMobileApp, uploadMobileApp } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
-import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession } from './session.controller';
+import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession } from './session.controller';
 
 // ── Multer config for APK/IPA uploads ────────────────────────────
 
@@ -201,6 +201,18 @@ router.post(
   '/sessions/:sessionId/apply',
   requireAuth,
   asyncHandler(applySession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/command
+ * Execute a single raw command on the emulator
+ *
+ * Body: { type: string, params?: object }
+ */
+router.post(
+  '/sessions/:sessionId/command',
+  requireAuth,
+  asyncHandler(commandSession),
 );
 
 // ═══════════════════════════════════════════════════════════════════════════
