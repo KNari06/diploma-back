@@ -177,51 +177,85 @@ If you didn't expect this invitation, you can safely ignore this email.
   </div>
 
   <div style="background: #ffffff; padding: 40px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
-    <h2 style="color: #333; margin-top: 0;">Welcome to QAIT.dev!</h2>
+    <h2 style="color: #333; margin-top: 0;">You're in! Welcome to QAIT.dev</h2>
 
     <p style="font-size: 16px; color: #555;">
-      Hi ${name}, great news — your account has been approved! You now have full access to the QAIT.dev platform.
+      Hey ${name}! Great news — your account has been approved. You now have full access to the platform.
     </p>
 
     <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 25px 0;">
-      <p style="margin: 0; font-size: 16px; color: #555;">
-        You can now sign in and start using AI-powered testing tools to streamline your QA workflow.
-      </p>
+      <p style="margin: 0 0 12px 0; font-size: 15px; font-weight: 600; color: #333;">Here's what you can do:</p>
+      <table style="width: 100%; border-collapse: collapse;">
+        <tr>
+          <td style="padding: 6px 0; font-size: 14px; color: #555; vertical-align: top; width: 24px;">&#x1F680;</td>
+          <td style="padding: 6px 0; font-size: 14px; color: #555;">Run AI-powered tests on your web apps</td>
+        </tr>
+        <tr>
+          <td style="padding: 6px 0; font-size: 14px; color: #555; vertical-align: top;">&#x1F4AC;</td>
+          <td style="padding: 6px 0; font-size: 14px; color: #555;">Chat with our AI assistant to create test plans</td>
+        </tr>
+        <tr>
+          <td style="padding: 6px 0; font-size: 14px; color: #555; vertical-align: top;">&#x1F4CA;</td>
+          <td style="padding: 6px 0; font-size: 14px; color: #555;">Track results and get detailed reports</td>
+        </tr>
+      </table>
     </div>
 
     <div style="text-align: center; margin: 35px 0;">
       <a href="${loginUrl}" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 14px 40px; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-        Open QAIT.dev
+        Get Started
       </a>
     </div>
 
-    <p style="font-size: 14px; color: #888; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e0e0e0;">
-      If you have any questions, feel free to reach out to our team. We're happy to help you get started.
-    </p>
+    <!-- Russian version -->
+    <div style="margin-top: 30px; padding-top: 25px; border-top: 1px solid #e0e0e0;">
+      <p style="font-size: 13px; color: #999; margin: 0 0 10px 0; text-transform: uppercase; letter-spacing: 0.5px;">&#x1F1F7;&#x1F1FA; Russian version</p>
+      <p style="font-size: 15px; color: #555;">
+        ${name}, отличные новости — ваш аккаунт одобрен! Теперь у вас есть полный доступ к платформе QAIT.dev.
+      </p>
+      <p style="font-size: 14px; color: #555; margin-bottom: 4px;"><strong>Что вы можете делать:</strong></p>
+      <ul style="font-size: 14px; color: #555; padding-left: 20px; margin: 8px 0;">
+        <li style="margin-bottom: 4px;">Запускать AI-тесты для ваших веб-приложений</li>
+        <li style="margin-bottom: 4px;">Создавать тест-планы в чате с AI-ассистентом</li>
+        <li style="margin-bottom: 4px;">Отслеживать результаты и получать подробные отчёты</li>
+      </ul>
+    </div>
 
-    <p style="font-size: 12px; color: #aaa; margin-top: 20px;">
-      If the button doesn't work, copy and paste this link into your browser:<br>
+    <p style="font-size: 12px; color: #aaa; margin-top: 25px;">
+      If the button doesn't work, copy and paste this link:<br>
       <a href="${loginUrl}" style="color: #667eea; word-break: break-all;">${loginUrl}</a>
     </p>
   </div>
 
   <div style="text-align: center; padding: 20px; color: #999; font-size: 12px;">
-    <p>© 2026 QAIT.dev - AI-Powered Testing Platform</p>
+    <p>&copy; 2026 QAIT.dev - AI-Powered Testing Platform</p>
   </div>
 </body>
 </html>
       `.trim();
 
       const textContent = `
-Welcome to QAIT.dev!
+You're in! Welcome to QAIT.dev
 
-Hi ${name}, great news — your account has been approved! You now have full access to the QAIT.dev platform.
+Hey ${name}! Great news — your account has been approved. You now have full access to the platform.
 
-You can now sign in and start using AI-powered testing tools to streamline your QA workflow.
+Here's what you can do:
+- Run AI-powered tests on your web apps
+- Chat with our AI assistant to create test plans
+- Track results and get detailed reports
 
-Sign in here: ${loginUrl}
+Get started: ${loginUrl}
 
-If you have any questions, feel free to reach out to our team.
+---
+
+${name}, отличные новости — ваш аккаунт одобрен! Теперь у вас есть полный доступ к платформе QAIT.dev.
+
+Что вы можете делать:
+- Запускать AI-тесты для ваших веб-приложений
+- Создавать тест-планы в чате с AI-ассистентом
+- Отслеживать результаты и получать подробные отчёты
+
+Войти: ${loginUrl}
 
 ---
 © 2026 QAIT.dev - AI-Powered Testing Platform
@@ -241,7 +275,7 @@ If you have any questions, feel free to reach out to our team.
       await transporter.sendMail({
         from: '"QAIT.dev" <noreply@qait.dev>',
         to: data.recipientEmail,
-        subject: 'Your QAIT.dev account has been approved!',
+        subject: "You're in! Your QAIT.dev account is approved",
         text: textContent,
         html: htmlContent,
       });
