@@ -1501,7 +1501,33 @@ export class PreviewStepApplyService {
     skipPostActionWait?: boolean; // V12: Skip post-action settle when caller uses lookahead (e.g. Run mode)
     expectsNavigation?: boolean; // V13: Next step is wait_for with changedFrom — wrap click with waitForNavigation
   }): Promise<ApplyResult> {
-    const { previewSessionId, stepDraft, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
+    const { previewSessionId, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
+    let { stepDraft } = params;
+
+    // ── Scratchpad: interpolate {{key}} context variable placeholders ──
+    // Resolves cross-step data (OTP codes, stored values, extracted text) before
+    // locator resolution. Same mechanism as preview-run.service.ts but for
+    // single-step applies (editor "Apply" button).
+    try {
+      const sessionService = getPreviewSessionService();
+      const session = sessionService.getSession(previewSessionId);
+      const contextData = session?.contextData;
+      if (contextData && Object.keys(contextData).length > 0) {
+        const resolve = (s: string): string => {
+          if (!s.includes('{{')) return s;
+          return s.replace(/\{\{([\w.-]+)\}\}/g, (match, key) => {
+            const replacement = contextData[key];
+            return typeof replacement === 'string' ? replacement : match;
+          });
+        };
+        const resolved = { ...stepDraft };
+        if (resolved.value) resolved.value = resolve(resolved.value);
+        if (resolved.assertionText) resolved.assertionText = resolve(resolved.assertionText);
+        stepDraft = resolved;
+      }
+    } catch {
+      // Non-critical — proceed without interpolation
+    }
 
     logger.info('[PREVIEW_APPLY] Applying step', {
       previewSessionId,
@@ -1512,6 +1538,22 @@ export class PreviewStepApplyService {
 
     try {
       const sessionService = getPreviewSessionService();
+
+      // ── Scratchpad: handle 'store' meta-step ──
+      if (stepDraft.type === 'store') {
+        const storeKey = stepDraft.description?.trim();
+        const storeValue = stepDraft.value;
+        if (storeKey && storeValue) {
+          // Merge into existing contextData (setContextData replaces the full object)
+          const session = sessionService.getSession(previewSessionId);
+          const existingData = session?.contextData || {};
+          sessionService.setContextData(previewSessionId, userId, { ...existingData, [storeKey]: storeValue });
+        }
+        return {
+          success: true,
+          appliedStep: stepDraft,
+        };
+      }
 
       // V15: Handle switch_tab action — switch active tab and return
       if (stepDraft.type === 'switch_tab') {

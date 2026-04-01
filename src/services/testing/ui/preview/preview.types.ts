@@ -212,7 +212,9 @@ export type IntentActionType =
   | 'switch_tab'
   // V16: Gesture and coordinate actions (carousels, canvas, maps)
   | 'swipe'
-  | 'click_at';
+  | 'click_at'
+  // V17: Meta / Scratchpad — store a key-value pair for cross-step memory
+  | 'store';
 
 /**
  * Binding hints for element resolution

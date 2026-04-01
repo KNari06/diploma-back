@@ -15,6 +15,7 @@ import {
   invalidateAuthCache,
   invalidateAuthCacheForUser,
 } from '@/services/auth/auth.service';
+import { EmailService } from '@/services/core/email.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -658,6 +659,20 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
       newStatus: status,
       updatedBy: req.user?.id,
     });
+
+    // Send approval email (non-blocking)
+    if (status === 'approved' && updatedUser.email) {
+      EmailService.sendApprovalEmail({
+        recipientEmail: updatedUser.email,
+        recipientName: updatedUser.name,
+        frontendUrl: env.FRONTEND_URL,
+      }).catch((err) =>
+        logger.error('[AUTH] Failed to send approval email', {
+          error: err instanceof Error ? err.message : String(err),
+          userId,
+        })
+      );
+    }
 
     // Invalidate auth cache so the user's next request picks up the new status
     await invalidateAuthCacheForUser(userId);

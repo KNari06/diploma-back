@@ -474,6 +474,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             },
           });
 
+          // ── Scratchpad: store meta-step (no Playwright action, no credit cost) ──
+          const intentActionType = (command as any).intentMeta?.actionType || (command as any).intentMeta?.type;
+          if (intentActionType === 'store') {
+            const storeKey = (command as any).intentMeta?.elementDescription || (command as any).intentMeta?.description;
+            const storeValue = (command as any).value || (command as any).intentMeta?.value;
+            if (storeKey && storeValue) {
+              executor.setExtractedData(storeKey, storeValue);
+            }
+            continue; // Skip Playwright execution and credit deduction — purely data storage
+          }
+
           // Deduct 1 credit for step execution
           if (testData.userId) {
             const stepCreditResult = await CreditCostTrackerService.deductStepCredit(
@@ -496,6 +507,20 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           const stepStartedAt = Date.now();
 
           try {
+            // ── Scratchpad: interpolate {{key}} placeholders from extractedData ──
+            const scratchpadData = executor.getExtractedData();
+            if (scratchpadData.size > 0) {
+              const resolveVars = (s: string) => s.replace(/\{\{([\w.-]+)\}\}/g, (m, k) => {
+                const v = scratchpadData.get(k);
+                return typeof v === 'string' ? v : (v != null ? String(v) : m);
+              });
+              if ((command as any).value) (command as any).value = resolveVars((command as any).value);
+              if ((command as any).assertionText) (command as any).assertionText = resolveVars((command as any).assertionText);
+              if ((command as any).url) (command as any).url = resolveVars((command as any).url);
+              // Also resolve in intentMeta fields (for intent-based commands)
+              if ((command as any).intentMeta?.value) (command as any).intentMeta.value = resolveVars((command as any).intentMeta.value);
+            }
+
             // Execute command via CommandExecutor
             // This supports compiled plans, self-healing, AI fallback (no clarification in background)
             const stepResult = await executor.executeCommand(command);

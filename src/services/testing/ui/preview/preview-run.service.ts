@@ -277,22 +277,47 @@ const activeRuns = new Map<string, RunState>();
  * Values are stored in session.contextData by the wait_for_email handler
  * (e.g., contextData['email.otp'] = '123456').
  */
-function interpolateEmailVariables(step: IntentStep, previewSessionId: string): IntentStep {
-  if (!step.value || !step.value.includes('{{email.')) return step;
-
+/**
+ * Interpolate {{key}} context variable placeholders in step fields.
+ *
+ * Supports any key stored in session.contextData — not just email.* variables.
+ * Email variables ({{email.otp}}) continue to work since they are stored as
+ * contextData['email.otp'] and the pattern matches any dot-notation key.
+ *
+ * Used as cross-step scratchpad: wait_for_email stores `email.otp`,
+ * store meta-steps write arbitrary keys, and subsequent steps resolve them.
+ */
+function interpolateContextVariables(step: IntentStep, previewSessionId: string): IntentStep {
   const sessionService = getPreviewSessionService();
   const session = sessionService.getSession(previewSessionId);
   const contextData = session?.contextData;
-  if (!contextData) return step;
+  if (!contextData || Object.keys(contextData).length === 0) return step;
 
-  let value = step.value;
-  value = value.replace(/\{\{email\.([\w-]+)\}\}/g, (match, key) => {
-    const replacement = contextData[`email.${key}`];
-    return typeof replacement === 'string' ? replacement : match;
-  });
+  const resolve = (s: string): string => {
+    if (!s.includes('{{')) return s;
+    return s.replace(/\{\{([\w.-]+)\}\}/g, (match, key) => {
+      const replacement = contextData[key];
+      return typeof replacement === 'string' ? replacement : match;
+    });
+  };
 
-  if (value === step.value) return step; // No changes
-  return { ...step, value };
+  let changed = false;
+  const result = { ...step };
+
+  if (result.value) {
+    const resolved = resolve(result.value);
+    if (resolved !== result.value) { result.value = resolved; changed = true; }
+  }
+  if (result.assertionText) {
+    const resolved = resolve(result.assertionText);
+    if (resolved !== result.assertionText) { result.assertionText = resolved; changed = true; }
+  }
+  if (result.description) {
+    const resolved = resolve(result.description);
+    if (resolved !== result.description) { result.description = resolved; changed = true; }
+  }
+
+  return changed ? result : step;
 }
 
 /**
@@ -747,8 +772,21 @@ export class PreviewRunService {
           },
         };
 
-        // V12: Interpolate email variables ({{email.otp}}, {{email.link}}, etc.)
-        const interpolatedStep = interpolateEmailVariables(stepWithCachePolicy, previewSessionId);
+        // ── Scratchpad: handle 'store' meta-step (no Playwright action) ──
+        if (stepWithCachePolicy.type === 'store') {
+          const storeKey = stepWithCachePolicy.description?.trim();
+          const storeValue = stepWithCachePolicy.value;
+          if (storeKey && storeValue) {
+            const sessionService = getPreviewSessionService();
+            const session = sessionService.getSession(previewSessionId);
+            const existingData = session?.contextData || {};
+            sessionService.setContextData(previewSessionId, userId, { ...existingData, [storeKey]: storeValue });
+          }
+          continue; // No browser action — purely data storage
+        }
+
+        // Interpolate context variables ({{email.otp}}, {{order_id}}, {{custom_key}}, etc.)
+        const interpolatedStep = interpolateContextVariables(stepWithCachePolicy, previewSessionId);
 
         // V13: Peek ahead — if next step is wait_for with changedFrom, current click expects navigation.
         // This enables Promise.all([waitForNavigation(), click()]) pattern for reliable nav capture.

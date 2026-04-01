@@ -11,6 +11,12 @@ export interface WorkspaceInviteEmailData {
   frontendUrl: string;
 }
 
+export interface ApprovalEmailData {
+  recipientEmail: string;
+  recipientName?: string;
+  frontendUrl: string;
+}
+
 /**
  * Email Service for sending custom emails
  * Uses the same SMTP settings as Supabase (Gmail)
@@ -145,6 +151,113 @@ If you didn't expect this invitation, you can safely ignore this email.
         recipientEmail: data.recipientEmail,
       });
       return { success: false, error: 'Failed to send email' };
+    }
+  }
+
+  /**
+   * Send approval notification email to a user whose account has been approved
+   */
+  static async sendApprovalEmail(data: ApprovalEmailData): Promise<{ success: boolean; error?: string }> {
+    try {
+      const loginUrl = data.frontendUrl;
+      const name = data.recipientName || 'there';
+
+      const htmlContent = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Account Approved</title>
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 10px 10px 0 0;">
+    <h1 style="color: white; margin: 0; font-size: 28px;">QAIT.dev</h1>
+    <p style="color: rgba(255,255,255,0.9); margin: 10px 0 0 0; font-size: 16px;">Account Approved</p>
+  </div>
+
+  <div style="background: #ffffff; padding: 40px; border: 1px solid #e0e0e0; border-top: none; border-radius: 0 0 10px 10px;">
+    <h2 style="color: #333; margin-top: 0;">Welcome to QAIT.dev!</h2>
+
+    <p style="font-size: 16px; color: #555;">
+      Hi ${name}, great news — your account has been approved! You now have full access to the QAIT.dev platform.
+    </p>
+
+    <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 25px 0;">
+      <p style="margin: 0; font-size: 16px; color: #555;">
+        You can now sign in and start using AI-powered testing tools to streamline your QA workflow.
+      </p>
+    </div>
+
+    <div style="text-align: center; margin: 35px 0;">
+      <a href="${loginUrl}" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 14px 40px; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        Open QAIT.dev
+      </a>
+    </div>
+
+    <p style="font-size: 14px; color: #888; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e0e0e0;">
+      If you have any questions, feel free to reach out to our team. We're happy to help you get started.
+    </p>
+
+    <p style="font-size: 12px; color: #aaa; margin-top: 20px;">
+      If the button doesn't work, copy and paste this link into your browser:<br>
+      <a href="${loginUrl}" style="color: #667eea; word-break: break-all;">${loginUrl}</a>
+    </p>
+  </div>
+
+  <div style="text-align: center; padding: 20px; color: #999; font-size: 12px;">
+    <p>© 2026 QAIT.dev - AI-Powered Testing Platform</p>
+  </div>
+</body>
+</html>
+      `.trim();
+
+      const textContent = `
+Welcome to QAIT.dev!
+
+Hi ${name}, great news — your account has been approved! You now have full access to the QAIT.dev platform.
+
+You can now sign in and start using AI-powered testing tools to streamline your QA workflow.
+
+Sign in here: ${loginUrl}
+
+If you have any questions, feel free to reach out to our team.
+
+---
+© 2026 QAIT.dev - AI-Powered Testing Platform
+      `.trim();
+
+      logger.info('[EMAIL_SERVICE] Sending approval email', {
+        recipientEmail: data.recipientEmail,
+      });
+
+      if (!process.env.SMTP_PASSWORD) {
+        logger.error('[EMAIL_SERVICE] SMTP_PASSWORD not configured in .env');
+        return { success: false, error: 'SMTP not configured' };
+      }
+
+      const transporter = this.createTransporter();
+
+      await transporter.sendMail({
+        from: '"QAIT.dev" <noreply@qait.dev>',
+        to: data.recipientEmail,
+        subject: 'Your QAIT.dev account has been approved!',
+        text: textContent,
+        html: htmlContent,
+      });
+
+      logger.info('[EMAIL_SERVICE] Approval email sent successfully', {
+        recipientEmail: data.recipientEmail,
+      });
+
+      return { success: true };
+    } catch (error) {
+      logger.error('[EMAIL_SERVICE] Failed to send approval email', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        recipientEmail: data.recipientEmail,
+      });
+      return { success: false, error: 'Failed to send approval email' };
     }
   }
 }
