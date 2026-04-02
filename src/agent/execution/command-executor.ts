@@ -2378,6 +2378,75 @@ export class CommandExecutor {
           break;
         }
 
+        // V18: Multi-tab switch — switch to target tab by index
+        case 'switchTab': {
+          const targetTabIndex = parseInt(String(value || '0'), 10);
+          const allPages = this.page.context().pages();
+          if (targetTabIndex < 0 || targetTabIndex >= allPages.length) {
+            // Wait up to 5s for tab to appear (popup may still be opening)
+            let found = false;
+            for (let w = 0; w < 10; w++) {
+              await new Promise(r => setTimeout(r, 500));
+              const current = this.page.context().pages();
+              if (targetTabIndex < current.length) { found = true; break; }
+            }
+            if (!found) {
+              throw new Error(`Tab ${targetTabIndex} not available (${this.page.context().pages().length} tabs open)`);
+            }
+          }
+          const targetPage = this.page.context().pages()[targetTabIndex];
+          // Wait for page to be ready before switching
+          try { await targetPage.waitForLoadState('load', { timeout: 10_000 }); } catch {
+            try { await targetPage.waitForLoadState('domcontentloaded', { timeout: 3_000 }); } catch { /* proceed */ }
+          }
+          this.page = targetPage;
+          logger.info('[COMMAND_EXECUTOR] Switched to tab', { targetTabIndex, url: targetPage.url() });
+          break;
+        }
+
+        // V18: Scratchpad — store key-value for cross-step memory (no browser action)
+        case 'store': {
+          const storeKey = description?.trim() || '';
+          const storeValue = value || '';
+          if (storeKey) {
+            this.extractedData.set(storeKey, storeValue);
+            logger.debug('[COMMAND_EXECUTOR] Stored scratchpad value', { key: storeKey, value: storeValue?.toString().slice(0, 50) });
+          }
+          break;
+        }
+
+        // V18: Coordinate-based click (canvas, maps, charts — no element selector)
+        case 'clickAt': {
+          const coords = value ? JSON.parse(String(value)) : null;
+          if (!coords || !Number.isFinite(coords.x) || !Number.isFinite(coords.y)) {
+            throw new Error('clickAt requires {x, y} coordinates in value');
+          }
+          await this.page.mouse.click(coords.x, coords.y);
+          break;
+        }
+
+        // V18: Swipe gesture (mobile web — mouse drag simulation)
+        case 'swipe': {
+          const swipeData = value ? JSON.parse(String(value)) : null;
+          if (!swipeData || !swipeData.start || !swipeData.end) {
+            throw new Error('swipe requires {start: {x,y}, end: {x,y}} in value');
+          }
+          const duration = swipeData.durationMs || 300;
+          await this.page.mouse.move(swipeData.start.x, swipeData.start.y);
+          await this.page.mouse.down();
+          // Simulate gradual swipe with intermediate points
+          const steps = Math.max(5, Math.round(duration / 50));
+          for (let s = 1; s <= steps; s++) {
+            const ratio = s / steps;
+            const mx = swipeData.start.x + (swipeData.end.x - swipeData.start.x) * ratio;
+            const my = swipeData.start.y + (swipeData.end.y - swipeData.start.y) * ratio;
+            await this.page.mouse.move(mx, my);
+            await new Promise(r => setTimeout(r, duration / steps));
+          }
+          await this.page.mouse.up();
+          break;
+        }
+
         default:
           throw new Error(`Unknown action: ${action}`);
       }

@@ -128,6 +128,17 @@ function mapActionType(intentAction: IntentActionType): string {
     // V13: Download verification
     case 'download':
       return 'verifyDownload';
+    // V15: Multi-tab
+    case 'switch_tab':
+      return 'switchTab';
+    // V16: Gestures and coordinates
+    case 'swipe':
+      return 'swipe';
+    case 'click_at':
+      return 'clickAt';
+    // V17: Scratchpad
+    case 'store':
+      return 'store';
     default:
       return 'click'; // Fallback
   }
@@ -379,6 +390,26 @@ export function convertIntentStepToCommand(
       if (step.options?.download) {
         command.download = step.options.download;
       }
+      break;
+
+    // V18: Multi-tab switch — pass target tab index
+    case 'switch_tab':
+      command.value = step.value || '0';
+      break;
+
+    // V18: Coordinate-based swipe gesture (mobile)
+    case 'swipe':
+      command.value = step.value || '';
+      break;
+
+    // V18: Coordinate-based click (canvas, maps, etc.)
+    case 'click_at':
+      command.value = step.value || '';
+      break;
+
+    // V18: Scratchpad — store key-value pair for cross-step memory
+    case 'store':
+      command.value = step.value || '';
       break;
 
     default:
