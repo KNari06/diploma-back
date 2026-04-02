@@ -793,20 +793,22 @@ async function installAppOnSession(
   // Prefer explicit package from warmup request or upload metadata
   const explicitPackage = appPackageOverride || mobileApp.packageName;
 
-  // Determine if we need to uninstall the old package first:
-  // - Different package name → uninstall old, fresh install new
-  // - Same package name or unknown → reinstall on top (preserves install)
+  // Always uninstall the old package if we know it from a previous install.
+  // This ensures clean state even when:
+  // - Package name changed between uploads
+  // - packageName was never provided by the user (common — frontend doesn't send it)
+  // - Same package but different signature (would fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE)
   const oldPackage = warmup?.installedPackage;
-  const needsUninstall = oldPackage && explicitPackage && oldPackage !== explicitPackage;
+  const shouldUninstallOld = !!oldPackage;
 
   const installResult = await client.executeBatchCommands(sessionId, [
     {
       type: 'install_app',
       params: {
         apkPath: uploaded.path,
-        reinstall: !needsUninstall, // fresh install if we uninstalled, reinstall otherwise
-        clearData: !needsUninstall, // clear data on reinstall for clean state (fresh install is already clean)
-        ...(needsUninstall ? { uninstallOldPackage: oldPackage } : {}),
+        reinstall: true, // use -r as safety net — if uninstall failed silently, install still works
+        clearData: true, // always wipe app data for clean state after install
+        ...(shouldUninstallOld ? { uninstallOldPackage: oldPackage } : {}),
         ...(explicitPackage ? { autoLaunch: false } : {}),
       },
     },
