@@ -19,6 +19,7 @@ import {
   signup,
   updateProfile,
   updateUserStatus,
+  sendApprovalEmailHandler,
 } from './auth.controller';
 
 const router = Router();
@@ -760,5 +761,11 @@ router.get('/users/pending', requireAuth, requireAdmin, asyncHandler(getPendingU
  * Body: { status: 'approved' | 'rejected' | 'pending_approval' }
  */
 router.patch('/users/:userId/status', requireAuth, requireAdmin, asyncHandler(updateUserStatus));
+
+/**
+ * Send approval notification email (admin only)
+ * Body: { email: string, name?: string }
+ */
+router.post('/send-approval-email', requireAuth, requireAdmin, asyncHandler(sendApprovalEmailHandler));
 
 export default router;

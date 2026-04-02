@@ -289,8 +289,8 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
   try {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
-      { type: 'tap', params: { x: Math.round(x), y: Math.round(y) } },
-    ]);
+      { type: 'tap', params: { x: Math.round(x), y: Math.round(y) }, _skipWait: true },
+    ], { interactive: true });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Tap failed', {
@@ -354,8 +354,9 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
           endY: Math.round(endY),
           durationMs: typeof durationMs === 'number' ? durationMs : 300,
         },
+        _skipWait: true,
       },
-    ]);
+    ], { interactive: true });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Swipe failed', {
@@ -390,8 +391,8 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
   try {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
-      { type: 'go_home', params: {} },
-    ]);
+      { type: 'go_home', params: {}, _skipWait: true },
+    ], { interactive: true });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Go home failed', {
@@ -426,8 +427,8 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
   try {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
-      { type: 'go_back', params: {} },
-    ]);
+      { type: 'go_back', params: {}, _skipWait: true },
+    ], { interactive: true });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Go back failed', {
@@ -469,8 +470,8 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
   try {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
-      { type: 'type_text', params: { text } },
-    ]);
+      { type: 'type_text', params: { text }, _skipWait: true },
+    ], { interactive: true });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Type text failed', {
@@ -512,8 +513,8 @@ export async function keySession(req: Request, res: Response): Promise<void> {
   try {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
-      { type: 'press_key', params: { keycode } },
-    ]);
+      { type: 'press_key', params: { keycode }, _skipWait: true },
+    ], { interactive: true });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Key press failed', {
@@ -524,6 +525,50 @@ export async function keySession(req: Request, res: Response): Promise<void> {
     res.status(500).json({
       success: false,
       error: 'Key press failed',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMMAND (execute a single raw command on the emulator)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/command
+ *
+ * Execute a single raw MobileCommand on the emulator.
+ * Body: { type: string, params?: object }
+ */
+export async function commandSession(req: Request, res: Response): Promise<void> {
+  if (!req.user?.id) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { type, params } = req.body as { type?: string; params?: Record<string, unknown> };
+
+  if (!sessionId || typeof type !== 'string' || type.length === 0) {
+    res.status(400).json({ success: false, error: 'sessionId and command type are required' });
+    return;
+  }
+
+  try {
+    const client = getMobileRunnerClient();
+    const result = await client.executeBatchCommands(sessionId, [
+      { type, params: params ?? {}, _skipWait: true },
+    ], { interactive: true });
+    res.json({ success: true, data: result?.results?.[0] });
+  } catch (error) {
+    logger.warn('[MOBILE_SESSION] Command failed', {
+      sessionId,
+      type,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Command failed',
       message: error instanceof Error ? error.message : String(error),
     });
   }

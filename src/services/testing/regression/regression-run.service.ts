@@ -2365,6 +2365,11 @@ export class RegressionRunService {
         }
       }
 
+      // V14: Extract failure classification from AI summary
+      const execAiSummary = testId ? (testResultsMap.get(testId)?.ai_summary) : null;
+      const failureClassification = execAiSummary?.failureClassification || null;
+      const rootCauseStep = execAiSummary?.rootCauseStep ?? null;
+
       reportExecutions.push({
         id: exec.id,
         testCaseId: exec.testCaseId,
@@ -2378,6 +2383,11 @@ export class RegressionRunService {
         ...(exec.isNegative && { isNegative: true }),
         ...(exec.isNegative && negativeMetaMap.has(exec.testCaseId) && { negativeMeta: negativeMetaMap.get(exec.testCaseId) }),
         ...(execHealthChecks && { healthChecks: execHealthChecks }),
+        ...(failureClassification && { failureClassification }),
+        ...(rootCauseStep !== null && { rootCauseStep }),
+        ...(execAiSummary?.classificationEvidence?.length > 0 && {
+          classificationEvidence: execAiSummary.classificationEvidence,
+        }),
       });
     }
 
@@ -2388,15 +2398,24 @@ export class RegressionRunService {
       bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
       byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
     }
+    // V14: Compute real flaky count and classification breakdown from AI analysis
+    const byClassification: Record<string, number> = {};
+    for (const re of reportExecutions) {
+      if (re.failureClassification) {
+        byClassification[re.failureClassification] = (byClassification[re.failureClassification] || 0) + 1;
+      }
+    }
+
     const summary: RunReportSummary = {
       total: stats.total,
       passed: stats.passed,
       failed: stats.failed,
       skipped: stats.skipped,
-      flaky: 0,
+      flaky: byClassification['flaky'] || 0,
       totalBugs: allBugs.length,
       bySeverity,
       byCategory,
+      byClassification,
     };
 
     // Compute duration (guard against negative if clocks are skewed)

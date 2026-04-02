@@ -569,6 +569,12 @@ export interface PlanAutomationConfig {
   schedule?: PlanScheduleConfig;
   gitTriggers?: PlanGitTriggersConfig;
   runtime?: PlanRuntimeConfig;
+  /** V14: Auto-retry tests classified as flaky after run completion */
+  autoRetryFlaky?: {
+    enabled: boolean;
+    /** Max retry attempts per test (1-3, default 1) */
+    maxRetries: number;
+  };
 }
 
 // ============================================================================
@@ -894,6 +900,10 @@ export interface RunReportExecution {
   isNegative?: boolean;
   negativeMeta?: NegativeMeta;
   healthChecks?: ExecutionHealthChecks;
+  /** V14: AI-determined failure classification */
+  failureClassification?: 'flaky' | 'real_bug' | 'environment' | 'test_drift' | null;
+  rootCauseStep?: number | null;
+  classificationEvidence?: string[];
 }
 
 /**
@@ -926,6 +936,8 @@ export interface RunReportSummary {
   totalBugs: number;
   bySeverity: Record<string, number>;
   byCategory: Record<string, number>;
+  /** V14: Failure classification breakdown (flaky, real_bug, environment, test_drift) */
+  byClassification?: Record<string, number>;
 }
 
 /**

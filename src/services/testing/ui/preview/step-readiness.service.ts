@@ -445,7 +445,7 @@ async function waitForLoadingIndicatorsClear(page: Page, timeoutMs: number): Pro
  * Wait for pending API requests (fetch/xhr) to complete.
  * Lightweight inline tracker — attaches listeners, waits for quiet period, cleans up.
  */
-async function waitForApiIdle(page: Page, timeoutMs: number): Promise<void> {
+export async function waitForApiIdle(page: Page, timeoutMs: number): Promise<void> {
   let pending = 0;
   let lastActivity = Date.now() - API_QUIET_THRESHOLD_MS; // Start with threshold met
 

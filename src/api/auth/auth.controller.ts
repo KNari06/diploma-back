@@ -660,20 +660,6 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
       updatedBy: req.user?.id,
     });
 
-    // Send approval email (non-blocking)
-    if (status === 'approved' && updatedUser.email) {
-      EmailService.sendApprovalEmail({
-        recipientEmail: updatedUser.email,
-        recipientName: updatedUser.name,
-        frontendUrl: env.FRONTEND_URL,
-      }).catch((err) =>
-        logger.error('[AUTH] Failed to send approval email', {
-          error: err instanceof Error ? err.message : String(err),
-          userId,
-        })
-      );
-    }
-
     // Invalidate auth cache so the user's next request picks up the new status
     await invalidateAuthCacheForUser(userId);
 
@@ -688,5 +674,63 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
       success: false,
       error: error.message || 'Failed to update user status',
     });
+  }
+};
+
+/**
+ * Send approval notification email
+ * POST /auth/send-approval-email
+ */
+export const sendApprovalEmailHandler = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email, name } = req.body;
+
+    if (!email || typeof email !== 'string') {
+      res.status(400).json({ success: false, error: 'Email is required' });
+      return;
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      res.status(400).json({ success: false, error: 'Invalid email format' });
+      return;
+    }
+
+    // Verify user exists and is in approved status (only send to approved users)
+    const { data: user, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('id, status, email')
+      .eq('email', email)
+      .single();
+
+    if (userError || !user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (user.status !== 'approved') {
+      res.status(400).json({
+        success: false,
+        error: `Cannot send approval email: user status is "${user.status}"`,
+      });
+      return;
+    }
+
+    EmailService.sendApprovalEmail({
+      recipientEmail: email,
+      recipientName: name || undefined,
+      frontendUrl: env.FRONTEND_URL,
+    }).catch((err) =>
+      logger.error('[AUTH] Failed to send approval email', {
+        error: err instanceof Error ? err.message : String(err),
+        email,
+      })
+    );
+
+    res.json({ success: true, message: 'Approval email queued' });
+  } catch (error: any) {
+    logger.error('[AUTH] Send approval email error', { error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to send approval email' });
   }
 };

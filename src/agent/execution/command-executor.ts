@@ -467,13 +467,16 @@ export class CommandExecutor {
               // Capture URL before click to detect navigation
               const urlBeforeClick = this.page.url();
               const pagesBefore = this.page.context().pages().length;
-              await locator.click(clickOpts);
-              // Wait for URL to change (replaces deprecated waitForNavigation)
+              // Promise.all: attach URL listener BEFORE click fires to avoid race condition
+              // on fast SPAs where navigation completes during click processing
               try {
-                await this.page.waitForURL(
-                  (url) => url.toString() !== urlBeforeClick,
-                  { timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs, waitUntil: 'load' }
-                );
+                await Promise.all([
+                  this.page.waitForURL(
+                    (url) => url.toString() !== urlBeforeClick,
+                    { timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs, waitUntil: 'load' }
+                  ),
+                  locator.click(clickOpts),
+                ]);
                 logger.debug('[COMMAND_EXECUTOR] Navigation after click detected', {
                   from: urlBeforeClick,
                   to: this.page.url(),
@@ -4748,6 +4751,9 @@ export class CommandExecutor {
     // Custom dropdown: click trigger → wait for dropdown to open → find visible option → click option
     await locator.click({ timeout });
 
+    // Wait for any API calls triggered by dropdown open (async options loading)
+    await this.waitForFetchIdle(1500);
+
     // Wait for any ARIA dropdown container to appear (up to 3s), instead of hardcoded 300ms
     // This is resilient to slow networks / animations
     const dropdownOpenedAt = Date.now();
@@ -4928,5 +4934,53 @@ export class CommandExecutor {
       `Waited ${timeout}ms but the element is not document.activeElement. ` +
       `Last error: ${lastError || 'unknown'}`
     );
+  }
+
+  /**
+   * Lightweight fetch/xhr idle wait — attaches listeners, polls until
+   * no pending requests for QUIET_MS, then cleans up.
+   * Used after dropdown trigger clicks where options may load from server.
+   */
+  private async waitForFetchIdle(timeoutMs: number): Promise<void> {
+    const QUIET_MS = 200;
+    let pending = 0;
+    let lastActivity = Date.now() - QUIET_MS;
+
+    const onRequest = (req: { resourceType: () => string }) => {
+      const type = req.resourceType();
+      if (type === 'fetch' || type === 'xhr') {
+        pending++;
+        lastActivity = Date.now();
+      }
+    };
+    const onDone = (req: { resourceType: () => string }) => {
+      const type = req.resourceType();
+      if (type === 'fetch' || type === 'xhr') {
+        pending = Math.max(0, pending - 1);
+        lastActivity = Date.now();
+      }
+    };
+
+    this.page.on('request', onRequest);
+    this.page.on('requestfinished', onDone);
+    this.page.on('requestfailed', onDone);
+
+    try {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (pending === 0 && (Date.now() - lastActivity) >= QUIET_MS) {
+          return;
+        }
+        await new Promise(r => setTimeout(r, 50));
+      }
+    } finally {
+      try {
+        this.page.off('request', onRequest);
+        this.page.off('requestfinished', onDone);
+        this.page.off('requestfailed', onDone);
+      } catch {
+        // Page may be closed
+      }
+    }
   }
 }

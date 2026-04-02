@@ -1005,3 +1005,41 @@ export interface IntentTestCase {
   createdAt: string;
   updatedAt: string;
 }
+
+// ─────────────────────────────────────────────────────────────────
+// Step Telemetry — per-step context collected during replay runs
+// ─────────────────────────────────────────────────────────────────
+
+/** Per-step telemetry entry collected during replay execution. */
+export interface StepTelemetryEntry {
+  stepIndex: number;
+  stepId: string;
+  actionType: IntentActionType;
+  /** Step description, truncated to 80 chars. */
+  description: string;
+  timestamp: number;
+  durationMs: number;
+  status: 'pass' | 'fail' | 'skipped';
+  urlBefore: string;
+  urlAfter: string;
+  urlChanged: boolean;
+  /** Console errors that appeared during this step (max 3). */
+  newConsoleErrors: string[];
+  /** Network 4xx/5xx responses during this step (max 3). */
+  newNetworkErrors: Array<{ url: string; method: string; status: number }>;
+  /** Successful mutating API responses during this step — POST/PUT/PATCH/DELETE 2xx (max 3). */
+  newNetworkSuccesses: Array<{ url: string; method: string; status: number }>;
+  error?: string;
+  retried?: boolean;
+  attempts?: number;
+}
+
+/** Full step telemetry timeline for an entire test run. */
+export interface StepTelemetryTimeline {
+  version: '1.0';
+  testCaseId?: string;
+  startUrl: string;
+  totalSteps: number;
+  collectedAt: string;
+  entries: StepTelemetryEntry[];
+}

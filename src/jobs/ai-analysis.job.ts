@@ -161,6 +161,10 @@ export class AIAnalysisJobHandler {
             bugs: processedBugs,
             recommendations: aiSummary.recommendations || [],
             confidence: aiSummary.confidence || 0,
+            // V14: Step-aware classification
+            failureClassification: aiSummary.failureClassification || null,
+            rootCauseStep: aiSummary.rootCauseStep ?? null,
+            classificationEvidence: aiSummary.classificationEvidence || [],
           },
           timestamp: new Date().toISOString(),
         };
