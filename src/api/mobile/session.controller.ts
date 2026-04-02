@@ -31,6 +31,10 @@ export interface WarmupData {
   runnerSocketUrl: string;
   platform: MobilePlatform;
   createdAt: string;
+  /** Package name currently installed on the emulator */
+  installedPackage?: string;
+  /** Supabase storage path of the APK currently installed */
+  appStoragePath?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -758,10 +762,29 @@ async function installAppOnSession(
     return;
   }
 
+  // Check Redis for what's currently installed on this emulator
+  const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
+  const warmupRaw = await redisConnection.get(redisKey);
+  const warmup: WarmupData | null = warmupRaw ? JSON.parse(warmupRaw) : null;
+
+  // If the same APK is already installed, just relaunch — skip download + install
+  if (warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
+    logger.debug('[MOBILE_SESSION] Same APK already installed, relaunching', {
+      sessionId,
+      projectId,
+      package: warmup.installedPackage,
+    });
+    await client.executeBatchCommands(sessionId, [
+      { type: 'launch_app', params: { packageName: appPackageOverride || warmup.installedPackage } },
+    ]);
+    return;
+  }
+
   logger.info('[MOBILE_SESSION] Installing app on session', {
     sessionId,
     projectId,
     originalName: mobileApp.originalName,
+    oldPackage: warmup?.installedPackage || '(none)',
   });
 
   const fileBuffer = await MobileAppStorageService.downloadApp(mobileApp.storagePath);
@@ -770,15 +793,20 @@ async function installAppOnSession(
   // Prefer explicit package from warmup request or upload metadata
   const explicitPackage = appPackageOverride || mobileApp.packageName;
 
-  // The runner auto-detects and auto-launches the installed package.
-  // If we have an explicit package, pass it as a hint (and disable auto-launch so we
-  // can launch the specific package ourselves).
+  // Determine if we need to uninstall the old package first:
+  // - Different package name → uninstall old, fresh install new
+  // - Same package name or unknown → reinstall on top (preserves install)
+  const oldPackage = warmup?.installedPackage;
+  const needsUninstall = oldPackage && explicitPackage && oldPackage !== explicitPackage;
+
   const installResult = await client.executeBatchCommands(sessionId, [
     {
       type: 'install_app',
       params: {
         apkPath: uploaded.path,
-        reinstall: true,
+        reinstall: !needsUninstall, // fresh install if we uninstalled, reinstall otherwise
+        clearData: !needsUninstall, // clear data on reinstall for clean state (fresh install is already clean)
+        ...(needsUninstall ? { uninstallOldPackage: oldPackage } : {}),
         ...(explicitPackage ? { autoLaunch: false } : {}),
       },
     },
@@ -791,6 +819,13 @@ async function installAppOnSession(
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName: explicitPackage } },
     ]);
+  }
+
+  // Update Redis with the installed package so future warmups know what's on the emulator
+  if (warmup && packageName) {
+    warmup.installedPackage = packageName;
+    warmup.appStoragePath = mobileApp.storagePath;
+    await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
   }
 
   logger.info('[MOBILE_SESSION] App installed on session', {

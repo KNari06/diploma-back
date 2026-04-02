@@ -156,12 +156,32 @@ describe('probeInteractiveElementAt', () => {
     expect(hints.tag).toBe('input');
   });
 
+  it('buildBindingHints captures testId', () => {
+    const element = { tag: 'div', testId: 'submit-btn' } as any;
+    const hints = RecordingCaptureService.buildBindingHints(element);
+    expect(hints.testId).toBe('submit-btn');
+  });
+
+  it('buildBindingHints uses title as nearText fallback', () => {
+    // No ariaLabel, no containerText → title becomes nearText
+    const element = { tag: 'div', title: 'Attach file' } as any;
+    const hints = RecordingCaptureService.buildBindingHints(element);
+    expect(hints.nearText).toBe('Attach file');
+  });
+
+  it('buildBindingHints prefers ariaLabel over title for nearText', () => {
+    const element = { tag: 'div', ariaLabel: 'Upload', title: 'Attach file' } as any;
+    const hints = RecordingCaptureService.buildBindingHints(element);
+    expect(hints.nearText).toBe('Upload');
+  });
+
   it('getElementLabel priority chain is correct', () => {
-    // ariaLabel > labelText > text (for button) > placeholder > name > role > tag
+    // ariaLabel > labelText > text (for button) > placeholder > title > name > role > tag
     expect(RecordingCaptureService.getElementLabel({ tag: 'button', ariaLabel: 'Submit' } as any)).toBe('Submit');
     expect(RecordingCaptureService.getElementLabel({ tag: 'input', labelText: 'Email' } as any)).toBe('Email');
     expect(RecordingCaptureService.getElementLabel({ tag: 'button', text: 'Sign In' } as any)).toBe('Sign In');
     expect(RecordingCaptureService.getElementLabel({ tag: 'input', placeholder: 'Search...' } as any)).toBe('Search...');
+    expect(RecordingCaptureService.getElementLabel({ tag: 'div', title: 'Attach file' } as any)).toBe('Attach file');
     expect(RecordingCaptureService.getElementLabel({ tag: 'input', name: 'email' } as any)).toBe('email');
     expect(RecordingCaptureService.getElementLabel({ tag: 'div', role: 'button' } as any)).toBe('button');
     expect(RecordingCaptureService.getElementLabel({ tag: 'div' } as any)).toBe('div');

@@ -50,6 +50,10 @@ export interface ProbedElement {
   isMultiline?: boolean;
   /** Nearest heading/landmark text — provides container context for multi-page AI lint */
   containerText?: string;
+  /** V18: title attribute — fallback identifier for icon-only buttons */
+  title?: string;
+  /** V18: data-testid/data-test/data-cy — stable test identifier */
+  testId?: string;
   /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
   iframeSelector?: string;
   /** V14: Marker — element is inside a cross-origin iframe and cannot be probed/recorded */
@@ -323,6 +327,14 @@ const PROBE_AT_POINT_FN = `
     });
   }
 
+  // V18: Collect title and data-testid for behavioral elements with no text/label
+  var titleAttr = target.getAttribute('title') || undefined;
+  var testId = target.getAttribute('data-testid')
+    || target.getAttribute('data-test')
+    || target.getAttribute('data-test-id')
+    || target.getAttribute('data-cy')
+    || undefined;
+
   return {
     tag: tag,
     role: target.getAttribute('role') || undefined,
@@ -333,6 +345,8 @@ const PROBE_AT_POINT_FN = `
     placeholder: target.getAttribute('placeholder') || undefined,
     name: target.getAttribute('name') || undefined,
     ref: target.getAttribute('data-agent-ref') || undefined,
+    title: titleAttr,
+    testId: testId,
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
@@ -809,6 +823,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         ? element.text
         : undefined)
       || element.placeholder
+      || element.title   // V18: title attribute as fallback for icon-only buttons
       || element.name
       || element.role
       || element.tag
@@ -893,11 +908,15 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.ariaLabel) hints.nearText = element.ariaLabel;
     // V11: Use containerText as nearText fallback for multi-page context
     if (element.containerText && !hints.nearText) hints.nearText = element.containerText;
+    // V18: Use title as nearText fallback for icon-only buttons (e.g. <div title="Attach file">📎</div>)
+    if (element.title && !hints.nearText) hints.nearText = element.title;
     if (element.type) hints.type = element.type;
     if (element.name) hints.autocomplete = element.name;
     // V15: Add text content and tag for better LLM resolution at replay time
     if (element.text) hints.text = element.text;
     if (element.tag) hints.tag = element.tag;
+    // V18: data-testid as stable identifier — highest confidence for element matching at replay
+    if (element.testId) hints.testId = element.testId;
     return hints;
   }
 

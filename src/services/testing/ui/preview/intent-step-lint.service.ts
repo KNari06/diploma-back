@@ -24,6 +24,7 @@ import type {
 
 // Scoring weights (V2: higher weights for labels, hierarchy bonus)
 const WEIGHTS = {
+  TESTID_EXACT_MATCH: 150,    // V18: data-testid is the most stable identifier — highest confidence
   LABEL_TEXT_EXACT: 120,      // V2: Higher priority for labelText
   LABEL_EXACT_MATCH: 100,
   ARIA_LABEL_MATCH: 90,
@@ -185,6 +186,14 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
       score += WEIGHTS.STATE_MISMATCH_PENALTY;
       reasons.push(`Already ${currentState ? 'checked/open' : 'unchecked/closed'}`);
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // V18: data-testid scoring — highest priority, stable identifier
+  // ═══════════════════════════════════════════════════════════════════════════
+  if (hints.testId && node.testIdAttr && hints.testId === node.testIdAttr) {
+    score += WEIGHTS.TESTID_EXACT_MATCH;
+    reasons.push('TestId exact match');
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
