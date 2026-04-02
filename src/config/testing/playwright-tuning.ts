@@ -127,8 +127,8 @@ export const ELEMENT_RESOLVER_CONFIG = {
   /** Max chars for intent text sent to LLM */
   maxIntentTextLength: 500,
 
-  /** Max candidates included in a single LLM selection call */
-  maxCandidatesForLlm: 50,
+  /** Max candidates included in a single LLM selection call (primary batch) */
+  maxCandidatesForLlm: 70,
 
   /**
    * Minimum LLM confidence to accept an element match.
