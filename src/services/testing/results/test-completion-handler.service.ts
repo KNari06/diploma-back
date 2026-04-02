@@ -1188,11 +1188,142 @@ export class TestCompletionHandlerService {
             message: `${passed}/${tests.length} passed`,
           },
         }).catch(() => {});
+
+        // V14: Auto-retry flaky tests (non-blocking, best-effort)
+        if (finalStatus === 'failed' && run.plan_id) {
+          this.maybeRetryFlakyTests(run, tests).catch(err => {
+            logger.warn('[TEST_COMPLETION] Auto-retry flaky check failed (non-fatal)', {
+              runId: run.id,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
       }
     } catch (error) {
       logger.error('[TEST_COMPLETION] Error recomputing run status', {
         error: error instanceof Error ? error.message : String(error),
         runId: run?.id || 'unknown',
+      });
+    }
+  }
+
+  /**
+   * V14: Auto-retry tests classified as flaky by AI analysis.
+   * Only runs if the plan has autoRetryFlaky enabled and retry count is within limits.
+   */
+  private static async maybeRetryFlakyTests(
+    run: any,
+    tests: any[],
+  ): Promise<void> {
+    // 1. Load plan and check config
+    const { data: plan } = await supabaseAdmin
+      .from('regression_plans')
+      .select('id, automation_config')
+      .eq('id', run.plan_id)
+      .single();
+
+    if (!plan?.automation_config?.autoRetryFlaky?.enabled) return;
+
+    const maxRetries = Math.min(plan.automation_config.autoRetryFlaky.maxRetries || 1, 3);
+
+    // 2. Check retry count from run metadata
+    const runMetadata = run.metadata || {};
+    const currentRetryCount = runMetadata.flakyRetryCount || 0;
+    if (currentRetryCount >= maxRetries) {
+      logger.debug('[TEST_COMPLETION] Auto-retry limit reached', {
+        runId: run.id,
+        currentRetryCount,
+        maxRetries,
+      });
+      return;
+    }
+
+    // 3. Find failed tests with flaky classification
+    const failedTestIds = tests
+      .filter((t: any) => t.status === 'failed' || t.status === 'timeout')
+      .map((t: any) => t.id);
+
+    if (failedTestIds.length === 0) return;
+
+    // Get AI summaries for failed tests
+    const { data: failedResults } = await supabaseAdmin
+      .from('test_results')
+      .select('test_id, ai_summary')
+      .in('test_id', failedTestIds);
+
+    const flakyTestIds = (failedResults || [])
+      .filter((r: any) => r.ai_summary?.failureClassification === 'flaky')
+      .map((r: any) => r.test_id as string);
+
+    if (flakyTestIds.length === 0) {
+      logger.debug('[TEST_COMPLETION] No flaky-classified tests to retry', { runId: run.id });
+      return;
+    }
+
+    // 4. Get test_case_ids for flaky tests (via test_executions)
+    const { data: flakyExecs } = await supabaseAdmin
+      .from('test_executions')
+      .select('test_case_id')
+      .eq('run_id', run.id)
+      .in('test_id', flakyTestIds);
+
+    const flakyTestCaseIds = [...new Set((flakyExecs || []).map((e: any) => e.test_case_id))];
+
+    if (flakyTestCaseIds.length === 0) return;
+
+    logger.info('[TEST_COMPLETION] Auto-retrying flaky tests', {
+      runId: run.id,
+      planId: run.plan_id,
+      flakyCount: flakyTestCaseIds.length,
+      retryAttempt: currentRetryCount + 1,
+      maxRetries,
+    });
+
+    // 5. Queue retry runs via RegressionRunService (one per flaky test case)
+    try {
+      const { RegressionRunService } = await import('../regression/regression-run.service');
+
+      // Notify user
+      webSocketService.emitRegressionRunProgress(run.user_id, {
+        runId: run.id,
+        userId: run.user_id,
+        status: 'completed',
+        progress: 100,
+        message: `Auto-retrying ${flakyTestCaseIds.length} flaky test(s)...`,
+        details: {
+          totalTests: flakyTestCaseIds.length,
+          completedTests: 0,
+          passed: 0,
+          failed: 0,
+          skipped: 0,
+        },
+        timestamp: new Date().toISOString(),
+      });
+
+      // Queue each flaky test case for retry
+      for (const testCaseId of flakyTestCaseIds) {
+        try {
+          await RegressionRunService.runSavedTestCase({
+            savedTestCaseId: testCaseId,
+            userId: run.user_id,
+            trigger: 'scheduled', // Closest match for automated trigger
+            parameters: {
+              isRetryRun: true,
+              parentRunId: run.id,
+              flakyRetryCount: currentRetryCount + 1,
+            },
+          });
+        } catch (singleRetryError) {
+          logger.warn('[TEST_COMPLETION] Failed to retry single flaky test case', {
+            testCaseId,
+            error: singleRetryError instanceof Error ? singleRetryError.message : String(singleRetryError),
+          });
+        }
+      }
+    } catch (retryError) {
+      logger.error('[TEST_COMPLETION] Failed to queue flaky retry run', {
+        runId: run.id,
+        error: retryError instanceof Error ? retryError.message : String(retryError),
       });
     }
   }

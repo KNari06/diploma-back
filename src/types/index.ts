@@ -161,6 +161,8 @@ export interface QualityCheckReport {
   };
 }
 
+export type FailureClassification = 'flaky' | 'real_bug' | 'environment' | 'test_drift';
+
 export interface AISummary {
   summary: string;
   bugs: BugReport[];
@@ -168,6 +170,11 @@ export interface AISummary {
   severity: 'low' | 'medium' | 'high' | 'critical';
   confidence: number; // 0-100
   generatedAt: Date;
+  // V14: Step-aware root cause analysis
+  rootCauseStep?: number | null;
+  causedByStep?: number | null;
+  failureClassification?: FailureClassification | null;
+  classificationEvidence?: string[];
 }
 
 export interface BugReport {

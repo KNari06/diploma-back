@@ -645,6 +645,10 @@ export interface AIAnalysisCompletedPayload {
     }>;
     recommendations: string[];
     confidence: number;
+    // V14: Step-aware classification
+    failureClassification?: 'flaky' | 'real_bug' | 'environment' | 'test_drift' | null;
+    rootCauseStep?: number | null;
+    classificationEvidence?: string[];
   };
   timestamp: string;
 }

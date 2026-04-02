@@ -128,6 +128,23 @@ export class AIService {
       context.accessibilityWarnings = qualityChecks.accessibility.warnings;
     }
 
+    // V14: Include per-step telemetry timeline for root cause analysis
+    const stepTelemetry = qualityChecks?.stepTelemetry;
+    if (stepTelemetry?.entries?.length > 0) {
+      context.stepTimeline = stepTelemetry.entries.map((e: any) => ({
+        step: e.stepIndex,
+        action: e.actionType,
+        desc: e.description?.slice(0, 60),
+        status: e.status,
+        durationMs: e.durationMs,
+        urlChanged: e.urlChanged || undefined,
+        error: e.error?.slice(0, 150) || undefined,
+        consoleErrors: e.newConsoleErrors?.length > 0 ? e.newConsoleErrors.slice(0, 3) : undefined,
+        networkErrors: e.newNetworkErrors?.length > 0 ? e.newNetworkErrors.slice(0, 3) : undefined,
+        retried: e.retried || undefined,
+      }));
+    }
+
     const contextString = JSON.stringify(context, null, 2);
 
     // ✅ Log final context size
@@ -295,6 +312,26 @@ CONFIDENCE GUIDELINES:
 - 50-69: Potential issues based on patterns, not clear errors
 - Below 50: Speculative, insufficient data
 
+STEP TIMELINE ANALYSIS (when "stepTimeline" is present in input):
+- Identify which step CAUSED the failure ("rootCauseStep" = step index).
+- If network errors appeared BEFORE the failing step, that earlier step is "causedByStep" (cascading failure).
+- If retried=true and no persistent errors at that step, likely flaky.
+- If no stepTimeline, set rootCauseStep to null.
+
+FAILURE CLASSIFICATION (always include for failed tests):
+"failureClassification" field — pick exactly one:
+- "real_bug": Reproducible failure with clear error evidence (console errors, API errors, assertion failures).
+- "flaky": Transient failure from timing/race conditions. Indicators: retried step, timeout without network errors, element not found briefly.
+- "environment": Infrastructure failure (DNS, connection refused, SSL, 503 on all endpoints).
+- "test_drift": Test expects changed behavior (element renamed, URL restructured, UI redesigned). Indicators: element_not_found on previously-passing steps with no errors.
+Set to null if test passed or insufficient evidence.
+
+EXTENDED OUTPUT FIELDS (add alongside existing fields):
+"rootCauseStep": <step index number or null>,
+"causedByStep": <step index number or null>,
+"failureClassification": "real_bug"|"flaky"|"environment"|"test_drift"|null,
+"classificationEvidence": ["<reason1>", "<reason2>"]
+
 FEW-SHOT EXAMPLE:
 
 Input: status=completed, errors=[{type:"console",message:"TypeError: Cannot read property 'map' of undefined",source:"app.js:142"}], logs=["Navigated to /dashboard","Clicked Reports tab","Error in console"], networkLogs=[{url:"/api/reports",status:500,method:"GET"}]
@@ -381,6 +418,11 @@ ${context}`;
         severity: this.validateSeverity(parsed.severity),
         confidence: Math.max(0, Math.min(100, parsed.confidence || 50)),
         generatedAt: new Date(),
+        // V14: Step-aware root cause analysis
+        rootCauseStep: typeof parsed.rootCauseStep === 'number' ? parsed.rootCauseStep : null,
+        causedByStep: typeof parsed.causedByStep === 'number' ? parsed.causedByStep : null,
+        failureClassification: this.validateClassification(parsed.failureClassification),
+        classificationEvidence: Array.isArray(parsed.classificationEvidence) ? parsed.classificationEvidence : [],
       };
     } catch (error) {
       logger.error('[AI_SERVICE] Failed to parse AI response', { error });
@@ -411,6 +453,15 @@ ${context}`;
   private validateCategory(category: any): 'visual' | 'functional' | 'performance' | 'accessibility' | 'security' {
     const validCategories = ['visual', 'functional', 'performance', 'accessibility', 'security'];
     return validCategories.includes(category) ? category : 'functional';
+  }
+
+  /**
+   * Validate failure classification from AI response.
+   * Returns null for invalid/missing values (backward compatible).
+   */
+  private validateClassification(classification: any): 'flaky' | 'real_bug' | 'environment' | 'test_drift' | null {
+    const valid = ['flaky', 'real_bug', 'environment', 'test_drift'];
+    return valid.includes(classification) ? classification : null;
   }
 
   /**

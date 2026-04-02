@@ -20,6 +20,7 @@ import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
+import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
@@ -526,12 +527,21 @@ export class PreviewRunService {
       });
     }, dynamicTimeoutMs);
 
+    // V14: Per-step telemetry collector — declared outside try for finally cleanup
+    let telemetryCollector: StepTelemetryCollector | null = null;
+
     try {
       // 4. Get session page
       const session = sessionService.getSession(previewSessionId);
       if (!session?.page) {
         throw new Error('Session has no active page');
       }
+
+      // V14: Initialize collector now that page is available
+      telemetryCollector = new StepTelemetryCollector(session.page, {
+        testCaseId: intentTestCaseId || undefined,
+        startUrl,
+      });
 
       logger.info('[PreviewRun] Starting run', {
         previewSessionId,
@@ -796,6 +806,9 @@ export class PreviewRunService {
           && !!peekNext.options?.urlMatcher?.changedFrom;
 
         try {
+          // V14: Record step start for telemetry
+          telemetryCollector.markStepStart(i, step.id, step.type, step.description || '', session.page.url());
+
           const stepStartMs = Date.now();
           let result = await raceAbort(PreviewStepApplyService.applyStep({
             previewSessionId,
@@ -933,6 +946,12 @@ export class PreviewRunService {
               ...(retried ? { retried: true } : {}),
             });
             passedSteps++;
+
+            // V14: Record step telemetry (pass)
+            telemetryCollector.markStepEnd('pass', session.page.url(), {
+              retried,
+              attempts: result.attempts,
+            });
 
             // Update tracked URL after successful step execution
             trackedUrl = session.page.url();
@@ -1077,6 +1096,13 @@ export class PreviewRunService {
               ...(retried ? { retried: true } : {}),
             });
             failedSteps++;
+
+            // V14: Record step telemetry (fail)
+            telemetryCollector.markStepEnd('fail', session.page.url(), {
+              error: result.error,
+              retried,
+              attempts: result.attempts,
+            });
 
             // Stop on first failure - emit remaining steps as skipped
             logger.info('[PreviewRun] Stopping due to failure, skipping remaining steps', {
@@ -1345,6 +1371,14 @@ export class PreviewRunService {
           });
           failedSteps++;
 
+          // V14: Record step telemetry (exception)
+          try {
+            telemetryCollector.markStepEnd('fail', session.page.url(), {
+              error: originalError,
+              retried: exceptionRetried,
+            });
+          } catch { /* page may be closed */ }
+
           // Stop and skip remaining
           for (let j = i + 1; j < stepsToExecute.length; j++) {
             const remainingStep = stepsToExecute[j];
@@ -1382,6 +1416,9 @@ export class PreviewRunService {
     } finally {
       // Clear global timeout
       clearTimeout(globalTimeout);
+
+      // V14: Clean up telemetry collector listeners
+      try { telemetryCollector?.destroy(); } catch { /* non-fatal */ }
 
       // V13: Reset dialog mode back to passive
       try { sessionService.setDialogMode(previewSessionId, userId, 'passive'); } catch { /* session may be gone */ }
@@ -1462,6 +1499,9 @@ export class PreviewRunService {
         }
       }
 
+      // V14: Get step telemetry timeline for the completed event
+      const stepTelemetry = telemetryCollector?.getTimeline() || null;
+
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
         success: runSuccess,
@@ -1473,6 +1513,7 @@ export class PreviewRunService {
         timedOut,
         duration,
         timestamp: new Date().toISOString(),
+        stepTelemetry,
       });
 
       // NOTE: We do NOT emit chat:processing:step on completion.

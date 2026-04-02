@@ -541,13 +541,15 @@ export class ActionExecutor {
       case 'goto':
         if (!cmd.url) throw new Error('goto requires url');
         // Use 'load' to ensure JS hydration completes (SPA frameworks),
-        // fallback to 'domcontentloaded' if load times out
+        // fallback to 'domcontentloaded' only on timeout errors
         try {
           await this.currentContext.goto(cmd.url, {
             waitUntil: 'load',
             timeout: 30000,
           });
-        } catch {
+        } catch (gotoErr) {
+          const isTimeout = gotoErr instanceof Error && gotoErr.message.includes('Timeout');
+          if (!isTimeout) throw gotoErr;
           await this.currentContext.goto(cmd.url, {
             waitUntil: 'domcontentloaded',
             timeout: 15000,
