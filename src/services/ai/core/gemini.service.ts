@@ -42,7 +42,7 @@ export interface GeminiResponse {
  */
 export async function generateTextWithGemini(params: {
   prompt: string;
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp' | 'gemini-2.5-flash-lite';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
@@ -125,7 +125,7 @@ export async function generateTextWithGemini(params: {
  */
 export async function getChatCompletionWithGemini(params: {
   messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp' | 'gemini-2.5-flash-lite';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
@@ -252,7 +252,7 @@ export async function generateTextWithGeminiVision(params: {
   prompt: string;
   imageBase64: string;
   mimeType?: 'image/png' | 'image/jpeg';
-  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.0-flash-exp' | 'gemini-2.5-flash-lite';
+  model?: 'gemini-2.5-flash' | 'gemini-2.5-pro' | 'gemini-2.5-flash-lite';
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
@@ -261,7 +261,7 @@ export async function generateTextWithGeminiVision(params: {
     prompt,
     imageBase64,
     mimeType = 'image/png',
-    model = 'gemini-2.0-flash-exp',
+    model = 'gemini-2.5-flash',
     temperature = 0,
     maxTokens = 300,
     timeout = 8000,

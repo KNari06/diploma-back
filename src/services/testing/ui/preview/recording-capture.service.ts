@@ -50,6 +50,10 @@ export interface ProbedElement {
   isMultiline?: boolean;
   /** Nearest heading/landmark text — provides container context for multi-page AI lint */
   containerText?: string;
+  /** V18: title attribute — fallback identifier for icon-only buttons */
+  title?: string;
+  /** V18: data-testid/data-test/data-cy — stable test identifier */
+  testId?: string;
   /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
   iframeSelector?: string;
   /** V14: Marker — element is inside a cross-origin iframe and cannot be probed/recorded */
@@ -142,7 +146,7 @@ const PROBE_AT_POINT_FN = `
     'combobox', 'slider', 'spinbutton', 'treeitem', 'gridcell',
     'searchbox', 'textbox'
   ];
-  var FRAMEWORK_ATTRS = ['ng-click', 'v-on:click', 'x-on:click'];
+  var FRAMEWORK_ATTRS = ['ng-click', 'v-on:click', 'x-on:click', 'on:click'];
   var BTN_CLASS_RE = /\\b(btn|button|clickable|toggle-btn|action-btn)\\b/i;
 
   var chain = [];
@@ -154,18 +158,39 @@ const PROBE_AT_POINT_FN = `
     var hasTabindex = walk.hasAttribute('tabindex') && walk.getAttribute('tabindex') !== '-1';
     var hasOnclick = walk.hasAttribute('onclick');
     var hasDraggable = walk.getAttribute('draggable') === 'true';
-    // Check (click) — Angular binding: attribute name starts with "(click"
-    var hasAngularClick = false;
+    // V18: contenteditable detection
+    var isContentEditable = walk.getAttribute('contenteditable') === 'true'
+      || walk.getAttribute('contenteditable') === '';
+    // Check (click) — Angular/Vue/Svelte/Alpine bindings
+    var hasFrameworkClick = false;
+    // V18: React onClick detection via __reactProps$ (React attaches props to DOM nodes)
+    var hasReactClick = false;
     try {
       var attrs = walk.attributes;
       for (var ai = 0; ai < attrs.length; ai++) {
         var aname = attrs[ai].name;
         if (aname === '(click)' || aname.indexOf('@click') === 0 || FRAMEWORK_ATTRS.indexOf(aname) !== -1) {
-          hasAngularClick = true;
+          hasFrameworkClick = true;
           break;
         }
       }
     } catch(e) {}
+    // V18: React synthetic event detection — check __reactProps$ for onClick handler.
+    // React attaches __reactProps$<hash> to DOM nodes with component props including event handlers.
+    if (!hasFrameworkClick && !hasOnclick) {
+      try {
+        var ownKeys = Object.keys(walk);
+        for (var ki = 0; ki < ownKeys.length; ki++) {
+          if (ownKeys[ki].indexOf('__reactProps$') === 0) {
+            var rp = walk[ownKeys[ki]];
+            if (rp && (typeof rp.onClick === 'function' || typeof rp.onClickCapture === 'function')) {
+              hasReactClick = true;
+            }
+            break; // Only one __reactProps$ key per element
+          }
+        }
+      } catch(e) {}
+    }
 
     chain.push({
       el: walk,
@@ -174,8 +199,10 @@ const PROBE_AT_POINT_FN = `
       className: wclass,
       hasTabindex: hasTabindex,
       hasOnclick: hasOnclick,
-      hasFrameworkBinding: hasAngularClick,
+      hasFrameworkBinding: hasFrameworkClick,
+      hasReactClick: hasReactClick,
       hasDraggable: hasDraggable,
+      isContentEditable: isContentEditable,
       text: (walk.textContent || '').trim().slice(0, 80),
       ariaLabel: walk.getAttribute('aria-label') || ''
     });
@@ -201,14 +228,14 @@ const PROBE_AT_POINT_FN = `
       resolvedVia = 'ariaRole';
       break;
     }
-    // Priority 3: Behavioral (tabindex, onclick, framework bindings)
-    if (node.hasTabindex || node.hasOnclick || node.hasFrameworkBinding) {
+    // Priority 3: Behavioral (tabindex, onclick, framework bindings, React onClick)
+    if (node.hasTabindex || node.hasOnclick || node.hasFrameworkBinding || node.hasReactClick) {
       target = node.el;
       resolvedVia = 'behavioral';
       break;
     }
-    // Priority 3.5: draggable
-    if (node.hasDraggable) {
+    // Priority 3.5: draggable or contenteditable
+    if (node.hasDraggable || node.isContentEditable) {
       target = node.el;
       resolvedVia = 'behavioral';
       break;
@@ -300,6 +327,14 @@ const PROBE_AT_POINT_FN = `
     });
   }
 
+  // V18: Collect title and data-testid for behavioral elements with no text/label
+  var titleAttr = target.getAttribute('title') || undefined;
+  var testId = target.getAttribute('data-testid')
+    || target.getAttribute('data-test')
+    || target.getAttribute('data-test-id')
+    || target.getAttribute('data-cy')
+    || undefined;
+
   return {
     tag: tag,
     role: target.getAttribute('role') || undefined,
@@ -310,6 +345,8 @@ const PROBE_AT_POINT_FN = `
     placeholder: target.getAttribute('placeholder') || undefined,
     name: target.getAttribute('name') || undefined,
     ref: target.getAttribute('data-agent-ref') || undefined,
+    title: titleAttr,
+    testId: testId,
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
@@ -786,6 +823,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         ? element.text
         : undefined)
       || element.placeholder
+      || element.title   // V18: title attribute as fallback for icon-only buttons
       || element.name
       || element.role
       || element.tag
@@ -870,11 +908,15 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.ariaLabel) hints.nearText = element.ariaLabel;
     // V11: Use containerText as nearText fallback for multi-page context
     if (element.containerText && !hints.nearText) hints.nearText = element.containerText;
+    // V18: Use title as nearText fallback for icon-only buttons (e.g. <div title="Attach file">📎</div>)
+    if (element.title && !hints.nearText) hints.nearText = element.title;
     if (element.type) hints.type = element.type;
     if (element.name) hints.autocomplete = element.name;
     // V15: Add text content and tag for better LLM resolution at replay time
     if (element.text) hints.text = element.text;
     if (element.tag) hints.tag = element.tag;
+    // V18: data-testid as stable identifier — highest confidence for element matching at replay
+    if (element.testId) hints.testId = element.testId;
     return hints;
   }
 
@@ -1364,9 +1406,11 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       value: buffer.text,
       bindingHints: buffer.bindingHints as BindingHints | undefined,
       ...(Object.keys(opts).length > 0 && { options: opts }),
-      ...(buffer.elementRef && {
-        evidence: { lastSuccessRef: buffer.elementRef, confidence: 1.0, pageUrl: buffer.pageUrl },
-      }),
+      evidence: {
+        ...(buffer.elementRef && { lastSuccessRef: buffer.elementRef }),
+        confidence: 1.0,
+        pageUrl: buffer.pageUrl,
+      },
     };
   }
 

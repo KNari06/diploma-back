@@ -50,7 +50,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * Wait for DOM to stabilize after navigation (SPA hydration).
  * Uses MutationObserver — does NOT wait for images/fonts/analytics.
  */
-async function waitForDOMStability(page: import('playwright').Page, maxWaitMs = 3000, stabilityMs = 800): Promise<void> {
+async function waitForDOMStability(
+  page: import('playwright').Page,
+  maxWaitMs: number = STEP_READINESS_CONFIG.defaults.maxWaitMs,
+  stabilityMs: number = STEP_READINESS_CONFIG.domStableThresholdMs.navigation,
+): Promise<void> {
   try {
     await page.evaluate(
       ({ maxWait, stability }: { maxWait: number; stability: number }) => {
@@ -593,7 +597,7 @@ export class PreviewRunService {
         // Wait for DOM to stabilize after initial navigation (SPA hydration).
         // networkidle waits for images/fonts/analytics — irrelevant for element resolution.
         // DOM stability (no mutations for 800ms) is what we actually need.
-        await raceAbort(waitForDOMStability(session.page, 3000, 800), signal);
+        await raceAbort(waitForDOMStability(session.page), signal);
 
         logger.info('[PreviewRun] Navigation to startUrl complete', {
           previewSessionId,
@@ -1015,7 +1019,7 @@ export class PreviewRunService {
                   error: lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError),
                 });
                 // MutationObserver-based: resolves when DOM stops mutating for 500ms, caps at 3s
-                await waitForDOMStability(session.page, 3000, 500).catch(() => {});
+                await waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default).catch(() => {});
               }
             }
 
@@ -1257,7 +1261,7 @@ export class PreviewRunService {
                   } catch (laError) {
                     if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                     // Lookahead failure is non-fatal — apply DOM stability fallback
-                    await waitForDOMStability(session.page, 3000, 500).catch(() => {});
+                    await waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default).catch(() => {});
                   }
                 }
 
@@ -1315,7 +1319,7 @@ export class PreviewRunService {
                       }), signal);
                     } catch (laError) {
                       if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
-                      await waitForDOMStability(session.page, 3000, 500).catch(() => {});
+                      await waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default).catch(() => {});
                     }
                   }
 
@@ -1405,7 +1409,7 @@ export class PreviewRunService {
           await raceAbort(
             Promise.all([
               waitForApiIdle(session.page, 3000),
-              waitForDOMStability(session.page, 3000, 500),
+              waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default),
             ]),
             signal,
           );

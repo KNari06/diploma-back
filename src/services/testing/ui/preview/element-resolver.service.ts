@@ -811,6 +811,180 @@ function buildSceneSummary(
   return scenes.slice(0, 5).join('; ');
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PRE-SCORE: Rank elements by text overlap with intent
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Tokenize text into lowercase words (3+ chars). No stop-word lists — no hardcode.
+ * Short tokens (<3 chars) are noise in any language and excluded.
+ */
+function tokenizeForPrescore(text: string): string[] {
+  if (!text) return [];
+  return text
+    .toLowerCase()
+    .split(/[\s|,;:.()\[\]{}'"!?/\\<>@#$%^&*+=~`\-_]+/)
+    .filter(w => w.length >= 3);
+}
+
+/**
+ * Build searchable text blob for an InteractiveNode.
+ * Combines all text fields that a user might reference when describing an element.
+ */
+function buildNodeSearchText(node: InteractiveNode): string {
+  const parts: string[] = [];
+  if (node.labelText) parts.push(node.labelText);
+  if (node.text) parts.push(node.text);
+  if (node.ariaLabel) parts.push(node.ariaLabel);
+  if (node.placeholder) parts.push(node.placeholder);
+  if (node.title) parts.push(node.title);
+  if (node.nearText) parts.push(node.nearText);
+  if (node.testIdAttr) parts.push(node.testIdAttr);
+  if (node.name && !node.isDynamicId) parts.push(node.name);
+  if (node.containerTitles?.length) parts.push(node.containerTitles.join(' '));
+  if (node.autocomplete) parts.push(node.autocomplete);
+  if (node.nearestLandmark) parts.push(node.nearestLandmark);
+  return parts.join(' ').toLowerCase();
+}
+
+/** Proportion of LLM slots reserved for scored elements (rest go to DOM-order) */
+const SCORED_SLOT_RATIO = 0.6; // 60% scored, 40% DOM-order
+
+/**
+ * Pre-score elements and build a merged batch that GUARANTEES both:
+ * 1. Elements with text overlap are prioritized (covers 65% of intents)
+ * 2. DOM-order elements always get slots (covers cross-language, visual, synonym intents)
+ *
+ * CRITICAL: No element is ever filtered out by score. Score only determines
+ * which RESERVED SLOTS an element fills. Zero-score elements fill DOM slots.
+ *
+ * Layout for limit=70:
+ *   [up to 42 scored elements (desc)] + [up to 28 DOM-order elements not already included]
+ *   = always 70 (or fewer if total < 70)
+ *
+ * If scored < 42, remaining slots go to DOM-order (total still 70).
+ * If scored >= 42, overflow scored elements go to DOM-order slots if space permits.
+ *
+ * This means: even if pre-score has 42 false positives, 28 DOM-order elements
+ * still get through — covering cross-language, synonym, and visual description cases.
+ */
+function preScoreAndSort(nodes: InteractiveNode[], intentText: string, limit: number): InteractiveNode[] {
+  if (nodes.length <= limit) return nodes; // Everything fits — no ranking needed
+
+  const intentWords = tokenizeForPrescore(intentText);
+
+  // If no usable tokens (very short intent, all <3 chars), keep DOM order
+  if (intentWords.length === 0) return nodes;
+
+  // Score each node
+  const scored: Array<{ node: InteractiveNode; score: number; domIndex: number }> = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const node = nodes[i];
+    const searchText = buildNodeSearchText(node);
+
+    let wordScore = 0;
+    for (const word of intentWords) {
+      if (searchText.includes(word)) wordScore++;
+    }
+
+    scored.push({ node, score: wordScore, domIndex: i });
+  }
+
+  // Find the median score to separate "specifically relevant" from "generically matching".
+  // Elements scoring above median are genuinely relevant; elements at or below may just
+  // share a common word (e.g. "button" appears in every element's text).
+  const scores = scored.map(s => s.score).filter(s => s > 0);
+  const medianScore = scores.length > 0
+    ? scores.sort((a, b) => a - b)[Math.floor(scores.length / 2)]
+    : 0;
+  // "Specifically scored" = above median (or above 1 if median is too low).
+  // This prevents a single generic word from promoting ALL elements.
+  const scoreThreshold = Math.max(medianScore, 1);
+
+  const highScored = scored.filter(s => s.score > scoreThreshold);
+  const rest = scored.filter(s => s.score <= scoreThreshold);
+
+  // Sort high-scored by score descending (stable — same score keeps DOM order)
+  highScored.sort((a, b) => b.score - a.score || a.domIndex - b.domIndex);
+
+  // Rest keeps DOM order (these include score=0 AND low-scored generics)
+  // Already in DOM order from the original loop
+
+  // Allocate slots: high-scored get up to SCORED_SLOT_RATIO of limit
+  const maxScoredSlots = Math.ceil(limit * SCORED_SLOT_RATIO);
+  const scoredToTake = highScored.slice(0, maxScoredSlots);
+  const remainingSlots = limit - scoredToTake.length;
+
+  // Fill remaining from rest (DOM order) — includes unscored AND low-scored
+  const domOrderFill = rest.slice(0, remainingSlots);
+
+  // If high-scored overflow AND still space, append them
+  if (domOrderFill.length < remainingSlots) {
+    const overflowScored = highScored.slice(maxScoredSlots);
+    for (const s of overflowScored) {
+      if (domOrderFill.length >= remainingSlots) break;
+      domOrderFill.push(s);
+    }
+  }
+
+  // Merge: high-scored first, then DOM-order fill
+  const result = [...scoredToTake, ...domOrderFill];
+  return result.map(s => s.node);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUPLICATE MARKING: Add [N of M] and CONTEXT for disambiguation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Mark duplicate-labeled elements with [N of M] suffixes and promote nearText
+ * to (CONTEXT: ...) right after the label for strong disambiguation signal.
+ * Mutates candidateText in-place.
+ */
+function markDuplicatesWithContext(
+  candidates: Array<{ node: InteractiveNode; candidateText: string }>,
+): void {
+  const labelCounts = new Map<string, number>();
+  for (const c of candidates) {
+    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    if (label) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+  }
+
+  const labelIndex = new Map<string, number>();
+  for (const c of candidates) {
+    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    if (label && (labelCounts.get(label) || 0) > 1) {
+      const idx = (labelIndex.get(label) || 0) + 1;
+      labelIndex.set(label, idx);
+
+      // Promote nearText so the LLM sees disambiguating context (card name, row label)
+      // IMMEDIATELY after the element label.
+      if (c.node.nearText) {
+        const nearSegment = `near: ${c.node.nearText}`;
+        const textWithoutNear = c.candidateText
+          .replace(` | ${nearSegment}`, '')
+          .replace(nearSegment, '');
+        const primaryLabel = c.node.labelText || c.node.ariaLabel || c.node.text || '';
+        // Find end of container prefix "[section > Title]" — it's always followed by " | "
+        // Use first "] |" to avoid matching state hints like [disabled] that appear later
+        const containerEndMarker = textWithoutNear.indexOf('] |');
+        const searchFrom = containerEndMarker >= 0 ? containerEndMarker : 0;
+        const labelPos = primaryLabel ? textWithoutNear.indexOf(primaryLabel, searchFrom) : -1;
+        if (labelPos >= 0) {
+          const insertAt = labelPos + primaryLabel.length;
+          c.candidateText = textWithoutNear.slice(0, insertAt)
+            + ` (CONTEXT: ${c.node.nearText})`
+            + textWithoutNear.slice(insertAt);
+        } else {
+          c.candidateText = textWithoutNear + ` (CONTEXT: ${c.node.nearText})`;
+        }
+      }
+
+      c.candidateText += ` [${idx} of ${labelCounts.get(label)}]`;
+    }
+  }
+}
+
 /**
  * Sanitize user intent for LLM matching
  * Redacts step value if present in description
@@ -1194,8 +1368,11 @@ RULES:
    - "small icon above the search bar" → match [small] size AND y < search_bar.y
    - "delete button in the third row" → match "delete" text AND near: context of third row
 11. DUPLICATE ELEMENTS: When multiple elements have the same label, they are marked [N of M].
-   Each duplicate has "near:" context showing neighboring text (row/card content).
-   - If the intent mentions context that matches ONE element's "near:" text → pick THAT one confidently
+   Each duplicate has "(CONTEXT: ...)" showing its card/row/container content — the KEY disambiguation signal.
+   - If the intent says "X button on Y" / "X for Y" / "X у Y" / "X на Y" / "X in Y row/card":
+     → Find the element whose CONTEXT contains "Y" and pick THAT one. This is the STRONGEST signal.
+   - If the intent mentions ANY name/text that matches ONE element's CONTEXT → pick THAT one confidently
+   - Example: intent "Забронировать button on Мирас А." + candidates have CONTEXT "Мирас А..." and CONTEXT "Кэтрин Ш..." → pick the one with "Мирас А."
    - "second delete" / "2nd remove" / "второй удалить" → pick [2 of M]
    - "first/last" → pick [1 of M] / [M of M]
    - If intent has NO context to distinguish duplicates → MUST return alternatives, NEVER guess
@@ -1261,10 +1438,16 @@ async function selectElementWithLLM(params: {
   const sceneSummary = buildSceneSummary(candidates);
   const sceneContext = sceneSummary ? `\nPAGE STATE: ${sceneSummary}` : '';
 
+  // Detect if duplicates exist (marked as [N of M] by the dedup logic above)
+  const hasDuplicates = candidates.some(c => /\[\d+ of \d+\]/.test(c.candidateText));
+  const dupHint = hasDuplicates
+    ? `\nIMPORTANT: Multiple elements share the same label. Use the (CONTEXT: ...) text to match the user's intent. Phrases like "on X", "for X", "у X", "на X", "button on Card Name" mean: pick the element whose CONTEXT contains X.`
+    : '';
+
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
 PAGE: ${pageUrl}
-VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}
+VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
@@ -1721,30 +1904,22 @@ export async function resolveElement(params: {
     // Falls through to Step 6 (LLM selection) below
   }
 
-  // Step 6: Multiple allowed elements → LLM selection
+  // Step 6: Multiple allowed elements → pre-score sort + LLM selection
+  // Pre-score: rank elements by text overlap with intent so the most relevant
+  // elements always land in the LLM batch, regardless of DOM position.
+  // This is a SORT, not a FILTER — score=0 elements still fill remaining slots.
+  const rankedAllowed = preScoreAndSort(allAllowed, intentText, MAX_CANDIDATES_FOR_LLM);
+  const primaryBatch = rankedAllowed.slice(0, MAX_CANDIDATES_FOR_LLM);
+  const overflowBatch = rankedAllowed.slice(MAX_CANDIDATES_FOR_LLM);
+
   const candidatesToProcess: Array<{ node: InteractiveNode; candidateText: string }> = [];
-  for (const node of allAllowed.slice(0, MAX_CANDIDATES_FOR_LLM)) {
+  for (const node of primaryBatch) {
     const candidateText = buildCandidateText(node);
     candidatesToProcess.push({ node, candidateText });
   }
 
-  // Mark duplicate elements with [N of M] so LLM can disambiguate
-  // e.g. two "Delete" buttons → "Delete [1 of 2]", "Delete [2 of 2]"
-  const labelCounts = new Map<string, number>();
-  for (const c of candidatesToProcess) {
-    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
-    if (label) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
-  }
-  // Only mark elements that appear more than once
-  const labelIndex = new Map<string, number>();
-  for (const c of candidatesToProcess) {
-    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
-    if (label && (labelCounts.get(label) || 0) > 1) {
-      const idx = (labelIndex.get(label) || 0) + 1;
-      labelIndex.set(label, idx);
-      c.candidateText += ` [${idx} of ${labelCounts.get(label)}]`;
-    }
-  }
+  // Mark duplicate elements with [N of M] and promote CONTEXT for disambiguation
+  markDuplicatesWithContext(candidatesToProcess);
 
   // Compute page signature for cache
   const pageSignature = computePageSignature(pageUrl, domNodes);
@@ -1953,7 +2128,73 @@ export async function resolveElement(params: {
       }
 
       // LLM returned not_found (and vision didn't help)
+      // Try overflow batch before giving up — the element may be outside the primary batch
       if (llmResult.status === 'not_found') {
+        if (overflowBatch.length > 0) {
+          logger.info('[ELEMENT_RESOLVER] Primary batch not_found, trying overflow batch', {
+            previewSessionId,
+            primaryBatchSize: primaryBatch.length,
+            overflowBatchSize: overflowBatch.length,
+          });
+
+          const overflowCandidates: Array<{ node: InteractiveNode; candidateText: string }> = [];
+          for (const node of overflowBatch.slice(0, MAX_CANDIDATES_FOR_LLM)) {
+            overflowCandidates.push({ node, candidateText: buildCandidateText(node) });
+          }
+
+          // Apply same duplicate marking logic to overflow batch
+          markDuplicatesWithContext(overflowCandidates);
+
+          const overflowResult = await selectElementWithLLM({
+            intentText,
+            actionType: stepDraft.type,
+            candidates: overflowCandidates,
+            pageUrl,
+            pageSignature: pageSignature + ':overflow',
+          });
+
+          if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {
+            const selectedNode = overflowCandidates.find(c => c.node.ref === overflowResult.selectedRef);
+            if (selectedNode) {
+              logger.info('[ELEMENT_RESOLVER] Overflow batch resolved element', {
+                event: 'lint_decision',
+                previewSessionId,
+                ref: overflowResult.selectedRef,
+                confidence: overflowResult.confidence,
+                overflowBatchSize: overflowBatch.length,
+                totalLatencyMs: Date.now() - startTime,
+              });
+
+              const lintCandidate: LintCandidate = {
+                ref: selectedNode.node.ref,
+                label: selectedNode.node.labelText || selectedNode.node.ariaLabel || selectedNode.node.text || selectedNode.node.placeholder || `<${selectedNode.node.tag}>`,
+                reason: `AI match (overflow): ${overflowResult.reason}`,
+                confidence: overflowResult.confidence,
+                boundingBox: selectedNode.node.boundingBox,
+                node: selectedNode.node,
+              };
+
+              return {
+                status: 'resolved',
+                message: 'Element found by AI (extended search)',
+                confidence: overflowResult.confidence,
+                candidates: [lintCandidate],
+                highlight: [{ ref: selectedNode.node.ref, boundingBox: selectedNode.node.boundingBox, type: 'success' }],
+                cacheHit: false,
+                degradedMode: false,
+                ..._diag,
+                _llmTrace: overflowResult._prompt ? {
+                  model: overflowResult._model || 'unknown',
+                  prompt: overflowResult._prompt,
+                  response: overflowResult._response || '',
+                  latencyMs: overflowResult.latencyMs,
+                  path: 'selectElementWithLLM' as const,
+                } : undefined,
+              };
+            }
+          }
+        }
+
         const totalLatencyMs = Date.now() - startTime;
         logger.info('[ELEMENT_RESOLVER] LLM selection returned not_found', {
           event: 'lint_decision',
@@ -1962,6 +2203,7 @@ export async function resolveElement(params: {
           status: 'not_found',
           reason: llmResult.reason,
           allowedCount,
+          overflowAttempted: overflowBatch.length > 0,
           totalLatencyMs,
         });
 

@@ -136,6 +136,9 @@ export async function handleEditorAction(
       type: actionType,
       description: actionDescription,
       ...(actionValue !== undefined && { value: actionValue }),
+      // V18: ai_check needs assertionText — map from description since AI extraction
+      // doesn't produce a separate assertionText field
+      ...(actionType === 'ai_check' && { assertionText: actionDescription }),
     };
 
     logger.info('[EDITOR_ACTION] Executing step', {

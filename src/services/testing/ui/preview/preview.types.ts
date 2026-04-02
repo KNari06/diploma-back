@@ -241,6 +241,8 @@ export interface BindingHints {
   text?: string;
   /** V15: HTML tag of the interactive element — structural hint for replay */
   tag?: string;
+  /** V18: data-testid/data-test/data-cy — stable test identifier for reliable element matching */
+  testId?: string;
 }
 
 /**

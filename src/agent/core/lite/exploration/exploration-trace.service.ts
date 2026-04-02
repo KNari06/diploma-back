@@ -358,6 +358,8 @@ export class ExplorationTraceService {
 
   writeFlowStepsExtracted(data: {
     entryPointId: string;
+    flowName?: string;
+    status?: string;
     steps: DiscoveredStep[];
     count: number;
   }): void {
@@ -370,6 +372,8 @@ export class ExplorationTraceService {
 
   writeFlowErrors(data: {
     entryPointId: string;
+    flowName?: string;
+    status?: string;
     errors: FlowError[];
     classification: ErrorClassification;
   }): void {

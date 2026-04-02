@@ -41,6 +41,15 @@ const previewSubscriptions = new Map<string, Set<string>>();
 const recordingTypingTimers = new Map<string, NodeJS.Timeout>();
 const RECORDING_TYPING_DEBOUNCE_MS = 1500;
 
+/** Per-socket+session hover probe state (throttle + dedup). Key: `${socketId}:${sessionId}` */
+const hoverProbeState = new Map<string, {
+  lastProbeAt: number;
+  lastElementKey: string | null;
+  probeInFlight: boolean;
+  pageUrl: string | null; // Guards against stale probe after navigation
+}>();
+const HOVER_PROBE_THROTTLE_MS = 100;
+
 /** Per-session scroll debounce timers */
 const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout }>();
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
@@ -725,6 +734,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         previewRoomRefCount.delete(room);
       }
 
+      // V18: Clear hover probe state for this session
+      hoverProbeState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
+
       logger.info('[WebSocket] Unsubscribed from preview', {
         socketId: socket.id,
         userId: ensuredUserId,
@@ -1243,6 +1255,71 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             x, y, timestamp: Date.now(),
           });
         }
+
+        // V18: Non-blocking hover probe for Cursor-style element highlight
+        const now = Date.now();
+        const hKey = `${socket.id}:${previewSessionId}`;
+        let hState = hoverProbeState.get(hKey);
+        if (!hState) {
+          hState = { lastProbeAt: 0, lastElementKey: null, probeInFlight: false, pageUrl: null };
+          hoverProbeState.set(hKey, hState);
+        }
+        if (!hState.probeInFlight && now - hState.lastProbeAt >= HOVER_PROBE_THROTTLE_MS) {
+          hState.probeInFlight = true;
+          hState.lastProbeAt = now;
+          const hStateRef = hState;
+          // Capture page URL before probe to detect navigation during setImmediate
+          const preProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
+          // Pre-resolve import outside setImmediate to reduce async overhead in hot path
+          const runServicePromise = import('@/services/testing/ui/preview/preview-run.service');
+          setImmediate(async () => {
+            try {
+              // Fix #7: Skip probe during active preview run
+              const { PreviewRunService } = await runServicePromise;
+              if (PreviewRunService.isRunning(previewSessionId)) {
+                // Clear hover during run
+                if (hStateRef.lastElementKey !== null) {
+                  hStateRef.lastElementKey = null;
+                  const room = createRoomName('preview', previewSessionId);
+                  socket.nsp.to(room).emit('preview:element:hover' as any, {
+                    previewSessionId, element: null, timestamp: new Date().toISOString(),
+                  });
+                }
+                return;
+              }
+
+              const el = await sessionService.probeInteractiveElementAt({
+                sessionId: previewSessionId,
+                userId: ensuredUserId,
+                x, y,
+              });
+
+              // Fix #6: Discard result if page navigated during probe
+              const postProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
+              if (preProbeUrl && postProbeUrl && preProbeUrl !== postProbeUrl) {
+                hStateRef.lastElementKey = null;
+                return;
+              }
+
+              const elKey = el
+                ? `${el.tag}:${el.boundingBox.x}:${el.boundingBox.y}:${el.boundingBox.width}:${el.boundingBox.height}`
+                : null;
+              // Dedup: only emit when element changes
+              if (elKey !== hStateRef.lastElementKey) {
+                hStateRef.lastElementKey = elKey;
+                const room = createRoomName('preview', previewSessionId);
+                socket.nsp.to(room).emit('preview:element:hover' as any, {
+                  previewSessionId,
+                  element: el,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            } catch { /* non-critical — don't break hover */ }
+            finally { // Fix #3: Always reset probeInFlight
+              hStateRef.probeInFlight = false;
+            }
+          });
+        }
       }
       // No snapshot, no error emit for hover
     } catch (error) {
@@ -1275,12 +1352,25 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const isRecording = sessionService.isRecording(previewSessionId, ensuredUserId);
       if (isRecording) {
         try {
-          const { RecordingCaptureService } = await import(
-            '@/services/testing/ui/preview/recording-capture.service'
-          );
-          const page = sessionService.getPage(previewSessionId, ensuredUserId);
-          if (page) {
-            preClickElement = await RecordingCaptureService.probeForRecording(page, x, y);
+          // V18: Reuse hover probe result if fresh AND click lands inside the highlighted element's bbox.
+          // This ensures the recorded step matches exactly what the user saw highlighted.
+          // BBox hit test is more robust than distance check — user can click anywhere inside the highlight.
+          const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
+          const hoverAge = lastHover ? Date.now() - lastHover.timestamp : Infinity;
+          const hoverBBox = lastHover?.probedElement?.boundingBox;
+          const clickInsideHoverBBox = hoverBBox
+            && x >= hoverBBox.x && x <= hoverBBox.x + hoverBBox.width
+            && y >= hoverBBox.y && y <= hoverBBox.y + hoverBBox.height;
+          if (lastHover?.probedElement && hoverAge <= 500 && clickInsideHoverBBox) {
+            preClickElement = lastHover.probedElement;
+          } else {
+            const { RecordingCaptureService } = await import(
+              '@/services/testing/ui/preview/recording-capture.service'
+            );
+            const page = sessionService.getPage(previewSessionId, ensuredUserId);
+            if (page) {
+              preClickElement = await RecordingCaptureService.probeForRecording(page, x, y);
+            }
           }
         } catch {
           // Non-critical — recording probe failure doesn't block click
@@ -1445,11 +1535,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }),
                   ...(iframeSel && { iframe: { selector: iframeSel } }),
                 },
-                evidence: preClickElement!.ref ? {
-                  lastSuccessRef: preClickElement!.ref,
+                evidence: {
+                  ...(preClickElement!.ref && { lastSuccessRef: preClickElement!.ref }),
                   confidence: 1.0,
                   pageUrl: currentPage?.url(),
-                } : undefined,
+                },
               };
               // Clean up empty options
               if (step.options && Object.keys(step.options).length === 0) {
@@ -1862,9 +1952,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   value: data.text,
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
                   options: { isPaste: true },
-                  ...(focusedEl?.ref && {
-                    evidence: { lastSuccessRef: focusedEl.ref, confidence: 1.0, pageUrl: page?.url() },
-                  }),
+                  evidence: {
+                    ...(focusedEl?.ref && { lastSuccessRef: focusedEl.ref }),
+                    confidence: 1.0,
+                    pageUrl: page?.url(),
+                  },
                 };
                 const room = createRoomName('preview', previewSessionId);
                 emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pasteStep });
@@ -3840,6 +3932,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
     cleanupPreviewSubscriptions(socket.id);
     cleanupRateLimits(socket.id); // V2: Cleanup rate limit data
+    // V18: Cleanup all hover probe entries for this socket (keyed as socketId:sessionId)
+    for (const key of hoverProbeState.keys()) {
+      if (key.startsWith(`${socket.id}:`)) hoverProbeState.delete(key);
+    }
   });
 };
 

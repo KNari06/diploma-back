@@ -576,6 +576,7 @@ export class FlowRunner {
       if (discoveredSteps.length > 0) {
         this.trace?.writeFlowStepsExtracted({
           entryPointId: entryPoint.id,
+          flowName: entryPoint.name,
           steps: discoveredSteps,
           count: discoveredSteps.length,
         });
@@ -601,6 +602,7 @@ export class FlowRunner {
       if (errors.length > 0) {
         this.trace?.writeFlowErrors({
           entryPointId: entryPoint.id,
+          flowName: entryPoint.name,
           errors,
           classification: errorClassification,
         });
@@ -637,7 +639,7 @@ export class FlowRunner {
         status = 'completed';
       } else if (pipelineResult.blockedReason) {
         status = 'blocked';
-        const blockerInfo = this.extractBlockerInfo(pipelineResult.insights);
+        const blockerInfo = this.extractBlockerInfo(pipelineResult.insights, pipelineResult.blockedReason);
         blockerType = blockerInfo.type;
         canUserHelp = blockerInfo.canUserHelp;
 
@@ -1200,7 +1202,7 @@ export class FlowRunner {
    * Extract blocker type and canUserHelp from pipeline insights.
    * CommandExecutor writes: "BLOCKED [captcha]: CAPTCHA required (user can help unblock)"
    */
-  private extractBlockerInfo(insights: string[]): {
+  private extractBlockerInfo(insights: string[], blockedReason?: string): {
     type: BlockerType;
     canUserHelp: boolean;
   } {
@@ -1208,6 +1210,7 @@ export class FlowRunner {
       'captcha', '2fa', 'payment', 'external_service', 'login_wall', 'file_upload', 'other',
     ];
 
+    // 1. Strongest signal: explicit BLOCKED [type] from report_blocked command
     for (const insight of insights) {
       const match = insight.match(/BLOCKED\s*\[(\w+)]/i);
       if (match) {
@@ -1220,18 +1223,33 @@ export class FlowRunner {
       }
     }
 
-    // Heuristic fallback: detect blocker type from keywords in any insight
-    const allInsights = insights.join(' ').toLowerCase();
-    if (allInsights.includes('captcha')) return { type: 'captcha', canUserHelp: true };
-    if (allInsights.includes('2fa') || allInsights.includes('two-factor') || allInsights.includes('verification code'))
+    // 2. Keyword heuristics — search insights AND blockedReason (ReviewerAgent's verdict).
+    //    blockedReason often contains the real reason when ReviewerAgent says "blocked"
+    //    but doesn't add a BLOCKED [...] formatted insight.
+    //    IMPORTANT: Only match specific captcha indicators (cloudflare, recaptcha, hcaptcha),
+    //    NOT generic "verification" which could be form validation.
+    const searchText = [...insights, blockedReason || ''].join(' ').toLowerCase();
+
+    // Captcha: require specific captcha product names or "captcha" keyword
+    if (
+      searchText.includes('captcha') ||
+      searchText.includes('cloudflare') ||
+      searchText.includes('recaptcha') ||
+      searchText.includes('hcaptcha')
+    ) {
+      return { type: 'captcha', canUserHelp: true };
+    }
+
+    if (searchText.includes('2fa') || searchText.includes('two-factor') || searchText.includes('verification code') || searchText.includes('authenticator'))
       return { type: '2fa', canUserHelp: true };
-    if (allInsights.includes('payment') || allInsights.includes('credit card'))
+    if (searchText.includes('payment') || searchText.includes('credit card') || searchText.includes('stripe'))
       return { type: 'payment', canUserHelp: false };
-    if (allInsights.includes('file upload'))
+    if (searchText.includes('file upload'))
       return { type: 'file_upload', canUserHelp: false };
-    if (allInsights.includes('login') || allInsights.includes('auth'))
+    if (searchText.includes('login') || searchText.includes('sign in') || searchText.includes('auth'))
       return { type: 'login_wall', canUserHelp: true };
 
+    // Default: "other" — NOT captcha. Most blocked flows are stuck/validation issues.
     return { type: 'other', canUserHelp: false };
   }
 
