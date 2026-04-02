@@ -137,6 +137,12 @@ export function buildExecutorSystemPrompt(bb: TestBlackboard): string {
   // Plan from Planner
   sections.push(`PLAN:\n${bb.formatPlanForPrompt()}`);
 
+  // Current page state — if available, Executor should NOT call observe_page redundantly
+  const snapshot = bb.getCurrentPageSnapshot();
+  if (snapshot) {
+    sections.push(`CURRENT PAGE STATE (already observed — do NOT call observe_page again until navigation):\n${snapshot}`);
+  }
+
   // Credential rules
   if (bb.getHasCredentials()) {
     sections.push(`CREDENTIALS:
@@ -169,7 +175,7 @@ COMMANDS AVAILABLE:
 - report_blocked(reason) — signal blocked (CAPTCHA, 2FA, etc.)
 
 EXECUTION RULES:
-1. Start with observe_page to see the current page
+1. If CURRENT PAGE STATE is already provided above, DO NOT call observe_page — you already have the page state. Only call observe_page after navigation/submit or when refs are stale.
 2. Follow the plan steps in order
 3. Plan steps may include element refs like [e1]. Use these refs directly when available. If a ref is stale (element not found), infer from the description and call observe_page to get fresh refs.
 4. You CAN call MULTIPLE commands in one response (batch fill + click together)

@@ -2168,10 +2168,12 @@ export class SnapshotCollector {
     if (snapshot.pageStructure) {
       const ps = snapshot.pageStructure;
       for (const t of ps.tables) {
-        lines.push(`TABLE: ref=${t.ref} rows=${t.rowCount} cols=${t.columnCount}${t.isSortable ? ' [SORTABLE]' : ''}${t.hasPagination ? ' [PAGINATED]' : ''}${t.hasCheckboxes ? ' [SELECTABLE]' : ''} headers=[${t.headers.join(', ')}]`);
+        // NOTE: Table/list refs (t0, l0) are structural metadata — NOT interactive element refs.
+        // Do NOT expose them as ref=... to avoid LLM hallucinating them as targetRef values.
+        lines.push(`TABLE (structural): rows=${t.rowCount} cols=${t.columnCount}${t.isSortable ? ' [SORTABLE]' : ''}${t.hasPagination ? ' [PAGINATED]' : ''}${t.hasCheckboxes ? ' [SELECTABLE]' : ''} headers=[${t.headers.join(', ')}]`);
       }
       for (const l of ps.lists) {
-        lines.push(`LIST: ref=${l.ref} items=${l.itemCount}${l.isVirtualized ? ' [VIRTUAL]' : ''}${l.hasLoadMore ? ' [HAS_LOAD_MORE]' : ''}`);
+        lines.push(`LIST (structural): items=${l.itemCount}${l.isVirtualized ? ' [VIRTUAL]' : ''}${l.hasLoadMore ? ' [HAS_LOAD_MORE]' : ''}`);
       }
       if (ps.pagination) {
         lines.push(`PAGINATION: page=${ps.pagination.currentPage || '?'}/${ps.pagination.totalPages || '?'} nextRef=${ps.pagination.nextRef || 'none'} prevRef=${ps.pagination.prevRef || 'none'}`);

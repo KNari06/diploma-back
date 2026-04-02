@@ -496,10 +496,15 @@ export class ReviewerAgent {
         return ReviewerAgent.safeDefault(blackboard);
       }
 
-      // Parse response
+      // Parse response — extract first balanced JSON object to handle LLM trailing text
       const content = result.content?.trim() || '';
       const cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '');
-      const parsed = JSON.parse(cleaned);
+      const jsonStr = extractBalancedJson(cleaned);
+      if (!jsonStr) {
+        logger.warn('[REVIEWER] No valid JSON object found in AI response');
+        return ReviewerAgent.safeDefault(blackboard);
+      }
+      const parsed = JSON.parse(jsonStr);
 
       // Validate verdict.
       // IMPORTANT: AI reviewer is NOT allowed to return 'done' — only the Executor's
@@ -605,4 +610,23 @@ export class ReviewerAgent {
       });
     } catch { /* never break agent for trace failures */ }
   }
+}
+
+/** Extract first balanced JSON object from text (handles LLM trailing text). */
+function extractBalancedJson(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return null;
 }

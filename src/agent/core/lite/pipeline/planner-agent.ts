@@ -99,7 +99,18 @@ export class PlannerAgent {
         tokensUsed: result.usage?.totalTokens,
       });
 
-      const parsed = JSON.parse(cleaned);
+      // Extract first balanced JSON object — LLM sometimes appends text after closing '}'
+      const jsonStr = extractBalancedJson(cleaned);
+      if (!jsonStr) {
+        logger.warn('[PLANNER] No valid JSON object found in response');
+        PlannerAgent.trace(traceWriter, 'planner_error', {
+          round,
+          error: 'No JSON object found in response',
+          latencyMs: Date.now() - llmStart,
+        });
+        return PlannerAgent.buildDefaultPlan(blackboard);
+      }
+      const parsed = JSON.parse(jsonStr);
 
       // Validate plan structure
       if (!parsed.summary || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
@@ -181,4 +192,28 @@ export class PlannerAgent {
       ],
     };
   }
+}
+
+/**
+ * Extract the first balanced JSON object from a string.
+ * Handles LLM responses that append text after the closing '}'.
+ */
+function extractBalancedJson(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
+  }
+  return null; // Unbalanced
 }
