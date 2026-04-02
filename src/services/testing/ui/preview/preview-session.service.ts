@@ -248,11 +248,14 @@ interface InternalSession extends PreviewSession {
     emittedAt: number;
   } | null;
   /** V11: Last hover position — for recording hover steps before click on different element */
+  /** V18: Extended with full ProbedElement from hover probe for click reuse */
   recordingLastHover: {
     x: number;
     y: number;
     ref?: string;
     timestamp: number;
+    /** V18: Full probe result from hover — reused by click to avoid double-probe divergence */
+    probedElement?: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement | null;
   } | null;
 
   /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
@@ -1453,6 +1456,85 @@ export class PreviewSessionService {
         error: error instanceof Error ? error.message : String(error),
       });
       return {};
+    }
+  }
+
+  /**
+   * Probe the nearest interactive element at (x, y) for hover highlighting.
+   * Reuses RecordingCaptureService.probeForRecording() which already has the
+   * 5-priority interactive element detection (nativeTag → ariaRole → behavioral → cssClass → cursorPointer).
+   *
+   * Returns null when:
+   * - No element at point
+   * - Element resolved via 'directHit' (not interactive — plain div/text)
+   * - Element is inside a cross-origin iframe
+   */
+  async probeInteractiveElementAt(params: {
+    sessionId: string;
+    userId: string;
+    x: number;
+    y: number;
+  }): Promise<{
+    tag: string;
+    label: string;
+    boundingBox: { x: number; y: number; width: number; height: number };
+    resolvedVia: string;
+  } | null> {
+    const { sessionId, userId, x, y } = params;
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return null;
+
+    try {
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+      const viewport = session.page.viewportSize();
+      if (!viewport) return null;
+
+      const clampedX = Math.max(0, Math.min(x, viewport.width - 1));
+      const clampedY = Math.max(0, Math.min(y, viewport.height - 1));
+
+      const { RecordingCaptureService } = await import(
+        '@/services/testing/ui/preview/recording-capture.service'
+      );
+      const probed = await RecordingCaptureService.probeForRecording(session.page, clampedX, clampedY);
+
+      // V18: Cache full probe result for click handler reuse.
+      // Guard: only store if recordingLastHover coords are close to this probe's input coords
+      // (another mouse:move may have overwritten lastHover while probe was in-flight).
+      // Use raw x,y (pre-clamp) for comparison since that's what handler stores.
+      if (session.recordingLastHover
+        && Math.abs(session.recordingLastHover.x - x) <= 1
+        && Math.abs(session.recordingLastHover.y - y) <= 1) {
+        session.recordingLastHover.probedElement = probed;
+      }
+
+      if (!probed) return null;
+      if (probed.crossOriginIframe) return null;
+      // directHit = no interactive element found — don't highlight plain divs
+      if (probed.resolvedVia === 'directHit') return null;
+      if (!probed.boundingBox) return null;
+
+      const label = (
+        probed.ariaLabel
+        || probed.labelText
+        || probed.text
+        || probed.placeholder
+        || probed.role
+        || probed.tag
+      )?.slice(0, 40) || probed.tag;
+
+      return {
+        tag: probed.tag,
+        label,
+        boundingBox: probed.boundingBox,
+        resolvedVia: probed.resolvedVia || 'unknown',
+      };
+    } catch (error) {
+      logger.debug('[PREVIEW_SESSION] probeInteractiveElementAt failed', {
+        sessionId, x, y,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
     }
   }
 

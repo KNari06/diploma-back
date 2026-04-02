@@ -142,7 +142,7 @@ const PROBE_AT_POINT_FN = `
     'combobox', 'slider', 'spinbutton', 'treeitem', 'gridcell',
     'searchbox', 'textbox'
   ];
-  var FRAMEWORK_ATTRS = ['ng-click', 'v-on:click', 'x-on:click'];
+  var FRAMEWORK_ATTRS = ['ng-click', 'v-on:click', 'x-on:click', 'on:click'];
   var BTN_CLASS_RE = /\\b(btn|button|clickable|toggle-btn|action-btn)\\b/i;
 
   var chain = [];
@@ -154,18 +154,39 @@ const PROBE_AT_POINT_FN = `
     var hasTabindex = walk.hasAttribute('tabindex') && walk.getAttribute('tabindex') !== '-1';
     var hasOnclick = walk.hasAttribute('onclick');
     var hasDraggable = walk.getAttribute('draggable') === 'true';
-    // Check (click) — Angular binding: attribute name starts with "(click"
-    var hasAngularClick = false;
+    // V18: contenteditable detection
+    var isContentEditable = walk.getAttribute('contenteditable') === 'true'
+      || walk.getAttribute('contenteditable') === '';
+    // Check (click) — Angular/Vue/Svelte/Alpine bindings
+    var hasFrameworkClick = false;
+    // V18: React onClick detection via __reactProps$ (React attaches props to DOM nodes)
+    var hasReactClick = false;
     try {
       var attrs = walk.attributes;
       for (var ai = 0; ai < attrs.length; ai++) {
         var aname = attrs[ai].name;
         if (aname === '(click)' || aname.indexOf('@click') === 0 || FRAMEWORK_ATTRS.indexOf(aname) !== -1) {
-          hasAngularClick = true;
+          hasFrameworkClick = true;
           break;
         }
       }
     } catch(e) {}
+    // V18: React synthetic event detection — check __reactProps$ for onClick handler.
+    // React attaches __reactProps$<hash> to DOM nodes with component props including event handlers.
+    if (!hasFrameworkClick && !hasOnclick) {
+      try {
+        var ownKeys = Object.keys(walk);
+        for (var ki = 0; ki < ownKeys.length; ki++) {
+          if (ownKeys[ki].indexOf('__reactProps$') === 0) {
+            var rp = walk[ownKeys[ki]];
+            if (rp && (typeof rp.onClick === 'function' || typeof rp.onClickCapture === 'function')) {
+              hasReactClick = true;
+            }
+            break; // Only one __reactProps$ key per element
+          }
+        }
+      } catch(e) {}
+    }
 
     chain.push({
       el: walk,
@@ -174,8 +195,10 @@ const PROBE_AT_POINT_FN = `
       className: wclass,
       hasTabindex: hasTabindex,
       hasOnclick: hasOnclick,
-      hasFrameworkBinding: hasAngularClick,
+      hasFrameworkBinding: hasFrameworkClick,
+      hasReactClick: hasReactClick,
       hasDraggable: hasDraggable,
+      isContentEditable: isContentEditable,
       text: (walk.textContent || '').trim().slice(0, 80),
       ariaLabel: walk.getAttribute('aria-label') || ''
     });
@@ -201,14 +224,14 @@ const PROBE_AT_POINT_FN = `
       resolvedVia = 'ariaRole';
       break;
     }
-    // Priority 3: Behavioral (tabindex, onclick, framework bindings)
-    if (node.hasTabindex || node.hasOnclick || node.hasFrameworkBinding) {
+    // Priority 3: Behavioral (tabindex, onclick, framework bindings, React onClick)
+    if (node.hasTabindex || node.hasOnclick || node.hasFrameworkBinding || node.hasReactClick) {
       target = node.el;
       resolvedVia = 'behavioral';
       break;
     }
-    // Priority 3.5: draggable
-    if (node.hasDraggable) {
+    // Priority 3.5: draggable or contenteditable
+    if (node.hasDraggable || node.isContentEditable) {
       target = node.el;
       resolvedVia = 'behavioral';
       break;
