@@ -763,9 +763,9 @@ router.get('/users/pending', requireAuth, requireAdmin, asyncHandler(getPendingU
 router.patch('/users/:userId/status', requireAuth, requireAdmin, asyncHandler(updateUserStatus));
 
 /**
- * Send approval notification email
+ * Send approval notification email (admin only)
  * Body: { email: string, name?: string }
  */
-router.post('/send-approval-email', requireAuth, asyncHandler(sendApprovalEmailHandler));
+router.post('/send-approval-email', requireAuth, requireAdmin, asyncHandler(sendApprovalEmailHandler));
 
 export default router;

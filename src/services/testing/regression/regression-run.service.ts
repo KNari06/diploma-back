@@ -2401,9 +2401,8 @@ export class RegressionRunService {
     // V14: Compute real flaky count and classification breakdown from AI analysis
     const byClassification: Record<string, number> = {};
     for (const re of reportExecutions) {
-      const fc = (re as any).failureClassification;
-      if (fc) {
-        byClassification[fc] = (byClassification[fc] || 0) + 1;
+      if (re.failureClassification) {
+        byClassification[re.failureClassification] = (byClassification[re.failureClassification] || 0) + 1;
       }
     }
 

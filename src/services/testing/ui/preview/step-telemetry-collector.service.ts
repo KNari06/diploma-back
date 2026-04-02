@@ -163,6 +163,9 @@ export class StepTelemetryCollector {
       attempts?: number;
     },
   ): void {
+    // Guard: skip if markStepStart was never called for this step
+    if (this.stepStartTimestamp === 0) return;
+
     const now = Date.now();
     const since = this.stepStartTimestamp;
 
@@ -206,6 +209,9 @@ export class StepTelemetryCollector {
     };
 
     this.entries.push(entry);
+
+    // Reset watermark to prevent duplicate entries on accidental double-call
+    this.stepStartTimestamp = 0;
   }
 
   /**

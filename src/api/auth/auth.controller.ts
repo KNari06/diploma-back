@@ -690,9 +690,36 @@ export const sendApprovalEmailHandler = async (req: Request, res: Response): Pro
       return;
     }
 
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      res.status(400).json({ success: false, error: 'Invalid email format' });
+      return;
+    }
+
+    // Verify user exists and is in approved status (only send to approved users)
+    const { data: user, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('id, status, email')
+      .eq('email', email)
+      .single();
+
+    if (userError || !user) {
+      res.status(404).json({ success: false, error: 'User not found' });
+      return;
+    }
+
+    if (user.status !== 'approved') {
+      res.status(400).json({
+        success: false,
+        error: `Cannot send approval email: user status is "${user.status}"`,
+      });
+      return;
+    }
+
     EmailService.sendApprovalEmail({
       recipientEmail: email,
-      recipientName: name,
+      recipientName: name || undefined,
       frontendUrl: env.FRONTEND_URL,
     }).catch((err) =>
       logger.error('[AUTH] Failed to send approval email', {

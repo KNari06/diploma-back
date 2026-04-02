@@ -807,7 +807,7 @@ export class PreviewRunService {
 
         try {
           // V14: Record step start for telemetry
-          telemetryCollector.markStepStart(i, step.id, step.type, step.description || '', session.page.url());
+          telemetryCollector?.markStepStart(i, step.id, step.type, step.description || '', session.page.url());
 
           const stepStartMs = Date.now();
           let result = await raceAbort(PreviewStepApplyService.applyStep({
@@ -948,7 +948,7 @@ export class PreviewRunService {
             passedSteps++;
 
             // V14: Record step telemetry (pass)
-            telemetryCollector.markStepEnd('pass', session.page.url(), {
+            telemetryCollector?.markStepEnd('pass', session.page.url(), {
               retried,
               attempts: result.attempts,
             });
@@ -1098,7 +1098,7 @@ export class PreviewRunService {
             failedSteps++;
 
             // V14: Record step telemetry (fail)
-            telemetryCollector.markStepEnd('fail', session.page.url(), {
+            telemetryCollector?.markStepEnd('fail', session.page.url(), {
               error: result.error,
               retried,
               attempts: result.attempts,
@@ -1373,7 +1373,7 @@ export class PreviewRunService {
 
           // V14: Record step telemetry (exception)
           try {
-            telemetryCollector.markStepEnd('fail', session.page.url(), {
+            telemetryCollector?.markStepEnd('fail', session.page.url(), {
               error: originalError,
               retried: exceptionRetried,
             });
