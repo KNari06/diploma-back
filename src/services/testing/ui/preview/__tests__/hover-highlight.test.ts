@@ -296,16 +296,34 @@ describe('Recording step creation (no regression)', () => {
     expect(step?.description).toBe('Press Shift+Enter');
   });
 
-  it('flushTypingBuffer creates type step', () => {
+  it('flushTypingBuffer creates type step with evidence.pageUrl always set', () => {
     const step = RecordingCaptureService.flushTypingBuffer({
       text: 'hello@email.com',
       elementLabel: 'Email',
       lastCharAt: Date.now(),
+      pageUrl: 'https://example.com/login',
     });
     expect(step?.type).toBe('type');
     expect(step?.value).toBe('hello@email.com');
     expect(step?.description).toContain('hello@email.com');
     expect(step?.description).toContain('Email');
+    // V18: evidence.pageUrl must always exist for auto-inject wait_for to work
+    expect(step?.evidence?.pageUrl).toBe('https://example.com/login');
+    expect(step?.evidence?.confidence).toBe(1.0);
+  });
+
+  it('flushTypingBuffer creates evidence even without elementRef', () => {
+    // No ref — evidence should still have pageUrl
+    const step = RecordingCaptureService.flushTypingBuffer({
+      text: 'test',
+      elementLabel: 'input',
+      lastCharAt: Date.now(),
+      pageUrl: 'https://example.com',
+      // elementRef intentionally missing
+    });
+    expect(step?.evidence).toBeDefined();
+    expect(step?.evidence?.pageUrl).toBe('https://example.com');
+    expect(step?.evidence?.lastSuccessRef).toBeUndefined();
   });
 
   it('flushTypingBuffer with Enter merges into pressEnter option', () => {

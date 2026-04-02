@@ -22,7 +22,7 @@ import type {
     UrlMatcher,
 } from './preview.types';
 
-import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
@@ -1115,7 +1115,7 @@ async function executeAction(
         // waitForNavigation to reliably capture the navigation event.
         if (options?.expectsNavigation) {
           await Promise.all([
-            page.waitForNavigation({ waitUntil: 'load', timeout: 15000 }).catch(() => {}),
+            page.waitForNavigation({ waitUntil: 'load', timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs }).catch(() => {}),
             locator.click(clickOpts),
           ]);
         } else {
@@ -1130,7 +1130,7 @@ async function executeAction(
             logger.info('[EXECUTE_ACTION] New tab detected after click, waiting for load', {
               pagesAfter: page.context().pages().length,
             });
-            await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+            await newPage.waitForLoadState('domcontentloaded', { timeout: COMMAND_EXECUTOR_CONFIG.newPageFallbackTimeoutMs }).catch(() => {});
           }
         }
         break;
@@ -1567,6 +1567,16 @@ export class PreviewStepApplyService {
           await new Promise(r => setTimeout(r, 500)); // 500ms × 10 = 5s max wait
         }
 
+        // V18: Lightweight settle after switch — just domcontentloaded (fast).
+        // Full readiness (loading indicators, DOM stable, element visible) is handled
+        // by the lookahead system in preview-run loop, which now runs after switch_tab.
+        if (switched) {
+          const newPage = sessionService.getPage(previewSessionId, userId);
+          if (newPage) {
+            try { await newPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
+          }
+        }
+
         return {
           success: switched,
           error: switched ? undefined : `Tab ${targetTab} not available after waiting`,
@@ -1592,6 +1602,12 @@ export class PreviewStepApplyService {
             url: session.page?.url() || '',
             attempts: 0,
           };
+        }
+        // V18: Lightweight settle after auto-switch — just domcontentloaded.
+        // Full readiness handled by lookahead (which now runs after switch_tab).
+        const switchedPage = sessionService.getPage(previewSessionId, userId);
+        if (switchedPage) {
+          try { await switchedPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
         }
       }
 

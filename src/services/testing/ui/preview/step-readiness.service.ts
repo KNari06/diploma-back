@@ -1205,12 +1205,29 @@ export async function waitForStepReadiness(
 }
 
 /**
+ * Actions after which lookahead should be SKIPPED for the next step.
+ * Separated from NON_TARGETING_ACTIONS (used for "skip readiness check FOR this step type").
+ *
+ * V18: switch_tab intentionally NOT here — it changes the active page context,
+ * so the next step needs full readiness checking (loading indicators, DOM stable,
+ * element visible/enabled) on the new tab's page. Without this, steps after
+ * switch_tab fail with element_not_found because the popup page hasn't loaded yet.
+ */
+const SKIP_LOOKAHEAD_AFTER: Set<IntentActionType> = new Set([
+  'wait',
+  'wait_for',
+  'ai_check',
+  'wait_for_email',
+  'dialog',
+  'download',
+]);
+
+/**
  * Check if lookahead should be skipped based on previous step type.
- * Only truly non-targeting actions (navigate/wait/wait_for/ai_check) skip lookahead.
- * Navigation-trigger actions (click/open/close) now go through SPA detection instead.
+ * switch_tab is NOT skipped — the next step needs readiness checks on the new page.
  *
  * @param prevStepType - The type of the previous step
  */
 export function shouldSkipLookaheadAfter(prevStepType: IntentActionType): boolean {
-  return NON_TARGETING_ACTIONS.has(prevStepType);
+  return SKIP_LOOKAHEAD_AFTER.has(prevStepType);
 }

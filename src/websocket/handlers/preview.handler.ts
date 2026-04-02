@@ -1535,11 +1535,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }),
                   ...(iframeSel && { iframe: { selector: iframeSel } }),
                 },
-                evidence: preClickElement!.ref ? {
-                  lastSuccessRef: preClickElement!.ref,
+                evidence: {
+                  ...(preClickElement!.ref && { lastSuccessRef: preClickElement!.ref }),
                   confidence: 1.0,
                   pageUrl: currentPage?.url(),
-                } : undefined,
+                },
               };
               // Clean up empty options
               if (step.options && Object.keys(step.options).length === 0) {
@@ -1952,9 +1952,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   value: data.text,
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
                   options: { isPaste: true },
-                  ...(focusedEl?.ref && {
-                    evidence: { lastSuccessRef: focusedEl.ref, confidence: 1.0, pageUrl: page?.url() },
-                  }),
+                  evidence: {
+                    ...(focusedEl?.ref && { lastSuccessRef: focusedEl.ref }),
+                    confidence: 1.0,
+                    pageUrl: page?.url(),
+                  },
                 };
                 const room = createRoomName('preview', previewSessionId);
                 emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pasteStep });

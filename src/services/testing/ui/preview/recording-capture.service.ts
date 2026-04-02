@@ -1406,9 +1406,11 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       value: buffer.text,
       bindingHints: buffer.bindingHints as BindingHints | undefined,
       ...(Object.keys(opts).length > 0 && { options: opts }),
-      ...(buffer.elementRef && {
-        evidence: { lastSuccessRef: buffer.elementRef, confidence: 1.0, pageUrl: buffer.pageUrl },
-      }),
+      evidence: {
+        ...(buffer.elementRef && { lastSuccessRef: buffer.elementRef }),
+        confidence: 1.0,
+        pageUrl: buffer.pageUrl,
+      },
     };
   }
 
