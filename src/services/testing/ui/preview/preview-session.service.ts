@@ -455,12 +455,28 @@ export class PreviewSessionService {
       let context: BrowserContext | undefined;
       let page: Page | undefined;
 
+      const sessionStartTime = Date.now();
+
+      /** Emit real-time progress to user room (client is authenticated but not yet subscribed to preview room). */
+      const emitProgress = (stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready', progress: number) => {
+        webSocketService.emitToUser(userId, 'preview:session:progress', {
+          stage,
+          progress,
+          url: safeStartUrl,
+          elapsedMs: Date.now() - sessionStartTime,
+        });
+      };
+
       try {
-        // Launch browser
+        // Stage 1: Launch browser
+        emitProgress('launching_browser', 10);
+
         browser = await chromium.launch({
           headless: BROWSER_HEADLESS_MODE,
           args: [...BROWSER_LAUNCH_ARGS],
         });
+
+        emitProgress('launching_browser', 25);
 
         context = await browser.newContext({
           viewport: viewport ?? PREVIEW_SESSION_CONFIG.viewport,
@@ -483,21 +499,25 @@ export class PreviewSessionService {
           // Non-fatal: preview should work without blocker
         }
 
+        // Stage 2: Load page
+        emitProgress('loading_page', 40);
+
         // Navigate to start URL (with progress events for slow sites)
-        // NOTE: Client hasn't joined WebSocket room yet at this point, so progress events
-        // during initial load are best-effort (lost if no subscriber). This is acceptable
-        // because frontend shows its own HTTP loading spinner. Progress events are mainly
-        // useful for navigate steps during runtime when client IS subscribed.
         await navigateWithProgress(page, safeStartUrl, sessionId, {
           waitUntil: 'domcontentloaded',
           timeout: 30000,
         });
+
+        emitProgress('loading_page', 60);
 
         // Wait for DOM to stabilize (SPA hydration / API-driven renders).
         // domcontentloaded fires when HTML is parsed, but SPAs render async.
         // Instead of networkidle (waits for images/fonts/analytics — irrelevant for element finding),
         // use a DOM stability check: no mutations for 800ms → DOM is ready for snapshot.
         await waitForDOMStability(page, 3000, 800);
+
+        // Stage 3: Extract elements
+        emitProgress('extracting_elements', 75);
 
         // Collect initial snapshot (skip stability wait — already done above via waitForDOMStability)
         const snapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
@@ -572,6 +592,9 @@ export class PreviewSessionService {
           url: page.url(),
           nodeCount: domAnalysis.interactiveNodes.length,
         });
+
+        // Stage 4: Ready
+        emitProgress('ready', 100);
 
         return {
           previewSessionId: sessionId,
