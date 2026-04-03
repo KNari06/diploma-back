@@ -1532,9 +1532,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             if (tag === 'input' || tag === 'textarea') {
               const key = (e.target.getAttribute('data-agent-ref') || e.target.name || e.target.id || '');
               if (key) recentKeyboardInputs.add(key);
-              // Clear after 500ms
+              // Clear after 2000ms — must exceed typing debounce (1500ms) to prevent
+              // browser 'change' events from being misclassified as autofill
               if (clearTimer) clearTimeout(clearTimer);
-              clearTimer = setTimeout(() => recentKeyboardInputs.clear(), 500);
+              clearTimer = setTimeout(() => recentKeyboardInputs.clear(), 2000);
             }
           }
         };

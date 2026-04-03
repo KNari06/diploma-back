@@ -24,6 +24,7 @@ import type {
 
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
+import { normalizeUrlForComparison } from './auto-wait-for.utils';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
@@ -1704,11 +1705,31 @@ export class PreviewStepApplyService {
         // V5.1: timeout is now primary (required from frontend), urlMatcher.timeoutMs is fallback
         const timeoutMs = stepDraft.options?.timeout ?? matcher?.timeoutMs ?? 15000;
 
-        // V13: changedFrom uses recording-time URL which may differ from runtime.
-        // Replace with current page URL so "wait until URL changes" works at runtime.
-        const runtimeMatcher = matcher?.changedFrom
-          ? { ...matcher, changedFrom: page.url() }
-          : matcher;
+        // V13 fix: changedFrom holds the URL from before navigation (recording-time).
+        // If the current URL already differs from changedFrom, navigation already happened
+        // (e.g. previous click used expectsNavigation=true) — skip the wait entirely.
+        // Only replace changedFrom with current URL when they still match (navigation pending).
+        let runtimeMatcher = matcher;
+        if (matcher?.changedFrom) {
+          const currentUrl = page.url();
+          if (normalizeUrlForComparison(currentUrl) !== normalizeUrlForComparison(matcher.changedFrom)) {
+            // URL already changed — navigation happened, skip wait
+            logger.info('[PREVIEW_APPLY] wait_for: URL already changed, skipping wait', {
+              previewSessionId,
+              changedFrom: matcher.changedFrom,
+              currentUrl,
+            });
+            return {
+              success: true,
+              appliedStep: stepDraft,
+              urlChanged: true,
+              url: currentUrl,
+              attempts: 1,
+            };
+          }
+          // URL hasn't changed yet — replace changedFrom with current URL for runtime
+          runtimeMatcher = { ...matcher, changedFrom: currentUrl };
+        }
 
         logger.info('[PREVIEW_APPLY] Handling wait_for', {
           previewSessionId,

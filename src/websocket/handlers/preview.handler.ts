@@ -3511,6 +3511,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
               if (buffer && buffer.elementRef === data.ref) return;
 
+              // Skip if a type step was just emitted for this element (buffer already flushed,
+              // but browser 'change' event fires after debounce — not real autofill)
+              const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
+              if (lastTypeStep && lastTypeStep.elementRef === data.ref && lastTypeStep.value === data.value) return;
+
               const autoPage = sessionService.getPage(previewSessionId, ensuredUserId);
               const step: PreviewIntentStep = {
                 id: `rec_${Date.now().toString(36)}`,
