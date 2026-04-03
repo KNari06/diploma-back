@@ -190,6 +190,14 @@ export interface ServerToClientEvents {
     error?: string;
   }) => void;
 
+  // Preview session startup progress (emitted to user room — client not yet subscribed to preview room)
+  'preview:session:progress': (data: {
+    stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready';
+    progress: number;     // 0-100
+    url?: string;
+    elapsedMs: number;
+  }) => void;
+
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;
