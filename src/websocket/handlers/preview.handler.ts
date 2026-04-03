@@ -47,6 +47,9 @@ const hoverProbeState = new Map<string, {
   lastElementKey: string | null;
   probeInFlight: boolean;
   pageUrl: string | null; // Guards against stale probe after navigation
+  /** Latest mouse coordinates — updated on every mouse:move, used by next probe */
+  latestX: number;
+  latestY: number;
 }>();
 const HOVER_PROBE_THROTTLE_MS = 200;
 
@@ -1271,9 +1274,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const hKey = `${socket.id}:${previewSessionId}`;
         let hState = hoverProbeState.get(hKey);
         if (!hState) {
-          hState = { lastProbeAt: 0, lastElementKey: null, probeInFlight: false, pageUrl: null };
+          hState = { lastProbeAt: 0, lastElementKey: null, probeInFlight: false, pageUrl: null, latestX: x, latestY: y };
           hoverProbeState.set(hKey, hState);
         }
+        // Always update latest coords — probe will use freshest position when it starts
+        hState.latestX = x;
+        hState.latestY = y;
         if (!hState.probeInFlight && now - hState.lastProbeAt >= HOVER_PROBE_THROTTLE_MS) {
           hState.probeInFlight = true;
           hState.lastProbeAt = now;
@@ -1298,10 +1304,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 return;
               }
 
+              // Use latest coords (not closure coords) — cursor may have moved during throttle window
+              const probeX = hStateRef.latestX;
+              const probeY = hStateRef.latestY;
+
               const el = await sessionService.probeInteractiveElementAt({
                 sessionId: previewSessionId,
                 userId: ensuredUserId,
-                x, y,
+                x: probeX, y: probeY,
               });
 
               // Fix #6: Discard result if page navigated during probe
@@ -3510,6 +3520,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // Skip if there's an active typing buffer for this element (user is typing, not autofill)
               const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
               if (buffer && buffer.elementRef === data.ref) return;
+
+              // Skip if a type step was just emitted for this element (buffer already flushed,
+              // but browser 'change' event fires after debounce — not real autofill)
+              const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
+              if (lastTypeStep && lastTypeStep.elementRef === data.ref && lastTypeStep.value === data.value) return;
 
               const autoPage = sessionService.getPage(previewSessionId, ensuredUserId);
               const step: PreviewIntentStep = {

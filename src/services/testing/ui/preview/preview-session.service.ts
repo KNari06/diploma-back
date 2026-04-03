@@ -807,13 +807,15 @@ export class PreviewSessionService {
         timeout: 10000,
       });
 
-      // goBack returns null if there's no history to go back to
-      if (!response) {
+      const newUrl = session.page.url();
+
+      // goBack returns null both when there's no history AND for SPA navigations
+      // (pushState/replaceState don't produce network responses).
+      // Check URL change to distinguish: if URL changed, back worked (SPA case).
+      if (!response && newUrl === previousUrl) {
         logger.debug('[PREVIEW_SESSION] No history to go back', { sessionId });
         return null;
       }
-
-      const newUrl = session.page.url();
       logPerformance('preview.goBack', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl });
 
       // Kick off snapshot collection without blocking — caller gets result immediately
@@ -868,12 +870,14 @@ export class PreviewSessionService {
         timeout: 10000,
       });
 
-      if (!response) {
+      const newUrl = session.page.url();
+
+      // goForward returns null both when no forward history AND for SPA navigations.
+      // Check URL change to distinguish: if URL changed, forward worked (SPA case).
+      if (!response && newUrl === previousUrl) {
         logger.debug('[PREVIEW_SESSION] No history to go forward', { sessionId });
         return null;
       }
-
-      const newUrl = session.page.url();
       logPerformance('preview.goForward', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl });
 
       // Kick off snapshot collection without blocking — caller gets result immediately
