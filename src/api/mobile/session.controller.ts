@@ -17,6 +17,7 @@ import { MobileRunnerClient, getMobileRunnerClient } from '@/services/mobile/mob
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { ProjectService } from '@/services/core/project.service';
+import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -622,9 +623,32 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     };
     const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
 
+    // Trace logging for mobile editor
+    const traceSessionId = `mobile-${sessionId}`;
+    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user.id);
+    trace.writeMobileLintRequest({ description, actionType, sessionId });
+    const lintStart = Date.now();
+
     // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
     // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
     const lintResult = await client.lintElement(sessionId, description, actionType);
+
+    // Log the result for debugging element resolution issues
+    trace.writeMobileLintResult({
+      description,
+      actionType,
+      sessionId,
+      latencyMs: Date.now() - lintStart,
+      result: {
+        status: lintResult.status,
+        confidence: lintResult.confidence,
+        resolvedVia: lintResult.resolvedVia,
+        elementText: lintResult.elementText,
+        elementType: lintResult.elementType,
+        boundingBox: lintResult.boundingBox,
+        message: lintResult.message,
+      },
+    });
 
     // Map to frontend-compatible response with highlight data
     const highlight = lintResult.boundingBox && lintResult.screenSize

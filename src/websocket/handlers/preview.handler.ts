@@ -1289,6 +1289,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           // Pre-resolve import outside setImmediate to reduce async overhead in hot path
           const runServicePromise = import('@/services/testing/ui/preview/preview-run.service');
           setImmediate(async () => {
+            const probeStartMs = Date.now();
+            const hTrace = EditorTraceService.get(previewSessionId);
             try {
               // Fix #7: Skip probe during active preview run
               const { PreviewRunService } = await runServicePromise;
@@ -1301,6 +1303,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     previewSessionId, element: null, timestamp: new Date().toISOString(),
                   });
                 }
+                hTrace?.writeHoverProbe({ x: hStateRef.latestX, y: hStateRef.latestY, latencyMs: Date.now() - probeStartMs, result: null, skipped: 'run_active' });
                 return;
               }
 
@@ -1314,18 +1317,30 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 x: probeX, y: probeY,
               });
 
+              const probeLatencyMs = Date.now() - probeStartMs;
+
               // Fix #6: Discard result if page navigated during probe
               const postProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
               if (preProbeUrl && postProbeUrl && preProbeUrl !== postProbeUrl) {
                 hStateRef.lastElementKey = null;
+                hTrace?.writeHoverProbe({ x: probeX, y: probeY, latencyMs: probeLatencyMs, result: null, skipped: 'page_navigated' });
                 return;
               }
+
+              hTrace?.writeHoverProbe({
+                x: probeX, y: probeY,
+                originalX: x, originalY: y,
+                latencyMs: probeLatencyMs,
+                result: el ? { tag: el.tag, label: el.label, resolvedVia: el.resolvedVia } : null,
+                skipped: el ? undefined : 'no_interactive_element',
+              });
 
               const elKey = el
                 ? `${el.tag}:${el.boundingBox.x}:${el.boundingBox.y}:${el.boundingBox.width}:${el.boundingBox.height}`
                 : null;
               // Dedup: only emit when element changes
-              if (elKey !== hStateRef.lastElementKey) {
+              const deduped = elKey === hStateRef.lastElementKey;
+              if (!deduped) {
                 hStateRef.lastElementKey = elKey;
                 const room = createRoomName('preview', previewSessionId);
                 socket.nsp.to(room).emit('preview:element:hover' as any, {
@@ -1333,6 +1348,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   element: el,
                   timestamp: new Date().toISOString(),
                 });
+                hTrace?.writeHoverEmit({ element: el, deduped: false, room });
+              } else {
+                hTrace?.writeHoverEmit({ element: el, deduped: true });
               }
             } catch { /* non-critical — don't break hover */ }
             finally { // Fix #3: Always reset probeInFlight
