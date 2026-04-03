@@ -13,7 +13,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
-import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
+import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 
 const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
 const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
@@ -458,14 +458,18 @@ export class PreviewSessionService {
       try {
         // Launch browser
         browser = await chromium.launch({
-          headless: true,
-          args: ['--no-sandbox', '--disable-setuid-sandbox'],
+          headless: BROWSER_HEADLESS_MODE,
+          args: [...BROWSER_LAUNCH_ARGS],
         });
 
         context = await browser.newContext({
           viewport: viewport ?? PREVIEW_SESSION_CONFIG.viewport,
-          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          userAgent: BROWSER_USER_AGENT,
+          extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
         });
+
+        // Apply stealth patches (hides headless/automation markers)
+        await context.addInitScript(BROWSER_STEALTH_SCRIPT);
 
         page = await context.newPage();
 
@@ -636,9 +640,11 @@ export class PreviewSessionService {
       // 3) Close old resources after swap.
       newContext = await browser.newContext({
         viewport: PREVIEW_SESSION_CONFIG.viewport,
-        userAgent:
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        userAgent: BROWSER_USER_AGENT,
+        extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
       });
+
+      await newContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
       newPage = await newContext.newPage();
 

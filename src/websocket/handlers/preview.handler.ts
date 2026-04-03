@@ -48,7 +48,7 @@ const hoverProbeState = new Map<string, {
   probeInFlight: boolean;
   pageUrl: string | null; // Guards against stale probe after navigation
 }>();
-const HOVER_PROBE_THROTTLE_MS = 100;
+const HOVER_PROBE_THROTTLE_MS = 200;
 
 /** Per-session scroll debounce timers */
 const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout }>();
@@ -348,6 +348,16 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
         return;
       }
       try {
+        // Skip snapshot collection during run mode — run loop manages its own state,
+        // frontend only uses preview:run:step events, and video stream is independent.
+        // Avoids page.evaluate() contention with step apply/readiness checks.
+        try {
+          const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+          if (PreviewRunService.isRunning(previewSessionId)) {
+            return;
+          }
+        } catch { /* non-critical — continue with snapshot if import fails */ }
+
         const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
           onlyIfChanged: true, // Only return full data if changed
         });

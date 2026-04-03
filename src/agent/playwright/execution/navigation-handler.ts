@@ -11,25 +11,8 @@ export async function navigateToUrl(
   testData: TestJobData,
   requestTracker: RequestTracker
 ): Promise<void> {
-  // ✅ FIX: Hide webdriver property to avoid bot detection
-  await page.addInitScript(() => {
-    // @ts-expect-error - browser context
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => false,
-    });
-    // @ts-expect-error - browser context
-    window.chrome = {
-      runtime: {},
-    };
-    // @ts-expect-error - browser context
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => [1, 2, 3, 4, 5],
-    });
-    // @ts-expect-error - browser context
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['en-US', 'en'],
-    });
-  });
+  // Stealth script is now applied at context level via setupBrowserContext / applyStealthScript.
+  // No per-page injection needed — context.addInitScript auto-applies to all pages.
 
   logger.info('[PLAYWRIGHT] Starting navigation', {
     testId: testData.testId,

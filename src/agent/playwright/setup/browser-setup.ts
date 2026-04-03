@@ -1,5 +1,6 @@
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { BROWSER_USER_AGENT, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { getActionIcon } from '@/websocket/types/types';
 import { Browser, BrowserContext, BrowserContextOptions, devices } from 'playwright';
@@ -24,9 +25,6 @@ export async function setupBrowserContext(
   await fs.mkdir(tracesDir, { recursive: true });
 
   // Create context with options
-  // ✅ FIX: Use realistic User-Agent to avoid bot detection
-  const defaultUserAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-
   const contextOptions: BrowserContextOptions = {
     viewport: testData.options?.viewport
       ? {
@@ -34,20 +32,8 @@ export async function setupBrowserContext(
           height: testData.options.viewport.height || 1080
         }
       : { width: 1920, height: 1080 },
-    userAgent: testData.options?.headers?.['User-Agent'] || defaultUserAgent,
-    // ✅ FIX: Add extra HTTP headers to look like real browser
-    extraHTTPHeaders: {
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Connection': 'keep-alive',
-      'Upgrade-Insecure-Requests': '1',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'none',
-      'Sec-Fetch-User': '?1',
-      'Cache-Control': 'max-age=0',
-    },
+    userAgent: testData.options?.headers?.['User-Agent'] || BROWSER_USER_AGENT,
+    extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
     // Video recording (disabled for initial replay attempts to save resources)
     ...(options?.disableVideo ? {} : {
       recordVideo: {
@@ -55,11 +41,9 @@ export async function setupBrowserContext(
         size: { width: 1920, height: 1080 },
       },
     }),
-    // ✅ FIX: Set locale and timezone to look more realistic
     locale: 'en-US',
-    timezoneId: 'America/New_York',
-    // ✅ FIX: Ignore HTTPS errors (in case of SSL issues)
-    ignoreHTTPSErrors: false, // Keep false for security, but we can enable if needed
+    timezoneId: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
+    ignoreHTTPSErrors: false,
   };
 
   // Mobile emulation
@@ -78,6 +62,9 @@ export async function setupBrowserContext(
   }
 
   const context = await browser.newContext(contextOptions);
+
+  // Apply stealth patches (hides headless/automation markers from bot detectors)
+  await context.addInitScript(BROWSER_STEALTH_SCRIPT);
 
   // ✅ Start tracing (skip on initial replay attempts to save RAM)
   let tracePath: string | undefined;

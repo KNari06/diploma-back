@@ -35,6 +35,7 @@ import { logger } from '@/utils/core/logger';
 
 import type { ExplorationConfig, ExplorationResult, ExplorationProgressCallback, ExplorationProgressEvent, ExplorationCheckpoint } from './types';
 import { DEFAULT_EXPLORATION_BUDGET, DEFAULT_MAX_CONCURRENCY, DESKTOP_USER_AGENT } from './types';
+import { BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { BudgetTracker } from './budget-tracker';
 import { RateLimiter } from './rate-limiter';
 import { ExplorationTree } from './exploration-tree';
@@ -131,7 +132,9 @@ export class ExplorationEngine {
       viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true,
       userAgent: DESKTOP_USER_AGENT,
+      extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
     });
+    await surveyContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
     try {
       const surveyPage = await surveyContext.newPage();
@@ -241,7 +244,10 @@ export class ExplorationEngine {
         const targetedSurveyContext = await this.browser.newContext({
           viewport: { width: 1280, height: 720 },
           ignoreHTTPSErrors: true,
+          userAgent: DESKTOP_USER_AGENT,
+          extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
         });
+        await targetedSurveyContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
         try {
           const targetedPage = await targetedSurveyContext.newPage();
@@ -393,7 +399,10 @@ export class ExplorationEngine {
           const targetedSurveyContext = await this.browser.newContext({
             viewport: { width: 1280, height: 720 },
             ignoreHTTPSErrors: true,
+            userAgent: DESKTOP_USER_AGENT,
+            extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
           });
+          await targetedSurveyContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
           try {
             const targetedPage = await targetedSurveyContext.newPage();
