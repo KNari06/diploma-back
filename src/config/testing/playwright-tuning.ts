@@ -121,14 +121,14 @@ export const STEP_READINESS_CONFIG = {
 // ─── Element Resolver ─────────────────────────────────────────────────────────
 
 export const ELEMENT_RESOLVER_CONFIG = {
-  /** Max chars per candidate text sent to LLM (increased from 200 for V8 visual/state/iframe hints) */
-  maxCandidateTextLength: 300,
+  /** Max chars per candidate text sent to LLM (V8 visual/state/iframe hints need ~280) */
+  maxCandidateTextLength: 280,
 
   /** Max chars for intent text sent to LLM */
   maxIntentTextLength: 500,
 
-  /** Max candidates included in a single LLM selection call (primary batch) */
-  maxCandidatesForLlm: 70,
+  /** Max candidates included in a single LLM selection call (pre-scoring ensures top elements) */
+  maxCandidatesForLlm: 60,
 
   /**
    * Minimum LLM confidence to accept an element match.
@@ -148,9 +148,10 @@ export const ELEMENT_RESOLVER_CONFIG = {
 
   /** LLM result cache */
   llmCache: {
-    /** 5s TTL — prevents double-click duplicate calls but ensures fresh results on retry */
-    ttlMs: 5 * 1000,
-    maxSize: 100,
+    /** 60s TTL — safe: cache key includes pageSignature (URL + refs + content hash),
+     *  so any DOM change → different key → cache miss → fresh LLM call */
+    ttlMs: 60 * 1000,
+    maxSize: 200,
   },
 
   /**

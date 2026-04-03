@@ -1408,8 +1408,8 @@ export class PreviewRunService {
         try {
           await raceAbort(
             Promise.all([
-              waitForApiIdle(session.page, 3000),
-              waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default),
+              waitForApiIdle(session.page, 2000),
+              waitForDOMStability(session.page, 2000, STEP_READINESS_CONFIG.domStableThresholdMs.default),
             ]),
             signal,
           );
@@ -1506,6 +1506,12 @@ export class PreviewRunService {
       // V14: Get step telemetry timeline for the completed event
       const stepTelemetry = telemetryCollector?.getTimeline() || null;
 
+      // Release activeRuns BEFORE emitting completed — so user can immediately start a new run.
+      // Trace write and email cleanup happen after, but they don't need the run lock.
+      if (activeRuns.get(previewSessionId) === runState) {
+        activeRuns.delete(previewSessionId);
+      }
+
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,
         success: runSuccess,
@@ -1566,11 +1572,7 @@ export class PreviewRunService {
         }).catch((err) => logger.error('[EDITOR_TRACE] Upload failed on preview run cleanup', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
       }).catch((err) => logger.error('[EDITOR_TRACE] Import failed on preview run cleanup', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
 
-      // 10. Cleanup run state — only delete if it's still OUR run (prevents
-      // wiping a newer run's state when user quickly starts a new run after cancel)
-      if (activeRuns.get(previewSessionId) === runState) {
-        activeRuns.delete(previewSessionId);
-      }
+      // activeRuns already released above (before completed event).
     }
   }
 
