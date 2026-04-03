@@ -420,10 +420,11 @@ export class IntentStepLintService {
     });
 
     try {
-      // Get DOM nodes from preview session
+      // Get DOM nodes from preview session (fullPage: include off-viewport elements for replay)
       const sessionService = getPreviewSessionService();
       const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
-        includeDomNodes: true, // Always need domNodes for linting
+        includeDomNodes: true,
+        fullPage: true,
       });
 
       if (!snapshot) {
@@ -619,9 +620,11 @@ export class IntentStepLintService {
     }
 
     // Get snapshot (throttled at 500ms — safe because frontend debounce is 2.5s)
+    // fullPage: include elements below viewport — replay can scrollIntoView before interacting
     const sessionService = getPreviewSessionService();
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
-      includeDomNodes: true, // Always need domNodes for linting
+      includeDomNodes: true,
+      fullPage: true,
     });
 
     if (!snapshot) {

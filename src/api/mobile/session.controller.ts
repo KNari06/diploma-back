@@ -618,11 +618,38 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Map step type to action type for element resolution context
+    // Map frontend step kind → mobile runner actionType for element resolution context.
+    // The actionType tells the LLM what the user intends to do with the element,
+    // which affects how it scores candidates (e.g., clickable for tap, editable for type).
     const ACTION_TYPE_MAP: Record<string, string> = {
-      click: 'tap', type: 'type_text', fill: 'type_text',
-      assert: 'assert_visible', ai_check: 'assert_visible',
-      scroll: 'tap', swipe: 'tap', long_press: 'tap', double_tap: 'tap',
+      // Core actions
+      tap: 'tap',
+      click: 'tap',
+      type: 'type_text',
+      fill: 'type_text',
+      scroll: 'scroll',
+      swipe: 'swipe',
+      long_press: 'long_press',
+      double_tap: 'double_tap',
+      drag: 'drag',
+      press: 'press_key',
+      // Assertions
+      assert: 'assert_visible',
+      ai_check: 'assert_visible',
+      // Navigation (no element resolution needed, but pass through)
+      go_back: 'go_back',
+      go_home: 'go_home',
+      navigate: 'open_url',
+      open_app: 'launch_app',
+      close_app: 'close_app',
+      // Device actions (no element resolution needed)
+      biometric: 'biometric',
+      otp: 'otp',
+      permission: 'permission_dialog',
+      network: 'set_network_condition',
+      pinch: 'pinch_zoom',
+      clipboard: 'set_clipboard',
+      upload: 'upload_file',
     };
     const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
 

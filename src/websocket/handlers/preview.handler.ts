@@ -95,6 +95,105 @@ function emitRecordingStep(
   } as any);
 }
 
+/**
+ * Flush pending scroll timer for a session.
+ * Emits accumulated scroll as a recording step (or merges with previous scroll step).
+ * Call BEFORE emitting another step to preserve correct step order.
+ */
+async function flushPendingScroll(
+  socket: TypedSocket,
+  previewSessionId: string,
+  userId: string,
+  sessionService: ReturnType<typeof import('@/services/testing/ui/preview/preview-session.service').getPreviewSessionService>,
+  source: string,
+): Promise<void> {
+  const pendingScroll = recordingScrollTimers.get(previewSessionId);
+  if (!pendingScroll) return;
+
+  clearTimeout(pendingScroll.timer);
+  recordingScrollTimers.delete(previewSessionId);
+  if (pendingScroll.deltaY === 0 && pendingScroll.deltaX === 0) return;
+
+  try {
+    const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
+    const scrollPage = sessionService.getPage(previewSessionId, userId);
+    const scrollPageUrl = scrollPage?.url();
+    if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
+
+    let scrollTargetHints: import('@/services/testing/ui/preview/preview.types').BindingHints | null = null;
+    if (scrollPage) {
+      try { scrollTargetHints = await RecordingCaptureService.probeScrollTarget(scrollPage); } catch { /* non-critical */ }
+    }
+
+    const room = createRoomName('preview', previewSessionId);
+    const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, userId);
+    const now = Date.now();
+    const withinMergeWindow = lastScrollStep && (now - lastScrollStep.emittedAt) < RECORDING_SCROLL_MERGE_WINDOW_MS;
+
+    if (withinMergeWindow && lastScrollStep) {
+      const mergedDelta = lastScrollStep.totalDelta + pendingScroll.deltaY;
+      const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + pendingScroll.deltaX;
+      const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined);
+      if (scrollStep) {
+        scrollStep.id = lastScrollStep.id;
+        socket.nsp.to(room).emit('preview:recording:step:update', { previewSessionId, step: scrollStep, timestamp: new Date().toISOString() });
+        sessionService.setRecordingLastScrollStep(previewSessionId, userId, { id: lastScrollStep.id, totalDelta: mergedDelta, totalDeltaX: mergedDeltaX, emittedAt: now });
+      }
+    } else {
+      const scrollStep = RecordingCaptureService.captureScroll(pendingScroll.deltaY, scrollPageUrl, pendingScroll.deltaX, scrollTargetHints ?? undefined);
+      if (scrollStep) {
+        emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: scrollStep });
+        const fTrace = EditorTraceService.get(previewSessionId);
+        if (fTrace) fTrace.writeStepCaptured(scrollStep, `scroll_flush_${source}`);
+        sessionService.setRecordingLastScrollStep(previewSessionId, userId, { id: scrollStep.id, totalDelta: pendingScroll.deltaY, totalDeltaX: pendingScroll.deltaX, emittedAt: now });
+      }
+    }
+  } catch { /* non-critical — don't block caller */ }
+}
+
+/**
+ * Flush pending typing buffer for a session.
+ * Emits accumulated text as a recording step (or merges with previous type step).
+ * Call BEFORE emitting another step to preserve correct step order.
+ */
+function flushPendingTyping(
+  socket: TypedSocket,
+  previewSessionId: string,
+  userId: string,
+  sessionService: ReturnType<typeof import('@/services/testing/ui/preview/preview-session.service').getPreviewSessionService>,
+  RecordingCaptureService: typeof import('@/services/testing/ui/preview/recording-capture.service').RecordingCaptureService,
+  source: string,
+): void {
+  const buffer = sessionService.getRecordingBuffer(previewSessionId, userId);
+  if (!buffer) return;
+
+  const room = createRoomName('preview', previewSessionId);
+  const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, userId);
+  const sameElement = lastTypeStep && buffer.elementRef && lastTypeStep.elementRef === buffer.elementRef;
+  const fTrace = EditorTraceService.get(previewSessionId);
+
+  if (sameElement && lastTypeStep) {
+    const mergedValue = lastTypeStep.value + buffer.text;
+    const typingStep = RecordingCaptureService.flushTypingBuffer({ ...buffer, text: mergedValue });
+    if (typingStep) {
+      typingStep.id = lastTypeStep.id;
+      socket.nsp.to(room).emit('preview:recording:step:update', { previewSessionId, step: typingStep, timestamp: new Date().toISOString() });
+      if (fTrace) fTrace.writeStepUpdated(typingStep, `type_merge_${source}`);
+    }
+  } else {
+    const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
+    if (typingStep) {
+      emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: typingStep });
+      if (fTrace) fTrace.writeStepCaptured(typingStep, `type_flush_${source}`);
+    }
+  }
+
+  sessionService.setRecordingLastTypeStep(previewSessionId, userId, null);
+  sessionService.setRecordingBuffer(previewSessionId, userId, null);
+  const timer = recordingTypingTimers.get(previewSessionId);
+  if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // V7: Video + DevTools streaming registry
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1457,40 +1556,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const room = createRoomName('preview', previewSessionId);
               const cTrace = EditorTraceService.get(previewSessionId);
 
-              // Flush pending typing buffer (user clicked elsewhere)
-              const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
-              if (buffer) {
-                // V10: Merge with previous type step if same element
-                const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
-                const sameElement = lastTypeStep
-                  && buffer.elementRef
-                  && lastTypeStep.elementRef === buffer.elementRef;
-
-                if (sameElement && lastTypeStep) {
-                  const mergedValue = lastTypeStep.value + buffer.text;
-                  const typingStep = RecordingCaptureService.flushTypingBuffer({
-                    ...buffer, text: mergedValue,
-                  });
-                  if (typingStep) {
-                    typingStep.id = lastTypeStep.id;
-                    socket.nsp.to(room).emit('preview:recording:step:update', {
-                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                    });
-                    if (cTrace) cTrace.writeStepUpdated(typingStep, 'type_merge_on_click');
-                  }
-                } else {
-                  const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
-                  if (typingStep) {
-                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
-                    if (cTrace) cTrace.writeStepCaptured(typingStep, 'type_flush_on_click');
-                  }
-                }
-                // Click = user left the field → clear merge state
-                sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
-                sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
-                const timer = recordingTypingTimers.get(previewSessionId);
-                if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
-              }
+              // Flush pending scroll + typing before click — preserve step order
+              await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'click');
+              flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'click');
 
               // V15: Emit hover step before click only if user dwelled on a genuinely different interactive element.
               // Fixes: V11 had hoverOnDifferentElement always true (ref never stored) → mass false positives.
@@ -2147,6 +2215,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const room = createRoomName('preview', previewSessionId);
               const pTrace = EditorTraceService.get(previewSessionId);
 
+              // Flush pending scroll before press step — preserve step order
+              await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'press');
+
               // V13: Detect paste (Ctrl+V / Cmd+V) — set flag so next keyboard:type marks step as isPaste
               const isPasteShortcut = data.key?.toLowerCase() === 'v'
                 && data.modifiers
@@ -2523,34 +2594,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const { RecordingCaptureService } = await import(
                 '@/services/testing/ui/preview/recording-capture.service'
               );
+
               const room = createRoomName('preview', previewSessionId);
 
-              // Flush pending typing buffer (with merge logic)
-              const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
-              if (buffer) {
-                const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
-                const sameElement = lastTypeStep && buffer.elementRef && lastTypeStep.elementRef === buffer.elementRef;
-
-                if (sameElement && lastTypeStep) {
-                  const mergedValue = lastTypeStep.value + buffer.text;
-                  const typingStep = RecordingCaptureService.flushTypingBuffer({ ...buffer, text: mergedValue });
-                  if (typingStep) {
-                    typingStep.id = lastTypeStep.id;
-                    socket.nsp.to(room).emit('preview:recording:step:update', {
-                      previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-                    });
-                  }
-                } else {
-                  const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
-                  if (typingStep) {
-                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: typingStep });
-                  }
-                }
-                sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
-                sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
-                const timer = recordingTypingTimers.get(previewSessionId);
-                if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
-              }
+              // Flush pending scroll + typing before refresh step
+              await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'refresh');
+              flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'refresh');
 
               // V11: Record a navigate step for refresh
               const page = sessionService.getPage(previewSessionId, ensuredUserId);
@@ -2608,6 +2657,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
+
+      // Flush pending scroll+typing before navigation — preserve step order
+      if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+        await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'back');
+        try {
+          const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
+          flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'back');
+        } catch { /* non-critical */ }
+      }
 
       const result = await sessionService.goBack(previewSessionId, ensuredUserId);
 
@@ -2676,6 +2734,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
+
+      // Flush pending scroll+typing before navigation — preserve step order
+      if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+        await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'forward');
+        try {
+          const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
+          flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'forward');
+        } catch { /* non-critical */ }
+      }
 
       const result = await sessionService.goForward(previewSessionId, ensuredUserId);
 
