@@ -249,6 +249,9 @@ export async function destroySession(req: Request, res: Response): Promise<void>
       await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`);
     }
 
+    // Close editor trace file for this session
+    await EditorTraceService.close(`mobile-${sessionId}`).catch(() => {});
+
     logger.info('[MOBILE_SESSION] Session destroyed', { sessionId, userId, projectId });
 
     res.json({ success: true, message: 'Session destroyed' });
@@ -731,12 +734,37 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       bindingHints: stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {},
     };
 
+    // Trace logging for mobile editor
+    const traceSessionId = `mobile-${sessionId}`;
+    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
+    trace.writeMobileApplyRequest({
+      stepId: intentStep.id,
+      stepType: stepType,
+      description: intentStep.description,
+      value: intentStep.value,
+      sessionId,
+    });
+    const applyStart = Date.now();
+
     const result = await client.runSteps(sessionId, [intentStep], {
       screenshotEachStep: true,
       stopOnFailure: false,
     });
 
     const stepResult = result.steps?.[0];
+
+    // Log the result
+    trace.writeMobileApplyResult({
+      stepId: intentStep.id,
+      sessionId,
+      latencyMs: Date.now() - applyStart,
+      result: {
+        success: stepResult?.success ?? false,
+        error: stepResult?.error,
+        resolvedVia: stepResult?.resolvedVia,
+        durationMs: stepResult?.durationMs,
+      },
+    });
 
     res.json({
       success: true,
