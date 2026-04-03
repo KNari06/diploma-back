@@ -285,11 +285,13 @@ export const BROWSER_LAUNCH_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
-  '--disable-gpu',
   '--disable-blink-features=AutomationControlled',
   '--disable-features=IsolateOrigins,site-per-process',
   '--disable-site-isolation-trials',
   '--window-size=1920,1080',
+  // NOTE: --disable-gpu intentionally omitted.
+  // It breaks CSS compositing (hover highlights, selection outlines) in preview mode.
+  // Playwright's new headless mode (1.50+) handles GPU rendering correctly without it.
 ] as const;
 
 /**
