@@ -78,20 +78,12 @@ export class ExplorationRunJobHandler {
         logger.info('[EXPLORATION_JOB] Resuming from checkpoint', { explorationId, resumeCount });
       }
 
-      // Launch dedicated browser for exploration (with anti-detection args matching browser-pool)
+      // Launch dedicated browser for exploration
       const { chromium } = await import('playwright');
+      const { BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE } = await import('@/config/testing/playwright-tuning');
       browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-blink-features=AutomationControlled',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-site-isolation-trials',
-          '--window-size=1920,1080',
-        ],
+        headless: BROWSER_HEADLESS_MODE,
+        args: [...BROWSER_LAUNCH_ARGS],
       });
 
       // Build exploration config

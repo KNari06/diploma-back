@@ -1,5 +1,6 @@
 import { BrowserType } from '@/types';
 import { logger } from '@/utils/core/logger';
+import { BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE } from '@/config/testing/playwright-tuning';
 import { Browser, chromium, firefox, webkit } from 'playwright';
 
 /**
@@ -41,22 +42,9 @@ class BrowserPool {
     // Launch new browser
     logger.info('Launching new browser instance', { browserType });
 
-    // ✅ FIX: Add arguments to avoid bot detection
-    const args = [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-blink-features=AutomationControlled', // Hide automation
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--disable-site-isolation-trials',
-      '--disable-web-security',
-      '--window-size=1920,1080',
-    ];
-
     const browser = await playwrightBrowser.launch({
-      headless: true,
-      args,
+      headless: BROWSER_HEADLESS_MODE,
+      args: [...BROWSER_LAUNCH_ARGS],
     });
 
     this.browsers.set(browserType, browser);

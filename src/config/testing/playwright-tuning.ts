@@ -259,3 +259,145 @@ export const REPLAY_TRACE_CONFIG = {
   closeTimeoutMs: 10_000,
 } as const;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// BROWSER FINGERPRINT — Single source of truth for UA, args, headers
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Realistic User-Agent string matching current stable Chrome.
+ * Updated periodically — search for BROWSER_USER_AGENT to find all usages.
+ */
+export const BROWSER_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36';
+
+/**
+ * Chromium launch args for anti-detection + stability.
+ * Used by browser-pool, exploration, and preview sessions.
+ */
+/**
+ * Headless mode. Playwright 1.50+ uses the new Chrome headless by default
+ * (indistinguishable from headed Chrome). No need for 'new' — `true` is correct.
+ */
+export const BROWSER_HEADLESS_MODE = true;
+
+export const BROWSER_LAUNCH_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--disable-blink-features=AutomationControlled',
+  '--disable-features=IsolateOrigins,site-per-process',
+  '--disable-site-isolation-trials',
+  '--window-size=1920,1080',
+] as const;
+
+/**
+ * Extra HTTP headers to look like a real browser (not automation tool).
+ * Applied to browser contexts to pass WAF/bot detection.
+ */
+export const BROWSER_EXTRA_HEADERS = {
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Connection': 'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Cache-Control': 'max-age=0',
+} as const;
+
+/**
+ * Stealth init script injected into every browser context via context.addInitScript().
+ * Patches browser APIs that bot detectors check:
+ * - navigator.webdriver → false
+ * - window.chrome runtime object
+ * - navigator.plugins (non-empty)
+ * - navigator.languages
+ * - WebGL vendor/renderer (generic, not "Google SwiftShader")
+ * - Permissions API (notifications = "denied" like real browsers)
+ *
+ * Must be called ONCE per context (not per page — addInitScript on context auto-applies to all pages).
+ */
+export const BROWSER_STEALTH_SCRIPT = `
+  // 1. Hide webdriver flag (primary bot detection signal)
+  Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+  // 2. Chrome runtime object (missing in headless = bot indicator)
+  if (!window.chrome) {
+    window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){} };
+  }
+
+  // 3. Plugins array (empty in headless = bot indicator)
+  Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+      const plugins = [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+      ];
+      plugins.refresh = () => {};
+      return plugins;
+    },
+  });
+
+  // 4. Languages (must match Accept-Language header)
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+  // 5. WebGL renderer — "Google SwiftShader" = headless giveaway
+  const getParameter = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function(param) {
+    if (param === 37445) return 'Intel Inc.';           // UNMASKED_VENDOR_WEBGL
+    if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+    return getParameter.call(this, param);
+  };
+
+  // 6. Permissions API — headless returns "prompt" for notifications, real Chrome returns "denied"
+  if (navigator.permissions) {
+    const originalQuery = navigator.permissions.query;
+    navigator.permissions.query = function(params) {
+      if (params.name === 'notifications') {
+        return Promise.resolve({ state: 'denied', onchange: null });
+      }
+      return originalQuery.call(this, params);
+    };
+  }
+
+  // 7. Connection API — headless often missing
+  if (!navigator.connection) {
+    Object.defineProperty(navigator, 'connection', {
+      get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false }),
+    });
+  }
+
+  // 8. Canvas fingerprint noise — add subtle pixel variation to prevent exact-match fingerprinting
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function(type) {
+    if (this.width > 16 && this.height > 16) {
+      const ctx = this.getContext('2d');
+      if (ctx) {
+        const style = ctx.fillStyle;
+        ctx.fillStyle = 'rgba(0,0,1,0.003)';
+        ctx.fillRect(0, 0, 1, 1);
+        ctx.fillStyle = style;
+      }
+    }
+    return origToDataURL.apply(this, arguments);
+  };
+
+  // 9. AudioContext — headless often has different sample rate or missing
+  if (window.AudioContext || window.webkitAudioContext) {
+    const OrigAudioCtx = window.AudioContext || window.webkitAudioContext;
+    const origGetFloat = OrigAudioCtx.prototype.__proto__.constructor.prototype.createAnalyser
+      ? null : null; // Just ensure constructor exists
+    // Ensure sampleRate looks normal (44100 or 48000)
+    try {
+      Object.defineProperty(OrigAudioCtx.prototype, 'sampleRate', {
+        get: function() { return 48000; },
+        configurable: true,
+      });
+    } catch {}
+  }
+`;
+

@@ -110,8 +110,8 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
 
 export const DEFAULT_MAX_CONCURRENCY = 5;
 
-/** Desktop user agent to prevent mobile redirects during exploration */
-export const DESKTOP_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+/** Desktop user agent — re-exported from centralized config */
+export { BROWSER_USER_AGENT as DESKTOP_USER_AGENT } from '@/config/testing/playwright-tuning';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TEST FLOW CATEGORIES

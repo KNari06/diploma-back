@@ -14,6 +14,7 @@
 import type { Browser, BrowserContext } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import { DESKTOP_USER_AGENT } from './types';
+import { BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 
 export class StateManager {
   private cachedAuthState: string | null = null;
@@ -35,7 +36,9 @@ export class StateManager {
       viewport: { width: 1280, height: 720 },
       ignoreHTTPSErrors: true,
       userAgent: DESKTOP_USER_AGENT,
+      extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
     });
+    await context.addInitScript(BROWSER_STEALTH_SCRIPT);
     this.activeContexts.add(context);
     return context;
   }
@@ -52,8 +55,10 @@ export class StateManager {
           viewport: { width: 1280, height: 720 },
           ignoreHTTPSErrors: true,
           userAgent: DESKTOP_USER_AGENT,
+          extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
           storageState: this.authStateJson as any,
         });
+        await context.addInitScript(BROWSER_STEALTH_SCRIPT);
         this.activeContexts.add(context);
         logger.debug('[STATE_MANAGER] Created authenticated context from cached state');
         return context;
