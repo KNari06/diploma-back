@@ -246,6 +246,7 @@ interface InternalSession extends PreviewSession {
     totalDelta: number;
     totalDeltaX: number;
     emittedAt: number;
+    containerSelector?: string | null;
   } | null;
   /** V11: Last hover position — for recording hover steps before click on different element */
   /** V18: Extended with full ProbedElement from hover probe for click reuse */
@@ -1629,6 +1630,8 @@ export class PreviewSessionService {
       includeScreenshot?: boolean;
       onlyIfChanged?: boolean;
       includeDomNodes?: boolean;
+      /** Collect elements below the viewport (for replay/run where scroll will happen) */
+      fullPage?: boolean;
     }
   ): Promise<{
     url: string;
@@ -1667,7 +1670,9 @@ export class PreviewSessionService {
     }
 
     try {
-      const snapshot = await SnapshotCollector.collect(session.page);
+      const snapshot = await SnapshotCollector.collect(session.page, {
+        fullPage: options?.fullPage,
+      });
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();
 

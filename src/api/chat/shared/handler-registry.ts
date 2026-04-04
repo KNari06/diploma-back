@@ -15,6 +15,7 @@ import { handleSaveTestIntent } from '../regression/save-test.handler';
 import { handleTestRecommendationsIntent } from '../regression/test-recommendations.handler';
 import { handleEditorAction } from '../editor_action/handler';
 import { handleMobileTest as handleMobileTestOriginal } from '../mobile_test/handler';
+import { handleApiFlowTest as handleApiFlowTestOriginal } from '../api_flow/handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
 
 /**
@@ -135,6 +136,24 @@ const handleClarificationRequest: IntentHandler = async (req, res, params) => {
 };
 
 /**
+ * Wrapper for api_flow_test handler
+ * Adapts original handler signature to IntentHandler type
+ */
+const handleApiFlowTest: IntentHandler = async (req, res, params) => {
+  return handleApiFlowTestOriginal(req, res, {
+    message: params.message,
+    parsedIntent: params.parsedIntent,
+    userId: params.userId,
+    workspace_id: params.workspace_id,
+    chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    answers: params.answers,
+    abortSignal: params.abortSignal,
+    attachments: params.attachments,
+  });
+};
+
+/**
  * Wrapper for mobile_test handler
  * Adapts original handler signature to IntentHandler type
  */
@@ -184,6 +203,9 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
 
   // Mobile testing intent
   mobile_test: handleMobileTest,
+
+  // API flow testing intent (Swagger/OpenAPI/Postman chain execution)
+  api_flow_test: handleApiFlowTest,
 };
 
 /**
@@ -243,5 +265,6 @@ export function getIntentDescriptions(): Record<string, string> {
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
     editor_action: 'User wants to perform a direct action on the live page in editor mode',
     mobile_test: 'User wants to run a mobile (Android/iOS) test on recorded steps',
+    api_flow_test: 'User wants to test an API flow from a Swagger/OpenAPI/Postman spec URL or file, or pasted cURL commands',
   };
 }

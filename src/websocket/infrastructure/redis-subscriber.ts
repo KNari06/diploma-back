@@ -250,6 +250,25 @@ class WebSocketRedisSubscriber {
           wsService.emitExplorationClarification(payload);
           break;
 
+        // ── Allure import events ──
+        case 'allure:import:progress':
+          if (target?.userId) {
+            wsService.emitAllureImportProgress(target.userId, payload);
+          }
+          break;
+
+        case 'allure:import:completed':
+          if (target?.userId) {
+            wsService.emitAllureImportCompleted(target.userId, payload);
+          }
+          break;
+
+        case 'allure:import:failed':
+          if (target?.userId) {
+            wsService.emitAllureImportFailed(target.userId, payload);
+          }
+          break;
+
         // Unknown event type
         default:
           logger.warn('[WS_REDIS_SUB] Unknown event type received', {

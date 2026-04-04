@@ -1183,6 +1183,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     pageUrl?: string,
     accumulatedDeltaX?: number,
     scrollTargetHints?: BindingHints,
+    containerSelector?: string | null,
   ): PreviewIntentStep | null {
     if (accumulatedDeltaY === 0 && (!accumulatedDeltaX || accumulatedDeltaX === 0)) return null;
 
@@ -1190,6 +1191,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     const totalMagnitude = Math.abs(accumulatedDeltaY) + Math.abs(accumulatedDeltaX || 0);
     if (totalMagnitude < this.SCROLL_MIN_THRESHOLD_PX) return null;
 
+    const isContainerScroll = !!containerSelector;
     const parts: string[] = [];
     if (accumulatedDeltaY !== 0) {
       parts.push(`${accumulatedDeltaY > 0 ? 'down' : 'up'} ${Math.abs(Math.round(accumulatedDeltaY))}px`);
@@ -1205,11 +1207,15 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     return {
       id: recStepId(),
       type: 'scroll',
-      description: `Scroll ${parts.join(', ')}`,
+      description: isContainerScroll
+        ? `Scroll container ${parts.join(', ')}`
+        : `Scroll ${parts.join(', ')}`,
       value: deltaXRounded !== 0 ? `${deltaYRounded},${deltaXRounded}` : String(deltaYRounded),
       // V15: If we found a target element after scroll, attach hints so replay can use scrollIntoView
       ...(scrollTargetHints && Object.keys(scrollTargetHints).length > 0 && { bindingHints: scrollTargetHints }),
       evidence: { confidence: 1.0, pageUrl },
+      // Container scroll: store selector for replay to target the right element
+      ...(containerSelector && { options: { scrollContainer: containerSelector } }),
     };
   }
 
@@ -1272,6 +1278,60 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       if (result.text) hints.text = result.text;
       if (result.tag) hints.tag = result.tag;
       return Object.keys(hints).length > 0 ? hints : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Detect if wheel event at (x,y) targets a scrollable container (not the page itself).
+   * Returns a CSS selector for the container, or null if page-level scroll.
+   *
+   * Walks up from elementFromPoint(x,y) to find nearest ancestor with overflow:auto/scroll
+   * and scrollHeight > clientHeight (actually scrollable, not just styled).
+   */
+  static async detectScrollContainer(page: Page, x: number, y: number): Promise<string | null> {
+    try {
+      return await page.evaluate(`
+        (function() {
+          var el = document.elementFromPoint(${x}, ${y});
+          if (!el) return null;
+
+          var current = el;
+          while (current && current !== document.documentElement && current !== document.body) {
+            var style = window.getComputedStyle(current);
+            var overflowY = style.overflowY;
+            var overflowX = style.overflowX;
+            var isScrollable =
+              ((overflowY === 'auto' || overflowY === 'scroll') && current.scrollHeight > current.clientHeight + 10) ||
+              ((overflowX === 'auto' || overflowX === 'scroll') && current.scrollWidth > current.clientWidth + 10);
+
+            if (isScrollable) {
+              var id = current.getAttribute('id');
+              if (id) return '#' + CSS.escape(id);
+
+              var testId = current.getAttribute('data-testid');
+              if (testId) return '[data-testid="' + CSS.escape(testId) + '"]';
+
+              var role = current.getAttribute('role');
+              var ariaLabel = current.getAttribute('aria-label');
+              if (role && ariaLabel) return '[role="' + role + '"][aria-label="' + CSS.escape(ariaLabel) + '"]';
+
+              var tag = current.tagName.toLowerCase();
+              var parent = current.parentElement;
+              if (parent) {
+                var siblings = Array.from(parent.children).filter(function(c) { return c.tagName === current.tagName; });
+                var idx = siblings.indexOf(current) + 1;
+                if (siblings.length === 1) return tag;
+                return tag + ':nth-of-type(' + idx + ')';
+              }
+              return tag;
+            }
+            current = current.parentElement;
+          }
+          return null;
+        })()
+      `) as string | null;
     } catch {
       return null;
     }

@@ -1,3 +1,4 @@
+import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
@@ -419,9 +420,26 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         },
         async () => {
 
+      // Cascading failure detection — stop early if N consecutive steps fail
+      let consecutiveFailures = 0;
+
       try {
         for (const command of commands) {
           currentStepIndex++;
+
+          // Check cascading failure threshold before executing next step
+          if (consecutiveFailures >= COMMAND_EXECUTOR_CONFIG.maxConsecutiveFailuresBeforeTermination) {
+            logger.warn('[PLAYWRIGHT] Cascading failure detected — terminating early', {
+              testId: testData.testId,
+              consecutiveFailures,
+              stoppedAtStep: currentStepIndex,
+              remainingSteps: commands.length - currentStepIndex + 1,
+            });
+            allSuccess = false;
+            finalError = `Cascading failure: ${consecutiveFailures} consecutive steps failed`;
+            break;
+          }
+
           const action = (command as any).action ?? (command as any).type ?? 'action';
           const intentMeta = (command as any).intentMeta as undefined | { elementDescription?: string; stepId?: string };
 
@@ -780,6 +798,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
             const stepDurationMs = Date.now() - stepStartedAt;
             const meta = stepResult.runtimeMeta;
+
+            // Cascading failure tracking
+            if (stepResult.success || meta?.source === 'self_heal') {
+              consecutiveFailures = 0; // Reset on success or healed step
+            } else if (isSoftFailure) {
+              consecutiveFailures++; // Soft failures count toward cascading
+            }
             logger.info(`[PLAYWRIGHT] Replay step ${isSoftFailure ? 'soft-failed (continueOnError)' : 'completed'}`, {
               testId: testData.testId,
               step: `${currentStepIndex}/${totalSteps}`,
@@ -934,6 +959,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             }
           } catch (stepError) {
             allSuccess = false;
+            consecutiveFailures++;
             finalError = stepError instanceof Error ? stepError.message : 'Unexpected error';
 
             // Collect UI errors at the moment of failure (DOM may show error banners)

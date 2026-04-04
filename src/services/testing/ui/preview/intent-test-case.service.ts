@@ -7,6 +7,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
+import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import type { CompiledStepPlan, IntentStep, IntentTestCase, StepEvidence } from './preview.types';
 import { injectAutoWaitForSteps } from './auto-wait-for.utils';
 
@@ -502,12 +503,26 @@ export class IntentTestCaseService {
         },
       };
 
+      // Track heal count for flakiness detection
+      const currentHealCount = steps[stepIndex].evidence?.healCount || 0;
+      const newHealCount = currentHealCount + 1;
+      const needsReview = newHealCount >= COMMAND_EXECUTOR_CONFIG.healCountReviewThreshold;
+
+      if (needsReview) {
+        logger.warn('[INTENT_TEST_CASE] Step healed multiple times — flagged for review', {
+          intentTestCaseId, stepId, healCount: newHealCount,
+        });
+      }
+
       steps[stepIndex] = {
         ...steps[stepIndex],
         compiled: mergedCompiled,
         evidence: {
           ...steps[stepIndex].evidence,
           ...evidence,
+          healCount: newHealCount,
+          lastHealedAt: new Date().toISOString(),
+          needsReview: needsReview || steps[stepIndex].evidence?.needsReview,
         },
       };
 

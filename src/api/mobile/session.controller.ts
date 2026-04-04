@@ -17,6 +17,7 @@ import { MobileRunnerClient, getMobileRunnerClient } from '@/services/mobile/mob
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { ProjectService } from '@/services/core/project.service';
+import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -247,6 +248,9 @@ export async function destroySession(req: Request, res: Response): Promise<void>
     if (projectId) {
       await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`);
     }
+
+    // Close editor trace file for this session
+    await EditorTraceService.close(`mobile-${sessionId}`).catch(() => {});
 
     logger.info('[MOBILE_SESSION] Session destroyed', { sessionId, userId, projectId });
 
@@ -614,17 +618,67 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Map step type to action type for element resolution context
+    // Map frontend step kind → mobile runner actionType for element resolution context.
+    // The actionType tells the LLM what the user intends to do with the element,
+    // which affects how it scores candidates (e.g., clickable for tap, editable for type).
     const ACTION_TYPE_MAP: Record<string, string> = {
-      click: 'tap', type: 'type_text', fill: 'type_text',
-      assert: 'assert_visible', ai_check: 'assert_visible',
-      scroll: 'tap', swipe: 'tap', long_press: 'tap', double_tap: 'tap',
+      // Core actions
+      tap: 'tap',
+      click: 'tap',
+      type: 'type_text',
+      fill: 'type_text',
+      scroll: 'scroll',
+      swipe: 'swipe',
+      long_press: 'long_press',
+      double_tap: 'double_tap',
+      drag: 'drag',
+      press: 'press_key',
+      // Assertions
+      assert: 'assert_visible',
+      ai_check: 'assert_visible',
+      // Navigation (no element resolution needed, but pass through)
+      go_back: 'go_back',
+      go_home: 'go_home',
+      navigate: 'open_url',
+      open_app: 'launch_app',
+      close_app: 'close_app',
+      // Device actions (no element resolution needed)
+      biometric: 'biometric',
+      otp: 'otp',
+      permission: 'permission_dialog',
+      network: 'set_network_condition',
+      pinch: 'pinch_zoom',
+      clipboard: 'set_clipboard',
+      upload: 'upload_file',
     };
     const actionType = ACTION_TYPE_MAP[stepType] || 'tap';
+
+    // Trace logging for mobile editor
+    const traceSessionId = `mobile-${sessionId}`;
+    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user.id);
+    trace.writeMobileLintRequest({ description, actionType, sessionId });
+    const lintStart = Date.now();
 
     // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
     // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
     const lintResult = await client.lintElement(sessionId, description, actionType);
+
+    // Log the result for debugging element resolution issues
+    trace.writeMobileLintResult({
+      description,
+      actionType,
+      sessionId,
+      latencyMs: Date.now() - lintStart,
+      result: {
+        status: lintResult.status,
+        confidence: lintResult.confidence,
+        resolvedVia: lintResult.resolvedVia,
+        elementText: lintResult.elementText,
+        elementType: lintResult.elementType,
+        boundingBox: lintResult.boundingBox,
+        message: lintResult.message,
+      },
+    });
 
     // Map to frontend-compatible response with highlight data
     const highlight = lintResult.boundingBox && lintResult.screenSize
@@ -707,12 +761,37 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       bindingHints: stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {},
     };
 
+    // Trace logging for mobile editor
+    const traceSessionId = `mobile-${sessionId}`;
+    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
+    trace.writeMobileApplyRequest({
+      stepId: intentStep.id,
+      stepType: stepType,
+      description: intentStep.description,
+      value: intentStep.value,
+      sessionId,
+    });
+    const applyStart = Date.now();
+
     const result = await client.runSteps(sessionId, [intentStep], {
       screenshotEachStep: true,
       stopOnFailure: false,
     });
 
     const stepResult = result.steps?.[0];
+
+    // Log the result
+    trace.writeMobileApplyResult({
+      stepId: intentStep.id,
+      sessionId,
+      latencyMs: Date.now() - applyStart,
+      result: {
+        success: stepResult?.success ?? false,
+        error: stepResult?.error,
+        resolvedVia: stepResult?.resolvedVia,
+        durationMs: stepResult?.durationMs,
+      },
+    });
 
     res.json({
       success: true,

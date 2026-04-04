@@ -1278,7 +1278,7 @@ export class FlowRunner {
         await VisualStability.waitForPageReady(page, { timeout: 3000 });
       } catch { /* non-fatal */ }
 
-      const snapshot = await SnapshotCollector.collect(page);
+      const snapshot = await SnapshotCollector.collect(page, { fullPage: true });
 
       // Collect known pages from blackboard (prevents Scout from re-discovering surveyed pages)
       const knownPages = this.blackboard?.tree?.getAllNodes?.()?.map((n: any) => n.url) ?? [];
@@ -1431,7 +1431,7 @@ export class FlowRunner {
         // Non-fatal
       }
 
-      const snapshot = await SnapshotCollector.collect(page);
+      const snapshot = await SnapshotCollector.collect(page, { fullPage: true });
       const formattedSnapshot = SnapshotCollector.format(snapshot);
 
       const prompt = buildBranchDetectionPrompt({

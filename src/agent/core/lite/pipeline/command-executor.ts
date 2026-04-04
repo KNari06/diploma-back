@@ -148,7 +148,7 @@ export class CommandExecutor {
 
   private async observePage(): Promise<CommandResult> {
     try {
-      const snapshot = await SnapshotCollector.collect(this.page);
+      const snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
       const formatted = SnapshotCollector.format(snapshot);
 
       // Update blackboard with current page state (all agents can read)

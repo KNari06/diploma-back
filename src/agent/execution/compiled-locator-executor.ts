@@ -182,7 +182,7 @@ async function checkPageSignature(
  * This catches cases like two "Submit" buttons in different forms
  * (same tag/role but different containers/labels).
  */
-async function quickFingerprintCheck(
+export async function quickFingerprintCheck(
   page: PageLike,
   locator: Locator,
   fingerprint: TargetFingerprint

@@ -291,6 +291,12 @@ export interface StepEvidence {
   interStepDelayMs?: number;
   /** V15: Tab index where evidence was captured (multi-tab support) */
   tabIndex?: number;
+  /** Number of times this step's selector was healed across runs (flakiness indicator) */
+  healCount?: number;
+  /** ISO timestamp of last heal */
+  lastHealedAt?: string;
+  /** Flagged for human review after repeated heals */
+  needsReview?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -522,6 +528,8 @@ export interface StepOptions {
     /** Timeout for waiting for download (ms, default 15000) */
     timeoutMs?: number;
   };
+  /** CSS selector of scrollable container (for container scroll vs page scroll) */
+  scrollContainer?: string;
 }
 
 /**

@@ -1518,7 +1518,7 @@ export class IntelligentTestOrchestrator {
     // ✅ NEW: Capture DOM analysis for step editor linting
     let domAnalysis;
     try {
-      const snapshot = await SnapshotCollector.collect(this.page);
+      const snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
       domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       logger.debug('[INTELLIGENT_ORCHESTRATOR] DOM analysis captured for step editor', {
         nodeCount: domAnalysis.interactiveNodes.length,

@@ -50,6 +50,14 @@ import {
   TestVideoStatsPayload,
   TestVideoStoppedPayload,
   TestVideoUnavailablePayload,
+  // API Flow payloads
+  ApiFlowParsingPayload,
+  ApiFlowDagReadyPayload,
+  ApiFlowStepStartPayload,
+  ApiFlowStepCompletePayload,
+  ApiFlowVariableExtractedPayload,
+  ApiFlowCompletedPayload,
+  ApiFlowFailedPayload,
 } from '../types/types';
 import { getIO, isWebSocketInitialized } from './server';
 
@@ -1022,6 +1030,100 @@ class WebSocketService {
       });
       return 0;
     }
+  }
+  // ============================================================================
+  // API FLOW EVENTS
+  // ============================================================================
+
+  emitApiFlowParsing(sessionId: string, payload: ApiFlowParsingPayload): void {
+    this.emitWithFallback(
+      'api:flow:parsing',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:parsing', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowDagReady(sessionId: string, payload: ApiFlowDagReadyPayload): void {
+    this.emitWithFallback(
+      'api:flow:dag-ready',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:dag-ready', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowStepStart(sessionId: string, payload: ApiFlowStepStartPayload): void {
+    this.emitWithFallback(
+      'api:flow:step-start',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:step-start', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowStepComplete(sessionId: string, payload: ApiFlowStepCompletePayload): void {
+    this.emitWithFallback(
+      'api:flow:step-complete',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:step-complete', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowVariableExtracted(sessionId: string, payload: ApiFlowVariableExtractedPayload): void {
+    this.emitWithFallback(
+      'api:flow:variable-extracted',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:variable-extracted', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowCompleted(sessionId: string, payload: ApiFlowCompletedPayload): void {
+    this.emitWithFallback(
+      'api:flow:completed',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:completed', payload);
+      },
+      { sessionId }
+    );
+  }
+
+  emitApiFlowFailed(sessionId: string, payload: ApiFlowFailedPayload): void {
+    this.emitWithFallback(
+      'api:flow:failed',
+      payload,
+      () => {
+        const io = getIO();
+        const room = createRoomName('chat', sessionId);
+        io.to(room).emit('api:flow:failed', payload);
+      },
+      { sessionId }
+    );
   }
 }
 

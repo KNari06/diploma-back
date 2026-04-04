@@ -345,6 +345,10 @@ export function convertIntentStepToCommand(
       if (step.value) {
         command.value = step.value;
       }
+      // Container scroll: pass selector so background replay scrolls the right element
+      if (step.options?.scrollContainer && command.intentMeta) {
+        (command.intentMeta as any).scrollContainer = step.options.scrollContainer;
+      }
       break;
 
     case 'drag_and_drop':

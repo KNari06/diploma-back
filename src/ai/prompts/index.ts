@@ -34,6 +34,14 @@ export {
   buildActionGenerationPrompt, buildLogicAnalysisPrompt, buildNextStepPrompt, buildPageAnalysisPrompt, buildVisionPrompt
 } from './intelligent-testing-prompts';
 
+// Re-export from api-flow-prompts.ts
+export {
+  buildSwaggerDependencyPrompt,
+  buildSwaggerDependencySystemPrompt,
+  buildSwaggerDagMergePrompt,
+  buildSwaggerFlowSummaryPrompt,
+} from './api-flow-prompts';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // UTILITY FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════

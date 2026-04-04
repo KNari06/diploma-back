@@ -402,6 +402,32 @@ export class EditorTraceService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // HOVER HIGHLIGHT EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeHoverProbe(data: {
+    x: number; y: number;
+    /** Coordinates originally from mouse:move event (before latestX/Y update) */
+    originalX?: number; originalY?: number;
+    latencyMs: number;
+    result: { tag: string; label: string; resolvedVia: string } | null;
+    skipped?: string; // reason for skip (e.g. 'run_active', 'page_navigated', 'no_element', 'direct_hit', 'cross_origin_iframe', 'no_bbox')
+    /** Number of mouse:move events skipped while probe was in-flight */
+    skippedMoves?: number;
+  }): void {
+    this.writer.write({ stage: 'hover', eventType: 'hover_probe', payload: data });
+  }
+
+  writeHoverEmit(data: {
+    element: { tag: string; label: string; boundingBox: Record<string, number> } | null;
+    deduped: boolean; // true if emission was skipped due to same element
+    /** WebSocket room the event was emitted to */
+    room?: string;
+  }): void {
+    this.writer.write({ stage: 'hover', eventType: 'hover_emit', payload: data });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // ERROR
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -410,6 +436,92 @@ export class EditorTraceService {
       stage: 'error',
       eventType: 'error',
       payload: { error, ...context },
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // MOBILE EDITOR EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Log a mobile lint request (user clicked "Find" in mobile editor).
+   */
+  writeMobileLintRequest(data: {
+    description: string;
+    actionType: string;
+    sessionId: string;
+  }): void {
+    this.writer.write({
+      stage: 'mobile_lint',
+      eventType: 'mobile_lint_request',
+      payload: data,
+    });
+  }
+
+  /**
+   * Log a mobile lint result — the most important event for debugging
+   * "why didn't it find my element on the mobile screen?"
+   *
+   * Includes: description, resolution strategy, confidence, A11y candidates,
+   * LLM usage, and final result.
+   */
+  writeMobileLintResult(data: {
+    description: string;
+    actionType: string;
+    sessionId: string;
+    latencyMs: number;
+    result: {
+      status: string;
+      confidence?: number;
+      resolvedVia?: string;
+      elementText?: string;
+      elementType?: string;
+      boundingBox?: Record<string, number>;
+      message?: string;
+    };
+  }): void {
+    this.writer.write({
+      stage: 'mobile_lint',
+      eventType: 'mobile_lint_result',
+      payload: data,
+    });
+  }
+
+  /**
+   * Log a mobile apply request (user clicked "Apply"/"Run step" in mobile editor).
+   */
+  writeMobileApplyRequest(data: {
+    stepId: string;
+    stepType: string;
+    description: string;
+    value?: string;
+    sessionId: string;
+  }): void {
+    this.writer.write({
+      stage: 'mobile_apply',
+      eventType: 'mobile_apply_request',
+      payload: data,
+    });
+  }
+
+  /**
+   * Log a mobile apply result.
+   */
+  writeMobileApplyResult(data: {
+    stepId: string;
+    sessionId: string;
+    latencyMs: number;
+    result: {
+      success: boolean;
+      error?: string;
+      resolvedVia?: string;
+      durationMs?: number;
+    };
+  }): void {
+    this.writer.write({
+      stage: 'mobile_apply',
+      eventType: 'mobile_apply_result',
+      payload: data,
     });
   }
 }
