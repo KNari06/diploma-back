@@ -237,7 +237,7 @@ function parseRetryAfter(headers: Record<string, string>): number {
 // DB OPERATIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function createFlowRun(
+export async function createFlowRun(
   flowSpecId: string,
   userId: string,
   config: FlowExecutionConfig,
@@ -305,6 +305,7 @@ export class FlowExecutorService {
     flowSpec: ApiFlowSpec,
     userId: string,
     request: RunFlowRequest,
+    preCreatedRunId?: string,
   ): Promise<FlowRunSummary> {
     const dag = flowSpec.executionDag;
     const chatSessionId = request.chatSessionId;
@@ -315,7 +316,7 @@ export class FlowExecutorService {
     };
 
     const startedAt = new Date().toISOString();
-    const flowRunId = await createFlowRun(flowSpec.id, userId, config, chatSessionId);
+    const flowRunId = preCreatedRunId || await createFlowRun(flowSpec.id, userId, config, chatSessionId);
 
     // Register cancellation controller
     const abortController = new AbortController();

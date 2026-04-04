@@ -7,7 +7,7 @@ import { Request, Response } from 'express';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { FlowBuilderService } from '@/services/testing/api/flow/flow-builder.service';
-import { FlowExecutorService, cancelFlowRun } from '@/services/testing/api/flow/flow-executor.service';
+import { FlowExecutorService, cancelFlowRun, createFlowRun } from '@/services/testing/api/flow/flow-executor.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import type { ParseSpecRequest, RunFlowRequest } from '@/services/testing/api/flow/flow.types';
 
@@ -236,12 +236,16 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Run async — respond immediately with runId via WS events
-    // But also return a run ID in the HTTP response so frontend can poll if needed
+    // Create flow run record first so we can return the ID immediately
+    const flowRunId = await createFlowRun(flowSpec.id, userId, {
+      ...({ errorStrategy: flowSpec.errorStrategy, maxRetries: 3, retryBackoffMs: 1000, stepTimeoutMs: 15000, totalTimeoutMs: 300000, rateLimitDelayMs: 100 }),
+      ...(config || {}),
+    } as any, chatSessionId);
+
     const runRequest: RunFlowRequest = { config, chatSessionId, nodeOverrides };
 
     // Start execution async — refund credits on catastrophic failure (not step failures)
-    FlowExecutorService.execute(flowSpec, userId, runRequest).catch(async (error) => {
+    FlowExecutorService.execute(flowSpec, userId, runRequest, flowRunId).catch(async (error) => {
       logger.error('[FLOW_SPEC_CONTROLLER] Flow execution failed catastrophically, refunding credits', {
         flowSpecId: id,
         error: error.message,
@@ -263,6 +267,7 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
       success: true,
       message: 'Flow execution started. Follow progress via WebSocket events.',
       flowSpecId: id,
+      flowRunId,
     });
   } catch (error: any) {
     logger.error('[FLOW_SPEC_CONTROLLER] Run failed', { error: error.message });
