@@ -250,7 +250,9 @@ export async function executeApiTest(
     const fetchOptions: RequestInit = {
       method,
       headers,
-      signal: AbortSignal.timeout(timeout),
+      signal: request.signal
+        ? AbortSignal.any([AbortSignal.timeout(timeout), request.signal])
+        : AbortSignal.timeout(timeout),
     };
 
     // Add body for POST, PUT, PATCH

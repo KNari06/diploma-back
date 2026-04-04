@@ -159,6 +159,10 @@ export class ApiTestStorageService {
           user_agent: 'QAI-Backend',
           workspace_id: params.workspaceId || null,
           project_id: params.projectId || null,
+          // API Flow tracking columns (optional — set when execution is part of a flow)
+          ...(params.metadata?.flow_spec_id ? { flow_spec_id: params.metadata.flow_spec_id } : {}),
+          ...(params.metadata?.flow_run_id ? { flow_run_id: params.metadata.flow_run_id } : {}),
+          ...(params.metadata?.flow_step_index !== undefined ? { flow_step_index: params.metadata.flow_step_index } : {}),
         })
         .select('id')
         .single();

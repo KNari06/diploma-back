@@ -184,6 +184,15 @@ export const COMMAND_EXECUTOR_CONFIG = {
 
   /** Max age of cached DOM nodes before re-collecting (ms) */
   domCacheMaxAgeMs: 1_500,
+
+  /** Hard cap on self-healing duration per step (ms). Prevents 40s+ hangs from scroll-retry chains. */
+  healTimeoutMs: 20_000,
+
+  /** Stop run after N consecutive step failures (cascading failure detection) */
+  maxConsecutiveFailuresBeforeTermination: 3,
+
+  /** Flag step for human review after N heals across runs (flakiness indicator) */
+  healCountReviewThreshold: 3,
 } as const;
 
 // ─── Preview Step Apply ───────────────────────────────────────────────────────

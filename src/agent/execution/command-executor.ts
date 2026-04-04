@@ -17,7 +17,7 @@ import { getLocator, getSmartLocator, isSelectorRelatedError, normalizeSelector,
 import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/smart-wait.service';
 import type { ReplayTraceWriter } from '../playwright/core/replay-trace-writer';
 import { executeCoordinateDrag, parseDragCoordinates } from '../playwright/core/drag-helpers';
-import { buildRuntimeMeta, executeCompiledLocatorPlan } from './compiled-locator-executor';
+import { buildRuntimeMeta, executeCompiledLocatorPlan, quickFingerprintCheck } from './compiled-locator-executor';
 import {
   buildGlobWaitPayload,
   buildRegexWaitPayload,
@@ -27,6 +27,52 @@ import {
   matchSubstring,
   parseRegexString,
 } from './url-pattern-matcher';
+
+/**
+ * Smart screenshot: captures current viewport + buffer above/below for vision-based element resolution.
+ * Instead of fullPage (5000px, expensive) or viewport-only (720px, misses nearby off-screen elements),
+ * captures a ~1020px window around the current scroll position.
+ *
+ * Coverage: scrollY - 100px (sticky headers, just-scrolled-past elements)
+ *        to scrollY + viewportH + 200px (elements just below fold)
+ *
+ * Size: ~150KB JPEG vs ~500KB fullPage — optimized for LLM vision tokens.
+ */
+async function captureSmartScreenshot(page: Page): Promise<string | null> {
+  try {
+    const dims = await page.evaluate(() => ({
+      scrollY: (globalThis as any).scrollY || 0,
+      viewportH: (globalThis as any).innerHeight || 720,
+      pageH: (globalThis as any).document?.documentElement?.scrollHeight || 720,
+      viewportW: (globalThis as any).innerWidth || 1280,
+    }));
+
+    const clipTop = Math.max(0, dims.scrollY - 100);
+    const clipBottom = Math.min(dims.pageH, dims.scrollY + dims.viewportH + 200);
+    const clipHeight = clipBottom - clipTop;
+
+    // Guard: clip must have meaningful dimensions
+    if (clipHeight < 100 || dims.viewportW < 100) {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
+      return buf.toString('base64');
+    }
+
+    const buf = await page.screenshot({
+      clip: { x: 0, y: clipTop, width: dims.viewportW, height: clipHeight },
+      type: 'jpeg',
+      quality: 70,
+    });
+    return buf.toString('base64');
+  } catch {
+    // Fallback: plain viewport screenshot if clip fails (page navigating, crashed, etc.)
+    try {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
+      return buf.toString('base64');
+    } catch {
+      return null;
+    }
+  }
+}
 
 /**
  * Adaptive post-hover settle: waits for hover-triggered DOM effects (tooltips, menus, popovers)
@@ -199,6 +245,8 @@ interface RetryContext {
   cachedDomNodes: any[] | null;
   /** Total candidates found across all stages on all previous attempts */
   totalCandidatesEver: number;
+  /** Whether scroll-retry was already attempted for lazy content detection */
+  scrollAttempted?: boolean;
 }
 
 /**
@@ -1226,10 +1274,27 @@ export class CommandExecutor {
             const sParts = (typeof command.value === 'string' ? command.value : String(command.value)).split(',');
             const sDy = parseFloat(sParts[0] || '') || 300;
             const sDx = sParts.length > 1 ? (parseFloat(sParts[1] || '') || 0) : 0;
-            await this.page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
-              // @ts-expect-error - browser context
-              window.scrollBy(dx, dy);
-            }, { dx: sDx, dy: sDy });
+
+            // Container scroll support: use recorded container selector if available
+            const scrollContainerSel = (command as any).intentMeta?.options?.scrollContainer
+              || (command as any).options?.scrollContainer;
+            if (scrollContainerSel) {
+              await this.page.evaluate(({ sel, dx, dy }: { sel: string; dx: number; dy: number }) => {
+                // @ts-expect-error - browser context
+                const container = document.querySelector(sel);
+                if (container) {
+                  container.scrollBy(dx, dy);
+                } else {
+                  // @ts-expect-error - browser context
+                  window.scrollBy(dx, dy);
+                }
+              }, { sel: scrollContainerSel, dx: sDx, dy: sDy });
+            } else {
+              await this.page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
+                // @ts-expect-error - browser context
+                window.scrollBy(dx, dy);
+              }, { dx: sDx, dy: sDy });
+            }
           } else {
             await this.page.evaluate(() => {
               // @ts-expect-error - browser context
@@ -3234,6 +3299,63 @@ export class CommandExecutor {
         if (domNodes.length === 0) {
           logger.warn('[COMMAND_EXECUTOR] No interactive nodes collected', { stepId });
         } else {
+          // Evidence shortcut: if lastSuccessRef exists in current DOM, use it directly (skip LLM)
+          // Same logic as preview lint evidence shortcut, but here in background pipeline.
+          // Saves 1-2s LLM call when element hasn't changed between runs.
+          if (intentMeta.evidence?.lastSuccessRef && retryCtx.attempt === 0) {
+            const cachedRef = intentMeta.evidence.lastSuccessRef;
+            const cachedNode = domNodes.find(n => n.ref === cachedRef);
+
+            if (cachedNode && cachedNode.isVisible !== false) {
+              // Semantic validation: check bindingHints still match (refs can shift after navigation)
+              let semanticOk = true;
+              if (intentMeta.bindingHints) {
+                const hints = intentMeta.bindingHints;
+                const nodeTexts = [cachedNode.labelText, cachedNode.ariaLabel, cachedNode.name, cachedNode.placeholder, cachedNode.text]
+                  .filter(Boolean).map(t => t!.toLowerCase());
+                const hintValues = [hints.label, hints.nearText, hints.autocomplete]
+                  .filter(Boolean).map(t => t!.toLowerCase());
+                if (hintValues.length > 0 && nodeTexts.length > 0) {
+                  semanticOk = hintValues.some(h => nodeTexts.some(n => n.includes(h) || h.includes(n)));
+                }
+              }
+
+              if (semanticOk) {
+                const refLocator = (iframeSelector
+                  ? this.page.frameLocator(iframeSelector).locator(`[data-agent-ref="${cachedRef}"]`)
+                  : this.page.locator(`[data-agent-ref="${cachedRef}"]`)
+                ).first();
+
+                try {
+                  await refLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 3000) });
+
+                  logger.info('[COMMAND_EXECUTOR] Evidence shortcut hit — skipping LLM', {
+                    stepId, cachedRef,
+                    nodeTag: cachedNode.tag,
+                    nodeLabel: (cachedNode.labelText || cachedNode.ariaLabel || '').slice(0, 40),
+                  });
+
+                  const runtimeMeta: StepRuntimeMeta = {
+                    runtimeStatus: 'executed',
+                    source: 'resolver',
+                    confidenceTier: 'high',
+                    executionMs: Date.now() - startTime,
+                    usedLocatorStrategy: 'evidence_shortcut',
+                    resolutionPath: 'evidence',
+                  };
+                  this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+                  return { locator: refLocator, runtimeMeta };
+                } catch {
+                  // Evidence ref not visible — fall through to full LLM resolution
+                  logger.debug('[COMMAND_EXECUTOR] Evidence shortcut failed (not visible)', { stepId, cachedRef });
+                }
+              } else {
+                logger.debug('[COMMAND_EXECUTOR] Evidence shortcut semantic mismatch', { stepId, cachedRef });
+              }
+            }
+          }
+
           // Run LLM-based element resolution
           const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
           // V14: Lazy screenshot callback for vision rescue when 0 candidates match
@@ -3250,12 +3372,7 @@ export class CommandExecutor {
             domNodes,
             pageUrl: this.page.url(),
             includeAlternatives: false,
-            screenshot: async () => {
-              try {
-                const buf = await pageForScreenshot.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
-                return buf.toString('base64');
-              } catch { return null; }
-            },
+            screenshot: () => captureSmartScreenshot(pageForScreenshot),
           });
 
           if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
@@ -3272,20 +3389,29 @@ export class CommandExecutor {
 
               await finalLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
 
-              // Validate element fingerprint: verify the resolved element matches expectations
+              // Validate element fingerprint: full 8-attribute check (same as Stage 1 compiled plan)
               // Catches race conditions where DOM changed between collection and resolution
               const expectedNode = topCandidate.node;
               if (expectedNode) {
-                const actualTag = await finalLocator.evaluate((el: any) => el?.tagName?.toLowerCase()).catch(() => '');
-                if (actualTag && expectedNode.tag && actualTag !== expectedNode.tag.toLowerCase()) {
-                  logger.warn('[COMMAND_EXECUTOR] Element fingerprint mismatch after resolution', {
+                const fpScore = await quickFingerprintCheck(this.page, finalLocator, {
+                  tag: expectedNode.tag,
+                  role: expectedNode.role,
+                  ariaLabel: expectedNode.ariaLabel,
+                  placeholder: expectedNode.placeholder,
+                  labelText: expectedNode.labelText,
+                  testIdAttr: expectedNode.testIdAttr,
+                  containerTitles: expectedNode.containerTitles,
+                  boundingBox: expectedNode.boundingBox,
+                });
+                if (fpScore < 0.3) {
+                  logger.warn('[COMMAND_EXECUTOR] Element fingerprint mismatch after LLM resolution', {
                     stepId,
-                    expectedTag: expectedNode.tag,
-                    actualTag,
                     ref: topCandidate.ref,
+                    fpScore,
+                    expectedTag: expectedNode.tag,
+                    expectedLabel: expectedNode.labelText || expectedNode.ariaLabel,
                   });
-                  // Don't use this element - fall through to smart locator / self-heal
-                  throw new Error(`Element mismatch: expected <${expectedNode.tag}>, found <${actualTag}>`);
+                  throw new Error(`Fingerprint validation failed: score ${fpScore} < 0.3 for <${expectedNode.tag}>`);
                 }
               }
 
@@ -3333,6 +3459,87 @@ export class CommandExecutor {
           // V11: Track candidate count for fail-fast heuristic
           if (resolveResult.candidates.length > 0) {
             retryCtx.totalCandidatesEver += resolveResult.candidates.length;
+          } else if (!retryCtx.scrollAttempted) {
+            // 0 candidates: element may be lazy-loaded below fold.
+            // Scroll down once, re-collect DOM, retry resolution before giving up.
+            retryCtx.scrollAttempted = true;
+            try {
+              const scrolled = await this.page.evaluate(() => {
+                const before = (globalThis as any).scrollY;
+                (globalThis as any).scrollBy(0, (globalThis as any).innerHeight * 0.8);
+                return (globalThis as any).scrollY !== before;
+              });
+
+              if (scrolled) {
+                await this.page.waitForTimeout(500); // Wait for lazy content to render
+
+                const freshNodes = await collectInteractiveNodes(this.page, this.maxDomNodes);
+                if (freshNodes.length > domNodes.length) {
+                  logger.info('[COMMAND_EXECUTOR] Scroll revealed new elements, retrying resolution', {
+                    stepId,
+                    beforeNodes: domNodes.length,
+                    afterNodes: freshNodes.length,
+                  });
+
+                  retryCtx.cachedDomNodes = freshNodes;
+                  retryCtx.lastDomCollectionTs = Date.now();
+
+                  const scrollResolve = await resolveElement({
+                    previewSessionId: 'background',
+                    stepDraft: {
+                      id: stepId,
+                      type: intentMeta.actionType as any,
+                      description: intentMeta.intentDescription,
+                      bindingHints: intentMeta.bindingHints,
+                      evidence: intentMeta.evidence,
+                    },
+                    domNodes: freshNodes,
+                    pageUrl: this.page.url(),
+                    includeAlternatives: false,
+                    screenshot: () => captureSmartScreenshot(this.page),
+                  });
+
+                  if (scrollResolve.status === 'resolved' && scrollResolve.candidates.length > 0) {
+                    const scrollCandidate = scrollResolve.candidates[0];
+                    if (scrollCandidate.ref) {
+                      const scrollLocator = (iframeSelector
+                        ? this.page.frameLocator(iframeSelector).locator(`[data-agent-ref="${scrollCandidate.ref}"]`)
+                        : this.page.locator(`[data-agent-ref="${scrollCandidate.ref}"]`)
+                      ).first();
+
+                      await scrollLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
+
+                      const runtimeMeta: StepRuntimeMeta = {
+                        runtimeStatus: 'healed',
+                        source: 'resolver',
+                        confidenceTier: scrollCandidate.confidence >= 0.85 ? 'high' : 'medium',
+                        executionMs: Date.now() - startTime,
+                        usedLocatorStrategy: 'llm_resolver_scroll',
+                        healConfidence: scrollCandidate.confidence,
+                        resolutionPath: 'llm_resolver',
+                        needsReview: scrollCandidate.confidence < 0.85,
+                      };
+                      this.stepRuntimeMeta.set(stepId, runtimeMeta);
+
+                      logger.info('[COMMAND_EXECUTOR] Scroll + LLM resolution succeeded', {
+                        stepId,
+                        ref: scrollCandidate.ref,
+                        confidence: scrollCandidate.confidence,
+                      });
+
+                      return { locator: scrollLocator, runtimeMeta };
+                    }
+                  }
+                }
+              }
+            } catch (scrollError) {
+              logger.debug('[COMMAND_EXECUTOR] Scroll-retry failed (non-fatal)', {
+                stepId,
+                error: scrollError instanceof Error ? scrollError.message : String(scrollError),
+              });
+            }
+
+            retryCtx.stageDeterministicFail.resolver = true;
           } else {
             retryCtx.stageDeterministicFail.resolver = true;
           }

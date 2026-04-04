@@ -5,6 +5,7 @@ import explorationsRoutes from '@/api/explorations/explorations.route';
 import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
+import apiFlowSpecRoutes from '@/api/apiFlowSpec/apiFlowSpec.route';
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
@@ -1275,6 +1276,7 @@ app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testC
 app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes);
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
+app.use(`/api/${env.API_VERSION}/api-flow-spec`, requireAuth, requireApproved, apiFlowSpecRoutes);
 app.use(`/api/${env.API_VERSION}/api-config`, requireAuth, requireApproved, apiConfigRoutes);
 // jira: OAuth callback is public (Atlassian redirects with code/state, no Bearer); router applies auth to all other routes
 app.use(`/api/${env.API_VERSION}/jira`, jiraRoutes);

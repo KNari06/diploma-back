@@ -479,9 +479,14 @@ async function verifyActionEffect(
       }
 
       case 'type': {
-        // Verify the input has a value
-        const value = await locator.inputValue().catch(() => '');
-        return value.length > 0 || step.value === ''; // Empty type is valid
+        // Verify the input contains the expected value (not just non-empty)
+        const actualValue = await locator.inputValue().catch(() => '');
+        if (step.value === '') return true; // Empty type is valid
+        if (actualValue.length === 0) return false; // Expected non-empty but got empty
+        // Check actual value matches expected (trim to handle whitespace diffs)
+        const expected = (step.value || '').trim();
+        const actual = actualValue.trim();
+        return actual === expected || actual.includes(expected) || expected.includes(actual);
       }
 
       case 'click': {
@@ -953,6 +958,12 @@ async function executeAction(
     // V7: Use pre-resolved locator if provided, otherwise build from selector
     const locator = preResolvedLocator || (selector ? (context as Page | FrameLocator).locator(selector) : undefined);
 
+    // Scroll element into viewport before action (fullPage snapshots can resolve off-screen elements)
+    // Skip for non-targeting actions that don't need a visible element
+    if (locator && !['navigate', 'wait', 'wait_for', 'scroll'].includes(step.type)) {
+      await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
+    }
+
     // Ensure element stability before action (unless disabled)
     if (locator && step.type !== 'navigate' && step.type !== 'wait') {
       await ensureStability(locator, step, timeout);
@@ -1063,9 +1074,40 @@ async function executeAction(
           // Legacy behavior: append typing (uses keyPressDelay if provided)
           await locator.click({ timeout });
           await locator.pressSequentially(value, { timeout, delay: step.options?.keyPressDelay });
+        } else if (value.length <= 50) {
+          // Short text (credentials, emails, OTP, validation data): use pressSequentially
+          // for full keyboard event chain — frameworks that rely on keydown/keyup won't miss input.
+          // Cost: ~20ms × N chars = max 1s for 50 chars — acceptable for reliability.
+          await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
+          await locator.click({ timeout });
+          await locator.pressSequentially(value, { timeout, delay: 20 });
         } else {
-          // Default: fast fill
+          // Long text (comments, descriptions): fast fill with post-blur fallback
           await locator.fill(value, { timeout });
+
+          // Post-fill verification: check value survived after triggering blur.
+          // Some frameworks (WPForms, React controlled inputs) clear fill() values
+          // because they only track state via keyboard events, not programmatic value sets.
+          try {
+            // Trigger blur by pressing Tab (moves focus to next field)
+            await locator.press('Tab', { timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(100); // Let framework process blur
+            // Re-focus to check value
+            await locator.focus({ timeout: 2000 }).catch(() => {});
+            const postBlurValue = await locator.inputValue().catch(() => '');
+            if (value && postBlurValue.trim() !== value.trim()) {
+              logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
+                expected: value.slice(0, 50),
+                actual: postBlurValue.slice(0, 50),
+              });
+              // Clear and retry with pressSequentially (generates full keyboard event chain)
+              await locator.fill('', { timeout }).catch(() => {});
+              await locator.click({ timeout });
+              await locator.pressSequentially(value, { timeout, delay: 30 });
+            }
+          } catch {
+            // Non-critical — best effort fallback
+          }
         }
         if (step.options?.pressEnter) {
           await locator.press('Enter', { timeout });
@@ -1157,8 +1199,6 @@ async function executeAction(
 
       case 'hover': {
         if (!locator) throw new Error('No selector for hover action');
-        // Scroll element into viewport before hovering (prevents out-of-viewport misses)
-        await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
         try {
           await locator.hover({ timeout });
         } catch {
@@ -1193,9 +1233,24 @@ async function executeAction(
           const rawDeltaX = valueParts.length > 1 ? parseFloat(valueParts[1] || '') : 0;
           const deltaY = Number.isFinite(rawDeltaY) ? rawDeltaY : 300;
           const deltaX = Number.isFinite(rawDeltaX) ? rawDeltaX : 0;
-          await page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
-            (globalThis as any).scrollBy(dx, dy);
-          }, { dx: deltaX, dy: deltaY });
+
+          // Container scroll: if scrollContainer selector recorded, scroll that element instead of window
+          const containerSel = step.options?.scrollContainer;
+          if (containerSel) {
+            await page.evaluate(({ sel, dx, dy }: { sel: string; dx: number; dy: number }) => {
+              const container = (globalThis as any).document.querySelector(sel);
+              if (container) {
+                container.scrollBy(dx, dy);
+              } else {
+                // Fallback to window scroll if container not found
+                (globalThis as any).scrollBy(dx, dy);
+              }
+            }, { sel: containerSel, dx: deltaX, dy: deltaY });
+          } else {
+            await page.evaluate(({ dx, dy }: { dx: number; dy: number }) => {
+              (globalThis as any).scrollBy(dx, dy);
+            }, { dx: deltaX, dy: deltaY });
+          }
         }
         // Post-scroll settle — give lazy-loaded content time to appear
         await sleepMs(page, STEP_READINESS_CONFIG.domStableThresholdMs.assertion);

@@ -13,6 +13,7 @@
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import { DOMNodeExtractor } from './dom-node-extractor';
+import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { AISelectorEngine } from './index';
 import type { DOMNode, SelectorType, SelfHealingResult } from './types';
 import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
@@ -24,20 +25,50 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 export class SelfHealingService {
   /**
-   * Attempt to heal a broken selector
-   * Called when element is not found during test execution
+   * Attempt to heal a broken selector with overall timeout guard.
+   * Prevents 40s+ hangs from scroll-retry + vision + LLM chains.
    */
   static async healSelector(params: {
-    oldSelector: string; // Selector that failed
-    intent: string; // What we're trying to do (from action.description)
-    page: Page; // Current page
-    errorMessage: string; // Error from Playwright
-    metadata: {
-      url: string;
-      projectId?: string;
-      userId?: string;
-    };
-    mode?: 'fast' | 'accurate'; // Fast: DOM only, Accurate: + screenshot
+    oldSelector: string;
+    intent: string;
+    page: Page;
+    errorMessage: string;
+    metadata: { url: string; projectId?: string; userId?: string };
+    mode?: 'fast' | 'accurate';
+  }): Promise<SelfHealingResult> {
+    const timeoutMs = COMMAND_EXECUTOR_CONFIG.healTimeoutMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      return await Promise.race([
+        this._healSelectorInternal(params),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Self-healing timeout')), timeoutMs);
+        }),
+      ]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Self-healing timeout';
+      logger.warn('[SELF_HEALING] Timeout exceeded', { timeoutMs, intent: params.intent.slice(0, 60), mode: params.mode });
+      return {
+        success: false,
+        oldSelector: params.oldSelector,
+        diff: { what_changed: msg, old_strategy: 'css' as any, new_strategy: 'css' as any, confidence: 0 },
+        suggestion: msg,
+        autoApplied: false,
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Internal heal logic — called by healSelector with timeout guard */
+  private static async _healSelectorInternal(params: {
+    oldSelector: string;
+    intent: string;
+    page: Page;
+    errorMessage: string;
+    metadata: { url: string; projectId?: string; userId?: string };
+    mode?: 'fast' | 'accurate';
   }): Promise<SelfHealingResult> {
     const { oldSelector, intent, page, metadata, mode = 'fast' } = params;
 
@@ -73,10 +104,35 @@ export class SelfHealingService {
         };
       }
 
-      // Step 2: Get page DOM and optionally screenshot
+      // Step 2: Get page DOM and optionally smart screenshot
+      // Smart screenshot captures viewport + 100px above + 200px below current scroll
+      // (~1020px total) instead of viewport-only (720px) or fullPage (5000px).
+      const captureScreenshot = async (): Promise<string | undefined> => {
+        try {
+          const dims = await page.evaluate(() => ({
+            scrollY: (globalThis as any).scrollY || 0,
+            viewportH: (globalThis as any).innerHeight || 720,
+            pageH: (globalThis as any).document?.documentElement?.scrollHeight || 720,
+            viewportW: (globalThis as any).innerWidth || 1280,
+          }));
+          const clipTop = Math.max(0, dims.scrollY - 100);
+          const clipBottom = Math.min(dims.pageH, dims.scrollY + dims.viewportH + 200);
+          const buf = await page.screenshot({
+            clip: { x: 0, y: clipTop, width: dims.viewportW, height: clipBottom - clipTop },
+            type: 'jpeg',
+            quality: 70,
+          });
+          return buf.toString('base64');
+        } catch {
+          // Fallback: plain viewport
+          const buf = await page.screenshot({ type: 'jpeg', quality: 70 }).catch(() => null);
+          return buf?.toString('base64');
+        }
+      };
+
       const [dom, screenshot] = await Promise.all([
         page.content(),
-        mode === 'accurate' ? page.screenshot({ type: 'png' }).then(b => b.toString('base64')) : Promise.resolve(undefined),
+        mode === 'accurate' ? captureScreenshot() : Promise.resolve(undefined),
       ]);
 
       // Step 3: Get viewport

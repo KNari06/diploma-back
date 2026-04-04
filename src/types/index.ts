@@ -502,6 +502,7 @@ export interface ApiTestRequest {
   body?: any;
   expectedStatus?: number;
   timeout?: number; // milliseconds, default 10000
+  signal?: AbortSignal; // optional external abort signal (combined with timeout via AbortSignal.any)
 }
 
 export interface ApiTestResponse {

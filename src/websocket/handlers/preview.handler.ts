@@ -54,7 +54,7 @@ const hoverProbeState = new Map<string, {
 const HOVER_PROBE_THROTTLE_MS = 200;
 
 /** Per-session scroll debounce timers */
-const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout }>();
+const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout; containerSelector?: string | null }>();
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
@@ -130,17 +130,19 @@ async function flushPendingScroll(
     const now = Date.now();
     const withinMergeWindow = lastScrollStep && (now - lastScrollStep.emittedAt) < RECORDING_SCROLL_MERGE_WINDOW_MS;
 
+    const flushContainerSel = pendingScroll.containerSelector ?? null;
+
     if (withinMergeWindow && lastScrollStep) {
       const mergedDelta = lastScrollStep.totalDelta + pendingScroll.deltaY;
       const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + pendingScroll.deltaX;
-      const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined);
+      const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined, flushContainerSel);
       if (scrollStep) {
         scrollStep.id = lastScrollStep.id;
         socket.nsp.to(room).emit('preview:recording:step:update', { previewSessionId, step: scrollStep, timestamp: new Date().toISOString() });
         sessionService.setRecordingLastScrollStep(previewSessionId, userId, { id: lastScrollStep.id, totalDelta: mergedDelta, totalDeltaX: mergedDeltaX, emittedAt: now });
       }
     } else {
-      const scrollStep = RecordingCaptureService.captureScroll(pendingScroll.deltaY, scrollPageUrl, pendingScroll.deltaX, scrollTargetHints ?? undefined);
+      const scrollStep = RecordingCaptureService.captureScroll(pendingScroll.deltaY, scrollPageUrl, pendingScroll.deltaX, scrollTargetHints ?? undefined, flushContainerSel);
       if (scrollStep) {
         emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: scrollStep });
         const fTrace = EditorTraceService.get(previewSessionId);
@@ -1913,14 +1915,29 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const accumulatedDeltaX = (existing?.deltaX ?? 0) + (data.deltaX ?? 0);
           if (existing) clearTimeout(existing.timer);
 
+          // Detect scrollable container on first wheel event (if x,y provided by frontend)
+          // Reuse container from existing accumulator if already detected
+          let containerSelector = existing?.containerSelector;
+          if (containerSelector === undefined && typeof data.x === 'number' && typeof data.y === 'number') {
+            try {
+              const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
+              const scrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
+              if (scrollPage) {
+                containerSelector = await RecordingCaptureService.detectScrollContainer(scrollPage, data.x, data.y);
+              }
+            } catch { /* non-critical */ }
+          }
+
           recordingScrollTimers.set(previewSessionId, {
             deltaY: accumulatedDeltaY,
             deltaX: accumulatedDeltaX,
+            containerSelector,
             timer: setTimeout(async () => {
               try {
                 const scrollState = recordingScrollTimers.get(previewSessionId);
                 const finalDeltaY = scrollState?.deltaY ?? accumulatedDeltaY;
                 const finalDeltaX = scrollState?.deltaX ?? accumulatedDeltaX;
+                const finalContainerSelector = scrollState?.containerSelector ?? null;
                 recordingScrollTimers.delete(previewSessionId);
                 if (finalDeltaY === 0 && finalDeltaX === 0) return;
 
@@ -1955,7 +1972,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   // Same direction or continuation — merge deltas
                   const mergedDelta = lastScrollStep.totalDelta + finalDeltaY;
                   const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + finalDeltaX;
-                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined);
+                  const scrollStep = RecordingCaptureService.captureScroll(mergedDelta, scrollPageUrl, mergedDeltaX, scrollTargetHints ?? undefined, finalContainerSelector);
                   if (scrollStep) {
                     scrollStep.id = lastScrollStep.id; // Reuse original step id
                     socket.nsp.to(room).emit('preview:recording:step:update', {
@@ -1971,7 +1988,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }
                 } else {
                   // New scroll sequence — emit new step
-                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl, finalDeltaX, scrollTargetHints ?? undefined);
+                  const scrollStep = RecordingCaptureService.captureScroll(finalDeltaY, scrollPageUrl, finalDeltaX, scrollTargetHints ?? undefined, finalContainerSelector);
                   if (scrollStep) {
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
                     if (sTrace) sTrace.writeStepCaptured(scrollStep, 'scroll');

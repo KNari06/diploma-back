@@ -212,6 +212,15 @@ export interface ServerToClientEvents {
 
   // Heartbeat response (echoes client timestamp for RTT measurement)
   pong: (data: { t?: number }) => void;
+
+  // API Flow events
+  'api:flow:parsing': (data: ApiFlowParsingPayload) => void;
+  'api:flow:dag-ready': (data: ApiFlowDagReadyPayload) => void;
+  'api:flow:step-start': (data: ApiFlowStepStartPayload) => void;
+  'api:flow:step-complete': (data: ApiFlowStepCompletePayload) => void;
+  'api:flow:variable-extracted': (data: ApiFlowVariableExtractedPayload) => void;
+  'api:flow:completed': (data: ApiFlowCompletedPayload) => void;
+  'api:flow:failed': (data: ApiFlowFailedPayload) => void;
 }
 
 // ============================================================================
@@ -1215,6 +1224,9 @@ export interface PreviewMouseWheelRequest {
   previewSessionId: string;
   deltaX: number;
   deltaY: number;
+  /** Viewport coordinates where wheel event occurred (for container scroll detection) */
+  x?: number;
+  y?: number;
 }
 
 /**
@@ -1731,4 +1743,90 @@ export function getActionEmoji(actionType?: string): string {
   };
 
   return emojiMap[actionType] || '🔄';
+}
+
+// ============================================================================
+// API FLOW PAYLOAD TYPES
+// ============================================================================
+
+export interface ApiFlowParsingPayload {
+  flowSpecId: string; // 'pending' during initial parse
+  sessionId: string;
+  stage: 'fetching_spec' | 'parsing' | 'analyzing_dependencies' | 'building_dag';
+  message: string;
+  progress: number; // 0-100
+  timestamp: string;
+}
+
+export interface ApiFlowDagReadyPayload {
+  flowSpecId: string;
+  sessionId: string;
+  nodes: any[]; // ReactFlowNode[]
+  edges: any[]; // ReactFlowEdge[]
+  totalEndpoints: number;
+  unsupportedEndpoints: Array<{ method: string; path: string; reason: string }>;
+  variableChain: Record<string, any>;
+  timestamp: string;
+}
+
+export interface ApiFlowStepStartPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  stepIndex: number;
+  nodeId: string;
+  method: string;
+  path: string;
+  resolvedUrl: string;
+  variablesInjected: string[]; // variable names used
+  timestamp: string;
+}
+
+export interface ApiFlowStepCompletePayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  stepIndex: number;
+  nodeId: string;
+  success: boolean;
+  statusCode: number;
+  durationMs: number;
+  variablesExtracted: Array<{ name: string; value: string }>;
+  error?: string;
+  timestamp: string;
+}
+
+export interface ApiFlowVariableExtractedPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  variableName: string;
+  extractedFrom: string; // e.g. "POST /auth/login → $.data.token"
+  value: string; // masked for sensitive values (tokens show first 8 chars + ***)
+  timestamp: string;
+}
+
+export interface ApiFlowCompletedPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    skipped: number;
+    totalDurationMs: number;
+    variablesResolved: number;
+  };
+  timestamp: string;
+}
+
+export interface ApiFlowFailedPayload {
+  flowSpecId: string;
+  flowRunId: string;
+  sessionId: string;
+  error: string;
+  failedAtStep?: number;
+  failedAtNodeId?: string;
+  timestamp: string;
 }

@@ -313,6 +313,39 @@ export async function parseIntent(
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // FAST PATH: Swagger/OpenAPI URL detection → api_flow_test
+  // Skip AI when the message obviously contains a spec URL
+  // ═══════════════════════════════════════════════════════════════════════
+  if (!parsedIntent) {
+    const SWAGGER_URL_PATTERN = /https?:\/\/[^\s]+\/(swagger|openapi|api-docs)[^\s]*/i;
+    const SPEC_FILE_URL = /https?:\/\/[^\s]+\.(json|yaml|yml)(\?[^\s]*)?/i;
+    const msgLower = validMessage.toLowerCase();
+
+    const hasSwaggerUrl = SWAGGER_URL_PATTERN.test(validMessage);
+    const hasSpecFileUrl = SPEC_FILE_URL.test(validMessage) &&
+      (msgLower.includes('swagger') || msgLower.includes('openapi') || msgLower.includes('spec') || msgLower.includes('api') || msgLower.includes('flow'));
+    const hasCurlBlock = msgLower.includes('curl ') && msgLower.includes('http');
+
+    if (hasSwaggerUrl || hasSpecFileUrl || hasCurlBlock) {
+      logger.info('[CHAT] Fast path: Swagger/OpenAPI spec URL detected', {
+        hasSwaggerUrl,
+        hasSpecFileUrl,
+        hasCurlBlock,
+      });
+      parsedIntent = {
+        intent: 'api_flow_test',
+        intent_confidence: 0.95,
+        confidence: 0.95,
+        rawText: validMessage,
+        metadata: {
+          source: 'fast_path_swagger_url',
+          parsedAt: new Date().toISOString(),
+        },
+      };
+    }
+  }
+
   // Normal path: Use AI to parse intent (if fast path didn't set parsedIntent)
   if (!parsedIntent) {
     // Check if request was cancelled
@@ -550,6 +583,9 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
 
     case 'mobile_test':
       return 'Got it! Starting mobile test...';
+
+    case 'api_flow_test':
+      return 'Got it! Building API flow from spec...';
 
     default:
       return 'Intent understood!';

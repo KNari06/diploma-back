@@ -674,7 +674,39 @@ export class IntentStepLintService {
           // V6: Validate cached node is compatible with action type (not just visible/enabled)
           const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
 
-        if (compat.ok) {
+          // Semantic validation: check that the cached node's label/name still matches
+          // the step description. Refs can get reassigned after page navigation (counter resets),
+          // so the same ref might point to a completely different element.
+          let semanticMismatch = false;
+          if (compat.ok && stepDraft.bindingHints) {
+            const hints = stepDraft.bindingHints;
+            const nodeTexts = [
+              cachedNode.labelText, cachedNode.ariaLabel, cachedNode.name,
+              cachedNode.placeholder, cachedNode.text,
+            ].filter(Boolean).map(t => t!.toLowerCase());
+
+            // Check if ANY hint matches ANY node text
+            const hintValues = [hints.label, hints.nearText, hints.autocomplete]
+              .filter(Boolean).map(t => t!.toLowerCase());
+
+            if (hintValues.length > 0 && nodeTexts.length > 0) {
+              const hasMatch = hintValues.some(h =>
+                nodeTexts.some(n => n.includes(h) || h.includes(n))
+              );
+              if (!hasMatch) {
+                semanticMismatch = true;
+                logger.info('[INTENT_LINT] Evidence shortcut semantic mismatch — ref may have shifted', {
+                  previewSessionId,
+                  cachedRef,
+                  hints: hintValues.slice(0, 3),
+                  nodeTexts: nodeTexts.slice(0, 3),
+                  stepDescription: stepDraft.description?.slice(0, 50),
+                });
+              }
+            }
+          }
+
+        if (compat.ok && !semanticMismatch) {
           logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
             previewSessionId,
             cachedRef,
@@ -756,7 +788,21 @@ export class IntentStepLintService {
         try {
           const page = sessionService.getPage(previewSessionId, userId);
           if (!page) return null;
-          const buf = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
+          // Smart screenshot: viewport + 100px above + 200px below current scroll
+          // Covers nearby off-screen elements without fullPage cost
+          const dims = await page.evaluate(() => ({
+            scrollY: (globalThis as any).scrollY || 0,
+            viewportH: (globalThis as any).innerHeight || 720,
+            pageH: (globalThis as any).document?.documentElement?.scrollHeight || 720,
+            viewportW: (globalThis as any).innerWidth || 1280,
+          }));
+          const clipTop = Math.max(0, dims.scrollY - 100);
+          const clipBottom = Math.min(dims.pageH, dims.scrollY + dims.viewportH + 200);
+          const buf = await page.screenshot({
+            clip: { x: 0, y: clipTop, width: dims.viewportW, height: clipBottom - clipTop },
+            type: 'jpeg',
+            quality: 70,
+          });
           return buf.toString('base64');
         } catch { return null; }
       },
