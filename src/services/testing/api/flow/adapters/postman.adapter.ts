@@ -4,7 +4,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
-import type { HttpMethod, ParsedApiSpec, ParsedEndpoint, ParsedParameter } from '../flow.types';
+import type { AuthScheme, HttpMethod, ParsedApiSpec, ParsedEndpoint, ParsedParameter } from '../flow.types';
 
 interface PostmanVariable {
   key: string;
@@ -57,6 +57,13 @@ interface PostmanItem {
   id?: string;
 }
 
+interface PostmanAuth {
+  type?: string; // "bearer", "basic", "apikey", "oauth2"
+  bearer?: Array<{ key: string; value: string }>;
+  basic?: Array<{ key: string; value: string }>;
+  apikey?: Array<{ key: string; value: string }>;
+}
+
 interface PostmanCollection {
   info?: {
     name?: string;
@@ -64,6 +71,7 @@ interface PostmanCollection {
     description?: string;
     version?: string;
   };
+  auth?: PostmanAuth;
   item?: PostmanItem[];
   variable?: PostmanVariable[];
 }
@@ -262,9 +270,43 @@ export function parsePostmanCollection(content: string): ParsedApiSpec {
     });
   }
 
+  // Extract collection-level auth
+  const authSchemes: AuthScheme[] = [];
+  const collectionAuth = collection.auth;
+  if (collectionAuth?.type) {
+    const authType = collectionAuth.type.toLowerCase();
+    if (authType === 'bearer') {
+      authSchemes.push({ name: 'bearerAuth', type: 'bearer' });
+      // Apply to all endpoints that don't have explicit auth
+      for (const ep of endpoints) {
+        if (ep.security.length === 0) {
+          ep.security = ['bearerAuth'];
+        }
+      }
+    } else if (authType === 'basic') {
+      authSchemes.push({ name: 'basicAuth', type: 'basic' });
+      for (const ep of endpoints) {
+        if (ep.security.length === 0) {
+          ep.security = ['basicAuth'];
+        }
+      }
+    } else if (authType === 'apikey') {
+      const keyEntries = collectionAuth.apikey || [];
+      const keyName = keyEntries.find(e => e.key === 'key')?.value || 'X-API-Key';
+      const keyIn = (keyEntries.find(e => e.key === 'in')?.value || 'header') as 'header' | 'query';
+      authSchemes.push({ name: 'apiKey', type: 'apiKey', in: keyIn, headerName: keyName });
+      for (const ep of endpoints) {
+        if (ep.security.length === 0) {
+          ep.security = ['apiKey'];
+        }
+      }
+    }
+  }
+
   logger.info('[POSTMAN_ADAPTER] Parsed collection', {
     title,
     totalEndpoints: endpoints.length,
+    authSchemes: authSchemes.length,
   });
 
   return {
@@ -272,7 +314,7 @@ export function parsePostmanCollection(content: string): ParsedApiSpec {
     version,
     specVersion,
     baseUrl,
-    authSchemes: [],
+    authSchemes,
     endpoints,
     unsupportedEndpoints: [],
     sourceType: 'postman',

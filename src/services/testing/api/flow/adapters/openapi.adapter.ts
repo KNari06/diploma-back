@@ -158,7 +158,10 @@ function parseRequestBody(operation: any, specVersion: string): ParsedRequestBod
     const rb = operation.requestBody;
     if (!rb) return undefined;
     const content = rb.content || {};
-    const contentType = Object.keys(content)[0] || 'application/json';
+    // Prefer application/json over other content types
+    const contentType = content['application/json']
+      ? 'application/json'
+      : (Object.keys(content)[0] || 'application/json');
     const mediaType = content[contentType] || {};
     return {
       contentType,
@@ -283,8 +286,16 @@ export async function parseOpenApiSpec(
         ? dedupedParams.filter((p: any) => p.in !== 'body')
         : dedupedParams;
 
-      const operationId = operation.operationId
+      // Generate unique operationId: use spec's operationId if available,
+      // otherwise method_path (sanitized). Append _N suffix if collision detected.
+      let operationId = operation.operationId
         || `${method.toLowerCase()}_${path.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')}`;
+      const seenOpIds = new Set(endpoints.map(e => e.operationId));
+      if (seenOpIds.has(operationId)) {
+        let suffix = 2;
+        while (seenOpIds.has(`${operationId}_${suffix}`)) suffix++;
+        operationId = `${operationId}_${suffix}`;
+      }
 
       endpoints.push({
         operationId,
@@ -306,6 +317,10 @@ export async function parseOpenApiSpec(
 
   const title = anyDoc.info?.title || 'API';
   const version = anyDoc.info?.version || '1.0.0';
+
+  if (endpoints.length === 0 && unsupportedEndpoints.length === 0) {
+    throw new Error('No API endpoints found in spec. The spec may be empty or all endpoints are unsupported.');
+  }
 
   logger.info('[OPENAPI_ADAPTER] Parsed spec successfully', {
     title,

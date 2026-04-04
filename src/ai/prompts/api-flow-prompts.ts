@@ -35,6 +35,11 @@ function serializeEndpointCompact(ep: ParsedEndpoint, index: number): string {
     ep.deprecated ? 'DEPRECATED' : '',
   ].filter(Boolean).join('|');
 
+  // Explicit security status: empty array = public (no auth), missing = inherits global
+  const securityStr = ep.security.length > 0
+    ? `  security: ${ep.security.join(',')}`
+    : '  security: NONE (public endpoint — do NOT inject auth)';
+
   return [
     `[${index}] ${ep.method} ${ep.path}`,
     `  operationId: ${ep.operationId}`,
@@ -43,9 +48,20 @@ function serializeEndpointCompact(ep: ParsedEndpoint, index: number): string {
     params ? `  params: ${params}` : '',
     reqBody ? `  ${reqBody}` : '',
     respSchema ? `  ${respSchema}` : '',
-    ep.security.length ? `  security: ${ep.security.join(',')}` : '',
+    securityStr,
     flags ? `  flags: ${flags}` : '',
   ].filter(Boolean).join('\n');
+}
+
+function serializeAuthSchemes(schemes: import('@/services/testing/api/flow/flow.types').AuthScheme[]): string {
+  if (schemes.length === 0) return 'none detected';
+  return schemes.map(s => {
+    const parts = [`${s.name}: type=${s.type}`];
+    if (s.in) parts.push(`in=${s.in}`);
+    if (s.headerName) parts.push(`headerName="${s.headerName}"`);
+    if (s.description) parts.push(`desc="${s.description.slice(0, 60)}"`);
+    return parts.join(', ');
+  }).join('\n  ');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,16 +85,22 @@ export function buildSwaggerDependencyPrompt(
   const endpoints = chunkEndpoints || spec.endpoints;
   const endpointList = endpoints.map(serializeEndpointCompact).join('\n\n');
 
-  const authSchemesStr = spec.authSchemes.length
-    ? spec.authSchemes.map(s => `${s.name}(${s.type}${s.in ? ',in:' + s.in : ''})`).join(', ')
-    : 'none detected';
+  const authSchemesStr = serializeAuthSchemes(spec.authSchemes);
 
   return `Analyze these API endpoints and build an execution DAG for sequential testing.
 
 === API INFO ===
 Title: ${spec.title}
 Base URL: ${spec.baseUrl}
-Auth Schemes: ${authSchemesStr}
+
+=== AUTH SCHEMES (from securitySchemes) ===
+  ${authSchemesStr}
+
+IMPORTANT: Use the EXACT headerName from each scheme for injection. For example:
+  - type=bearer → injectAs: "header", targetKey: "Authorization", prefix: "Bearer "
+  - type=apiKey, in=header, headerName="X-API-Key" → injectAs: "header", targetKey: "X-API-Key", NO prefix
+  - type=apiKey, in=query, headerName="api_key" → injectAs: "query_param", targetKey: "api_key"
+  - type=basic → injectAs: "header", targetKey: "Authorization", prefix: "Basic " (value must be base64-encoded "user:pass")
 
 === ENDPOINTS (${endpoints.length} total) ===
 ${endpointList}
@@ -88,7 +110,11 @@ ${endpointList}
 1. AUTH ENDPOINTS FIRST
    - Endpoints with "login", "signin", "token", "auth", "oauth" in path → isAuthEndpoint: true
    - They must have priority 0 and be in executionOrder first
-   - Extract token from their response (look for: access_token, token, jwt, id_token, auth_token fields)
+   - Extract token from their response — look CAREFULLY at the response schema for the exact JSON path:
+     * If response is { access_token: "..." } → jsonPath: "$.access_token"
+     * If response is { data: { token: "..." } } → jsonPath: "$.data.token"
+     * If response is { data: { tokens: { access_token: "..." } } } → jsonPath: "$.data.tokens.access_token"
+     * Always match the EXACT nesting from the response schema, not just top-level
 
 2. DEPENDENCY DETECTION
    - If endpoint B's path has {userId} and endpoint A (POST /users) returns { id: "..." } → B depends on A
@@ -107,10 +133,15 @@ ${endpointList}
    - Extract IDs from newly created resources (POST responses)
 
 4. VARIABLE INJECTION (into requests)
-   - Authorization header: injectAs: "header", targetKey: "Authorization", prefix: "Bearer "
+   - CRITICAL: Match injection to the AUTH SCHEME defined above:
+     * Bearer auth → injectAs: "header", targetKey: "Authorization", prefix: "Bearer "
+     * API Key in header → injectAs: "header", targetKey: "<exact headerName from scheme>" (e.g. "X-API-Key"), NO prefix
+     * API Key in query → injectAs: "query_param", targetKey: "<exact headerName from scheme>"
+     * Basic auth → injectAs: "header", targetKey: "Authorization", prefix: "Basic "
    - Path params: injectAs: "path_param", targetKey: "userId" (must match param name exactly)
    - Query params: injectAs: "query_param", targetKey: "filter"
    - Body fields: injectAs: "body_field", targetKey: "userId"
+   - If endpoint has security: NONE → do NOT add any auth variableInjections for that endpoint
 
 5. PARALLEL EXECUTION
    - Endpoints at the same dependency level (no interdependencies) → canRunParallel: true

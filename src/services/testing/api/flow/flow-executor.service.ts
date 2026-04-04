@@ -160,7 +160,16 @@ function buildResolvedRequest(
       });
       continue;
     }
-    const value = injection.prefix ? `${injection.prefix}${rawValue}` : String(rawValue);
+    let value: string;
+    if (injection.prefix === 'Basic ' && !String(rawValue).includes(':')) {
+      // Basic auth: if rawValue is already base64, use as-is; otherwise assume "user:pass" format
+      value = `Basic ${rawValue}`;
+    } else if (injection.prefix === 'Basic ') {
+      // rawValue contains "user:pass" — encode to base64
+      value = `Basic ${Buffer.from(String(rawValue)).toString('base64')}`;
+    } else {
+      value = injection.prefix ? `${injection.prefix}${rawValue}` : String(rawValue);
+    }
     variablesInjected.push(injection.variableName);
 
     switch (injection.injectAs) {
