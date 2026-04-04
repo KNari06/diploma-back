@@ -22,8 +22,8 @@
     },
     {
       "name": "frontend",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--prefix", "/Users/yerassylospanov/Desktop/qai-frontend/apps/web"],
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "export PATH=/Users/yerassylospanov/.nvm/versions/node/v22.17.0/bin:$PATH && cd /Users/yerassylospanov/Desktop/qai-frontend/apps/web && npm run dev"],
       "port": 5173,
       "autoPort": false
     }

@@ -246,6 +246,7 @@ interface InternalSession extends PreviewSession {
     totalDelta: number;
     totalDeltaX: number;
     emittedAt: number;
+    containerSelector?: string | null;
   } | null;
   /** V11: Last hover position — for recording hover steps before click on different element */
   /** V18: Extended with full ProbedElement from hover probe for click reuse */

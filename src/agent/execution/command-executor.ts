@@ -1276,7 +1276,7 @@ export class CommandExecutor {
             const sDx = sParts.length > 1 ? (parseFloat(sParts[1] || '') || 0) : 0;
 
             // Container scroll support: use recorded container selector if available
-            const scrollContainerSel = (command as any).intentMeta?.options?.scrollContainer
+            const scrollContainerSel = (command as any).intentMeta?.scrollContainer
               || (command as any).options?.scrollContainer;
             if (scrollContainerSel) {
               await this.page.evaluate(({ sel, dx, dy }: { sel: string; dx: number; dy: number }) => {

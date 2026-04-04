@@ -1967,8 +1967,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, ensuredUserId);
                 const now = Date.now();
                 const withinMergeWindow = lastScrollStep && (now - lastScrollStep.emittedAt) < RECORDING_SCROLL_MERGE_WINDOW_MS;
+                // Only merge if same scroll target (both page-level, or same container)
+                const sameScrollTarget = !lastScrollStep
+                  || (lastScrollStep.containerSelector ?? null) === (finalContainerSelector ?? null);
 
-                if (withinMergeWindow && lastScrollStep) {
+                if (withinMergeWindow && lastScrollStep && sameScrollTarget) {
                   // Same direction or continuation — merge deltas
                   const mergedDelta = lastScrollStep.totalDelta + finalDeltaY;
                   const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + finalDeltaX;
@@ -1984,6 +1987,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       totalDelta: mergedDelta,
                       totalDeltaX: mergedDeltaX,
                       emittedAt: now,
+                      containerSelector: finalContainerSelector,
                     });
                   }
                 } else {
@@ -1997,6 +2001,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       totalDelta: finalDeltaY,
                       totalDeltaX: finalDeltaX,
                       emittedAt: now,
+                      containerSelector: finalContainerSelector,
                     });
                   }
                 }
