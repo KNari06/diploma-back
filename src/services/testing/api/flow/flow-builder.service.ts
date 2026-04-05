@@ -279,7 +279,12 @@ export class FlowBuilderService {
         multiSpecError.isMultiSpec = true;
         throw multiSpecError;
       }
-      throw new Error(`Spec parsing failed: ${error.message}`);
+      logger.error('[FLOW_BUILDER] Spec parsing failed', { error: error.message });
+      // Provide a meaningful message for connectivity vs parse errors
+      if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|ERR_CONNECTION|AggregateError/i.test(error.message)) {
+        throw new Error('Could not connect to the API URL. The server may be down, behind a VPN, or unreachable.');
+      }
+      throw new Error('Spec parsing failed. Please check the format and try again.');
     }
 
     emit('parsing', 35, `Parsed ${spec.endpoints.length} endpoints from ${spec.title}`);
@@ -291,17 +296,28 @@ export class FlowBuilderService {
       sourceType: spec.sourceType,
     });
 
+    // Guard: reject specs that are too large for reliable AI processing
+    if (spec.endpoints.length > 300) {
+      throw new Error(
+        `This API has ${spec.endpoints.length} endpoints — too many for reliable analysis. ` +
+        `Please select a specific API group (e.g., "Admin API" or "Student API") instead of "All API". ` +
+        `Most Swagger UIs let you pick a group from the dropdown at the top.`
+      );
+    }
+
     // Step 2: AI dependency resolution
-    emit('analyzing_dependencies', 55, `AI is analyzing dependencies for ${spec.endpoints.length} endpoints...`);
+    emit('analyzing_dependencies', 40, `AI is analyzing ${spec.endpoints.length} endpoints...`);
 
     let resolveResult: ResolveResult;
     try {
       resolveResult = await DependencyResolverService.resolve(spec, {
         analysisId: request.analysisId,
         userAnswers: request.userAnswers,
+        onProgress: (stage, message, progress) => emit(stage, progress, message),
       });
     } catch (error: any) {
-      throw new Error(`Dependency analysis failed: ${error.message}`);
+      logger.error('[FLOW_BUILDER] Dependency analysis failed', { error: error.message });
+      throw new Error('Dependency analysis failed. Please try again or use a different spec format.');
     }
 
     // If analyst has questions, return them to the caller (don't build DAG yet)

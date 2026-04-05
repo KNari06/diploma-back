@@ -19,6 +19,25 @@ import type {
   UnsupportedEndpoint,
 } from '../flow.types';
 
+/**
+ * Deep-clone an object while replacing circular references with null.
+ * Prevents JSON.stringify crashes throughout the pipeline.
+ */
+function stripCircularRefs(obj: any): any {
+  try {
+    const seen = new WeakSet();
+    return JSON.parse(JSON.stringify(obj, (_, value) => {
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return null;
+        seen.add(value);
+      }
+      return value;
+    }));
+  } catch {
+    return {};
+  }
+}
+
 // Content types that indicate non-REST endpoints we can't test
 const UNSUPPORTED_CONTENT_TYPES = ['text/event-stream', 'application/octet-stream'];
 const FILE_UPLOAD_CONTENT_TYPES = ['multipart/form-data', 'application/octet-stream'];
@@ -346,6 +365,17 @@ export async function parseOpenApiSpec(
     unsupported: unsupportedEndpoints.length,
   });
 
+  // Strip circular references from raw spec and all endpoint schemas
+  // (happens when spec has recursive $ref that dereference() couldn't resolve)
+  const safeRawSpec = stripCircularRefs(anyDoc);
+  const safeEndpoints = endpoints.map(ep => ({
+    ...ep,
+    requestBody: ep.requestBody ? { ...ep.requestBody, schema: stripCircularRefs(ep.requestBody.schema) } : undefined,
+    responses: Object.fromEntries(
+      Object.entries(ep.responses).map(([code, resp]) => [code, { ...resp, schema: stripCircularRefs(resp.schema) }])
+    ),
+  }));
+
   return {
     title,
     version,
@@ -353,9 +383,9 @@ export async function parseOpenApiSpec(
     baseUrl,
     description: anyDoc.info?.description,
     authSchemes,
-    endpoints,
+    endpoints: safeEndpoints,
     unsupportedEndpoints,
     sourceType,
-    rawSpec: anyDoc,
+    rawSpec: safeRawSpec,
   };
 }

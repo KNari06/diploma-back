@@ -35,7 +35,7 @@ import type {
   UnsupportedEndpoint,
 } from './flow.types';
 
-const MAX_ENDPOINTS_PER_BATCH = 50; // GPT can handle ~50 endpoints per batch with compact serialization
+const MAX_ENDPOINTS_PER_BATCH = 20; // Small batches — each node produces ~500-1000 chars of JSON output
 const MAX_ENRICHER_BATCH = 25;
 const PIPELINE_TIMEOUT_MS = 600_000; // 10 minutes for very large specs (1000+ endpoints)
 const AGENT_RETRY_COUNT = 1; // 1 retry per agent on failure
@@ -235,7 +235,7 @@ async function runAnalyst(spec: ParsedApiSpec): Promise<string> {
       { role: 'system', content: buildAnalystSystemPrompt() },
       { role: 'user', content: buildAnalystPrompt(spec) },
     ],
-    { temperature: 0.3, response_format: { type: 'json_object' }, max_tokens: 8000, model: AI_TASK_MODELS.apiFlowAnalyst },
+    { temperature: 0.3, response_format: { type: 'json_object' }, max_tokens: 8000, model: AI_TASK_MODELS.apiFlowAnalyst, timeout: 120000 } as any,
     'Analyst',
   );
 
@@ -282,14 +282,72 @@ async function runArchitect(
       { role: 'system', content: buildArchitectSystemPrompt() },
       { role: 'user', content: buildArchitectPrompt(spec, endpoints, analysisJson) },
     ],
-    { temperature: 0.2, response_format: { type: 'json_object' }, model: AI_TASK_MODELS.apiFlowArchitect },
+    { temperature: 0.2, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 120000 } as any,
     'Architect',
   );
 
   try {
     return JSON.parse(content);
   } catch {
-    throw new Error(`Architect returned invalid JSON: ${content.slice(0, 300)}`);
+    // Truncated JSON — try to salvage complete nodes
+    logger.warn('[DEPENDENCY_RESOLVER] Architect JSON truncated, attempting repair', {
+      contentLength: content.length,
+    });
+
+    try {
+      // Strategy: find each complete node object in the nodes array
+      const nodesStart = content.indexOf('"nodes"');
+      if (nodesStart === -1) throw new Error('no nodes key');
+
+      const arrayStart = content.indexOf('[', nodesStart);
+      if (arrayStart === -1) throw new Error('no array start');
+
+      // Extract individual node objects by finding balanced {} pairs
+      const recoveredNodes: any[] = [];
+      let depth = 0;
+      let nodeStart = -1;
+
+      for (let i = arrayStart + 1; i < content.length; i++) {
+        const ch = content[i];
+        if (ch === '{' && depth === 0) {
+          nodeStart = i;
+          depth = 1;
+        } else if (ch === '{') {
+          depth++;
+        } else if (ch === '}') {
+          depth--;
+          if (depth === 0 && nodeStart !== -1) {
+            // Found a complete node object
+            const nodeStr = content.slice(nodeStart, i + 1);
+            try {
+              const node = JSON.parse(nodeStr);
+              if (node.id && node.method && node.path) {
+                recoveredNodes.push(node);
+              }
+            } catch {
+              // Malformed node, skip
+            }
+            nodeStart = -1;
+          }
+        }
+      }
+
+      if (recoveredNodes.length > 0) {
+        logger.info('[DEPENDENCY_RESOLVER] Architect JSON repaired', {
+          nodesRecovered: recoveredNodes.length,
+          totalContentLength: content.length,
+        });
+        return {
+          nodes: recoveredNodes,
+          executionOrder: recoveredNodes.map(n => n.id),
+          summary: `Partially recovered ${recoveredNodes.length} nodes from truncated response`,
+        };
+      }
+    } catch (repairErr: any) {
+      logger.warn('[DEPENDENCY_RESOLVER] JSON repair failed', { error: repairErr.message });
+    }
+
+    throw new Error(`Architect returned invalid JSON (${content.length} chars, likely truncated). Try a smaller API spec or select a specific API group.`);
   }
 }
 
@@ -334,7 +392,7 @@ async function runEnricher(
           { role: 'system', content: buildEnricherSystemPrompt() },
           { role: 'user', content: prompt },
         ],
-        { temperature: 0.4, response_format: { type: 'json_object' }, model: AI_TASK_MODELS.apiFlowEnricher },
+        { temperature: 0.4, response_format: { type: 'json_object' }, max_tokens: 8000, model: AI_TASK_MODELS.apiFlowEnricher, timeout: 90000 } as any,
         'Enricher',
       );
 
@@ -451,7 +509,11 @@ export class DependencyResolverService {
    */
   static async resolve(
     spec: ParsedApiSpec,
-    options?: { analysisId?: string; userAnswers?: Record<string, string> },
+    options?: {
+      analysisId?: string;
+      userAnswers?: Record<string, string>;
+      onProgress?: (stage: string, message: string, progress: number) => void;
+    },
   ): Promise<ResolveResult> {
     const endpoints = spec.endpoints;
 
@@ -463,6 +525,7 @@ export class DependencyResolverService {
     });
 
     const deadline = Date.now() + PIPELINE_TIMEOUT_MS;
+    const emit = options?.onProgress || (() => {});
     const checkTimeout = () => {
       if (Date.now() > deadline) {
         throw new Error(`Pipeline timed out after ${PIPELINE_TIMEOUT_MS / 1000}s`);
@@ -494,6 +557,7 @@ export class DependencyResolverService {
       });
     } else {
       // Fresh analysis
+      emit('analyzing', `AI is understanding the API domain (${spec.endpoints.length} endpoints)...`, 40);
       analysisJson = await runAnalyst(spec);
       checkTimeout();
 
@@ -536,6 +600,7 @@ export class DependencyResolverService {
     let rawDag: any;
 
     if (endpoints.length <= MAX_ENDPOINTS_PER_BATCH) {
+      emit('building_dag', `AI is building execution plan for ${endpoints.length} endpoints...`, 55);
       rawDag = await runArchitect(spec, endpoints, analysisJson);
     } else {
       const chunks: ParsedEndpoint[][] = [];
@@ -543,6 +608,7 @@ export class DependencyResolverService {
         chunks.push(endpoints.slice(i, i + MAX_ENDPOINTS_PER_BATCH));
       }
 
+      emit('building_dag', `Building execution plan in ${chunks.length} batches (${endpoints.length} endpoints)...`, 55);
       logger.info('[DEPENDENCY_RESOLVER] Batching', { chunks: chunks.length });
 
       const partialDags = await Promise.all(
@@ -557,7 +623,7 @@ export class DependencyResolverService {
           { role: 'system', content: buildSwaggerDependencySystemPrompt() },
           { role: 'user', content: `Domain context from analyst:\n${analysisJson.slice(0, 1000)}\n\n${mergePrompt}` },
         ],
-        { temperature: 0.1, response_format: { type: 'json_object' }, model: AI_TASK_MODELS.apiFlowArchitect },
+        { temperature: 0.1, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 180000 } as any,
         'Merger',
       );
       rawDag = JSON.parse(mergeContent);
@@ -611,6 +677,7 @@ export class DependencyResolverService {
       priority: levelMap.get(node.id) ?? node.priority,
     }));
 
+    emit('enriching', `Generating test data for ${nodes.filter(n => ['POST','PUT','PATCH'].includes(n.method)).length} endpoints...`, 80);
     // ── Agent 3: Enricher ───────────────────────────────────────────────
     checkTimeout();
     nodes = await runEnricher(nodes, spec, analysisJson);

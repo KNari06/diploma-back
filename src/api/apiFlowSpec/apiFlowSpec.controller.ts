@@ -17,6 +17,29 @@ function getUserId(req: Request): string | null {
   return userId && typeof userId === 'string' ? userId : null;
 }
 
+/** Strip raw AI/LLM errors, internal stack traces, and prompt leaks from error messages */
+function sanitizeErrorMessage(msg: string): string {
+  if (!msg || typeof msg !== 'string') return 'An unexpected error occurred. Please try again.';
+  // Detect leaked AI prompts or internal errors
+  const leakPatterns = [
+    /\[GoogleGenerativeAI/i,
+    /system[_\s]?instruction/i,
+    /you are an? (?:expert|senior|ai|assistant)/i,
+    /```json/i,
+    /finishReason:/i,
+    /safetyRatings/i,
+    /RECITATION|SAFETY|BLOCK/i,
+  ];
+  if (leakPatterns.some(p => p.test(msg))) {
+    return 'AI analysis failed. Please try again or use a different spec format.';
+  }
+  // Truncate overly long messages (likely contain raw error dumps)
+  if (msg.length > 300) {
+    return msg.slice(0, 200).replace(/\s+\S*$/, '') + '…';
+  }
+  return msg;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/api-flow-spec/parse
 // Parse a Swagger URL or uploaded spec → AI DAG → visualization
@@ -116,7 +139,9 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
     }
 
     logger.error('[FLOW_SPEC_CONTROLLER] Parse failed', { error: error.message });
-    res.status(500).json({ success: false, error: error.message || 'Failed to parse spec' });
+    // Sanitize error: never leak raw AI/LLM errors or internal details to the client
+    const safeError = sanitizeErrorMessage(error.message || 'Failed to parse spec');
+    res.status(500).json({ success: false, error: safeError });
   }
 };
 
@@ -452,6 +477,7 @@ export const reparseSpec = async (req: Request, res: Response): Promise<void> =>
     });
   } catch (error: any) {
     logger.error('[FLOW_SPEC_CONTROLLER] Re-parse failed', { error: error.message });
-    res.status(500).json({ success: false, error: error.message || 'Failed to re-parse spec' });
+    const safeReparseError = sanitizeErrorMessage(error.message || 'Failed to re-parse spec');
+    res.status(500).json({ success: false, error: safeReparseError });
   }
 };

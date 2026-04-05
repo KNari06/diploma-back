@@ -212,10 +212,9 @@ async function discoverSpecUrl(swaggerUiUrl: string): Promise<string | SpecGroup
               groupCount: groups.length,
               groups: groups.map(g => g.name),
             });
-            // If there's only one spec or "All API" option, use it directly
-            const allApi = groups.find(g => /^all\s/i.test(g.name));
+            // If only one spec, use it directly. Otherwise let user choose.
+            // Don't auto-select "All API" — it's often too large (1000+ endpoints)
             if (groups.length === 1) return groups[0].url;
-            if (allApi) return allApi.url;
             return groups; // Return list for user to choose
           }
           // Single spec: config has url field
@@ -251,9 +250,7 @@ async function discoverSpecUrl(swaggerUiUrl: string): Promise<string | SpecGroup
             name: u.name || u.url,
             url: u.url?.startsWith('/') ? `${origin}${u.url}` : u.url,
           }));
-          const allApi = groups.find(g => /^all\s/i.test(g.name));
           if (groups.length === 1) return groups[0].url;
-          if (allApi) return allApi.url;
           return groups;
         }
       }

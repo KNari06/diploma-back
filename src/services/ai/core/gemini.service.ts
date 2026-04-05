@@ -136,12 +136,26 @@ export async function getChatCompletionWithGemini(params: {
     model = 'gemini-2.5-flash',
     temperature = 0,
     maxTokens = 1000,
-    timeout = 10000,
+    timeout = 30000,
     jsonMode = false,
   } = params;
 
   try {
     const client = getGeminiClient();
+    // Extract system instruction and chat messages
+    let systemInstruction = '';
+    const chatHistory: Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> = [];
+
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        systemInstruction += msg.content + '\n';
+      } else if (msg.role === 'user') {
+        chatHistory.push({ role: 'user', parts: [{ text: msg.content }] });
+      } else if (msg.role === 'assistant') {
+        chatHistory.push({ role: 'model', parts: [{ text: msg.content }] });
+      }
+    }
+
     const genModel = client.getGenerativeModel({
       model,
       generationConfig: {
@@ -151,25 +165,15 @@ export async function getChatCompletionWithGemini(params: {
       },
     });
 
-    // Convert OpenAI-style messages to Gemini format
-    // Gemini uses: system instruction + chat history
-    let systemInstruction = '';
-    const chatHistory: Array<{ role: 'user' | 'model'; parts: [{ text: string }] }> = [];
-
-    for (const msg of messages) {
-      if (msg.role === 'system') {
-        systemInstruction += msg.content + '\n';
-      } else if (msg.role === 'user') {
-        chatHistory.push({
-          role: 'user',
-          parts: [{ text: msg.content }],
-        });
-      } else if (msg.role === 'assistant') {
-        chatHistory.push({
-          role: 'model',
-          parts: [{ text: msg.content }],
-        });
-      }
+    // Prepend system instruction as context in the first user message
+    // (Gemini SDK doesn't reliably support systemInstruction in all versions)
+    if (systemInstruction.trim() && chatHistory.length > 0 && chatHistory[0].role === 'user') {
+      chatHistory[0] = {
+        role: 'user',
+        parts: [{ text: `${systemInstruction.trim()}\n\n${chatHistory[0].parts[0].text}` }],
+      };
+    } else if (systemInstruction.trim()) {
+      chatHistory.unshift({ role: 'user', parts: [{ text: systemInstruction.trim() }] });
     }
 
     // Get last user message to send via sendMessage()
@@ -178,18 +182,13 @@ export async function getChatCompletionWithGemini(params: {
       throw new Error('Last message must be from user');
     }
 
-    // Build history (all except last message), ensuring it starts with 'user' role
-    // Gemini requires history to begin with a user message
+    // Build history (all except last), ensuring starts with 'user' role
     let history = chatHistory.slice(0, -1);
     while (history.length > 0 && history[0].role !== 'user') {
       history = history.slice(1);
     }
 
-    // Start chat with sanitized history
-    const chat = genModel.startChat({
-      history,
-      systemInstruction,
-    });
+    const chat = genModel.startChat({ history });
 
     // Create timeout promise
     const timeoutPromise = new Promise<never>((_, reject) => {

@@ -16,6 +16,23 @@ import type { ParsedApiSpec, ParsedEndpoint, ExecutionDAG, DAGNode } from '@/ser
 // SERIALIZATION HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Safe JSON.stringify that handles circular references */
+function safeStringify(obj: any, maxLen = 500): string {
+  try {
+    const seen = new WeakSet();
+    const json = JSON.stringify(obj, (_, value) => {
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return '[Circular]';
+        seen.add(value);
+      }
+      return value;
+    }, 1);
+    return (json || '{}').slice(0, maxLen);
+  } catch {
+    return '{}';
+  }
+}
+
 /**
  * Serialize a single endpoint with maximum context.
  * Every field matters — the AI needs to understand what this endpoint does,
@@ -27,18 +44,18 @@ function serializeEndpoint(ep: ParsedEndpoint, index: number): string {
     if (p.schema?.type) parts.push(p.schema.type);
     if (p.schema?.enum) parts.push(`enum:[${p.schema.enum.join('|')}]`);
     if (p.schema?.format) parts.push(`format=${p.schema.format}`);
-    if (p.example !== undefined) parts.push(`example=${JSON.stringify(p.example).slice(0, 60)}`);
+    if (p.example !== undefined) parts.push(`example=${safeStringify(p.example, 60)}`);
     if (p.description) parts.push(`"${p.description.slice(0, 80)}"`);
     return parts.join(' ');
   }).join('\n    ');
 
   const reqBody = ep.requestBody
-    ? `  RequestBody[${ep.requestBody.contentType}${ep.requestBody.required ? ', required' : ''}]:\n    ${JSON.stringify(ep.requestBody.schema || ep.requestBody.example || {}, null, 1).slice(0, 500)}`
+    ? `  RequestBody[${ep.requestBody.contentType}${ep.requestBody.required ? ', required' : ''}]:\n    ${safeStringify(ep.requestBody.schema || ep.requestBody.example || {})}`
     : '';
 
   const responseLines: string[] = [];
   for (const [code, resp] of Object.entries(ep.responses)) {
-    const schema = resp.schema ? JSON.stringify(resp.schema).slice(0, 400) : '';
+    const schema = resp.schema ? safeStringify(resp.schema, 400) : '';
     responseLines.push(`  Response[${code}]: ${resp.description || ''}${schema ? '\n    Schema: ' + schema : ''}`);
   }
 
@@ -552,7 +569,7 @@ export function buildEnricherPrompt(
   const nodeDescriptions = needsData.map(n => {
     const ep = endpointMap.get(`${n.method}:${n.path}`);
     const schema = ep?.requestBody?.schema
-      ? JSON.stringify(ep.requestBody.schema, null, 1).slice(0, 600)
+      ? safeStringify(ep.requestBody.schema, 600)
       : '(no schema — infer from endpoint path and summary)';
     const injectedVars = n.variableInjections
       .filter(i => i.injectAs === 'body_field')
