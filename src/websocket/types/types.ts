@@ -210,6 +210,14 @@ export interface ServerToClientEvents {
   'preview:mouse:probe:result': (data: PreviewMouseProbeResultPayload) => void;
   'preview:page:action:result': (data: PreviewPageActionResultPayload) => void;
 
+  // Mobile emulator boot/install progress (emitted to user room during APK upload)
+  'mobile:boot:status': (data: {
+    projectId: string;
+    stage: 'booting' | 'installing' | 'launching' | 'ready' | 'error';
+    message: string;
+    sessionId?: string;
+  }) => void;
+
   // Heartbeat response (echoes client timestamp for RTT measurement)
   pong: (data: { t?: number }) => void;
 }

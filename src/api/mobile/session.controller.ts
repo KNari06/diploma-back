@@ -18,6 +18,7 @@ import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/m
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { ProjectService } from '@/services/core/project.service';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -89,6 +90,42 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       if (!existing.sessionId) {
         // Stale entry without a valid sessionId — discard and create fresh
         logger.warn('[MOBILE_SESSION] Discarding stale warmed session (missing sessionId)', { projectId, userId });
+        await redisConnection.del(redisKey);
+      } else if (existing.sessionId === '_booting') {
+        // Auto-boot from APK upload is in progress — poll until it completes
+        logger.info('[MOBILE_SESSION] Emulator boot in progress (auto-boot), waiting...', { projectId, userId });
+        const POLL_INTERVAL = 2000;
+        const MAX_WAIT = 90_000; // 90s max wait for boot
+        const waitStart = Date.now();
+
+        let bootedSessionId: string | null = null;
+        while (Date.now() - waitStart < MAX_WAIT) {
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+          const refreshRaw = await redisConnection.get(redisKey);
+          if (!refreshRaw) break; // Redis key gone — boot failed or expired
+          const refreshed: WarmupData = JSON.parse(refreshRaw);
+          if (refreshed.sessionId && refreshed.sessionId !== '_booting') {
+            bootedSessionId = refreshed.sessionId;
+            break;
+          }
+        }
+
+        if (bootedSessionId) {
+          const refreshRaw = await redisConnection.get(redisKey);
+          const refreshed: WarmupData = refreshRaw ? JSON.parse(refreshRaw) : existing;
+          logger.info('[MOBILE_SESSION] Auto-boot completed, reusing session', { projectId, sessionId: bootedSessionId });
+          res.json({
+            success: true,
+            sessionId: bootedSessionId,
+            runnerSocketUrl: refreshed.runnerSocketUrl,
+            platform: refreshed.platform,
+            reused: true,
+          });
+          return;
+        }
+
+        // Boot didn't complete in time — clean up and fall through to create fresh
+        logger.warn('[MOBILE_SESSION] Auto-boot timed out, creating fresh session', { projectId, userId });
         await redisConnection.del(redisKey);
       } else {
         // Verify the session still exists on the runner (it may have been
@@ -818,6 +855,105 @@ export async function applySession(req: Request, res: Response): Promise<void> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// AUTO-BOOT: Boot emulator + install APK immediately after upload
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Called after APK upload to immediately boot an emulator and install the app.
+ * If an emulator session already exists for this project+user, reuses it and
+ * just reinstalls the new APK. Emits WebSocket progress events to the user.
+ *
+ * Fire-and-forget — errors are logged but not thrown to the caller.
+ */
+export async function autoBootAndInstall(
+  projectId: string,
+  userId: string,
+  platform: MobilePlatform,
+): Promise<void> {
+  const emit = (stage: string, message: string, sessionId?: string) => {
+    webSocketService.emitToUser(userId, 'mobile:boot:status', { projectId, stage, message, sessionId });
+  };
+
+  try {
+    if (!env.MOBILE_RUNNER_ENABLED) return;
+
+    const client = getMobileRunnerClient();
+    const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
+
+    // Check for existing session
+    let sessionId: string | null = null;
+    const existingRaw = await redisConnection.get(redisKey);
+    if (existingRaw) {
+      const existing: WarmupData = JSON.parse(existingRaw);
+      if (existing.sessionId) {
+        const alive = await client.sessionExists(existing.sessionId);
+        if (alive) {
+          sessionId = existing.sessionId;
+          logger.info('[MOBILE_AUTO_BOOT] Reusing existing session for reinstall', { projectId, sessionId });
+        }
+      }
+    }
+
+    // Boot new emulator if no existing session
+    if (!sessionId) {
+      emit('booting', 'Starting emulator...');
+
+      const healthy = await client.isHealthy();
+      if (!healthy) {
+        emit('error', 'Mobile runner is unavailable');
+        return;
+      }
+
+      // Set a "booting" placeholder in Redis BEFORE starting the emulator.
+      // This prevents warmupSession from creating a duplicate emulator if
+      // the user opens the editor while the boot is still in progress.
+      const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+      const bootingData: WarmupData = {
+        sessionId: '_booting',
+        runnerUrl: env.MOBILE_RUNNER_URL,
+        runnerSocketUrl,
+        platform,
+        createdAt: new Date().toISOString(),
+      };
+      await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
+
+      const session = await client.createSession(platform);
+      sessionId = session.sessionId;
+
+      // Update Redis with the real session ID
+      bootingData.sessionId = sessionId;
+      await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
+
+      logger.info('[MOBILE_AUTO_BOOT] Emulator created', { projectId, sessionId });
+    }
+
+    // Install the app
+    emit('installing', 'Installing app...', sessionId);
+    await installAppOnSession(client, sessionId, projectId, userId);
+
+    emit('ready', 'Emulator ready', sessionId);
+    logger.info('[MOBILE_AUTO_BOOT] App installed, emulator ready', { projectId, sessionId });
+
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    emit('error', `Setup failed: ${message}`);
+    logger.error('[MOBILE_AUTO_BOOT] Failed', { projectId, userId, error: message });
+
+    // Clean up the _booting placeholder so warmup doesn't wait forever
+    const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
+    const raw = await redisConnection.get(redisKey);
+    if (raw) {
+      try {
+        const data = JSON.parse(raw);
+        if (data.sessionId === '_booting') {
+          await redisConnection.del(redisKey);
+        }
+      } catch { /* ignore parse error */ }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Install app on a freshly created session
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -855,7 +991,7 @@ async function installAppOnSession(
     });
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName: appPackageOverride || warmup.installedPackage } },
-    ]);
+    ], { timeoutMs: 60_000 });
     return;
   }
 
@@ -891,7 +1027,7 @@ async function installAppOnSession(
         ...(explicitPackage ? { autoLaunch: false } : {}),
       },
     },
-  ]);
+  ], { timeoutMs: 120_000 }); // 2 min — adb install can take 60s+ for large APKs
 
   const detected = (installResult?.results?.[0] as any)?.packageName as string | undefined;
   const packageName = explicitPackage || detected;
@@ -899,7 +1035,7 @@ async function installAppOnSession(
   if (explicitPackage) {
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName: explicitPackage } },
-    ]);
+    ], { timeoutMs: 60_000 });
   }
 
   // Update Redis with the installed package so future warmups know what's on the emulator
