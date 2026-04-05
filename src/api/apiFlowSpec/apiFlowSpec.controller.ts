@@ -101,6 +101,20 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       },
     });
   } catch (error: any) {
+    // Multi-spec Swagger UI — return group choices to frontend
+    if (error.isMultiSpec && error.specGroups) {
+      res.json({
+        success: true,
+        needsInput: true,
+        isMultiSpec: true,
+        data: {
+          specGroups: error.specGroups, // [{ url, name }]
+          message: error.message,
+        },
+      });
+      return;
+    }
+
     logger.error('[FLOW_SPEC_CONTROLLER] Parse failed', { error: error.message });
     res.status(500).json({ success: false, error: error.message || 'Failed to parse spec' });
   }

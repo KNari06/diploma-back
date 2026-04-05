@@ -266,6 +266,19 @@ export class FlowBuilderService {
         throw new Error('Either url or content must be provided');
       }
     } catch (error: any) {
+      // Multi-spec Swagger UI — return API group choices to caller
+      if (error.message === 'MULTI_SPEC' && error.specGroups) {
+        const groups = error.specGroups as Array<{ url: string; name: string }>;
+        // Return as needsInput with specGroups — frontend shows selector,
+        // user picks one, frontend calls /parse again with the direct spec URL
+        const multiSpecError: any = new Error(
+          `This Swagger UI has ${groups.length} API groups (${groups.map(g => g.name).join(', ')}). ` +
+          `Please select which group to test.`
+        );
+        multiSpecError.specGroups = groups;
+        multiSpecError.isMultiSpec = true;
+        throw multiSpecError;
+      }
       throw new Error(`Spec parsing failed: ${error.message}`);
     }
 
