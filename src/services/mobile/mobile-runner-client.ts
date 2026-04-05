@@ -83,6 +83,7 @@ export class MobileRunnerClient {
   ): Promise<MobileSessionResponse> {
     return this.request<MobileSessionResponse>('POST', '/api/sessions', {
       body: { platform, ...config },
+      timeoutMs: 60_000, // Emulator boot can take 30-60s
     });
   }
 
@@ -159,16 +160,15 @@ export class MobileRunnerClient {
   async executeBatchCommands(
     sessionId: string,
     commands: unknown[],
-    opts?: { interactive?: boolean },
+    opts?: { interactive?: boolean; timeoutMs?: number },
   ): Promise<{ results: unknown[] }> {
     return this.request<{ results: unknown[] }>(
       'POST',
       `/api/commands/${sessionId}/batch`,
       {
         body: { commands },
-        timeoutMs: opts?.interactive
-          ? CLIENT_CONFIG.interactiveTimeoutMs
-          : CLIENT_CONFIG.defaultTimeoutMs,
+        timeoutMs: opts?.timeoutMs
+          ?? (opts?.interactive ? CLIENT_CONFIG.interactiveTimeoutMs : CLIENT_CONFIG.defaultTimeoutMs),
         // Interactive commands must not retry — a failed tap should not
         // be silently retried (user may have already moved on).
         noRetry: opts?.interactive,

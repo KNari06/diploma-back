@@ -8,6 +8,7 @@
 import { ProjectService } from '@/services/core/project.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { MobileAppStorageService, MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
+import { autoBootAndInstall } from './session.controller';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
@@ -89,6 +90,15 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
   res.status(201).json({
     success: true,
     mobileApp: metadata,
+  });
+
+  // Auto-boot emulator + install APK in background (fire-and-forget).
+  // By the time the user opens the editor, the emulator is already running.
+  autoBootAndInstall(projectId, userId, platform).catch((err) => {
+    logger.warn('[MOBILE_API] Background auto-boot failed (non-fatal)', {
+      projectId,
+      error: err instanceof Error ? err.message : String(err),
+    });
   });
 }
 
