@@ -513,14 +513,21 @@ Using the domain analysis as your guide, produce this EXACT JSON:
 
 ═══ CRITICAL RULES ═══
 
-1. EVERY node ID in dependsOn MUST exist in the nodes array. Don't reference non-existent nodes.
-2. EVERY variableName in variableInjections MUST be extracted by a node that appears EARLIER in executionOrder.
-3. executionOrder MUST be a valid topological sort: no node appears before any of its dependencies.
-4. Set sampleRequestBody to null for now — Agent 3 will fill it in. But DO set sampleQueryParams if the endpoint has query parameters.
-5. isAuthEndpoint = true ONLY for endpoints whose PURPOSE is producing auth credentials (login, token exchange). NOT for endpoints that merely require auth.
-6. Public endpoints (auth_required: NONE from spec) → NO auth variableInjections.
-7. canRunParallel = true for nodes at the same dependency level with no shared state.
-8. expectedStatusCodes: use the success codes from the response schemas (200, 201, 204, etc.)`;
+1. **NO FABRICATED ENDPOINTS**: You MUST only create nodes for endpoints listed in the spec above.
+   - NEVER invent helper endpoints like "initial_setup", "auth_token_provider", "setup", "cleanup", "health_check" unless they literally exist in the endpoint list.
+   - NEVER create nodes with paths that don't appear in the FULL ENDPOINT SPECIFICATIONS section.
+   - Every node's "method" and "path" MUST exactly match one endpoint from the spec.
+   - If you need an auth token, use the ACTUAL login/token endpoint from the spec — don't create a fictional one.
+
+2. EVERY node ID in dependsOn MUST exist in the nodes array. Don't reference non-existent nodes.
+3. EVERY variableName in variableInjections MUST be extracted by a node that appears EARLIER in executionOrder.
+4. executionOrder MUST be a valid topological sort: no node appears before any of its dependencies.
+5. Set sampleRequestBody to null for now — Agent 3 will fill it in. But DO set sampleQueryParams if the endpoint has query parameters.
+6. isAuthEndpoint = true ONLY for endpoints whose PURPOSE is producing auth credentials (login, token exchange). NOT for endpoints that merely require auth.
+7. Public endpoints (auth_required: NONE from spec) → NO auth variableInjections.
+8. canRunParallel = true for nodes at the same dependency level with no shared state.
+9. expectedStatusCodes: use the success codes from the response schemas (200, 201, 204, etc.)
+10. **AUTH DEPENDENCIES**: Every endpoint that requires authentication MUST have the auth endpoint in its dependsOn chain (directly or transitively). Don't leave authenticated endpoints at priority 0 with empty dependsOn.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

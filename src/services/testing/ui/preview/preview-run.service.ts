@@ -22,7 +22,7 @@ import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
 import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
-import { injectAutoWaitForSteps } from './auto-wait-for.utils';
+import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 
 /** Base timeout for run setup (navigation, init). */
@@ -582,17 +582,46 @@ export class PreviewRunService {
       });
       startedEmitted = true;
 
-      // 6. Navigate to startUrl before executing steps
+      // 6. Reset session state for fresh run (prevents stale state from previous run)
+      session.lastSnapshotEmit = 0;
+      session.lastPageSignature = '';
+      session.lastScreenshotEmitAt = 0;
+      sessionService.setDialogMode(previewSessionId, userId, 'passive');
+      // Close extra tabs from previous run (keep only active tab)
+      if (session.pages.length > 1) {
+        for (const p of session.pages) {
+          if (p !== session.page && !p.isClosed()) {
+            try { await p.close().catch(() => {}); } catch { /* best effort */ }
+          }
+        }
+        session.pages = [session.page];
+        session.activeTabIndex = 0;
+      }
+
+      // 7. Navigate to startUrl before executing steps
+      // If already on startUrl, force reload to clear DOM state (refs, form values, modals)
+      // If different URL, normal goto works (full navigation)
+      const currentUrl = session.page.url();
+      const needsReload = normalizeUrlForComparison(currentUrl) === normalizeUrlForComparison(startUrl);
+
       logger.info('[PreviewRun] Navigating to startUrl', {
         previewSessionId,
         startUrl,
+        needsReload,
       });
 
       try {
-        await raceAbort(session.page.goto(startUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000,
-        }), signal);
+        if (needsReload) {
+          await raceAbort(session.page.reload({
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          }), signal);
+        } else {
+          await raceAbort(session.page.goto(startUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          }), signal);
+        }
 
         // Wait for DOM to stabilize after initial navigation (SPA hydration).
         // networkidle waits for images/fonts/analytics — irrelevant for element resolution.

@@ -35,7 +35,43 @@ import type {
   UnsupportedEndpoint,
 } from './flow.types';
 
-const MAX_ENDPOINTS_PER_BATCH = 20; // Small batches — each node produces ~500-1000 chars of JSON output
+const MAX_ENDPOINTS_PER_BATCH = 20;
+
+/**
+ * Extract JSON from AI response that may contain reasoning text around it.
+ * Gemini 2.5 Flash with thinking mode often returns text before/after JSON.
+ */
+function extractJson(content: string): any {
+  // Try direct parse first
+  try {
+    return JSON.parse(content);
+  } catch {
+    // no-op
+  }
+
+  // Try to find JSON object in the content
+  const firstBrace = content.indexOf('{');
+  const lastBrace = content.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(content.slice(firstBrace, lastBrace + 1));
+    } catch {
+      // no-op
+    }
+  }
+
+  // Try to find JSON inside markdown code block
+  const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (codeBlockMatch?.[1]) {
+    try {
+      return JSON.parse(codeBlockMatch[1].trim());
+    } catch {
+      // no-op
+    }
+  }
+
+  return null;
+}
 const MAX_ENRICHER_BATCH = 25;
 const PIPELINE_TIMEOUT_MS = 600_000; // 10 minutes for very large specs (1000+ endpoints)
 const AGENT_RETRY_COUNT = 1; // 1 retry per agent on failure
@@ -235,33 +271,33 @@ async function runAnalyst(spec: ParsedApiSpec): Promise<string> {
       { role: 'system', content: buildAnalystSystemPrompt() },
       { role: 'user', content: buildAnalystPrompt(spec) },
     ],
-    { temperature: 0.3, response_format: { type: 'json_object' }, max_tokens: 8000, model: AI_TASK_MODELS.apiFlowAnalyst, timeout: 120000 } as any,
+    { temperature: 0.3, response_format: { type: 'json_object' }, max_tokens: 8000, model: AI_TASK_MODELS.apiFlowAnalyst, timeout: 180000 } as any,
     'Analyst',
   );
 
-  // Validate JSON
-  try {
-    const parsed = JSON.parse(content);
-    // Ensure minimum structure
-    if (!parsed.domain && !parsed.entities && !parsed.authFlow) {
-      logger.warn('[DEPENDENCY_RESOLVER] Analyst output missing key fields, using raw');
-    }
-  } catch {
-    logger.warn('[DEPENDENCY_RESOLVER] Analyst returned invalid JSON');
-    // Return a minimal valid analysis so the pipeline continues
-    return JSON.stringify({
-      domain: { name: 'Unknown', description: `API: ${spec.title}` },
-      entities: [],
-      authFlow: { type: spec.authSchemes.length > 0 ? 'unknown' : 'none', steps: [], tokenExtraction: null },
-      dataFlows: [],
-      publicEndpoints: [],
-      executionPhases: [{ phase: 1, name: 'All', endpoints: spec.endpoints.map(e => e.operationId), parallelizable: false }],
-      edgeCases: ['Analyst failed to parse spec — architect must analyze endpoints directly'],
+  // Extract JSON from response (Gemini may include reasoning text around JSON)
+  const parsed = extractJson(content);
+  if (parsed && (parsed.domain || parsed.entities || parsed.authFlow)) {
+    logger.info('[DEPENDENCY_RESOLVER] Agent 1: Analyst completed', {
+      hasDomain: !!parsed.domain,
+      entityCount: parsed.entities?.length || 0,
     });
+    return JSON.stringify(parsed);
   }
 
-  logger.info('[DEPENDENCY_RESOLVER] Agent 1: Analyst completed');
-  return content;
+  logger.warn('[DEPENDENCY_RESOLVER] Analyst returned invalid/empty JSON, using fallback', {
+    contentLength: content.length,
+    contentPreview: content.slice(0, 200),
+  });
+  return JSON.stringify({
+    domain: { name: 'Unknown', description: `API: ${spec.title}` },
+    entities: [],
+    authFlow: { type: spec.authSchemes.length > 0 ? 'unknown' : 'none', steps: [], tokenExtraction: null },
+    dataFlows: [],
+    publicEndpoints: [],
+    executionPhases: [{ phase: 1, name: 'All', endpoints: spec.endpoints.map(e => e.operationId), parallelizable: false }],
+    edgeCases: ['Analyst could not parse — architect must analyze endpoints directly'],
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,14 +318,18 @@ async function runArchitect(
       { role: 'system', content: buildArchitectSystemPrompt() },
       { role: 'user', content: buildArchitectPrompt(spec, endpoints, analysisJson) },
     ],
-    { temperature: 0.2, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 120000 } as any,
+    { temperature: 0.2, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 180000 } as any,
     'Architect',
   );
 
-  try {
-    return JSON.parse(content);
-  } catch {
-    // Truncated JSON — try to salvage complete nodes
+  // Try extracting JSON (Gemini may include reasoning text)
+  const parsed = extractJson(content);
+  if (parsed?.nodes && Array.isArray(parsed.nodes) && parsed.nodes.length > 0) {
+    return parsed;
+  }
+
+  // If extractJson failed or returned no nodes, try salvaging from raw content
+  {
     logger.warn('[DEPENDENCY_RESOLVER] Architect JSON truncated, attempting repair', {
       contentLength: content.length,
     });
@@ -423,6 +463,57 @@ async function runEnricher(
 // POST-PROCESSING: Deduplication + Validation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Remove phantom nodes — nodes fabricated by AI that don't exist in the original spec.
+ * The AI sometimes creates helper nodes like "initial_setup", "auth_token_provider"
+ * that have no corresponding endpoint in the parsed spec.
+ */
+function removePhantomNodes(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] {
+  // Build a set of valid method:path combinations from the spec
+  const validPaths = new Set<string>();
+  for (const ep of spec.endpoints) {
+    validPaths.add(`${ep.method}:${ep.path}`);
+    // Also add with/without trailing slash for tolerance
+    const normalized = ep.path.endsWith('/') ? ep.path.slice(0, -1) : ep.path + '/';
+    validPaths.add(`${ep.method}:${normalized}`);
+  }
+
+  const phantoms: string[] = [];
+  const valid: DAGNode[] = [];
+
+  for (const node of nodes) {
+    const key = `${node.method}:${node.path}`;
+    if (validPaths.has(key)) {
+      valid.push(node);
+    } else {
+      phantoms.push(`${node.id} (${node.method} ${node.path})`);
+    }
+  }
+
+  if (phantoms.length > 0) {
+    logger.warn('[DEPENDENCY_RESOLVER] Phantom nodes removed (not in spec)', {
+      count: phantoms.length,
+      phantoms,
+    });
+
+    // Clean up dependsOn references to removed phantom nodes
+    const phantomIds = new Set(nodes.filter(n => !validPaths.has(`${n.method}:${n.path}`)).map(n => n.id));
+    return valid.map(node => ({
+      ...node,
+      dependsOn: node.dependsOn.filter(dep => !phantomIds.has(dep)),
+      variableInjections: node.variableInjections.filter(inj => {
+        // Remove injections that only come from phantom producers
+        const producers = valid.filter(v =>
+          v.variableExtractions.some(ext => ext.variableName === inj.variableName)
+        );
+        return producers.length > 0;
+      }),
+    }));
+  }
+
+  return valid;
+}
+
 function deduplicateNodes(nodes: DAGNode[]): DAGNode[] {
   const seen = new Map<string, DAGNode>();
   const duplicates: string[] = [];
@@ -440,6 +531,173 @@ function deduplicateNodes(nodes: DAGNode[]): DAGNode[] {
   }
 
   return Array.from(seen.values());
+}
+
+/**
+ * Auto-wire auth dependencies: ensure every node that injects an auth variable
+ * has a dependsOn edge to the node that extracts it.
+ * Also ensures auth nodes (isAuthEndpoint) have no spurious dependencies.
+ * This fixes the cross-batch dependency loss when merger is skipped.
+ */
+function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
+  // Build producer map: variableName → producerNodeId
+  const producerMap = new Map<string, string>();
+  for (const node of nodes) {
+    for (const ext of node.variableExtractions) {
+      producerMap.set(ext.variableName, node.id);
+    }
+  }
+
+  // Common auth variable patterns
+  const AUTH_VAR_PATTERNS = /^(auth_token|access_token|jwt|bearer_token|api_key|session_token|token|authorization)$/i;
+
+  // Find auth producer nodes (nodes that extract auth variables)
+  const authProducerIds = new Set<string>();
+  for (const [varName, producerId] of producerMap) {
+    if (AUTH_VAR_PATTERNS.test(varName)) {
+      authProducerIds.add(producerId);
+    }
+  }
+
+  // Also include nodes explicitly marked as auth endpoints
+  for (const node of nodes) {
+    if (node.isAuthEndpoint && node.variableExtractions.length > 0) {
+      authProducerIds.add(node.id);
+    }
+  }
+
+  if (authProducerIds.size === 0) return nodes;
+
+  let wiredCount = 0;
+  const result = nodes.map(node => {
+    if (authProducerIds.has(node.id)) return node; // Don't wire auth to itself
+
+    // Check if this node injects any variable produced by an auth node
+    const missingDeps = new Set<string>();
+    for (const inj of node.variableInjections) {
+      const producerId = producerMap.get(inj.variableName);
+      if (producerId && authProducerIds.has(producerId) && !node.dependsOn.includes(producerId)) {
+        missingDeps.add(producerId);
+      }
+    }
+
+    if (missingDeps.size > 0) {
+      wiredCount++;
+      return {
+        ...node,
+        dependsOn: [...node.dependsOn, ...missingDeps],
+      };
+    }
+
+    return node;
+  });
+
+  if (wiredCount > 0) {
+    logger.info('[DEPENDENCY_RESOLVER] Auto-wired auth dependencies', {
+      authProducers: Array.from(authProducerIds),
+      nodesWired: wiredCount,
+    });
+  }
+
+  return result;
+}
+
+/**
+ * CRUD-heuristic dependency wiring.
+ *
+ * Problem: when batches are processed independently, DELETE /users/{id} may end up
+ * at priority 0 because the Architect in that batch never saw POST /users.
+ *
+ * Solution: detect CRUD patterns from paths and auto-wire:
+ *   - POST /resource → must run before GET/PUT/PATCH/DELETE /resource/{id}
+ *   - GET /resource (list) → no forced dependency
+ *   - DELETE /resource/{id} → must run after POST (and preferably after GET/PUT)
+ *
+ * This extracts the "resource base" from paths like /api/v1/users/{userId}/orders/{orderId}
+ * and builds implicit edges.
+ */
+function autoWireCrudDependencies(nodes: DAGNode[]): DAGNode[] {
+  // Extract resource base: /api/v1/users/{id} → "/api/v1/users"
+  // Also handles nested: /users/{userId}/orders → "/users/*/orders"
+  function getResourceBase(path: string): string {
+    return path
+      .replace(/\{[^}]+\}/g, '*')  // {id} → *
+      .replace(/\/\*$/g, '')         // remove trailing /*
+      .replace(/\/\*\//g, '/*/');    // keep nested structure
+  }
+
+  // Group nodes by resource base
+  const resourceGroups = new Map<string, Map<string, DAGNode[]>>(); // base → method → nodes
+  for (const node of nodes) {
+    const base = getResourceBase(node.path);
+    if (!resourceGroups.has(base)) resourceGroups.set(base, new Map());
+    const methods = resourceGroups.get(base)!;
+    if (!methods.has(node.method)) methods.set(node.method, []);
+    methods.get(node.method)!.push(node);
+  }
+
+  // METHOD_ORDER: POST first, then GET, PUT, PATCH, DELETE last
+  const METHOD_ORDER: Record<string, number> = {
+    POST: 0, GET: 1, PUT: 2, PATCH: 3, DELETE: 4, HEAD: 5, OPTIONS: 5,
+  };
+
+  let wiredCount = 0;
+  const depsToAdd = new Map<string, Set<string>>(); // nodeId → Set<depId>
+
+  for (const [base, methods] of resourceGroups) {
+    const postNodes = methods.get('POST') || [];
+    if (postNodes.length === 0) continue;
+
+    // POST creates the resource — GET/{id}, PUT/{id}, PATCH/{id}, DELETE/{id} need it
+    for (const postNode of postNodes) {
+      for (const [method, methodNodes] of methods) {
+        if (method === 'POST' || method === 'HEAD' || method === 'OPTIONS') continue;
+
+        for (const node of methodNodes) {
+          // Only wire if the node uses a path parameter (indicating it operates on a specific resource)
+          const hasPathParam = node.path.includes('{');
+          if (!hasPathParam && method === 'GET') continue; // GET /users (list) doesn't need POST
+
+          if (!node.dependsOn.includes(postNode.id)) {
+            if (!depsToAdd.has(node.id)) depsToAdd.set(node.id, new Set());
+            depsToAdd.get(node.id)!.add(postNode.id);
+            wiredCount++;
+          }
+        }
+      }
+    }
+
+    // DELETE should also run after PUT/PATCH for the same resource
+    const deleteNodes = methods.get('DELETE') || [];
+    const mutateNodes = [...(methods.get('PUT') || []), ...(methods.get('PATCH') || [])];
+    for (const delNode of deleteNodes) {
+      for (const mutNode of mutateNodes) {
+        if (!delNode.dependsOn.includes(mutNode.id)) {
+          if (!depsToAdd.has(delNode.id)) depsToAdd.set(delNode.id, new Set());
+          depsToAdd.get(delNode.id)!.add(mutNode.id);
+          wiredCount++;
+        }
+      }
+    }
+  }
+
+  if (wiredCount === 0) return nodes;
+
+  const result = nodes.map(node => {
+    const extra = depsToAdd.get(node.id);
+    if (!extra || extra.size === 0) return node;
+    return {
+      ...node,
+      dependsOn: [...new Set([...node.dependsOn, ...extra])],
+    };
+  });
+
+  logger.info('[DEPENDENCY_RESOLVER] Auto-wired CRUD dependencies', {
+    resourceGroups: resourceGroups.size,
+    edgesAdded: wiredCount,
+  });
+
+  return result;
 }
 
 function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): void {
@@ -612,30 +870,112 @@ export class DependencyResolverService {
       logger.info('[DEPENDENCY_RESOLVER] Batching', { chunks: chunks.length });
 
       const partialDags = await Promise.all(
-        chunks.map(chunk => runArchitect(spec, chunk, analysisJson))
+        chunks.map(async (chunk, idx) => {
+          const result = await runArchitect(spec, chunk, analysisJson);
+          const nodeCount = Array.isArray(result?.nodes) ? result.nodes.length : 0;
+          logger.info('[DEPENDENCY_RESOLVER] Architect batch completed', {
+            batch: idx + 1,
+            totalBatches: chunks.length,
+            inputEndpoints: chunk.length,
+            outputNodes: nodeCount,
+          });
+          return result;
+        })
       );
       checkTimeout();
 
-      // Merge — pass analyst context so merge AI understands cross-batch deps
-      const mergePrompt = buildSwaggerDagMergePrompt(partialDags, spec);
-      const mergeContent = await callAiWithRetry(
-        [
-          { role: 'system', content: buildSwaggerDependencySystemPrompt() },
-          { role: 'user', content: `Domain context from analyst:\n${analysisJson.slice(0, 1000)}\n\n${mergePrompt}` },
-        ],
-        { temperature: 0.1, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 180000 } as any,
-        'Merger',
-      );
-      rawDag = JSON.parse(mergeContent);
+      // Collect all nodes from partial DAGs
+      const allPartialNodes = partialDags.flatMap(d => Array.isArray(d.nodes) ? d.nodes : []);
+      logger.info('[DEPENDENCY_RESOLVER] Partial DAGs collected', {
+        partialDagCount: partialDags.length,
+        totalPartialNodes: allPartialNodes.length,
+      });
+
+      if (allPartialNodes.length === 0) {
+        throw new Error('All Architect batches returned 0 nodes. The API spec may be too complex or malformed.');
+      }
+
+      // For large specs (many batches), skip AI merge — just concatenate
+      // AI merge is unreliable for 100+ nodes and wastes time/tokens
+      if (chunks.length > 4) {
+        logger.info('[DEPENDENCY_RESOLVER] Skipping AI merge for large spec, concatenating directly', {
+          chunks: chunks.length,
+          totalNodes: allPartialNodes.length,
+        });
+        emit('building_dag', `Combining ${allPartialNodes.length} nodes from ${chunks.length} batches...`, 70);
+        rawDag = {
+          nodes: allPartialNodes,
+          executionOrder: allPartialNodes.map((n: any) => n.id),
+          summary: `API flow with ${allPartialNodes.length} endpoints across ${chunks.length} groups`,
+        };
+      } else {
+        // Small number of batches — try AI merge
+        emit('building_dag', `Merging ${chunks.length} batches into one execution plan...`, 70);
+        try {
+          const mergePrompt = buildSwaggerDagMergePrompt(partialDags, spec);
+          logger.info('[DEPENDENCY_RESOLVER] Merger starting', {
+            promptLength: mergePrompt.length,
+            totalNodes: allPartialNodes.length,
+          });
+          const mergeContent = await callAiWithRetry(
+            [
+              { role: 'system', content: buildSwaggerDependencySystemPrompt() },
+              { role: 'user', content: `Domain context:\n${analysisJson.slice(0, 800)}\n\n${mergePrompt}` },
+            ],
+            { temperature: 0.1, response_format: { type: 'json_object' }, max_tokens: 65000, model: AI_TASK_MODELS.apiFlowArchitect, timeout: 180000 } as any,
+            'Merger',
+          );
+          const mergedDag = extractJson(mergeContent);
+
+          if (mergedDag?.nodes && Array.isArray(mergedDag.nodes) && mergedDag.nodes.length > 0) {
+            logger.info('[DEPENDENCY_RESOLVER] Merger succeeded', { mergedNodes: mergedDag.nodes.length });
+            rawDag = mergedDag;
+          } else {
+            logger.warn('[DEPENDENCY_RESOLVER] Merger returned 0 nodes, using concatenation', {
+              mergedContent: (mergeContent || '').slice(0, 200),
+            });
+            rawDag = {
+              nodes: allPartialNodes,
+              executionOrder: allPartialNodes.map((n: any) => n.id),
+              summary: `Concatenated ${chunks.length} partial DAGs`,
+            };
+          }
+        } catch (mergeErr: any) {
+          logger.warn('[DEPENDENCY_RESOLVER] Merger failed, using concatenation', {
+            error: mergeErr.message?.slice(0, 150),
+            totalNodes: allPartialNodes.length,
+          });
+          rawDag = {
+            nodes: allPartialNodes,
+            executionOrder: allPartialNodes.map((n: any) => n.id),
+            summary: `Concatenated ${chunks.length} partial DAGs (merger failed)`,
+          };
+        }
+      }
     }
     checkTimeout();
 
     // ── Post-processing ─────────────────────────────────────────────────
     const rawNodes: any[] = Array.isArray(rawDag.nodes) ? rawDag.nodes : [];
+    if (rawNodes.length === 0) {
+      throw new Error('AI could not generate any API flow nodes. Try selecting a smaller API group or a different spec.');
+    }
     let nodes: DAGNode[] = rawNodes.map((n, i) => normalizeNode(n, i));
+
+    // Remove phantom nodes (AI-fabricated endpoints not in spec)
+    nodes = removePhantomNodes(nodes, spec);
+    if (nodes.length === 0) {
+      throw new Error('All nodes were phantom (not in spec). AI may have misunderstood the specification.');
+    }
 
     // Deduplicate
     nodes = deduplicateNodes(nodes);
+
+    // Auto-wire auth dependencies (critical for cross-batch concatenation)
+    nodes = autoWireAuthDependencies(nodes);
+
+    // Auto-wire CRUD dependencies (POST before GET/{id}, DELETE after PUT)
+    nodes = autoWireCrudDependencies(nodes);
 
     // Validate dependencies exist
     const nodeIds = new Set(nodes.map(n => n.id));
@@ -662,6 +1002,33 @@ export class DependencyResolverService {
     }
 
     const executionOrder = sortResult.order;
+
+    // Repair broken variable injections:
+    // - Remove injections where no producer exists AND variable isn't a known user-provided pattern
+    // - Keep injections for auth_token, api_key etc. (user may provide via initialVariables)
+    const USER_PROVIDED_VARS = /^(auth_token|access_token|api_key|bearer_token|jwt|session_token|oauth_client_id|oauth_client_secret|base_url|token|authorization)$/i;
+    {
+      const producerVars = new Set<string>();
+      for (const n of nodes) {
+        for (const ext of n.variableExtractions) producerVars.add(ext.variableName);
+      }
+      let repairedCount = 0;
+      nodes = nodes.map(node => {
+        const validInjections = node.variableInjections.filter(inj => {
+          if (producerVars.has(inj.variableName)) return true;
+          if (USER_PROVIDED_VARS.test(inj.variableName)) return true; // user may provide
+          repairedCount++;
+          return false;
+        });
+        if (validInjections.length !== node.variableInjections.length) {
+          return { ...node, variableInjections: validInjections };
+        }
+        return node;
+      });
+      if (repairedCount > 0) {
+        logger.info('[DEPENDENCY_RESOLVER] Removed broken variable injections', { count: repairedCount });
+      }
+    }
 
     // Validate variable chain
     validateVariableChain(nodes, executionOrder);
