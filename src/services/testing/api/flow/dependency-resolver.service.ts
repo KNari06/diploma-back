@@ -27,6 +27,7 @@ import {
 import type {
   DAGNode,
   ExecutionDAG,
+  FlowQuestion,
   HttpMethod,
   ParsedApiSpec,
   ParsedEndpoint,
@@ -431,20 +432,35 @@ function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): void
 // MAIN SERVICE
 // ─────────────────────────────────────────────────────────────────────────────
 
+// In-memory cache for analysis results (so user can answer questions and resume)
+const analysisCache = new Map<string, { analysis: string; spec: ParsedApiSpec; expiresAt: number }>();
+
+export interface ResolveResult {
+  dag?: ExecutionDAG;
+  // If questions are present, the pipeline paused and needs user input
+  questions?: FlowQuestion[];
+  analysisId?: string; // cache key for resuming
+  confidence?: { overall: number; auth: number; dependencies: number; dataFlow: number };
+}
+
 export class DependencyResolverService {
   /**
    * 3-agent pipeline: Analyst → Architect → Enricher
-   * With retry, timeout, deduplication, and variable validation.
+   * Returns questions if analyst is uncertain — caller must resume with answers.
    */
-  static async resolve(spec: ParsedApiSpec): Promise<ExecutionDAG> {
+  static async resolve(
+    spec: ParsedApiSpec,
+    options?: { analysisId?: string; userAnswers?: Record<string, string> },
+  ): Promise<ResolveResult> {
     const endpoints = spec.endpoints;
 
     logger.info('[DEPENDENCY_RESOLVER] Starting pipeline', {
       title: spec.title,
       endpointCount: endpoints.length,
+      hasExistingAnalysis: !!options?.analysisId,
+      hasUserAnswers: !!options?.userAnswers,
     });
 
-    // Global timeout
     const deadline = Date.now() + PIPELINE_TIMEOUT_MS;
     const checkTimeout = () => {
       if (Date.now() > deadline) {
@@ -453,8 +469,67 @@ export class DependencyResolverService {
     };
 
     // ── Agent 1: Analyst ────────────────────────────────────────────────
-    const analysisJson = await runAnalyst(spec);
-    checkTimeout();
+    let analysisJson: string;
+
+    if (options?.analysisId) {
+      // Resume from cached analysis — user answered questions
+      const cached = analysisCache.get(options.analysisId);
+      if (!cached || cached.expiresAt < Date.now()) {
+        throw new Error('Analysis expired. Please start over.');
+      }
+
+      // Merge user answers into the analysis
+      const analysis = JSON.parse(cached.analysis);
+      if (options.userAnswers) {
+        analysis._userAnswers = options.userAnswers;
+        // Clear questions since user answered them
+        analysis.questions = [];
+      }
+      analysisJson = JSON.stringify(analysis);
+      analysisCache.delete(options.analysisId);
+
+      logger.info('[DEPENDENCY_RESOLVER] Resumed from cached analysis with user answers', {
+        answerCount: Object.keys(options.userAnswers || {}).length,
+      });
+    } else {
+      // Fresh analysis
+      analysisJson = await runAnalyst(spec);
+      checkTimeout();
+
+      // Check if analyst has questions for the user
+      try {
+        const analysis = JSON.parse(analysisJson);
+        const questions: FlowQuestion[] = (analysis.questions || []).filter(
+          (q: any) => q.id && q.question && q.type,
+        );
+        const confidence = analysis.confidence || { overall: 1, auth: 1, dependencies: 1, dataFlow: 1 };
+
+        if (questions.length > 0) {
+          // Cache the analysis and return questions to caller
+          const analysisId = `analysis_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          analysisCache.set(analysisId, {
+            analysis: analysisJson,
+            spec,
+            expiresAt: Date.now() + 10 * 60 * 1000, // 10 minute TTL
+          });
+
+          // Clean old cache entries
+          for (const [key, val] of analysisCache) {
+            if (val.expiresAt < Date.now()) analysisCache.delete(key);
+          }
+
+          logger.info('[DEPENDENCY_RESOLVER] Analyst has questions for user', {
+            questionCount: questions.length,
+            confidence,
+            analysisId,
+          });
+
+          return { questions, analysisId, confidence };
+        }
+      } catch {
+        // Analysis wasn't valid JSON — continue without questions
+      }
+    }
 
     // ── Agent 2: Architect ──────────────────────────────────────────────
     let rawDag: any;
@@ -546,12 +621,14 @@ export class DependencyResolverService {
     });
 
     return {
-      nodes,
-      executionOrder,
-      parallelGroups,
-      summary: typeof rawDag.summary === 'string' ? rawDag.summary : `API flow with ${nodes.length} endpoints`,
-      totalEndpoints: endpoints.length + spec.unsupportedEndpoints.length,
-      unsupportedEndpoints: spec.unsupportedEndpoints as UnsupportedEndpoint[],
+      dag: {
+        nodes,
+        executionOrder,
+        parallelGroups,
+        summary: typeof rawDag.summary === 'string' ? rawDag.summary : `API flow with ${nodes.length} endpoints`,
+        totalEndpoints: endpoints.length + spec.unsupportedEndpoints.length,
+        unsupportedEndpoints: spec.unsupportedEndpoints as UnsupportedEndpoint[],
+      },
     };
   }
 }

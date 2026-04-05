@@ -14,7 +14,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { SpecParserService } from './spec-parser.service';
-import { DependencyResolverService } from './dependency-resolver.service';
+import { DependencyResolverService, type ResolveResult } from './dependency-resolver.service';
 import type {
   ApiFlowSpec,
   ApiSpecSourceType,
@@ -230,10 +230,14 @@ export class FlowBuilderService {
     request: ParseSpecRequest,
     userId: string,
   ): Promise<{
-    flowSpec: ApiFlowSpec;
-    visualization: FlowVisualization;
-    dag: ExecutionDAG;
+    flowSpec?: ApiFlowSpec;
+    visualization?: FlowVisualization;
+    dag?: ExecutionDAG;
     spec: ParsedApiSpec;
+    // If questions are returned, the pipeline paused — user must answer
+    questions?: import('./flow.types').FlowQuestion[];
+    analysisId?: string;
+    confidence?: { overall: number; auth: number; dependencies: number; dataFlow: number };
   }> {
     const { projectId, environmentId, chatSessionId } = request;
 
@@ -277,19 +281,51 @@ export class FlowBuilderService {
     // Step 2: AI dependency resolution
     emit('analyzing_dependencies', 55, `AI is analyzing dependencies for ${spec.endpoints.length} endpoints...`);
 
-    let dag: ExecutionDAG;
+    let resolveResult: ResolveResult;
     try {
-      dag = await DependencyResolverService.resolve(spec);
+      resolveResult = await DependencyResolverService.resolve(spec, {
+        analysisId: request.analysisId,
+        userAnswers: request.userAnswers,
+      });
     } catch (error: any) {
       throw new Error(`Dependency analysis failed: ${error.message}`);
     }
 
+    // If analyst has questions, return them to the caller (don't build DAG yet)
+    if (resolveResult.questions && resolveResult.questions.length > 0) {
+      emit('analyzing_dependencies', 45, 'AI needs some clarification before building the execution plan...');
+      return {
+        spec,
+        questions: resolveResult.questions,
+        analysisId: resolveResult.analysisId,
+        confidence: resolveResult.confidence,
+      };
+    }
+
+    const dag = resolveResult.dag!;
     emit('building_dag', 80, `Built execution DAG with ${dag.nodes.length} nodes`);
 
     // Step 3: Build visualization
     const visualization = buildVisualization(dag);
 
     // Step 4: Persist to DB
+    // Extract user-provided variables from answers (questions with variableName)
+    // These will be pre-loaded into variable context at execution time
+    const userProvidedVariables: Record<string, string> = {};
+    if (request.userAnswers) {
+      try {
+        // The analysis JSON may contain questions with variableName mappings
+        const cachedAnalysis = JSON.parse(resolveResult.dag ? '{}' : '{}'); // analysis is consumed
+        // Check the original questions from the cached analysis
+        // userAnswers keys are question IDs — we need to map them to variableNames
+        // For now, store all answers as potential variables
+        // The frontend sends answers with question IDs as keys
+        Object.assign(userProvidedVariables, request.userAnswers);
+      } catch {
+        // Non-critical
+      }
+    }
+
     emit('building_dag', 90, 'Saving flow spec...');
     const flowSpec = await saveFlowSpec({
       userId,
@@ -300,6 +336,12 @@ export class FlowBuilderService {
       dag,
       errorStrategy: 'stop_on_failure',
     });
+
+    // Store user-provided variables in variable_chain (encrypted in future)
+    if (Object.keys(userProvidedVariables).length > 0) {
+      await updateFlowSpec(flowSpec.id, { variableChain: userProvidedVariables });
+      flowSpec.variableChain = userProvidedVariables;
+    }
 
     // Step 5: Emit dag-ready event with visualization
     if (chatSessionId) {

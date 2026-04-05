@@ -295,6 +295,17 @@ export interface ApiFlowRun {
 // REQUEST TYPES (API controller inputs)
 // ─────────────────────────────────────────────────────────────────────────────
 
+export interface FlowQuestion {
+  id: string;       // unique question ID
+  question: string;  // human-readable question
+  context: string;   // why the AI is asking this
+  type: 'text' | 'select' | 'confirm' | 'secret'; // 'secret' for tokens/keys — masked in UI
+  options?: string[]; // for 'select' type
+  defaultValue?: string;
+  // If set, the answer will be injected into variable context at execution time
+  variableName?: string; // e.g. "auth_token", "api_key" — maps to {{variableName}} in DAG
+}
+
 export interface ParseSpecRequest {
   source: 'url' | 'file';
   url?: string;
@@ -303,11 +314,17 @@ export interface ParseSpecRequest {
   projectId: string;
   environmentId?: string;
   chatSessionId?: string;
+  // For resuming after user answers questions
+  analysisId?: string; // ID of cached analysis to resume
+  userAnswers?: Record<string, string>; // question ID → answer
 }
 
 export interface RunFlowRequest {
   config?: Partial<FlowExecutionConfig>;
   chatSessionId?: string;
+  // User-provided variables injected into variable context before execution
+  // Typically: auth tokens, API keys, base URLs, test credentials
+  initialVariables?: Record<string, string>;
   // optional: override sample data per node
   nodeOverrides?: Record<string, {
     requestBody?: any;

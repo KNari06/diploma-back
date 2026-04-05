@@ -365,6 +365,33 @@ export class FlowExecutorService {
       }
     }
 
+    // Load saved variable chain from flow spec (user-provided during setup)
+    if (flowSpec.variableChain && typeof flowSpec.variableChain === 'object') {
+      for (const [key, value] of Object.entries(flowSpec.variableChain)) {
+        if (key && value !== undefined && value !== null) {
+          ctx[key] = value;
+        }
+      }
+      if (Object.keys(flowSpec.variableChain).length > 0) {
+        logger.info('[FLOW_EXECUTOR] Loaded saved variable chain', {
+          variableNames: Object.keys(flowSpec.variableChain),
+        });
+      }
+    }
+
+    // Inject user-provided variables from this run (tokens, API keys, credentials)
+    // These override saved variable chain values
+    if (request.initialVariables && typeof request.initialVariables === 'object') {
+      for (const [key, value] of Object.entries(request.initialVariables)) {
+        if (key && value !== undefined && value !== null) {
+          ctx[key] = value;
+        }
+      }
+      logger.info('[FLOW_EXECUTOR] Injected user-provided variables', {
+        variableNames: Object.keys(request.initialVariables),
+      });
+    }
+
     // Build node map for quick access
     const nodeMap = new Map(dag.nodes.map(n => [n.id, n]));
 

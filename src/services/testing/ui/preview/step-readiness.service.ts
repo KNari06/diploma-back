@@ -495,8 +495,12 @@ export async function waitForApiIdle(page: Page, timeoutMs: number): Promise<voi
     try { return new URL(url).origin === pageOrigin; } catch { return false; }
   };
 
-  /** Only count relevant requests: same-origin AND not third-party */
-  const isRelevantRequest = (req: { resourceType: () => string; url: () => string }): boolean => {
+  // Track which requests we're actually waiting for (by URL) to avoid counter leaks.
+  // Only relevant requests get tracked; their completion always decrements pending.
+  const trackedRequests = new Set<string>();
+
+  /** Check base eligibility: fetch/xhr + same-origin + not third-party */
+  const isEligibleRequest = (req: { resourceType: () => string; url: () => string }): boolean => {
     const type = req.resourceType();
     if (type !== 'fetch' && type !== 'xhr') return false;
     const url = req.url();
@@ -505,14 +509,22 @@ export async function waitForApiIdle(page: Page, timeoutMs: number): Promise<voi
     return true;
   };
 
-  const onRequest = (req: { resourceType: () => string; url: () => string }) => {
-    if (isRelevantRequest(req)) {
+  const onRequest = (req: { resourceType: () => string; url: () => string; method?: () => string }) => {
+    if (!isEligibleRequest(req)) return;
+    const method = typeof req.method === 'function' ? req.method() : 'GET';
+    // Always track mutating requests — step likely triggered them
+    // For GET: only track if it's not a known polling pattern (same URL seen before)
+    const url = req.url();
+    if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method) || !trackedRequests.has(url)) {
+      trackedRequests.add(url);
       pending++;
       lastActivity = Date.now();
     }
   };
   const onDone = (req: { resourceType: () => string; url: () => string }) => {
-    if (isRelevantRequest(req)) {
+    const url = req.url();
+    if (trackedRequests.has(url)) {
+      trackedRequests.delete(url);
       pending = Math.max(0, pending - 1);
       lastActivity = Date.now();
     }

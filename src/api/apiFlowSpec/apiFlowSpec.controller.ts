@@ -30,7 +30,7 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const { source, url, content, fileName, projectId, environmentId, chatSessionId } = req.body;
+    const { source, url, content, fileName, projectId, environmentId, chatSessionId, analysisId, userAnswers } = req.body;
 
     if (!projectId) {
       res.status(400).json({ success: false, error: 'projectId is required' });
@@ -57,11 +57,31 @@ export const parseSpec = async (req: Request, res: Response): Promise<void> => {
       projectId,
       environmentId,
       chatSessionId,
+      analysisId,
+      userAnswers,
     };
 
     logger.info('[FLOW_SPEC_CONTROLLER] Parsing spec', { source, url, projectId, userId });
 
     const result = await FlowBuilderService.buildFromSpec(parseRequest, userId);
+
+    // If AI has questions, return them instead of the DAG
+    if (result.questions && result.questions.length > 0) {
+      res.json({
+        success: true,
+        needsInput: true,
+        data: {
+          questions: result.questions,
+          analysisId: result.analysisId,
+          confidence: result.confidence,
+          specSummary: {
+            title: result.spec.title,
+            totalEndpoints: result.spec.endpoints.length,
+          },
+        },
+      });
+      return;
+    }
 
     res.json({
       success: true,
@@ -398,7 +418,7 @@ export const reparseSpec = async (req: Request, res: Response): Promise<void> =>
     }, userId);
 
     // Preserve user's error strategy from the old spec
-    if (existing.errorStrategy !== 'stop_on_failure') {
+    if (result.flowSpec && existing.errorStrategy !== 'stop_on_failure') {
       await FlowBuilderService.update(result.flowSpec.id, userId, {
         errorStrategy: existing.errorStrategy,
       });
