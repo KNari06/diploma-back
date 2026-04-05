@@ -155,6 +155,7 @@ export interface ApiFlowNodeData {
   operationId: string;
   summary?: string;
   status: FlowNodeStatus;
+  stepNumber?: number;
   isAuthEndpoint: boolean;
   isPagination: boolean;
   hasFileUpload: boolean;
@@ -162,6 +163,12 @@ export interface ApiFlowNodeData {
   variableExtractions: VariableExtraction[];
   variableInjections: VariableInjection[];
   tags: string[];
+  // DAG metadata (so frontend can reconstruct if needed)
+  dependsOn?: string[];
+  sampleRequestBody?: any;
+  sampleQueryParams?: Record<string, string>;
+  expectedStatusCodes?: number[];
+  priority?: number;
   // populated after execution
   statusCode?: number;
   durationMs?: number;

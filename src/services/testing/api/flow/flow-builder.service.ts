@@ -63,9 +63,31 @@ function buildVisualization(dag: ExecutionDAG): FlowVisualization {
     yOffset += NODE_HEIGHT + V_GAP;
   }
 
+  // INVARIANT: every node in dag.nodes MUST have a position.
+  // If any node wasn't in parallelGroups, place it in a new "orphan" row at the bottom.
+  const orphanNodes = dag.nodes.filter(n => !nodePositions.has(n.id));
+  if (orphanNodes.length > 0) {
+    const totalWidth = orphanNodes.length * NODE_WIDTH + (orphanNodes.length - 1) * H_GAP;
+    let xOffset = -(totalWidth / 2);
+    for (const node of orphanNodes) {
+      nodePositions.set(node.id, { x: xOffset, y: yOffset });
+      xOffset += NODE_WIDTH + H_GAP;
+    }
+    logger.warn('[FLOW_BUILDER] Orphan nodes positioned at bottom row', {
+      count: orphanNodes.length,
+      ids: orphanNodes.map(n => n.id),
+    });
+  }
+
+  // Build stepNumber map from executionOrder for display
+  const stepNumberMap = new Map<string, number>();
+  dag.executionOrder.forEach((id, i) => {
+    stepNumberMap.set(id, i + 1);
+  });
+
   // Create React Flow nodes
   for (const dagNode of dag.nodes) {
-    const pos = nodePositions.get(dagNode.id) ?? { x: 0, y: 0 };
+    const pos = nodePositions.get(dagNode.id)!; // guaranteed to exist now
 
     nodes.push({
       id: dagNode.id,
@@ -78,6 +100,7 @@ function buildVisualization(dag: ExecutionDAG): FlowVisualization {
         operationId: dagNode.operationId,
         summary: dagNode.summary,
         status: 'pending',
+        stepNumber: stepNumberMap.get(dagNode.id) || 0,
         isAuthEndpoint: dagNode.isAuthEndpoint,
         isPagination: dagNode.isPagination,
         hasFileUpload: dagNode.hasFileUpload,
@@ -85,6 +108,12 @@ function buildVisualization(dag: ExecutionDAG): FlowVisualization {
         variableExtractions: dagNode.variableExtractions,
         variableInjections: dagNode.variableInjections,
         tags: dagNode.tags,
+        // Include DAG metadata so frontend can reconstruct if needed
+        dependsOn: dagNode.dependsOn,
+        sampleRequestBody: dagNode.sampleRequestBody,
+        sampleQueryParams: dagNode.sampleQueryParams,
+        expectedStatusCodes: dagNode.expectedStatusCodes,
+        priority: dagNode.priority,
       },
     });
   }

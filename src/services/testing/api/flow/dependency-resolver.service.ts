@@ -603,79 +603,183 @@ function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
 }
 
 /**
- * CRUD-heuristic dependency wiring.
+ * CRUD + nested-resource dependency wiring.
  *
- * Problem: when batches are processed independently, DELETE /users/{id} may end up
- * at priority 0 because the Architect in that batch never saw POST /users.
+ * Solves 3 problems:
  *
- * Solution: detect CRUD patterns from paths and auto-wire:
- *   - POST /resource → must run before GET/PUT/PATCH/DELETE /resource/{id}
- *   - GET /resource (list) → no forced dependency
- *   - DELETE /resource/{id} → must run after POST (and preferably after GET/PUT)
+ * 1. SAME-RESOURCE CRUD ORDER:
+ *    POST /students → GET/PUT/PATCH /students/{id} → DELETE /students/{id}
  *
- * This extracts the "resource base" from paths like /api/v1/users/{userId}/orders/{orderId}
- * and builds implicit edges.
+ * 2. NESTED RESOURCE PARENT DEPENDENCY:
+ *    POST /students/{studentId}/grades needs studentId
+ *    → auto-wire to POST /students (which creates studentId)
+ *
+ * 3. PATH-PARAM PRODUCER DETECTION:
+ *    Any node with path param {fooId} must depend on the node that
+ *    creates that entity — even if AI didn't set variableInjections.
+ *
+ * Works by analyzing URL structure, not AI output — so it's reliable
+ * even when Architect batches miss cross-resource dependencies.
  */
 function autoWireCrudDependencies(nodes: DAGNode[]): DAGNode[] {
-  // Extract resource base: /api/v1/users/{id} → "/api/v1/users"
-  // Also handles nested: /users/{userId}/orders → "/users/*/orders"
-  function getResourceBase(path: string): string {
-    return path
-      .replace(/\{[^}]+\}/g, '*')  // {id} → *
-      .replace(/\/\*$/g, '')         // remove trailing /*
-      .replace(/\/\*\//g, '/*/');    // keep nested structure
+  /**
+   * Parse a path into segments, identifying resource names and param slots.
+   * /api/v1/students/{studentId}/grades/{gradeId}
+   * → [ { resource: "students", param: "studentId" },
+   *     { resource: "grades",   param: "gradeId" } ]
+   */
+  function parsePathSegments(path: string): Array<{ resource: string; param?: string }> {
+    // Remove common API prefixes
+    const cleaned = path.replace(/^\/(api\/)?v\d+\/?/, '/');
+    const parts = cleaned.split('/').filter(Boolean);
+    const segments: Array<{ resource: string; param?: string }> = [];
+
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.startsWith('{')) continue; // skip param-only segments
+
+      const nextPart = parts[i + 1];
+      const paramName = nextPart?.startsWith('{') ? nextPart.slice(1, -1) : undefined;
+      segments.push({ resource: part, param: paramName });
+      if (paramName) i++; // skip the param part
+    }
+    return segments;
   }
 
-  // Group nodes by resource base
-  const resourceGroups = new Map<string, Map<string, DAGNode[]>>(); // base → method → nodes
+  /**
+   * Get the "collection path" — the path for creating this resource.
+   * /students/{studentId}/grades/{gradeId} → /students/{studentId}/grades
+   * /students/{studentId} → /students
+   */
+  function getCollectionPath(path: string): string {
+    // Remove trailing path param: /foo/bar/{id} → /foo/bar
+    return path.replace(/\/\{[^}]+\}$/, '');
+  }
+
+  /**
+   * Get parent resource collection path.
+   * /students/{studentId}/grades → /students (parent creates studentId)
+   * /students/{studentId}/grades/{gradeId}/comments → /students/{studentId}/grades (parent creates gradeId)
+   */
+  function getParentCollectionPath(path: string): string | null {
+    const collection = getCollectionPath(path);
+    // Find the last resource segment and go up one level
+    const match = collection.match(/^(.+\/\{[^}]+\})\/[^/]+$/);
+    if (match) {
+      // e.g., /students/{studentId}/grades → parent collection is /students
+      return getCollectionPath(match[1]);
+    }
+    return null;
+  }
+
+  // Index: collection path → POST node(s) that create resources in this collection
+  const postByCollection = new Map<string, DAGNode[]>();
   for (const node of nodes) {
-    const base = getResourceBase(node.path);
-    if (!resourceGroups.has(base)) resourceGroups.set(base, new Map());
-    const methods = resourceGroups.get(base)!;
-    if (!methods.has(node.method)) methods.set(node.method, []);
-    methods.get(node.method)!.push(node);
+    if (node.method === 'POST') {
+      // POST /students → collection "/students" creates student resources
+      // POST /students/{id}/grades → collection "/students/{id}/grades" creates grade resources
+      const normalizedPath = node.path.replace(/\/$/, ''); // strip trailing slash
+      if (!postByCollection.has(normalizedPath)) postByCollection.set(normalizedPath, []);
+      postByCollection.get(normalizedPath)!.push(node);
+    }
   }
 
-  // METHOD_ORDER: POST first, then GET, PUT, PATCH, DELETE last
-  const METHOD_ORDER: Record<string, number> = {
-    POST: 0, GET: 1, PUT: 2, PATCH: 3, DELETE: 4, HEAD: 5, OPTIONS: 5,
-  };
+  // Also index without API version prefix for fuzzy matching
+  const postByCollectionFuzzy = new Map<string, DAGNode[]>();
+  for (const [path, postNodes] of postByCollection) {
+    const fuzzy = path.replace(/^\/(api\/)?v\d+\/?/, '/');
+    if (!postByCollectionFuzzy.has(fuzzy)) postByCollectionFuzzy.set(fuzzy, []);
+    postByCollectionFuzzy.get(fuzzy)!.push(...postNodes);
+  }
 
   let wiredCount = 0;
-  const depsToAdd = new Map<string, Set<string>>(); // nodeId → Set<depId>
+  const depsToAdd = new Map<string, Set<string>>();
 
-  for (const [base, methods] of resourceGroups) {
-    const postNodes = methods.get('POST') || [];
-    if (postNodes.length === 0) continue;
+  function addDep(nodeId: string, depId: string) {
+    if (nodeId === depId) return;
+    if (!depsToAdd.has(nodeId)) depsToAdd.set(nodeId, new Set());
+    depsToAdd.get(nodeId)!.add(depId);
+    wiredCount++;
+  }
 
-    // POST creates the resource — GET/{id}, PUT/{id}, PATCH/{id}, DELETE/{id} need it
-    for (const postNode of postNodes) {
-      for (const [method, methodNodes] of methods) {
-        if (method === 'POST' || method === 'HEAD' || method === 'OPTIONS') continue;
+  // Group nodes by collection path for same-resource CRUD ordering
+  const byCollection = new Map<string, DAGNode[]>();
+  for (const node of nodes) {
+    const col = getCollectionPath(node.path.replace(/\/$/, ''));
+    if (!byCollection.has(col)) byCollection.set(col, []);
+    byCollection.get(col)!.push(node);
+  }
 
-        for (const node of methodNodes) {
-          // Only wire if the node uses a path parameter (indicating it operates on a specific resource)
-          const hasPathParam = node.path.includes('{');
-          if (!hasPathParam && method === 'GET') continue; // GET /users (list) doesn't need POST
+  for (const [collection, collectionNodes] of byCollection) {
+    const posts = collectionNodes.filter(n => n.method === 'POST');
+    const gets = collectionNodes.filter(n => n.method === 'GET' && n.path.includes('{'));
+    const puts = collectionNodes.filter(n => n.method === 'PUT');
+    const patches = collectionNodes.filter(n => n.method === 'PATCH');
+    const deletes = collectionNodes.filter(n => n.method === 'DELETE');
 
-          if (!node.dependsOn.includes(postNode.id)) {
-            if (!depsToAdd.has(node.id)) depsToAdd.set(node.id, new Set());
-            depsToAdd.get(node.id)!.add(postNode.id);
-            wiredCount++;
-          }
+    // Rule 1: POST → GET/{id}, PUT/{id}, PATCH/{id}, DELETE/{id}
+    for (const post of posts) {
+      for (const node of [...gets, ...puts, ...patches, ...deletes]) {
+        if (!node.dependsOn.includes(post.id)) {
+          addDep(node.id, post.id);
         }
       }
     }
 
-    // DELETE should also run after PUT/PATCH for the same resource
-    const deleteNodes = methods.get('DELETE') || [];
-    const mutateNodes = [...(methods.get('PUT') || []), ...(methods.get('PATCH') || [])];
-    for (const delNode of deleteNodes) {
-      for (const mutNode of mutateNodes) {
-        if (!delNode.dependsOn.includes(mutNode.id)) {
-          if (!depsToAdd.has(delNode.id)) depsToAdd.set(delNode.id, new Set());
-          depsToAdd.get(delNode.id)!.add(mutNode.id);
-          wiredCount++;
+    // Rule 2: DELETE runs after PUT/PATCH (test update before you delete)
+    for (const del of deletes) {
+      for (const mut of [...puts, ...patches]) {
+        if (!del.dependsOn.includes(mut.id)) {
+          addDep(del.id, mut.id);
+        }
+      }
+    }
+  }
+
+  // Rule 3: Nested resources depend on parent POST
+  // e.g., anything under /students/{studentId}/grades/* needs POST /students
+  for (const node of nodes) {
+    const parentCol = getParentCollectionPath(node.path.replace(/\/$/, ''));
+    if (!parentCol) continue;
+
+    // Find POST nodes for the parent collection
+    const parentPosts = postByCollection.get(parentCol) || [];
+    for (const parentPost of parentPosts) {
+      if (!node.dependsOn.includes(parentPost.id) && node.id !== parentPost.id) {
+        addDep(node.id, parentPost.id);
+      }
+    }
+  }
+
+  // Rule 4: Path-param matching — if a node has {fooId} in path, find who creates "foo"
+  // e.g., GET /grades/{gradeId}/report → needs whoever creates grades (POST /…/grades)
+  for (const node of nodes) {
+    const pathParams = node.path.match(/\{([^}]+)\}/g);
+    if (!pathParams) continue;
+
+    for (const rawParam of pathParams) {
+      const paramName = rawParam.slice(1, -1); // strip { }
+      // Derive resource name from param: studentId → student, grade_id → grade
+      const resourceGuess = paramName
+        .replace(/Id$/, '').replace(/_id$/, '')
+        .replace(/ID$/, '').toLowerCase();
+
+      if (!resourceGuess) continue;
+
+      // Find POST nodes whose path ends with /resourceGuess (pluralized or not)
+      for (const [col, postNodes] of postByCollection) {
+        const colResource = col.split('/').filter(Boolean).pop()?.toLowerCase() || '';
+        // Match: "student" → "students", "grade" → "grades" (simple plural)
+        if (colResource === resourceGuess ||
+            colResource === resourceGuess + 's' ||
+            colResource === resourceGuess + 'es' ||
+            resourceGuess === colResource + 's' ||
+            resourceGuess === colResource + 'es') {
+          for (const postNode of postNodes) {
+            if (node.id !== postNode.id && !node.dependsOn.includes(postNode.id)) {
+              addDep(node.id, postNode.id);
+            }
+          }
         }
       }
     }
@@ -693,7 +797,7 @@ function autoWireCrudDependencies(nodes: DAGNode[]): DAGNode[] {
   });
 
   logger.info('[DEPENDENCY_RESOLVER] Auto-wired CRUD dependencies', {
-    resourceGroups: resourceGroups.size,
+    collections: byCollection.size,
     edgesAdded: wiredCount,
   });
 
@@ -971,11 +1075,26 @@ export class DependencyResolverService {
     // Deduplicate
     nodes = deduplicateNodes(nodes);
 
-    // Auto-wire auth dependencies (critical for cross-batch concatenation)
+    // Safety-net: auto-wire dependencies that AI should have set but missed.
+    // These functions only ADD edges — they never remove AI decisions.
+    // If they fire, it means the prompt needs improvement for this API pattern.
+    const preAuthCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
     nodes = autoWireAuthDependencies(nodes);
+    const postAuthCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
+    if (postAuthCount > preAuthCount) {
+      logger.warn('[DEPENDENCY_RESOLVER] PROMPT_GAP: Auth auto-wire added edges AI missed', {
+        edgesAdded: postAuthCount - preAuthCount,
+      });
+    }
 
-    // Auto-wire CRUD dependencies (POST before GET/{id}, DELETE after PUT)
+    const preCrudCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
     nodes = autoWireCrudDependencies(nodes);
+    const postCrudCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
+    if (postCrudCount > preCrudCount) {
+      logger.warn('[DEPENDENCY_RESOLVER] PROMPT_GAP: CRUD auto-wire added edges AI missed', {
+        edgesAdded: postCrudCount - preCrudCount,
+      });
+    }
 
     // Validate dependencies exist
     const nodeIds = new Set(nodes.map(n => n.id));
@@ -1001,7 +1120,22 @@ export class DependencyResolverService {
       }
     }
 
-    const executionOrder = sortResult.order;
+    let executionOrder = sortResult.order;
+
+    // INVARIANT: executionOrder must contain ALL node IDs.
+    // If topological sort dropped some (should not happen after cycle-breaking),
+    // append them at the end so no nodes are ever lost.
+    {
+      const inOrder = new Set(executionOrder);
+      const orphans = nodes.filter(n => !inOrder.has(n.id));
+      if (orphans.length > 0) {
+        logger.warn('[DEPENDENCY_RESOLVER] Orphan nodes not in topological order — appending', {
+          orphanCount: orphans.length,
+          orphanIds: orphans.map(n => n.id),
+        });
+        executionOrder = [...executionOrder, ...orphans.map(n => n.id)];
+      }
+    }
 
     // Repair broken variable injections:
     // - Remove injections where no producer exists AND variable isn't a known user-provided pattern
