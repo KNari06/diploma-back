@@ -350,7 +350,19 @@ export async function parseOpenApiSpec(
     }
   }
 
-  const title = anyDoc.info?.title || 'API';
+  // Derive a meaningful title — generic defaults like "OpenAPI definition" are useless
+  const rawTitle = anyDoc.info?.title || '';
+  const isGeneric = !rawTitle || /^(openapi|swagger|api)\s*(definition|spec|docs?)?$/i.test(rawTitle.trim());
+  let title: string;
+  if (isGeneric) {
+    // Fallback: use first tag name, or hostname from servers/baseUrl, or "API"
+    const firstTag = endpoints[0]?.tags?.[0];
+    const serverUrl = anyDoc.servers?.[0]?.url || anyDoc.host || '';
+    const hostname = serverUrl ? (serverUrl.replace(/^https?:\/\//, '').split('/')[0] || '') : '';
+    title = firstTag ? `${firstTag} API` : hostname ? `${hostname} API` : 'API';
+  } else {
+    title = rawTitle;
+  }
   const version = anyDoc.info?.version || '1.0.0';
 
   if (endpoints.length === 0 && unsupportedEndpoints.length === 0) {
