@@ -13,6 +13,7 @@
  */
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import {
   buildAnalystSystemPrompt,
@@ -34,9 +35,9 @@ import type {
   UnsupportedEndpoint,
 } from './flow.types';
 
-const MAX_ENDPOINTS_PER_BATCH = 30;
-const MAX_ENRICHER_BATCH = 20;
-const PIPELINE_TIMEOUT_MS = 180_000; // 3 minutes total for the pipeline
+const MAX_ENDPOINTS_PER_BATCH = 50; // GPT can handle ~50 endpoints per batch with compact serialization
+const MAX_ENRICHER_BATCH = 25;
+const PIPELINE_TIMEOUT_MS = 600_000; // 10 minutes for very large specs (1000+ endpoints)
 const AGENT_RETRY_COUNT = 1; // 1 retry per agent on failure
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,7 +235,7 @@ async function runAnalyst(spec: ParsedApiSpec): Promise<string> {
       { role: 'system', content: buildAnalystSystemPrompt() },
       { role: 'user', content: buildAnalystPrompt(spec) },
     ],
-    { temperature: 0.3, response_format: { type: 'json_object' } },
+    { temperature: 0.3, response_format: { type: 'json_object' }, max_tokens: 8000, model: AI_TASK_MODELS.apiFlowAnalyst },
     'Analyst',
   );
 
@@ -281,7 +282,7 @@ async function runArchitect(
       { role: 'system', content: buildArchitectSystemPrompt() },
       { role: 'user', content: buildArchitectPrompt(spec, endpoints, analysisJson) },
     ],
-    { temperature: 0.2, response_format: { type: 'json_object' } },
+    { temperature: 0.2, response_format: { type: 'json_object' }, model: AI_TASK_MODELS.apiFlowArchitect },
     'Architect',
   );
 
@@ -333,7 +334,7 @@ async function runEnricher(
           { role: 'system', content: buildEnricherSystemPrompt() },
           { role: 'user', content: prompt },
         ],
-        { temperature: 0.4, response_format: { type: 'json_object' } },
+        { temperature: 0.4, response_format: { type: 'json_object' }, model: AI_TASK_MODELS.apiFlowEnricher },
         'Enricher',
       );
 
@@ -556,7 +557,7 @@ export class DependencyResolverService {
           { role: 'system', content: buildSwaggerDependencySystemPrompt() },
           { role: 'user', content: `Domain context from analyst:\n${analysisJson.slice(0, 1000)}\n\n${mergePrompt}` },
         ],
-        { temperature: 0.1, response_format: { type: 'json_object' } },
+        { temperature: 0.1, response_format: { type: 'json_object' }, model: AI_TASK_MODELS.apiFlowArchitect },
         'Merger',
       );
       rawDag = JSON.parse(mergeContent);

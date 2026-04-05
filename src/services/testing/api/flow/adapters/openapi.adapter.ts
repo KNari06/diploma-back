@@ -213,31 +213,47 @@ export async function parseOpenApiSpec(
 ): Promise<ParsedApiSpec> {
   let doc: OpenAPI.Document;
 
+  // Helper: parse raw content to object
+  const parseRawContent = async (content: string) => {
+    const trimmed = content.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      return JSON.parse(trimmed);
+    }
+    const yaml = await import('js-yaml');
+    const obj = yaml.load(trimmed);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      throw new Error('Invalid API spec: expected a YAML/JSON object with OpenAPI structure');
+    }
+    return obj;
+  };
+
   try {
     if ('url' in input) {
       logger.info('[OPENAPI_ADAPTER] Fetching and parsing spec from URL', { url: input.url });
-      doc = await SwaggerParser.dereference(input.url) as OpenAPI.Document;
+      try {
+        doc = await SwaggerParser.dereference(input.url) as OpenAPI.Document;
+      } catch (derefErr: any) {
+        // Broken $ref — fallback to parse without dereference
+        logger.warn('[OPENAPI_ADAPTER] Dereference failed, falling back to parse()', {
+          error: derefErr.message?.slice(0, 200),
+        });
+        doc = await SwaggerParser.parse(input.url) as OpenAPI.Document;
+      }
     } else {
-      // Parse raw content (JSON or YAML)
       logger.info('[OPENAPI_ADAPTER] Parsing spec from file content', {
         fileName: input.fileName,
         contentLength: input.content.length,
       });
-      // SwaggerParser.parse() expects a file path, not a raw string.
-      // Parse JSON/YAML to object first, then dereference.
-      let rawObj: any;
-      const trimmed = input.content.trim();
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        rawObj = JSON.parse(trimmed);
-      } else {
-        // YAML content — use js-yaml (bundled with swagger-parser)
-        const yaml = await import('js-yaml');
-        rawObj = yaml.load(trimmed);
-        if (!rawObj || typeof rawObj !== 'object' || Array.isArray(rawObj)) {
-          throw new Error('Invalid API spec: expected a YAML/JSON object with OpenAPI structure');
-        }
+      const rawObj = await parseRawContent(input.content);
+      try {
+        doc = await SwaggerParser.dereference(rawObj) as OpenAPI.Document;
+      } catch (derefErr: any) {
+        // Broken $ref — fallback to raw parsed object
+        logger.warn('[OPENAPI_ADAPTER] Dereference failed, using raw parsed spec', {
+          error: derefErr.message?.slice(0, 200),
+        });
+        doc = rawObj as OpenAPI.Document;
       }
-      doc = await SwaggerParser.dereference(rawObj) as OpenAPI.Document;
     }
   } catch (error: any) {
     throw new Error(`Failed to parse OpenAPI spec: ${error.message}`);

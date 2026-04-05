@@ -134,7 +134,40 @@ Output ONLY valid JSON matching the exact schema specified.`;
 }
 
 export function buildAnalystPrompt(spec: ParsedApiSpec): string {
-  const endpointList = spec.endpoints.map(serializeEndpointCompact).join('\n\n');
+  const isLargeSpec = spec.endpoints.length > 80;
+
+  // For large specs: show tag summary + sample endpoints per tag (max ~100 total)
+  // For small specs: show all endpoints
+  let endpointList: string;
+  if (isLargeSpec) {
+    // Group by tag, show up to 5 endpoints per tag for context
+    const byTag = new Map<string, ParsedEndpoint[]>();
+    for (const ep of spec.endpoints) {
+      const tag = ep.tags[0] || 'untagged';
+      if (!byTag.has(tag)) byTag.set(tag, []);
+      byTag.get(tag)!.push(ep);
+    }
+
+    const sampled: string[] = [];
+    let idx = 0;
+    for (const [tag, eps] of byTag) {
+      sampled.push(`\n── ${tag} (${eps.length} endpoints) ──`);
+      // Show up to 5 per tag: prioritize POST, then GET with path params, then others
+      const sorted = [...eps].sort((a, b) => {
+        const methodPriority: Record<string, number> = { POST: 0, PUT: 1, PATCH: 2, DELETE: 3, GET: 4, HEAD: 5, OPTIONS: 6 };
+        return (methodPriority[a.method] ?? 9) - (methodPriority[b.method] ?? 9);
+      });
+      for (const ep of sorted.slice(0, 5)) {
+        sampled.push(serializeEndpointCompact(ep, idx++));
+      }
+      if (eps.length > 5) {
+        sampled.push(`  ... and ${eps.length - 5} more ${tag} endpoints`);
+      }
+    }
+    endpointList = sampled.join('\n');
+  } else {
+    endpointList = spec.endpoints.map(serializeEndpointCompact).join('\n\n');
+  }
 
   const tagGroups = new Map<string, string[]>();
   for (const ep of spec.endpoints) {
@@ -143,7 +176,7 @@ export function buildAnalystPrompt(spec: ParsedApiSpec): string {
     tagGroups.get(tag)!.push(`${ep.method} ${ep.path}`);
   }
   const tagSummary = Array.from(tagGroups.entries())
-    .map(([tag, eps]) => `  ${tag}: ${eps.join(', ')}`)
+    .map(([tag, eps]) => `  ${tag} (${eps.length}): ${eps.slice(0, 10).join(', ')}${eps.length > 10 ? `, ... +${eps.length - 10} more` : ''}`)
     .join('\n');
 
   const authInfo = serializeAuthSchemes(spec.authSchemes);
