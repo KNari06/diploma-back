@@ -1,21 +1,28 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * DEPENDENCY RESOLVER SERVICE
+ * DEPENDENCY RESOLVER SERVICE — 3-Agent Pipeline
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Uses AI (GPT, JSON mode) to analyze a ParsedApiSpec and produce an
- * ExecutionDAG — a directed acyclic graph of API calls with variable
- * extraction/injection mappings.
+ * Pipeline:
+ *   Agent 1 (ANALYST)   → reads spec, outputs domain analysis + resource map
+ *   Agent 2 (ARCHITECT) → uses analysis + spec, builds DAG with dependencies
+ *   Agent 3 (ENRICHER)  → takes DAG, generates realistic test data per node
  *
- * Also runs topological sort validation and cycle detection (Kahn's algorithm).
+ * Post-processing: topological sort, cycle detection, variable validation,
+ * node deduplication, and parallel group computation.
  */
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
 import {
-  buildSwaggerDependencyPrompt,
-  buildSwaggerDependencySystemPrompt,
+  buildAnalystSystemPrompt,
+  buildAnalystPrompt,
+  buildArchitectSystemPrompt,
+  buildArchitectPrompt,
+  buildEnricherSystemPrompt,
+  buildEnricherPrompt,
   buildSwaggerDagMergePrompt,
+  buildSwaggerDependencySystemPrompt,
 } from '@/ai/prompts/api-flow-prompts';
 import type {
   DAGNode,
@@ -26,8 +33,10 @@ import type {
   UnsupportedEndpoint,
 } from './flow.types';
 
-// Max endpoints per AI batch (GPT context limit safety)
 const MAX_ENDPOINTS_PER_BATCH = 30;
+const MAX_ENRICHER_BATCH = 20;
+const PIPELINE_TIMEOUT_MS = 180_000; // 3 minutes total for the pipeline
+const AGENT_RETRY_COUNT = 1; // 1 retry per agent on failure
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TOPOLOGICAL SORT (Kahn's algorithm)
@@ -38,9 +47,8 @@ function topologicalSort(nodes: DAGNode[]): {
   hasCycle: boolean;
   cycleEdges: Array<{ from: string; to: string }>;
 } {
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
   const inDegree = new Map<string, number>();
-  const adjacency = new Map<string, string[]>(); // id → dependents
+  const adjacency = new Map<string, string[]>();
 
   for (const node of nodes) {
     inDegree.set(node.id, inDegree.get(node.id) ?? 0);
@@ -68,7 +76,6 @@ function topologicalSort(nodes: DAGNode[]): {
   }
 
   if (order.length < nodes.length) {
-    // Cycle detected — find which edges form cycles
     const visited = new Set(order);
     const cycleEdges: Array<{ from: string; to: string }> = [];
     for (const node of nodes) {
@@ -86,13 +93,8 @@ function topologicalSort(nodes: DAGNode[]): {
   return { order, hasCycle: false, cycleEdges: [] };
 }
 
-/**
- * Break cycles by removing the cycle edges and logging warnings.
- * After removal, re-sort.
- */
 function breakCycles(nodes: DAGNode[], cycleEdges: Array<{ from: string; to: string }>): DAGNode[] {
-  logger.warn('[DEPENDENCY_RESOLVER] Cycle detected in DAG, breaking edges', { cycleEdges });
-
+  logger.warn('[DEPENDENCY_RESOLVER] Cycle detected, breaking edges', { cycleEdges });
   return nodes.map(node => ({
     ...node,
     dependsOn: node.dependsOn.filter(dep =>
@@ -106,8 +108,6 @@ function breakCycles(nodes: DAGNode[], cycleEdges: Array<{ from: string; to: str
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildParallelGroups(nodes: DAGNode[], executionOrder: string[]): string[][] {
-  // Compute topological level: longest path from any root to this node
-  // Nodes at the same level have no dependency on each other → can run in parallel
   const nodeMap = new Map(nodes.map(n => [n.id, n]));
   const levelCache = new Map<string, number>();
 
@@ -153,20 +153,25 @@ function normalizeNode(raw: any, index: number): DAGNode {
     tags: Array.isArray(raw.tags) ? raw.tags.map(String) : [],
     dependsOn: Array.isArray(raw.dependsOn) ? raw.dependsOn.map(String) : [],
     variableExtractions: Array.isArray(raw.variableExtractions)
-      ? raw.variableExtractions.map((e: any) => ({
-          variableName: String(e.variableName || ''),
-          jsonPath: e.jsonPath ? String(e.jsonPath) : undefined,
-          headerSource: e.headerSource ? String(e.headerSource) : undefined,
-          regex: e.regex ? String(e.regex) : undefined,
-        }))
+      ? raw.variableExtractions
+          .filter((e: any) => e.variableName && String(e.variableName).trim())
+          .map((e: any) => ({
+            variableName: String(e.variableName).trim(),
+            jsonPath: e.jsonPath ? String(e.jsonPath) : undefined,
+            headerSource: e.headerSource ? String(e.headerSource) : undefined,
+            regex: e.regex ? String(e.regex) : undefined,
+          }))
       : [],
     variableInjections: Array.isArray(raw.variableInjections)
-      ? raw.variableInjections.map((i: any) => ({
-          variableName: String(i.variableName || ''),
-          injectAs: i.injectAs || 'header',
-          targetKey: String(i.targetKey || ''),
-          prefix: i.prefix ? String(i.prefix) : undefined,
-        }))
+      ? raw.variableInjections
+          .filter((i: any) => i.variableName && String(i.variableName).trim() && i.targetKey)
+          .map((i: any) => ({
+            variableName: String(i.variableName).trim(),
+            injectAs: ['header', 'path_param', 'query_param', 'body_field', 'body_json_path'].includes(i.injectAs)
+              ? i.injectAs : 'header',
+            targetKey: String(i.targetKey),
+            prefix: i.prefix ? String(i.prefix) : undefined,
+          }))
       : [],
     priority: typeof raw.priority === 'number' ? raw.priority : 0,
     isAuthEndpoint: !!raw.isAuthEndpoint,
@@ -177,43 +182,248 @@ function normalizeNode(raw: any, index: number): DAGNode {
     canRunParallel: !!raw.canRunParallel,
     sampleRequestBody: raw.sampleRequestBody || undefined,
     sampleQueryParams: raw.sampleQueryParams || undefined,
-    expectedStatusCodes: Array.isArray(raw.expectedStatusCodes)
+    expectedStatusCodes: Array.isArray(raw.expectedStatusCodes) && raw.expectedStatusCodes.length > 0
       ? raw.expectedStatusCodes.map(Number)
       : [200, 201],
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AI CALL
+// AI CALL WITH RETRY
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function callAiForDag(
-  spec: ParsedApiSpec,
-  endpoints: ParsedEndpoint[],
-): Promise<any> {
-  const prompt = buildSwaggerDependencyPrompt(spec, endpoints);
-  const systemPrompt = buildSwaggerDependencySystemPrompt();
+async function callAiWithRetry(
+  messages: Array<{ role: string; content: string }>,
+  options: any,
+  agentName: string,
+): Promise<string> {
+  let lastError: Error | undefined;
 
-  logger.info('[DEPENDENCY_RESOLVER] Calling AI for DAG', {
-    endpointCount: endpoints.length,
+  for (let attempt = 0; attempt <= AGENT_RETRY_COUNT; attempt++) {
+    try {
+      const response = await getChatCompletionWithMessages(messages as any, options);
+      return response.content;
+    } catch (err: any) {
+      lastError = err;
+      logger.warn(`[DEPENDENCY_RESOLVER] ${agentName} attempt ${attempt + 1} failed`, {
+        error: err.message,
+        willRetry: attempt < AGENT_RETRY_COUNT,
+      });
+      if (attempt < AGENT_RETRY_COUNT) {
+        await new Promise(r => setTimeout(r, 2000)); // 2s backoff
+      }
+    }
+  }
+
+  throw new Error(`${agentName} failed after ${AGENT_RETRY_COUNT + 1} attempts: ${lastError?.message}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENT 1: ANALYST
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runAnalyst(spec: ParsedApiSpec): Promise<string> {
+  logger.info('[DEPENDENCY_RESOLVER] Agent 1: Analyst starting', {
     title: spec.title,
+    endpointCount: spec.endpoints.length,
   });
 
-  const response = await getChatCompletionWithMessages(
+  const content = await callAiWithRetry(
     [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: prompt },
+      { role: 'system', content: buildAnalystSystemPrompt() },
+      { role: 'user', content: buildAnalystPrompt(spec) },
     ],
-    {
-      temperature: 0.2,
-      response_format: { type: 'json_object' },
+    { temperature: 0.3, response_format: { type: 'json_object' } },
+    'Analyst',
+  );
+
+  // Validate JSON
+  try {
+    const parsed = JSON.parse(content);
+    // Ensure minimum structure
+    if (!parsed.domain && !parsed.entities && !parsed.authFlow) {
+      logger.warn('[DEPENDENCY_RESOLVER] Analyst output missing key fields, using raw');
     }
+  } catch {
+    logger.warn('[DEPENDENCY_RESOLVER] Analyst returned invalid JSON');
+    // Return a minimal valid analysis so the pipeline continues
+    return JSON.stringify({
+      domain: { name: 'Unknown', description: `API: ${spec.title}` },
+      entities: [],
+      authFlow: { type: spec.authSchemes.length > 0 ? 'unknown' : 'none', steps: [], tokenExtraction: null },
+      dataFlows: [],
+      publicEndpoints: [],
+      executionPhases: [{ phase: 1, name: 'All', endpoints: spec.endpoints.map(e => e.operationId), parallelizable: false }],
+      edgeCases: ['Analyst failed to parse spec — architect must analyze endpoints directly'],
+    });
+  }
+
+  logger.info('[DEPENDENCY_RESOLVER] Agent 1: Analyst completed');
+  return content;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENT 2: ARCHITECT
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runArchitect(
+  spec: ParsedApiSpec,
+  endpoints: ParsedEndpoint[],
+  analysisJson: string,
+): Promise<any> {
+  logger.info('[DEPENDENCY_RESOLVER] Agent 2: Architect starting', {
+    endpointCount: endpoints.length,
+  });
+
+  const content = await callAiWithRetry(
+    [
+      { role: 'system', content: buildArchitectSystemPrompt() },
+      { role: 'user', content: buildArchitectPrompt(spec, endpoints, analysisJson) },
+    ],
+    { temperature: 0.2, response_format: { type: 'json_object' } },
+    'Architect',
   );
 
   try {
-    return JSON.parse(response.content);
+    return JSON.parse(content);
   } catch {
-    throw new Error(`AI returned invalid JSON for DAG. Response: ${response.content.slice(0, 300)}`);
+    throw new Error(`Architect returned invalid JSON: ${content.slice(0, 300)}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AGENT 3: ENRICHER (with batching for large specs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runEnricher(
+  nodes: DAGNode[],
+  spec: ParsedApiSpec,
+  analysisJson: string,
+): Promise<DAGNode[]> {
+  const needsData = nodes.filter(n =>
+    ['POST', 'PUT', 'PATCH'].includes(n.method) && !n.sampleRequestBody
+  );
+
+  if (needsData.length === 0) return nodes;
+
+  logger.info('[DEPENDENCY_RESOLVER] Agent 3: Enricher starting', {
+    nodesToEnrich: needsData.length,
+  });
+
+  // Batch enricher calls if too many nodes
+  const batches: DAGNode[][] = [];
+  for (let i = 0; i < needsData.length; i += MAX_ENRICHER_BATCH) {
+    batches.push(needsData.slice(i, i + MAX_ENRICHER_BATCH));
+  }
+
+  const allSamples: Record<string, any> = {};
+
+  for (const batch of batches) {
+    // Build a subset of nodes for this batch prompt
+    const batchNodes = nodes.map(n =>
+      batch.some(b => b.id === n.id) ? n : { ...n, sampleRequestBody: '__SKIP__' as any }
+    );
+    const prompt = buildEnricherPrompt(batchNodes.filter(n => n.sampleRequestBody !== '__SKIP__'), spec, analysisJson);
+    if (!prompt) continue;
+
+    try {
+      const content = await callAiWithRetry(
+        [
+          { role: 'system', content: buildEnricherSystemPrompt() },
+          { role: 'user', content: prompt },
+        ],
+        { temperature: 0.4, response_format: { type: 'json_object' } },
+        'Enricher',
+      );
+
+      const result = JSON.parse(content);
+      Object.assign(allSamples, result.samples || {});
+    } catch (err: any) {
+      logger.warn('[DEPENDENCY_RESOLVER] Enricher batch failed, skipping', {
+        batchSize: batch.length,
+        error: err.message,
+      });
+    }
+  }
+
+  logger.info('[DEPENDENCY_RESOLVER] Agent 3: Enricher completed', {
+    samplesGenerated: Object.keys(allSamples).length,
+    expected: needsData.length,
+  });
+
+  return nodes.map(n => {
+    if (allSamples[n.id]) {
+      return { ...n, sampleRequestBody: allSamples[n.id] };
+    }
+    return n;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST-PROCESSING: Deduplication + Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+function deduplicateNodes(nodes: DAGNode[]): DAGNode[] {
+  const seen = new Map<string, DAGNode>();
+  const duplicates: string[] = [];
+
+  for (const node of nodes) {
+    if (seen.has(node.id)) {
+      duplicates.push(node.id);
+    } else {
+      seen.set(node.id, node);
+    }
+  }
+
+  if (duplicates.length > 0) {
+    logger.warn('[DEPENDENCY_RESOLVER] Duplicate node IDs removed', { duplicates });
+  }
+
+  return Array.from(seen.values());
+}
+
+function validateVariableChain(nodes: DAGNode[], executionOrder: string[]): void {
+  // Build map: which variables are extracted and by which nodes
+  const producerMap = new Map<string, string>(); // variableName → producerNodeId
+  for (const id of executionOrder) {
+    const node = nodes.find(n => n.id === id);
+    if (!node) continue;
+    for (const ext of node.variableExtractions) {
+      if (producerMap.has(ext.variableName)) {
+        logger.warn('[DEPENDENCY_RESOLVER] Variable name collision', {
+          variable: ext.variableName,
+          firstProducer: producerMap.get(ext.variableName),
+          secondProducer: node.id,
+        });
+      }
+      producerMap.set(ext.variableName, node.id);
+    }
+  }
+
+  // Check every injection has a matching extraction
+  for (const node of nodes) {
+    for (const inj of node.variableInjections) {
+      if (!producerMap.has(inj.variableName)) {
+        logger.warn('[DEPENDENCY_RESOLVER] Broken injection — no producer', {
+          nodeId: node.id,
+          variable: inj.variableName,
+          injectAs: inj.injectAs,
+          targetKey: inj.targetKey,
+        });
+      } else {
+        // Verify producer is in dependsOn chain (direct or transitive)
+        const producerId = producerMap.get(inj.variableName)!;
+        const producerIdx = executionOrder.indexOf(producerId);
+        const consumerIdx = executionOrder.indexOf(node.id);
+        if (producerIdx >= consumerIdx) {
+          logger.warn('[DEPENDENCY_RESOLVER] Producer runs AFTER consumer', {
+            variable: inj.variableName,
+            producer: producerId,
+            consumer: node.id,
+          });
+        }
+      }
+    }
   }
 }
 
@@ -223,64 +433,75 @@ async function callAiForDag(
 
 export class DependencyResolverService {
   /**
-   * Build an execution DAG from a parsed API spec.
-   * Handles batching for large specs (>30 endpoints).
+   * 3-agent pipeline: Analyst → Architect → Enricher
+   * With retry, timeout, deduplication, and variable validation.
    */
   static async resolve(spec: ParsedApiSpec): Promise<ExecutionDAG> {
     const endpoints = spec.endpoints;
 
-    logger.info('[DEPENDENCY_RESOLVER] Starting resolution', {
+    logger.info('[DEPENDENCY_RESOLVER] Starting pipeline', {
       title: spec.title,
       endpointCount: endpoints.length,
     });
 
+    // Global timeout
+    const deadline = Date.now() + PIPELINE_TIMEOUT_MS;
+    const checkTimeout = () => {
+      if (Date.now() > deadline) {
+        throw new Error(`Pipeline timed out after ${PIPELINE_TIMEOUT_MS / 1000}s`);
+      }
+    };
+
+    // ── Agent 1: Analyst ────────────────────────────────────────────────
+    const analysisJson = await runAnalyst(spec);
+    checkTimeout();
+
+    // ── Agent 2: Architect ──────────────────────────────────────────────
     let rawDag: any;
 
     if (endpoints.length <= MAX_ENDPOINTS_PER_BATCH) {
-      // Single batch
-      rawDag = await callAiForDag(spec, endpoints);
+      rawDag = await runArchitect(spec, endpoints, analysisJson);
     } else {
-      // Batch into chunks of MAX_ENDPOINTS_PER_BATCH
       const chunks: ParsedEndpoint[][] = [];
       for (let i = 0; i < endpoints.length; i += MAX_ENDPOINTS_PER_BATCH) {
         chunks.push(endpoints.slice(i, i + MAX_ENDPOINTS_PER_BATCH));
       }
 
-      logger.info('[DEPENDENCY_RESOLVER] Large spec — batching into chunks', {
-        chunks: chunks.length,
-        endpointCount: endpoints.length,
-      });
+      logger.info('[DEPENDENCY_RESOLVER] Batching', { chunks: chunks.length });
 
       const partialDags = await Promise.all(
-        chunks.map(chunk => callAiForDag(spec, chunk))
+        chunks.map(chunk => runArchitect(spec, chunk, analysisJson))
       );
+      checkTimeout();
 
-      // Merge via AI
+      // Merge — pass analyst context so merge AI understands cross-batch deps
       const mergePrompt = buildSwaggerDagMergePrompt(partialDags, spec);
-      const mergeResponse = await getChatCompletionWithMessages(
+      const mergeContent = await callAiWithRetry(
         [
           { role: 'system', content: buildSwaggerDependencySystemPrompt() },
-          { role: 'user', content: mergePrompt },
+          { role: 'user', content: `Domain context from analyst:\n${analysisJson.slice(0, 1000)}\n\n${mergePrompt}` },
         ],
-        { temperature: 0.1, response_format: { type: 'json_object' } }
+        { temperature: 0.1, response_format: { type: 'json_object' } },
+        'Merger',
       );
-      rawDag = JSON.parse(mergeResponse.content);
+      rawDag = JSON.parse(mergeContent);
     }
+    checkTimeout();
 
-    // Normalize nodes
+    // ── Post-processing ─────────────────────────────────────────────────
     const rawNodes: any[] = Array.isArray(rawDag.nodes) ? rawDag.nodes : [];
     let nodes: DAGNode[] = rawNodes.map((n, i) => normalizeNode(n, i));
 
-    // Validate all dependsOn references exist
+    // Deduplicate
+    nodes = deduplicateNodes(nodes);
+
+    // Validate dependencies exist
     const nodeIds = new Set(nodes.map(n => n.id));
     nodes = nodes.map(node => ({
       ...node,
       dependsOn: node.dependsOn.filter(dep => {
         if (!nodeIds.has(dep)) {
-          logger.warn('[DEPENDENCY_RESOLVER] Unknown dependency reference — removed', {
-            nodeId: node.id,
-            unknownDep: dep,
-          });
+          logger.warn('[DEPENDENCY_RESOLVER] Unknown dep removed', { nodeId: node.id, dep });
           return false;
         }
         return true;
@@ -293,16 +514,18 @@ export class DependencyResolverService {
       nodes = breakCycles(nodes, sortResult.cycleEdges);
       sortResult = topologicalSort(nodes);
       if (sortResult.hasCycle) {
-        logger.error('[DEPENDENCY_RESOLVER] Could not break all cycles — forcing flat order');
+        logger.error('[DEPENDENCY_RESOLVER] Persistent cycle — forcing flat order');
         sortResult = { order: nodes.map(n => n.id), hasCycle: false, cycleEdges: [] };
       }
     }
 
     const executionOrder = sortResult.order;
 
-    const parallelGroups = buildParallelGroups(nodes, executionOrder);
+    // Validate variable chain
+    validateVariableChain(nodes, executionOrder);
 
-    // Re-assign priority based on parallel group level (not unique position)
+    // Parallel groups + priority assignment
+    const parallelGroups = buildParallelGroups(nodes, executionOrder);
     const levelMap = new Map<string, number>();
     parallelGroups.forEach((group, level) => {
       for (const id of group) levelMap.set(id, level);
@@ -312,7 +535,11 @@ export class DependencyResolverService {
       priority: levelMap.get(node.id) ?? node.priority,
     }));
 
-    logger.info('[DEPENDENCY_RESOLVER] DAG resolved', {
+    // ── Agent 3: Enricher ───────────────────────────────────────────────
+    checkTimeout();
+    nodes = await runEnricher(nodes, spec, analysisJson);
+
+    logger.info('[DEPENDENCY_RESOLVER] Pipeline completed', {
       nodes: nodes.length,
       executionOrder: executionOrder.length,
       parallelGroups: parallelGroups.length,

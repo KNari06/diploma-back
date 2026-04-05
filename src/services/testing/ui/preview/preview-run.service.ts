@@ -18,7 +18,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
-import type { IntentStep } from './preview.types';
+import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
 import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
@@ -627,6 +627,34 @@ export class PreviewRunService {
       // Track page summary after navigation for better error context
       let lastNavigationSummary: PageSummary | null = null;
 
+      // Adaptive settle threshold: tracks actual settle times PER ACTION TYPE.
+      // After click (navigation risk) → longer settle. After type (input) → shorter settle.
+      // Groups match getDomStableThresholdMs categories: navigation, input, assertion, default.
+      const adaptiveSettleByCategory = new Map<string, number[]>();
+      const getActionCategory = (actionType: IntentActionType | string): string => {
+        if (['click', 'open', 'close', 'toggle', 'select', 'dblclick'].includes(actionType)) return 'navigation';
+        if (['type', 'press'].includes(actionType)) return 'input';
+        if (['assert', 'ai_check'].includes(actionType)) return 'assertion';
+        return 'default';
+      };
+      const getAdaptiveSettleMs = (prevActionType?: IntentActionType | string): number => {
+        const category = prevActionType ? getActionCategory(prevActionType) : 'default';
+        const samples = adaptiveSettleByCategory.get(category);
+        if (!samples || samples.length < 2) return STEP_READINESS_CONFIG.defaults.settleMs; // Not enough data
+        // p75 × 1.5 safety margin, clamped to [150, 3000]
+        const sorted = [...samples].sort((a, b) => a - b);
+        const p75 = sorted[Math.floor(sorted.length * 0.75)];
+        return Math.max(150, Math.min(3000, Math.round(p75 * 1.5)));
+      };
+      const recordSettleTime = (prevActionType: IntentActionType | string, waitedMs: number): void => {
+        const category = getActionCategory(prevActionType);
+        const samples = adaptiveSettleByCategory.get(category) || [];
+        samples.push(waitedMs);
+        // Keep last 10 samples per category to stay responsive to changes
+        if (samples.length > 10) samples.shift();
+        adaptiveSettleByCategory.set(category, samples);
+      };
+
       // V13: Pre-inject auto-wait steps for first-run stability.
       // On second+ runs these are already in the DB from batchUpdateStepsFromRun().
       // The injection is idempotent — it skips if the next step is already wait_for.
@@ -983,14 +1011,20 @@ export class PreviewRunService {
             if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
               const nextStep = stepsToExecute[i + 1];
               try {
+                const adaptiveSettle = getAdaptiveSettleMs(step.type);
                 const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
                   maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                  settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                  settleMs: adaptiveSettle,
                   autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                   prevActionType: step.type,
                   prevUrl: trackedUrl,
                   recordedDelayMs: nextStep.evidence?.interStepDelayMs,
                 }), signal);
+
+                // Track actual settle time per action category for adaptive threshold
+                if (lookahead.waited > 0) {
+                  recordSettleTime(step.type, lookahead.waited);
+                }
 
                 if (lookahead.autoWaitApplied) {
                   logger.info('[PreviewRun] Lookahead auto-wait applied before next step', {

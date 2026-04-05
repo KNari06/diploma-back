@@ -246,9 +246,25 @@ async function waitForDOMStable(
           let lastMutationTime = Date.now();
           const startTime = Date.now();
 
+          // Attribute names that indicate CSS animation/transition (not structural change)
+          const animationAttrs = new Set(['class', 'style', 'aria-hidden', 'data-state', 'data-active']);
+
           // @ts-expect-error - MutationObserver exists in browser context
-          const observer = new MutationObserver(() => {
-            lastMutationTime = Date.now();
+          const observer = new MutationObserver((mutations: any[]) => {
+            // Only count structural mutations (node add/remove) and meaningful attribute changes.
+            // Ignore CSS animation noise (class/style toggling, aria-hidden transitions).
+            for (const m of mutations) {
+              if (m.type === 'childList') {
+                // Structural: node added or removed — always counts
+                lastMutationTime = Date.now();
+                return;
+              }
+              if (m.type === 'attributes' && !animationAttrs.has(m.attributeName)) {
+                // Meaningful attribute change (e.g. value, src, href, disabled)
+                lastMutationTime = Date.now();
+                return;
+              }
+            }
           });
 
           // @ts-expect-error - document exists in browser context
@@ -256,6 +272,7 @@ async function waitForDOMStable(
             childList: true,
             subtree: true,
             attributes: true,
+            attributeFilter: undefined, // Observe all, filter in callback
           });
 
           const checkStable = () => {
@@ -444,21 +461,58 @@ async function waitForLoadingIndicatorsClear(page: Page, timeoutMs: number): Pro
 /**
  * Wait for pending API requests (fetch/xhr) to complete.
  * Lightweight inline tracker — attaches listeners, waits for quiet period, cleans up.
+ *
+ * Filters out third-party requests (analytics, tracking, monitoring) to prevent
+ * endless waits caused by Google Analytics, Intercom, Sentry, etc.
+ * Reuses THIRD_PARTY_DOMAINS from third-party-blocker for consistency.
  */
 export async function waitForApiIdle(page: Page, timeoutMs: number): Promise<void> {
+  // Lazy-load to avoid circular dependency
+  let thirdPartyDomains: readonly string[] = [];
+  try {
+    const { THIRD_PARTY_DOMAINS } = await import('@/agent/playwright/execution/third-party-blocker');
+    thirdPartyDomains = THIRD_PARTY_DOMAINS;
+  } catch { /* non-critical — proceed without filter */ }
+
+  // Get page origin for same-origin check
+  let pageOrigin = '';
+  try { pageOrigin = new URL(page.url()).origin; } catch { /* proceed without origin filter */ }
+
   let pending = 0;
   let lastActivity = Date.now() - API_QUIET_THRESHOLD_MS; // Start with threshold met
 
-  const onRequest = (req: { resourceType: () => string }) => {
+  /** Check if request URL is a third-party domain (analytics, tracking, etc.) */
+  const isThirdPartyRequest = (url: string): boolean => {
+    try {
+      const hostname = new URL(url).hostname;
+      return thirdPartyDomains.some(domain => hostname.includes(domain));
+    } catch { return false; }
+  };
+
+  /** Check if request URL is same-origin as the page being tested */
+  const isSameOrigin = (url: string): boolean => {
+    if (!pageOrigin) return true; // No origin = can't filter, count all
+    try { return new URL(url).origin === pageOrigin; } catch { return false; }
+  };
+
+  /** Only count relevant requests: same-origin AND not third-party */
+  const isRelevantRequest = (req: { resourceType: () => string; url: () => string }): boolean => {
     const type = req.resourceType();
-    if (type === 'fetch' || type === 'xhr') {
+    if (type !== 'fetch' && type !== 'xhr') return false;
+    const url = req.url();
+    if (isThirdPartyRequest(url)) return false;
+    if (!isSameOrigin(url)) return false;
+    return true;
+  };
+
+  const onRequest = (req: { resourceType: () => string; url: () => string }) => {
+    if (isRelevantRequest(req)) {
       pending++;
       lastActivity = Date.now();
     }
   };
-  const onDone = (req: { resourceType: () => string }) => {
-    const type = req.resourceType();
-    if (type === 'fetch' || type === 'xhr') {
+  const onDone = (req: { resourceType: () => string; url: () => string }) => {
+    if (isRelevantRequest(req)) {
       pending = Math.max(0, pending - 1);
       lastActivity = Date.now();
     }

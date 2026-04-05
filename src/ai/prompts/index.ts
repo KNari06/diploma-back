@@ -36,6 +36,12 @@ export {
 
 // Re-export from api-flow-prompts.ts
 export {
+  buildAnalystSystemPrompt,
+  buildAnalystPrompt,
+  buildArchitectSystemPrompt,
+  buildArchitectPrompt,
+  buildEnricherSystemPrompt,
+  buildEnricherPrompt,
   buildSwaggerDependencyPrompt,
   buildSwaggerDependencySystemPrompt,
   buildSwaggerDagMergePrompt,
