@@ -678,6 +678,9 @@ export class PreviewRunService {
       // V13: Switch dialog handler to replay mode — use pre-installed actions from recorded dialog steps
       sessionService.setDialogMode(previewSessionId, userId, 'replay');
 
+      // Skip compiled shortcut for remaining steps if first compiled plan failed (likely stale after deploy)
+      let skipCompiledForRemaining = false;
+
       // ─── Step execution loop ───────────────────────────────────────────
       for (let i = 0; i < stepsToExecute.length; i++) {
         // Check cancellation
@@ -848,7 +851,17 @@ export class PreviewRunService {
             userId,
             skipPostActionWait: true, // V12: Lookahead handles inter-step timing
             expectsNavigation, // V13: Wrap click with waitForNavigation if next step expects URL change
+            skipCompiled: skipCompiledForRemaining,
           }), signal);
+
+          // If compiled plan was tried and failed, skip compiled for remaining steps
+          // (plans likely stale after deploy — don't waste 3s timeout per step)
+          if (result.compiledFailed && !skipCompiledForRemaining) {
+            skipCompiledForRemaining = true;
+            logger.info('[PreviewRun] Compiled plan failed — skipping compiled for remaining steps', {
+              previewSessionId, stepIndex: i, stepId: step.id,
+            });
+          }
           let retried = false;
 
           // ── Step-level retry: one attempt with relaxed params on failure ──

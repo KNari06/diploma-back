@@ -370,6 +370,8 @@ interface ApplyResult {
     modalText?: string;
     boundingBox?: { x: number; y: number; width: number; height: number };
   };
+  /** Compiled locator plan was tried but failed (stale plan, DOM changed) */
+  compiledFailed?: boolean;
 }
 
 /**
@@ -1556,6 +1558,7 @@ export class PreviewStepApplyService {
     selectedRef?: string; // V3: User-confirmed element ref from clarification
     skipPostActionWait?: boolean; // V12: Skip post-action settle when caller uses lookahead (e.g. Run mode)
     expectsNavigation?: boolean; // V13: Next step is wait_for with changedFrom — wrap click with waitForNavigation
+    skipCompiled?: boolean; // Skip compiled shortcut (stale plans after deploy or URL change)
   }): Promise<ApplyResult> {
     const { previewSessionId, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
     let { stepDraft } = params;
@@ -2340,17 +2343,32 @@ export class PreviewStepApplyService {
         };
       }
 
+      // Track whether compiled plan was tried but failed (reported to caller for skip-compiled optimization)
+      let compiledWasTried = false;
+
       // ═══════════════════════════════════════════════════════════════════════
       // V7: Try compiled locator plan first (if available) before lint
       // This is a fast path that avoids expensive AI/LLM resolution when we have
       // a cached, validated locator from a previous successful resolution
       // ═══════════════════════════════════════════════════════════════════════
-      if (stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0) {
+      // Skip compiled shortcut if:
+      // - Caller flagged skipCompiled (previous step's compiled failed = likely stale plans)
+      // - Page URL changed since compiled was generated (plan targets wrong page)
+      const compiledPageUrl = stepDraft.compiled?.context?.pageUrl;
+      const currentPageUrl = page.url();
+      const compiledUrlStale = compiledPageUrl && currentPageUrl
+        && normalizeUrlForComparison(compiledPageUrl) !== normalizeUrlForComparison(currentPageUrl);
+
+      if (
+        stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0
+        && !params.skipCompiled
+        && !compiledUrlStale
+      ) {
         logger.debug('[PREVIEW_APPLY] Trying compiled locator plan before lint', {
           previewSessionId,
           stepId: stepDraft.id,
           locatorCount: stepDraft.compiled.locatorPlan.length,
-          pageUrl: stepDraft.compiled.context?.pageUrl,
+          pageUrl: compiledPageUrl,
         });
 
         try {
@@ -2424,6 +2442,7 @@ export class PreviewStepApplyService {
           }
 
           // Compiled failed or element not found - fallthrough to lint
+          compiledWasTried = true;
           logger.debug('[PREVIEW_APPLY] Compiled locator failed, falling back to lint', {
             previewSessionId,
             stepId: stepDraft.id,
@@ -2431,6 +2450,7 @@ export class PreviewStepApplyService {
           });
         } catch (compiledError) {
           // Compiled execution threw - fallthrough to lint
+          compiledWasTried = true;
           logger.debug('[PREVIEW_APPLY] Compiled execution error, falling back to lint', {
             previewSessionId,
             stepId: stepDraft.id,
@@ -2660,6 +2680,7 @@ export class PreviewStepApplyService {
             attempts,
             verified,
             stateChange,
+            compiledFailed: compiledWasTried,
           };
         }
 
