@@ -1112,6 +1112,12 @@ export class DependencyResolverService {
     // Topological sort + cycle detection
     let sortResult = topologicalSort(nodes);
     if (sortResult.hasCycle) {
+      // Notify caller so they can surface a warning to the user via WebSocket
+      emit(
+        'building_dag',
+        `Circular dependencies detected between ${sortResult.cycleEdges.length} endpoint(s) — automatically resolved. Execution order may differ from the original spec.`,
+        78,
+      );
       nodes = breakCycles(nodes, sortResult.cycleEdges);
       sortResult = topologicalSort(nodes);
       if (sortResult.hasCycle) {

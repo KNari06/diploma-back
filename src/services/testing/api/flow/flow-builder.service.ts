@@ -334,6 +334,17 @@ export class FlowBuilderService {
       );
     }
 
+    // Warn user about expected analysis time for large specs
+    if (spec.endpoints.length > 50) {
+      const batchCount = Math.ceil(spec.endpoints.length / 20);
+      const estimatedMinutes = Math.ceil(batchCount * 0.5); // ~30s per Architect batch
+      emit(
+        'fetching_spec',
+        12,
+        `Large spec detected (${spec.endpoints.length} endpoints, ~${estimatedMinutes} min to analyze). This may take a while…`,
+      );
+    }
+
     // Step 2: AI dependency resolution
     emit('analyzing_dependencies', 40, `AI is analyzing ${spec.endpoints.length} endpoints...`);
 
