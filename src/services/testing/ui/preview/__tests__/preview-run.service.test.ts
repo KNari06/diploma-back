@@ -273,12 +273,19 @@ describe('PreviewRunService', () => {
       ).rejects.toThrow('No steps to run');
     });
 
-    it('should throw error if session has no active page', async () => {
+    it('should return failed summary if session has no active page', async () => {
       mockSessionService.getSession.mockReturnValue({ page: null });
 
-      await expect(
-        PreviewRunService.runSavedSteps(mockPreviewSessionId, mockIntentTestCaseId, mockUserId)
-      ).rejects.toThrow('Session has no active page');
+      // The run loop now captures inner errors and returns them in the summary
+      // (instead of throwing), so chat tools / AI agents can read the failure.
+      const summary = await PreviewRunService.runSavedSteps(
+        mockPreviewSessionId,
+        mockIntentTestCaseId,
+        mockUserId,
+      );
+
+      expect(summary.success).toBe(false);
+      expect(summary.firstError).toMatch(/Session has no active page/);
     });
 
     it('should throw error if run already in progress', async () => {

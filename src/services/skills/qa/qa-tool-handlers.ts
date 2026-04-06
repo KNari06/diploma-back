@@ -3226,20 +3226,50 @@ export async function handleRunTest(
         if (PreviewRunService.isRunning(context.previewSessionId)) {
           return { success: false, message: 'A run is already in progress on this preview session. Wait for it to finish or cancel it first.', displayToUser: false };
         }
-        // Fire-and-forget: progress is streamed via WebSocket events (preview:run:started, preview:run:step, preview:run:completed)
-        PreviewRunService.runSavedSteps(context.previewSessionId, targetId, context.userId).catch(err => {
-          logger.error('[QA_TOOL] Preview run failed', {
-            error: err instanceof Error ? err.message : String(err),
+        // Await the run so the AI agent sees the actual outcome (passed/failed/error)
+        // and can respond with a meaningful summary. Frontend keeps getting realtime
+        // progress via WebSocket events.
+        try {
+          const summary = await PreviewRunService.runSavedSteps(
+            context.previewSessionId,
+            targetId,
+            context.userId,
+          );
+          const durationSec = (summary.duration / 1000).toFixed(1);
+          const statusWord = summary.success
+            ? 'completed successfully'
+            : summary.cancelled
+              ? 'cancelled'
+              : summary.timedOut
+                ? 'timed out'
+                : 'failed';
+          const failedHint = summary.firstError
+            ? ` First failure: ${summary.firstError.substring(0, 200)}`
+            : '';
+          return {
+            success: summary.success,
+            data: {
+              intentTestCaseId: targetId,
+              previewSessionId: context.previewSessionId,
+              runType,
+              ...summary,
+            },
+            message: `Test case run ${statusWord} in ${durationSec}s — ${summary.passedSteps}/${summary.totalSteps} steps passed${summary.failedSteps > 0 ? `, ${summary.failedSteps} failed` : ''}${summary.skippedSteps > 0 ? `, ${summary.skippedSteps} skipped` : ''}.${failedHint}`,
+            displayToUser: true,
+          };
+        } catch (previewErr) {
+          const errorMessage = previewErr instanceof Error ? previewErr.message : String(previewErr);
+          logger.error('[QA_TOOL] Preview run failed before starting', {
+            error: errorMessage,
             previewSessionId: context.previewSessionId,
             intentTestCaseId: targetId,
           });
-        });
-        return {
-          success: true,
-          data: { intentTestCaseId: targetId, previewSessionId: context.previewSessionId, runType },
-          message: `Started preview run for test case ${targetId}. Steps are executing on the live preview — watch the browser.`,
-          displayToUser: true,
-        };
+          return {
+            success: false,
+            message: `Failed to start preview run: ${errorMessage}`,
+            displayToUser: true,
+          };
+        }
       }
 
       default:
@@ -3360,32 +3390,56 @@ export async function handleRunDraftSteps(
     DraftStepsCache.set(context.chatSessionId, { steps, startUrl, userId: context.userId });
   }
 
-  // 8. Fire-and-forget: progress is streamed via WebSocket events
-  PreviewRunService.runStepsOnPreview(
-    context.previewSessionId,
-    steps,
-    startUrl,
-    context.userId,
-    { persistAppliedSteps: false, chatSessionId: context.chatSessionId ?? undefined }, // ephemeral — no DB writes
-  ).catch(err => {
-    logger.error('[QA_TOOL] Draft steps run failed', {
-      error: err instanceof Error ? err.message : String(err),
+  // 8. Await the run so the AI agent can read the actual outcome (passed/failed/error)
+  //    and respond with a meaningful summary instead of "I started a run, watch the browser".
+  //    Frontend still gets realtime progress via WebSocket (preview:run:started/step/completed).
+  try {
+    const summary = await PreviewRunService.runStepsOnPreview(
+      context.previewSessionId,
+      steps,
+      startUrl,
+      context.userId,
+      { persistAppliedSteps: false, chatSessionId: context.chatSessionId ?? undefined }, // ephemeral — no DB writes
+    );
+
+    const durationSec = (summary.duration / 1000).toFixed(1);
+    const statusWord = summary.success
+      ? 'completed successfully'
+      : summary.cancelled
+        ? 'cancelled'
+        : summary.timedOut
+          ? 'timed out'
+          : 'failed';
+    const failedHint = summary.firstError
+      ? ` First failure: ${summary.firstError.substring(0, 200)}`
+      : '';
+
+    return {
+      success: summary.success,
+      data: {
+        previewSessionId: context.previewSessionId,
+        ephemeral: true,
+        startUrl,
+        ...summary,
+      },
+      message: `Run ${statusWord} in ${durationSec}s — ${summary.passedSteps}/${summary.totalSteps} steps passed${summary.failedSteps > 0 ? `, ${summary.failedSteps} failed` : ''}${summary.skippedSteps > 0 ? `, ${summary.skippedSteps} skipped` : ''}.${failedHint}`,
+      displayToUser: true,
+    };
+  } catch (err) {
+    // Synchronous throw before the run loop starts (e.g., concurrent run, no session page).
+    // The async run loop now captures errors internally and returns them in the summary.
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    logger.error('[QA_TOOL] Draft steps run failed before starting', {
+      error: errorMessage,
       previewSessionId: context.previewSessionId,
       stepCount: steps.length,
     });
-  });
-
-  return {
-    success: true,
-    data: {
-      previewSessionId: context.previewSessionId,
-      stepCount: steps.length,
-      startUrl,
-      ephemeral: true,
-    },
-    message: `Started ephemeral run with ${steps.length} steps on the live preview. Steps are NOT saved — watch the browser for progress. Use qa_create_test_case to persist when satisfied.`,
-    displayToUser: true,
-  };
+    return {
+      success: false,
+      message: `Failed to start draft run: ${errorMessage}`,
+      displayToUser: true,
+    };
+  }
 }
 
 /**

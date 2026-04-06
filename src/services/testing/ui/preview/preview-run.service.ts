@@ -326,6 +326,32 @@ function interpolateContextVariables(step: IntentStep, previewSessionId: string)
 }
 
 /**
+ * Result summary returned by runStepsOnPreview / runSavedSteps after the run
+ * has fully completed (or errored). Mirrors the payload of preview:run:completed
+ * so callers (chat tools, AI agents) can answer "did the run succeed?" without
+ * subscribing to WebSocket events.
+ */
+export interface PreviewRunSummary {
+  success: boolean;
+  totalSteps: number;
+  passedSteps: number;
+  failedSteps: number;
+  skippedSteps: number;
+  cancelled: boolean;
+  timedOut: boolean;
+  duration: number;
+  /** Failed step details (truncated to first 5) for human-readable error messages */
+  failedStepDetails?: Array<{
+    stepIndex: number;
+    description: string;
+    action: string;
+    error?: string;
+  }>;
+  /** First failed step error (for quick AI summary) */
+  firstError?: string;
+}
+
+/**
  * Service for running steps in preview session
  */
 export class PreviewRunService {
@@ -349,7 +375,7 @@ export class PreviewRunService {
       inlineSteps?: IntentStep[];
       startUrl?: string;
     },
-  ): Promise<void> {
+  ): Promise<PreviewRunSummary> {
     // ─── Early guards (fail-fast before any DB work) ───────────────────
     if (activeRuns.has(previewSessionId)) {
       throw new Error('Run already in progress for this session');
@@ -461,7 +487,7 @@ export class PreviewRunService {
       /** @internal Skip ownership check when caller (runSavedSteps) already verified */
       _skipOwnershipCheck?: boolean;
     },
-  ): Promise<void> {
+  ): Promise<PreviewRunSummary> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
 
@@ -493,6 +519,12 @@ export class PreviewRunService {
     let passedSteps = 0;
     let failedSteps = 0;
     let skippedSteps = 0;
+
+    // Capture per-failure details for the returned summary (used by chat tools/AI)
+    const failedStepDetails: NonNullable<PreviewRunSummary['failedStepDetails']> = [];
+
+    // Built in finally — returned to caller after the run fully completes.
+    let runSummary: PreviewRunSummary | null = null;
 
     // Batch accumulator: collect enriched steps in-memory, persist once at end
     const enrichedSteps = new Map<string, IntentStep>();
@@ -533,6 +565,10 @@ export class PreviewRunService {
 
     // V14: Per-step telemetry collector — declared outside try for finally cleanup
     let telemetryCollector: StepTelemetryCollector | null = null;
+
+    // Capture any error thrown inside the run loop so the finally block
+    // can record it in the returned summary (used by chat tools/AI agents).
+    let caughtRunError: unknown = null;
 
     try {
       // 4. Get session page
@@ -1176,6 +1212,15 @@ export class PreviewRunService {
               ...(retried ? { retried: true } : {}),
             });
             failedSteps++;
+            // Capture for summary (truncate to first 5 to bound payload size)
+            if (failedStepDetails.length < 5) {
+              failedStepDetails.push({
+                stepIndex: i,
+                description: step.description || '',
+                action: step.type,
+                error: errorWithContext,
+              });
+            }
 
             // V14: Record step telemetry (fail)
             telemetryCollector?.markStepEnd('fail', session.page.url(), {
@@ -1450,6 +1495,15 @@ export class PreviewRunService {
             ...(exceptionRetried ? { retried: true } : {}),
           });
           failedSteps++;
+          // Capture for summary (truncate to first 5)
+          if (failedStepDetails.length < 5) {
+            failedStepDetails.push({
+              stepIndex: i,
+              description: step.description || '',
+              action: step.type,
+              error: errorWithContext,
+            });
+          }
 
           // V14: Record step telemetry (exception)
           try {
@@ -1493,6 +1547,16 @@ export class PreviewRunService {
           // Non-fatal — AbortError or timeout, proceed to completion
         }
       }
+    } catch (runError) {
+      // Capture so the finally block can flag the summary as failed and AI/chat
+      // tools see a meaningful firstError. We do NOT re-throw — callers always
+      // get a PreviewRunSummary now (success: false on error).
+      caughtRunError = runError;
+      logger.error('[PreviewRun] Run loop threw — recording in summary', {
+        previewSessionId,
+        intentTestCaseId: intentTestCaseId ?? '(ephemeral)',
+        error: runError instanceof Error ? runError.message : String(runError),
+      });
     } finally {
       // Clear global timeout
       clearTimeout(globalTimeout);
@@ -1602,6 +1666,28 @@ export class PreviewRunService {
         stepTelemetry,
       });
 
+      // Build the summary object returned to the caller (chat tools, AI agents).
+      // Mirrors the WebSocket payload but adds failedStepDetails for human-readable
+      // error messages without subscribing to step events.
+      const runErrorMessage = caughtRunError
+        ? (caughtRunError instanceof Error ? caughtRunError.message : String(caughtRunError))
+        : undefined;
+      const summarySuccess = runSuccess && !caughtRunError;
+      runSummary = {
+        success: summarySuccess,
+        totalSteps: steps.length,
+        passedSteps,
+        failedSteps,
+        skippedSteps,
+        cancelled,
+        timedOut,
+        duration,
+        ...(failedStepDetails.length > 0 ? { failedStepDetails } : {}),
+        ...(runErrorMessage
+          ? { firstError: runErrorMessage }
+          : failedStepDetails[0]?.error ? { firstError: failedStepDetails[0].error } : {}),
+      };
+
       // NOTE: We do NOT emit chat:processing:step on completion.
       // The progress:100 signal would trigger the frontend's "API agent finished" handler
       // (which clears processingSteps, resets isTyping, etc.) — destructive side-effect.
@@ -1650,6 +1736,25 @@ export class PreviewRunService {
 
       // activeRuns already released above (before completed event).
     }
+
+    // Defensive: if we somehow exited finally without building summary
+    // (e.g., very early throw before emit completed), synthesize a minimal one
+    // so callers always get a non-null value.
+    if (!runSummary) {
+      runSummary = {
+        success: false,
+        totalSteps: steps.length,
+        passedSteps,
+        failedSteps,
+        skippedSteps,
+        cancelled: true,
+        timedOut,
+        duration: Date.now() - runState.startTime,
+        ...(failedStepDetails.length > 0 ? { failedStepDetails } : {}),
+        ...(failedStepDetails[0]?.error ? { firstError: failedStepDetails[0].error } : {}),
+      };
+    }
+    return runSummary;
   }
 
   /**

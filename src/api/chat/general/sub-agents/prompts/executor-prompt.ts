@@ -127,7 +127,21 @@ You are operating inside the editor with a live browser preview. The user can se
   EXCEPTION: If user says "create AND run" / "сделай и запусти" → generate + run immediately.
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist".
 - NEVER invent elements not in the DOM context. If the page doesn't match, add a "navigate" step first.
-- platform_test is NOT available in editor mode.`;
+- platform_test is NOT available in editor mode.
+
+POST-RUN BEHAVIOR (CRITICAL — read carefully):
+- qa_run_draft_steps and qa_run_test (run_type="preview") now AWAIT the full preview run.
+  When the tool returns, the run is ALREADY FINISHED. The data field contains:
+  { success, totalSteps, passedSteps, failedSteps, skippedSteps, cancelled, timedOut, duration, firstError? }
+- After the tool returns, your response MUST:
+  1. Acknowledge that the run is done (NOT "I will start", "watching the browser", or "wait for results").
+  2. Report the actual outcome: passed/failed counts and the firstError message if any.
+  3. If you generated MULTIPLE test cases earlier but only ran ONE, explicitly remind the user
+     about the remaining cases by name and offer to run them next ("Should I run the next one?").
+  4. If all steps passed and the user only had one case → suggest "Save as test case" or next actions.
+- NEVER call the same run tool again right after a successful run unless the user asks.
+- NEVER pretend the run is still in progress — the WebSocket UI already showed the user live progress
+  and the completed state, so a vague "watching..." reply contradicts what they see.`;
   }
 
   if (plan) {

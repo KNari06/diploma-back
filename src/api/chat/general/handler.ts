@@ -701,9 +701,18 @@ EDITOR WORKFLOW:
 
 IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
-- After a successful run, tell the user: "Test ran successfully on the preview. Say 'save' to persist."
 - For SINGLE actions (one click, one type) → this is editor_action, handled automatically
 - For MULTI-STEP flows (login, checkout, search+filter) → generate IntentSteps, ask to run, then qa_run_draft_steps
+
+POST-RUN BEHAVIOR (CRITICAL):
+- qa_run_draft_steps and qa_run_test (run_type="preview") AWAIT the full run. When the tool returns, the run is FINISHED.
+- The result.data contains: { success, totalSteps, passedSteps, failedSteps, skippedSteps, cancelled, timedOut, duration, firstError? }
+- After the tool returns, your reply MUST:
+  1. Use past tense and report the actual numbers ("The run finished — 5/5 steps passed in 13.6s.")
+  2. If failedSteps > 0 → quote firstError and the failed step description
+  3. If you proposed multiple cases earlier and only ran one → name the remaining cases and offer to run them next
+  4. If success and only one case → suggest "Save as test case" or related next actions
+- NEVER say "I'll start the run" or "watching the browser" — by the time you reply, the run is already done
 
 WHEN THE PAGE DOESN'T MATCH:
 - If the requested test target isn't on the current page, add a "navigate" step first to go to the right URL

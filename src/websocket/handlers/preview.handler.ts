@@ -1597,68 +1597,103 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               }
               sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
 
-              // V15: LLM fallback — if probe couldn't find interactive element (directHit/cssClass),
-              // ask LLM to pick the correct ancestor from the chain.
-              // This runs async but BEFORE we build the step, so the step gets correct element data.
-              if (preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass') {
-                try {
-                  const llmPage = sessionService.getPage(previewSessionId, ensuredUserId);
-                  if (llmPage) {
-                    preClickElement = await RecordingCaptureService.resolveInteractiveTarget(
-                      llmPage, preClickElement!, x, y,
-                    );
-                  }
-                } catch {
-                  // Non-critical — use original probe result
-                }
-              }
+              // V19: Non-blocking click step emission.
+              // Old flow: await LLM (up to 2s) → emit step → user sees step ~2s after click.
+              // New flow: build step from pre-click probe → emit immediately → run LLM in background
+              //          → if LLM refines the element, emit preview:recording:step:update with same id.
+              // Data preservation:
+              //   - step.id is generated ONCE and reused for the update (frontend merges by id)
+              //   - All initial fields (modifiers, iframe, evidence.pageUrl, tabIndex) are kept
+              //   - Update only overrides type/description/bindingHints/iframe/highlight/evidence.lastSuccessRef
+              //   - If LLM fails or returns same element, no update is sent (initial step stays correct)
 
               // V10: Pass button and clickCount to inferClickActionType for dblclick/right-click support
               const safeButton = (data.button === 'right' || data.button === 'middle') ? data.button : 'left';
               const safeClickCount = (data.clickCount === 2) ? 2 : 1;
-              const actionType = RecordingCaptureService.inferClickActionType(preClickElement!, safeClickCount, safeButton);
-              const description = RecordingCaptureService.buildDescription(actionType, preClickElement!);
-              const bindingHints = RecordingCaptureService.buildBindingHints(preClickElement!);
+              const needsLLM = preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass';
 
+              // Helper: build a click step from a ProbedElement (kept local so initial + update are identical)
+              const stepIdForClick = `rec_${Date.now().toString(36)}`;
               const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
-
-              // V13: Capture modifier keys for multi-select (Shift+Click, Ctrl+Click, etc.)
+              const initialPageUrl = currentPage?.url();
               const hasModifiers = modifiers && (modifiers.shift || modifiers.ctrl || modifiers.meta || modifiers.alt);
-              // V13: Capture iframe context for replay (auto-detected from probing)
-              const iframeSel = preClickElement!.iframeSelector;
 
-              const step: PreviewIntentStep = {
-                id: `rec_${Date.now().toString(36)}`,
-                type: actionType,
-                description,
-                bindingHints: Object.keys(bindingHints).length > 0 ? bindingHints : undefined,
-                options: {
-                  ...(hasModifiers && {
-                    modifiers: {
-                      ...(modifiers.shift && { shift: true }),
-                      ...(modifiers.ctrl && { ctrl: true }),
-                      ...(modifiers.meta && { meta: true }),
-                      ...(modifiers.alt && { alt: true }),
-                    },
-                  }),
-                  ...(iframeSel && { iframe: { selector: iframeSel } }),
-                },
-                evidence: {
-                  ...(preClickElement!.ref && { lastSuccessRef: preClickElement!.ref }),
-                  confidence: 1.0,
-                  pageUrl: currentPage?.url(),
-                },
+              const buildClickStep = (el: NonNullable<typeof preClickElement>): PreviewIntentStep => {
+                const aType = RecordingCaptureService.inferClickActionType(el, safeClickCount, safeButton);
+                const desc = RecordingCaptureService.buildDescription(aType, el);
+                const bHints = RecordingCaptureService.buildBindingHints(el);
+                const iSel = el.iframeSelector;
+                const built: PreviewIntentStep = {
+                  id: stepIdForClick,
+                  type: aType,
+                  description: desc,
+                  bindingHints: Object.keys(bHints).length > 0 ? bHints : undefined,
+                  options: {
+                    ...(hasModifiers && {
+                      modifiers: {
+                        ...(modifiers.shift && { shift: true }),
+                        ...(modifiers.ctrl && { ctrl: true }),
+                        ...(modifiers.meta && { meta: true }),
+                        ...(modifiers.alt && { alt: true }),
+                      },
+                    }),
+                    ...(iSel && { iframe: { selector: iSel } }),
+                  },
+                  evidence: {
+                    ...(el.ref && { lastSuccessRef: el.ref }),
+                    confidence: 1.0,
+                    pageUrl: initialPageUrl,
+                  },
+                };
+                if (built.options && Object.keys(built.options).length === 0) {
+                  delete built.options;
+                }
+                return built;
               };
-              // Clean up empty options
-              if (step.options && Object.keys(step.options).length === 0) {
-                delete step.options;
-              }
+
+              // Build & emit the initial step IMMEDIATELY using pre-click probe data
+              const step = buildClickStep(preClickElement!);
 
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
               emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
-              if (cTrace) cTrace.writeStepCaptured(step, 'click');
+              if (cTrace) cTrace.writeStepCaptured(step, needsLLM ? 'click_pending_llm' : 'click');
+
+              // V19: Background LLM refinement — does NOT block step appearing in the panel.
+              // We snapshot the original element for diffing so we only emit an update when LLM
+              // actually picked a different ancestor.
+              if (needsLLM) {
+                const originalEl = preClickElement!;
+                const originalKey = `${originalEl.tag}|${originalEl.boundingBox?.x ?? -1}|${originalEl.boundingBox?.y ?? -1}|${originalEl.boundingBox?.width ?? -1}|${originalEl.boundingBox?.height ?? -1}|${originalEl.ref ?? ''}`;
+                // Fire-and-forget: refines step in background. Errors are non-fatal.
+                (async () => {
+                  try {
+                    const llmPage = sessionService.getPage(previewSessionId, ensuredUserId);
+                    if (!llmPage) return;
+                    const refined = await RecordingCaptureService.resolveInteractiveTarget(
+                      llmPage, originalEl, x, y,
+                    );
+                    if (!refined) return;
+                    const refinedKey = `${refined.tag}|${refined.boundingBox?.x ?? -1}|${refined.boundingBox?.y ?? -1}|${refined.boundingBox?.width ?? -1}|${refined.boundingBox?.height ?? -1}|${refined.ref ?? ''}`;
+                    if (refinedKey === originalKey) return; // LLM confirmed original — nothing to update
+                    // Mutate the closure ref so the navigation block below sees the refined element
+                    preClickElement = refined;
+                    const updatedStep = buildClickStep(refined);
+                    socket.nsp.to(room).emit('preview:recording:step:update', {
+                      previewSessionId,
+                      step: updatedStep,
+                      highlight: refined.boundingBox,
+                      timestamp: new Date().toISOString(),
+                    } as any);
+                    if (cTrace) cTrace.writeStepUpdated(updatedStep, 'click_llm_refine');
+                  } catch (e) {
+                    logger.debug('[RECORDING] Background LLM refinement failed', {
+                      error: e instanceof Error ? e.message : String(e),
+                    });
+                  }
+                })();
+              }
 
               // V13: Smart navigation detection — condition-based polling instead of fixed 500ms
               // Wait for domcontentloaded first, then poll URL for up to 2s (SPA redirects can be delayed)
