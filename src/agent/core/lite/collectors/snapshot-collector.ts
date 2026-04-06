@@ -1120,11 +1120,14 @@ export class SnapshotCollector {
         // cursor:pointer leaf elements that aren't caught by querySelectorAll.
         // Scans entire document.body — capped at MAX_SECONDARY_ELEMENTS (60).
         // ═══════════════════════════════════════════════════════════════════════
-        const secondaryPassElements = collectFrameworkInteractiveElements(
-          document.body,
-          seenElements,
-          uniqueElements
-        );
+        // Guard: document.body may be null during page navigation
+        const secondaryPassElements = document.body
+          ? collectFrameworkInteractiveElements(
+              document.body,
+              seenElements,
+              uniqueElements
+            )
+          : new Set<Element>();
 
         // ✅ FIX BUG 5: Track refs used in THIS snapshot pass to prevent duplicates
         // When two elements produce the same fingerprint (e.g. repeated UI cards),
