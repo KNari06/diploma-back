@@ -1676,6 +1676,12 @@ export class PreviewSessionService {
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();
 
+      // Detect navigation-in-progress state: document.body not yet ready
+      // (__debugStats.documentBodyChildCount === -1 means document.body was null during collection)
+      const debugStats = (snapshot as any).__debugStats;
+      const isNavigationInProgress = debugStats?.documentBodyChildCount === -1
+        && domAnalysis.interactiveNodes.length === 0;
+
       // ── DEBUG: Log when snapshot returns 0 elements to diagnose drawer/popup issues ──
       if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length === 0) {
         logger.warn('[PREVIEW_SESSION] Snapshot returned 0 elements', {
@@ -1683,6 +1689,7 @@ export class PreviewSessionService {
           url: currentUrl,
           pageIsClosed: session.page.isClosed(),
           snapshotElementCount: snapshot.elements?.length ?? -1,
+          isNavigationInProgress,
         });
       } else if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length > 0) {
         logger.warn('[PREVIEW_SESSION] Snapshot has elements but extractor returned 0 nodes', {
@@ -1690,6 +1697,23 @@ export class PreviewSessionService {
           url: currentUrl,
           rawElementCount: snapshot.elements.length,
         });
+      }
+
+      // If navigation is in progress and we have valid previous state, return cached state
+      // instead of overwriting pageState with empty nodes (which would break next lint)
+      if (isNavigationInProgress && session.pageState.domNodes.length > 0) {
+        logger.debug('[PREVIEW_SESSION] Navigation in progress, keeping previous DOM state', {
+          sessionId,
+          previousNodeCount: session.pageState.domNodes.length,
+        });
+        return {
+          url: session.pageState.url,
+          pageTitle: session.pageState.pageTitle,
+          domNodes: options?.includeDomNodes ? session.pageState.domNodes : undefined,
+          domVersion: session.domVersion,
+          pageSignature: session.lastPageSignature,
+          changed: false,
+        };
       }
 
       const currentTitle = await session.page.title().catch(() => undefined);
