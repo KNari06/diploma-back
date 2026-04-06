@@ -202,6 +202,14 @@ interface InternalSession extends PreviewSession {
   lastSnapshotEmit: number;
   lastScreenshotEmitAt: number;  // Last screenshot emission timestamp
   lastPageSignature: string;      // Hash for diff detection (url+domMetrics)
+  /**
+   * V20: Signature of the last `preview:page` payload actually emitted on the wire.
+   * Used by emitSnapshotIfChanged + DOM tick + apply/subscribe handlers to skip redundant
+   * emits when the DOM hasn't changed since the previous emit (e.g. rapid clicks on
+   * non-mutating elements, wheel events on a static page). Updated by EVERY preview:page
+   * emit site so force-emits and interval-emits share the same dedup window.
+   */
+  lastEmittedSignature: string;
   lastMouseInputAt: number;       // Mouse input throttling timestamp
   lastWheelInputAt: number;       // Wheel input throttling timestamp
   lastKeyboardTypeAt: number;     // Keyboard type throttling timestamp
@@ -550,6 +558,8 @@ export class PreviewSessionService {
           lastSnapshotEmit: 0,
           lastScreenshotEmitAt: 0,
           lastPageSignature: initialSignature,
+          // V20: Start empty so the first emit after session start always passes dedup
+          lastEmittedSignature: '',
           lastMouseInputAt: 0,
           lastWheelInputAt: 0,
           lastKeyboardTypeAt: 0,
@@ -721,6 +731,8 @@ export class PreviewSessionService {
       session.lastSnapshotEmit = 0;
       session.lastScreenshotEmitAt = 0;
       session.lastPageSignature = '';
+      // V20: Reset dedup marker so the first emit on the new page always passes through
+      session.lastEmittedSignature = '';
       session.lastMouseInputAt = 0;
       session.lastWheelInputAt = 0;
       session.lastKeyboardTypeAt = 0;
@@ -1852,6 +1864,30 @@ export class PreviewSessionService {
   }
 
   /**
+   * V20: Get the signature of the last `preview:page` payload emitted on the wire.
+   * Used by every preview:page emit site to skip redundant emits when the DOM hasn't
+   * changed since the previous emit. Returns empty string if no emit has happened yet
+   * (first emit always passes the dedup gate).
+   */
+  getLastEmittedSignature(sessionId: string, userId?: string): string {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.lastEmittedSignature ?? '';
+  }
+
+  /**
+   * V20: Mark a pageSignature as just-emitted so the next emit site with the same
+   * signature can skip. Callers MUST invoke this immediately after a successful
+   * `nsp.to(room).emit('preview:page', ...)` to keep the dedup window consistent
+   * across `emitSnapshotIfChanged`, DOM tick, apply, subscribe, and page-switch retry.
+   */
+  markEmittedSignature(sessionId: string, userId: string | undefined, signature: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session && typeof signature === 'string') {
+      session.lastEmittedSignature = signature;
+    }
+  }
+
+  /**
    * Get context data for a session
    */
   getContextData(sessionId: string, userId?: string): { version: number; data: Record<string, any> } | null {
@@ -2321,6 +2357,10 @@ export class PreviewSessionService {
         // Reset snapshot state so next getSnapshot() forces a fresh collect
         session.lastSnapshotEmit = 0;
         session.lastPageSignature = '';
+        // V20: Reset dedup marker so the first emit for the new page always passes
+        // through, even in the (unlikely) case that the new page's signature
+        // coincidentally matches the old page's last-emitted signature.
+        session.lastEmittedSignature = '';
 
         // V11: Unblock snapshot collection now that new page is loaded
         session.pageSwitchInProgress = false;
@@ -2449,6 +2489,9 @@ export class PreviewSessionService {
     // Reset snapshot state for fresh collection on new tab
     session.lastSnapshotEmit = 0;
     session.lastPageSignature = '';
+    // V20: Reset dedup marker so the first emit for the newly active tab always
+    // passes through the signature-dedup gate.
+    session.lastEmittedSignature = '';
 
     session.pageSwitchInProgress = false;
 
@@ -2504,6 +2547,8 @@ export class PreviewSessionService {
       // Reset snapshot + invoke callback
       session.lastSnapshotEmit = 0;
       session.lastPageSignature = '';
+      // V20: Reset dedup marker for the newly-active tab
+      session.lastEmittedSignature = '';
       if (session.onPageSwitch) {
         try { session.onPageSwitch(session.page, closedPage.url()); } catch { /* non-critical */ }
       }
@@ -2567,6 +2612,8 @@ export class PreviewSessionService {
         session.page = session.pages[session.activeTabIndex];
         session.lastSnapshotEmit = 0;
         session.lastPageSignature = '';
+        // V20: Reset dedup marker for the newly-active tab
+        session.lastEmittedSignature = '';
         if (session.onPageSwitch) {
           try { session.onPageSwitch(session.page, ''); } catch { /* non-critical */ }
         }

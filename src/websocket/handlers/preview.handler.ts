@@ -22,6 +22,7 @@ import {
 } from '../types/types';
 import {
     emitSnapshotAlways,
+    emitSnapshotForHandshake,
     emitSnapshotIfChanged,
     validateInputRequest,
 } from './preview-input-helpers';
@@ -493,27 +494,40 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
         });
 
         if (snapshot && snapshot.changed) {
-          const payload: PreviewPagePayload = {
-            previewSessionId,
-            url: snapshot.url,
-            pageTitle: snapshot.pageTitle,
-            domVersion: snapshot.domVersion,
-            pageSignature: snapshot.pageSignature,
-            domNodes: snapshot.domNodes, // Only included when changed
-            timestamp: new Date().toISOString(),
-          };
+          // V20: Second-level dedup — even though getSnapshot returned changed=true
+          // against `lastPageSignature`, another emit site (click, apply, subscribe)
+          // may have already pushed this exact signature to the wire. Compare against
+          // `lastEmittedSignature` before sending to avoid a double-emit race.
+          const lastEmitted = sessionService.getLastEmittedSignature(previewSessionId, userId);
+          if (lastEmitted && snapshot.pageSignature === lastEmitted) {
+            // Still bump video stream's domVersion pointer and bail.
+            videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+          } else {
+            const payload: PreviewPagePayload = {
+              previewSessionId,
+              url: snapshot.url,
+              pageTitle: snapshot.pageTitle,
+              domVersion: snapshot.domVersion,
+              pageSignature: snapshot.pageSignature,
+              domNodes: snapshot.domNodes, // Only included when changed
+              timestamp: new Date().toISOString(),
+            };
 
-          // Emit to entire room
-          nsp.to(room).emit('preview:page', payload);
+            // Emit to entire room
+            nsp.to(room).emit('preview:page', payload);
 
-          // Update video stream with new DOM version
-          videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+            // V20: Record the signature so subsequent emit sites can dedup
+            sessionService.markEmittedSignature(previewSessionId, userId, snapshot.pageSignature);
 
-          logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
-            previewSessionId,
-            domVersion: snapshot.domVersion,
-            nodeCount: snapshot.domNodes?.length || 0,
-          });
+            // Update video stream with new DOM version
+            videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+
+            logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
+              previewSessionId,
+              domVersion: snapshot.domVersion,
+              nodeCount: snapshot.domNodes?.length || 0,
+            });
+          }
         }
       } catch (error) {
         logger.error('[PREVIEW_STREAM] Failed to check DOM update', {
@@ -574,6 +588,13 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           // DOM tick may have been blocked by pageSwitchInProgress, so we need to send
           // the first valid snapshot explicitly. Retry up to 3 times if nodeCount is 0
           // (page may still be rendering).
+          //
+          // V20: Page switch is a handshake — we MUST deliver at least one snapshot
+          // to the frontend so its lastKnownDomNodes reflect the new page. Dedup by
+          // signature WITHIN the retry loop (skip emit if identical to previous retry)
+          // but always allow the first successful emit through even if by coincidence
+          // the new signature matches a stale lastEmittedSignature from the old page.
+          let lastRetrySignature: string | null = null;
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
               const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
@@ -581,24 +602,31 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
                 includeDomNodes: true,
               });
               if (snapshot) {
-                const payload: PreviewPagePayload = {
-                  previewSessionId,
-                  url: snapshot.url,
-                  pageTitle: snapshot.pageTitle,
-                  domVersion: snapshot.domVersion,
-                  pageSignature: snapshot.pageSignature,
-                  domNodes: snapshot.domNodes,
-                  timestamp: new Date().toISOString(),
-                };
-                nsp.to(room).emit('preview:page', payload);
-                videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+                const sameAsLastRetry = lastRetrySignature !== null
+                  && snapshot.pageSignature === lastRetrySignature;
+                if (!sameAsLastRetry) {
+                  const payload: PreviewPagePayload = {
+                    previewSessionId,
+                    url: snapshot.url,
+                    pageTitle: snapshot.pageTitle,
+                    domVersion: snapshot.domVersion,
+                    pageSignature: snapshot.pageSignature,
+                    domNodes: snapshot.domNodes,
+                    timestamp: new Date().toISOString(),
+                  };
+                  nsp.to(room).emit('preview:page', payload);
+                  // V20: Record signature so subsequent emit sites dedup correctly
+                  sessionService.markEmittedSignature(previewSessionId, userId, snapshot.pageSignature);
+                  lastRetrySignature = snapshot.pageSignature;
+                  videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
 
-                logger.info('[PREVIEW_STREAM] Emitted fresh snapshot after page switch', {
-                  previewSessionId,
-                  attempt,
-                  domVersion: snapshot.domVersion,
-                  nodeCount: snapshot.domNodes?.length || 0,
-                });
+                  logger.info('[PREVIEW_STREAM] Emitted fresh snapshot after page switch', {
+                    previewSessionId,
+                    attempt,
+                    domVersion: snapshot.domVersion,
+                    nodeCount: snapshot.domNodes?.length || 0,
+                  });
+                }
 
                 // If we got actual DOM nodes, we're done
                 if (snapshot.domNodes && snapshot.domNodes.length > 0) {
@@ -782,6 +810,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       // V7: Emit initial preview:page with domNodes (video stream handles visuals)
+      // V20 note: This is a PER-SOCKET emit (only to the new subscriber), not a room
+      // broadcast. We intentionally do NOT call markEmittedSignature here — that map
+      // tracks what was last sent to the WHOLE ROOM. If we updated it here, other
+      // subscribers already in the room would get stuck on a stale snapshot because
+      // subsequent room-wide emit sites would think "already sent" when those others
+      // never received this payload.
       try {
         const snapshot = await sessionService.getSnapshot(normalizedPreviewSessionId, ensuredUserId, {
           force: true,
@@ -1312,31 +1346,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
 
             if (snapshot && snapshot.changed) {
-              const room = createRoomName('preview', previewSessionId);
-              const payload: PreviewPagePayload = {
-                previewSessionId,
-                url: snapshot.url,
-                pageTitle: snapshot.pageTitle,
-                domVersion: snapshot.domVersion,
-                pageSignature: snapshot.pageSignature,
-                domNodes: snapshot.domNodes,
-                timestamp: new Date().toISOString(),
-              };
+              // V20: Second-level dedup — another emit site may have pushed this
+              // exact signature already (e.g. DOM tick + apply racing on the same
+              // mutation). Bump video stream domVersion either way.
+              const lastEmitted = sessionService.getLastEmittedSignature(previewSessionId, ensuredUserId);
+              if (lastEmitted && snapshot.pageSignature === lastEmitted) {
+                getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+              } else {
+                const room = createRoomName('preview', previewSessionId);
+                const payload: PreviewPagePayload = {
+                  previewSessionId,
+                  url: snapshot.url,
+                  pageTitle: snapshot.pageTitle,
+                  domVersion: snapshot.domVersion,
+                  pageSignature: snapshot.pageSignature,
+                  domNodes: snapshot.domNodes,
+                  timestamp: new Date().toISOString(),
+                };
 
-              // Emit to the caller immediately (even if not subscribed)
-              socket.emit('preview:page', payload);
-              // Emit to other subscribers
-              socket.to(room).emit('preview:page', payload);
+                // Emit to the caller immediately (even if not subscribed)
+                socket.emit('preview:page', payload);
+                // Emit to other subscribers
+                socket.to(room).emit('preview:page', payload);
 
-              // Update video stream with new DOM version
-              getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+                // V20: Record signature so subsequent emit sites can dedup
+                sessionService.markEmittedSignature(previewSessionId, ensuredUserId, snapshot.pageSignature);
 
-              logger.debug('[WebSocket] Emitted preview:page after apply', {
-                socketId: socket.id,
-                previewSessionId,
-                domVersion: snapshot.domVersion,
-                changed: snapshot.changed,
-              });
+                // Update video stream with new DOM version
+                getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+
+                logger.debug('[WebSocket] Emitted preview:page after apply', {
+                  socketId: socket.id,
+                  previewSessionId,
+                  domVersion: snapshot.domVersion,
+                  changed: snapshot.changed,
+                });
+              }
             }
           } catch (snapshotError) {
             logger.warn('[WebSocket] Failed to emit preview:page after apply', {
@@ -2669,7 +2714,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       // Force snapshot re-collect with the new viewport already reflowed.
       // This ensures domNodes/boundingBox are correct BEFORE the client rescales.
-      await emitSnapshotAlways(socket, normalizedPreviewSessionId, ensuredUserId);
+      // V20: bypass signature dedup — the frontend treats this as a handshake and
+      // must receive the snapshot even when DOM bytes are unchanged, because it
+      // needs the fresh coordinates for its rescale pipeline.
+      await emitSnapshotForHandshake(socket, normalizedPreviewSessionId, ensuredUserId);
 
       // Emit viewport metadata so client updates coordinate mapping
       // with coordinates that match the freshly-collected snapshot.
@@ -3060,7 +3108,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'reset', true);
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // V20: page reset is a handshake — the frontend must receive the fresh DOM
+        // even if by coincidence the new page's signature matches the previous. Also
+        // `resetSession` already cleared `lastEmittedSignature` internally, but we
+        // still use the bypass path so the intent is explicit.
+        setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
 
         // Restart video + devtools streams on the new page (old stream died with old page)
         setImmediate(async () => {
