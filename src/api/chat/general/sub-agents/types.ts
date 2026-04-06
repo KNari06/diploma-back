@@ -116,6 +116,12 @@ export interface SubAgentPipelineResult {
   needsClarification?: boolean;
   /** Tools already executed before fallback — used to seed monolithic loop tracker */
   executedTools?: Array<{ toolName: string; args: Record<string, any> }>;
+  /**
+   * Quick action descriptors synthesized from tool results.
+   * Attached to AI message metadata so the frontend renders inline buttons.
+   * Empty array when no actions apply (most non-editor cases).
+   */
+  quickActions?: import('@/api/chat/shared/quick-action.types').QuickAction[];
 }
 
 /**

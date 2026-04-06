@@ -59,6 +59,32 @@ const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
 
+/**
+ * V20: Per-socket+session move coalescing state.
+ * Multiple `preview:mouse:move` events arriving within one event loop tick are
+ * collapsed into a single Playwright call with the latest coordinates.
+ * Key: `${socketId}:${previewSessionId}`
+ */
+const moveCoalesceState = new Map<string, {
+  latestX: number;
+  latestY: number;
+  flushScheduled: boolean;
+}>();
+
+/**
+ * V20: Per-socket+session wheel coalescing state.
+ * Multiple `preview:mouse:wheel` events arriving within one event loop tick are
+ * accumulated into a single Playwright call with the summed delta.
+ * Key: `${socketId}:${previewSessionId}`
+ */
+const wheelCoalesceState = new Map<string, {
+  accDeltaX: number;
+  accDeltaY: number;
+  lastX: number | undefined;
+  lastY: number | undefined;
+  flushScheduled: boolean;
+}>();
+
 // ═══════════════════════════════════════════════════════════════════════════
 // V14: Inter-step delay stamping for recording
 // ═══════════════════════════════════════════════════════════════════════════
@@ -850,6 +876,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       // V18: Clear hover probe state for this session
       hoverProbeState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
+      // V20: Clear move/wheel coalesce state for this session
+      moveCoalesceState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
+      wheelCoalesceState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
 
       logger.info('[WebSocket] Unsubscribed from preview', {
         socketId: socket.id,
@@ -1338,6 +1367,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   // Handle mouse move (hover) — fire-and-forget, no error/success emitted to client.
   // Hover is a passive, high-frequency event; emitting errors would spam the UI with
   // "Preview action failed (move)" toasts that are meaningless to the user.
+  //
+  // V20: Coalescing — multiple move events arriving within one event-loop tick collapse
+  // into a single Playwright `mouse.move` call with the latest coordinates. The hover
+  // probe and recording lastHover cache are updated SYNCHRONOUSLY on every WS event so
+  // they always see the freshest position regardless of how the Playwright call is batched.
   socket.on('preview:mouse:move', async (data) => {
     try {
       const ensuredUserId = requireUser();
@@ -1354,15 +1388,38 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
-      const result = await sessionService.executeMouseAction({
-        sessionId: previewSessionId,
-        userId: ensuredUserId,
-        action: 'move',
-        x,
-        y,
-      });
+      // V20: Coalesce — record latest coords and schedule one Playwright call per tick.
+      // We do NOT block on the Playwright call; downstream side effects (hover probe,
+      // recordingLastHover) work off these in-memory coords, not page state, so they are
+      // updated below regardless of when the actual page.mouse.move() resolves.
+      const moveKey = `${socket.id}:${previewSessionId}`;
+      let mState = moveCoalesceState.get(moveKey);
+      if (!mState) {
+        mState = { latestX: x, latestY: y, flushScheduled: false };
+        moveCoalesceState.set(moveKey, mState);
+      } else {
+        mState.latestX = x;
+        mState.latestY = y;
+      }
+      if (!mState.flushScheduled) {
+        mState.flushScheduled = true;
+        const flushRef = mState;
+        setImmediate(() => {
+          flushRef.flushScheduled = false;
+          // Fire-and-forget — executeMouseAction is itself fire-and-forget for 'move' (V20)
+          sessionService.executeMouseAction({
+            sessionId: previewSessionId,
+            userId: ensuredUserId,
+            action: 'move',
+            x: flushRef.latestX,
+            y: flushRef.latestY,
+          }).catch(() => { /* fire-and-forget — already logged inside */ });
+        });
+      }
 
-      if (result.success) {
+      // Side effects below run on EVERY WS event with the just-received coords —
+      // they don't wait for the coalesced Playwright call to land.
+      {
         // V11: Track last hover position for recording (used to emit hover step before click)
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, {
@@ -1910,6 +1967,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
   // Handle mouse wheel (scroll) — fire-and-forget for validation errors.
   // Scroll is high-frequency; emitting errors would spam the UI with toasts.
+  //
+  // V20: Coalescing — multiple wheel events arriving within one event-loop tick are
+  // accumulated (deltas summed) into a single Playwright `mouse.wheel` call. Snapshot
+  // emit and recording scroll debounce both run synchronously per WS event so neither
+  // waits for the coalesced Playwright call.
   socket.on('preview:mouse:wheel', async (data) => {
     try {
       const ensuredUserId = requireUser();
@@ -1926,14 +1988,48 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
-      const result = await sessionService.executeMouseWheel({
-        sessionId: previewSessionId,
-        userId: ensuredUserId,
-        deltaX,
-        deltaY,
-      });
+      // V20: Coalesce — accumulate deltas until next event-loop tick, then send one wheel call.
+      const wheelKey = `${socket.id}:${previewSessionId}`;
+      let wState = wheelCoalesceState.get(wheelKey);
+      if (!wState) {
+        wState = {
+          accDeltaX: deltaX,
+          accDeltaY: deltaY,
+          lastX: typeof data.x === 'number' ? data.x : undefined,
+          lastY: typeof data.y === 'number' ? data.y : undefined,
+          flushScheduled: false,
+        };
+        wheelCoalesceState.set(wheelKey, wState);
+      } else {
+        wState.accDeltaX += deltaX;
+        wState.accDeltaY += deltaY;
+        if (typeof data.x === 'number') wState.lastX = data.x;
+        if (typeof data.y === 'number') wState.lastY = data.y;
+      }
+      if (!wState.flushScheduled) {
+        wState.flushScheduled = true;
+        const flushRef = wState;
+        setImmediate(() => {
+          const dx = flushRef.accDeltaX;
+          const dy = flushRef.accDeltaY;
+          flushRef.accDeltaX = 0;
+          flushRef.accDeltaY = 0;
+          flushRef.flushScheduled = false;
+          if (dx === 0 && dy === 0) return;
+          // Fire-and-forget — executeMouseWheel is itself fire-and-forget (V20)
+          sessionService.executeMouseWheel({
+            sessionId: previewSessionId,
+            userId: ensuredUserId,
+            deltaX: dx,
+            deltaY: dy,
+          }).catch(() => { /* non-critical — already logged inside */ });
+        });
+      }
 
-      if (result.success) {
+      // V20: Side effects below run on EVERY WS event regardless of when the coalesced
+      // wheel call lands in Playwright. Errors from the actual page.mouse.wheel() call
+      // are logged at debug level inside executeMouseWheel and don't affect this path.
+      {
         // Scroll may reveal lazy-loaded content – always emit for visual feedback
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
 
@@ -2048,10 +2144,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             }, RECORDING_SCROLL_DEBOUNCE_MS),
           });
         }
-      } else {
-        // Silent — no error emit for scroll; trace only
-        const wheelErrTrace = EditorTraceService.get(previewSessionId);
-        if (wheelErrTrace) wheelErrTrace.writeError('wheel_failed', { deltaX, deltaY, error: result.error });
       }
     } catch (error) {
       logger.error('[WebSocket] Error in preview:mouse:wheel', {
@@ -4102,6 +4194,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     // V18: Cleanup all hover probe entries for this socket (keyed as socketId:sessionId)
     for (const key of hoverProbeState.keys()) {
       if (key.startsWith(`${socket.id}:`)) hoverProbeState.delete(key);
+    }
+    // V20: Cleanup all move/wheel coalesce entries for this socket
+    for (const key of moveCoalesceState.keys()) {
+      if (key.startsWith(`${socket.id}:`)) moveCoalesceState.delete(key);
+    }
+    for (const key of wheelCoalesceState.keys()) {
+      if (key.startsWith(`${socket.id}:`)) wheelCoalesceState.delete(key);
     }
   });
 };

@@ -3,10 +3,12 @@
  * Manages real-time video streaming for preview sessions via CDP screencast
  *
  * Features:
- * - CDP screencast frame capture (1280x720, JPEG quality 65, ~15 fps)
- * - Throttling to ~10 FPS
+ * - CDP screencast frame capture (1280x720, JPEG quality 65)
+ * - V20: Throttling to ~30 FPS (was ~15) — possible after binary transport removed
+ *   the +33% base64 inflation, leaving bandwidth headroom for higher framerate.
+ * - V20: Binary frame transport (Socket.IO 4.x native binary, not base64)
  * - No Redis dependency (direct Socket.IO emit)
- * - Backpressure handling
+ * - Backpressure handling + circuit breaker (auto-fallback if subscribers lag)
  * - Automatic cleanup on session end
  */
 
@@ -22,14 +24,17 @@ import { PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 
 const PREVIEW_VIDEO_CONFIG = {
   // CDP Screencast settings
-  fps: 15,
+  fps: 30,
   maxWidth: PREVIEW_SESSION_CONFIG.viewport.width,
   maxHeight: PREVIEW_SESSION_CONFIG.viewport.height,
   quality: PREVIEW_SESSION_CONFIG.screenshot.quality,
   format: 'jpeg' as const,
 
-  // Throttle settings (target ~15 fps = ~66ms between frames)
-  minFrameIntervalMs: 65,
+  // Throttle settings.
+  // V20: 33ms ≈ 30fps cap (was 65ms ≈ 15fps). After binary transport removed the +33%
+  // base64 inflation, we have headroom to double the framerate. Backpressure + circuit
+  // breaker (below) auto-fall back to slower rates if subscribers can't keep up.
+  minFrameIntervalMs: 33,
 
   // Backpressure handling
   maxPendingFrames: 4,
@@ -282,8 +287,24 @@ export class PreviewVideoStreamService {
       return; // Skip frame (not counted as drop, just throttled)
     }
 
-    // Check frame size (safety cap)
-    const frameSize = params.data.length;
+    // V20: Decode base64 → binary bytes once on the backend (~1-2ms per frame).
+    // Saves ~33% bandwidth vs sending base64 over the wire AND avoids the
+    // ~5-15ms main-thread base64 decode on the frontend.
+    let frameBuffer: Buffer;
+    try {
+      frameBuffer = Buffer.from(params.data, 'base64');
+    } catch (decodeError) {
+      this.framesDropped++;
+      logger.debug('[PREVIEW_VIDEO] Failed to decode CDP base64 frame', {
+        previewSessionId: this.previewSessionId,
+        error: decodeError instanceof Error ? decodeError.message : String(decodeError),
+      });
+      return;
+    }
+
+    // Check frame size (safety cap) — measured on actual binary bytes, not base64 chars.
+    // Note: previously this used params.data.length (base64 char count), which over-counted by ~33%.
+    const frameSize = frameBuffer.byteLength;
     if (frameSize > PREVIEW_VIDEO_CONFIG.maxFrameSizeBytes) {
       this.framesDropped++;
       logger.debug('[PREVIEW_VIDEO] Dropping oversized frame', {
@@ -317,7 +338,7 @@ export class PreviewVideoStreamService {
     }
 
     try {
-      await this.emitFrame(params.data, params.metadata.deviceWidth, params.metadata.deviceHeight);
+      await this.emitFrame(frameBuffer, params.metadata.deviceWidth, params.metadata.deviceHeight);
 
       // Success - reset circuit breaker
       this.consecutiveFailures = 0;
@@ -361,9 +382,12 @@ export class PreviewVideoStreamService {
   }
 
   /**
-   * Emit frame to Socket.IO room (no Redis)
+   * Emit frame to Socket.IO room (no Redis).
+   * V20: Sends raw JPEG bytes as the second emit() argument. Socket.IO 4.x serializes
+   * Buffer / ArrayBuffer / Uint8Array as native binary frames (no base64 inflation).
+   * The meta object's `data` field is left empty for backward compat with old clients.
    */
-  private async emitFrame(data: string, width: number, height: number): Promise<void> {
+  private async emitFrame(frame: Buffer, width: number, height: number): Promise<void> {
     if (!this.nsp) {
       throw new Error('Socket.IO namespace not available');
     }
@@ -372,11 +396,12 @@ export class PreviewVideoStreamService {
       previewSessionId: this.previewSessionId,
       seq: this.seq,
       format: 'jpeg',
-      data,
+      data: '', // V20: empty — actual bytes sent as binary arg below
       width: Math.min(width, PREVIEW_VIDEO_CONFIG.maxWidth),
       height: Math.min(height, PREVIEW_VIDEO_CONFIG.maxHeight),
       domVersion: this.currentDomVersion,
       timestamp: new Date().toISOString(),
+      byteLength: frame.byteLength,
     };
 
     // Emit with timeout to handle slow consumers
@@ -386,7 +411,7 @@ export class PreviewVideoStreamService {
       }, PREVIEW_VIDEO_CONFIG.publishTimeoutMs);
 
       try {
-        this.nsp!.to(this.room).emit('preview:video:frame', payload);
+        this.nsp!.to(this.room).emit('preview:video:frame', payload, frame);
         clearTimeout(timeout);
         resolve();
       } catch (error) {
@@ -539,7 +564,6 @@ export class PreviewVideoStreamService {
         type: 'jpeg',
         quality: PREVIEW_VIDEO_CONFIG.quality,
       });
-      const base64 = buf.toString('base64');
 
       this.seq++;
       this.framesEmitted++;
@@ -549,18 +573,20 @@ export class PreviewVideoStreamService {
         this.frameTimestamps.shift();
       }
 
+      // V20: Send binary frame instead of base64 (saves 33% bandwidth)
       const payload: PreviewVideoFramePayload = {
         previewSessionId: this.previewSessionId,
         seq: this.seq,
         format: 'jpeg',
-        data: base64,
+        data: '', // empty — bytes sent as binary arg
         width: PREVIEW_VIDEO_CONFIG.maxWidth,
         height: PREVIEW_VIDEO_CONFIG.maxHeight,
         domVersion: this.currentDomVersion,
         timestamp: new Date().toISOString(),
+        byteLength: buf.byteLength,
       };
 
-      this.nsp.to(this.room).emit('preview:video:frame', payload);
+      this.nsp.to(this.room).emit('preview:video:frame', payload, buf);
 
       logger.debug('[PREVIEW_VIDEO] Injected manual frame after navigation', {
         previewSessionId: this.previewSessionId,

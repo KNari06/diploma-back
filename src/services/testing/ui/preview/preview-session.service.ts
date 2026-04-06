@@ -1239,9 +1239,22 @@ export class PreviewSessionService {
       const safeClickCount = Number.isInteger(clickCount) && clickCount > 0 && clickCount <= 2 ? clickCount : 1;
 
       switch (action) {
-        case 'move':
-          await session.page.mouse.move(clampedX, clampedY);
+        case 'move': {
+          // V20: Fire-and-forget for high-frequency hover. The handler does NOT need to know
+          // when Playwright finished applying the move — hover probe and recordingLastHover
+          // both work off the coords stored in the WS handler closure, not the actual page state.
+          // Awaiting here serializes every move through one network RTT and is the main source
+          // of perceived lag on cloud Playwright.
+          session.page.mouse.move(clampedX, clampedY).catch((err: unknown) => {
+            logger.debug('[PREVIEW_SESSION] Async mouse move failed', {
+              sessionId,
+              x: clampedX,
+              y: clampedY,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
           return { success: true, needsSnapshot: false };
+        }
 
         case 'click':
           await session.page.mouse.click(clampedX, clampedY, { button: safeButton, clickCount: safeClickCount });
@@ -1311,7 +1324,17 @@ export class PreviewSessionService {
       const safeDeltaX = Math.max(-2000, Math.min(2000, deltaX * SCROLL_SENSITIVITY));
       const safeDeltaY = Math.max(-2000, Math.min(2000, deltaY * SCROLL_SENSITIVITY));
 
-      await session.page.mouse.wheel(safeDeltaX, safeDeltaY);
+      // V20: Fire-and-forget — wheel is high-frequency and the recording / snapshot
+      // pipeline does not depend on Playwright having finished applying the wheel before
+      // we acknowledge the WS event. Errors logged at debug level only.
+      session.page.mouse.wheel(safeDeltaX, safeDeltaY).catch((err: unknown) => {
+        logger.debug('[PREVIEW_SESSION] Async mouse wheel failed', {
+          sessionId,
+          deltaX: safeDeltaX,
+          deltaY: safeDeltaY,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       return { success: true };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Mouse wheel failed', {

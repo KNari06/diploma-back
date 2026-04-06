@@ -149,7 +149,11 @@ export interface ServerToClientEvents {
 
   // Preview events
   'preview:page': (data: PreviewPagePayload) => void;
-  'preview:video:frame': (data: PreviewVideoFramePayload) => void;
+  // V20: Frame is sent as 2-arg emit — meta object + raw JPEG bytes (Buffer/ArrayBuffer)
+  // Socket.IO 4.x serializes Buffer/ArrayBuffer/Uint8Array as binary frames over the wire
+  // (no base64 inflation). The legacy `data: string` field on the meta object is kept for
+  // backward compat but is empty when binary transport is used.
+  'preview:video:frame': (meta: PreviewVideoFramePayload, frame?: Buffer | ArrayBuffer | Uint8Array) => void;
   'preview:step:lint:result': (data: PreviewStepLintResultPayload) => void;
   'preview:step:apply:result': (data: PreviewStepApplyResultPayload) => void;
   'preview:step:clarify': (data: PreviewClarifyPayload) => void;
@@ -1038,11 +1042,18 @@ export interface PreviewVideoFramePayload {
   previewSessionId: string;
   seq: number;               // Monotonic frame number
   format: 'jpeg';
-  data: string;              // base64 without prefix
+  /**
+   * Frame bytes — base64 string only when binary transport is unavailable.
+   * When binary transport is used (preferred), this is an empty string and
+   * the actual JPEG bytes are passed as the second `emit()` argument.
+   */
+  data: string;
   width: number;             // 1280
   height: number;            // 720
   domVersion: number;        // Which DOM version this frame relates to
   timestamp: string;
+  /** V20: byte length of the binary frame (set when binary transport is used) */
+  byteLength?: number;
 }
 
 /**

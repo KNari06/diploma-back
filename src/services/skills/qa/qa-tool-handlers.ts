@@ -3303,6 +3303,10 @@ export async function handleRunDraftSteps(
 ): Promise<SkillResult> {
   const steps = args.steps as IntentStep[] | undefined;
   const startUrl = args.start_url as string | undefined;
+  const suggestedNameRaw = args.suggested_name;
+  const suggestedName = typeof suggestedNameRaw === 'string' && suggestedNameRaw.trim()
+    ? suggestedNameRaw.trim().slice(0, 120) // hard cap to avoid abuse via giant strings
+    : undefined;
   const confirm = args.confirm === true;
 
   // 1. Confirm gate
@@ -3385,9 +3389,16 @@ export async function handleRunDraftSteps(
   }
 
   // 7. Cache draft steps for cross-turn retrieval
+  //    Also cache the AI's suggested name so the "Save as test case" quick
+  //    action can use it as the default test case title.
   if (context.chatSessionId) {
     const { DraftStepsCache } = await import('@/services/testing/ui/preview/draft-steps-cache');
-    DraftStepsCache.set(context.chatSessionId, { steps, startUrl, userId: context.userId });
+    DraftStepsCache.set(context.chatSessionId, {
+      steps,
+      startUrl,
+      userId: context.userId,
+      ...(suggestedName ? { suggestedName } : {}),
+    });
   }
 
   // 8. Await the run so the AI agent can read the actual outcome (passed/failed/error)

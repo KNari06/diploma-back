@@ -64,6 +64,7 @@ EDITOR MODE:
 - qa_run_test (run_type="preview") and qa_run_draft_steps AWAIT the full run — when they return,
   the run is finished and result.data contains { success, passedSteps, failedSteps, firstError? }.
   Report the actual outcome; never claim "the run is starting".
+- ALWAYS pass suggested_name to qa_run_draft_steps — a short 3-5 word title (e.g., "Positive Login Flow") used as the default test case name when the user clicks "Save as test case".
 - NEVER invent elements that are not in the DOM context.
 - platform_test is NOT available in editor mode.`;
   }

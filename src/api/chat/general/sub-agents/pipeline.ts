@@ -10,6 +10,7 @@ import { formatResponse, generateSimpleResponse } from './agents/responder-agent
 import { reviewExecution } from './agents/reviewer-agent';
 import { validateEditorSteps, extractStepsFromContent, formatValidationWarnings } from './agents/step-validator-agent';
 import { SubAgentSpawner } from './spawner';
+import { injectQuickActions } from './quick-actions-injector';
 import type {
   ExecutorResult,
   PipelineContext,
@@ -575,15 +576,27 @@ export class SubAgentPipeline {
 
         chatCircuitBreaker.recordResult(true);
 
+        // Synthesize quick action descriptors from tool results so the
+        // frontend can render inline buttons under the AI message.
+        const quickActions = injectQuickActions(executorResult.toolResults, {
+          mode: this.context.mode,
+          previewSessionId: this.context.previewSessionId,
+          chatSessionId: this.context.chatSessionId,
+          projectId: this.context.projectId,
+          userId: this.context.userId,
+        });
+
         logger.info('[SUB_AGENT_PIPELINE] Single-tool complete', {
           metrics,
           blackboard: blackboard.toLogSummary(),
+          quickActionsCount: quickActions.length,
         });
         return {
           success: true,
           content: response.content,
           path: 'single_tool',
           metrics,
+          ...(quickActions.length > 0 ? { quickActions } : {}),
         };
       }
 
@@ -801,15 +814,27 @@ export class SubAgentPipeline {
 
       chatCircuitBreaker.recordResult(true);
 
+      // Synthesize quick action descriptors from tool results so the
+      // frontend can render inline buttons under the AI message.
+      const multiToolQuickActions = injectQuickActions(executorResult.toolResults, {
+        mode: this.context.mode,
+        previewSessionId: this.context.previewSessionId,
+        chatSessionId: this.context.chatSessionId,
+        projectId: this.context.projectId,
+        userId: this.context.userId,
+      });
+
       logger.info('[SUB_AGENT_PIPELINE] Multi-tool complete', {
         metrics,
         blackboard: blackboard.toLogSummary(),
+        quickActionsCount: multiToolQuickActions.length,
       });
       return {
         success: true,
         content: response.content,
         path: 'multi_tool',
         metrics,
+        ...(multiToolQuickActions.length > 0 ? { quickActions: multiToolQuickActions } : {}),
       };
 
     } catch (error) {

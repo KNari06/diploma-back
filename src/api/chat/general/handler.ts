@@ -693,11 +693,12 @@ When user says yes → call qa_run_draft_steps(steps=<above>, start_url="<curren
 
 EDITOR WORKFLOW:
 1. User asks to create/test something → Generate IntentSteps from DOM, show them in chat, ask "Shall I run these?"
-2. User confirms ("да" / "запусти" / "run it" / "давай") → call qa_run_draft_steps → steps execute on live browser
+2. User confirms ("да" / "запусти" / "run it" / "давай") → call qa_run_draft_steps with steps + start_url + suggested_name → steps execute on live browser
 3. User says "save it" / "сохрани" → call qa_create_test_case with the same steps → saved to DB
 4. User says "tweak step 3" → modify steps, show updated list, ask to re-run
 5. User refers to saved test → qa_run_test with run_type="preview"
 - EXCEPTION: If user explicitly says "create AND run" / "сделай и запусти" → generate + run immediately without asking
+- ALWAYS pass suggested_name to qa_run_draft_steps — a short 3-5 word title like "Positive Login Flow" or "Checkout with Promo Code". This becomes the default test case name if the user clicks "Save as test case" later.
 
 IMPORTANT RULES:
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist"
@@ -887,6 +888,14 @@ You can still help with general questions, saved test cases, and test management
   let shouldDeductCredits = false;
   let requestCancelled = false;
   let pipelineClarification = false;
+  /**
+   * Quick action descriptors emitted by the sub-agent pipeline (or the
+   * monolithic loop fallback). Attached to the AI message metadata so the
+   * frontend renders inline action buttons. Undefined when no actions apply.
+   */
+  let pipelineQuickActions:
+    | import('@/api/chat/shared/quick-action.types').QuickAction[]
+    | undefined;
   const MAX_TOOL_ROUNDS = 5; // Prevent infinite loops
 
   // Wrap AI calls with tracking context
@@ -949,9 +958,13 @@ You can still help with general questions, saved test cases, and test management
               path: pipelineResult.path,
               needsClarification: pipelineResult.needsClarification ?? false,
               metrics: pipelineResult.metrics,
+              quickActionsCount: pipelineResult.quickActions?.length ?? 0,
             });
 
             gptResponse = { content: pipelineResult.content, usage: undefined };
+            // Surface synthesized quick actions to the outer scope so the
+            // metadata builder can attach them to the AI message.
+            pipelineQuickActions = pipelineResult.quickActions;
             // Clarification responses don't deduct credits (user didn't get an answer)
             shouldDeductCredits = !pipelineResult.needsClarification;
             if (pipelineResult.needsClarification) {
@@ -981,6 +994,10 @@ You can still help with general questions, saved test cases, and test management
       let toolRound = 0;
       let finalResponse: string | null = null;
       const monolithicTracker = new ToolCallTracker(SUB_AGENT_CONFIG.loopDetection);
+      // Accumulate tool execution records so we can run the quick-actions
+      // injector at the end of the loop (mirrors pipeline behavior). Without
+      // this, draft-run actions disappear when sub-agents are disabled.
+      const monolithicToolResults: import('@/api/chat/general/sub-agents/types').ToolExecutionRecord[] = [];
 
       // Seed tracker with tools already executed by pipeline (prevents duplicate calls)
       if (pipelineExecutedTools?.length) {
@@ -1083,6 +1100,8 @@ You can still help with general questions, saved test cases, and test management
         });
 
         messages.push(...callResult.messages);
+        // Accumulate for quick-actions injection at end of loop
+        monolithicToolResults.push(callResult.record);
 
         logger.info('[GENERAL_CHAT] Tool executed', {
           toolName,
@@ -1111,6 +1130,28 @@ You can still help with general questions, saved test cases, and test management
         totalMs: 0, // not tracked in monolithic loop
         toolRounds: toolRound,
       });
+    }
+
+    // Inject quick actions from the monolithic loop's tool results so editor
+    // mode users still get the Save button when sub-agent pipeline is bypassed.
+    if (monolithicToolResults.length > 0) {
+      try {
+        const { injectQuickActions } = await import('@/api/chat/general/sub-agents/quick-actions-injector');
+        const monolithicQuickActions = injectQuickActions(monolithicToolResults, {
+          mode: mode as 'lite' | 'pro' | 'editor' | undefined,
+          previewSessionId: resolvedPreviewSessionId,
+          chatSessionId,
+          projectId,
+          userId,
+        });
+        if (monolithicQuickActions.length > 0) {
+          pipelineQuickActions = monolithicQuickActions;
+        }
+      } catch (injErr) {
+        logger.warn('[GENERAL_CHAT] Failed to inject quick actions from monolithic loop', {
+          error: injErr instanceof Error ? injErr.message : String(injErr),
+        });
+      }
     }
 
     gptResponse = { content: finalResponse, usage: undefined };
@@ -1247,6 +1288,22 @@ You can still help with general questions, saved test cases, and test management
   let userMessageTimestamp: string | undefined;
   let aiReplyTimestamp: string | undefined;
 
+  // AI message metadata is built before the chatSessionId block (so it's
+  // always available for the HTTP response below) and then conditionally
+  // persisted inside the block.
+  const aiMessageMetadata: Record<string, any> = {};
+
+  if (pipelineClarification) {
+    aiMessageMetadata.requiresAnswers = true;
+    aiMessageMetadata.needsMoreInfo = true;
+    aiMessageMetadata.source = 'sub_agent_pipeline';
+  }
+  // Attach quick action descriptors so the frontend renders inline buttons.
+  // Empty/undefined → no actions key on metadata (frontend renders nothing).
+  if (pipelineQuickActions && pipelineQuickActions.length > 0) {
+    aiMessageMetadata.actions = pipelineQuickActions;
+  }
+
   if (chatSessionId) {
     const saveChatMessagesWithLogging = functionLogger
       ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
@@ -1259,13 +1316,6 @@ You can still help with general questions, saved test cases, and test management
       userMessageMetadata.files = attachments.map(f => ({ name: f.name, type: f.type, mimeType: f.mimeType, size: f.size }));
     }
 
-    // Build AI message metadata
-    const aiMessageMetadata: Record<string, any> = {};
-    if (pipelineClarification) {
-      aiMessageMetadata.requiresAnswers = true;
-      aiMessageMetadata.needsMoreInfo = true;
-      aiMessageMetadata.source = 'sub_agent_pipeline';
-    }
     // Tag messages with draft steps so they won't be compressed on future history loads
     if (mode === 'editor' && chatSessionId) {
       try {
@@ -1378,6 +1428,10 @@ You can still help with general questions, saved test cases, and test management
     timestamp: aiReplyTimestamp || new Date().toISOString(), // Use saved timestamp or fallback
     userMessageTimestamp: userMessageTimestamp, // Include user message timestamp
     sessionId: chatSessionId,
+    // Mirror the AI message metadata so the frontend gets quick actions and
+    // other contextual UI hints in the same round-trip (instead of waiting for
+    // the next history reload). The same object is also persisted to the DB.
+    ...(Object.keys(aiMessageMetadata).length > 0 && { metadata: aiMessageMetadata }),
     // Include active project info so frontend can display which project is being queried
     ...(projectId && { activeProject: { id: projectId, name: projectName || projectId } }),
   };
