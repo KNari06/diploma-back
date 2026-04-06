@@ -71,6 +71,14 @@ export const AI_TASK_MODELS = {
   selectorResolution: AI_MODELS.fast,
   /** Intent parsing (NL → structured command) */
   intentParsing: AI_MODELS.fast,
+  // ── API Flow Testing ───────────────────────────────────────────────
+  /** API Flow Analyst — domain analysis from spec (needs large context for 1000+ endpoints) */
+  apiFlowAnalyst: 'gemini-2.5-flash' as const,
+  /** API Flow Architect — DAG building from analysis + endpoints */
+  apiFlowArchitect: 'gemini-2.5-flash' as const,
+  /** API Flow Enricher — realistic test data generation */
+  apiFlowEnricher: 'gemini-2.5-flash' as const,
+
   /** Vision-based element resolution (Gemini multimodal, screenshot + DOM) */
   visionElementResolution: 'gemini-2.5-flash' as const,
   /** Post-healing visual verification (Gemini multimodal, confirm correct element) */

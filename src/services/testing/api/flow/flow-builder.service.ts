@@ -14,7 +14,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { SpecParserService } from './spec-parser.service';
-import { DependencyResolverService } from './dependency-resolver.service';
+import { DependencyResolverService, type ResolveResult } from './dependency-resolver.service';
 import type {
   ApiFlowSpec,
   ApiSpecSourceType,
@@ -63,9 +63,31 @@ function buildVisualization(dag: ExecutionDAG): FlowVisualization {
     yOffset += NODE_HEIGHT + V_GAP;
   }
 
+  // INVARIANT: every node in dag.nodes MUST have a position.
+  // If any node wasn't in parallelGroups, place it in a new "orphan" row at the bottom.
+  const orphanNodes = dag.nodes.filter(n => !nodePositions.has(n.id));
+  if (orphanNodes.length > 0) {
+    const totalWidth = orphanNodes.length * NODE_WIDTH + (orphanNodes.length - 1) * H_GAP;
+    let xOffset = -(totalWidth / 2);
+    for (const node of orphanNodes) {
+      nodePositions.set(node.id, { x: xOffset, y: yOffset });
+      xOffset += NODE_WIDTH + H_GAP;
+    }
+    logger.warn('[FLOW_BUILDER] Orphan nodes positioned at bottom row', {
+      count: orphanNodes.length,
+      ids: orphanNodes.map(n => n.id),
+    });
+  }
+
+  // Build stepNumber map from executionOrder for display
+  const stepNumberMap = new Map<string, number>();
+  dag.executionOrder.forEach((id, i) => {
+    stepNumberMap.set(id, i + 1);
+  });
+
   // Create React Flow nodes
   for (const dagNode of dag.nodes) {
-    const pos = nodePositions.get(dagNode.id) ?? { x: 0, y: 0 };
+    const pos = nodePositions.get(dagNode.id)!; // guaranteed to exist now
 
     nodes.push({
       id: dagNode.id,
@@ -78,6 +100,7 @@ function buildVisualization(dag: ExecutionDAG): FlowVisualization {
         operationId: dagNode.operationId,
         summary: dagNode.summary,
         status: 'pending',
+        stepNumber: stepNumberMap.get(dagNode.id) || 0,
         isAuthEndpoint: dagNode.isAuthEndpoint,
         isPagination: dagNode.isPagination,
         hasFileUpload: dagNode.hasFileUpload,
@@ -85,6 +108,12 @@ function buildVisualization(dag: ExecutionDAG): FlowVisualization {
         variableExtractions: dagNode.variableExtractions,
         variableInjections: dagNode.variableInjections,
         tags: dagNode.tags,
+        // Include DAG metadata so frontend can reconstruct if needed
+        dependsOn: dagNode.dependsOn,
+        sampleRequestBody: dagNode.sampleRequestBody,
+        sampleQueryParams: dagNode.sampleQueryParams,
+        expectedStatusCodes: dagNode.expectedStatusCodes,
+        priority: dagNode.priority,
       },
     });
   }
@@ -230,10 +259,14 @@ export class FlowBuilderService {
     request: ParseSpecRequest,
     userId: string,
   ): Promise<{
-    flowSpec: ApiFlowSpec;
-    visualization: FlowVisualization;
-    dag: ExecutionDAG;
+    flowSpec?: ApiFlowSpec;
+    visualization?: FlowVisualization;
+    dag?: ExecutionDAG;
     spec: ParsedApiSpec;
+    // If questions are returned, the pipeline paused — user must answer
+    questions?: import('./flow.types').FlowQuestion[];
+    analysisId?: string;
+    confidence?: { overall: number; auth: number; dependencies: number; dataFlow: number };
   }> {
     const { projectId, environmentId, chatSessionId } = request;
 
@@ -262,7 +295,25 @@ export class FlowBuilderService {
         throw new Error('Either url or content must be provided');
       }
     } catch (error: any) {
-      throw new Error(`Spec parsing failed: ${error.message}`);
+      // Multi-spec Swagger UI — return API group choices to caller
+      if (error.message === 'MULTI_SPEC' && error.specGroups) {
+        const groups = error.specGroups as Array<{ url: string; name: string }>;
+        // Return as needsInput with specGroups — frontend shows selector,
+        // user picks one, frontend calls /parse again with the direct spec URL
+        const multiSpecError: any = new Error(
+          `This Swagger UI has ${groups.length} API groups (${groups.map(g => g.name).join(', ')}). ` +
+          `Please select which group to test.`
+        );
+        multiSpecError.specGroups = groups;
+        multiSpecError.isMultiSpec = true;
+        throw multiSpecError;
+      }
+      logger.error('[FLOW_BUILDER] Spec parsing failed', { error: error.message });
+      // Provide a meaningful message for connectivity vs parse errors
+      if (/ECONNREFUSED|ETIMEDOUT|ENOTFOUND|ERR_CONNECTION|AggregateError/i.test(error.message)) {
+        throw new Error('Could not connect to the API URL. The server may be down, behind a VPN, or unreachable.');
+      }
+      throw new Error('Spec parsing failed. Please check the format and try again.');
     }
 
     emit('parsing', 35, `Parsed ${spec.endpoints.length} endpoints from ${spec.title}`);
@@ -274,22 +325,76 @@ export class FlowBuilderService {
       sourceType: spec.sourceType,
     });
 
-    // Step 2: AI dependency resolution
-    emit('analyzing_dependencies', 55, `AI is analyzing dependencies for ${spec.endpoints.length} endpoints...`);
-
-    let dag: ExecutionDAG;
-    try {
-      dag = await DependencyResolverService.resolve(spec);
-    } catch (error: any) {
-      throw new Error(`Dependency analysis failed: ${error.message}`);
+    // Guard: reject specs that are too large for reliable AI processing
+    if (spec.endpoints.length > 300) {
+      throw new Error(
+        `This API has ${spec.endpoints.length} endpoints — too many for reliable analysis. ` +
+        `Please select a specific API group (e.g., "Admin API" or "Student API") instead of "All API". ` +
+        `Most Swagger UIs let you pick a group from the dropdown at the top.`
+      );
     }
 
+    // Warn user about expected analysis time for large specs
+    if (spec.endpoints.length > 50) {
+      const batchCount = Math.ceil(spec.endpoints.length / 20);
+      const estimatedMinutes = Math.ceil(batchCount * 0.5); // ~30s per Architect batch
+      emit(
+        'fetching_spec',
+        12,
+        `Large spec detected (${spec.endpoints.length} endpoints, ~${estimatedMinutes} min to analyze). This may take a while…`,
+      );
+    }
+
+    // Step 2: AI dependency resolution
+    emit('analyzing_dependencies', 40, `AI is analyzing ${spec.endpoints.length} endpoints...`);
+
+    let resolveResult: ResolveResult;
+    try {
+      resolveResult = await DependencyResolverService.resolve(spec, {
+        analysisId: request.analysisId,
+        userAnswers: request.userAnswers,
+        onProgress: (stage, message, progress) => emit(stage, progress, message),
+      });
+    } catch (error: any) {
+      logger.error('[FLOW_BUILDER] Dependency analysis failed', { error: error.message });
+      throw new Error('Dependency analysis failed. Please try again or use a different spec format.');
+    }
+
+    // If analyst has questions, return them to the caller (don't build DAG yet)
+    if (resolveResult.questions && resolveResult.questions.length > 0) {
+      emit('analyzing_dependencies', 45, 'AI needs some clarification before building the execution plan...');
+      return {
+        spec,
+        questions: resolveResult.questions,
+        analysisId: resolveResult.analysisId,
+        confidence: resolveResult.confidence,
+      };
+    }
+
+    const dag = resolveResult.dag!;
     emit('building_dag', 80, `Built execution DAG with ${dag.nodes.length} nodes`);
 
     // Step 3: Build visualization
     const visualization = buildVisualization(dag);
 
     // Step 4: Persist to DB
+    // Extract user-provided variables from answers (questions with variableName)
+    // These will be pre-loaded into variable context at execution time
+    const userProvidedVariables: Record<string, string> = {};
+    if (request.userAnswers) {
+      try {
+        // The analysis JSON may contain questions with variableName mappings
+        const cachedAnalysis = JSON.parse(resolveResult.dag ? '{}' : '{}'); // analysis is consumed
+        // Check the original questions from the cached analysis
+        // userAnswers keys are question IDs — we need to map them to variableNames
+        // For now, store all answers as potential variables
+        // The frontend sends answers with question IDs as keys
+        Object.assign(userProvidedVariables, request.userAnswers);
+      } catch {
+        // Non-critical
+      }
+    }
+
     emit('building_dag', 90, 'Saving flow spec...');
     const flowSpec = await saveFlowSpec({
       userId,
@@ -300,6 +405,12 @@ export class FlowBuilderService {
       dag,
       errorStrategy: 'stop_on_failure',
     });
+
+    // Store user-provided variables in variable_chain (encrypted in future)
+    if (Object.keys(userProvidedVariables).length > 0) {
+      await updateFlowSpec(flowSpec.id, { variableChain: userProvidedVariables });
+      flowSpec.variableChain = userProvidedVariables;
+    }
 
     // Step 5: Emit dag-ready event with visualization
     if (chatSessionId) {

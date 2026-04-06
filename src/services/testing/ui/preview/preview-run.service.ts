@@ -18,11 +18,11 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
-import type { IntentStep } from './preview.types';
+import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
 import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
-import { injectAutoWaitForSteps } from './auto-wait-for.utils';
+import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 
 /** Base timeout for run setup (navigation, init). */
@@ -582,17 +582,46 @@ export class PreviewRunService {
       });
       startedEmitted = true;
 
-      // 6. Navigate to startUrl before executing steps
+      // 6. Reset session state for fresh run (prevents stale state from previous run)
+      session.lastSnapshotEmit = 0;
+      session.lastPageSignature = '';
+      session.lastScreenshotEmitAt = 0;
+      sessionService.setDialogMode(previewSessionId, userId, 'passive');
+      // Close extra tabs from previous run (keep only active tab)
+      if (session.pages.length > 1) {
+        for (const p of session.pages) {
+          if (p !== session.page && !p.isClosed()) {
+            try { await p.close().catch(() => {}); } catch { /* best effort */ }
+          }
+        }
+        session.pages = [session.page];
+        session.activeTabIndex = 0;
+      }
+
+      // 7. Navigate to startUrl before executing steps
+      // If already on startUrl, force reload to clear DOM state (refs, form values, modals)
+      // If different URL, normal goto works (full navigation)
+      const currentUrl = session.page.url();
+      const needsReload = normalizeUrlForComparison(currentUrl) === normalizeUrlForComparison(startUrl);
+
       logger.info('[PreviewRun] Navigating to startUrl', {
         previewSessionId,
         startUrl,
+        needsReload,
       });
 
       try {
-        await raceAbort(session.page.goto(startUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000,
-        }), signal);
+        if (needsReload) {
+          await raceAbort(session.page.reload({
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          }), signal);
+        } else {
+          await raceAbort(session.page.goto(startUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000,
+          }), signal);
+        }
 
         // Wait for DOM to stabilize after initial navigation (SPA hydration).
         // networkidle waits for images/fonts/analytics — irrelevant for element resolution.
@@ -627,6 +656,34 @@ export class PreviewRunService {
       // Track page summary after navigation for better error context
       let lastNavigationSummary: PageSummary | null = null;
 
+      // Adaptive settle threshold: tracks actual settle times PER ACTION TYPE.
+      // After click (navigation risk) → longer settle. After type (input) → shorter settle.
+      // Groups match getDomStableThresholdMs categories: navigation, input, assertion, default.
+      const adaptiveSettleByCategory = new Map<string, number[]>();
+      const getActionCategory = (actionType: IntentActionType | string): string => {
+        if (['click', 'open', 'close', 'toggle', 'select', 'dblclick'].includes(actionType)) return 'navigation';
+        if (['type', 'press'].includes(actionType)) return 'input';
+        if (['assert', 'ai_check'].includes(actionType)) return 'assertion';
+        return 'default';
+      };
+      const getAdaptiveSettleMs = (prevActionType?: IntentActionType | string): number => {
+        const category = prevActionType ? getActionCategory(prevActionType) : 'default';
+        const samples = adaptiveSettleByCategory.get(category);
+        if (!samples || samples.length < 2) return STEP_READINESS_CONFIG.defaults.settleMs; // Not enough data
+        // p75 × 1.5 safety margin, clamped to [150, 3000]
+        const sorted = [...samples].sort((a, b) => a - b);
+        const p75 = sorted[Math.floor(sorted.length * 0.75)];
+        return Math.max(150, Math.min(3000, Math.round(p75 * 1.5)));
+      };
+      const recordSettleTime = (prevActionType: IntentActionType | string, waitedMs: number): void => {
+        const category = getActionCategory(prevActionType);
+        const samples = adaptiveSettleByCategory.get(category) || [];
+        samples.push(waitedMs);
+        // Keep last 10 samples per category to stay responsive to changes
+        if (samples.length > 10) samples.shift();
+        adaptiveSettleByCategory.set(category, samples);
+      };
+
       // V13: Pre-inject auto-wait steps for first-run stability.
       // On second+ runs these are already in the DB from batchUpdateStepsFromRun().
       // The injection is idempotent — it skips if the next step is already wait_for.
@@ -649,6 +706,9 @@ export class PreviewRunService {
 
       // V13: Switch dialog handler to replay mode — use pre-installed actions from recorded dialog steps
       sessionService.setDialogMode(previewSessionId, userId, 'replay');
+
+      // Skip compiled shortcut for remaining steps if first compiled plan failed (likely stale after deploy)
+      let skipCompiledForRemaining = false;
 
       // ─── Step execution loop ───────────────────────────────────────────
       for (let i = 0; i < stepsToExecute.length; i++) {
@@ -820,7 +880,17 @@ export class PreviewRunService {
             userId,
             skipPostActionWait: true, // V12: Lookahead handles inter-step timing
             expectsNavigation, // V13: Wrap click with waitForNavigation if next step expects URL change
+            skipCompiled: skipCompiledForRemaining,
           }), signal);
+
+          // If compiled plan was tried and failed, skip compiled for remaining steps
+          // (plans likely stale after deploy — don't waste 3s timeout per step)
+          if (result.compiledFailed && !skipCompiledForRemaining) {
+            skipCompiledForRemaining = true;
+            logger.info('[PreviewRun] Compiled plan failed — skipping compiled for remaining steps', {
+              previewSessionId, stepIndex: i, stepId: step.id,
+            });
+          }
           let retried = false;
 
           // ── Step-level retry: one attempt with relaxed params on failure ──
@@ -983,14 +1053,20 @@ export class PreviewRunService {
             if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
               const nextStep = stepsToExecute[i + 1];
               try {
+                const adaptiveSettle = getAdaptiveSettleMs(step.type);
                 const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
                   maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                  settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                  settleMs: adaptiveSettle,
                   autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
                   prevActionType: step.type,
                   prevUrl: trackedUrl,
                   recordedDelayMs: nextStep.evidence?.interStepDelayMs,
                 }), signal);
+
+                // Track actual settle time per action category for adaptive threshold
+                if (lookahead.waited > 0) {
+                  recordSettleTime(step.type, lookahead.waited);
+                }
 
                 if (lookahead.autoWaitApplied) {
                   logger.info('[PreviewRun] Lookahead auto-wait applied before next step', {

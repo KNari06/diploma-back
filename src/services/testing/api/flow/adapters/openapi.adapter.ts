@@ -19,6 +19,25 @@ import type {
   UnsupportedEndpoint,
 } from '../flow.types';
 
+/**
+ * Deep-clone an object while replacing circular references with null.
+ * Prevents JSON.stringify crashes throughout the pipeline.
+ */
+function stripCircularRefs(obj: any): any {
+  try {
+    const seen = new WeakSet();
+    return JSON.parse(JSON.stringify(obj, (_, value) => {
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) return null;
+        seen.add(value);
+      }
+      return value;
+    }));
+  } catch {
+    return {};
+  }
+}
+
 // Content types that indicate non-REST endpoints we can't test
 const UNSUPPORTED_CONTENT_TYPES = ['text/event-stream', 'application/octet-stream'];
 const FILE_UPLOAD_CONTENT_TYPES = ['multipart/form-data', 'application/octet-stream'];
@@ -213,31 +232,47 @@ export async function parseOpenApiSpec(
 ): Promise<ParsedApiSpec> {
   let doc: OpenAPI.Document;
 
+  // Helper: parse raw content to object
+  const parseRawContent = async (content: string) => {
+    const trimmed = content.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      return JSON.parse(trimmed);
+    }
+    const yaml = await import('js-yaml');
+    const obj = yaml.load(trimmed);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      throw new Error('Invalid API spec: expected a YAML/JSON object with OpenAPI structure');
+    }
+    return obj;
+  };
+
   try {
     if ('url' in input) {
       logger.info('[OPENAPI_ADAPTER] Fetching and parsing spec from URL', { url: input.url });
-      doc = await SwaggerParser.dereference(input.url) as OpenAPI.Document;
+      try {
+        doc = await SwaggerParser.dereference(input.url) as OpenAPI.Document;
+      } catch (derefErr: any) {
+        // Broken $ref — fallback to parse without dereference
+        logger.warn('[OPENAPI_ADAPTER] Dereference failed, falling back to parse()', {
+          error: derefErr.message?.slice(0, 200),
+        });
+        doc = await SwaggerParser.parse(input.url) as OpenAPI.Document;
+      }
     } else {
-      // Parse raw content (JSON or YAML)
       logger.info('[OPENAPI_ADAPTER] Parsing spec from file content', {
         fileName: input.fileName,
         contentLength: input.content.length,
       });
-      // SwaggerParser.parse() expects a file path, not a raw string.
-      // Parse JSON/YAML to object first, then dereference.
-      let rawObj: any;
-      const trimmed = input.content.trim();
-      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-        rawObj = JSON.parse(trimmed);
-      } else {
-        // YAML content — use js-yaml (bundled with swagger-parser)
-        const yaml = await import('js-yaml');
-        rawObj = yaml.load(trimmed);
-        if (!rawObj || typeof rawObj !== 'object' || Array.isArray(rawObj)) {
-          throw new Error('Invalid API spec: expected a YAML/JSON object with OpenAPI structure');
-        }
+      const rawObj = await parseRawContent(input.content);
+      try {
+        doc = await SwaggerParser.dereference(rawObj) as OpenAPI.Document;
+      } catch (derefErr: any) {
+        // Broken $ref — fallback to raw parsed object
+        logger.warn('[OPENAPI_ADAPTER] Dereference failed, using raw parsed spec', {
+          error: derefErr.message?.slice(0, 200),
+        });
+        doc = rawObj as OpenAPI.Document;
       }
-      doc = await SwaggerParser.dereference(rawObj) as OpenAPI.Document;
     }
   } catch (error: any) {
     throw new Error(`Failed to parse OpenAPI spec: ${error.message}`);
@@ -315,7 +350,19 @@ export async function parseOpenApiSpec(
     }
   }
 
-  const title = anyDoc.info?.title || 'API';
+  // Derive a meaningful title — generic defaults like "OpenAPI definition" are useless
+  const rawTitle = anyDoc.info?.title || '';
+  const isGeneric = !rawTitle || /^(openapi|swagger|api)\s*(definition|spec|docs?)?$/i.test(rawTitle.trim());
+  let title: string;
+  if (isGeneric) {
+    // Fallback: use first tag name, or hostname from servers/baseUrl, or "API"
+    const firstTag = endpoints[0]?.tags?.[0];
+    const serverUrl = anyDoc.servers?.[0]?.url || anyDoc.host || '';
+    const hostname = serverUrl ? (serverUrl.replace(/^https?:\/\//, '').split('/')[0] || '') : '';
+    title = firstTag ? `${firstTag} API` : hostname ? `${hostname} API` : 'API';
+  } else {
+    title = rawTitle;
+  }
   const version = anyDoc.info?.version || '1.0.0';
 
   if (endpoints.length === 0 && unsupportedEndpoints.length === 0) {
@@ -330,6 +377,17 @@ export async function parseOpenApiSpec(
     unsupported: unsupportedEndpoints.length,
   });
 
+  // Strip circular references from raw spec and all endpoint schemas
+  // (happens when spec has recursive $ref that dereference() couldn't resolve)
+  const safeRawSpec = stripCircularRefs(anyDoc);
+  const safeEndpoints = endpoints.map(ep => ({
+    ...ep,
+    requestBody: ep.requestBody ? { ...ep.requestBody, schema: stripCircularRefs(ep.requestBody.schema) } : undefined,
+    responses: Object.fromEntries(
+      Object.entries(ep.responses).map(([code, resp]) => [code, { ...resp, schema: stripCircularRefs(resp.schema) }])
+    ),
+  }));
+
   return {
     title,
     version,
@@ -337,9 +395,9 @@ export async function parseOpenApiSpec(
     baseUrl,
     description: anyDoc.info?.description,
     authSchemes,
-    endpoints,
+    endpoints: safeEndpoints,
     unsupportedEndpoints,
     sourceType,
-    rawSpec: anyDoc,
+    rawSpec: safeRawSpec,
   };
 }

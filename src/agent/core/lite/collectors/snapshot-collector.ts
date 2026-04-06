@@ -1120,11 +1120,14 @@ export class SnapshotCollector {
         // cursor:pointer leaf elements that aren't caught by querySelectorAll.
         // Scans entire document.body — capped at MAX_SECONDARY_ELEMENTS (60).
         // ═══════════════════════════════════════════════════════════════════════
-        const secondaryPassElements = collectFrameworkInteractiveElements(
-          document.body,
-          seenElements,
-          uniqueElements
-        );
+        // Guard: document.body may be null during page navigation
+        const secondaryPassElements = document.body
+          ? collectFrameworkInteractiveElements(
+              document.body,
+              seenElements,
+              uniqueElements
+            )
+          : new Set<Element>();
 
         // ✅ FIX BUG 5: Track refs used in THIS snapshot pass to prevent duplicates
         // When two elements produce the same fingerprint (e.g. repeated UI cards),
@@ -2007,15 +2010,21 @@ export class SnapshotCollector {
         };
       }, __modalConsts);
 
-      // DEBUG: Always log when snapshot returns 0 elements
+      // DEBUG: Log when snapshot returns 0 elements
+      // Use debug level for navigation-in-progress (expected, not an error)
+      // Use warn level for genuine 0-element issues (unexpected)
       if (snapshot.elements.length === 0) {
-        logger.warn('[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements', {
+        const debugStats = (snapshot as any).__debugStats;
+        const isNavInProgress = debugStats?.documentBodyChildCount === -1;
+        const logFn = isNavInProgress ? logger.debug : logger.warn;
+        logFn('[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements', {
           url: snapshot.url?.slice(0, 100),
           title: snapshot.title?.slice(0, 50),
-          debugStats: (snapshot as any).__debugStats,
+          debugStats,
           hasActiveModal: !!snapshot.activeModalRef,
           isTransient: snapshot.transientState?.isTransient || false,
           transientType: snapshot.transientState?.type,
+          isNavInProgress,
         });
       }
 

@@ -173,6 +173,22 @@ export async function handleApiFlowTest(
     const result = await FlowBuilderService.buildFromSpec(parseRequest, userId);
     const { flowSpec, dag, spec } = result;
 
+    // If AI has questions (via chat, just proceed without asking — chat context is limited)
+    if (!flowSpec || !dag) {
+      const questionMsg = result.questions?.length
+        ? `I'm analyzing your API spec but need some clarification. Please use the API Flows page to provide answers.`
+        : `Parsed ${spec.endpoints.length} endpoints but couldn't build the execution plan. Try uploading via the API Flows page.`;
+
+      if (chatSessionId) {
+        await ChatService.saveChatMessages(chatSessionId, [
+          { role: 'user', content: message },
+          { role: 'ai', content: questionMsg },
+        ]);
+      }
+      res.json({ success: true, reply: questionMsg, timestamp: new Date().toISOString() });
+      return;
+    }
+
     // Build success message
     const unsupportedNote = dag.unsupportedEndpoints.length > 0
       ? `\n\n⚠️ ${dag.unsupportedEndpoints.length} endpoints were skipped (WebSocket/SSE — not supported for HTTP testing).`

@@ -72,6 +72,7 @@ export async function getChatCompletionWithMessages(
         temperature: options?.temperature,
         maxTokens: options?.max_tokens,
         jsonMode: !!options?.response_format,
+        timeout: (options as any)?.timeout,
       });
       return { content: response.content, usage: response.usage };
     }

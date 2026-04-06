@@ -140,6 +140,75 @@ export class EditorTraceService {
     });
   }
 
+  writeSessionStart(data: { startUrl: string; viewport?: { width: number; height: number } }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'session_start',
+      payload: { previewSessionId: this.previewSessionId, userId: this.userId, ...data },
+    });
+  }
+
+  writeSessionStop(reason: string): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'session_stop',
+      payload: { previewSessionId: this.previewSessionId, reason },
+    });
+  }
+
+  writeNavigation(data: { fromUrl: string; toUrl: string; trigger: 'goto' | 'reload' | 'click' | 'back' | 'forward' | 'auto' }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'navigation',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // SNAPSHOT EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeSnapshotResult(data: {
+    url: string;
+    nodeCount: number;
+    durationMs: number;
+    source: 'lint' | 'interval' | 'after_input' | 'force';
+    debugStats?: Record<string, any>;
+  }): void {
+    this.writer.write({
+      stage: 'snapshot',
+      eventType: 'snapshot_collected',
+      payload: data,
+    });
+  }
+
+  writeSnapshotError(data: {
+    url: string;
+    source: string;
+    error: string;
+    isNavigationInProgress?: boolean;
+    debugStats?: Record<string, any>;
+  }): void {
+    this.writer.write({
+      stage: 'snapshot',
+      eventType: 'snapshot_error',
+      payload: data,
+    });
+  }
+
+  writeSnapshotEmpty(data: {
+    url: string;
+    isNavigationInProgress: boolean;
+    keptPreviousState: boolean;
+    debugStats?: Record<string, any>;
+  }): void {
+    this.writer.write({
+      stage: 'snapshot',
+      eventType: 'snapshot_empty',
+      payload: data,
+    });
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // RAW INPUT EVENTS
   // ─────────────────────────────────────────────────────────────────────────
