@@ -50,8 +50,9 @@ import { swaggerSpec } from '@/config/api/swagger';
 import { env, isDevelopment } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { testSupabaseAuthHealth, testSupabaseConnection } from '@/db/supabase';
+import { SystemHealthMonitor } from '@/services/system/system-health-monitor.service';
 import { errorHandler, notFoundHandler } from '@/utils/core/error-handler';
-import { logger, morganStream } from '@/utils/core/logger';
+import { logger, morganStream, formatError } from '@/utils/core/logger';
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
@@ -1133,6 +1134,43 @@ app.get('/health/live', (req: express.Request, res: express.Response) => {
 
 /**
  * @swagger
+ * /api/v1/system/status:
+ *   get:
+ *     summary: Current system health snapshot
+ *     description: |
+ *       Returns the in-process system health snapshot maintained by
+ *       SystemHealthMonitor. The frontend calls this on app load so the
+ *       maintenance banner can render immediately for users who connect after
+ *       the outage already started (the WebSocket `system:maintenance` push
+ *       only reaches sockets that were already connected when the status
+ *       changed).
+ *
+ *       This endpoint is intentionally PUBLIC (no auth) so unauthenticated
+ *       visitors can also see "service is down" instead of a generic 401.
+ *     tags: [Health]
+ *     responses:
+ *       200:
+ *         description: Current snapshot
+ */
+app.get(`/api/${env.API_VERSION}/system/status`, (req: express.Request, res: express.Response) => {
+  // Same CORS treatment as /health — allow frontend monitoring tools.
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS, HEAD');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+
+  const snapshot = SystemHealthMonitor.getStatus();
+  res.status(200).json({
+    success: true,
+    data: snapshot,
+  });
+});
+
+/**
+ * @swagger
  * /health:
  *   get:
  *     summary: Health check endpoint
@@ -1476,6 +1514,17 @@ const startServer = async () => {
       server = app.listen(env.PORT, async () => {
         logger.info(`QAIT Backend started | port=${env.PORT} env=${env.NODE_ENV}`);
 
+        // V21: Start system health monitor (polls Supabase, broadcasts maintenance
+        // banner to all connected clients on outage). Independent from zombie cleanup
+        // and safe to start before any test infrastructure is initialised.
+        try {
+          SystemHealthMonitor.start();
+        } catch (monitorError) {
+          logger.error('[SERVER] Failed to start system health monitor', {
+            error: formatError(monitorError),
+          });
+        }
+
         // Cleanup zombie regression runs from previous server crashes
         try {
           const { RegressionRunService } = await import('@/services/testing/regression/regression-run.service');
@@ -1486,11 +1535,11 @@ const startServer = async () => {
             try {
               await RegressionRunService.cleanupZombieRuns();
             } catch (err) {
-              logger.error('[SERVER] Periodic zombie cleanup failed', { error: err });
+              logger.error('[SERVER] Periodic zombie cleanup failed', { error: formatError(err) });
             }
           }, 10 * 60 * 1000);
         } catch (cleanupError) {
-          logger.error('[SERVER] Failed to cleanup zombie runs', { error: cleanupError });
+          logger.error('[SERVER] Failed to cleanup zombie runs', { error: formatError(cleanupError) });
         }
       });
 
@@ -1585,6 +1634,12 @@ const startServer = async () => {
       }, SHUTDOWN_TIMEOUT);
 
       try {
+        // V21: Stop the system health poll loop early so we don't keep probing
+        // Supabase while the rest of the process is tearing down.
+        try {
+          SystemHealthMonitor.stop();
+        } catch { /* non-critical */ }
+
         // Stop accepting new connections
         if (server) {
           server.close(async () => {

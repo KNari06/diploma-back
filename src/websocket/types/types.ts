@@ -816,8 +816,21 @@ export interface SystemErrorPayload {
 }
 
 export interface SystemMaintenancePayload {
+  /**
+   * V21: True when system enters maintenance/degraded mode (e.g. Supabase outage),
+   * false when service is restored. Frontend uses this to show/hide a global
+   * banner. When omitted, backwards-compat consumers can treat the event as
+   * `active: true` (legacy: every emission used to mean "maintenance starting").
+   */
+  active?: boolean;
+  /** User-facing reason. Free-form, e.g. "База данных недоступна" */
   message: string;
-  estimatedDuration?: number; // seconds
+  /** Optional machine-readable code (e.g. 'supabase_down', 'queue_unreachable') */
+  reason?: string;
+  /** ISO timestamp when the current maintenance window started */
+  since?: string;
+  /** Optional estimated duration in seconds — informational only */
+  estimatedDuration?: number;
   timestamp: string;
 }
 

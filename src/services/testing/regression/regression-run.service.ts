@@ -19,7 +19,7 @@ import type {
   NegativeSummary,
 } from '@/types/testing.types';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
-import { logger } from '@/utils/core/logger';
+import { logger, formatError } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { topologicalSort } from '@/utils/graph/topological-sort';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -80,7 +80,9 @@ export class RegressionRunService {
         .select('id');
 
       if (error) {
-        logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error });
+        // Use formatError so upstream HTML gateway responses (e.g. Cloudflare 520
+        // when Supabase origin is down) don't dump multi-KB of HTML into the logs.
+        logger.error('[REGRESSION_RUN] Failed to cleanup zombie runs', { error: formatError(error) });
         return;
       }
 
@@ -91,7 +93,7 @@ export class RegressionRunService {
         });
       }
     } catch (error) {
-      logger.error('[REGRESSION_RUN] Error in zombie run cleanup', { error });
+      logger.error('[REGRESSION_RUN] Error in zombie run cleanup', { error: formatError(error) });
     }
   }
 
