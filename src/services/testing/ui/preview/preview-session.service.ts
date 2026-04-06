@@ -594,6 +594,16 @@ export class PreviewSessionService {
           nodeCount: domAnalysis.interactiveNodes.length,
         });
 
+        // Initialize trace writer for this session — captures all preview operations to JSONL
+        try {
+          const { EditorTraceService } = await import('./editor-trace.service');
+          const trace = EditorTraceService.getOrCreate(sessionId, userId);
+          trace.writeSessionStart({
+            startUrl: safeStartUrl,
+            viewport: viewport ?? PREVIEW_SESSION_CONFIG.viewport,
+          });
+        } catch { /* trace logging must never break session start */ }
+
         // Stage 4: Ready
         emitProgress('ready', 100);
 
@@ -997,6 +1007,11 @@ export class PreviewSessionService {
     // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
     try {
       const { EditorTraceService } = await import('./editor-trace.service');
+      // Write final session_stop event before closing the trace file
+      const traceBeforeClose = EditorTraceService.get(sessionId);
+      if (traceBeforeClose) {
+        try { traceBeforeClose.writeSessionStop('stop_internal'); } catch { /* non-critical */ }
+      }
       const meta = await EditorTraceService.close(sessionId);
       if (meta) {
         const { uploadEditorTrace } = await import('./editor-trace-upload');
@@ -1683,19 +1698,43 @@ export class PreviewSessionService {
         && domAnalysis.interactiveNodes.length === 0;
 
       // ── DEBUG: Log when snapshot returns 0 elements to diagnose drawer/popup issues ──
+      const trace = await import('./editor-trace.service').then(m => m.EditorTraceService.get(sessionId)).catch(() => null);
+
       if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length === 0) {
-        logger.warn('[PREVIEW_SESSION] Snapshot returned 0 elements', {
+        // Navigation in progress = expected (debug level), genuine empty = warn
+        const logFn = isNavigationInProgress ? logger.debug : logger.warn;
+        logFn('[PREVIEW_SESSION] Snapshot returned 0 elements', {
           sessionId,
           url: currentUrl,
           pageIsClosed: session.page.isClosed(),
           snapshotElementCount: snapshot.elements?.length ?? -1,
           isNavigationInProgress,
         });
+        trace?.writeSnapshotEmpty({
+          url: currentUrl,
+          isNavigationInProgress,
+          keptPreviousState: isNavigationInProgress && session.pageState.domNodes.length > 0,
+          debugStats,
+        });
       } else if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length > 0) {
         logger.warn('[PREVIEW_SESSION] Snapshot has elements but extractor returned 0 nodes', {
           sessionId,
           url: currentUrl,
           rawElementCount: snapshot.elements.length,
+        });
+        trace?.writeSnapshotError({
+          url: currentUrl,
+          source: 'getSnapshot',
+          error: 'extractor returned 0 nodes from non-empty raw elements',
+          debugStats,
+        });
+      } else {
+        trace?.writeSnapshotResult({
+          url: currentUrl,
+          nodeCount: domAnalysis.interactiveNodes.length,
+          durationMs: Date.now() - now,
+          source: options?.force ? 'force' : 'interval',
+          debugStats,
         });
       }
 
