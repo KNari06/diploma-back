@@ -14,6 +14,7 @@ import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
+import { waitForPageInteractive } from './page-interactive.utils';
 
 const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
 const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
@@ -202,6 +203,14 @@ interface InternalSession extends PreviewSession {
   lastSnapshotEmit: number;
   lastScreenshotEmitAt: number;  // Last screenshot emission timestamp
   lastPageSignature: string;      // Hash for diff detection (url+domMetrics)
+  /**
+   * V20: Signature of the last `preview:page` payload actually emitted on the wire.
+   * Used by emitSnapshotIfChanged + DOM tick + apply/subscribe handlers to skip redundant
+   * emits when the DOM hasn't changed since the previous emit (e.g. rapid clicks on
+   * non-mutating elements, wheel events on a static page). Updated by EVERY preview:page
+   * emit site so force-emits and interval-emits share the same dedup window.
+   */
+  lastEmittedSignature: string;
   lastMouseInputAt: number;       // Mouse input throttling timestamp
   lastWheelInputAt: number;       // Wheel input throttling timestamp
   lastKeyboardTypeAt: number;     // Keyboard type throttling timestamp
@@ -511,11 +520,35 @@ export class PreviewSessionService {
 
         emitProgress('loading_page', 60);
 
-        // Wait for DOM to stabilize (SPA hydration / API-driven renders).
-        // domcontentloaded fires when HTML is parsed, but SPAs render async.
-        // Instead of networkidle (waits for images/fonts/analytics — irrelevant for element finding),
-        // use a DOM stability check: no mutations for 800ms → DOM is ready for snapshot.
-        await waitForDOMStability(page, 3000, 800);
+        // Wait until the page is **actually interactive for a bot**, not just
+        // "DOM stopped mutating for 800ms". The old waitForDOMStability() was
+        // fooled by SSO/OAuth redirect chains (e.g. dlkz.doculite.kz →
+        // accounttest.doculite.kz/oauth/authorize → …): mutations quieted
+        // between redirects, so it returned ready while the login form wasn't
+        // even on screen yet, and the initial snapshot collected 0 elements.
+        //
+        // waitForPageInteractive only returns ready once:
+        //   1. URL has stopped changing (redirect chain finished)
+        //   2. API idle + DOM stable + loading indicators cleared
+        //   3. SnapshotCollector.collect() returns ≥1 interactive element
+        //      (same collector used on line 532 — if it sees elements here,
+        //      the initial snapshot below is guaranteed to be non-empty).
+        // Fails open on timeout, so we preserve the old "always proceed"
+        // behaviour — worst case the initial snapshot is still empty, same
+        // as today.
+        const initialReadiness = await waitForPageInteractive(page, {
+          previewSessionId: sessionId,
+        });
+
+        if (!initialReadiness.ready) {
+          logger.warn('[PREVIEW_SESSION] Initial readiness gate timed out', {
+            sessionId,
+            waited: initialReadiness.waited,
+            elementCount: initialReadiness.elementCount,
+            finalUrl: initialReadiness.finalUrl,
+            reason: initialReadiness.reason,
+          });
+        }
 
         // Stage 3: Extract elements
         emitProgress('extracting_elements', 75);
@@ -550,6 +583,8 @@ export class PreviewSessionService {
           lastSnapshotEmit: 0,
           lastScreenshotEmitAt: 0,
           lastPageSignature: initialSignature,
+          // V20: Start empty so the first emit after session start always passes dedup
+          lastEmittedSignature: '',
           lastMouseInputAt: 0,
           lastWheelInputAt: 0,
           lastKeyboardTypeAt: 0,
@@ -694,8 +729,25 @@ export class PreviewSessionService {
         timeout: 30000,
       });
 
-      // Wait for DOM to stabilize (SPA hydration) — no need for networkidle (images/fonts/analytics irrelevant)
-      await waitForDOMStability(newPage, 3000, 800);
+      // Wait until the page is actually interactive for a bot. Same reasoning
+      // as the initial session start path above — naive DOM stability is
+      // fooled by SSO/OAuth redirect chains. See waitForPageInteractive
+      // for the full gate (URL stable → API idle + loading indicators clear
+      // → snapshot returns ≥1 interactive element). Fails open on timeout
+      // to preserve the old "always proceed" behaviour.
+      const resetReadiness = await waitForPageInteractive(newPage, {
+        previewSessionId: sessionId,
+      });
+
+      if (!resetReadiness.ready) {
+        logger.warn('[PREVIEW_SESSION] Reset readiness gate timed out', {
+          sessionId,
+          waited: resetReadiness.waited,
+          elementCount: resetReadiness.elementCount,
+          finalUrl: resetReadiness.finalUrl,
+          reason: resetReadiness.reason,
+        });
+      }
 
       // Save old resources (close after swap)
       const oldContext = session.context;
@@ -721,6 +773,8 @@ export class PreviewSessionService {
       session.lastSnapshotEmit = 0;
       session.lastScreenshotEmitAt = 0;
       session.lastPageSignature = '';
+      // V20: Reset dedup marker so the first emit on the new page always passes through
+      session.lastEmittedSignature = '';
       session.lastMouseInputAt = 0;
       session.lastWheelInputAt = 0;
       session.lastKeyboardTypeAt = 0;
@@ -1239,9 +1293,22 @@ export class PreviewSessionService {
       const safeClickCount = Number.isInteger(clickCount) && clickCount > 0 && clickCount <= 2 ? clickCount : 1;
 
       switch (action) {
-        case 'move':
-          await session.page.mouse.move(clampedX, clampedY);
+        case 'move': {
+          // V20: Fire-and-forget for high-frequency hover. The handler does NOT need to know
+          // when Playwright finished applying the move — hover probe and recordingLastHover
+          // both work off the coords stored in the WS handler closure, not the actual page state.
+          // Awaiting here serializes every move through one network RTT and is the main source
+          // of perceived lag on cloud Playwright.
+          session.page.mouse.move(clampedX, clampedY).catch((err: unknown) => {
+            logger.debug('[PREVIEW_SESSION] Async mouse move failed', {
+              sessionId,
+              x: clampedX,
+              y: clampedY,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
           return { success: true, needsSnapshot: false };
+        }
 
         case 'click':
           await session.page.mouse.click(clampedX, clampedY, { button: safeButton, clickCount: safeClickCount });
@@ -1311,7 +1378,17 @@ export class PreviewSessionService {
       const safeDeltaX = Math.max(-2000, Math.min(2000, deltaX * SCROLL_SENSITIVITY));
       const safeDeltaY = Math.max(-2000, Math.min(2000, deltaY * SCROLL_SENSITIVITY));
 
-      await session.page.mouse.wheel(safeDeltaX, safeDeltaY);
+      // V20: Fire-and-forget — wheel is high-frequency and the recording / snapshot
+      // pipeline does not depend on Playwright having finished applying the wheel before
+      // we acknowledge the WS event. Errors logged at debug level only.
+      session.page.mouse.wheel(safeDeltaX, safeDeltaY).catch((err: unknown) => {
+        logger.debug('[PREVIEW_SESSION] Async mouse wheel failed', {
+          sessionId,
+          deltaX: safeDeltaX,
+          deltaY: safeDeltaY,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       return { success: true };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Mouse wheel failed', {
@@ -1701,12 +1778,21 @@ export class PreviewSessionService {
       const trace = await import('./editor-trace.service').then(m => m.EditorTraceService.get(sessionId)).catch(() => null);
 
       if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length === 0) {
-        // Navigation in progress = expected (debug level), genuine empty = warn
-        const logFn = isNavigationInProgress ? logger.debug : logger.warn;
+        // V21: Three benign states downgrade this from warn to debug:
+        //   1. Navigation in progress (document.body not ready yet)
+        //   2. Page already closed (race with session shutdown)
+        //   3. Genuinely empty page but mid-teardown
+        // Only a non-navigation, non-closed zero-element result is a real
+        // anomaly worth a warn-level log.
+        const pageIsClosed = (() => {
+          try { return session.page.isClosed(); } catch { return true; }
+        })();
+        const isBenign = isNavigationInProgress || pageIsClosed;
+        const logFn = isBenign ? logger.debug : logger.warn;
         logFn('[PREVIEW_SESSION] Snapshot returned 0 elements', {
           sessionId,
           url: currentUrl,
-          pageIsClosed: session.page.isClosed(),
+          pageIsClosed,
           snapshotElementCount: snapshot.elements?.length ?? -1,
           isNavigationInProgress,
         });
@@ -1826,6 +1912,30 @@ export class PreviewSessionService {
   getDomVersion(sessionId: string, userId?: string): number | null {
     const session = this.getAuthorizedSession(sessionId, userId);
     return session?.domVersion ?? null;
+  }
+
+  /**
+   * V20: Get the signature of the last `preview:page` payload emitted on the wire.
+   * Used by every preview:page emit site to skip redundant emits when the DOM hasn't
+   * changed since the previous emit. Returns empty string if no emit has happened yet
+   * (first emit always passes the dedup gate).
+   */
+  getLastEmittedSignature(sessionId: string, userId?: string): string {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.lastEmittedSignature ?? '';
+  }
+
+  /**
+   * V20: Mark a pageSignature as just-emitted so the next emit site with the same
+   * signature can skip. Callers MUST invoke this immediately after a successful
+   * `nsp.to(room).emit('preview:page', ...)` to keep the dedup window consistent
+   * across `emitSnapshotIfChanged`, DOM tick, apply, subscribe, and page-switch retry.
+   */
+  markEmittedSignature(sessionId: string, userId: string | undefined, signature: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session && typeof signature === 'string') {
+      session.lastEmittedSignature = signature;
+    }
   }
 
   /**
@@ -2298,6 +2408,10 @@ export class PreviewSessionService {
         // Reset snapshot state so next getSnapshot() forces a fresh collect
         session.lastSnapshotEmit = 0;
         session.lastPageSignature = '';
+        // V20: Reset dedup marker so the first emit for the new page always passes
+        // through, even in the (unlikely) case that the new page's signature
+        // coincidentally matches the old page's last-emitted signature.
+        session.lastEmittedSignature = '';
 
         // V11: Unblock snapshot collection now that new page is loaded
         session.pageSwitchInProgress = false;
@@ -2426,6 +2540,9 @@ export class PreviewSessionService {
     // Reset snapshot state for fresh collection on new tab
     session.lastSnapshotEmit = 0;
     session.lastPageSignature = '';
+    // V20: Reset dedup marker so the first emit for the newly active tab always
+    // passes through the signature-dedup gate.
+    session.lastEmittedSignature = '';
 
     session.pageSwitchInProgress = false;
 
@@ -2481,6 +2598,8 @@ export class PreviewSessionService {
       // Reset snapshot + invoke callback
       session.lastSnapshotEmit = 0;
       session.lastPageSignature = '';
+      // V20: Reset dedup marker for the newly-active tab
+      session.lastEmittedSignature = '';
       if (session.onPageSwitch) {
         try { session.onPageSwitch(session.page, closedPage.url()); } catch { /* non-critical */ }
       }
@@ -2544,6 +2663,8 @@ export class PreviewSessionService {
         session.page = session.pages[session.activeTabIndex];
         session.lastSnapshotEmit = 0;
         session.lastPageSignature = '';
+        // V20: Reset dedup marker for the newly-active tab
+        session.lastEmittedSignature = '';
         if (session.onPageSwitch) {
           try { session.onPageSwitch(session.page, ''); } catch { /* non-critical */ }
         }

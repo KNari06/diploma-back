@@ -2091,13 +2091,42 @@ export class SnapshotCollector {
 
       return snapshot as LiteSnapshot;
     } catch (error) {
-      logger.error('[SNAPSHOT_COLLECTOR] Failed to collect snapshot', {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      // V21: "Target page/context/browser has been closed" is a race between
+      // the 500ms DOM tick and PreviewSession shutdown — the interval fires one
+      // last tick after page.close() was invoked but before the interval was
+      // cleared. This is not an application error, it's expected shutdown
+      // behaviour; log at debug level so it doesn't pollute error.log with
+      // one noisy line per session close.
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const isExpectedShutdown =
+        errorMessage.includes('Target page, context or browser has been closed') ||
+        errorMessage.includes('Target closed') ||
+        errorMessage.includes('has been closed') ||
+        errorMessage.includes('Execution context was destroyed') ||
+        errorMessage.includes('Protocol error') ||
+        page.isClosed();
 
-      // Return empty snapshot on error
+      if (isExpectedShutdown) {
+        logger.debug('[SNAPSHOT_COLLECTOR] Skipped collect during shutdown/navigation', {
+          reason: errorMessage,
+          pageIsClosed: (() => { try { return page.isClosed(); } catch { return true; } })(),
+        });
+      } else {
+        logger.error('[SNAPSHOT_COLLECTOR] Failed to collect snapshot', {
+          error: errorMessage,
+        });
+      }
+
+      // Return empty snapshot on error. Guard page.url() in case the page is
+      // already closed (calling .url() on a closed page can also throw).
+      let safeUrl = '';
+      try {
+        safeUrl = page.url();
+      } catch {
+        // Page fully torn down — no URL available
+      }
       return {
-        url: page.url(),
+        url: safeUrl,
         title: '',
         elements: [],
         timestamp: Date.now(),

@@ -24,6 +24,12 @@ interface CachedDraftSteps {
   startUrl: string;
   createdAt: number;
   userId: string;
+  /**
+   * Short name suggested by the AI when it ran the draft (e.g., "Positive Login Flow").
+   * Optional — if absent, the save-as-test-case endpoint falls back to a heuristic
+   * derived from the steps themselves (first navigate URL, etc.).
+   */
+  suggestedName?: string;
 }
 
 /** TTL: 30 minutes — generous enough for slow human workflows */
@@ -92,6 +98,37 @@ export const DraftStepsCache = {
       logger.debug('[DRAFT_STEPS_CACHE] Entry cleared', { chatSessionId });
     }
     return deleted;
+  },
+
+  /**
+   * Atomic read-and-delete. Returns the cached entry (if any) and removes it
+   * from the map in a single synchronous operation. Defends against the race
+   * where two parallel "save as test case" requests both read the cache and
+   * both call IntentTestCaseService.create() — without consume() they would
+   * each create a duplicate test case.
+   *
+   * Single-process atomicity only — if the backend is sharded across
+   * processes (cluster mode, multiple workers), use a Redis-backed lock
+   * instead. The current QAIT backend runs as a single Node process per
+   * environment, so consume() is sufficient.
+   *
+   * Returns undefined for missing or expired entries, same as get().
+   */
+  consume(chatSessionId: string): CachedDraftSteps | undefined {
+    const entry = cache.get(chatSessionId);
+    if (!entry) return undefined;
+
+    // Check TTL — even on consume, expired entries are evicted, not returned
+    if (Date.now() - entry.createdAt > DRAFT_CACHE_TTL_MS) {
+      cache.delete(chatSessionId);
+      logger.debug('[DRAFT_STEPS_CACHE] Entry expired on consume', { chatSessionId });
+      return undefined;
+    }
+
+    // Atomic delete BEFORE returning so concurrent callers see the empty cache
+    cache.delete(chatSessionId);
+    logger.debug('[DRAFT_STEPS_CACHE] Entry consumed', { chatSessionId });
+    return entry;
   },
 
   /** @internal TEST-ONLY: prevent cross-test leakage */

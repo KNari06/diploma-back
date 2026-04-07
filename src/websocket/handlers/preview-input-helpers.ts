@@ -73,16 +73,41 @@ export function emitInputSuccess(
 
 /**
  * Emit preview:page snapshot to caller + subscribers
- * Used after input actions that may have changed the page
- * @param options.forceEmit - If true, always emit even if change-detection says unchanged (for clicks etc.)
+ * Used after input actions that may have changed the page.
+ *
+ * V20 (signature dedup):
+ *   - `forceEmit` still bypasses the "onlyIfChanged" gate inside getSnapshot() so we
+ *     always collect a fresh snapshot (needed because the throttle window would
+ *     otherwise skip the collect and leave us comparing stale signatures).
+ *   - BUT after the collect, we compare `snapshot.pageSignature` against the
+ *     per-session `lastEmittedSignature`. If the DOM hasn't mutated since the
+ *     previous emit, we skip the WebSocket send entirely — the frontend already
+ *     has the exact same data. This is safe because the frontend:
+ *       (a) keeps `lastKnownDomNodes` across emits and gracefully handles missing
+ *           domNodes fields;
+ *       (b) batches preview:page into a single setState via a 140-650ms debounce,
+ *           so the 'dropped' emit would have collapsed into the batch anyway;
+ *       (c) drives URL / title updates from the same payload, so once the signature
+ *           DOES change (navigation, real DOM mutation) the very next emit carries
+ *           the fresh url/title.
+ *     The DOM tick (500ms interval) and apply/subscribe/page-switch handlers use the
+ *     same `lastEmittedSignature` window, so all emit sites agree on dedup state.
+ *
+ * @param options.forceEmit - If true, collect a fresh snapshot even if throttled.
+ *   Dedup by signature still applies — use `bypassDedup` to also disable that.
+ * @param options.bypassDedup - If true, skip the signature-dedup gate and ALWAYS emit.
+ *   Required for cases where the frontend needs the snapshot as a handshake response
+ *   regardless of DOM state (viewport resize → coordinate rescale, page reset → fresh
+ *   page handshake, subscribe → initial state delivery).
  */
 export async function emitSnapshotIfChanged(
   socket: TypedSocket,
   previewSessionId: string,
   userId: string,
-  options?: { forceEmit?: boolean }
+  options?: { forceEmit?: boolean; bypassDedup?: boolean }
 ): Promise<void> {
   const forceEmit = options?.forceEmit ?? false;
+  const bypassDedup = options?.bypassDedup ?? false;
 
   try {
     const { getPreviewSessionService, getPreviewVideoStreamRegistry } =
@@ -95,8 +120,29 @@ export async function emitSnapshotIfChanged(
       onlyIfChanged: !forceEmit, // Skip change-gate when forceEmit=true
     });
 
-    // Emit when forceEmit or when change was detected
-    if (snapshot && (forceEmit || snapshot.changed)) {
+    if (!snapshot) return;
+
+    // V20: signature-based dedup — skip wire emit when the DOM is byte-identical
+    // to the last payload we already sent. `bypassDedup` callers (resize/reset/
+    // subscribe) opt out because the frontend uses their emit as a handshake.
+    if (!bypassDedup) {
+      const lastSig = sessionService.getLastEmittedSignature(previewSessionId, userId);
+      if (lastSig && snapshot.pageSignature === lastSig) {
+        // Nothing new on the wire. Still update the video stream's domVersion pointer
+        // so downstream consumers see the freshest version number; it's idempotent.
+        getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+        logger.debug('[WebSocket] Skipped preview:page emit (signature unchanged)', {
+          socketId: socket.id,
+          previewSessionId,
+          domVersion: snapshot.domVersion,
+          forceEmit,
+        });
+        return;
+      }
+    }
+
+    // Emit when forceEmit/bypassDedup or when change was detected
+    if (forceEmit || bypassDedup || snapshot.changed) {
       const room = createRoomName('preview', previewSessionId);
       const payload = {
         previewSessionId,
@@ -113,6 +159,9 @@ export async function emitSnapshotIfChanged(
       // Emit to other subscribers
       socket.to(room).emit('preview:page', payload);
 
+      // V20: Record the signature we just sent so subsequent emit sites can dedup
+      sessionService.markEmittedSignature(previewSessionId, userId, snapshot.pageSignature);
+
       // Update video stream with new DOM version
       getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
 
@@ -121,6 +170,7 @@ export async function emitSnapshotIfChanged(
         previewSessionId,
         domVersion: snapshot.domVersion,
         forceEmit,
+        bypassDedup,
       });
     }
   } catch (snapshotError) {
@@ -133,8 +183,11 @@ export async function emitSnapshotIfChanged(
 }
 
 /**
- * Emit preview:page unconditionally (always send new snapshot + screenshot)
- * Used after click/up/wheel where user expects visual feedback regardless of "detected change"
+ * Emit preview:page unconditionally (always send new snapshot + screenshot).
+ * Used after click/up/wheel where user expects visual feedback regardless of
+ * "detected change". V20: still subject to signature dedup — use
+ * `emitSnapshotForHandshake` when the caller is a handshake-style operation
+ * (resize/reset/subscribe) that needs delivery guaranteed.
  */
 export async function emitSnapshotAlways(
   socket: TypedSocket,
@@ -142,4 +195,17 @@ export async function emitSnapshotAlways(
   userId: string
 ): Promise<void> {
   return emitSnapshotIfChanged(socket, previewSessionId, userId, { forceEmit: true });
+}
+
+/**
+ * V20: Guaranteed delivery of preview:page, bypassing signature dedup.
+ * Use for handshake-style cases where the frontend needs the emit regardless of
+ * DOM state (viewport resize → client rescale, page reset → fresh page state).
+ */
+export async function emitSnapshotForHandshake(
+  socket: TypedSocket,
+  previewSessionId: string,
+  userId: string
+): Promise<void> {
+  return emitSnapshotIfChanged(socket, previewSessionId, userId, { forceEmit: true, bypassDedup: true });
 }

@@ -1242,6 +1242,10 @@ const QA_TOOLS: ChatCompletionTool[] = [
             type: 'string',
             description: 'Starting URL for the test. Use the current preview page URL from the page context.',
           },
+          suggested_name: {
+            type: 'string',
+            description: 'Short, descriptive name (3-5 words) for this test scenario, derived from the user\'s intent and the page being tested. Examples: "Positive Login Flow", "Checkout with Promo Code", "Reset Password Email". Used as the default test case name when the user later clicks "Save as test case". Always include this when you call qa_run_draft_steps.',
+          },
           confirm: {
             type: 'boolean',
             description: 'Must be true. Set ONLY after describing the steps to user AND receiving explicit approval.',

@@ -22,6 +22,7 @@ import {
 } from '../types/types';
 import {
     emitSnapshotAlways,
+    emitSnapshotForHandshake,
     emitSnapshotIfChanged,
     validateInputRequest,
 } from './preview-input-helpers';
@@ -58,6 +59,32 @@ const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; 
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
+
+/**
+ * V20: Per-socket+session move coalescing state.
+ * Multiple `preview:mouse:move` events arriving within one event loop tick are
+ * collapsed into a single Playwright call with the latest coordinates.
+ * Key: `${socketId}:${previewSessionId}`
+ */
+const moveCoalesceState = new Map<string, {
+  latestX: number;
+  latestY: number;
+  flushScheduled: boolean;
+}>();
+
+/**
+ * V20: Per-socket+session wheel coalescing state.
+ * Multiple `preview:mouse:wheel` events arriving within one event loop tick are
+ * accumulated into a single Playwright call with the summed delta.
+ * Key: `${socketId}:${previewSessionId}`
+ */
+const wheelCoalesceState = new Map<string, {
+  accDeltaX: number;
+  accDeltaY: number;
+  lastX: number | undefined;
+  lastY: number | undefined;
+  flushScheduled: boolean;
+}>();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // V14: Inter-step delay stamping for recording
@@ -452,6 +479,18 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
         return;
       }
       try {
+        // V21: Early exit if the session was torn down since this tick was
+        // scheduled. Without this, the interval races with stopSession() —
+        // the tick fires, calls getSnapshot() → page.evaluate() on an
+        // already-closed page, and Playwright throws
+        // "Target page, context or browser has been closed" which used to
+        // land in error.log on every session close. Check both the session
+        // record AND the page object to cover partial tear-down states.
+        const liveSession = sessionService.getSession(previewSessionId);
+        if (!liveSession || !liveSession.page || liveSession.page.isClosed()) {
+          return;
+        }
+
         // Skip snapshot collection during run mode — run loop manages its own state,
         // frontend only uses preview:run:step events, and video stream is independent.
         // Avoids page.evaluate() contention with step apply/readiness checks.
@@ -467,33 +506,64 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
         });
 
         if (snapshot && snapshot.changed) {
-          const payload: PreviewPagePayload = {
-            previewSessionId,
-            url: snapshot.url,
-            pageTitle: snapshot.pageTitle,
-            domVersion: snapshot.domVersion,
-            pageSignature: snapshot.pageSignature,
-            domNodes: snapshot.domNodes, // Only included when changed
-            timestamp: new Date().toISOString(),
-          };
+          // V20: Second-level dedup — even though getSnapshot returned changed=true
+          // against `lastPageSignature`, another emit site (click, apply, subscribe)
+          // may have already pushed this exact signature to the wire. Compare against
+          // `lastEmittedSignature` before sending to avoid a double-emit race.
+          const lastEmitted = sessionService.getLastEmittedSignature(previewSessionId, userId);
+          if (lastEmitted && snapshot.pageSignature === lastEmitted) {
+            // Still bump video stream's domVersion pointer and bail.
+            videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+          } else {
+            const payload: PreviewPagePayload = {
+              previewSessionId,
+              url: snapshot.url,
+              pageTitle: snapshot.pageTitle,
+              domVersion: snapshot.domVersion,
+              pageSignature: snapshot.pageSignature,
+              domNodes: snapshot.domNodes, // Only included when changed
+              timestamp: new Date().toISOString(),
+            };
 
-          // Emit to entire room
-          nsp.to(room).emit('preview:page', payload);
+            // Emit to entire room
+            nsp.to(room).emit('preview:page', payload);
 
-          // Update video stream with new DOM version
-          videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+            // V20: Record the signature so subsequent emit sites can dedup
+            sessionService.markEmittedSignature(previewSessionId, userId, snapshot.pageSignature);
 
-          logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
-            previewSessionId,
-            domVersion: snapshot.domVersion,
-            nodeCount: snapshot.domNodes?.length || 0,
-          });
+            // Update video stream with new DOM version
+            videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+
+            logger.debug('[PREVIEW_STREAM] Emitted preview:page (DOM changed)', {
+              previewSessionId,
+              domVersion: snapshot.domVersion,
+              nodeCount: snapshot.domNodes?.length || 0,
+            });
+          }
         }
       } catch (error) {
-        logger.error('[PREVIEW_STREAM] Failed to check DOM update', {
-          previewSessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        // V21: "Target closed" errors here are the same shutdown race as in
+        // snapshot-collector — the tick survived one cycle past stop(). Log
+        // at debug level so error.log stays clean during normal session
+        // teardown. Real errors (e.g. evaluate bugs) still surface.
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isShutdownRace =
+          errorMessage.includes('Target page, context or browser has been closed') ||
+          errorMessage.includes('Target closed') ||
+          errorMessage.includes('has been closed') ||
+          errorMessage.includes('Execution context was destroyed');
+
+        if (isShutdownRace) {
+          logger.debug('[PREVIEW_STREAM] DOM tick skipped (shutdown race)', {
+            previewSessionId,
+            reason: errorMessage,
+          });
+        } else {
+          logger.error('[PREVIEW_STREAM] Failed to check DOM update', {
+            previewSessionId,
+            error: errorMessage,
+          });
+        }
       } finally {
         releaseDomTickGuard(previewSessionId, activeDomUpdateTicks);
       }
@@ -548,6 +618,13 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           // DOM tick may have been blocked by pageSwitchInProgress, so we need to send
           // the first valid snapshot explicitly. Retry up to 3 times if nodeCount is 0
           // (page may still be rendering).
+          //
+          // V20: Page switch is a handshake — we MUST deliver at least one snapshot
+          // to the frontend so its lastKnownDomNodes reflect the new page. Dedup by
+          // signature WITHIN the retry loop (skip emit if identical to previous retry)
+          // but always allow the first successful emit through even if by coincidence
+          // the new signature matches a stale lastEmittedSignature from the old page.
+          let lastRetrySignature: string | null = null;
           for (let attempt = 1; attempt <= 3; attempt++) {
             try {
               const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
@@ -555,24 +632,31 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
                 includeDomNodes: true,
               });
               if (snapshot) {
-                const payload: PreviewPagePayload = {
-                  previewSessionId,
-                  url: snapshot.url,
-                  pageTitle: snapshot.pageTitle,
-                  domVersion: snapshot.domVersion,
-                  pageSignature: snapshot.pageSignature,
-                  domNodes: snapshot.domNodes,
-                  timestamp: new Date().toISOString(),
-                };
-                nsp.to(room).emit('preview:page', payload);
-                videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
+                const sameAsLastRetry = lastRetrySignature !== null
+                  && snapshot.pageSignature === lastRetrySignature;
+                if (!sameAsLastRetry) {
+                  const payload: PreviewPagePayload = {
+                    previewSessionId,
+                    url: snapshot.url,
+                    pageTitle: snapshot.pageTitle,
+                    domVersion: snapshot.domVersion,
+                    pageSignature: snapshot.pageSignature,
+                    domNodes: snapshot.domNodes,
+                    timestamp: new Date().toISOString(),
+                  };
+                  nsp.to(room).emit('preview:page', payload);
+                  // V20: Record signature so subsequent emit sites dedup correctly
+                  sessionService.markEmittedSignature(previewSessionId, userId, snapshot.pageSignature);
+                  lastRetrySignature = snapshot.pageSignature;
+                  videoRegistry.setDomVersion(previewSessionId, snapshot.domVersion);
 
-                logger.info('[PREVIEW_STREAM] Emitted fresh snapshot after page switch', {
-                  previewSessionId,
-                  attempt,
-                  domVersion: snapshot.domVersion,
-                  nodeCount: snapshot.domNodes?.length || 0,
-                });
+                  logger.info('[PREVIEW_STREAM] Emitted fresh snapshot after page switch', {
+                    previewSessionId,
+                    attempt,
+                    domVersion: snapshot.domVersion,
+                    nodeCount: snapshot.domNodes?.length || 0,
+                  });
+                }
 
                 // If we got actual DOM nodes, we're done
                 if (snapshot.domNodes && snapshot.domNodes.length > 0) {
@@ -756,6 +840,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       // V7: Emit initial preview:page with domNodes (video stream handles visuals)
+      // V20 note: This is a PER-SOCKET emit (only to the new subscriber), not a room
+      // broadcast. We intentionally do NOT call markEmittedSignature here — that map
+      // tracks what was last sent to the WHOLE ROOM. If we updated it here, other
+      // subscribers already in the room would get stuck on a stale snapshot because
+      // subsequent room-wide emit sites would think "already sent" when those others
+      // never received this payload.
       try {
         const snapshot = await sessionService.getSnapshot(normalizedPreviewSessionId, ensuredUserId, {
           force: true,
@@ -850,6 +940,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       // V18: Clear hover probe state for this session
       hoverProbeState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
+      // V20: Clear move/wheel coalesce state for this session
+      moveCoalesceState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
+      wheelCoalesceState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
 
       logger.info('[WebSocket] Unsubscribed from preview', {
         socketId: socket.id,
@@ -1283,31 +1376,42 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
 
             if (snapshot && snapshot.changed) {
-              const room = createRoomName('preview', previewSessionId);
-              const payload: PreviewPagePayload = {
-                previewSessionId,
-                url: snapshot.url,
-                pageTitle: snapshot.pageTitle,
-                domVersion: snapshot.domVersion,
-                pageSignature: snapshot.pageSignature,
-                domNodes: snapshot.domNodes,
-                timestamp: new Date().toISOString(),
-              };
+              // V20: Second-level dedup — another emit site may have pushed this
+              // exact signature already (e.g. DOM tick + apply racing on the same
+              // mutation). Bump video stream domVersion either way.
+              const lastEmitted = sessionService.getLastEmittedSignature(previewSessionId, ensuredUserId);
+              if (lastEmitted && snapshot.pageSignature === lastEmitted) {
+                getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+              } else {
+                const room = createRoomName('preview', previewSessionId);
+                const payload: PreviewPagePayload = {
+                  previewSessionId,
+                  url: snapshot.url,
+                  pageTitle: snapshot.pageTitle,
+                  domVersion: snapshot.domVersion,
+                  pageSignature: snapshot.pageSignature,
+                  domNodes: snapshot.domNodes,
+                  timestamp: new Date().toISOString(),
+                };
 
-              // Emit to the caller immediately (even if not subscribed)
-              socket.emit('preview:page', payload);
-              // Emit to other subscribers
-              socket.to(room).emit('preview:page', payload);
+                // Emit to the caller immediately (even if not subscribed)
+                socket.emit('preview:page', payload);
+                // Emit to other subscribers
+                socket.to(room).emit('preview:page', payload);
 
-              // Update video stream with new DOM version
-              getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+                // V20: Record signature so subsequent emit sites can dedup
+                sessionService.markEmittedSignature(previewSessionId, ensuredUserId, snapshot.pageSignature);
 
-              logger.debug('[WebSocket] Emitted preview:page after apply', {
-                socketId: socket.id,
-                previewSessionId,
-                domVersion: snapshot.domVersion,
-                changed: snapshot.changed,
-              });
+                // Update video stream with new DOM version
+                getPreviewVideoStreamRegistry().setDomVersion(previewSessionId, snapshot.domVersion);
+
+                logger.debug('[WebSocket] Emitted preview:page after apply', {
+                  socketId: socket.id,
+                  previewSessionId,
+                  domVersion: snapshot.domVersion,
+                  changed: snapshot.changed,
+                });
+              }
             }
           } catch (snapshotError) {
             logger.warn('[WebSocket] Failed to emit preview:page after apply', {
@@ -1338,6 +1442,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   // Handle mouse move (hover) — fire-and-forget, no error/success emitted to client.
   // Hover is a passive, high-frequency event; emitting errors would spam the UI with
   // "Preview action failed (move)" toasts that are meaningless to the user.
+  //
+  // V20: Coalescing — multiple move events arriving within one event-loop tick collapse
+  // into a single Playwright `mouse.move` call with the latest coordinates. The hover
+  // probe and recording lastHover cache are updated SYNCHRONOUSLY on every WS event so
+  // they always see the freshest position regardless of how the Playwright call is batched.
   socket.on('preview:mouse:move', async (data) => {
     try {
       const ensuredUserId = requireUser();
@@ -1354,15 +1463,38 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
-      const result = await sessionService.executeMouseAction({
-        sessionId: previewSessionId,
-        userId: ensuredUserId,
-        action: 'move',
-        x,
-        y,
-      });
+      // V20: Coalesce — record latest coords and schedule one Playwright call per tick.
+      // We do NOT block on the Playwright call; downstream side effects (hover probe,
+      // recordingLastHover) work off these in-memory coords, not page state, so they are
+      // updated below regardless of when the actual page.mouse.move() resolves.
+      const moveKey = `${socket.id}:${previewSessionId}`;
+      let mState = moveCoalesceState.get(moveKey);
+      if (!mState) {
+        mState = { latestX: x, latestY: y, flushScheduled: false };
+        moveCoalesceState.set(moveKey, mState);
+      } else {
+        mState.latestX = x;
+        mState.latestY = y;
+      }
+      if (!mState.flushScheduled) {
+        mState.flushScheduled = true;
+        const flushRef = mState;
+        setImmediate(() => {
+          flushRef.flushScheduled = false;
+          // Fire-and-forget — executeMouseAction is itself fire-and-forget for 'move' (V20)
+          sessionService.executeMouseAction({
+            sessionId: previewSessionId,
+            userId: ensuredUserId,
+            action: 'move',
+            x: flushRef.latestX,
+            y: flushRef.latestY,
+          }).catch(() => { /* fire-and-forget — already logged inside */ });
+        });
+      }
 
-      if (result.success) {
+      // Side effects below run on EVERY WS event with the just-received coords —
+      // they don't wait for the coalesced Playwright call to land.
+      {
         // V11: Track last hover position for recording (used to emit hover step before click)
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
           sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, {
@@ -1597,68 +1729,103 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               }
               sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
 
-              // V15: LLM fallback — if probe couldn't find interactive element (directHit/cssClass),
-              // ask LLM to pick the correct ancestor from the chain.
-              // This runs async but BEFORE we build the step, so the step gets correct element data.
-              if (preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass') {
-                try {
-                  const llmPage = sessionService.getPage(previewSessionId, ensuredUserId);
-                  if (llmPage) {
-                    preClickElement = await RecordingCaptureService.resolveInteractiveTarget(
-                      llmPage, preClickElement!, x, y,
-                    );
-                  }
-                } catch {
-                  // Non-critical — use original probe result
-                }
-              }
+              // V19: Non-blocking click step emission.
+              // Old flow: await LLM (up to 2s) → emit step → user sees step ~2s after click.
+              // New flow: build step from pre-click probe → emit immediately → run LLM in background
+              //          → if LLM refines the element, emit preview:recording:step:update with same id.
+              // Data preservation:
+              //   - step.id is generated ONCE and reused for the update (frontend merges by id)
+              //   - All initial fields (modifiers, iframe, evidence.pageUrl, tabIndex) are kept
+              //   - Update only overrides type/description/bindingHints/iframe/highlight/evidence.lastSuccessRef
+              //   - If LLM fails or returns same element, no update is sent (initial step stays correct)
 
               // V10: Pass button and clickCount to inferClickActionType for dblclick/right-click support
               const safeButton = (data.button === 'right' || data.button === 'middle') ? data.button : 'left';
               const safeClickCount = (data.clickCount === 2) ? 2 : 1;
-              const actionType = RecordingCaptureService.inferClickActionType(preClickElement!, safeClickCount, safeButton);
-              const description = RecordingCaptureService.buildDescription(actionType, preClickElement!);
-              const bindingHints = RecordingCaptureService.buildBindingHints(preClickElement!);
+              const needsLLM = preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass';
 
+              // Helper: build a click step from a ProbedElement (kept local so initial + update are identical)
+              const stepIdForClick = `rec_${Date.now().toString(36)}`;
               const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
-
-              // V13: Capture modifier keys for multi-select (Shift+Click, Ctrl+Click, etc.)
+              const initialPageUrl = currentPage?.url();
               const hasModifiers = modifiers && (modifiers.shift || modifiers.ctrl || modifiers.meta || modifiers.alt);
-              // V13: Capture iframe context for replay (auto-detected from probing)
-              const iframeSel = preClickElement!.iframeSelector;
 
-              const step: PreviewIntentStep = {
-                id: `rec_${Date.now().toString(36)}`,
-                type: actionType,
-                description,
-                bindingHints: Object.keys(bindingHints).length > 0 ? bindingHints : undefined,
-                options: {
-                  ...(hasModifiers && {
-                    modifiers: {
-                      ...(modifiers.shift && { shift: true }),
-                      ...(modifiers.ctrl && { ctrl: true }),
-                      ...(modifiers.meta && { meta: true }),
-                      ...(modifiers.alt && { alt: true }),
-                    },
-                  }),
-                  ...(iframeSel && { iframe: { selector: iframeSel } }),
-                },
-                evidence: {
-                  ...(preClickElement!.ref && { lastSuccessRef: preClickElement!.ref }),
-                  confidence: 1.0,
-                  pageUrl: currentPage?.url(),
-                },
+              const buildClickStep = (el: NonNullable<typeof preClickElement>): PreviewIntentStep => {
+                const aType = RecordingCaptureService.inferClickActionType(el, safeClickCount, safeButton);
+                const desc = RecordingCaptureService.buildDescription(aType, el);
+                const bHints = RecordingCaptureService.buildBindingHints(el);
+                const iSel = el.iframeSelector;
+                const built: PreviewIntentStep = {
+                  id: stepIdForClick,
+                  type: aType,
+                  description: desc,
+                  bindingHints: Object.keys(bHints).length > 0 ? bHints : undefined,
+                  options: {
+                    ...(hasModifiers && {
+                      modifiers: {
+                        ...(modifiers.shift && { shift: true }),
+                        ...(modifiers.ctrl && { ctrl: true }),
+                        ...(modifiers.meta && { meta: true }),
+                        ...(modifiers.alt && { alt: true }),
+                      },
+                    }),
+                    ...(iSel && { iframe: { selector: iSel } }),
+                  },
+                  evidence: {
+                    ...(el.ref && { lastSuccessRef: el.ref }),
+                    confidence: 1.0,
+                    pageUrl: initialPageUrl,
+                  },
+                };
+                if (built.options && Object.keys(built.options).length === 0) {
+                  delete built.options;
+                }
+                return built;
               };
-              // Clean up empty options
-              if (step.options && Object.keys(step.options).length === 0) {
-                delete step.options;
-              }
+
+              // Build & emit the initial step IMMEDIATELY using pre-click probe data
+              const step = buildClickStep(preClickElement!);
 
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
               emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
-              if (cTrace) cTrace.writeStepCaptured(step, 'click');
+              if (cTrace) cTrace.writeStepCaptured(step, needsLLM ? 'click_pending_llm' : 'click');
+
+              // V19: Background LLM refinement — does NOT block step appearing in the panel.
+              // We snapshot the original element for diffing so we only emit an update when LLM
+              // actually picked a different ancestor.
+              if (needsLLM) {
+                const originalEl = preClickElement!;
+                const originalKey = `${originalEl.tag}|${originalEl.boundingBox?.x ?? -1}|${originalEl.boundingBox?.y ?? -1}|${originalEl.boundingBox?.width ?? -1}|${originalEl.boundingBox?.height ?? -1}|${originalEl.ref ?? ''}`;
+                // Fire-and-forget: refines step in background. Errors are non-fatal.
+                (async () => {
+                  try {
+                    const llmPage = sessionService.getPage(previewSessionId, ensuredUserId);
+                    if (!llmPage) return;
+                    const refined = await RecordingCaptureService.resolveInteractiveTarget(
+                      llmPage, originalEl, x, y,
+                    );
+                    if (!refined) return;
+                    const refinedKey = `${refined.tag}|${refined.boundingBox?.x ?? -1}|${refined.boundingBox?.y ?? -1}|${refined.boundingBox?.width ?? -1}|${refined.boundingBox?.height ?? -1}|${refined.ref ?? ''}`;
+                    if (refinedKey === originalKey) return; // LLM confirmed original — nothing to update
+                    // Mutate the closure ref so the navigation block below sees the refined element
+                    preClickElement = refined;
+                    const updatedStep = buildClickStep(refined);
+                    socket.nsp.to(room).emit('preview:recording:step:update', {
+                      previewSessionId,
+                      step: updatedStep,
+                      highlight: refined.boundingBox,
+                      timestamp: new Date().toISOString(),
+                    } as any);
+                    if (cTrace) cTrace.writeStepUpdated(updatedStep, 'click_llm_refine');
+                  } catch (e) {
+                    logger.debug('[RECORDING] Background LLM refinement failed', {
+                      error: e instanceof Error ? e.message : String(e),
+                    });
+                  }
+                })();
+              }
 
               // V13: Smart navigation detection — condition-based polling instead of fixed 500ms
               // Wait for domcontentloaded first, then poll URL for up to 2s (SPA redirects can be delayed)
@@ -1875,6 +2042,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
   // Handle mouse wheel (scroll) — fire-and-forget for validation errors.
   // Scroll is high-frequency; emitting errors would spam the UI with toasts.
+  //
+  // V20: Coalescing — multiple wheel events arriving within one event-loop tick are
+  // accumulated (deltas summed) into a single Playwright `mouse.wheel` call. Snapshot
+  // emit and recording scroll debounce both run synchronously per WS event so neither
+  // waits for the coalesced Playwright call.
   socket.on('preview:mouse:wheel', async (data) => {
     try {
       const ensuredUserId = requireUser();
@@ -1891,14 +2063,48 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
-      const result = await sessionService.executeMouseWheel({
-        sessionId: previewSessionId,
-        userId: ensuredUserId,
-        deltaX,
-        deltaY,
-      });
+      // V20: Coalesce — accumulate deltas until next event-loop tick, then send one wheel call.
+      const wheelKey = `${socket.id}:${previewSessionId}`;
+      let wState = wheelCoalesceState.get(wheelKey);
+      if (!wState) {
+        wState = {
+          accDeltaX: deltaX,
+          accDeltaY: deltaY,
+          lastX: typeof data.x === 'number' ? data.x : undefined,
+          lastY: typeof data.y === 'number' ? data.y : undefined,
+          flushScheduled: false,
+        };
+        wheelCoalesceState.set(wheelKey, wState);
+      } else {
+        wState.accDeltaX += deltaX;
+        wState.accDeltaY += deltaY;
+        if (typeof data.x === 'number') wState.lastX = data.x;
+        if (typeof data.y === 'number') wState.lastY = data.y;
+      }
+      if (!wState.flushScheduled) {
+        wState.flushScheduled = true;
+        const flushRef = wState;
+        setImmediate(() => {
+          const dx = flushRef.accDeltaX;
+          const dy = flushRef.accDeltaY;
+          flushRef.accDeltaX = 0;
+          flushRef.accDeltaY = 0;
+          flushRef.flushScheduled = false;
+          if (dx === 0 && dy === 0) return;
+          // Fire-and-forget — executeMouseWheel is itself fire-and-forget (V20)
+          sessionService.executeMouseWheel({
+            sessionId: previewSessionId,
+            userId: ensuredUserId,
+            deltaX: dx,
+            deltaY: dy,
+          }).catch(() => { /* non-critical — already logged inside */ });
+        });
+      }
 
-      if (result.success) {
+      // V20: Side effects below run on EVERY WS event regardless of when the coalesced
+      // wheel call lands in Playwright. Errors from the actual page.mouse.wheel() call
+      // are logged at debug level inside executeMouseWheel and don't affect this path.
+      {
         // Scroll may reveal lazy-loaded content – always emit for visual feedback
         setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
 
@@ -2013,10 +2219,6 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             }, RECORDING_SCROLL_DEBOUNCE_MS),
           });
         }
-      } else {
-        // Silent — no error emit for scroll; trace only
-        const wheelErrTrace = EditorTraceService.get(previewSessionId);
-        if (wheelErrTrace) wheelErrTrace.writeError('wheel_failed', { deltaX, deltaY, error: result.error });
       }
     } catch (error) {
       logger.error('[WebSocket] Error in preview:mouse:wheel', {
@@ -2542,7 +2744,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       // Force snapshot re-collect with the new viewport already reflowed.
       // This ensures domNodes/boundingBox are correct BEFORE the client rescales.
-      await emitSnapshotAlways(socket, normalizedPreviewSessionId, ensuredUserId);
+      // V20: bypass signature dedup — the frontend treats this as a handshake and
+      // must receive the snapshot even when DOM bytes are unchanged, because it
+      // needs the fresh coordinates for its rescale pipeline.
+      await emitSnapshotForHandshake(socket, normalizedPreviewSessionId, ensuredUserId);
 
       // Emit viewport metadata so client updates coordinate mapping
       // with coordinates that match the freshly-collected snapshot.
@@ -2933,7 +3138,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       if (result) {
         emitPageActionResult(socket, previewSessionId, 'reset', true);
-        setImmediate(() => emitSnapshotAlways(socket, previewSessionId, ensuredUserId));
+        // V20: page reset is a handshake — the frontend must receive the fresh DOM
+        // even if by coincidence the new page's signature matches the previous. Also
+        // `resetSession` already cleared `lastEmittedSignature` internally, but we
+        // still use the bypass path so the intent is explicit.
+        setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
 
         // Restart video + devtools streams on the new page (old stream died with old page)
         setImmediate(async () => {
@@ -4067,6 +4276,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     // V18: Cleanup all hover probe entries for this socket (keyed as socketId:sessionId)
     for (const key of hoverProbeState.keys()) {
       if (key.startsWith(`${socket.id}:`)) hoverProbeState.delete(key);
+    }
+    // V20: Cleanup all move/wheel coalesce entries for this socket
+    for (const key of moveCoalesceState.keys()) {
+      if (key.startsWith(`${socket.id}:`)) moveCoalesceState.delete(key);
+    }
+    for (const key of wheelCoalesceState.keys()) {
+      if (key.startsWith(`${socket.id}:`)) wheelCoalesceState.delete(key);
     }
   });
 };

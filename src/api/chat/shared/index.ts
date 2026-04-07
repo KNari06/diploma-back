@@ -5,3 +5,4 @@ export * from './utils';
 export * from './intent-parsing';
 export * from './clarification';
 export * from './routing';
+export * from './quick-action.types';

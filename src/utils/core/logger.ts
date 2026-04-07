@@ -37,6 +37,80 @@ const colors = {
 // Tell winston that you want to link the colors
 winston.addColors(colors);
 
+// Hard cap for individual log fields to protect against accidental huge dumps
+// (e.g. upstream Cloudflare HTML pages stuffed into error.message). Anything
+// larger gets truncated with a marker. Applies to BOTH console transport
+// (via safeStringifyMeta) AND file transports (via truncateLargeFields format).
+const LOG_FIELD_MAX_LENGTH = 4 * 1024;       // per-string field cap
+const LOG_META_MAX_BYTES = 8 * 1024;          // per-line cap for console pretty-print
+
+function safeStringifyMeta(meta: Record<string, unknown>): string {
+  let json: string;
+  try {
+    json = JSON.stringify(meta, null, 2);
+  } catch {
+    // Circular reference or non-serializable value — fall back to a shallow string
+    try {
+      json = String(meta);
+    } catch {
+      return '[unserializable meta]';
+    }
+  }
+  if (json.length > LOG_META_MAX_BYTES) {
+    return json.slice(0, LOG_META_MAX_BYTES) + `\n…[truncated ${json.length - LOG_META_MAX_BYTES} bytes]`;
+  }
+  return json;
+}
+
+/**
+ * Recursively truncate any string field in a log info object that exceeds
+ * LOG_FIELD_MAX_LENGTH. Mutates a clone of the input — never the original.
+ *
+ * Why this exists separately from safeStringifyMeta: console transport uses
+ * `printf` and produces pretty-printed JSON, while file transports use
+ * `winston.format.json()` which serialises the info object directly and
+ * bypasses our printf. Without this pre-format, a 5 KB Cloudflare HTML page
+ * would still land in error.log even though console is capped.
+ */
+const RESERVED_LOG_KEYS = new Set(['level', 'message', 'timestamp', 'stack', 'label', 'service']);
+
+const truncateLargeFields = winston.format((info) => {
+  const visit = (value: unknown, depth: number): unknown => {
+    if (depth > 6) return '[depth-limit]';
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') {
+      if (value.length > LOG_FIELD_MAX_LENGTH) {
+        return value.slice(0, LOG_FIELD_MAX_LENGTH) + `…[truncated ${value.length - LOG_FIELD_MAX_LENGTH}b]`;
+      }
+      return value;
+    }
+    if (typeof value !== 'object') return value;
+    if (Array.isArray(value)) {
+      return value.slice(0, 50).map((v) => visit(v, depth + 1));
+    }
+    // Object — copy first 50 keys, recursively visiting each value.
+    const out: Record<string, unknown> = {};
+    let count = 0;
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      if (count++ >= 50) break;
+      out[key] = visit((value as Record<string, unknown>)[key], depth + 1);
+    }
+    return out;
+  };
+
+  // Walk top-level fields except reserved winston meta. Mutate info in place
+  // (winston format functions are expected to do that).
+  for (const key of Object.keys(info)) {
+    if (RESERVED_LOG_KEYS.has(key)) continue;
+    (info as Record<string, unknown>)[key] = visit((info as Record<string, unknown>)[key], 0);
+  }
+  // Also guard the top-level message in case someone logs a giant string directly
+  if (typeof info.message === 'string' && info.message.length > LOG_FIELD_MAX_LENGTH) {
+    info.message = info.message.slice(0, LOG_FIELD_MAX_LENGTH) + `…[truncated ${info.message.length - LOG_FIELD_MAX_LENGTH}b]`;
+  }
+  return info;
+});
+
 // Define which transports the logger must use
 const transports: winston.transport[] = [
   // Console transport
@@ -44,6 +118,7 @@ const transports: winston.transport[] = [
     format: winston.format.combine(
       winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss:ms' }),
       winston.format.errors({ stack: true }), // ← FIX: Extract error.stack
+      truncateLargeFields(), // V21: cap individual fields before colorize/printf
       winston.format.colorize({ all: true }),
       winston.format.printf((info) => {
         // Include all metadata fields (error details, context, etc.)
@@ -55,9 +130,9 @@ const transports: winston.transport[] = [
           logMessage += `\n${stack}`;
         }
 
-        // If there's additional metadata, stringify it
+        // If there's additional metadata, stringify it (with size cap)
         if (Object.keys(meta).length > 0) {
-          logMessage += `\n${JSON.stringify(meta, null, 2)}`;
+          logMessage += `\n${safeStringifyMeta(meta as Record<string, unknown>)}`;
         }
 
         return logMessage;
@@ -78,6 +153,7 @@ try {
     format: winston.format.combine(
       winston.format.timestamp(),
       winston.format.errors({ stack: true }),
+      truncateLargeFields(), // V21: cap fields before json() so HTML payloads don't bloat error.log
       winston.format.json()
     ),
   });
@@ -105,6 +181,7 @@ if (env.NODE_ENV === 'production') {
         maxFiles: 5,
         format: winston.format.combine(
           winston.format.timestamp(),
+          truncateLargeFields(), // V21: same field cap as error.log
           winston.format.json()
         ),
       }),
@@ -115,6 +192,7 @@ if (env.NODE_ENV === 'production') {
         maxFiles: 10, // Keep last 10 files
         format: winston.format.combine(
           winston.format.timestamp(),
+          truncateLargeFields(), // V21: same field cap as error.log
           winston.format.json()
         ),
       }),
@@ -261,6 +339,94 @@ process.on('uncaughtException', (error) => {
     _safeLog('warn', 'Uncaught exception in development, continuing...');
   }
 });
+
+/**
+ * Compact, log-safe representation of an arbitrary error value.
+ *
+ * Why this exists: third-party clients (Supabase, fetch, etc.) sometimes throw
+ * "errors" whose `.message` is the entire HTML body of an upstream gateway
+ * page (Cloudflare 520, nginx 502, etc.). Logging the raw object via
+ * `logger.error('...', { error })` then dumps multi-KB of HTML into stdout and
+ * the error.log file, which is useless and noisy.
+ *
+ * This helper:
+ *  - Detects HTML payloads and replaces them with `{host, statusCode}` summary
+ *  - Truncates message to 500 chars
+ *  - Preserves common useful fields (name, code, status, statusCode, hint, details)
+ *  - Never throws — falls back to a string snapshot for exotic shapes
+ */
+const ERROR_MESSAGE_MAX = 500;
+const ERROR_HTML_SNIFF = /^\s*<(?:!doctype|html|head|body)/i;
+const ERROR_CF_STATUS = /Error code (\d{3})/i;
+const ERROR_CF_HOST = /<title>([^|<]+)\s*\|/i;
+
+export function formatError(err: unknown): Record<string, unknown> {
+  if (err === null || err === undefined) {
+    return { message: String(err) };
+  }
+
+  if (typeof err === 'string') {
+    return { message: err.length > ERROR_MESSAGE_MAX ? err.slice(0, ERROR_MESSAGE_MAX) + '…' : err };
+  }
+
+  if (typeof err !== 'object') {
+    return { message: String(err) };
+  }
+
+  const e = err as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  // Extract message (the field that usually contains HTML in upstream errors)
+  let rawMessage: string | undefined;
+  if (typeof e.message === 'string') rawMessage = e.message;
+  else if (e instanceof Error) rawMessage = e.message;
+
+  if (rawMessage) {
+    if (ERROR_HTML_SNIFF.test(rawMessage)) {
+      // HTML payload — extract gateway summary instead of dumping the page
+      const statusMatch = rawMessage.match(ERROR_CF_STATUS);
+      const hostMatch = rawMessage.match(ERROR_CF_HOST);
+      out.message = '[upstream gateway HTML response]';
+      if (statusMatch) out.upstreamStatus = Number(statusMatch[1]);
+      if (hostMatch) out.upstreamHost = hostMatch[1].trim();
+    } else if (rawMessage.length > ERROR_MESSAGE_MAX) {
+      out.message = rawMessage.slice(0, ERROR_MESSAGE_MAX) + '…';
+    } else {
+      out.message = rawMessage;
+    }
+  }
+
+  // Preserve common useful fields
+  for (const key of ['name', 'code', 'status', 'statusCode', 'hint', 'details'] as const) {
+    if (e[key] !== undefined && e[key] !== null) {
+      const val = e[key];
+      // Recursively guard nested string fields
+      if (typeof val === 'string' && val.length > ERROR_MESSAGE_MAX) {
+        out[key] = val.slice(0, ERROR_MESSAGE_MAX) + '…';
+      } else if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+        out[key] = val;
+      }
+    }
+  }
+
+  // Stack only for real Error instances, capped to first 10 lines
+  if (e instanceof Error && e.stack) {
+    const lines = e.stack.split('\n').slice(0, 10);
+    out.stack = lines.join('\n');
+  }
+
+  // If we extracted nothing usable, fall back to a short JSON snapshot
+  if (Object.keys(out).length === 0) {
+    try {
+      const json = JSON.stringify(e);
+      out.message = json.length > ERROR_MESSAGE_MAX ? json.slice(0, ERROR_MESSAGE_MAX) + '…' : json;
+    } catch {
+      out.message = String(e);
+    }
+  }
+
+  return out;
+}
 
 // Helper functions for structured logging
 export const logRequest = (req: any, res: any, next: any) => {

@@ -594,6 +594,7 @@ export async function deleteLiteTraceLogFromStorage(storagePath: string): Promis
 export async function insertTraceFileRecord(params: {
   userId: string;
   testId: string | null;
+  intentTestCaseId?: string | null;
   fileName: string;
   storagePath: string;
   fileSize: number;
@@ -601,34 +602,80 @@ export async function insertTraceFileRecord(params: {
   status?: string;
 }): Promise<{ id: string }> {
   try {
-    const { userId, testId, fileName, storagePath, fileSize, browser, status = 'uploaded' } = params;
+    const {
+      userId,
+      testId,
+      intentTestCaseId = null,
+      fileName,
+      storagePath,
+      fileSize,
+      browser,
+      status = 'uploaded',
+    } = params;
 
     logger.info('[STORAGE] Inserting trace file record', {
       testId,
+      intentTestCaseId,
       fileName,
       browser,
       fileSize,
     });
 
-    const { data, error } = await supabaseAdmin
+    const basePayload: Record<string, unknown> = {
+      user_id: userId,
+      test_id: testId,
+      file_name: fileName,
+      storage_path: storagePath,
+      file_size: fileSize,
+      browser,
+      status,
+      public_url: null, // Private bucket, use signed URLs
+    };
+
+    const payloadWithIntent: Record<string, unknown> = {
+      ...basePayload,
+      intent_test_case_id: intentTestCaseId,
+    };
+
+    // First attempt includes the new intent_test_case_id column. If the
+    // database hasn't had the `trace-files-intent-test-case.sql` migration
+    // applied yet, Postgres replies with code 42703 ("column does not
+    // exist") — in that case we fall back to the legacy payload so traces
+    // still get recorded while the schema catches up. Any non-null
+    // intentTestCaseId is dropped in that fallback and logged as a warning.
+    let { data, error } = await supabaseAdmin
       .from('trace_files')
-      .insert({
-        user_id: userId,
-        test_id: testId,
-        file_name: fileName,
-        storage_path: storagePath,
-        file_size: fileSize,
-        browser,
-        status,
-        public_url: null, // Private bucket, use signed URLs
-      })
+      .insert(payloadWithIntent)
       .select('id')
       .single();
+
+    const missingColumn =
+      error &&
+      (error.code === '42703' ||
+        /column\s+"?intent_test_case_id"?\s+.*does not exist/i.test(error.message || ''));
+
+    if (missingColumn) {
+      logger.warn(
+        '[STORAGE] trace_files.intent_test_case_id column missing — retrying without it. Apply supabase-migrations/features/trace-files-intent-test-case.sql.',
+        {
+          intentTestCaseId,
+          fileName,
+        },
+      );
+      const retry = await supabaseAdmin
+        .from('trace_files')
+        .insert(basePayload)
+        .select('id')
+        .single();
+      data = retry.data;
+      error = retry.error;
+    }
 
     if (error || !data) {
       logger.error('[STORAGE] Failed to insert trace file record', {
         error,
         testId,
+        intentTestCaseId,
         fileName,
       });
       throw new Error(`Failed to insert trace file record: ${error?.message || 'Unknown error'}`);
@@ -637,6 +684,7 @@ export async function insertTraceFileRecord(params: {
     logger.info('[STORAGE] Trace file record inserted successfully', {
       id: data.id,
       testId,
+      intentTestCaseId,
       fileName,
     });
 
@@ -645,6 +693,7 @@ export async function insertTraceFileRecord(params: {
     logger.error('[STORAGE] Insert trace file record error', {
       error: error instanceof Error ? error.message : String(error),
       testId: params.testId,
+      intentTestCaseId: params.intentTestCaseId ?? null,
       fileName: params.fileName,
     });
     throw error;

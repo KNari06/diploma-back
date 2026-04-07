@@ -61,7 +61,19 @@ DATA QUALITY:
 - If testType is provided (ui/api/mixed), use it — never guess or invent test method/type
 - Sensitive values (shown as "••••••••") are masked intentionally — never try to reveal or guess them
 - When showing test steps, describe WHAT the step does ("enters credentials", "clicks submit") not the raw values
-- If execution results are missing, say "No execution results yet — the test hasn't been run" instead of showing placeholder statuses`;
+- If execution results are missing, say "No execution results yet — the test hasn't been run" instead of showing placeholder statuses
+
+PREVIEW RUN RESULTS (CRITICAL — qa_run_draft_steps / qa_run_test with run_type="preview"):
+- These tools BLOCK until the run finishes. When you see their result, the run is COMPLETED.
+- The data field contains: { success, totalSteps, passedSteps, failedSteps, skippedSteps, cancelled, timedOut, duration (ms), firstError?, failedStepDetails? }
+- Your response MUST:
+  1. State the outcome in past tense: "The run finished — 5/5 steps passed in 13.6s." (NOT "I started", "watching", "wait for it")
+  2. If failedSteps > 0: surface the firstError concisely and reference the failed step.
+  3. If multiple test cases were proposed but only one was executed: explicitly mention the remaining
+     cases by name and ask if the user wants to run them next.
+  4. If success = true and there's only one case: offer next actions (Save as test case, run again, edit).
+- NEVER say "I'll start the run" or "watching the browser" — the run is already done by the time you respond.
+- NEVER repeat the literal "Started ephemeral run..." message — it's outdated.`;
 }
 
 export function buildSimpleChatPrompt(skillDescriptions: string): string {

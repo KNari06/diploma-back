@@ -52,6 +52,12 @@ import { PromptSanitizer } from './security/prompt-sanitizer';
 import { LiteTraceWriter } from './trace/lite-trace-writer';
 import { WorkspaceMemoryService } from '@/services/ai/memory/workspace-memory.service';
 import { WorkspaceService } from '@/services/core/workspace.service';
+// TODO(refactor): page-interactive.utils.ts should move to a shared location
+// (e.g. @/agent/core/lite/collectors/page-interactive) so Lite doesn't depend
+// on preview internals. For now, reuse the preview helper as-is since it's
+// framework-agnostic and only depends on VisualStability/SnapshotCollector
+// which already live in lite's collectors.
+import { waitForPageInteractive } from '@/services/testing/ui/preview/page-interactive.utils';
 
 export class LiteEngine {
   private page: Page;
@@ -1251,6 +1257,10 @@ export class LiteEngine {
         waitUntil: 'domcontentloaded',
         timeout: 15000,
       });
+      // loadTimeMs reflects raw goto → DOMContentLoaded duration only. Do NOT
+      // include the waitForPageInteractive budget below in this measurement,
+      // otherwise adaptive profile would misclassify every SSO/OAuth site as
+      // "slow" and bloat all downstream timeouts.
       const loadTimeMs = Date.now() - loadStartTime;
       this.adaptiveTimeouts = computeAdaptiveTimeouts(loadTimeMs);
 
@@ -1278,6 +1288,83 @@ export class LiteEngine {
       logger.warn('[LITE_ENGINE] Failed to measure initial load, using normal profile', {
         testId: this.config.testId,
         error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Wait until the page is **actually interactive for a bot** before the AI
+    // loop starts collecting snapshots. Naively proceeding after
+    // `goto(domcontentloaded)` is fooled by SSO/OAuth redirect chains (e.g.
+    // dlkz.doculite.kz → accounttest.doculite.kz/oauth/authorize → …):
+    // DOMContentLoaded fires on the landing page, but the real login form
+    // doesn't exist yet, so the first snapshot collected by the AI loop is
+    // empty and the agent flounders.
+    //
+    // waitForPageInteractive is a composite gate that only returns ready once:
+    //   1. URL has stopped changing (normalized origin+pathname compare, so
+    //      SPAs pushing ?t=<timestamp> for analytics are NOT mistaken for
+    //      redirects)
+    //   2. API idle + DOM stable + loading indicators cleared
+    //      ([role="progressbar"], skeletons, spinners, NProgress, aria-busy)
+    //   3. A cheap document.querySelectorAll shows ≥1 interactive element
+    //      for 2 consecutive polls
+    //   4. A full SnapshotCollector.collect confirms ≥1 interactive element
+    //
+    // Lives OUTSIDE the goto try/catch above so that:
+    //   a) withCancellation's cancel error propagates out of the method
+    //      instead of being swallowed by the goto fallback catch
+    //   b) a failed readiness gate never resets adaptiveTimeouts to the
+    //      default "normal" profile that was already correctly computed
+    //
+    // Fail-open: on helper timeout returns `{ ready: false, reason }` and we
+    // proceed anyway, so the AI sees an empty/partial snapshot — identical
+    // to pre-fix behavior. Wrapped in withCancellation so a user cancel
+    // during a slow redirect chain doesn't waste up to 15s of the cancel
+    // budget. Defensive try/catch for non-cancel errors so a helper bug
+    // can never break the init sequence.
+    // ═══════════════════════════════════════════════════════════════════════════
+    try {
+      const readiness = await withCancellation(
+        this.config.testId,
+        waitForPageInteractive(this.page, {
+          previewSessionId: this.config.testId,
+        }),
+        'waitForPageInteractive.initial',
+      );
+      if (!readiness.ready) {
+        logger.warn('[LITE_ENGINE] Initial readiness gate timed out', {
+          testId: this.config.testId,
+          waited: readiness.waited,
+          elementCount: readiness.elementCount,
+          finalUrl: readiness.finalUrl,
+          reason: readiness.reason,
+        });
+      } else {
+        logger.info('[LITE_ENGINE] Initial readiness gate passed', {
+          testId: this.config.testId,
+          waited: readiness.waited,
+          elementCount: readiness.elementCount,
+          finalUrl: readiness.finalUrl,
+        });
+      }
+    } catch (readinessError) {
+      // Cancellation must unwind cleanly with the canonical "cancelled by
+      // user" terminal path — same pattern as strategy-init cancel handling
+      // above. Throwing would land in execute()'s HARDENING branch and
+      // emit "Engine error" instead of "Test cancelled by user".
+      if (readinessError instanceof Error && readinessError.message.includes('cancelled')) {
+        logger.info('[LITE_ENGINE] Test cancelled during initial readiness gate', {
+          testId: this.config.testId,
+        });
+        this.emitCompletion(false, 'Test cancelled by user');
+        return await this.buildResult(false, 'Test cancelled by user');
+      }
+      // Any other throw is non-fatal — waitForPageInteractive is fail-open
+      // internally, this is belt-and-braces. Proceed into the AI loop with
+      // whatever state the page is in.
+      logger.warn('[LITE_ENGINE] Initial readiness gate threw (non-fatal)', {
+        testId: this.config.testId,
+        error: readinessError instanceof Error ? readinessError.message : String(readinessError),
       });
     }
 

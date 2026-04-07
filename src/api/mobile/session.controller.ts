@@ -648,12 +648,15 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
 
     const stepType = stepDraft.type || stepDraft.kind || 'click';
-    const description = (stepDraft.elementDescription || stepDraft.description || '').trim();
+    const rawDescription = (stepDraft.elementDescription || stepDraft.description || '').trim();
 
-    if (!description) {
+    if (!rawDescription) {
       res.json({ success: true, status: 'not_found', message: 'No element description provided' });
       return;
     }
+
+    // Normalize: strip surrounding quotes ("'Search' navigation" → "Search navigation")
+    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
 
     // Map frontend step kind → mobile runner actionType for element resolution context.
     // The actionType tells the LLM what the user intends to do with the element,
@@ -785,30 +788,107 @@ export async function applySession(req: Request, res: Response): Promise<void> {
   try {
     const client = getMobileRunnerClient();
 
-    const stepType = stepDraft.type || stepDraft.kind || 'click';
+    const rawStepType = stepDraft.type || stepDraft.kind || 'click';
 
+    // Map frontend step types to runner-compatible types.
+    // Frontend uses "tap" but the runner schema expects "click".
+    const STEP_TYPE_MAP: Record<string, string> = { tap: 'click', fill: 'type' };
+    const stepType = STEP_TYPE_MAP[rawStepType] || rawStepType;
+
+    // Normalize description: strip surrounding quotes
+    const rawDescription = (stepDraft.elementDescription || stepDraft.description || '');
+    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+
+    // Trace logging for mobile editor
+    const traceSessionId = `mobile-${sessionId}`;
+    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
+    trace.writeMobileApplyRequest({
+      stepId: stepDraft.id || `apply_${Date.now()}`,
+      stepType: rawStepType,
+      description,
+      value: stepDraft.value,
+      sessionId,
+    });
+    const applyStart = Date.now();
+
+    // ── Resolve-then-execute: lint first, then execute by coordinates.
+    // This ensures "Run" uses the EXACT same element as "Find using desc."
+    // and avoids the slow runSteps → smartResolve → LLM pipeline.
+    const FAST_PATH_TYPES = new Set(['click', 'tap', 'double_tap', 'long_press', 'open', 'toggle', 'check', 'uncheck', 'select', 'hover', 'type', 'fill']);
+    if (description && FAST_PATH_TYPES.has(rawStepType)) {
+      const ACTION_TYPE_MAP: Record<string, string> = {
+        click: 'tap', tap: 'tap', double_tap: 'tap', long_press: 'tap',
+        open: 'tap', toggle: 'tap', check: 'tap', uncheck: 'tap',
+        select: 'tap', hover: 'tap', type: 'type_text', fill: 'type_text',
+      };
+      const lintActionType = ACTION_TYPE_MAP[rawStepType] || 'tap';
+      const lintResult = await client.lintElement(sessionId, description, lintActionType);
+
+      if (lintResult.status === 'resolved' && lintResult.boundingBox) {
+        const bb = lintResult.boundingBox;
+        const centerX = Math.round(bb.x + bb.width / 2);
+        const centerY = Math.round(bb.y + bb.height / 2);
+
+        // Build command sequence based on step type
+        const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
+
+        if (rawStepType === 'type' || rawStepType === 'fill') {
+          // Type steps: tap to focus → type text → optionally press Enter
+          commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
+          if (stepDraft.value) {
+            const pressEnter = !!(stepDraft.options?.pressEnter);
+            commands.push({
+              type: 'type_text',
+              params: {
+                text: stepDraft.value,
+                clearFirst: !!(stepDraft.options?.replaceContent),
+              },
+            });
+            if (pressEnter) {
+              commands.push({ type: 'press_key', params: { keycode: 'KEYCODE_ENTER' } });
+            }
+          }
+        } else {
+          // Tap-like steps: single command at coordinates
+          const RAW_CMD_MAP: Record<string, string> = {
+            click: 'tap', tap: 'tap', open: 'tap', toggle: 'tap',
+            check: 'tap', uncheck: 'tap', select: 'tap', hover: 'tap',
+            double_tap: 'double_tap', long_press: 'long_press',
+          };
+          commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { x: centerX, y: centerY } });
+        }
+
+        await client.executeBatchCommands(sessionId, commands);
+        const durationMs = Date.now() - applyStart;
+
+        trace.writeMobileApplyResult({
+          stepId: stepDraft.id || `apply_${Date.now()}`,
+          sessionId,
+          latencyMs: durationMs,
+          result: { success: true, resolvedVia: lintResult.resolvedVia || 'lint', durationMs },
+        });
+
+        res.json({
+          success: true,
+          stepResult: { success: true, resolvedVia: lintResult.resolvedVia || 'lint', durationMs },
+          status: 'passed',
+        });
+        return;
+      }
+      // Lint didn't resolve — fall through to runSteps
+    }
+
+    // Fallback: full runSteps pipeline (re-resolves from scratch)
     const intentStep = {
       id: stepDraft.id || `apply_${Date.now()}`,
       type: stepType,
-      description: stepDraft.elementDescription || stepDraft.description || '',
+      description,
       value: stepDraft.value,
       assertionText: stepDraft.assertionText,
       appPackage: stepDraft.appPackage,
       options: stepDraft.options,
       bindingHints: stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {},
     };
-
-    // Trace logging for mobile editor
-    const traceSessionId = `mobile-${sessionId}`;
-    const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
-    trace.writeMobileApplyRequest({
-      stepId: intentStep.id,
-      stepType: stepType,
-      description: intentStep.description,
-      value: intentStep.value,
-      sessionId,
-    });
-    const applyStart = Date.now();
 
     const result = await client.runSteps(sessionId, [intentStep], {
       screenshotEachStep: true,

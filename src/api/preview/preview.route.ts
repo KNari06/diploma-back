@@ -19,6 +19,7 @@ import {
   stopPreview,
   updateIntentTestCase,
 } from './preview.controller';
+import { saveDraftRunAsTestCase } from './draft.controller';
 
 const router = Router();
 
@@ -927,5 +928,68 @@ const uploadFile = multer({
  *         description: Unauthorized
  */
 router.post('/upload-file', requireAuth, uploadFile.single('file'), uploadTestFile);
+
+// ============================================================================
+// DRAFT RUN ROUTES (Quick Action framework)
+// ============================================================================
+//
+// These routes power the universal Quick Action framework for in-chat draft
+// runs. They are consumed by the frontend QuickActions component (see
+// apps/web/src/components/quickActions/) via descriptors emitted from the
+// backend quick-actions injector. Every endpoint added here MUST also be
+// registered in src/api/preview/quick-action-endpoints.ts (the security
+// whitelist) — actions whose endpoint string is missing from the whitelist
+// are silently rejected by the frontend dispatcher.
+
+/**
+ * @swagger
+ * /api/v1/preview/draft/save-as-test-case:
+ *   post:
+ *     summary: Persist a cached draft run as an intent_test_case
+ *     description: |
+ *       Reads steps from DraftStepsCache (keyed by chatSessionId), resolves
+ *       a name via the waterfall (override → AI suggested → first navigate
+ *       URL → default), and creates an intent_test_case in the database.
+ *
+ *       The cache is cleared after a successful save. Failures leave the
+ *       cache intact so the user can retry.
+ *
+ *       Triggered by the "Save as test case" Quick Action button below
+ *       successful draft runs in editor mode.
+ *     tags: [Preview - Draft]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [previewSessionId, chatSessionId]
+ *             properties:
+ *               previewSessionId:
+ *                 type: string
+ *                 description: Preview session ID owned by the caller
+ *               chatSessionId:
+ *                 type: string
+ *                 description: Chat session ID under which steps are cached
+ *               nameOverride:
+ *                 type: string
+ *                 description: Optional user-supplied name (highest priority)
+ *     responses:
+ *       200:
+ *         description: Test case created
+ *       400:
+ *         description: Missing fields or empty cached steps
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Preview session not owned, or cached steps belong to a different user
+ *       404:
+ *         description: Preview session or cached steps not found
+ *       500:
+ *         description: Internal error (cache is preserved so user can retry)
+ */
+router.post('/draft/save-as-test-case', requireAuth, saveDraftRunAsTestCase);
 
 export default router;

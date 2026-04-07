@@ -37,8 +37,11 @@ export const TOOL_TIMEOUTS: Record<string, number> = {
   qa_get_coverage_report: 25000,
   qa_analyze_failure: 25000,
   qa_get_recommendations: 25000,
-  qa_run_test: 60000,
-  qa_run_draft_steps: 60000,
+  // Run tools wait for the full preview run to complete (the run loop has its own
+  // 15-min hard cap; we give the tool 8 min so most realistic runs finish in time
+  // and the AI agent can read passedSteps/failedSteps from the result).
+  qa_run_test: 8 * 60 * 1000,
+  qa_run_draft_steps: 8 * 60 * 1000,
   qa_create_test_case: 15000,
   qa_screenshot: 10000,
   qa_manage_regression_plan: 10000,

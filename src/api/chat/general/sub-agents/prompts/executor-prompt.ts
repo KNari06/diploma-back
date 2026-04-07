@@ -120,14 +120,36 @@ You are operating inside the editor with a live browser preview. The user can se
 - Each step must have: id (UUID), type (navigate/click/type/select/hover/scroll/press/wait/ai_check/wait_for/upload/check/uncheck), description (SPECIFIC with real element labels from DOM), value (for type/press/select), assertionText (for ai_check).
 - WORKFLOW:
   1. User asks to create/test → generate IntentSteps from DOM → show in chat → ask "Shall I run these on the preview?"
-  2. User confirms ("да"/"запусти"/"run it"/"давай") → call qa_run_draft_steps(steps=[...], start_url="<page URL>", confirm=true). Steps execute on live browser.
+  2. User confirms ("да"/"запусти"/"run it"/"давай") → call qa_run_draft_steps(steps=[...], start_url="<page URL>", suggested_name="<3-5 word title>", confirm=true). Steps execute on live browser.
   3. User says "save" / "сохрани" → call qa_create_test_case to persist to DB.
   4. User refers to saved test → qa_run_test with run_type="preview" and target_id=<test case ID>.
   5. To update steps of a saved test case → qa_update_test_case_steps.
   EXCEPTION: If user says "create AND run" / "сделай и запусти" → generate + run immediately.
+
+- ALWAYS pass suggested_name to qa_run_draft_steps. Pick a short, descriptive 3-5 word
+  title from the user's intent and the page being tested. Examples:
+  • "log in" on /login → "Positive Login Flow"
+  • "checkout with promo" on /cart → "Checkout with Promo Code"
+  • "reset password" on /forgot → "Reset Password Email"
+  This name appears as the default test case title when the user clicks "Save as test case",
+  so make it accurate and human-readable. Never invent generic names like "Test 1".
 - Do NOT call qa_create_test_case unless user explicitly says "save" / "сохрани" / "persist".
 - NEVER invent elements not in the DOM context. If the page doesn't match, add a "navigate" step first.
-- platform_test is NOT available in editor mode.`;
+- platform_test is NOT available in editor mode.
+
+POST-RUN BEHAVIOR (CRITICAL — read carefully):
+- qa_run_draft_steps and qa_run_test (run_type="preview") now AWAIT the full preview run.
+  When the tool returns, the run is ALREADY FINISHED. The data field contains:
+  { success, totalSteps, passedSteps, failedSteps, skippedSteps, cancelled, timedOut, duration, firstError? }
+- After the tool returns, your response MUST:
+  1. Acknowledge that the run is done (NOT "I will start", "watching the browser", or "wait for results").
+  2. Report the actual outcome: passed/failed counts and the firstError message if any.
+  3. If you generated MULTIPLE test cases earlier but only ran ONE, explicitly remind the user
+     about the remaining cases by name and offer to run them next ("Should I run the next one?").
+  4. If all steps passed and the user only had one case → suggest "Save as test case" or next actions.
+- NEVER call the same run tool again right after a successful run unless the user asks.
+- NEVER pretend the run is still in progress — the WebSocket UI already showed the user live progress
+  and the completed state, so a vague "watching..." reply contradicts what they see.`;
   }
 
   if (plan) {
