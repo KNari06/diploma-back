@@ -1736,12 +1736,21 @@ export class PreviewSessionService {
       const trace = await import('./editor-trace.service').then(m => m.EditorTraceService.get(sessionId)).catch(() => null);
 
       if (domAnalysis.interactiveNodes.length === 0 && snapshot.elements.length === 0) {
-        // Navigation in progress = expected (debug level), genuine empty = warn
-        const logFn = isNavigationInProgress ? logger.debug : logger.warn;
+        // V21: Three benign states downgrade this from warn to debug:
+        //   1. Navigation in progress (document.body not ready yet)
+        //   2. Page already closed (race with session shutdown)
+        //   3. Genuinely empty page but mid-teardown
+        // Only a non-navigation, non-closed zero-element result is a real
+        // anomaly worth a warn-level log.
+        const pageIsClosed = (() => {
+          try { return session.page.isClosed(); } catch { return true; }
+        })();
+        const isBenign = isNavigationInProgress || pageIsClosed;
+        const logFn = isBenign ? logger.debug : logger.warn;
         logFn('[PREVIEW_SESSION] Snapshot returned 0 elements', {
           sessionId,
           url: currentUrl,
-          pageIsClosed: session.page.isClosed(),
+          pageIsClosed,
           snapshotElementCount: snapshot.elements?.length ?? -1,
           isNavigationInProgress,
         });

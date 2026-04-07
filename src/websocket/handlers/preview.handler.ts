@@ -479,6 +479,18 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
         return;
       }
       try {
+        // V21: Early exit if the session was torn down since this tick was
+        // scheduled. Without this, the interval races with stopSession() —
+        // the tick fires, calls getSnapshot() → page.evaluate() on an
+        // already-closed page, and Playwright throws
+        // "Target page, context or browser has been closed" which used to
+        // land in error.log on every session close. Check both the session
+        // record AND the page object to cover partial tear-down states.
+        const liveSession = sessionService.getSession(previewSessionId);
+        if (!liveSession || !liveSession.page || liveSession.page.isClosed()) {
+          return;
+        }
+
         // Skip snapshot collection during run mode — run loop manages its own state,
         // frontend only uses preview:run:step events, and video stream is independent.
         // Avoids page.evaluate() contention with step apply/readiness checks.
@@ -530,10 +542,28 @@ const startPreviewStreams = async (context: StreamContext, nsp: any): Promise<vo
           }
         }
       } catch (error) {
-        logger.error('[PREVIEW_STREAM] Failed to check DOM update', {
-          previewSessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        // V21: "Target closed" errors here are the same shutdown race as in
+        // snapshot-collector — the tick survived one cycle past stop(). Log
+        // at debug level so error.log stays clean during normal session
+        // teardown. Real errors (e.g. evaluate bugs) still surface.
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isShutdownRace =
+          errorMessage.includes('Target page, context or browser has been closed') ||
+          errorMessage.includes('Target closed') ||
+          errorMessage.includes('has been closed') ||
+          errorMessage.includes('Execution context was destroyed');
+
+        if (isShutdownRace) {
+          logger.debug('[PREVIEW_STREAM] DOM tick skipped (shutdown race)', {
+            previewSessionId,
+            reason: errorMessage,
+          });
+        } else {
+          logger.error('[PREVIEW_STREAM] Failed to check DOM update', {
+            previewSessionId,
+            error: errorMessage,
+          });
+        }
       } finally {
         releaseDomTickGuard(previewSessionId, activeDomUpdateTicks);
       }
