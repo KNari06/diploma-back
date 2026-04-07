@@ -14,6 +14,7 @@ import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
 import type { InteractiveNode, PreviewSession } from './preview.types';
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
+import { waitForPageInteractive } from './page-interactive.utils';
 
 const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
 const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
@@ -519,11 +520,35 @@ export class PreviewSessionService {
 
         emitProgress('loading_page', 60);
 
-        // Wait for DOM to stabilize (SPA hydration / API-driven renders).
-        // domcontentloaded fires when HTML is parsed, but SPAs render async.
-        // Instead of networkidle (waits for images/fonts/analytics — irrelevant for element finding),
-        // use a DOM stability check: no mutations for 800ms → DOM is ready for snapshot.
-        await waitForDOMStability(page, 3000, 800);
+        // Wait until the page is **actually interactive for a bot**, not just
+        // "DOM stopped mutating for 800ms". The old waitForDOMStability() was
+        // fooled by SSO/OAuth redirect chains (e.g. dlkz.doculite.kz →
+        // accounttest.doculite.kz/oauth/authorize → …): mutations quieted
+        // between redirects, so it returned ready while the login form wasn't
+        // even on screen yet, and the initial snapshot collected 0 elements.
+        //
+        // waitForPageInteractive only returns ready once:
+        //   1. URL has stopped changing (redirect chain finished)
+        //   2. API idle + DOM stable + loading indicators cleared
+        //   3. SnapshotCollector.collect() returns ≥1 interactive element
+        //      (same collector used on line 532 — if it sees elements here,
+        //      the initial snapshot below is guaranteed to be non-empty).
+        // Fails open on timeout, so we preserve the old "always proceed"
+        // behaviour — worst case the initial snapshot is still empty, same
+        // as today.
+        const initialReadiness = await waitForPageInteractive(page, {
+          previewSessionId: sessionId,
+        });
+
+        if (!initialReadiness.ready) {
+          logger.warn('[PREVIEW_SESSION] Initial readiness gate timed out', {
+            sessionId,
+            waited: initialReadiness.waited,
+            elementCount: initialReadiness.elementCount,
+            finalUrl: initialReadiness.finalUrl,
+            reason: initialReadiness.reason,
+          });
+        }
 
         // Stage 3: Extract elements
         emitProgress('extracting_elements', 75);
@@ -704,8 +729,25 @@ export class PreviewSessionService {
         timeout: 30000,
       });
 
-      // Wait for DOM to stabilize (SPA hydration) — no need for networkidle (images/fonts/analytics irrelevant)
-      await waitForDOMStability(newPage, 3000, 800);
+      // Wait until the page is actually interactive for a bot. Same reasoning
+      // as the initial session start path above — naive DOM stability is
+      // fooled by SSO/OAuth redirect chains. See waitForPageInteractive
+      // for the full gate (URL stable → API idle + loading indicators clear
+      // → snapshot returns ≥1 interactive element). Fails open on timeout
+      // to preserve the old "always proceed" behaviour.
+      const resetReadiness = await waitForPageInteractive(newPage, {
+        previewSessionId: sessionId,
+      });
+
+      if (!resetReadiness.ready) {
+        logger.warn('[PREVIEW_SESSION] Reset readiness gate timed out', {
+          sessionId,
+          waited: resetReadiness.waited,
+          elementCount: resetReadiness.elementCount,
+          finalUrl: resetReadiness.finalUrl,
+          reason: resetReadiness.reason,
+        });
+      }
 
       // Save old resources (close after swap)
       const oldContext = session.context;

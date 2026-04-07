@@ -69,13 +69,19 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
 
     const uploadResult = await uploadLiteTraceLogToStorage(filePath, userId, fileName);
 
-    // testId must be UUID or null — previewSessionId is not a UUID
-    const testId = intentTestCaseId && isValidUUID(intentTestCaseId) ? intentTestCaseId : null;
+    // trace_files.test_id has a FK on tests(id); intent_test_cases rows live
+    // in a different table, so we never put an intentTestCaseId there.
+    // Preview/editor traces are not produced by the legacy `tests` runner,
+    // so testId is always null for this code path. The intent test case link
+    // (if any) goes into the separate intent_test_case_id column instead.
+    const resolvedIntentTestCaseId =
+      intentTestCaseId && isValidUUID(intentTestCaseId) ? intentTestCaseId : null;
 
     try {
       await insertTraceFileRecord({
         userId,
-        testId,
+        testId: null,
+        intentTestCaseId: resolvedIntentTestCaseId,
         fileName,
         storagePath: uploadResult.storagePath,
         fileSize: uploadResult.fileSize,

@@ -24,6 +24,7 @@ import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
+import { waitForPageInteractive } from './page-interactive.utils';
 
 /** Base timeout for run setup (navigation, init). */
 const BASE_RUN_TIMEOUT_MS = 60 * 1000; // 1 minute for setup
@@ -659,14 +660,44 @@ export class PreviewRunService {
           }), signal);
         }
 
-        // Wait for DOM to stabilize after initial navigation (SPA hydration).
-        // networkidle waits for images/fonts/analytics — irrelevant for element resolution.
-        // DOM stability (no mutations for 800ms) is what we actually need.
-        await raceAbort(waitForDOMStability(session.page), signal);
+        // Wait until the page is **actually interactive for a bot**, not just
+        // "DOM stopped mutating for 500ms". The old waitForDOMStability() was
+        // fooled by SSO/OAuth redirect chains (e.g. dlkz.doculite.kz →
+        // accounttest.doculite.kz/oauth/authorize → …): mutations quiet down
+        // between redirects, so it returned ready while the login form wasn't
+        // even on screen yet. See preview-run `No interactive elements found
+        // on page` incident, 2026-04-07.
+        //
+        // waitForPageInteractive is a composite gate that only returns ready
+        // once:
+        //   1. URL has stopped changing (redirect chain finished)
+        //   2. API idle + DOM stable + loading indicators cleared
+        //   3. SnapshotCollector.collect() returns ≥1 interactive element
+        //      (same collector the step resolver uses — if it sees elements
+        //      here, step 1 is guaranteed to resolve a target).
+        // Fails open on timeout so we preserve the old "always try" behavior.
+        // Passes the cancel signal natively — no raceAbort wrapper needed,
+        // waitForPageInteractive checks signal.aborted each iteration and
+        // returns early with { ready: false, reason: 'aborted' }.
+        const initialReadiness = await waitForPageInteractive(session.page, {
+          previewSessionId,
+          signal,
+        });
+
+        // If the caller cancelled, propagate the same AbortError the old
+        // raceAbort path used — so the outer catch block can still detect
+        // cancellation uniformly.
+        if (initialReadiness.reason === 'aborted') {
+          throw new DOMException('Run cancelled', 'AbortError');
+        }
 
         logger.info('[PreviewRun] Navigation to startUrl complete', {
           previewSessionId,
           currentUrl: session.page.url(),
+          readinessReady: initialReadiness.ready,
+          readinessWaited: initialReadiness.waited,
+          readinessElementCount: initialReadiness.elementCount,
+          ...(initialReadiness.reason ? { readinessReason: initialReadiness.reason } : {}),
         });
       } catch (navError) {
         // AbortError from raceAbort — run was cancelled during initial navigation

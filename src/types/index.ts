@@ -725,7 +725,14 @@ export type TraceFileStatus = 'uploaded' | 'parsing' | 'parsed' | 'failed';
 export interface TraceFile {
   id: string;
   user_id: string;
+  /** FK → tests(id). Set only for traces produced by the legacy `tests` runner. */
   test_id?: string;
+  /**
+   * FK → intent_test_cases(id). Set only for traces produced by preview/editor
+   * runs of intent test cases. Added by the `trace-files-intent-test-case.sql`
+   * migration — may be undefined on rows inserted before the migration ran.
+   */
+  intent_test_case_id?: string;
   file_name: string;
   storage_path: string;
   file_size?: number;
