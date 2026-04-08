@@ -223,13 +223,133 @@ async function collectLightPageSummary(page: import('playwright').Page): Promise
 /**
  * Augment a step error message with navigation page context.
  * Gives the user actionable info: what page they're on and what content is visible.
+ *
+ * Optionally includes a `urlMismatch` hint when the run started on a page that
+ * doesn't match where the test was originally recorded (typically: user is
+ * already authenticated and the recorded login flow doesn't apply anymore).
+ * The hint is only added to the FIRST few step failures so it doesn't pollute
+ * later, unrelated errors.
  */
-function augmentErrorWithPageContext(error: string, pageSummary: PageSummary | null): string {
-  if (!pageSummary) return error;
-  const parts = [`Page: ${pageSummary.url}`];
-  if (pageSummary.title) parts.push(`Title: "${pageSummary.title}"`);
-  if (pageSummary.headings.length > 0) parts.push(`Headings: ${pageSummary.headings.join(', ')}`);
-  return `${error}\n\n[Page context after last navigation]\n${parts.join('\n')}`;
+function augmentErrorWithPageContext(
+  error: string,
+  pageSummary: PageSummary | null,
+  urlMismatch?: UrlMismatchInfo | null,
+): string {
+  const sections: string[] = [error];
+
+  if (pageSummary) {
+    const parts = [`Page: ${pageSummary.url}`];
+    if (pageSummary.title) parts.push(`Title: "${pageSummary.title}"`);
+    if (pageSummary.headings.length > 0) parts.push(`Headings: ${pageSummary.headings.join(', ')}`);
+    sections.push(`[Page context after last navigation]\n${parts.join('\n')}`);
+  }
+
+  if (urlMismatch) {
+    // Show normalized URLs (origin + pathname only) in the user-visible
+    // hint — raw URLs may contain session tokens, CSRF nonces, OAuth state
+    // params, etc. that we don't want to leak into error messages.
+    const recordedDisplay = normalizeUrlForComparison(urlMismatch.recordedUrl);
+    const actualDisplay = normalizeUrlForComparison(urlMismatch.actualUrl);
+    sections.push(
+      `[Possible cause — page diverged from recording]\n` +
+      `Test was recorded on: ${recordedDisplay}\n` +
+      `Run actually landed on: ${actualDisplay}\n` +
+      `${urlMismatch.sameOrigin
+        ? 'Same site, different path. The site may have redirected you (e.g. you are already authenticated and skipped past the login form).'
+        : 'Different origin. The site may be redirecting to an SSO/OAuth provider that the recording did not capture.'}\n` +
+      `If you intended to test from the recorded starting page, try logging out (or using an incognito session) and re-running.`
+    );
+  }
+
+  return sections.join('\n\n');
+}
+
+// ── Auth/URL mismatch detection ────────────────────────────────────────────
+
+/**
+ * Information about a divergence between where the test was recorded and where
+ * the actual run landed after initial navigation. Populated by
+ * `detectInitialUrlMismatch` after `waitForPageInteractive` settles.
+ */
+interface UrlMismatchInfo {
+  recordedUrl: string;
+  actualUrl: string;
+  /** True iff the two URLs share an origin but differ in pathname. */
+  sameOrigin: boolean;
+  /** Index of the recorded step the recordedUrl was sourced from. */
+  sourceStepIndex: number;
+}
+
+/**
+ * Number of consecutive failing steps for which we still show the URL-mismatch
+ * hint. After this many steps it's almost certainly not the auth-mismatch
+ * cause anymore — adding the hint to step 17's error would be misleading.
+ */
+const URL_MISMATCH_HINT_MAX_STEPS = 5;
+
+/**
+ * Find the URL of the first recorded step that captured one. Falls back across
+ * compiled.context.pageUrl → evidence.pageUrl → none. Returns null if no step
+ * in the supplied list ever had a captured URL — in that case we cannot
+ * detect mismatches and proceed without warning.
+ */
+function findFirstRecordedStepUrl(
+  steps: IntentStep[],
+): { url: string; stepIndex: number } | null {
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const compiled = step.compiled?.context?.pageUrl;
+    if (typeof compiled === 'string' && compiled.length > 0) {
+      return { url: compiled, stepIndex: i };
+    }
+    const evidence = step.evidence?.pageUrl;
+    if (typeof evidence === 'string' && evidence.length > 0) {
+      return { url: evidence, stepIndex: i };
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect whether the actual landing URL diverged from the URL the test was
+ * originally recorded on. Returns null when:
+ *   - No recorded URL was available (nothing to compare against)
+ *   - URLs match after normalization (origin + pathname, ignoring query/hash)
+ *   - Either URL is unparseable (we can't make a meaningful comparison)
+ *
+ * Returns a `UrlMismatchInfo` object when the normalized paths differ — this
+ * is the signal that the user is probably on a different page than what the
+ * recorded steps were captured on (most commonly: already authenticated and
+ * redirected past the recorded login form).
+ */
+function detectInitialUrlMismatch(
+  actualUrl: string,
+  steps: IntentStep[],
+): UrlMismatchInfo | null {
+  if (!actualUrl || actualUrl === 'about:blank') return null;
+
+  const recorded = findFirstRecordedStepUrl(steps);
+  if (!recorded) return null;
+
+  const normalizedActual = normalizeUrlForComparison(actualUrl);
+  const normalizedRecorded = normalizeUrlForComparison(recorded.url);
+
+  if (normalizedActual === normalizedRecorded) return null;
+
+  // Compute origin (best-effort) so callers can tell SSO redirects apart from
+  // intra-app drift. URL parsing is wrapped in try/catch because the recorded
+  // URL was captured on a different machine and could be in any state.
+  let actualOrigin = '';
+  let recordedOrigin = '';
+  try { actualOrigin = new URL(actualUrl).origin; } catch { /* leave empty */ }
+  try { recordedOrigin = new URL(recorded.url).origin; } catch { /* leave empty */ }
+
+  return {
+    recordedUrl: recorded.url,
+    actualUrl,
+    sameOrigin: actualOrigin !== '' && actualOrigin === recordedOrigin,
+    sourceStepIndex: recorded.stepIndex,
+  };
 }
 
 // ── Step-Level Retry ───────────────────────────────────────────────────────
@@ -527,6 +647,13 @@ export class PreviewRunService {
     // Built in finally — returned to caller after the run fully completes.
     let runSummary: PreviewRunSummary | null = null;
 
+    // Populated by `detectInitialUrlMismatch` after the initial navigation
+    // settles. When set, the first few step failures will include a hint
+    // explaining that the page diverged from the recorded one — typically
+    // because the user is already authenticated. Cleared on every URL gate
+    // pass; never set to a stale value.
+    let urlMismatchInfo: UrlMismatchInfo | null = null;
+
     // Batch accumulator: collect enriched steps in-memory, persist once at end
     const enrichedSteps = new Map<string, IntentStep>();
 
@@ -699,6 +826,52 @@ export class PreviewRunService {
           readinessElementCount: initialReadiness.elementCount,
           ...(initialReadiness.reason ? { readinessReason: initialReadiness.reason } : {}),
         });
+
+        // ── URL mismatch detection ─────────────────────────────────────────
+        // The page is now stable (waitForPageInteractive has settled all
+        // redirect chains and confirmed interactive elements exist). This is
+        // the right moment to compare where we actually landed against where
+        // the test was originally recorded. If they diverge — most commonly
+        // because the user is already authenticated and the site redirected
+        // past the recorded login form — we log a warning now and stash the
+        // info on `urlMismatchInfo` so the first few step failures can show
+        // a useful hint instead of dying with a generic "element not found".
+        //
+        // We do NOT hard-fail here. The recorded URL could be wrong (old
+        // recording, bug in the recorder, OAuth chain that wasn't fully
+        // captured), and a false positive would be worse than the current
+        // behavior. So we let the run proceed, and only the actual step
+        // failures will pick up the hint via augmentErrorWithPageContext.
+        //
+        // We pass the original `steps` (not `stepsToExecute`) because:
+        //   1. stepsToExecute is computed later in the function
+        //   2. injectAutoWaitForSteps only adds wait_for steps BETWEEN existing
+        //      ones — it never reorders or removes the original first step,
+        //      so the first recorded URL is identical in both arrays.
+        //
+        // Wrapped in defensive try/catch: this is a best-effort observability
+        // feature, never a reason to fail a run. session.page.url() can throw
+        // if the page closed mid-flight; URL parsing inside the detector is
+        // already guarded, but belt-and-braces.
+        try {
+          urlMismatchInfo = detectInitialUrlMismatch(session.page.url(), steps);
+          if (urlMismatchInfo) {
+            logger.warn('[PreviewRun] Page URL diverged from recording', {
+              previewSessionId,
+              recordedUrl: urlMismatchInfo.recordedUrl,
+              actualUrl: urlMismatchInfo.actualUrl,
+              sameOrigin: urlMismatchInfo.sameOrigin,
+              sourceStepIndex: urlMismatchInfo.sourceStepIndex,
+              hint: 'User may already be authenticated, or the site redirected past the recorded starting page',
+            });
+          }
+        } catch (mismatchError) {
+          logger.debug('[PreviewRun] URL mismatch detection threw (non-fatal)', {
+            previewSessionId,
+            error: mismatchError instanceof Error ? mismatchError.message : String(mismatchError),
+          });
+          urlMismatchInfo = null;
+        }
       } catch (navError) {
         // AbortError from raceAbort — run was cancelled during initial navigation
         if (navError instanceof DOMException && navError.name === 'AbortError') {
@@ -1197,10 +1370,15 @@ export class PreviewRunService {
               break;
             }
           } else {
-            // Augment error with page context if we navigated earlier
+            // Augment error with page context if we navigated earlier.
+            // Also include the URL-mismatch hint, but ONLY for the first few
+            // steps — login flows are typically 2-4 steps, and showing the
+            // "you may already be logged in" hint on step 17 would be both
+            // misleading and confusing.
             const errorWithContext = augmentErrorWithPageContext(
               result.error || 'Step failed',
               lastNavigationSummary,
+              i < URL_MISMATCH_HINT_MAX_STEPS ? urlMismatchInfo : null,
             );
 
             logger.warn('[PreviewRun] Step failed', {
@@ -1210,6 +1388,7 @@ export class PreviewRunService {
               error: result.error,
               retried,
               hasPageContext: !!lastNavigationSummary,
+              hasUrlMismatchHint: i < URL_MISMATCH_HINT_MAX_STEPS && !!urlMismatchInfo,
             });
 
             // Trace step_result (fail)
@@ -1486,7 +1665,13 @@ export class PreviewRunService {
             }
           }
 
-          const errorWithContext = augmentErrorWithPageContext(originalError, lastNavigationSummary);
+          // Same URL-mismatch hint policy as the failed-result branch above:
+          // only attach the hint to the first few step failures.
+          const errorWithContext = augmentErrorWithPageContext(
+            originalError,
+            lastNavigationSummary,
+            i < URL_MISMATCH_HINT_MAX_STEPS ? urlMismatchInfo : null,
+          );
 
           logger.error('[PreviewRun] Step exception', {
             previewSessionId,
@@ -1494,6 +1679,7 @@ export class PreviewRunService {
             stepId: step.id,
             error: originalError,
             retried: exceptionRetried,
+            hasUrlMismatchHint: i < URL_MISMATCH_HINT_MAX_STEPS && !!urlMismatchInfo,
           });
 
           // Trace step_result (exception)
