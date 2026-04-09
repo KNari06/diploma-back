@@ -26,6 +26,20 @@
       "runtimeArgs": ["-c", "export PATH=/Users/yerassylospanov/.nvm/versions/node/v22.17.0/bin:$PATH && cd /Users/yerassylospanov/Desktop/qai-frontend/apps/web && npm run dev"],
       "port": 8080,
       "autoPort": false
+    },
+    {
+      "name": "marketing",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "export PATH=/Users/yerassylospanov/.nvm/versions/node/v22.17.0/bin:$PATH && cd /Users/yerassylospanov/Desktop/qai-frontend/.claude/worktrees/marketing-site/apps/marketing && npx next dev --port 3333"],
+      "port": 3333,
+      "autoPort": false
+    },
+    {
+      "name": "web-worktree",
+      "runtimeExecutable": "/bin/bash",
+      "runtimeArgs": ["-c", "export PATH=/Users/yerassylospanov/.nvm/versions/node/v22.17.0/bin:$PATH && cd /Users/yerassylospanov/Desktop/qai-frontend/.claude/worktrees/marketing-site/apps/web && npx vite --port 3444"],
+      "port": 3444,
+      "autoPort": false
     }
   ]
 }
