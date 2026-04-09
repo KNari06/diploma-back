@@ -8,12 +8,12 @@
 # Образ хранится в Google Artifact Registry (GCP-native, Cloud Run тянет без доп. auth).
 # Перед первым запуском CI создай репозиторий один раз:
 #   gcloud artifacts repositories create qai \
-#     --repository-format=docker --location=us-central1 --project=qait-dev
+#     --repository-format=docker --location=europe-north1 --project=qait-dev
 #
 # CI/CD Variables (Settings → CI/CD → Variables):
 #   GCP_PROJECT_ID      — qait-dev
 #   GCP_PROJECT_NUMBER  — 728473466858
-#   GCP_REGION          — us-central1
+#   GCP_REGION          — europe-north1
 #   GCP_RUNNER_SA_EMAIL — SA email из: terraform output gitlab_runner_sa_email
 #   GCP_WIF_PROVIDER    — Provider из:  terraform output wif_provider_name
 #   WIF_POOL_ID         — gitlab-pool-prod2 (optional fallback)
@@ -29,9 +29,9 @@ variables:
   DOCKER_CERT_PATH: "/certs/client"
   # Shared runner image may not include buildx plugin; use classic docker build.
   DOCKER_BUILDKIT: "0"
-  GCP_REGION: "us-central1"
-  AR_HOST: "us-central1-docker.pkg.dev"
-  # Полный путь: us-central1-docker.pkg.dev/qait-dev/qai/qai-backend
+  GCP_REGION: "europe-north1"
+  AR_HOST: "europe-north1-docker.pkg.dev"
+  # Полный путь: europe-north1-docker.pkg.dev/qait-dev/qai/qai-backend
   IMAGE: "${AR_HOST}/${GCP_PROJECT_ID}/qai/qai-backend:${CI_COMMIT_SHORT_SHA}"
   IMAGE_LATEST: "${AR_HOST}/${GCP_PROJECT_ID}/qai/qai-backend:latest"
 
