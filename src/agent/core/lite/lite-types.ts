@@ -491,9 +491,42 @@ export interface AICommand {
  * Structured blocked info for better UX
  * Provides reason and whether user can help resolve the block
  */
+/**
+ * Structured blocker type — helps dashboard/frontend decide how to present
+ * the block to the user (e.g., show OTP input for 2fa, captcha solver, etc).
+ * PR1C: added for pause_for_human background mode support.
+ */
+export type BlockerType =
+  | 'captcha'
+  | '2fa'
+  | 'sms_code'
+  | 'email_verification'
+  | 'oauth_consent'
+  | 'payment_auth'
+  | 'file_upload'
+  | 'ambiguous_choice'
+  | 'manual_verification'
+  | 'unknown';
+
 export interface BlockedInfo {
   reason: string;
   canUserHelp: boolean;
+  /**
+   * PR1C: Structured blocker classification. Optional for backwards compat —
+   * older code paths can emit just reason+canUserHelp. When present, the
+   * frontend can render a specific UI (e.g., OTP input for 2fa).
+   */
+  blockerType?: BlockerType;
+  /**
+   * PR1C: The action AI wanted to take when it hit the block. Helps the
+   * user understand the context — e.g., "wanted to click 'Continue' after
+   * filling credentials, but 2FA code input appeared".
+   */
+  requestedAction?: {
+    action: string;
+    ref?: string;
+    description?: string;
+  };
 }
 
 /**
@@ -540,11 +573,38 @@ export interface CollectedError {
   details?: Record<string, unknown>;
 }
 
+/**
+ * PR-Hybrid: Which execution path the engine actually took for this test.
+ * Set by lite-engine.ts as it walks the fallback chain (hybrid → pipeline v2
+ * → multi-agent legacy). Exposed in LiteTestResult so dashboards can slice
+ * latency/cost/success metrics by path.
+ *
+ *   - hybrid_success           — hybrid ran, returned success
+ *   - hybrid_then_pipeline_v2  — hybrid failed/declined, pipeline v2 took over
+ *   - hybrid_then_legacy       — hybrid failed/declined, legacy loop took over
+ *   - pipeline_v2_success      — hybrid OFF, pipeline v2 ran, returned result
+ *   - pipeline_v2_then_legacy  — hybrid OFF, pipeline v2 failed, legacy took over
+ *   - legacy_only              — hybrid OFF, pipeline v2 OFF, legacy loop ran
+ */
+export type LiteExecutionPath =
+  | 'hybrid_success'
+  | 'hybrid_then_pipeline_v2'
+  | 'hybrid_then_legacy'
+  | 'pipeline_v2_success'
+  | 'pipeline_v2_then_legacy'
+  | 'legacy_only';
+
 export interface LiteTestResult {
   success: boolean;
   reason: string;
   iterations: number;
   history: string;
+  /**
+   * PR-Hybrid: which execution path the engine actually took. Used by
+   * observability dashboards to compare cost/latency/success rates across
+   * paths during the hybrid rollout.
+   */
+  executionPath?: LiteExecutionPath;
   // ✅ FIX: Screenshots can be either Buffers (during execution) or URLs (after upload)
   // For Lite mode: only final screenshot URL after completion
   screenshots: Array<{ url: string; screenshot: string }> | Array<{ name: string; buffer: Buffer; timestamp: number }>;
@@ -628,6 +688,29 @@ export interface LiteCredentials {
 /**
  * Engine configuration
  */
+/**
+ * PR1C: How the engine handles "test needs human input" situations
+ * (captcha, 2FA, OAuth consent, ambiguous choice).
+ *
+ *  - 'background' (default, safest): no pause infrastructure. When AI
+ *    reports `blockedInfo.canUserHelp=true`, the engine immediately
+ *    terminates the test with a structured blocked result. The frontend
+ *    sees reason + blockerType + screenshot and can either resume
+ *    manually or mark the test as "known blocker, skip in CI". Safe for
+ *    workers, cron jobs, CI, background tests.
+ *
+ *  - 'interactive' (future): emits a humanInputRequired WebSocket event
+ *    and pauses the engine loop, waiting for a resume signal from the
+ *    frontend. NOT IMPLEMENTED in PR1C — planned for a dedicated sprint
+ *    once pause/resume infrastructure exists (Redis state persistence,
+ *    BullMQ pause hooks, frontend dialog). Falls back to 'background'.
+ *
+ *  - 'hybrid' (future): emits the event and waits N seconds for a
+ *    resume signal. If no response, degrades to 'background'. NOT
+ *    IMPLEMENTED in PR1C — same reason as 'interactive'.
+ */
+export type LitePauseMode = 'background' | 'interactive' | 'hybrid';
+
 export interface LiteEngineConfig {
   testId: string;
   userId?: string;
@@ -641,6 +724,11 @@ export interface LiteEngineConfig {
   chatSessionId?: string;
   /** Prefilled steps from Smart Test Case Resolver for fast replay before AI loop */
   prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[];
+  /**
+   * PR1C: How to handle `blockedInfo.canUserHelp=true` responses.
+   * Default: 'background' — safe for all run contexts. See LitePauseMode.
+   */
+  pauseMode?: LitePauseMode;
 }
 
 /**

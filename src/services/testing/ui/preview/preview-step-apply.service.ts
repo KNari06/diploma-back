@@ -103,6 +103,199 @@ function detectModalBlockingFromSession(
 }
 
 /**
+ * V13: Ground-truth verification of modal blocking via browser hit-testing.
+ *
+ * The snapshot collector's modal detector is a heuristic (position/z-index/coverage).
+ * It produces false positives on onboarding cards, floating chats, toasts, and other
+ * fixed-position UI that is visually separated from the target element.
+ *
+ * This function asks the browser directly: "is my target actually covered by the
+ * suspected modal?" using three independent geometric signals, any one of which
+ * is sufficient to clear the block:
+ *
+ *   1. CONTAINMENT — target is a descendant of the modal node (target IS inside it).
+ *   2. HIT-TEST    — pixel at target's visible center resolves to target/ancestor/descendant.
+ *   3. DISJOINT    — bounding boxes of target and modal do not intersect at all.
+ *
+ * All three checks run inside a single page.evaluate() so there is no hardcoded
+ * allowlist, no element-type assumptions, no size thresholds. It works for
+ * dropdowns, popovers, onboarding tooltips, chat widgets, cookie banners, and
+ * any future UI pattern — because the browser itself is the source of truth.
+ *
+ * Returns:
+ *   - `blocked: false, reason: ...` when the target is reachable (proceed with action)
+ *   - `blocked: true, occludingText: ...` when the target is genuinely covered (surface error)
+ */
+async function verifyModalActuallyBlocks(
+  page: Page,
+  candidateRefs: string[],
+  modalRef: string,
+): Promise<{ blocked: boolean; reason: string; occludingText?: string }> {
+  if (candidateRefs.length === 0) {
+    return { blocked: true, reason: 'no_candidates' };
+  }
+
+  try {
+    const result = await page.evaluate(
+      ({ refs, modalRef: mRef }) => {
+        // Browser context — pull DOM globals through `globalThis` to avoid
+        // server tsconfig noise (no `lib: ["dom"]` in the Node build).
+        const g = globalThis as unknown as {
+          document: {
+            querySelector: (sel: string) => unknown;
+            elementFromPoint: (x: number, y: number) => unknown;
+          };
+          innerWidth: number;
+          innerHeight: number;
+          getComputedStyle: (el: unknown) => { display: string; visibility: string };
+          ShadowRoot: new () => unknown;
+        };
+        type El = {
+          contains: (other: unknown) => boolean;
+          getBoundingClientRect: () => { left: number; top: number; right: number; bottom: number; width: number; height: number };
+          getRootNode: () => unknown;
+          textContent: string | null;
+          tagName: string;
+        };
+        const docQuery = (sel: string): El | null => (g.document.querySelector(sel) as El | null);
+
+        const modal = docQuery(`[data-agent-ref="${mRef}"]`);
+        if (!modal) return { blocked: false, reason: 'modal_gone' as const };
+
+        const modalRect = modal.getBoundingClientRect();
+
+        // Scratchpad lives on globalThis so it survives across candidate iterations.
+        const scratch = g as unknown as { __lastOccluder?: string };
+
+        // Track whether ANY candidate was actually evaluated end-to-end.
+        // If every candidate bailed early (not in main frame, off-screen, detached)
+        // we must NOT report "all occluded" — defer to Playwright's actionability.
+        let anyCandidateEvaluated = false;
+
+        // Check every candidate — if ANY one is reachable, the block is false-positive.
+        for (const ref of refs) {
+          const target = docQuery(`[data-agent-ref="${ref}"]`);
+          // Ref not in main frame (likely iframe/shadow-DOM lint candidate) —
+          // can't hit-test from here. Skip and let Playwright resolve it.
+          if (!target) continue;
+
+          // Signal 1: CONTAINMENT — target lives inside the modal.
+          // (Covers self-inclusion: modal.contains(modal) === true in DOM.)
+          if (target === modal || modal.contains(target)) {
+            return { blocked: false, reason: 'target_inside_modal' as const, matchedRef: ref };
+          }
+
+          // Target must be visible and laid out for geometric checks.
+          const tRect = target.getBoundingClientRect();
+          if (tRect.width === 0 || tRect.height === 0) continue;
+
+          const style = g.getComputedStyle(target);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+          // Signal 2: DISJOINT — bounding boxes do not intersect.
+          // If the modal lives in a completely different region of the viewport,
+          // it cannot possibly be blocking this target.
+          const disjoint =
+            tRect.right  <= modalRect.left  ||
+            tRect.left   >= modalRect.right ||
+            tRect.bottom <= modalRect.top   ||
+            tRect.top    >= modalRect.bottom;
+          if (disjoint) {
+            return { blocked: false, reason: 'disjoint_regions' as const, matchedRef: ref };
+          }
+
+          // Signal 3: HIT-TEST — ask the browser what is actually at the target's pixels.
+          // Sample the center plus four inset points to survive partial occlusions
+          // (e.g. a tooltip tail covering the dead-center of a button).
+          const cx = tRect.left + tRect.width / 2;
+          const cy = tRect.top + tRect.height / 2;
+          const vw = g.innerWidth;
+          const vh = g.innerHeight;
+
+          const inset = 2;
+          const samplePoints: Array<[number, number]> = (
+            [
+              [cx, cy],
+              [tRect.left + inset,  tRect.top + inset],
+              [tRect.right - inset, tRect.top + inset],
+              [tRect.left + inset,  tRect.bottom - inset],
+              [tRect.right - inset, tRect.bottom - inset],
+            ] as Array<[number, number]>
+          ).filter(([x, y]) => x >= 0 && x <= vw && y >= 0 && y <= vh);
+
+          // Target is laid out but all sample points fall outside the viewport —
+          // it just needs scrolling. Let Playwright auto-scroll and retry; do NOT
+          // report a block based on a target we never actually hit-tested.
+          if (samplePoints.length === 0) {
+            return { blocked: false, reason: 'needs_scroll' as const, matchedRef: ref };
+          }
+
+          // Past this point the candidate is fully evaluated.
+          anyCandidateEvaluated = true;
+
+          let reachableSamples = 0;
+          let firstOccluder: El | null = null;
+          for (const [x, y] of samplePoints) {
+            const hit = g.document.elementFromPoint(x, y) as El | null;
+            if (!hit) continue;
+            // Target itself, or related by the DOM tree — reachable.
+            if (hit === target || target.contains(hit) || hit.contains(target)) {
+              reachableSamples++;
+              continue;
+            }
+            // Shadow DOM host of the target also counts as reachable.
+            const root = target.getRootNode() as { host?: El } | null;
+            if (root && root instanceof (g.ShadowRoot as unknown as { new (): unknown }) && root.host === hit) {
+              reachableSamples++;
+              continue;
+            }
+            if (!firstOccluder) firstOccluder = hit;
+          }
+
+          // At least one sample reaching the target is enough — user can click it.
+          if (reachableSamples > 0) {
+            return { blocked: false, reason: 'hit_test_reachable' as const, matchedRef: ref };
+          }
+
+          // This candidate is geometrically blocked. Record the occluder but
+          // keep scanning other candidates — lint may have ranked an unreachable
+          // candidate first while a reachable sibling exists.
+          if (firstOccluder) {
+            const occluderText = (firstOccluder.textContent || '').trim().slice(0, 80);
+            const occluderTag = firstOccluder.tagName.toLowerCase();
+            scratch.__lastOccluder = occluderText || occluderTag;
+          }
+        }
+
+        // If no candidate was actually hit-tested (all refs missing from main frame,
+        // all zero-sized, all display:none), we have zero evidence of blocking —
+        // defer to Playwright's own actionability checks.
+        if (!anyCandidateEvaluated) {
+          delete scratch.__lastOccluder;
+          return { blocked: false, reason: 'no_evaluable_candidates' as const };
+        }
+
+        // Every evaluated candidate failed the hit-test and none was disjoint/contained.
+        const occluder = scratch.__lastOccluder;
+        delete scratch.__lastOccluder;
+        return { blocked: true, reason: 'all_candidates_occluded' as const, occludingText: occluder };
+      },
+      { refs: candidateRefs, modalRef },
+    );
+
+    return result as { blocked: boolean; reason: string; occludingText?: string };
+  } catch (err) {
+    // Browser eval failed (page navigating, frame detached, etc.) —
+    // fail open: let the action attempt proceed. Playwright has its own
+    // actionability checks and will surface a real error if it cannot click.
+    logger.debug('[PREVIEW_APPLY] verifyModalActuallyBlocks eval failed, failing open', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { blocked: false, reason: 'eval_failed_fail_open' };
+  }
+}
+
+/**
  * Generate a random integer in range [min, max] (inclusive).
  */
 function randomIntInclusive(min: number, max: number): number {
@@ -217,6 +410,143 @@ export function normalizeTypeActionValue(rawValue: string | undefined): string {
 }
 
 /**
+ * V13: Wait for the page's mutation rate to drop to a baseline — i.e. the
+ * action-driven burst of DOM changes has ended, even if background widgets
+ * (live tickers, chat feeds, animation loops, analytics pixels) keep the
+ * DOM from ever being absolutely quiet.
+ *
+ * Rather than requiring absolute silence for N ms (the previous approach,
+ * which never returned true on sites with live widgets), this measures the
+ * *rate* of mutations inside rolling 200 ms windows and returns true once
+ * the current window's count is ≤ max(2, baseline * 1.5).
+ *
+ * How baseline is established:
+ *   • First 400 ms = "observation burst" — we record whatever the action
+ *     triggered (likely the highest mutation rate of the whole wait).
+ *   • From 400 ms onward, we track the LOWEST 200 ms window seen so far
+ *     as the baseline — that is the site's steady-state mutation rate.
+ *   • The moment a fresh 200 ms window returns to ≤1.5× baseline (or ≤2
+ *     mutations regardless of baseline, for genuinely quiet sites), we
+ *     declare settled.
+ *
+ * This adapts per-page automatically: a static page settles on zero
+ * mutations; a site with a 10-Hz ticker settles once the ticker's own
+ * cadence resumes after the action's burst. No hardcoded thresholds tied
+ * to element types, paths, or site identities.
+ *
+ * Returns true on settle, false on timeout. Never throws.
+ */
+async function waitForPageSettled(
+  page: Page,
+  timeoutMs: number,
+  _quietMs: number = 500, // kept for API compat; unused in rate-based impl
+): Promise<boolean> {
+  void _quietMs;
+  try {
+    await page.waitForFunction(
+      () => {
+        type SettleState = {
+          observer: { disconnect: () => void };
+          mutationsInCurrentWindow: number;
+          currentWindowStart: number;
+          baseline: number | null;
+          startedAt: number;
+        };
+        const g = globalThis as unknown as {
+          __qaitSettleState?: SettleState;
+          document: { body: unknown };
+          MutationObserver: new (cb: (records: unknown[]) => void) => {
+            observe: (target: unknown, opts: unknown) => void;
+            disconnect: () => void;
+          };
+          performance: { now: () => number };
+        };
+
+        const WINDOW_MS = 200;
+        const OBSERVATION_BURST_MS = 400; // let the action's burst pass first
+        const ABSOLUTE_QUIET = 2; // ≤ this per window → settled regardless of baseline
+        const BASELINE_MULT = 1.5;
+
+        const now = g.performance.now();
+
+        if (!g.__qaitSettleState) {
+          const state: SettleState = {
+            observer: null as unknown as SettleState['observer'],
+            mutationsInCurrentWindow: 0,
+            currentWindowStart: now,
+            baseline: null,
+            startedAt: now,
+          };
+          const obs = new g.MutationObserver((records) => {
+            state.mutationsInCurrentWindow += records.length;
+          });
+          obs.observe(g.document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            characterData: true,
+          });
+          state.observer = obs;
+          g.__qaitSettleState = state;
+          return false;
+        }
+
+        const state = g.__qaitSettleState;
+        const elapsedWindow = now - state.currentWindowStart;
+        if (elapsedWindow < WINDOW_MS) return false;
+
+        // Window closed — evaluate.
+        const windowCount = state.mutationsInCurrentWindow;
+        const elapsedTotal = now - state.startedAt;
+
+        // Reset for next window BEFORE checking exit conditions so we never
+        // double-count and always start the next window from zero.
+        state.mutationsInCurrentWindow = 0;
+        state.currentWindowStart = now;
+
+        // Absolute-quiet fast path: static or nearly-static page.
+        if (windowCount <= ABSOLUTE_QUIET) {
+          try { state.observer.disconnect(); } catch { /* noop */ }
+          delete g.__qaitSettleState;
+          return true;
+        }
+
+        // Still in the observation burst — don't sample baseline yet.
+        if (elapsedTotal < OBSERVATION_BURST_MS) return false;
+
+        // Establish / refine baseline as the lowest post-burst window.
+        if (state.baseline === null || windowCount < state.baseline) {
+          state.baseline = windowCount;
+        }
+
+        // Settled when this window is no worse than 1.5× the observed baseline.
+        const threshold = Math.max(ABSOLUTE_QUIET, Math.ceil(state.baseline * BASELINE_MULT));
+        if (windowCount <= threshold) {
+          try { state.observer.disconnect(); } catch { /* noop */ }
+          delete g.__qaitSettleState;
+          return true;
+        }
+
+        return false;
+      },
+      undefined,
+      { timeout: timeoutMs, polling: 100 },
+    );
+    return true;
+  } catch {
+    // Clean up leftover observer on timeout.
+    await page.evaluate(() => {
+      const g = globalThis as unknown as { __qaitSettleState?: { observer: { disconnect: () => void } } };
+      if (g.__qaitSettleState?.observer) {
+        try { g.__qaitSettleState.observer.disconnect(); } catch { /* noop */ }
+        delete g.__qaitSettleState;
+      }
+    }).catch(() => { /* noop */ });
+    return false;
+  }
+}
+
+/**
  * V5: Execute wait_for using SPA-safe approach (page.waitForFunction)
  * Works for both full navigations AND SPA client-side routing (React Router, Next.js, etc.)
  *
@@ -230,12 +560,15 @@ export function normalizeTypeActionValue(rawValue: string | undefined): string {
  * @param page Playwright Page
  * @param matcher UrlMatcher configuration
  * @param timeoutMs Timeout in milliseconds
+ * @param isAutoInjected V13: when true, fall back to page-settle signal on changedFrom timeout
+ *                             (recorded URL change may not reproduce at replay — e.g. i18n switchers)
  */
 async function executeWaitFor(
   page: Page,
   matcher: UrlMatcher | undefined,
-  timeoutMs: number
-): Promise<{ success: boolean; error?: string }> {
+  timeoutMs: number,
+  isAutoInjected: boolean = false,
+): Promise<{ success: boolean; error?: string; degraded?: 'page_settled' }> {
   try {
     if (!matcher) {
       // No matcher specified - simple wait for duration (like 'wait' action)
@@ -253,16 +586,114 @@ async function executeWaitFor(
     if (matcher.changedFrom) {
       // Wait until URL changes from the specified value
       const prevUrl = matcher.changedFrom;
-      await page.waitForFunction(
-        (prev: string) => String((globalThis as any).location?.href ?? '') !== prev,
-        prevUrl,
-        { timeout: timeoutMs }
-      );
-      logger.debug('[WAIT_FOR_URL] URL changed from previous value', {
-        prevUrl,
-        newUrl: page.url(),
-      });
-      return { success: true };
+
+      // V13: Split the total budget between two signals — URL change (primary)
+      // and page-settle (fallback). This is NOT hardcoded-per-flag; it is a
+      // universal answer to the question: "the recorded action changed the
+      // URL but replay isn't changing it — what should we do?"
+      //
+      // Why this works for both manual and auto-injected:
+      //   • Auto-injected steps exist to stabilize replay after ambiguous
+      //     actions. When the recorded URL change doesn't reproduce (i18n
+      //     toggle, feature flag, A/B bucket, cached state, legacy record
+      //     before this code existed), we must not block the whole run.
+      //   • Manual steps expressing URL intent get the full primary budget;
+      //     the fallback only engages in the final slice. If the page is
+      //     genuinely hung, settle fails and the timeout surfaces correctly.
+      //     If the page is quiet but URL didn't change, that's almost always
+      //     a recorder/app mismatch — degraded success is the right call.
+      //
+      // Budget split:
+      //   auto-injected: 2s URL wait, up to 3s settle fallback (fast-degrade)
+      //   manual:        (timeoutMs - 1.5s) URL wait, 1.5s settle fallback (min 500ms URL)
+      // Why manual gets a smaller fallback: a user-written wait_for for URL change
+      // is a contract; hiding a broken auth/redirect/nav behind "page settled" is
+      // far worse than surfacing it. We still keep a tiny safety net for tests
+      // recorded before this code existed (historical steps without isAutoInjected).
+      const SETTLE_MAX_MS = isAutoInjected ? 3000 : 1500;
+      const urlWaitBudget = isAutoInjected
+        ? Math.min(2000, timeoutMs)
+        : Math.max(500, timeoutMs - SETTLE_MAX_MS);
+
+      try {
+        await page.waitForFunction(
+          (prev: string) => String((globalThis as unknown as { location?: { href?: string } }).location?.href ?? '') !== prev,
+          prevUrl,
+          { timeout: urlWaitBudget }
+        );
+        logger.debug('[WAIT_FOR_URL] URL changed from previous value', {
+          prevUrl,
+          newUrl: page.url(),
+        });
+        return { success: true };
+      } catch (urlWaitErr) {
+        // V13: Cross-origin navigation short-circuit.
+        // When a click leads to another origin, Playwright tears down the
+        // old execution context and waitForFunction throws with a non-timeout
+        // error ("Execution context was destroyed", "frame was detached", etc.).
+        // That destruction IS the URL change we were waiting for — re-read
+        // page.url() and compare; if it moved, we succeed immediately instead
+        // of degrading into the settle fallback.
+        const errMsg = urlWaitErr instanceof Error ? urlWaitErr.message : String(urlWaitErr);
+        const isContextLost =
+          /execution context was destroyed/i.test(errMsg) ||
+          /frame was detached/i.test(errMsg) ||
+          /target closed/i.test(errMsg) ||
+          /navigation/i.test(errMsg);
+        if (isContextLost) {
+          // Give the new context a beat to expose its URL, then check.
+          await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { /* noop */ });
+          const postCrashUrl = page.url();
+          if (postCrashUrl && postCrashUrl !== prevUrl) {
+            logger.info('[WAIT_FOR_URL] URL change detected via context-lost short-circuit', {
+              prevUrl,
+              newUrl: postCrashUrl,
+              reason: errMsg.slice(0, 120),
+            });
+            return { success: true };
+          }
+        }
+
+        // Primary signal (URL change) timed out — try the fallback (page settle).
+        const remaining = Math.max(500, timeoutMs - urlWaitBudget);
+        const settleBudget = Math.min(remaining, SETTLE_MAX_MS);
+
+        const enterFn = isAutoInjected ? logger.info : logger.warn;
+        enterFn('[WAIT_FOR_URL] URL change not observed, attempting page-settle fallback', {
+          prevUrl,
+          currentUrl: page.url(),
+          isAutoInjected,
+          urlWaitBudget,
+          settleBudget,
+        });
+
+        const settled = await waitForPageSettled(page, settleBudget, 500);
+        if (settled) {
+          // Best-effort short networkidle on top of DOM settle.
+          await page.waitForLoadState('networkidle', { timeout: 1000 }).catch(() => { /* noop */ });
+          // Manual wait_for degraded → loud error log. A user-written URL-change
+          // contract silently succeeded via the fallback, which likely masks a
+          // broken redirect/auth/nav. Auto-injected → info (expected path).
+          const exitFn = isAutoInjected ? logger.info : logger.error;
+          exitFn('[WAIT_FOR_URL] wait_for resolved via page-settle fallback (URL unchanged but page quiet)', {
+            prevUrl,
+            currentUrl: page.url(),
+            isAutoInjected,
+            hint: isAutoInjected
+              ? undefined
+              : 'Manual wait_for expected URL change but page settled without navigating. This may mask a broken redirect or auth flow — verify the action under test.',
+          });
+          return { success: true, degraded: 'page_settled' };
+        }
+
+        // Page never settled — genuine hang. Surface the original timeout.
+        logger.warn('[WAIT_FOR_URL] Neither URL change nor page settle observed', {
+          prevUrl,
+          currentUrl: page.url(),
+          isAutoInjected,
+        });
+        throw urlWaitErr;
+      }
     }
 
     if (matcher.regex) {
@@ -1797,7 +2228,13 @@ export class PreviewStepApplyService {
         });
 
         try {
-          const result = await executeWaitFor(page, runtimeMatcher, timeoutMs);
+          const result = await executeWaitFor(page, runtimeMatcher, timeoutMs, stepDraft.isAutoInjected === true);
+          if (result.degraded === 'page_settled') {
+            logger.info('[PREVIEW_APPLY] wait_for degraded to page-settle (auto-injected)', {
+              previewSessionId,
+              stepId: stepDraft.id,
+            });
+          }
 
           // Generate compiled plan for wait_for
           let compiled;
@@ -2489,9 +2926,22 @@ export class PreviewStepApplyService {
         // ═══════════════════════════════════════════════════════════════════
         // V11: Modal-aware "not found" — if a modal is open, the target may
         // be behind it. Inform the user so they can dismiss the modal first.
+        // V13: Only surface the modal warning if the modal has an iron-clad
+        // ARIA signature (role=dialog/alertdialog, aria-modal, native <dialog>)
+        // — positional-heuristic modals (floating chats, onboarding cards)
+        // are too unreliable to report as "blocking" in the not-found path.
         // ═══════════════════════════════════════════════════════════════════
         const modalInfo = detectModalBlockingFromSession(previewSessionId, userId);
-        if (modalInfo) {
+        const sessionForNotFound = sessionService.getSession(previewSessionId);
+        const modalNodeForNotFound = modalInfo
+          ? sessionForNotFound?.pageState?.domNodes?.find(n => n.ref === modalInfo.modalRef)
+          : undefined;
+        const isIronCladModal = !!modalNodeForNotFound && (
+          modalNodeForNotFound.role === 'dialog' ||
+          modalNodeForNotFound.role === 'alertdialog' ||
+          modalNodeForNotFound.tag === 'dialog'
+        );
+        if (modalInfo && isIronCladModal) {
           logger.info('[PREVIEW_APPLY] Element not found — modal/popup may be blocking', {
             previewSessionId,
             modalRef: modalInfo.modalRef,
@@ -2525,35 +2975,49 @@ export class PreviewStepApplyService {
       const modalDetected = detectModalBlockingFromSession(previewSessionId, userId);
 
       if (modalDetected && !anyInsideModal) {
-        // Target element is NOT inside the modal — modal is blocking it.
-        // Don't execute: inform the user.
-        logger.info('[PREVIEW_APPLY] Modal blocking target — candidates are behind popup', {
+        // V13: The session's modal flag is a heuristic signal — verify with
+        // the browser before blocking. Geometric + hit-test ground truth
+        // eliminates false positives from onboarding tooltips, floating
+        // chats, toasts, cookie banners, sticky headers, etc.
+        const candidateRefs = resolvedCandidates.map(c => c.ref).filter((r): r is string => !!r);
+        const verdict = await verifyModalActuallyBlocks(page, candidateRefs, modalDetected.modalRef);
+
+        if (verdict.blocked) {
+          logger.info('[PREVIEW_APPLY] Modal blocking target — verified by hit-test', {
+            previewSessionId,
+            modalRef: modalDetected.modalRef,
+            reason: verdict.reason,
+            occludingText: verdict.occludingText,
+            candidateRefs: candidateRefs.join(', '),
+          });
+          return {
+            success: false,
+            error: 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.',
+            highlight: [
+              ...(modalDetected.boundingBox ? [{
+                boundingBox: modalDetected.boundingBox,
+                type: 'warning' as const,
+              }] : []),
+              ...resolvedCandidates.map(c => ({
+                ref: c.ref,
+                boundingBox: c.boundingBox,
+                type: 'error' as const,
+              })),
+            ],
+            modalBlocking: modalDetected,
+            attempts: 0,
+          };
+        }
+
+        // Verified NOT blocked — log and fall through to normal execution.
+        logger.debug('[PREVIEW_APPLY] Modal flag cleared by hit-test verification', {
           previewSessionId,
           modalRef: modalDetected.modalRef,
-          candidateRefs: resolvedCandidates.map(c => c.ref).join(', '),
+          reason: verdict.reason,
         });
-        return {
-          success: false,
-          error: 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.',
-          highlight: [
-            // Highlight the modal itself as warning
-            ...(modalDetected.boundingBox ? [{
-              boundingBox: modalDetected.boundingBox,
-              type: 'warning' as const,
-            }] : []),
-            // Highlight candidates as error (behind modal)
-            ...resolvedCandidates.map(c => ({
-              ref: c.ref,
-              boundingBox: c.boundingBox,
-              type: 'error' as const,
-            })),
-          ],
-          modalBlocking: modalDetected,
-          attempts: 0,
-        };
       }
-      // If target IS inside the modal (anyInsideModal=true) or no modal detected,
-      // proceed normally — the user is working with the popup layer.
+      // If target IS inside the modal (anyInsideModal=true) or no modal detected
+      // or modal-blocking was disproven by hit-test, proceed normally.
 
       // Try candidates in order (reuse resolvedCandidates from modal check above)
       let lastError: string | undefined;

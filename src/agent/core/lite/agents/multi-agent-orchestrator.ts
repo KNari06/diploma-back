@@ -26,6 +26,7 @@ import { ActorAgent } from './actor-agent';
 import { CriticAgent } from './critic-agent';
 import { ObserverCache } from './observer-cache';
 import { ObserverAgent } from './observer-agent';
+import { SafetyInterceptor } from './safety-interceptor';
 import { StrategistAgent } from './strategist-agent';
 import { SupervisorAgent } from './supervisor-agent';
 import type {
@@ -98,10 +99,27 @@ export class MultiAgentOrchestrator {
     supervisorRecoveryModeCount: 0,
     supervisorHardBacktrackCount: 0,
     supervisorTier2Count: 0,
+    skipPathSafetyBlockCount: 0,
   };
 
   constructor() {
     this.observerCache = new ObserverCache();
+
+    // Startup sanity check: criticConcerns recording requires working memory
+    // to be enabled. If only enableCriticConcernsMemory is on, concerns are
+    // silently dropped. Log once at construction so a misconfig is visible
+    // in server startup logs instead of silently failing at runtime.
+    if (
+      LITE_ENGINE_FLAGS.enableCriticConcernsMemory
+      && !LITE_ENGINE_FLAGS.enableWorkingMemory
+    ) {
+      logger.warn(
+        '[MULTI_AGENT] Misconfiguration: enableCriticConcernsMemory=true '
+          + 'but enableWorkingMemory=false. Critic concerns will NOT be '
+          + 'recorded. Either enable working memory or disable the concerns '
+          + 'flag to avoid confusion.',
+      );
+    }
   }
 
   /** Get last expected outcome for expectation validation loop */
@@ -225,12 +243,20 @@ export class MultiAgentOrchestrator {
         };
       }
 
-      // Tier 2 Nuclear: AI diagnosis when Tier 1 exhausted
-      // Cooldown: only invoke every 3 interventions after threshold to avoid cost/latency spam
+      // Tier 2 Nuclear: AI diagnosis when Tier 1 exhausted.
+      //
+      // PR1B: trigger rework:
+      //   - Threshold lowered 5 → 3 (see supervisorMaxInterventions)
+      //   - Old `% 3` cooldown removed — it was a rate limiter with no upper
+      //     bound, so a deeply stuck run would pay indefinitely for Tier 2.
+      //   - New hard cap via supervisorTier2MaxPerRun: once the per-run
+      //     budget is exhausted, Tier 2 is disabled for the rest of the run.
+      //   - Tier 2 now fires on every intervention past the threshold until
+      //     the budget runs out — earlier help, predictable max cost.
       const tier2Eligible = blackboard.recoveryMode
         && blackboard.interventionCount >= LITE_ENGINE_FLAGS.supervisorMaxInterventions
         && LITE_ENGINE_FLAGS.enableSupervisorTier2
-        && ((blackboard.interventionCount - LITE_ENGINE_FLAGS.supervisorMaxInterventions) % 3 === 0);
+        && !this.supervisor.isTier2BudgetExhausted();
 
       if (tier2Eligible) {
         const diagnosis = await this.supervisor.diagnoseBlocker(input, blackboard);
@@ -244,7 +270,11 @@ export class MultiAgentOrchestrator {
           if (diagnosis.mandatoryAction) {
             const ma = diagnosis.mandatoryAction;
             const VALID_ACTIONS = new Set(['click', 'fill', 'press', 'goto', 'scroll', 'select', 'hover', 'wait', 'toggle', 'setRange', 'clear', 'selectDate']);
-            const refValid = !ma.ref || new RegExp(`\\b${ma.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(input.snapshotElements);
+            const refValid = !ma.ref || (
+              input.parsedSnapshot
+                ? input.parsedSnapshot.hasRef(ma.ref)
+                : new RegExp(`\\b${ma.ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(input.snapshotElements)
+            );
 
             // Check against forbidden actions — mandatory actions must NOT repeat failed actions
             const isForbidden = blackboard.forbiddenActions.some(fa =>
@@ -489,6 +519,14 @@ export class MultiAgentOrchestrator {
         blackboard,
         // TimeoutGovernor: time pressure signal
         urgencyLevel: input.urgencyLevel,
+        // PR1C: vision escalation signal for SPAs with sparse DOM semantics
+        visionRecommendation: input.pageMetadata
+          ? {
+              isDOMWeak: input.pageMetadata.isDOMWeak,
+              recommendVision: input.pageMetadata.recommendVision,
+              interactiveElementCount: input.pageMetadata.interactiveElementCount,
+            }
+          : undefined,
       });
 
       if (!strategy) {
@@ -615,8 +653,10 @@ export class MultiAgentOrchestrator {
           }
           // Alternative ref must exist in page elements (if specified) — word-boundary match to avoid e5 matching e50
           if (alt.action.targetRef) {
-            const altRefPattern = new RegExp(`\\b${alt.action.targetRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-            if (!altRefPattern.test(input.snapshotElements)) {
+            const altRefExists = input.parsedSnapshot
+              ? input.parsedSnapshot.hasRef(alt.action.targetRef)
+              : new RegExp(`\\b${alt.action.targetRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(input.snapshotElements);
+            if (!altRefExists) {
               continue;
             }
           }
@@ -695,6 +735,7 @@ export class MultiAgentOrchestrator {
               isPageLoading: observation.loadingState?.isLoading,
               coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
               blackboard,
+              parsedSnapshot: input.parsedSnapshot,
             });
             if (!isSafe) {
               logger.info('[MULTI_AGENT] Alternative blocked by safety check', {
@@ -768,6 +809,8 @@ export class MultiAgentOrchestrator {
           blackboard,
           // Layer 3: Last blocker info from previous iteration
           lastBlockerInfo: input.lastBlockerInfo,
+          // PR1: O(1) ref existence check
+          parsedSnapshot: input.parsedSnapshot,
         });
 
         criticMs = Date.now() - criticStart;
@@ -835,6 +878,7 @@ export class MultiAgentOrchestrator {
                   isPageLoading: observation.loadingState?.isLoading,
                   coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
                   blackboard,
+                  parsedSnapshot: input.parsedSnapshot,
                 });
                 if (fallbackSafe) {
                   usedHypothesisIndex = h;
@@ -891,6 +935,14 @@ export class MultiAgentOrchestrator {
                   blackboard,
                   // TimeoutGovernor: time pressure signal
                   urgencyLevel: input.urgencyLevel,
+                  // PR1C: vision escalation signal
+                  visionRecommendation: input.pageMetadata
+                    ? {
+                        isDOMWeak: input.pageMetadata.isDOMWeak,
+                        recommendVision: input.pageMetadata.recommendVision,
+                        interactiveElementCount: input.pageMetadata.interactiveElementCount,
+                      }
+                    : undefined,
                 });
                 strategistMs += Date.now() - reStrategistStart;
 
@@ -926,6 +978,7 @@ export class MultiAgentOrchestrator {
                       isPageLoading: observation.loadingState?.isLoading,
                       coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
                       blackboard,
+                      parsedSnapshot: input.parsedSnapshot,
                     });
 
                     if (reSafe) {
@@ -1019,8 +1072,10 @@ export class MultiAgentOrchestrator {
                 });
               } else {
                 // Validate that override ref actually exists on the page
-                const refPattern = new RegExp(`\\b${overrideRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
-                if (refPattern.test(input.snapshotElements)) {
+                const overrideRefExists = input.parsedSnapshot
+                  ? input.parsedSnapshot.hasRef(overrideRef)
+                  : new RegExp(`\\b${overrideRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(input.snapshotElements);
+                if (overrideRefExists) {
                   action = {
                     command: {
                       action: overrideAction as 'click' | 'fill' | 'press' | 'goto' | 'scroll' | 'select' | 'hover' | 'wait' | 'toggle' | 'setRange' | 'clear' | 'selectDate',
@@ -1059,9 +1114,111 @@ export class MultiAgentOrchestrator {
               first: verdict.reasoningInconsistencies[0].description,
             });
           }
+
+          // PR1B: Record critic CONCERNS (warn-level violations on APPROVED
+          // actions) into working memory. Distinct from criticRejections:
+          // these are actions that went through but the Critic flagged
+          // something worth remembering. Feeds the next Strategist so it
+          // can avoid repeating the same risky pattern.
+          //
+          // Only records on approve / override — rejection already records
+          // via criticRejections above. Reject doesn't double-count here.
+          if (
+            LITE_ENGINE_FLAGS.enableCriticConcernsMemory
+            && LITE_ENGINE_FLAGS.enableWorkingMemory
+            && (verdict.verdict === 'approve' || verdict.verdict === 'override')
+            && verdict.policyViolations.length > 0
+          ) {
+            const warnings = verdict.policyViolations.filter(v => v.severity === 'warn');
+            if (warnings.length > 0 && action.command.ref) {
+              this.workingMemory.criticConcerns ??= [];
+              this.workingMemory.criticConcerns.push({
+                iteration: input.iteration,
+                action: action.command.action,
+                ref: action.command.ref,
+                concern: (verdict.riskAssessment || warnings[0].description).slice(0, 120),
+                violationTypes: warnings.map(w => w.type),
+              });
+              const maxConcerns = LITE_ENGINE_FLAGS.criticConcernsMemorySize;
+              // Guard against misconfiguration: if someone sets memorySize to 0
+              // (or a negative number), `length > 0` would stay false forever
+              // and the array would grow unbounded. Require a positive cap to
+              // apply the trim; otherwise leave the array as-is (callers can
+              // either use the default 5 or opt out entirely via the boolean
+              // enableCriticConcernsMemory flag).
+              if (maxConcerns > 0 && this.workingMemory.criticConcerns.length > maxConcerns) {
+                this.workingMemory.criticConcerns = this.workingMemory.criticConcerns.slice(-maxConcerns);
+              }
+              logger.debug('[MULTI_AGENT] Critic concern recorded (approved with warnings)', {
+                action: action.command.action,
+                ref: action.command.ref,
+                violations: warnings.length,
+              });
+            }
+          }
         }
       } else if (shouldSkipCritic) {
         criticSkippedLowRisk = true;
+
+        // PR2: Run SafetyInterceptor (Phase 1 deterministic checks) on the
+        // skip path so hallucinated refs and forbidden actions cannot bypass
+        // safety entirely. Default OFF — flip via enableSafetyInterceptorOnSkip.
+        // <1ms overhead. Pure function. See safety-interceptor.ts.
+        if (LITE_ENGINE_FLAGS.enableSafetyInterceptorOnSkip) {
+          const safetyResult = SafetyInterceptor.check({
+            proposedCommand: action.command,
+            parsedSnapshot: input.parsedSnapshot,
+            availableElements: input.snapshotElements,
+            currentUrl: input.url,
+            hasCredentials: input.hasCredentials,
+            formAnalysis: observation.formAnalysis,
+            visionConflicts: input.visionHints?.conflicts,
+            isPageLoading: observation.loadingState?.isLoading,
+            coveredElements: (observation.overlapInfo || []).map(o => o.coveredRef),
+            blackboard,
+            lastBlockerInfo: input.lastBlockerInfo,
+            iteration: input.iteration,
+          });
+
+          if (!safetyResult.safe) {
+            // Skip-path action blocked by deterministic safety check.
+            // Bail out to monolithic fallback so the engine can re-decide
+            // with full Critic involvement on the next attempt. The blocked
+            // action is recorded in rejectedAction so the engine's blacklist
+            // (LITE_ENGINE_FLAGS.enableNegativeReinforcement) prevents repeats.
+            //
+            // We deliberately do NOT enter the AI Critic reject cascade
+            // (try alternatives → re-strategize → backtrack) because:
+            //   1. We never had an AI Critic verdict here (skip path)
+            //   2. The cascade is tightly coupled to AI verdict context
+            //   3. Monolithic fallback is the existing safe escape hatch
+            //
+            // Net effect: hallucinated/forbidden actions on the skip path
+            // cause one extra monolithic iteration instead of executing.
+            this.metrics.skipPathSafetyBlockCount++;
+            this.metrics.monolithicFallbackCount++;
+            this.recordCircuitBreakerResult(false);
+
+            logger.warn('[SAFETY_INTERCEPTOR] Skip-path action blocked', {
+              reason: safetyResult.reason,
+              action: action.command.action,
+              ref: action.command.ref,
+              iteration: input.iteration,
+            });
+
+            return {
+              success: false,
+              rejectedAction: action.command.ref ? {
+                action: action.command.action,
+                ref: action.command.ref,
+                elementHint: action.reasoning?.slice(0, 60) || action.command.ref,
+                reason: `SAFETY_INTERCEPTOR: ${safetyResult.reason ?? 'deterministic block'}`,
+              } : undefined,
+            };
+          }
+        }
+
+        // Safety passed (or feature flag off) — original skip path behavior
         this.metrics.criticLowRiskSkipCount++;
         this.metrics.criticSkippedCount++;
         this.consecutiveCriticRejections = 0;

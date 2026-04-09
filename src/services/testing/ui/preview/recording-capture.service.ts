@@ -1036,6 +1036,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       id: recStepId(),
       type: 'wait_for',
       description: 'Auto: wait for URL change',
+      // V13: Mark as auto-injected so runtime executor can apply the
+      // page-settle fallback when replay behaves differently from recording
+      // (e.g. i18n toggle, feature flag, A/B bucket, cached state).
+      isAutoInjected: true,
       options: {
         urlMatcher: {
           changedFrom: previousUrl,

@@ -90,12 +90,28 @@ export class PreviewVideoStreamService {
   private page: Page | null = null;
   private pageCloseHandler: (() => void) | null = null;
   private pageLoadHandler: (() => void) | null = null;
+  private pageFrameNavigatedHandler: ((frame: unknown) => void) | null = null;
 
   // Deferred frame injection timers (cleared on stop to prevent orphan execution).
   // pageLoadInjectTimer: single slot, replaced on each SPA navigation (not accumulated).
   // initialInjectTimer: one-shot, fired once after start().
   private pageLoadInjectTimer: NodeJS.Timeout | null = null;
   private initialInjectTimer: NodeJS.Timeout | null = null;
+
+  // V13: Hardened first-frame guarantee.
+  // After start() (or any main-frame navigation that wipes the screencast
+  // pipeline) we MUST get at least one frame to the client — CDP screencast
+  // does not emit on statically-rendered pages without paint/damage events,
+  // so we cannot rely on it. ensureFirstFrame() retries injectFrame() with
+  // backoff until either (a) one of our injects succeeds, or (b) a real CDP
+  // frame arrives, or (c) the stream is stopped.
+  private gotFirstFrame = false;
+  private ensureFirstFrameTimer: NodeJS.Timeout | null = null;
+  private ensureFirstFrameAttempts = 0;
+  // Last main-frame URL we issued a guarantee for. Used to distinguish "real"
+  // navigations (worth re-arming the guarantee) from spurious framenavigated
+  // events (sub-frames, hash-only changes, repeated fires).
+  private lastGuaranteedUrl: string | null = null;
 
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
@@ -153,6 +169,33 @@ export class PreviewVideoStreamService {
       };
       page.on('load', this.pageLoadHandler);
 
+      // V13: Also listen for framenavigated, but ONLY for main-frame
+      // transitions to a new URL. Why:
+      //   • `load` only fires on a fresh full navigation. If the page was
+      //     already loaded by the time we attached our listener (exactly what
+      //     happens on session reset — resetSession awaits goto() before
+      //     re-starting the stream), `load` will never fire again until the
+      //     user navigates.
+      //   • framenavigated wakes us up on SPA / pushState transitions where
+      //     `load` does not fire.
+      //   • Filtering out sub-frames (iframes, ads) and same-URL re-fires
+      //     prevents re-arming a healthy stream and duplicating screenshots.
+      this.pageFrameNavigatedHandler = ((frame: { parentFrame: () => unknown | null; url: () => string }) => {
+        if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) return;
+        // Sub-frame navigations — ignore.
+        if (frame && typeof frame.parentFrame === 'function' && frame.parentFrame() !== null) return;
+        // Same URL as the last guarantee — ignore (avoids dup work and broken seq).
+        let frameUrl: string | null = null;
+        try { frameUrl = typeof frame.url === 'function' ? frame.url() : null; } catch { frameUrl = null; }
+        if (frameUrl && frameUrl === this.lastGuaranteedUrl) return;
+        // Real main-frame nav to a new URL — re-arm the first-frame guarantee.
+        this.gotFirstFrame = false;
+        this.ensureFirstFrameAttempts = 0;
+        this.lastGuaranteedUrl = frameUrl;
+        this.scheduleFirstFrameAttempt(0);
+      }) as (frame: unknown) => void;
+      page.on('framenavigated', this.pageFrameNavigatedHandler as (frame: unknown) => void);
+
       // Create CDP session
       const context = page.context();
       this.cdpSession = await context.newCDPSession(page);
@@ -183,15 +226,27 @@ export class PreviewVideoStreamService {
         resolution: `${PREVIEW_VIDEO_CONFIG.maxWidth}x${PREVIEW_VIDEO_CONFIG.maxHeight}`,
       });
 
-      // V11: Inject an immediate screenshot frame after start.
-      // CDP screencast may not emit frames on already-loaded/static pages,
-      // so we guarantee at least one frame reaches the frontend.
-      this.initialInjectTimer = setTimeout(() => {
-        this.initialInjectTimer = null;
-        if (this.isStreaming && !this.isStopped && !this.cdpSessionClosed) {
-          this.injectFrame().catch(() => {});
-        }
-      }, 500);
+      // V13: Seed lastGuaranteedUrl with the page's current URL so the
+      // immediately-following framenavigated event for THIS same URL does not
+      // re-arm the guarantee. We only want main-frame nav to a NEW URL to
+      // re-arm.
+      try { this.lastGuaranteedUrl = page.url(); } catch { this.lastGuaranteedUrl = null; }
+
+      // V13: Hardened first-frame guarantee.
+      // CDP screencast does NOT emit frames on already-loaded / statically-rendered
+      // pages — it requires a paint/damage event. Sites that finish rendering
+      // before our screencast subscription will sit silent forever waiting for
+      // user interaction. The pre-V13 code had a single 500 ms `injectFrame()`
+      // attempt with a silent catch, so any transient failure (page in
+      // navigation, screenshot busy, frame size cap) meant the entire stream
+      // appeared dead until the user clicked.
+      //
+      // V13 fix: kick off ensureFirstFrame() which retries injectFrame() with
+      // backoff (immediate, 250ms, 500ms, 900ms, 1800ms) until either the
+      // inject succeeds OR a real CDP screencast frame arrives. The flag is
+      // also re-armed on framenavigated, so navigations during the stream's
+      // lifetime are covered too.
+      this.scheduleFirstFrameAttempt(150);
 
       return true;
     } catch (error) {
@@ -344,6 +399,16 @@ export class PreviewVideoStreamService {
       this.consecutiveFailures = 0;
       this.framesEmitted++;
       this.lastFrameTime = now;
+
+      // V13: First real CDP frame arrived — first-frame guarantee satisfied.
+      // Cancel any pending inject retry to avoid duplicate work / wasted screenshots.
+      if (!this.gotFirstFrame) {
+        this.gotFirstFrame = true;
+        if (this.ensureFirstFrameTimer) {
+          clearTimeout(this.ensureFirstFrameTimer);
+          this.ensureFirstFrameTimer = null;
+        }
+      }
 
       // Resume if was paused
       if (this.isPaused) {
@@ -498,6 +563,11 @@ export class PreviewVideoStreamService {
       clearTimeout(this.initialInjectTimer);
       this.initialInjectTimer = null;
     }
+    // V13: Cancel any pending first-frame retry
+    if (this.ensureFirstFrameTimer) {
+      clearTimeout(this.ensureFirstFrameTimer);
+      this.ensureFirstFrameTimer = null;
+    }
 
     // Remove page close listener
     if (this.page && this.pageCloseHandler) {
@@ -517,6 +587,16 @@ export class PreviewVideoStreamService {
         // Ignore
       }
       this.pageLoadHandler = null;
+    }
+
+    // V13: Remove framenavigated listener
+    if (this.page && this.pageFrameNavigatedHandler) {
+      try {
+        this.page.off('framenavigated', this.pageFrameNavigatedHandler);
+      } catch {
+        // Ignore
+      }
+      this.pageFrameNavigatedHandler = null;
     }
 
     // Remove CDP listener
@@ -551,6 +631,95 @@ export class PreviewVideoStreamService {
   }
 
   /**
+   * V13: Public re-arm — used by external callers (refresh handler, SPA nav
+   * hooks) to restart the first-frame guarantee on an existing live stream
+   * after the underlying page repainted but CDP screencast hasn't caught up.
+   *
+   * Idempotent: safe to call repeatedly. If a real CDP frame arrives during
+   * the retry chain, it cancels itself.
+   */
+  armFirstFrameGuarantee(): void {
+    if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) return;
+    this.gotFirstFrame = false;
+    this.ensureFirstFrameAttempts = 0;
+    this.scheduleFirstFrameAttempt(0);
+  }
+
+  /**
+   * V13: Schedule one attempt of the first-frame guarantee retry chain.
+   *
+   * Backoff schedule (cumulative): 0ms → 150ms → 400ms → 900ms → 1800ms.
+   * After 5 unsuccessful attempts (~3.3s wall time) we stop and emit a warn
+   * log instead of silently failing forever. Any real CDP screencast frame
+   * arriving in the meantime will set `gotFirstFrame=true` and abort the
+   * chain (see handleScreencastFrame).
+   *
+   * Re-armable: clearing `gotFirstFrame=false` and resetting `attempts=0`
+   * allows the helper to be reused after navigations (see framenavigated
+   * handler in start()).
+   */
+  private scheduleFirstFrameAttempt(delayMs: number): void {
+    // Drop if we already satisfied the guarantee or the stream is dead.
+    if (this.gotFirstFrame || !this.isStreaming || this.isStopped || this.cdpSessionClosed) {
+      return;
+    }
+    // Replace any pending attempt so we don't double-schedule.
+    if (this.ensureFirstFrameTimer) {
+      clearTimeout(this.ensureFirstFrameTimer);
+      this.ensureFirstFrameTimer = null;
+    }
+    this.ensureFirstFrameTimer = setTimeout(async () => {
+      this.ensureFirstFrameTimer = null;
+      if (this.gotFirstFrame || !this.isStreaming || this.isStopped || this.cdpSessionClosed) {
+        return;
+      }
+
+      this.ensureFirstFrameAttempts++;
+      const attemptNo = this.ensureFirstFrameAttempts;
+
+      // Try the actual inject. injectFrame() returns true on success, false on
+      // any failure (page closed, screenshot threw, frame too large, nsp gone).
+      let ok = false;
+      try {
+        ok = await this.injectFrame();
+      } catch (err) {
+        // injectFrame already swallows internally, but defend against future changes.
+        ok = false;
+        logger.debug('[PREVIEW_VIDEO] First-frame attempt threw', {
+          previewSessionId: this.previewSessionId,
+          attempt: attemptNo,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      if (ok) {
+        this.gotFirstFrame = true;
+        logger.debug('[PREVIEW_VIDEO] First frame guaranteed via inject', {
+          previewSessionId: this.previewSessionId,
+          attempts: attemptNo,
+        });
+        return;
+      }
+
+      // Schedule next attempt or give up loudly.
+      // Schedule cumulative ladder: 150 → 400 → 900 → 1800 ms (relative to previous).
+      const ladder = [250, 500, 900, 1800];
+      const nextDelay = ladder[attemptNo - 1];
+      if (nextDelay !== undefined) {
+        this.scheduleFirstFrameAttempt(nextDelay);
+      } else {
+        // 5 attempts (initial + 4 retries) all failed AND CDP screencast also
+        // hasn't emitted a frame. Surface this loudly — pre-V13 this was a
+        // silent debug log, hiding exactly the bug we're trying to fix.
+        logger.warn('[PREVIEW_VIDEO] First-frame guarantee exhausted — stream may appear blank until user interacts', {
+          previewSessionId: this.previewSessionId,
+          attempts: attemptNo,
+        });
+      }
+    }, delayMs);
+  }
+
+  /**
    * Inject a manual screenshot frame into the video stream.
    * Used after page reload/navigation when CDP screencast may lag behind.
    */
@@ -564,6 +733,13 @@ export class PreviewVideoStreamService {
         type: 'jpeg',
         quality: PREVIEW_VIDEO_CONFIG.quality,
       });
+
+      // V13: TOCTOU re-check — between the screenshot await and the emit
+      // below, stop()/cleanup() may have run on another microtask and nulled
+      // out this.nsp. Without this guard the emit would NPE.
+      if (!this.isStreaming || this.isStopped || !this.nsp) {
+        return false;
+      }
 
       this.seq++;
       this.framesEmitted++;
@@ -587,6 +763,16 @@ export class PreviewVideoStreamService {
       };
 
       this.nsp.to(this.room).emit('preview:video:frame', payload, buf);
+
+      // V13: Any successful inject satisfies the first-frame guarantee.
+      // Cancel pending retries so they don't fire after we've already delivered.
+      if (!this.gotFirstFrame) {
+        this.gotFirstFrame = true;
+        if (this.ensureFirstFrameTimer) {
+          clearTimeout(this.ensureFirstFrameTimer);
+          this.ensureFirstFrameTimer = null;
+        }
+      }
 
       logger.debug('[PREVIEW_VIDEO] Injected manual frame after navigation', {
         previewSessionId: this.previewSessionId,
@@ -738,6 +924,20 @@ export class PreviewVideoStreamRegistry {
       return stream.injectFrame();
     }
     return false;
+  }
+
+  /**
+   * V13: Re-arm the first-frame guarantee for an existing stream.
+   * Use after page reload / refresh / SPA navigation when the existing CDP
+   * screencast may emit no frames until something repaints. Idempotent and
+   * cheap if a real frame arrives in the meantime — the helper internally
+   * cancels its retry chain on the first successful frame.
+   */
+  armFirstFrameGuarantee(previewSessionId: string): void {
+    const stream = this.streams.get(previewSessionId);
+    if (stream) {
+      stream.armFirstFrameGuarantee();
+    }
   }
 
   /**

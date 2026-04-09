@@ -45,6 +45,8 @@ import { GoalExpander } from '../analysis/goal-expander';
 import type { NetworkTracker } from '../collectors/network-tracker';
 import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { checkTestCancelled, withCancellation } from '../../../playwright/utils/test-cancellation-checker';
+import { SupervisorAgent } from '../agents/supervisor-agent';
+import type { MultiAgentInput } from '../agents/types';
 
 import { TestBlackboard } from './blackboard';
 import { CommandExecutor, type CommandExecutorIntegrations } from './command-executor';
@@ -98,6 +100,16 @@ export class TestPipeline {
   /** Max consecutive same-state rounds before flagging stuck */
   private static readonly MAX_SAME_STATE_ROUNDS = 3;
 
+  /**
+   * PR-Hybrid: SupervisorAgent instance, created lazily when
+   * enableHybridSafety is true. ONE instance per run — state (interventionCount,
+   * stateHashes, knownGoodUrls, tier2InvocationCount) accumulates across
+   * rounds and is never reset mid-run. See supervisor-agent.ts for details.
+   */
+  private supervisor: SupervisorAgent | null = null;
+  /** PR-Hybrid: Track last action for Supervisor state hash + recording */
+  private lastActionForSupervisor: { action: string; ref?: string; url?: string } | undefined;
+
   constructor(integrations: PipelineIntegrations) {
     this.integrations = integrations;
   }
@@ -122,6 +134,26 @@ export class TestPipeline {
       config.testId,
       config.hasCredentials,
     );
+    // PR-Hybrid: propagate goalUrl into blackboard for Supervisor wrong-page detection
+    if (config.goalUrl) {
+      this.blackboard.setGoalUrl(config.goalUrl);
+    }
+
+    // PR-Hybrid: Create SupervisorAgent ONCE per run when hybrid safety is on.
+    // State accumulates across all rounds — intervention counts, state hashes,
+    // known-good URLs, and per-run Tier 2 budget are never reset mid-run.
+    if (config.enableHybridSafety) {
+      this.supervisor = new SupervisorAgent();
+      // Seed blackboard with empty default so CommandExecutor never reads
+      // undefined. Real Tier 1 computation fills it in starting round 1.
+      // Without this seed, round 1's first command would see undefined and
+      // skip forbidden-action enforcement silently.
+      this.blackboard.setSupervisorBlackboard(TestPipeline.buildEmptySupervisorBlackboard());
+      logger.info('[PIPELINE] Hybrid safety enabled — SupervisorAgent instantiated', {
+        testId: config.testId,
+        goalUrl: config.goalUrl,
+      });
+    }
 
     // ── Initialize CommandExecutor with ALL integrations ──
     const cmdIntegrations: CommandExecutorIntegrations = {
@@ -198,6 +230,21 @@ export class TestPipeline {
           url: roundUrl,
           progressScore: this.blackboard.getProgressScore(),
         });
+
+        // ════════════════════════════════════════════════════════════
+        // PR-HYBRID: SUPERVISOR TIER 1 (deterministic watchdog)
+        // Runs at the START of each round to detect:
+        //   - State hash repeats (stuck on same state)
+        //   - Jaccard similarity loops (soft loops)
+        //   - Wrong-page navigation (if goalUrl is set)
+        //   - Recovery mode activation → populates forbidden actions
+        //     which CommandExecutor reads via getSupervisorBlackboard()
+        //
+        // Tier 2 (AI diagnosis) and hard-backtrack are NOT wired in this
+        // PR — they require control-flow changes (skip Planner/Executor
+        // round, force navigate_to). Planned for follow-up PR.
+        // ════════════════════════════════════════════════════════════
+        this.runSupervisorTier1(pipelineRound, roundUrl);
 
         // ════════════════════════════════════════════════════════════
         // STEP 1: PLANNER
@@ -425,6 +472,13 @@ export class TestPipeline {
           this.blackboard.setProgressScore(reviewProgress);
         }
         this.emitProgress(pipelineRound, maxRounds, `Round ${pipelineRound} complete (${review.verdict})`);
+
+        // ════════════════════════════════════════════════════════════
+        // PR-HYBRID: SUPERVISOR END-OF-ROUND BOOKKEEPING
+        // Record last action + reset counters on progress. Runs AFTER
+        // Reviewer so we see the final round state and progress score.
+        // ════════════════════════════════════════════════════════════
+        this.updateSupervisorEndOfRound();
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -765,6 +819,185 @@ export class TestPipeline {
   // ═══════════════════════════════════════════════════════════════════════
   // PRIVATE HELPERS
   // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * PR-Hybrid: Build an empty Supervisor blackboard (no recovery, no forbidden
+   * actions). Used to seed the TestBlackboard on hybrid startup so CommandExecutor
+   * always sees a non-undefined blackboard from round 1 command 1 onwards.
+   *
+   * The shape mirrors SupervisorAgent.computeBlackboard() output so downstream
+   * consumers (SafetyInterceptor.checkForbiddenActions, logging) can treat the
+   * seed identically to a real Tier 1 result.
+   */
+  private static buildEmptySupervisorBlackboard(): import('../agents/types').SupervisorBlackboard {
+    return {
+      recoveryMode: false,
+      recoveryTier: 0,
+      currentBlocker: undefined,
+      forbiddenActions: [],
+      knownGoodUrls: [],
+      backtrackFailures: 0,
+      interventionCount: 0,
+      stateHash: '',
+      stateHashRepeatCount: 0,
+      hardBacktrack: false,
+      wrongPageCount: 0,
+      jaccardSimilarity: 0,
+      softLoopCount: 0,
+    };
+  }
+
+  /**
+   * PR-Hybrid: Run Supervisor Tier 1 (deterministic watchdog) at the start
+   * of each pipeline round. Populates `blackboard.supervisorBlackboard`
+   * which CommandExecutor reads for forbidden-action enforcement via
+   * SafetyInterceptor.
+   *
+   * Tier 1 only — no AI calls, no control-flow changes. Tier 2 (AI diagnosis)
+   * and hard backtrack are planned for follow-up PRs.
+   *
+   * INVARIANT: on exit from this method, when `this.supervisor` is non-null,
+   * `this.blackboard.getSupervisorBlackboard()` MUST return a non-undefined
+   * value. Never leave it in a stale/undefined state — even on error, fall
+   * back to an empty blackboard so SafetyInterceptor has something to read.
+   *
+   * Never throws — wrapped in try/catch. On error, blackboard is reset to
+   * empty (no forbidden actions, no recovery mode) so hybrid safety degrades
+   * to SafetyInterceptor-only with zero forbidden-action context.
+   */
+  private runSupervisorTier1(pipelineRound: number, roundUrl: string): void {
+    if (!this.supervisor) return;
+
+    try {
+      const snapshot = this.blackboard.getCurrentPageSnapshot();
+      const snapshotElements = this.blackboard.getCurrentSnapshot() ?? '';
+
+      // Round 1 edge case: if no snapshot was captured yet (first round,
+      // before any observe_page), Supervisor's state-hash computation would
+      // hash an empty string. Seed the blackboard with an empty result and
+      // skip the compute call entirely. Next round (after observe_page) the
+      // real computation will run.
+      if (!snapshot && pipelineRound === 1) {
+        this.blackboard.setSupervisorBlackboard(TestPipeline.buildEmptySupervisorBlackboard());
+        this.trace('supervisor_tier1_seed', {
+          round: pipelineRound,
+          reason: 'no_snapshot_yet',
+        });
+        return;
+      }
+
+      // Compose a MINIMAL MultiAgentInput. Fields we don't have in
+      // Pipeline v2 (auditedDrift, failedActions, full history) are left
+      // undefined — Supervisor reads them optionally and skips if absent.
+      const supervisorInput: MultiAgentInput = {
+        snapshot: snapshotElements,
+        snapshotElements,
+        url: roundUrl,
+        title: snapshot?.title ?? '',
+        goal: this.blackboard.getGoal(),
+        history: this.blackboard.formatHistoryForPrompt(),
+        progressScore: this.blackboard.getProgressScore() / 100, // Supervisor expects 0-1
+        iteration: pipelineRound,
+        isStuck: this.consecutiveSameStateRounds >= TestPipeline.MAX_SAME_STATE_ROUNDS,
+        hasCredentials: this.blackboard.getHasCredentials(),
+        contentHash: this.previousSnapshotHash, // best-effort; not used by Supervisor
+        lastAction: this.lastActionForSupervisor?.action,
+        goalUrl: this.blackboard.getGoalUrl(),
+      };
+
+      const blackboard = this.supervisor.computeBlackboard(supervisorInput);
+      this.blackboard.setSupervisorBlackboard(blackboard);
+
+      if (blackboard.recoveryMode) {
+        this.trace('supervisor_tier1', {
+          round: pipelineRound,
+          recoveryMode: blackboard.recoveryMode,
+          interventionCount: blackboard.interventionCount,
+          jaccardSimilarity: blackboard.jaccardSimilarity,
+          softLoopCount: blackboard.softLoopCount,
+          stateHashRepeatCount: blackboard.stateHashRepeatCount,
+          currentBlocker: blackboard.currentBlocker,
+          forbiddenCount: blackboard.forbiddenActions.length,
+        });
+        logger.info('[PIPELINE] Supervisor Tier 1 detected recovery mode', {
+          round: pipelineRound,
+          interventionCount: blackboard.interventionCount,
+          currentBlocker: blackboard.currentBlocker,
+        });
+      }
+    } catch (error) {
+      // INVARIANT: never leave blackboard undefined. On error, reset to
+      // empty so CommandExecutor reads a consistent (empty) state instead
+      // of stale or missing data.
+      this.blackboard.setSupervisorBlackboard(TestPipeline.buildEmptySupervisorBlackboard());
+      logger.warn('[PIPELINE] Supervisor Tier 1 failed, reset blackboard to empty', {
+        round: pipelineRound,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.trace('supervisor_tier1_error', {
+        round: pipelineRound,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * PR-Hybrid: End-of-round Supervisor bookkeeping.
+   *   - recordAction with the last executed command (from round's commands list)
+   *   - resetOnProgress if progress > 0.1 and not in recovery mode
+   *
+   * Runs AFTER the Reviewer verdict so we have the final progress score.
+   */
+  private updateSupervisorEndOfRound(): void {
+    if (!this.supervisor) return;
+
+    try {
+      const lastRound = this.blackboard.getLastRound();
+      if (lastRound && lastRound.commands.length > 0) {
+        // Pick the LAST ref-producing command as the round's representative action
+        for (let i = lastRound.commands.length - 1; i >= 0; i--) {
+          const cmd = lastRound.commands[i].command;
+          const args = cmd.args ?? {};
+          if (args.ref || cmd.name === 'navigate_to') {
+            this.lastActionForSupervisor = {
+              action: cmd.name,
+              ref: args.ref,
+              url: args.url,
+            };
+            this.supervisor.recordAction({
+              action: cmd.name,
+              ref: args.ref,
+              url: args.url,
+              value: args.value,
+            });
+            // Also record outcome so Tier 2 context is populated (when wired).
+            // Use explicit ternary instead of `?.slice(0, 80) ?? ''` — the
+            // latter silently turns an empty string error into just "failed: "
+            // because ?? only short-circuits on null/undefined, not empty strings.
+            const result = lastRound.commands[i].result;
+            const errorText = result.error && result.error.length > 0
+              ? result.error.slice(0, 80)
+              : 'unknown error';
+            this.supervisor.recordActionOutcome(
+              result.success ? 'success' : `failed: ${errorText}`,
+            );
+            break;
+          }
+        }
+      }
+
+      // Reset counters on meaningful progress (mirrors multi-agent orchestrator)
+      const bb = this.blackboard.getSupervisorBlackboard();
+      const progressScore = this.blackboard.getProgressScore() / 100;
+      if (bb && !bb.recoveryMode && progressScore > 0.1) {
+        this.supervisor.resetOnProgress(progressScore);
+      }
+    } catch (error) {
+      logger.warn('[PIPELINE] Supervisor end-of-round update failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
   private isTimedOut(timeoutMs: number): boolean {
     return Date.now() - this.startTime >= timeoutMs;

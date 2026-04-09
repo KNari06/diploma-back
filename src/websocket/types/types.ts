@@ -954,6 +954,13 @@ export interface PreviewIntentStep {
   evidence?: StepEvidence;
   /** V15: Tab index this step targets (0 = initial tab, 1+ = popups) */
   tabIndex?: number;
+  /**
+   * V13: True when this step was created automatically (recorder nav-capture
+   * or auto-inject pass) rather than by an explicit user action. Runtime uses
+   * this flag to apply a softer execution policy — e.g. wait_for steps with a
+   * page-settle fallback instead of a hard URL-change timeout.
+   */
+  isAutoInjected?: boolean;
 }
 
 /**
@@ -993,6 +1000,8 @@ export interface PreviewRunStartRequest {
   steps?: PreviewIntentStep[];
   /** Optional: startUrl override (used with inline steps when test case may lack a URL). */
   startUrl?: string;
+  /** Optional: mobile runner session ID for mobile test cases. */
+  mobileSessionId?: string;
 }
 
 /**

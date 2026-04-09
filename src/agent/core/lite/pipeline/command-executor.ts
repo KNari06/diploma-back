@@ -34,8 +34,104 @@ import type { DynamicAction } from '@/agent/types/intelligent-testing.types';
 import type { GraphBuilder, GraphActionResult } from '@/agent/utils/visualization/graph-builder.service';
 import type { LiteTraceWriter } from '../trace/lite-trace-writer';
 import { shouldRedactField } from '../analysis/field-classifier';
+import { buildParsedSnapshot } from '../agents/parsed-snapshot';
+import { SafetyInterceptor, type SafetyInput } from '../agents/safety-interceptor';
 import { TestBlackboard } from './blackboard';
 import type { CommandName, CommandResult, PipelineConfig } from './types';
+
+/**
+ * PR-Hybrid: Commands that carry a `ref` parameter and can be intercepted
+ * by SafetyInterceptor. Terminal/meta commands (mark_done, report_blocked,
+ * navigate_to, press_key, scroll_page, wait_for_page, observe_page) are
+ * explicitly excluded — they are either goal-signalling or global actions.
+ *
+ * EXPORTED for unit tests — ensures the set is in sync with the switch/case
+ * dispatch table and cannot drift silently.
+ */
+export const REF_BASED_COMMANDS: ReadonlySet<CommandName> = new Set<CommandName>([
+  'click_element',
+  'fill_field',
+  'select_option',
+  'hover_element',
+  'scroll_to_element',
+  'toggle_element',
+  'set_range',
+  'select_date',
+  'clear_field',
+]);
+
+/**
+ * PR-Hybrid: Placeholder inserted into preliminary fill_field commands
+ * when the LLM marked the field as sensitive. The real credential is
+ * substituted LATER by overrideCredentialFillValue in the command handler.
+ * This placeholder never reaches Playwright — it exists only so any
+ * downstream logging of the preliminary command (SafetyInterceptor, trace
+ * events, insights) never sees plaintext credentials.
+ */
+const SENSITIVE_VALUE_PLACEHOLDER = '[SENSITIVE]';
+
+/**
+ * PR-Hybrid: Build a preliminary AICommand from tool-call args. Used by
+ * runSafetyInterceptor to validate the shape before dispatch. Returns
+ * null for non-ref commands or malformed args.
+ *
+ * Security invariant: for fill_field with is_sensitive=true, the real
+ * value is NEVER propagated into the preliminary command. This is
+ * defence-in-depth against future logging bugs in SafetyInterceptor
+ * or trace writers. Credential override in the per-command handler
+ * (overrideCredentialFillValue) substitutes the real credential from
+ * config.credentials BEFORE the command reaches Playwright.
+ *
+ * For non-sensitive fill_field, the value IS propagated so
+ * SafetyInterceptor's Policy 4 (PII leak detection via SSN/credit-card
+ * regex) can catch cases where the LLM forgot to mark a sensitive field.
+ *
+ * Free function — no `this` dependencies, fully unit-testable.
+ */
+export function buildPrelimCommand(
+  name: CommandName,
+  args: Record<string, any>,
+): AICommand | null {
+  const ref: string | undefined = args.ref;
+  if (!ref) return null;
+
+  switch (name) {
+    case 'click_element':
+      return { action: 'click', ref };
+    case 'fill_field': {
+      const isSensitive = args.is_sensitive === true;
+      // Security: scrub value when sensitive. SafetyInterceptor doesn't need
+      // the real credential to validate shape/policy — only the isSensitive
+      // flag matters for Policy 1 (password in text field) and Policy 3
+      // (HTTP credentials).
+      const value = isSensitive
+        ? SENSITIVE_VALUE_PLACEHOLDER
+        : (args.value ?? '');
+      return {
+        action: 'fill',
+        ref,
+        value,
+        isSensitive,
+      };
+    }
+    case 'select_option':
+      return { action: 'select', ref, value: args.value };
+    case 'hover_element':
+      return { action: 'hover', ref };
+    case 'scroll_to_element':
+      return { action: 'scroll', ref, targetRef: ref };
+    case 'toggle_element':
+      return { action: 'toggle', ref };
+    case 'set_range':
+      return { action: 'setRange', ref, value: String(args.value ?? '') };
+    case 'select_date':
+      return { action: 'selectDate', ref, value: String(args.value ?? '') };
+    case 'clear_field':
+      return { action: 'clear', ref };
+    default:
+      return null;
+  }
+}
 
 /**
  * External integrations passed from TestPipeline.
@@ -49,7 +145,33 @@ export interface CommandExecutorIntegrations {
   consoleCollector?: ConsoleCollector;
 }
 
+/**
+ * PR-Hybrid: Auto-disable threshold for SafetyInterceptor on consecutive
+ * exceptions. If SafetyInterceptor throws 3 times in a single run (e.g., a
+ * code bug, malformed snapshot, or runtime type error), it self-disables
+ * for the rest of the run so the next failure doesn't burn more CPU.
+ *
+ * Rationale: the interceptor is defence-in-depth on top of existing
+ * checkRefExists + clarification gates. If it's broken, falling back to
+ * the baseline is better than crashing the pipeline or silently retrying
+ * the same broken code on every command.
+ */
+const SAFETY_INTERCEPTOR_FAILURE_THRESHOLD = 3;
+
 export class CommandExecutor {
+  /**
+   * PR-Hybrid: Count of consecutive SafetyInterceptor exceptions in this
+   * run. Reset to 0 on any successful check. When it hits the threshold,
+   * the interceptor is disabled via `safetyInterceptorDisabled = true`.
+   */
+  private safetyInterceptorFailureCount = 0;
+  /**
+   * PR-Hybrid: One-way latch. Once true, runSafetyInterceptor short-circuits
+   * to null (command proceeds) without running any checks. Stays true for
+   * the rest of this CommandExecutor instance's lifetime.
+   */
+  private safetyInterceptorDisabled = false;
+
   constructor(
     private page: Page,
     private actionExecutor: ActionExecutor,
@@ -60,17 +182,46 @@ export class CommandExecutor {
 
   /**
    * Execute a single Playwright command.
-   * 1. Run deterministic safety checks
-   * 2. Map to AICommand format
-   * 3. Execute via ActionExecutor
-   * 4. Update Blackboard + emit graph/trace
-   * 5. Return structured result for LLM
+   * 1. (PR-Hybrid) Run SafetyInterceptor for ref-based commands if enableHybridSafety=true
+   * 2. Run deterministic safety checks (checkRefExists)
+   * 3. Map to AICommand format
+   * 4. Execute via ActionExecutor
+   * 5. Update Blackboard + emit graph/trace
+   * 6. Return structured result for LLM
    */
   async execute(commandName: string, args: Record<string, any>): Promise<CommandResult> {
     const name = commandName as CommandName;
     const startMs = Date.now();
 
     try {
+      // ═══════════════════════════════════════════════════════════════════
+      // PR-Hybrid: SafetyInterceptor (Critic Phase 1 deterministic checks)
+      //
+      // Runs BEFORE the per-command handlers. If the gated feature flag is
+      // ON and the command is ref-based, we build a preliminary AICommand,
+      // run the interceptor, and short-circuit on block.
+      //
+      // Design invariants:
+      //   - Terminal commands (mark_done, report_blocked) are NEVER blocked
+      //   - Meta commands (observe_page, navigate_to, press_key, etc.)
+      //     don't go through the interceptor (no ref to validate)
+      //   - Interceptor NEVER throws — caught by try/catch, logs warn,
+      //     falls through to normal dispatch as a defence-in-depth fallback
+      //   - Trace events are emitted even on block so observability stays
+      //     consistent with unblocked commands
+      //   - Existing checkRefExists + clarification gates still run in
+      //     command methods — this is intentional defence-in-depth
+      // ═══════════════════════════════════════════════════════════════════
+      if (this.config.enableHybridSafety && REF_BASED_COMMANDS.has(name)) {
+        const safetyBlockResult = this.runSafetyInterceptor(name, args);
+        if (safetyBlockResult) {
+          // Trace the block so dashboards can count it
+          this.traceCommand(name, args, safetyBlockResult, Date.now() - startMs);
+          // Do NOT emit graph action node — no action was executed
+          return safetyBlockResult;
+        }
+      }
+
       let result: CommandResult;
 
       switch (name) {
@@ -800,6 +951,156 @@ export class CommandExecutor {
   // ═══════════════════════════════════════════════════════════════════════
   // SAFETY CHECKS (deterministic, <1ms, no AI)
   // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * PR-Hybrid: Run SafetyInterceptor (Critic Phase 1 deterministic checks)
+   * on a ref-based command BEFORE dispatch. Returns a CommandResult if the
+   * action is blocked, or null if the action is safe to proceed.
+   *
+   * Safety invariants:
+   *   - Terminal commands (mark_done, report_blocked) never reach this path
+   *     (filtered by REF_BASED_COMMANDS set in execute())
+   *   - Never throws — any internal error is caught, counted, and on the
+   *     third consecutive failure the interceptor self-disables for the
+   *     rest of this CommandExecutor instance's lifetime. Defence-in-depth
+   *     via existing checkRefExists + clarification gates continues to work.
+   *   - Only active when config.enableHybridSafety === true AND not
+   *     self-disabled after repeated failures.
+   */
+  private runSafetyInterceptor(
+    name: CommandName,
+    args: Record<string, any>,
+  ): CommandResult | null {
+    // Auto-disable latch: if we've already hit the failure threshold, skip
+    // the interceptor entirely. This prevents burning CPU on a broken check
+    // and keeps logs clean (one error log total, not one per command).
+    if (this.safetyInterceptorDisabled) {
+      return null;
+    }
+
+    try {
+      const snapshot = this.blackboard.getCurrentPageSnapshot();
+      if (!snapshot) {
+        // No snapshot yet — let the command handler produce the standard
+        // "call observe_page first" error. This is NOT an interceptor failure.
+        return null;
+      }
+
+      // Build preliminary AICommand from args. For fill_field with sensitive
+      // flag, we scrub the value to a placeholder so it never enters any
+      // downstream logging path (see buildPrelimCommand for details).
+      const prelimCommand = buildPrelimCommand(name, args);
+      if (!prelimCommand) return null; // unknown or incompatible shape
+
+      // Build ParsedSnapshot lazily — same structure used by multi-agent
+      // Critic and SafetyInterceptor.
+      const parsedSnapshot = buildParsedSnapshot(snapshot);
+
+      // Compose formatted string fallback (preserves regex path in Safety
+      // Interceptor if parsedSnapshot is ever absent).
+      const availableElements = this.blackboard.getCurrentSnapshot() || '';
+
+      const safetyInput: SafetyInput = {
+        proposedCommand: prelimCommand,
+        parsedSnapshot,
+        availableElements,
+        currentUrl: snapshot.url,
+        hasCredentials: this.config.hasCredentials,
+        // Pipeline v2 doesn't use Observer's formAnalysis today — pass
+        // undefined so password-field policy skips gracefully.
+        formAnalysis: undefined,
+        // Pipeline v2 doesn't have visionHints wired yet — future work.
+        visionConflicts: undefined,
+        // Pipeline v2 doesn't track loading state the same way — leave off.
+        isPageLoading: undefined,
+        // Pipeline v2 has no overlapInfo structure — leave off.
+        coveredElements: undefined,
+        // HYBRID: pull forbidden-actions context from supervisor blackboard
+        // (pre-seeded on hybrid startup, refreshed at start of each round —
+        // never undefined when supervisor is enabled).
+        blackboard: this.blackboard.getSupervisorBlackboard(),
+        // Pipeline v2 has no Layer-3 blocker tracking today — leave off.
+        lastBlockerInfo: undefined,
+      };
+
+      const result = SafetyInterceptor.check(safetyInput);
+
+      // Successful check — reset the consecutive-failure counter
+      this.safetyInterceptorFailureCount = 0;
+
+      if (result.safe) {
+        return null;
+      }
+
+      logger.warn('[SAFETY_INTERCEPTOR] Pipeline v2 command blocked', {
+        command: name,
+        ref: prelimCommand.ref,
+        reason: result.reason,
+        violations: result.policyViolations.map(v => v.type),
+      });
+
+      // Record an insight so the Planner/Reviewer can see what happened
+      this.blackboard.addInsight(
+        `Safety interceptor blocked ${name}(${prelimCommand.ref ?? ''}): ${result.reason}`,
+      );
+
+      return {
+        success: false,
+        output: '',
+        error: `SAFETY_INTERCEPTOR: ${result.reason ?? 'deterministic block'}`,
+      };
+    } catch (error) {
+      this.safetyInterceptorFailureCount++;
+      const errorMsg = error instanceof Error ? error.message : String(error);
+
+      if (this.safetyInterceptorFailureCount >= SAFETY_INTERCEPTOR_FAILURE_THRESHOLD) {
+        // Self-disable: the interceptor is broken. Log once at error level
+        // so on-call sees it, emit a trace event for dashboards, and set
+        // the latch so we stop burning CPU on every subsequent command.
+        this.safetyInterceptorDisabled = true;
+        logger.error(
+          '[SAFETY_INTERCEPTOR] Disabled for this run after repeated failures — falling back to baseline checkRefExists',
+          {
+            command: name,
+            failureCount: this.safetyInterceptorFailureCount,
+            threshold: SAFETY_INTERCEPTOR_FAILURE_THRESHOLD,
+            lastError: errorMsg,
+          },
+        );
+        try {
+          this.integrations.traceWriter?.write({
+            iteration: this.blackboard.getRounds().length,
+            stage: 'command_execution',
+            eventType: 'safety_interceptor_auto_disabled',
+            spanId: this.integrations.traceWriter.generateSpanId(),
+            payload: {
+              command: name,
+              failureCount: this.safetyInterceptorFailureCount,
+              lastError: errorMsg,
+            },
+          });
+        } catch {
+          // Never break execution for trace failures
+        }
+        this.blackboard.addInsight(
+          `Safety interceptor auto-disabled after ${this.safetyInterceptorFailureCount} failures — baseline checks still active`,
+        );
+      } else {
+        logger.warn('[SAFETY_INTERCEPTOR] Check failed, continuing without block', {
+          command: name,
+          failureCount: this.safetyInterceptorFailureCount,
+          threshold: SAFETY_INTERCEPTOR_FAILURE_THRESHOLD,
+          error: errorMsg,
+        });
+      }
+
+      // Fall through to normal dispatch. Existing checkRefExists +
+      // clarification gates in command handlers still provide baseline
+      // protection. This is intentional fail-open for resilience — but
+      // once we exceed the threshold, we stop attempting the check.
+      return null;
+    }
+  }
 
   /**
    * Validate that a ref exists in the current page snapshot.

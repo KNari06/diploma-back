@@ -28,6 +28,7 @@ import {
 } from './preview-input-helpers';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
+import { webSocketService } from '@/websocket/core/websocket.service';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
 
@@ -2803,16 +2804,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Snapshot is already kicked off inside refreshPage() via setImmediate —
         // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
-        // Inject a fresh screenshot frame so frontend doesn't show stale/white frame
-        // while CDP screencast catches up after page reload
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical — CDP screencast will resume on its own
-          }
-        });
+        // V13: Re-arm the first-frame guarantee instead of issuing a single
+        // injectFrame. After page.reload() the existing CDP screencast may
+        // emit no frames until the page repaints, so we need the same retry
+        // ladder used at start() to survive transient inject failures.
+        try {
+          const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+          getPreviewVideoStreamRegistry().armFirstFrameGuarantee(previewSessionId);
+        } catch {
+          // Non-critical — CDP screencast will resume on its own
+        }
 
         // V9: Recording hook — flush buffers and update URL baseline after refresh
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -2901,15 +2902,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Snapshot is already kicked off inside goBack() via setImmediate —
         // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
-        // Inject a fresh frame so frontend doesn't show stale content
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical
-          }
-        });
+        // V13: Re-arm first-frame guarantee instead of single injectFrame.
+        try {
+          const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+          getPreviewVideoStreamRegistry().armFirstFrameGuarantee(previewSessionId);
+        } catch {
+          // Non-critical
+        }
 
         // V11: Recording hook — record navigate step for back
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -2978,14 +2977,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Snapshot is already kicked off inside goForward() via setImmediate —
         // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical
-          }
-        });
+        // V13: Re-arm first-frame guarantee instead of single injectFrame.
+        try {
+          const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+          getPreviewVideoStreamRegistry().armFirstFrameGuarantee(previewSessionId);
+        } catch {
+          // Non-critical
+        }
 
         // V11: Recording hook — record navigate step for forward
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -3137,28 +3135,26 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result) {
-        emitPageActionResult(socket, previewSessionId, 'reset', true);
-        // V20: page reset is a handshake — the frontend must receive the fresh DOM
-        // even if by coincidence the new page's signature matches the previous. Also
-        // `resetSession` already cleared `lastEmittedSignature` internally, but we
-        // still use the bypass path so the intent is explicit.
-        setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
+        // V13: Restart video + devtools streams on the new page BEFORE we ack
+        // the reset to the client. The pre-V13 flow used setImmediate
+        // fire-and-forget, which left a window where the frontend thought
+        // reset was complete while the new screencast was still being attached.
+        // Awaiting here is cheap (CDP attach + startScreencast is sub-100ms)
+        // and eliminates the race entirely.
+        try {
+          const { getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry, getPreviewSessionService: getSvc } =
+            await import('@/services/testing/ui/preview');
+          const videoReg = getPreviewVideoStreamRegistry();
+          const devtoolsReg = getPreviewDevToolsRegistry();
+          const svc = getSvc();
+          const newPage = svc.getPage(previewSessionId, ensuredUserId);
 
-        // Restart video + devtools streams on the new page (old stream died with old page)
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry, getPreviewSessionService: getSvc } =
-              await import('@/services/testing/ui/preview');
-            const videoReg = getPreviewVideoStreamRegistry();
-            const devtoolsReg = getPreviewDevToolsRegistry();
-            const svc = getSvc();
-            const newPage = svc.getPage(previewSessionId, ensuredUserId);
-
-            if (!newPage) return;
-
+          if (newPage) {
             const room = createRoomName('preview', previewSessionId);
 
-            // Stop old (already dead) stream, then start fresh on new page
+            // Stop old (already dead) stream, then start fresh on new page.
+            // startStream() is mutex'd by the registry so concurrent reset
+            // requests cannot create orphaned CDP sessions.
             await videoReg.stopStream(previewSessionId);
             await videoReg.startStream(previewSessionId, ensuredUserId, room, newPage, socket.nsp);
 
@@ -3167,13 +3163,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             devtoolsReg.start(previewSessionId, room, newPage, socket.nsp);
 
             logger.info('[PREVIEW_STREAM] Streams restarted after reset', { previewSessionId });
-          } catch (restartError) {
-            logger.warn('[PREVIEW_STREAM] Failed to restart streams after reset', {
-              previewSessionId,
-              error: restartError instanceof Error ? restartError.message : String(restartError),
-            });
           }
-        });
+        } catch (restartError) {
+          logger.warn('[PREVIEW_STREAM] Failed to restart streams after reset', {
+            previewSessionId,
+            error: restartError instanceof Error ? restartError.message : String(restartError),
+          });
+        }
+
+        emitPageActionResult(socket, previewSessionId, 'reset', true);
+        // V20: page reset is a handshake — the frontend must receive the fresh DOM
+        // even if by coincidence the new page's signature matches the previous. Also
+        // `resetSession` already cleared `lastEmittedSignature` internally, but we
+        // still use the bypass path so the intent is explicit.
+        setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
 
         // V9: Recording — reset destroys old page+context, so recording must stop
         // (resetSession already sets recording=false and clears buffer)
@@ -3496,7 +3499,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:run:start', async (data) => {
     try {
       const userId = getUserId(socket);
-      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl } = data;
+      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient } = data;
 
       // Validate input
       if (!previewSessionId || !intentTestCaseId) {
@@ -3508,6 +3511,183 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
+      // ── Check if this is a mobile test case ──────────────────────────
+      // Use getByIdInternal (no user_id filter) because in workspaces the
+      // test case owner may differ from the socket user. We only need the
+      // platform field to decide the routing — ownership is validated later
+      // by the preview session service (web) or mobile runner (mobile).
+      const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+      const testCase = await IntentTestCaseService.getByIdInternal(intentTestCaseId);
+      const isMobile = testCase && testCase.platform && testCase.platform.startsWith('mobile_');
+
+      logger.info('[WebSocket] preview:run:start — routing decision', {
+        intentTestCaseId,
+        platform: testCase?.platform ?? 'NO_TEST_CASE',
+        isMobile: !!isMobile,
+        previewSessionId,
+        userId,
+      });
+
+      if (isMobile && testCase) {
+        // Mobile path: delegate to mobile runner via HTTP
+        logger.info('[WebSocket] Starting mobile preview run', {
+          previewSessionId,
+          intentTestCaseId,
+          platform: testCase.platform,
+          userId,
+          socketId: socket.id,
+        });
+
+        // Always use stepsJson from DB — it's already in the format the mobile runner expects
+        const steps = (testCase.stepsJson || []) as any[];
+
+        if (!steps.length) {
+          socket.emit('error', {
+            code: 'NO_STEPS',
+            message: 'No steps to run',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        // If inline steps provided, save them to DB first (Apply All flow)
+        if (Array.isArray(inlineSteps) && inlineSteps.length > 0) {
+          const patch: Record<string, unknown> = { steps: inlineSteps };
+          if (inlineStartUrl) {
+            patch.url = inlineStartUrl;
+            patch.startUrl = inlineStartUrl;
+          }
+          await IntentTestCaseService.update({ id: intentTestCaseId, userId, ...patch });
+        }
+
+        // ── Resolve mobile runner session ID BEFORE emitting started ──
+        // 1. From client payload (if frontend sent it)
+        // 2. From Redis warmup cache (mobile_warmup:{projectId}:{userId})
+        // 3. From previewSessionId (frontend may send mobileSessionId as previewSessionId)
+        // 4. Fail with clear error
+        let mobileSessionId = mobileSessionIdFromClient;
+        if (!mobileSessionId) {
+          try {
+            const { redisConnection } = await import('@/config/infrastructure/queues');
+            const redisKey = `mobile_warmup:${testCase.projectId}:${userId}`;
+            const warmupRaw = await redisConnection.get(redisKey);
+            if (warmupRaw) {
+              const warmup = JSON.parse(warmupRaw);
+              if (warmup.sessionId && warmup.sessionId !== '_booting') {
+                mobileSessionId = warmup.sessionId;
+                logger.info('[WebSocket] Resolved mobile session from Redis warmup', {
+                  mobileSessionId, projectId: testCase.projectId, userId,
+                });
+              }
+            }
+          } catch (err) {
+            logger.warn('[WebSocket] Failed to look up mobile session from Redis', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        // Fallback: the frontend sends mobileSessionId as previewSessionId via effectiveSessionId
+        if (!mobileSessionId && previewSessionId) {
+          mobileSessionId = previewSessionId;
+          logger.info('[WebSocket] Using previewSessionId as mobile session fallback', {
+            mobileSessionId, userId,
+          });
+        }
+        if (!mobileSessionId) {
+          socket.emit('error', {
+            code: 'NO_MOBILE_SESSION',
+            message: 'No active mobile emulator session. Please wait for the emulator to connect.',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+
+        const { getMobileRunnerClient } = await import('@/services/mobile');
+        const mobileClient = getMobileRunnerClient();
+        const { buildMetadataFromTestCase } = await import('@/services/mobile/mobile-runner.types');
+
+        // Emit started AFTER session is validated
+        webSocketService.emitToUser(userId, 'preview:run:started', {
+          previewSessionId,
+          totalSteps: steps.length,
+          startUrl: testCase.startUrl || testCase.url || '',
+          timestamp: new Date().toISOString(),
+        });
+
+        logger.info('[WebSocket] Mobile run: sending steps to runner', {
+          mobileSessionId,
+          stepCount: steps.length,
+          stepTypes: steps.map((s: any) => s.type),
+          stepIds: steps.map((s: any) => s.id),
+        });
+
+        // Run steps on mobile runner (async)
+        mobileClient.runSteps(mobileSessionId, steps, {
+          screenshotEachStep: true,
+          stopOnFailure: true,
+          metadata: buildMetadataFromTestCase(testCase),
+        }).then((result) => {
+          logger.info('[WebSocket] Mobile run completed', {
+            mobileSessionId,
+            totalSteps: result.totalSteps,
+            passedSteps: result.passedSteps,
+            failedSteps: result.failedSteps,
+            skippedSteps: result.skippedSteps,
+            stepErrors: result.steps
+              .filter((s: any) => !s.success)
+              .map((s: any) => ({ stepId: s.stepId, error: s.error })),
+          });
+          // Emit per-step results
+          for (let i = 0; i < result.steps.length; i++) {
+            const stepResult = result.steps[i];
+            webSocketService.emitToUser(userId, 'preview:run:step', {
+              previewSessionId,
+              stepIndex: i,
+              stepId: stepResult.stepId,
+              status: stepResult.success ? 'passed' : 'failed',
+              error: stepResult.error,
+              screenshot: stepResult.screenshot,
+              durationMs: stepResult.durationMs,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          // Emit completed event
+          webSocketService.emitToUser(userId, 'preview:run:completed', {
+            previewSessionId,
+            totalSteps: result.totalSteps,
+            passedSteps: result.passedSteps,
+            failedSteps: result.failedSteps,
+            skippedSteps: result.skippedSteps,
+            cancelled: false,
+            duration: result.durationMs,
+            timestamp: new Date().toISOString(),
+          });
+        }).catch((error) => {
+          logger.error('[WebSocket] Mobile preview run failed', {
+            previewSessionId,
+            intentTestCaseId,
+            userId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          // Emit completed with failure so frontend exits running state
+          webSocketService.emitToUser(userId, 'preview:run:completed', {
+            previewSessionId,
+            totalSteps: steps.length,
+            passedSteps: 0,
+            failedSteps: steps.length,
+            skippedSteps: 0,
+            cancelled: false,
+            duration: 0,
+            error: error instanceof Error ? error.message : 'Mobile run failed',
+            timestamp: new Date().toISOString(),
+          });
+        });
+
+        return; // Mobile path done — skip web flow below
+      }
+
+      // ── Web path (existing flow) ─────────────────────────────────────
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 

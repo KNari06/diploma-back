@@ -9,7 +9,7 @@
 import { TestRunRegistry } from '@/agent/playwright/core/test-run-registry';
 import { GraphBuilder, GraphUpdate } from '@/agent/utils/visualization/graph-builder.service';
 import { TestProgressEmitter } from '@/agent/utils/visualization/progress-emitter';
-import { AdaptiveTimeoutConfig, computeAdaptiveTimeouts, LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
+import { AdaptiveTimeoutConfig, computeAdaptiveTimeouts, isHybridExecutorEnabled, LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -41,6 +41,7 @@ import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { PageWatcher } from './execution/page-watcher';
 import { MultiAgentOrchestrator } from './agents/multi-agent-orchestrator';
+import { buildParsedSnapshot } from './agents/parsed-snapshot';
 import { SnapshotPruner } from './agents/snapshot-pruner';
 import type { MultiAgentInput } from './agents/types';
 import { toDynamicAction, toGraphActionResult } from './graph/lite-graph-adapter';
@@ -87,6 +88,15 @@ export class LiteEngine {
 
   // Flag to prevent non-final graph updates during finalization (race-safe)
   private isFinalizing = false;
+
+  /**
+   * PR-Hybrid: Tracks which execution path was actually taken (hybrid,
+   * pipeline v2, legacy, or combinations via fall-through). Set as the
+   * engine walks the fallback chain; surfaced in LiteTestResult for
+   * dashboard slicing. Defaults to 'legacy_only' and is upgraded as
+   * the engine tries each path.
+   */
+  private executionPath: import('./lite-types').LiteExecutionPath = 'legacy_only';
 
   // Pro-grade error collection
   private collectedErrors: CollectedError[] = [];
@@ -1458,6 +1468,112 @@ export class LiteEngine {
     // When enabled, replaces the entire multi-agent + monolithic loop below.
     // All agents share context through a Blackboard.
     // ═══════════════════════════════════════════════════════════════════════════
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PR-HYBRID: HYBRID EXECUTOR (Pipeline v2 + SafetyInterceptor + Supervisor)
+    //
+    // When enabled, runs Pipeline v2 with:
+    //   1. SafetyInterceptor wired into CommandExecutor (ref validation,
+    //      policy checks, forbidden actions) — gates every ref-based command
+    //   2. SupervisorAgent Tier 1 running at the start of each round
+    //      (state hash, Jaccard, wrong-page, populates forbidden actions)
+    //
+    // On ANY error, falls through to Pipeline v2 (if enabled) and then to
+    // the existing multi-agent orchestrator legacy loop. Default: OFF via
+    // LITE_ENGINE_FLAGS.enableHybridExecutor, with runtime override via
+    // LITE_HYBRID_EXECUTOR env var (see isHybridExecutorEnabled).
+    //
+    // Kill switch: set LITE_HYBRID_EXECUTOR=false in the worker env and
+    // restart the pool — no code redeploy needed. Resolution happens on
+    // every test run so ops can roll back within one worker restart cycle.
+    //
+    // SHORT of Hybrid MVP scope (planned follow-ups):
+    //   - Supervisor Tier 2 AI diagnosis invocation
+    //   - Hard backtrack + mandatory action override control-flow
+    //   - Vision escalation when isDOMWeak
+    //   - Element resolver LLM fallback for stale refs
+    // ═══════════════════════════════════════════════════════════════════════════
+    const hybridEnabled = isHybridExecutorEnabled();
+    if (hybridEnabled) {
+      try {
+        const { TestPipeline } = await import('./pipeline/test-pipeline');
+
+        logger.info('[LITE_ENGINE] Hybrid executor starting', {
+          testId: this.config.testId,
+          flagSource: process.env.LITE_HYBRID_EXECUTOR !== undefined ? 'env' : 'config',
+        });
+
+        const hybridPipeline = new TestPipeline({
+          page: this.page,
+          actionExecutor: this.executor,
+          networkTracker: this.networkTracker,
+          goalDetector: this.goalDetector,
+          graphBuilder: this.graphBuilder,
+          progressEmitter: this.progressEmitter,
+          traceWriter: this.traceWriter,
+          consoleCollector: this.consoleCollector,
+          browserContext: this.page.context(),
+        });
+
+        const hybridResult = await hybridPipeline.run(this.config.goal, {
+          url: this.config.url,
+          credentials: this.config.credentials,
+          hasCredentials: !!this.config.credentials,
+          testId: this.config.testId,
+          maxRounds: LITE_ENGINE_FLAGS.pipelineMaxRounds,
+          timeoutMs: LITE_ENGINE_FLAGS.pipelineTimeoutMs,
+          skillsContext: this.skillsContext,
+          integrationContext: this.integrationContext || undefined,
+          // HYBRID: goalUrl for Supervisor wrong-page detection
+          goalUrl: this.config.url,
+          // HYBRID: activates SafetyInterceptor + Supervisor Tier 1 inside the pipeline
+          enableHybridSafety: true,
+        });
+
+        logger.info('[LITE_ENGINE] Hybrid executor complete', {
+          testId: this.config.testId,
+          success: hybridResult.success,
+          rounds: hybridResult.roundsExecuted,
+          commands: hybridResult.commandsExecuted,
+          progress: hybridResult.progressScore,
+          durationMs: hybridResult.durationMs,
+        });
+
+        // Only return on explicit success. On failure (or ambiguous results),
+        // fall through to legacy paths so hybrid is a pure improvement and
+        // never causes regressions from baseline.
+        if (hybridResult.success) {
+          this.executionPath = 'hybrid_success';
+          this.emitCompletion(true, 'Goal achieved');
+          await this.flushPendingGraphScreenshotUploads();
+          return await this.buildResult(true, hybridResult.reason);
+        }
+
+        // Hybrid ran but did not succeed — fall-through expected. Which
+        // path we take next depends on whether Pipeline v2 is enabled.
+        this.executionPath = LITE_ENGINE_FLAGS.enablePipelineV2
+          ? 'hybrid_then_pipeline_v2'
+          : 'hybrid_then_legacy';
+        logger.info('[LITE_ENGINE] Hybrid executor did not succeed, falling through to legacy paths', {
+          testId: this.config.testId,
+          reason: hybridResult.reason,
+          fallbackTo: this.executionPath,
+        });
+      } catch (hybridError) {
+        const errorMsg = hybridError instanceof Error ? hybridError.message : String(hybridError);
+        // Same fall-through accounting on exception path
+        this.executionPath = LITE_ENGINE_FLAGS.enablePipelineV2
+          ? 'hybrid_then_pipeline_v2'
+          : 'hybrid_then_legacy';
+        logger.error('[LITE_ENGINE] Hybrid executor error, falling through to legacy paths', {
+          testId: this.config.testId,
+          error: errorMsg,
+          fallbackTo: this.executionPath,
+        });
+        // Fall through to legacy paths (pipeline v2 if enabled, else multi-agent loop)
+      }
+    }
+
     if (LITE_ENGINE_FLAGS.enablePipelineV2) {
       try {
         const { TestPipeline } = await import('./pipeline/test-pipeline');
@@ -1494,6 +1610,13 @@ export class LiteEngine {
           durationMs: pipelineResult.durationMs,
         });
 
+        // PR-Hybrid: only overwrite path if hybrid didn't run (pipeline_v2_success).
+        // If hybrid already ran and we're in fallback, the path stays at
+        // 'hybrid_then_pipeline_v2' regardless of this run's outcome.
+        if (this.executionPath === 'legacy_only') {
+          this.executionPath = 'pipeline_v2_success';
+        }
+
         this.emitCompletion(
           pipelineResult.success,
           pipelineResult.success ? 'Goal achieved' : pipelineResult.reason,
@@ -1507,6 +1630,11 @@ export class LiteEngine {
         );
       } catch (pipelineError) {
         const errorMsg = pipelineError instanceof Error ? pipelineError.message : String(pipelineError);
+        // Fall-through accounting: if hybrid already ran, stay on its
+        // transition path; otherwise mark as pipeline_v2_then_legacy.
+        if (this.executionPath === 'legacy_only') {
+          this.executionPath = 'pipeline_v2_then_legacy';
+        }
         logger.error('[LITE_ENGINE] Pipeline v2 error', {
           testId: this.config.testId,
           error: errorMsg,
@@ -3242,18 +3370,39 @@ export class LiteEngine {
         if (decision.blocked || decision.blockedInfo) {
           const reason = decision.blockedInfo?.reason || decision.blocked || 'Unknown reason';
           const canUserHelp = decision.blockedInfo?.canUserHelp || false;
+          // PR1C: structured blocker classification (optional, from Strategist)
+          const blockerType = decision.blockedInfo?.blockerType;
+          const requestedAction = decision.blockedInfo?.requestedAction;
 
           logger.warn('[LITE_ENGINE] Test blocked', {
             testId: this.config.testId,
             reason,
             canUserHelp,
+            blockerType,
             iterations: i + 1,
           });
 
           // Only emit clarification and stop for HARD blocks where user can help
           if (canUserHelp) {
-            // Hard block: captcha, 2FA, verification code, etc.
-            // Emit clarification request via WebSocket
+            // PR1C: Resolve pause mode. Default 'background' — safe for all
+            // run contexts (workers, cron, CI, unattended tests). Interactive
+            // and hybrid modes are planned but not implemented yet; they
+            // gracefully degrade to background behavior here.
+            const pauseMode = this.config.pauseMode ?? 'background';
+            if (pauseMode !== 'background') {
+              logger.warn('[LITE_ENGINE] pauseMode not yet implemented, degrading to background', {
+                testId: this.config.testId,
+                requestedMode: pauseMode,
+              });
+            }
+
+            // Hard block: captcha, 2FA, verification code, OAuth consent, etc.
+            // Emit a structured humanInputRequired event so the frontend /
+            // dashboard / telegram bot can surface it to the user. We go
+            // through the existing testProgress channel (already wired in
+            // WebSocket), plus a dedicated event that carries blockerType +
+            // requestedAction — listeners that care can subscribe, those
+            // that don't will ignore it.
             try {
               webSocketService.emitTestProgress(this.config.testId, {
                 testId: this.config.testId,
@@ -3266,13 +3415,39 @@ export class LiteEngine {
                 userId: this.config.userId,
                 sessionId: this.config.chatSessionId,
               });
+
+              // PR1C: Richer human-input-required event. Best-effort —
+              // emitHumanInputRequired is a generic event emitter that
+              // silently no-ops if the method is absent on older
+              // WebSocket service builds (via the try/catch around it).
+              const emitter = (webSocketService as any).emitHumanInputRequired
+                || (webSocketService as any).emitGenericEvent;
+              if (typeof emitter === 'function') {
+                emitter.call(webSocketService, this.config.testId, {
+                  testId: this.config.testId,
+                  blockerType: blockerType ?? 'unknown',
+                  reason,
+                  requestedAction,
+                  iteration: i + 1,
+                  currentUrl: snapshotBefore.url,
+                  pauseMode,
+                  timestamp: new Date().toISOString(),
+                  userId: this.config.userId,
+                  sessionId: this.config.chatSessionId,
+                });
+              }
             } catch {
-              // Ignore WebSocket errors
+              // Ignore WebSocket errors — blocker result is still returned below
             }
 
             this.emitCompletion(false, reason);
             await this.flushPendingGraphScreenshotUploads();
-            return await this.buildResult(false, `Blocked: ${reason}`);
+            // PR1C: include blockerType in the failure reason so it's visible
+            // in logs, dashboards, and test result records without extra plumbing
+            const structuredReason = blockerType
+              ? `Blocked [${blockerType}]: ${reason}`
+              : `Blocked: ${reason}`;
+            return await this.buildResult(false, structuredReason);
           } else {
             // Soft block: just log and continue trying
             logger.info('[LITE_ENGINE] Soft block detected, continuing', {
@@ -4735,6 +4910,9 @@ export class LiteEngine {
       errorCount: this.collectedErrors.length,
       errorTypes: [...new Set(this.collectedErrors.map((e) => e.type))],
       hasFinalScreenshot: !!finalScreenshotUrl,
+      // PR-Hybrid: surface chosen path in the completion log so on-call
+      // can answer "which path did this test take" from logs alone
+      executionPath: this.executionPath,
     });
 
     // ✅ FIX: Emit final progress=100 NOW that everything is truly done
@@ -4757,6 +4935,9 @@ export class LiteEngine {
         errorTypes: [...new Set(this.collectedErrors.map((e) => e.type))],
         hasFinalScreenshot: !!finalScreenshotUrl,
         endTime: new Date().toISOString(),
+        // PR-Hybrid: include executionPath so trace consumers can slice
+        // metrics by path without joining to the DB result
+        executionPath: this.executionPath,
         ...(this.multiAgentOrchestrator && {
           multiAgent: this.multiAgentOrchestrator.getRunMetrics(),
         }),
@@ -4937,6 +5118,9 @@ export class LiteEngine {
       pageVisits,
       uniquePagesVisited,
       executedSteps,
+      // PR-Hybrid: surface which execution path was actually taken so
+      // dashboards and debug tools can compare hybrid vs legacy cohorts.
+      executionPath: this.executionPath,
     };
   }
 
@@ -5693,18 +5877,22 @@ export class LiteEngine {
     iteration: number,
     iterationSpanId: string,
     snapshotBefore: LiteSnapshot,
-    multiAgentContext?: Omit<MultiAgentInput, 'url' | 'title' | 'iteration' | 'contentHash'>,
+    multiAgentContext?: Omit<MultiAgentInput, 'url' | 'title' | 'iteration' | 'contentHash' | 'parsedSnapshot'>,
   ): Promise<AIDecision> {
     // Multi-Agent Brain: Try orchestrator first when enabled
     if (LITE_ENGINE_FLAGS.enableMultiAgentBrain && this.multiAgentOrchestrator && multiAgentContext) {
       try {
         const contentHash = this.state.computeContentHash(snapshotBefore);
+        // Build parsed snapshot once per iteration for O(1) ref lookups in
+        // deterministic checks (Critic, Orchestrator). See parsed-snapshot.ts.
+        const parsedSnapshot = buildParsedSnapshot(snapshotBefore);
         const result = await this.multiAgentOrchestrator.execute({
           ...multiAgentContext,
           url: snapshotBefore.url,
           title: snapshotBefore.title,
           iteration,
           contentHash,
+          parsedSnapshot,
         });
 
         if (result.success && result.decision) {
