@@ -1197,9 +1197,15 @@ export class SnapshotCollector {
             // Previous fallback `secondaryPassElements.has(el)` caused massive false positives —
             // it marked ALL framework-bound elements (React onClick, cursor:pointer, etc.)
             // as "inside modal" even when NO modal exists on the page (e.g. jobescape.me).
+            // V13: treat the modal container itself as "inside" — Element.contains()
+            // returns true for self in the DOM spec, but we make this explicit so
+            // lint resolving the container (not an item within) doesn't trigger
+            // a false "target behind modal" block downstream.
             const isInsideModal = activeModalElement
-              ? activeModalElement.contains(el)
-              : (fallbackModalElement ? fallbackModalElement.contains(el) : false);
+              ? (el === activeModalElement || activeModalElement.contains(el))
+              : (fallbackModalElement
+                  ? (el === fallbackModalElement || fallbackModalElement.contains(el))
+                  : false);
 
             // Universal visibility check via elementFromPoint.
             // The browser tells us exactly what the user sees at the element's center pixel.

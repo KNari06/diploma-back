@@ -103,6 +103,199 @@ function detectModalBlockingFromSession(
 }
 
 /**
+ * V13: Ground-truth verification of modal blocking via browser hit-testing.
+ *
+ * The snapshot collector's modal detector is a heuristic (position/z-index/coverage).
+ * It produces false positives on onboarding cards, floating chats, toasts, and other
+ * fixed-position UI that is visually separated from the target element.
+ *
+ * This function asks the browser directly: "is my target actually covered by the
+ * suspected modal?" using three independent geometric signals, any one of which
+ * is sufficient to clear the block:
+ *
+ *   1. CONTAINMENT — target is a descendant of the modal node (target IS inside it).
+ *   2. HIT-TEST    — pixel at target's visible center resolves to target/ancestor/descendant.
+ *   3. DISJOINT    — bounding boxes of target and modal do not intersect at all.
+ *
+ * All three checks run inside a single page.evaluate() so there is no hardcoded
+ * allowlist, no element-type assumptions, no size thresholds. It works for
+ * dropdowns, popovers, onboarding tooltips, chat widgets, cookie banners, and
+ * any future UI pattern — because the browser itself is the source of truth.
+ *
+ * Returns:
+ *   - `blocked: false, reason: ...` when the target is reachable (proceed with action)
+ *   - `blocked: true, occludingText: ...` when the target is genuinely covered (surface error)
+ */
+async function verifyModalActuallyBlocks(
+  page: Page,
+  candidateRefs: string[],
+  modalRef: string,
+): Promise<{ blocked: boolean; reason: string; occludingText?: string }> {
+  if (candidateRefs.length === 0) {
+    return { blocked: true, reason: 'no_candidates' };
+  }
+
+  try {
+    const result = await page.evaluate(
+      ({ refs, modalRef: mRef }) => {
+        // Browser context — pull DOM globals through `globalThis` to avoid
+        // server tsconfig noise (no `lib: ["dom"]` in the Node build).
+        const g = globalThis as unknown as {
+          document: {
+            querySelector: (sel: string) => unknown;
+            elementFromPoint: (x: number, y: number) => unknown;
+          };
+          innerWidth: number;
+          innerHeight: number;
+          getComputedStyle: (el: unknown) => { display: string; visibility: string };
+          ShadowRoot: new () => unknown;
+        };
+        type El = {
+          contains: (other: unknown) => boolean;
+          getBoundingClientRect: () => { left: number; top: number; right: number; bottom: number; width: number; height: number };
+          getRootNode: () => unknown;
+          textContent: string | null;
+          tagName: string;
+        };
+        const docQuery = (sel: string): El | null => (g.document.querySelector(sel) as El | null);
+
+        const modal = docQuery(`[data-agent-ref="${mRef}"]`);
+        if (!modal) return { blocked: false, reason: 'modal_gone' as const };
+
+        const modalRect = modal.getBoundingClientRect();
+
+        // Scratchpad lives on globalThis so it survives across candidate iterations.
+        const scratch = g as unknown as { __lastOccluder?: string };
+
+        // Track whether ANY candidate was actually evaluated end-to-end.
+        // If every candidate bailed early (not in main frame, off-screen, detached)
+        // we must NOT report "all occluded" — defer to Playwright's actionability.
+        let anyCandidateEvaluated = false;
+
+        // Check every candidate — if ANY one is reachable, the block is false-positive.
+        for (const ref of refs) {
+          const target = docQuery(`[data-agent-ref="${ref}"]`);
+          // Ref not in main frame (likely iframe/shadow-DOM lint candidate) —
+          // can't hit-test from here. Skip and let Playwright resolve it.
+          if (!target) continue;
+
+          // Signal 1: CONTAINMENT — target lives inside the modal.
+          // (Covers self-inclusion: modal.contains(modal) === true in DOM.)
+          if (target === modal || modal.contains(target)) {
+            return { blocked: false, reason: 'target_inside_modal' as const, matchedRef: ref };
+          }
+
+          // Target must be visible and laid out for geometric checks.
+          const tRect = target.getBoundingClientRect();
+          if (tRect.width === 0 || tRect.height === 0) continue;
+
+          const style = g.getComputedStyle(target);
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+
+          // Signal 2: DISJOINT — bounding boxes do not intersect.
+          // If the modal lives in a completely different region of the viewport,
+          // it cannot possibly be blocking this target.
+          const disjoint =
+            tRect.right  <= modalRect.left  ||
+            tRect.left   >= modalRect.right ||
+            tRect.bottom <= modalRect.top   ||
+            tRect.top    >= modalRect.bottom;
+          if (disjoint) {
+            return { blocked: false, reason: 'disjoint_regions' as const, matchedRef: ref };
+          }
+
+          // Signal 3: HIT-TEST — ask the browser what is actually at the target's pixels.
+          // Sample the center plus four inset points to survive partial occlusions
+          // (e.g. a tooltip tail covering the dead-center of a button).
+          const cx = tRect.left + tRect.width / 2;
+          const cy = tRect.top + tRect.height / 2;
+          const vw = g.innerWidth;
+          const vh = g.innerHeight;
+
+          const inset = 2;
+          const samplePoints: Array<[number, number]> = (
+            [
+              [cx, cy],
+              [tRect.left + inset,  tRect.top + inset],
+              [tRect.right - inset, tRect.top + inset],
+              [tRect.left + inset,  tRect.bottom - inset],
+              [tRect.right - inset, tRect.bottom - inset],
+            ] as Array<[number, number]>
+          ).filter(([x, y]) => x >= 0 && x <= vw && y >= 0 && y <= vh);
+
+          // Target is laid out but all sample points fall outside the viewport —
+          // it just needs scrolling. Let Playwright auto-scroll and retry; do NOT
+          // report a block based on a target we never actually hit-tested.
+          if (samplePoints.length === 0) {
+            return { blocked: false, reason: 'needs_scroll' as const, matchedRef: ref };
+          }
+
+          // Past this point the candidate is fully evaluated.
+          anyCandidateEvaluated = true;
+
+          let reachableSamples = 0;
+          let firstOccluder: El | null = null;
+          for (const [x, y] of samplePoints) {
+            const hit = g.document.elementFromPoint(x, y) as El | null;
+            if (!hit) continue;
+            // Target itself, or related by the DOM tree — reachable.
+            if (hit === target || target.contains(hit) || hit.contains(target)) {
+              reachableSamples++;
+              continue;
+            }
+            // Shadow DOM host of the target also counts as reachable.
+            const root = target.getRootNode() as { host?: El } | null;
+            if (root && root instanceof (g.ShadowRoot as unknown as { new (): unknown }) && root.host === hit) {
+              reachableSamples++;
+              continue;
+            }
+            if (!firstOccluder) firstOccluder = hit;
+          }
+
+          // At least one sample reaching the target is enough — user can click it.
+          if (reachableSamples > 0) {
+            return { blocked: false, reason: 'hit_test_reachable' as const, matchedRef: ref };
+          }
+
+          // This candidate is geometrically blocked. Record the occluder but
+          // keep scanning other candidates — lint may have ranked an unreachable
+          // candidate first while a reachable sibling exists.
+          if (firstOccluder) {
+            const occluderText = (firstOccluder.textContent || '').trim().slice(0, 80);
+            const occluderTag = firstOccluder.tagName.toLowerCase();
+            scratch.__lastOccluder = occluderText || occluderTag;
+          }
+        }
+
+        // If no candidate was actually hit-tested (all refs missing from main frame,
+        // all zero-sized, all display:none), we have zero evidence of blocking —
+        // defer to Playwright's own actionability checks.
+        if (!anyCandidateEvaluated) {
+          delete scratch.__lastOccluder;
+          return { blocked: false, reason: 'no_evaluable_candidates' as const };
+        }
+
+        // Every evaluated candidate failed the hit-test and none was disjoint/contained.
+        const occluder = scratch.__lastOccluder;
+        delete scratch.__lastOccluder;
+        return { blocked: true, reason: 'all_candidates_occluded' as const, occludingText: occluder };
+      },
+      { refs: candidateRefs, modalRef },
+    );
+
+    return result as { blocked: boolean; reason: string; occludingText?: string };
+  } catch (err) {
+    // Browser eval failed (page navigating, frame detached, etc.) —
+    // fail open: let the action attempt proceed. Playwright has its own
+    // actionability checks and will surface a real error if it cannot click.
+    logger.debug('[PREVIEW_APPLY] verifyModalActuallyBlocks eval failed, failing open', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { blocked: false, reason: 'eval_failed_fail_open' };
+  }
+}
+
+/**
  * Generate a random integer in range [min, max] (inclusive).
  */
 function randomIntInclusive(min: number, max: number): number {
@@ -2489,9 +2682,22 @@ export class PreviewStepApplyService {
         // ═══════════════════════════════════════════════════════════════════
         // V11: Modal-aware "not found" — if a modal is open, the target may
         // be behind it. Inform the user so they can dismiss the modal first.
+        // V13: Only surface the modal warning if the modal has an iron-clad
+        // ARIA signature (role=dialog/alertdialog, aria-modal, native <dialog>)
+        // — positional-heuristic modals (floating chats, onboarding cards)
+        // are too unreliable to report as "blocking" in the not-found path.
         // ═══════════════════════════════════════════════════════════════════
         const modalInfo = detectModalBlockingFromSession(previewSessionId, userId);
-        if (modalInfo) {
+        const sessionForNotFound = sessionService.getSession(previewSessionId);
+        const modalNodeForNotFound = modalInfo
+          ? sessionForNotFound?.pageState?.domNodes?.find(n => n.ref === modalInfo.modalRef)
+          : undefined;
+        const isIronCladModal = !!modalNodeForNotFound && (
+          modalNodeForNotFound.role === 'dialog' ||
+          modalNodeForNotFound.role === 'alertdialog' ||
+          modalNodeForNotFound.tag === 'dialog'
+        );
+        if (modalInfo && isIronCladModal) {
           logger.info('[PREVIEW_APPLY] Element not found — modal/popup may be blocking', {
             previewSessionId,
             modalRef: modalInfo.modalRef,
@@ -2525,35 +2731,49 @@ export class PreviewStepApplyService {
       const modalDetected = detectModalBlockingFromSession(previewSessionId, userId);
 
       if (modalDetected && !anyInsideModal) {
-        // Target element is NOT inside the modal — modal is blocking it.
-        // Don't execute: inform the user.
-        logger.info('[PREVIEW_APPLY] Modal blocking target — candidates are behind popup', {
+        // V13: The session's modal flag is a heuristic signal — verify with
+        // the browser before blocking. Geometric + hit-test ground truth
+        // eliminates false positives from onboarding tooltips, floating
+        // chats, toasts, cookie banners, sticky headers, etc.
+        const candidateRefs = resolvedCandidates.map(c => c.ref).filter((r): r is string => !!r);
+        const verdict = await verifyModalActuallyBlocks(page, candidateRefs, modalDetected.modalRef);
+
+        if (verdict.blocked) {
+          logger.info('[PREVIEW_APPLY] Modal blocking target — verified by hit-test', {
+            previewSessionId,
+            modalRef: modalDetected.modalRef,
+            reason: verdict.reason,
+            occludingText: verdict.occludingText,
+            candidateRefs: candidateRefs.join(', '),
+          });
+          return {
+            success: false,
+            error: 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.',
+            highlight: [
+              ...(modalDetected.boundingBox ? [{
+                boundingBox: modalDetected.boundingBox,
+                type: 'warning' as const,
+              }] : []),
+              ...resolvedCandidates.map(c => ({
+                ref: c.ref,
+                boundingBox: c.boundingBox,
+                type: 'error' as const,
+              })),
+            ],
+            modalBlocking: modalDetected,
+            attempts: 0,
+          };
+        }
+
+        // Verified NOT blocked — log and fall through to normal execution.
+        logger.debug('[PREVIEW_APPLY] Modal flag cleared by hit-test verification', {
           previewSessionId,
           modalRef: modalDetected.modalRef,
-          candidateRefs: resolvedCandidates.map(c => c.ref).join(', '),
+          reason: verdict.reason,
         });
-        return {
-          success: false,
-          error: 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.',
-          highlight: [
-            // Highlight the modal itself as warning
-            ...(modalDetected.boundingBox ? [{
-              boundingBox: modalDetected.boundingBox,
-              type: 'warning' as const,
-            }] : []),
-            // Highlight candidates as error (behind modal)
-            ...resolvedCandidates.map(c => ({
-              ref: c.ref,
-              boundingBox: c.boundingBox,
-              type: 'error' as const,
-            })),
-          ],
-          modalBlocking: modalDetected,
-          attempts: 0,
-        };
       }
-      // If target IS inside the modal (anyInsideModal=true) or no modal detected,
-      // proceed normally — the user is working with the popup layer.
+      // If target IS inside the modal (anyInsideModal=true) or no modal detected
+      // or modal-blocking was disproven by hit-test, proceed normally.
 
       // Try candidates in order (reuse resolvedCandidates from modal check above)
       let lastError: string | undefined;
