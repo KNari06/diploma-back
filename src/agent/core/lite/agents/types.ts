@@ -5,6 +5,7 @@
 
 import type { AICommand, BlacklistedAction, BlockerInfo, NetworkValidationError, ObstacleFact, ObstacleType, StateDriftAuditResult, VisionHints } from '../lite-types';
 import type { NetworkError } from '../collectors/network-tracker';
+import type { ParsedSnapshot } from './parsed-snapshot';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Observer Agent Types
@@ -241,6 +242,25 @@ export interface CriticRejectionRecord {
   riskAssessment: string;
 }
 
+/**
+ * PR1B: Critic concerns on an APPROVED action (warnings, not rejections).
+ * Recorded whenever the Critic approves an action but flagged warn-level
+ * policy violations. Fed back to Strategist on the next iteration so it
+ * can avoid repeating the same risky pattern.
+ */
+export interface CriticConcernRecord {
+  /** Iteration when the concern was raised */
+  iteration: number;
+  /** The action that was approved-with-warnings */
+  action: string;
+  /** The element ref that was targeted */
+  ref?: string;
+  /** Concise concern summary (from Critic's riskAssessment or failureRisk) */
+  concern: string;
+  /** Warn-level violation types (e.g., "external_navigation", "password_exposure") */
+  violationTypes: string[];
+}
+
 /** Structured working memory persisted across iterations */
 export interface WorkingMemory {
   /** Form fields we've interacted with: ref → status */
@@ -257,6 +277,12 @@ export interface WorkingMemory {
   lastFormAnalysis?: FormAnalysis;
   /** Critic rejection history: captures rejection reasons for cross-ref pattern avoidance (bounded) */
   criticRejections?: CriticRejectionRecord[];
+  /**
+   * PR1B: Critic concerns on APPROVED actions (warn-level violations).
+   * Distinct from criticRejections — these are actions that went through
+   * but the Critic flagged something worth remembering. Bounded.
+   */
+  criticConcerns?: CriticConcernRecord[];
   /** Consecutive expectation mismatches count (predictions that were wrong) */
   consecutiveExpectationMisses?: number;
   /** Last expectation mismatch description */
@@ -336,8 +362,12 @@ export interface StrategistOutput {
   riskLevel?: 'low' | 'medium' | 'high';
   /** Whether the goal is already achieved */
   done?: boolean;
-  /** Whether the agent is blocked */
-  blockedInfo?: { reason: string; canUserHelp: boolean };
+  /**
+   * Whether the agent is blocked. PR1C: extended with optional blockerType
+   * and requestedAction for richer frontend UX in background pauseMode.
+   * The full structure matches lite-types.ts BlockedInfo.
+   */
+  blockedInfo?: import('../lite-types').BlockedInfo;
   /** Current sub-goal the agent is focused on (persists in working memory) */
   subGoal?: string;
 }
@@ -393,6 +423,20 @@ export interface StrategistInput {
   blackboard?: SupervisorBlackboard;
   /** Time pressure level from TimeoutGovernor — affects strategy directness */
   urgencyLevel?: 'normal' | 'hurry' | 'critical';
+  /**
+   * PR1C: Vision escalation signal from page metadata. When `isDOMWeak` is
+   * true (e.g., SPA with <div onClick>, canvas apps, custom-rendered UI),
+   * the DOM snapshot may not describe the page accurately. Strategist
+   * should prefer coordinate-based or scroll-oriented actions, widen the
+   * visibility of visionHints, and avoid being too confident about ref
+   * targeting. When `recommendVision` is true, the agent should actively
+   * consider visionHints as primary evidence.
+   */
+  visionRecommendation?: {
+    isDOMWeak: boolean;
+    recommendVision: boolean;
+    interactiveElementCount: number;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -503,6 +547,12 @@ export interface CriticInput {
   blackboard?: SupervisorBlackboard;
   /** Layer 3: Blocker info from previous iteration's failed click */
   lastBlockerInfo?: BlockerInfo;
+  /**
+   * Pre-parsed snapshot for O(1) ref existence checks.
+   * Optional for backwards compat — checkRefExists falls back to regex
+   * over availableElements when this is absent. See parsed-snapshot.ts.
+   */
+  parsedSnapshot?: ParsedSnapshot;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -548,6 +598,15 @@ export interface MultiAgentInput {
   snapshotElements: string;
   /** Content hash for observer cache */
   contentHash: string;
+  /**
+   * Pre-parsed snapshot for O(1) ref existence checks in deterministic
+   * code paths (Critic, Orchestrator ref validation). Built once per
+   * iteration in lite-engine.ts getAIDecision().
+   *
+   * Optional for backwards compat — every consumer must provide a regex
+   * fallback when this is absent. See parsed-snapshot.ts.
+   */
+  parsedSnapshot?: ParsedSnapshot;
 
   // Manus-style enhancements
   /** Previous snapshot for visual diff */
@@ -641,6 +700,10 @@ export interface MultiAgentRunMetrics {
   /** Times Supervisor Tier 2 AI diagnosis was invoked */
   supervisorTier2Count: number;
 
+  // SafetyInterceptor (PR2)
+  /** Times SafetyInterceptor blocked an action on the skip path */
+  skipPathSafetyBlockCount: number;
+
   // Computed (for convenience)
   avgPipelineMs: number;
   observerCacheHitRate: number;
@@ -656,7 +719,8 @@ export interface MultiAgentResult {
     command: AICommand;
     done?: boolean;
     blocked?: string;
-    blockedInfo?: { reason: string; canUserHelp: boolean };
+    /** PR1C: extended BlockedInfo with blockerType and requestedAction */
+    blockedInfo?: import('../lite-types').BlockedInfo;
     analysis?: {
       pageState: string;
       availableActions: string[];
@@ -698,6 +762,8 @@ export interface MultiAgentResult {
     supervisorHardBacktrack?: boolean;
     /** Supervisor recovery tier (0=none, 1=deterministic, 2=AI) */
     supervisorTier?: 0 | 1 | 2;
+    /** PR2: SafetyInterceptor blocked an action on the skip path */
+    skipPathSafetyBlocked?: boolean;
   };
   /** Action rejected by Critic (for blacklist recording by caller) */
   rejectedAction?: {

@@ -275,6 +275,31 @@ export class TestBlackboard {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  // PR-HYBRID: SUPERVISOR BLACKBOARD (written by TestPipeline per round,
+  // read by CommandExecutor for forbidden-action enforcement)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  setSupervisorBlackboard(
+    bb: import('../agents/types').SupervisorBlackboard | undefined,
+  ): void {
+    this.state.supervisorBlackboard = bb;
+  }
+
+  getSupervisorBlackboard():
+    | import('../agents/types').SupervisorBlackboard
+    | undefined {
+    return this.state.supervisorBlackboard;
+  }
+
+  setGoalUrl(url: string | undefined): void {
+    this.state.goalUrl = url;
+  }
+
+  getGoalUrl(): string | undefined {
+    return this.state.goalUrl;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   // SNAPSHOT & SERIALIZATION
   // ═══════════════════════════════════════════════════════════════════════
 
