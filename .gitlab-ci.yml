@@ -179,7 +179,7 @@ deploy:worker:
 # DEV deploy to VM via shell runner (does not affect production jobs)
 # Runner requirements:
 #   - executor: shell
-#   - tags: qiat-dev-runner
+#   - tags: dev-back-runner
 #   - docker installed on VM
 # Optional CI/CD variables:
 #   BACKEND_ENV_FILE      - absolute path to .env on VM (default: /opt/qait/dev/backend/.env)
@@ -188,7 +188,7 @@ deploy:worker:
 deploy:dev:vm:
   stage: deploy
   tags:
-    - qiat-dev-runner
+    - dev-back-runner
   rules:
     - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
   variables:
