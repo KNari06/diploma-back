@@ -15,6 +15,7 @@ import {
   passwordResetRequest,
   passwordUpdate,
   refresh,
+  resendVerification,
   sendMagicLink,
   signup,
   updateProfile,
@@ -46,6 +47,11 @@ const refreshSchema = z.object({
 });
 
 const passwordResetSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  redirectTo: z.string().url().optional(),
+});
+
+const resendVerificationSchema = z.object({
   email: z.string().email('Invalid email format'),
   redirectTo: z.string().url().optional(),
 });
@@ -537,6 +543,44 @@ router.post('/password/reset-request', asyncHandler(async (req: Request, res: Re
     const validatedData = passwordResetSchema.parse(req.body);
     req.body = validatedData;
     await passwordResetRequest(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/resend-verification:
+ *   post:
+ *     summary: Resend signup verification email
+ *     description: Re-sends the Supabase signup confirmation email to the given address.
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               redirectTo:
+ *                 type: string
+ *                 format: uri
+ *     responses:
+ *       200:
+ *         description: Verification email sent
+ *       400:
+ *         description: Invalid request or resend failed
+ */
+router.post('/resend-verification', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = resendVerificationSchema.parse(req.body);
+    req.body = validatedData;
+    await resendVerification(req, res);
   } catch (error) {
     handleValidationError(error);
   }

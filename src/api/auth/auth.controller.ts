@@ -6,6 +6,7 @@ import {
   getOAuthUrl,
   refreshAccessToken,
   requestPasswordReset,
+  resendVerificationEmail,
   signInWithEmail,
   signInWithMagicLink,
   signOut,
@@ -433,6 +434,29 @@ export const passwordResetRequest = async (req: Request, res: Response): Promise
 };
 
 /**
+ * Resend verification email
+ * POST /auth/resend-verification
+ */
+export const resendVerification = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email, redirectTo } = req.body;
+
+    const result = await resendVerificationEmail(email, redirectTo);
+
+    res.json({
+      success: true,
+      message: result.message,
+    });
+  } catch (error: any) {
+    logger.error('Resend verification error', error);
+    res.status(400).json({
+      success: false,
+      error: error.message || 'Failed to resend verification email',
+    });
+  }
+};
+
+/**
  * Update password
  * POST /auth/password/update
  */
@@ -634,6 +658,14 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    // Read previous status to detect the pending_approval → approved transition
+    // so we only send the approval email once (not on every idempotent PATCH).
+    const { data: prevUser } = await supabaseAdmin
+      .from('users')
+      .select('status')
+      .eq('id', userId)
+      .maybeSingle();
+
     const { data: updatedUser, error } = await supabaseAdmin
       .from('users')
       .update({ status, updated_at: new Date().toISOString() })
@@ -662,6 +694,26 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
 
     // Invalidate auth cache so the user's next request picks up the new status
     await invalidateAuthCacheForUser(userId);
+
+    // Fire-and-forget approval email when transitioning into 'approved'.
+    // Guarded by the previous status so repeated PATCHes don't spam the user.
+    if (
+      status === 'approved' &&
+      prevUser?.status !== 'approved' &&
+      updatedUser?.email
+    ) {
+      EmailService.sendApprovalEmail({
+        recipientEmail: updatedUser.email,
+        recipientName: updatedUser.name || undefined,
+        frontendUrl: env.FRONTEND_URL,
+      }).catch((err) =>
+        logger.error('[AUTH] Failed to send approval email on status change', {
+          error: err instanceof Error ? err.message : String(err),
+          userId,
+          email: updatedUser.email,
+        })
+      );
+    }
 
     res.json({
       success: true,

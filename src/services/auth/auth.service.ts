@@ -1023,6 +1023,56 @@ export async function requestPasswordReset(
 }
 
 /**
+ * Resend signup verification email via Supabase.
+ * Used by the /verify-email page when the user didn't receive the original mail.
+ *
+ * Note: Supabase rate-limits resend (60s by default) and silently no-ops for
+ * already-confirmed emails, so we don't leak whether the account exists.
+ */
+export async function resendVerificationEmail(
+  email: string,
+  redirectTo?: string
+): Promise<{ success: boolean; message: string }> {
+  if (!email || typeof email !== 'string' || !email.includes('@')) {
+    throw new Error('Invalid email address');
+  }
+
+  try {
+    const { error } = await supabase.auth.resend({
+      type: 'signup',
+      email: email.trim().toLowerCase(),
+      options: {
+        emailRedirectTo: redirectTo || `${env.FRONTEND_URL}/auth/callback`,
+      },
+    });
+
+    if (error) {
+      logger.error('[AUTH] Resend verification error', {
+        error: error.message,
+        code: error.status,
+        email: email.substring(0, 5) + '***',
+      });
+      throw error;
+    }
+
+    logger.info('[AUTH] Verification email resent', {
+      email: email.substring(0, 5) + '***',
+    });
+
+    return {
+      success: true,
+      message: 'Verification email sent. Please check your inbox.',
+    };
+  } catch (error) {
+    logger.error('[AUTH] Resend verification error', {
+      error: error instanceof Error ? error.message : String(error),
+      email: email.substring(0, 5) + '***',
+    });
+    throw error;
+  }
+}
+
+/**
  * Update password
  * @param accessToken - User access token
  * @param newPassword - New password
