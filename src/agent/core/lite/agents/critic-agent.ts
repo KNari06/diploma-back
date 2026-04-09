@@ -232,13 +232,22 @@ export class CriticAgent {
 
   /**
    * Hallucination check: Does the ref exist in available elements?
+   *
+   * Fast path: O(1) Set lookup via parsedSnapshot when available.
+   * Fallback: word-boundary regex over the formatted snapshot string.
+   * Both paths are equivalent for ref existence — see parsed-snapshot.ts
+   * for the rules on which refs the Set contains.
    */
   private static checkRefExists(input: CriticInput): boolean {
     const ref = input.proposedCommand.ref;
     if (!ref) return true; // Actions without ref (wait, press) are fine
 
-    // Check if ref appears in the available elements string
-    // Format: elements contain refs like "e5", "e12" etc.
+    // Fast path
+    if (input.parsedSnapshot) {
+      return input.parsedSnapshot.hasRef(ref);
+    }
+
+    // Fallback: regex on formatted string (legacy, equivalent semantics)
     const refPattern = new RegExp(`\\b${ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
     return refPattern.test(input.availableElements);
   }

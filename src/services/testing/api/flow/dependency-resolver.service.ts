@@ -342,13 +342,37 @@ async function runArchitect(
       const arrayStart = content.indexOf('[', nodesStart);
       if (arrayStart === -1) throw new Error('no array start');
 
-      // Extract individual node objects by finding balanced {} pairs
+      // Extract individual node objects by finding balanced {} pairs.
+      // IMPORTANT: the scanner must be STRING-AWARE — otherwise a literal '{'
+      // or '}' inside a JSON string value (e.g. "summary": "uses {userId}")
+      // corrupts the depth counter. Unbalanced braces in strings used to
+      // swallow subsequent nodes entirely (see json-repair test scenario 4b).
       const recoveredNodes: any[] = [];
       let depth = 0;
       let nodeStart = -1;
+      let inString = false;
+      let escaped = false;
 
       for (let i = arrayStart + 1; i < content.length; i++) {
         const ch = content[i];
+
+        // Handle escape sequences inside strings (e.g. \" or \\)
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+
+        if (inString) {
+          if (ch === '\\') escaped = true;
+          else if (ch === '"') inString = false;
+          continue; // braces inside strings are literal, not structural
+        }
+
+        if (ch === '"') {
+          inString = true;
+          continue;
+        }
+
         if (ch === '{' && depth === 0) {
           nodeStart = i;
           depth = 1;
@@ -605,7 +629,7 @@ function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
 /**
  * CRUD + nested-resource dependency wiring.
  *
- * Solves 3 problems:
+ * Solves these problems:
  *
  * 1. SAME-RESOURCE CRUD ORDER:
  *    POST /students → GET/PUT/PATCH /students/{id} → DELETE /students/{id}
@@ -618,10 +642,19 @@ function autoWireAuthDependencies(nodes: DAGNode[]): DAGNode[] {
  *    Any node with path param {fooId} must depend on the node that
  *    creates that entity — even if AI didn't set variableInjections.
  *
- * Works by analyzing URL structure, not AI output — so it's reliable
- * even when Architect batches miss cross-resource dependencies.
+ * 4. NESTED DELETE ORDER (Rule 5):
+ *    DELETE /students/{id} must run AFTER DELETE /students/{id}/grades/{gid}.
+ *
+ * 5. BODY-FIELD PRODUCER DETECTION (Rule 6):
+ *    POST /orders has `cartId` in its request body schema — depend on POST /carts.
+ *    This is critical in BATCHING: when the spec is split into chunks, AI can
+ *    only see its own chunk and cannot wire cross-chunk body references.
+ *    Rule 6 reads the spec's schema to recover those edges deterministically.
+ *
+ * Works by analyzing URL structure and request body schemas, not AI output —
+ * so it's reliable even when Architect batches miss cross-resource dependencies.
  */
-function autoWireCrudDependencies(nodes: DAGNode[]): DAGNode[] {
+function autoWireCrudDependencies(nodes: DAGNode[], spec: ParsedApiSpec): DAGNode[] {
   /**
    * Parse a path into segments, identifying resource names and param slots.
    * /api/v1/students/{studentId}/grades/{gradeId}
@@ -751,6 +784,61 @@ function autoWireCrudDependencies(nodes: DAGNode[]): DAGNode[] {
     }
   }
 
+  // Rule 5: Parent DELETE must run AFTER nested DELETE.
+  //
+  // Without this, deleteStudent runs before deleteGrade — and when deleteGrade
+  // finally fires, the parent student no longer exists (404 or cascade-deleted).
+  // Matches Morest's (ICSE'22) CRUD filter rule: "delete must not precede
+  // another operation on the same resource tree".
+  //
+  // "nested" = strict path-segment descendant, computed via parsePathSegments
+  // so we don't false-match on string prefixes like /student vs /students.
+  {
+    const deleteNodes = nodes.filter(n => n.method === 'DELETE');
+    // Pre-compute segments once per DELETE node.
+    const segmentCache = new Map<string, Array<{ resource: string; param?: string }>>();
+    for (const del of deleteNodes) {
+      segmentCache.set(del.id, parsePathSegments(del.path.replace(/\/$/, '')));
+    }
+
+    const isStrictDescendant = (
+      parentSegs: Array<{ resource: string; param?: string }>,
+      childSegs: Array<{ resource: string; param?: string }>,
+    ): boolean => {
+      if (childSegs.length <= parentSegs.length) return false;
+      for (let i = 0; i < parentSegs.length; i++) {
+        if (parentSegs[i].resource !== childSegs[i].resource) return false;
+      }
+      return true;
+    };
+
+    for (const parentDel of deleteNodes) {
+      const parentSegs = segmentCache.get(parentDel.id)!;
+      // Only DELETE on an identified resource (last segment has a param, e.g.
+      // /students/{studentId}) can be a "parent" in a nesting sense. DELETE on
+      // a bare collection like /students (bulk delete) shouldn't gate nested
+      // deletes — it's a different semantic.
+      const lastSeg = parentSegs[parentSegs.length - 1];
+      if (!lastSeg || !lastSeg.param) continue;
+
+      for (const nestedDel of deleteNodes) {
+        if (nestedDel.id === parentDel.id) continue;
+        const nestedSegs = segmentCache.get(nestedDel.id)!;
+        if (!isStrictDescendant(parentSegs, nestedSegs)) continue;
+        // CYCLE GUARD: if the nested DELETE already depends on the parent
+        // DELETE (AI set it explicitly, or another rule wired it), adding
+        // parent → nested would create a 2-cycle. Skip this edge — the
+        // nested-before-parent ordering is still recovered by breakCycles
+        // later, but without producing an unstable cycle here.
+        if (nestedDel.dependsOn.includes(parentDel.id)) continue;
+        // Parent DELETE now depends on nested DELETE (nested runs first).
+        if (!parentDel.dependsOn.includes(nestedDel.id)) {
+          addDep(parentDel.id, nestedDel.id);
+        }
+      }
+    }
+  }
+
   // Rule 4: Path-param matching — if a node has {fooId} in path, find who creates "foo"
   // e.g., GET /grades/{gradeId}/report → needs whoever creates grades (POST /…/grades)
   for (const node of nodes) {
@@ -777,6 +865,111 @@ function autoWireCrudDependencies(nodes: DAGNode[]): DAGNode[] {
             resourceGuess === colResource + 'es') {
           for (const postNode of postNodes) {
             if (node.id !== postNode.id && !node.dependsOn.includes(postNode.id)) {
+              addDep(node.id, postNode.id);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Rule 6: Body-field producer matching — scan POST/PUT/PATCH request body
+  // schemas for *Id / *_id fields, and depend on whoever creates that resource.
+  //
+  // WHY THIS EXISTS: When the spec is split into batches (>20 endpoints), each
+  // Architect call sees ONLY its own chunk. Cross-batch body references are
+  // structurally invisible to the AI. Example: batch 2 has POST /orders with
+  // body { cartId }, batch 1 has POST /carts → AI in batch 2 cannot set
+  // dependsOn: ['createCart'] because createCart isn't in its input. Rule 4
+  // only inspects URL path params, so it misses body-field refs entirely.
+  //
+  // Rule 6 reads the original spec (not normalized DAG node) to find request
+  // body schemas, walks their properties looking for ID-like fields, and wires
+  // the same producer-matching logic as Rule 4.
+  {
+    // Build lookup from "METHOD:/path" → spec endpoint (has requestBody.schema)
+    const endpointByKey = new Map<string, ParsedEndpoint>();
+    for (const ep of spec.endpoints) {
+      endpointByKey.set(`${ep.method}:${ep.path}`, ep);
+    }
+
+    /**
+     * Extract ID-like field names from a request body schema.
+     * Handles:
+     *   - Flat objects:       { cartId, userId }
+     *   - Nested objects:     { cart: { cartId } }
+     *   - Arrays of items:    { items: [{ productId }] }
+     *   - Arrays of arrays:   { batches: [{ items: [{ productId }] }] }
+     *   - oneOf/anyOf:        take the first variant
+     *
+     * We recurse up to MAX_SCHEMA_DEPTH=5 to cover realistic nesting without
+     * runaway recursion on self-referential schemas. Every recursive call
+     * increments depth so the cap is enforced uniformly across object/array
+     * paths. Depth 5 lets us find e.g. { data: { order: { items: [{ product:
+     * { productId } } } } } — common in wrapped-response API designs.
+     */
+    const MAX_SCHEMA_DEPTH = 5;
+    function extractIdFields(schema: any, depth = 0): string[] {
+      if (!schema || typeof schema !== 'object' || depth > MAX_SCHEMA_DEPTH) return [];
+      const out: string[] = [];
+
+      // oneOf / anyOf — pick first variant, same as Enricher's rule
+      const variants = schema.oneOf || schema.anyOf;
+      if (Array.isArray(variants) && variants.length > 0) {
+        return extractIdFields(variants[0], depth + 1);
+      }
+
+      // Object with properties — check field names + recurse into nested
+      if (schema.type === 'object' || schema.properties) {
+        const props = schema.properties || {};
+        for (const [name, def] of Object.entries(props)) {
+          if (/(Id|_id|ID)$/.test(name)) {
+            out.push(name);
+          }
+          if (def && typeof def === 'object') {
+            out.push(...extractIdFields(def, depth + 1));
+          }
+        }
+      }
+
+      // Array — check items (array-of-objects is common for bulk endpoints)
+      if (schema.type === 'array' && schema.items) {
+        out.push(...extractIdFields(schema.items, depth + 1));
+      }
+
+      return out;
+    }
+
+    for (const node of nodes) {
+      if (!['POST', 'PUT', 'PATCH'].includes(node.method)) continue;
+      const ep = endpointByKey.get(`${node.method}:${node.path}`);
+      if (!ep?.requestBody?.schema) continue;
+
+      const idFields = extractIdFields(ep.requestBody.schema);
+      if (idFields.length === 0) continue;
+
+      for (const fieldName of idFields) {
+        // Same resource-name derivation as Rule 4
+        const resourceGuess = fieldName
+          .replace(/Id$/, '').replace(/_id$/, '')
+          .replace(/ID$/, '').toLowerCase();
+        if (!resourceGuess) continue;
+
+        // Same plural matching as Rule 4
+        for (const [col, postNodes] of postByCollection) {
+          const colResource = col.split('/').filter(Boolean).pop()?.toLowerCase() || '';
+          if (colResource === resourceGuess ||
+              colResource === resourceGuess + 's' ||
+              colResource === resourceGuess + 'es' ||
+              resourceGuess === colResource + 's' ||
+              resourceGuess === colResource + 'es') {
+            for (const postNode of postNodes) {
+              if (node.id === postNode.id) continue;
+              if (node.dependsOn.includes(postNode.id)) continue;
+              // CYCLE GUARD: mutual body references (A's body has bId while
+              // B's body has aId) would create A→B→A. Skip when the producer
+              // already depends on this node.
+              if (postNode.dependsOn.includes(node.id)) continue;
               addDep(node.id, postNode.id);
             }
           }
@@ -1088,7 +1281,7 @@ export class DependencyResolverService {
     }
 
     const preCrudCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
-    nodes = autoWireCrudDependencies(nodes);
+    nodes = autoWireCrudDependencies(nodes, spec);
     const postCrudCount = nodes.reduce((sum, n) => sum + n.dependsOn.length, 0);
     if (postCrudCount > preCrudCount) {
       logger.warn('[DEPENDENCY_RESOLVER] PROMPT_GAP: CRUD auto-wire added edges AI missed', {

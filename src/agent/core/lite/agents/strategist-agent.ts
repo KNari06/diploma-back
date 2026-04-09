@@ -160,6 +160,15 @@ export class StrategistAgent {
       parts.push(`\n🛡️ CRITIC REJECTIONS (avoid these patterns):\n${rejections.join('\n')}`);
     }
 
+    // PR1B: Critic concerns on APPROVED actions (warn-level — softer hints)
+    // Shown to Strategist so it can avoid repeating risky-but-allowed patterns.
+    if (memory.criticConcerns && memory.criticConcerns.length > 0) {
+      const concerns = memory.criticConcerns.map(c =>
+        `- [iter ${c.iteration}] ${c.action}${c.ref ? `(${c.ref})` : ''} [${c.violationTypes.join(',')}]: ${c.concern}`
+      );
+      parts.push(`\n⚠️ CRITIC CONCERNS (approved with warnings — consider safer alternatives):\n${concerns.join('\n')}`);
+    }
+
     // Expectation mismatch tracking (prediction failures)
     if (memory.consecutiveExpectationMisses && memory.consecutiveExpectationMisses >= 2) {
       parts.push(`\n⚠️ PREDICTION FAILURES: ${memory.consecutiveExpectationMisses} consecutive wrong predictions${memory.lastExpectationMismatch ? ` (last: "${memory.lastExpectationMismatch}")` : ''}. Your expectedOutcome keeps being wrong — reassess page state.`);
@@ -206,6 +215,32 @@ export class StrategistAgent {
 
     const confidenceTrendSection = input.confidenceTrend === 'declining'
       ? '\n⚠️ LOW CONFIDENCE TREND: Your confidence has been below 0.4 for 2+ iterations. Consider a fundamentally different approach — current strategy path may be wrong.\n'
+      : '';
+
+    // PR1C: Vision escalation hint for SPAs with sparse DOM semantics.
+    // When the page has few interactive elements but is clearly a rich app
+    // (e.g., React/Vue with <div onClick>), the DOM snapshot alone misses
+    // a lot of real interactivity. This section tells the Strategist to:
+    //   1. Prefer scroll/hover over aggressive clicks to explore the UI
+    //   2. Lower confidence in ref targeting — the ref map is incomplete
+    //   3. Report via blockedInfo if a visually obvious element can't be targeted
+    //
+    // IMPORTANT: We intentionally do NOT tell the model to "trust visionHints"
+    // because Strategist currently does not receive the VisionHints object
+    // (only the boolean recommendation flag). Adding the hints here would be
+    // instructing the model to use data it does not have. A follow-up PR can
+    // plumb VisionHints through StrategistInput and re-enable vision-guided
+    // targeting instructions.
+    const visionRecommendationSection = input.visionRecommendation?.isDOMWeak
+      ? `
+⚠️ WEAK DOM WARNING: This page has only ${input.visionRecommendation.interactiveElementCount} interactive elements in the DOM snapshot. It is likely a rich SPA/canvas app where real interactivity is NOT in the DOM ref map.
+${input.visionRecommendation.recommendVision ? 'The Observer recommends vision-based exploration — the ref list alone is unreliable here.' : ''}
+Strategy guidance for weak DOM:
+- Prefer scroll/hover to discover interactivity before clicking
+- Lower your confidence in targetRef — refs may not resolve to the intended element
+- Use the Observer's page layout cues (form fields, buttons, modals it describes in text) over bare refs
+- If a visually obvious element has no matching ref, report it via blockedInfo with blockerType="ambiguous_choice"
+`
       : '';
 
     // Supervisor: Recovery mode section with forbidden actions + blocker + AI diagnosis
@@ -376,7 +411,7 @@ Before choosing an action, consider its cost and risk:
 | press    | MEDIUM | MEDIUM | Keyboard shortcut. May trigger submit.   |
 | goto     | HIGH   | HIGH   | Navigate to new URL. Loses current page. |
 Prefer LOW-cost actions when multiple paths exist. Use HIGH-risk actions only when necessary.
-${timePressureSection}${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${supervisorSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
+${timePressureSection}${planSection}${guidanceSection}${stuckSection}${confidenceTrendSection}${visionRecommendationSection}${supervisorSection}${criticFeedbackSection}${failedActionsSection}${auditSection}
 ═══ PROGRESS ═══
 Progress: ${Math.round(input.progressScore * 100)}% | Iteration: ${input.iteration}
 Last outcome: ${input.lastOutcome || 'none'}
@@ -410,7 +445,7 @@ Respond with JSON:
   "confidence": 0.85,
   "riskLevel": "low",
   "done": false,
-  "blockedInfo": null,
+  "blockedInfo": null,  // or { "reason": "...", "canUserHelp": true, "blockerType": "2fa", "requestedAction": {...} } — see rules below
   "subGoal": "Fill login credentials"${structuredStrategyFormat}
 }
 
@@ -423,7 +458,27 @@ Rules:
 - "riskLevel": "low" (scroll/hover/wait/fill), "medium" (click/select/press), "high" (goto/submit with side effects)
 - "confidence": 0-1. Lower if obstacles present, history shows failures, or expectation mismatch${structuredStrategyRules}
 - If goal is achieved: set "done": true
-- If blocked (captcha, 2FA, verification): set "blockedInfo": {"reason": "...", "canUserHelp": true/false}
+- If blocked and need HUMAN INPUT: set "blockedInfo" with structured classification.
+  Use this ONLY when automation cannot proceed without a real person.
+  Common blockers that REQUIRE a human:
+    * captcha / reCAPTCHA / hCaptcha  → blockerType: "captcha"
+    * 2FA / TOTP / authenticator app  → blockerType: "2fa"
+    * SMS verification code           → blockerType: "sms_code"
+    * Email verification link click   → blockerType: "email_verification"
+    * OAuth consent screen            → blockerType: "oauth_consent"
+    * Payment / 3DS verification      → blockerType: "payment_auth"
+    * Manual file upload              → blockerType: "file_upload"
+    * Ambiguous UI choice (user must decide A vs B) → blockerType: "ambiguous_choice"
+  Shape:
+    "blockedInfo": {
+      "reason": "Concrete description, e.g., 'Google 2FA code input appeared'",
+      "canUserHelp": true,
+      "blockerType": "2fa",
+      "requestedAction": { "action": "fill", "ref": "e5", "description": "Enter 2FA code" }
+    }
+  DO NOT use blockedInfo for soft issues like "button not found yet" or
+  "page still loading" — those are normal iteration concerns. Only block
+  when a real human decision/secret is required.
 - Return ONLY valid JSON`;
   }
 }

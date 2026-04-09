@@ -99,6 +99,25 @@ export interface TestBlackboardState {
 
   // ── Contextual hints (from GoalDetector, updated per round) ──
   contextualHints?: string[];         // navigation hints (e.g. "registration form not visible, click Sign Up")
+
+  // ══════════════════════════════════════════════════════════════════════
+  // HYBRID EXECUTOR FIELDS (only populated when enableHybridExecutor=true)
+  // ══════════════════════════════════════════════════════════════════════
+
+  /**
+   * PR-Hybrid: Most recent Supervisor blackboard (Tier 1 deterministic +
+   * optional Tier 2 AI diagnosis). Refreshed at the start of each pipeline
+   * round. Readable by CommandExecutor for forbidden-action enforcement
+   * and by ExecutorAgent for prompt hints (currently unused — future).
+   */
+  supervisorBlackboard?: import('../agents/types').SupervisorBlackboard;
+
+  /**
+   * PR-Hybrid: Goal URL for Supervisor's wrong-page detection (pathname
+   * comparison vs currentUrl). Optional — if absent, wrong-page detection
+   * is skipped, which is the current Pipeline v2 behavior.
+   */
+  goalUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -205,6 +224,21 @@ export interface PipelineConfig {
   skipDbCancellationCheck?: boolean;
   /** Entry point ID for exploration flows — propagated to pipeline trace events for log correlation */
   entryPointId?: string;
+  /**
+   * PR-Hybrid: Original goal URL for Supervisor wrong-page detection.
+   * Optional — if absent, Supervisor skips pathname comparison.
+   */
+  goalUrl?: string;
+  /**
+   * PR-Hybrid: Enable SafetyInterceptor + Supervisor wiring in Pipeline v2.
+   * When true:
+   *   - CommandExecutor runs SafetyInterceptor before executing each
+   *     ref-based command (Critic Phase 1 deterministic checks).
+   *   - TestPipeline runs SupervisorAgent at the start of each round
+   *     (state hash, Jaccard, forbidden actions, Tier 2 AI diagnosis).
+   * Default: false. Decided by LiteEngine based on enableHybridExecutor flag.
+   */
+  enableHybridSafety?: boolean;
 }
 
 /** Result returned by the pipeline */

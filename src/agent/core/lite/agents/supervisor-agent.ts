@@ -70,6 +70,12 @@ export class SupervisorAgent {
   // Jaccard similarity tracking
   private previousSignatureSet: Set<string> = new Set();
   private softLoopCount = 0;
+  /**
+   * PR1B: Per-run Tier 2 invocation counter. Hard cap via
+   * LITE_ENGINE_FLAGS.supervisorTier2MaxPerRun prevents runaway AI diagnosis
+   * cost when the agent is deeply stuck. Reset NEVER — budget is per run.
+   */
+  private tier2InvocationCount = 0;
 
   // ═══════════════════════════════════════════════════════════════════════
   // Tier 1: Deterministic Watchdog (<5ms, 0 tokens)
@@ -361,14 +367,21 @@ export class SupervisorAgent {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * AI diagnosis — called ONLY when Tier 1 is exhausted (5+ interventions).
-   * Uses gpt-5.4-mini for a diagnostic call.
+   * AI diagnosis — called ONLY when Tier 1 is exhausted (3+ interventions
+   * by default). Uses goalAuditor model for a diagnostic call.
    * Returns actionable hint + optional mandatory action override.
+   *
+   * PR1B: Increments per-run `tier2InvocationCount`. Caller should check
+   * `isTier2BudgetExhausted()` before invoking — this method itself does
+   * NOT gate on the budget (so an already-started diagnosis completes
+   * even if it pushes us over the cap).
    */
   async diagnoseBlocker(
     input: MultiAgentInput,
     blackboard: SupervisorBlackboard,
   ): Promise<Tier2DiagnosticResult | undefined> {
+    // PR1B: count the invocation regardless of success — cost was spent
+    this.tier2InvocationCount++;
     try {
       const observerContext = this.lastObserverOutputs.slice(-3).join('\n---\n');
       const actionContext = this.lastActions.slice(-3)
@@ -417,6 +430,8 @@ Valid actions: click, fill, select, press, goto, scroll, hover, wait.`;
 
       logger.info('[SUPERVISOR] Tier 2: Invoking AI diagnosis', {
         interventionCount: blackboard.interventionCount,
+        tier2InvocationCount: this.tier2InvocationCount,
+        tier2Budget: LITE_ENGINE_FLAGS.supervisorTier2MaxPerRun,
         promptLength: prompt.length,
       });
 
@@ -526,5 +541,15 @@ Valid actions: click, fill, select, press, goto, scroll, hover, wait.`;
   /** Get current intervention count (for external checks) */
   getInterventionCount(): number {
     return this.interventionCount;
+  }
+
+  /** PR1B: Current Tier 2 AI diagnosis invocation count for this run */
+  getTier2InvocationCount(): number {
+    return this.tier2InvocationCount;
+  }
+
+  /** PR1B: Check if Tier 2 budget is exhausted for this run */
+  isTier2BudgetExhausted(): boolean {
+    return this.tier2InvocationCount >= LITE_ENGINE_FLAGS.supervisorTier2MaxPerRun;
   }
 }

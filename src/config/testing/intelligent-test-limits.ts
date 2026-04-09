@@ -233,6 +233,13 @@ export const LITE_ENGINE_FLAGS = {
   circuitBreakerRetryInterval: 3,
   /** Skip critic for low-risk deterministic actions (saves ~2s) */
   criticSkipForLowRisk: true,
+  /**
+   * PR2: Run SafetyInterceptor (Critic Phase 1 deterministic checks) on the
+   * skip path. When true, hallucinated refs and forbidden actions are caught
+   * even when the AI Critic is bypassed. Default OFF for safe rollout —
+   * flip in a separate PR after staging soak.
+   */
+  enableSafetyInterceptorOnSkip: false,
   /** Enable critic override — apply structured override commands instead of just logging */
   enableCriticOverride: true,
   /** Preserve accumulated context when falling back to monolithic */
@@ -245,6 +252,14 @@ export const LITE_ENGINE_FLAGS = {
   enableCriticRejectionMemory: true,
   /** Maximum number of critic rejections to keep in working memory */
   criticRejectionMemorySize: 5,
+  /**
+   * PR1B: Track critic concerns (warn-level violations on APPROVED actions)
+   * in working memory. When true, warnings from Critic are fed to the next
+   * Strategist iteration even when the action was approved.
+   */
+  enableCriticConcernsMemory: true,
+  /** PR1B: Max critic concerns to keep in working memory (bounded ring) */
+  criticConcernsMemorySize: 5,
   /** Re-run Strategist with critic feedback when all alternatives exhausted (one retry, no loops) */
   enableReStrategizeOnReject: true,
   /** Check vision conflicts (covered/hidden/disabled elements) in Critic Phase 1 (zero AI cost) */
@@ -275,8 +290,13 @@ export const LITE_ENGINE_FLAGS = {
   supervisorStateHashRepeatThreshold: 3,
   /** Wrong-page iterations for hard backtrack */
   supervisorWrongPageThreshold: 2,
-  /** Max Tier 1 interventions before escalation to Tier 2 */
-  supervisorMaxInterventions: 5,
+  /**
+   * Max Tier 1 interventions before escalation to Tier 2.
+   * PR1B: Lowered from 5 → 3 so AI diagnosis fires earlier in the run.
+   * At MAX_ITERATIONS=20, waiting for 5 interventions used over half the
+   * budget before any AI help arrived.
+   */
+  supervisorMaxInterventions: 3,
   /** Recent iterations for forbidden action window */
   supervisorForbiddenActionWindow: 3,
   /** Max element signatures in state hash */
@@ -285,6 +305,13 @@ export const LITE_ENGINE_FLAGS = {
   enableSupervisorTier2: true,
   /** Timeout for Tier 2 AI call (ms) */
   supervisorTier2TimeoutMs: 3000,
+  /**
+   * PR1B: Hard cap on Tier 2 AI diagnoses per test run. After this many
+   * calls, Tier 2 is disabled for the rest of the run — the test should
+   * bail to monolithic or fail rather than burn more budget on diagnosis.
+   * Replaces the old `% 3` cooldown which had no upper bound.
+   */
+  supervisorTier2MaxPerRun: 3,
 
   // ═══════════════════════════════════════════════════════════════════════════
   // TIMEOUT GOVERNOR (Adaptive Timeout System)
@@ -323,7 +350,69 @@ export const LITE_ENGINE_FLAGS = {
   pipelineTimeoutMs: 5 * 60 * 1000,
   /** Max command-calling rounds per Executor invocation */
   pipelineExecutorMaxRounds: 3,
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // HYBRID EXECUTOR (Pipeline v2 + SafetyInterceptor + Supervisor Tier 1)
+  // ═══════════════════════════════════════════════════════════════════════════
+  /**
+   * PR-Hybrid: Enable Hybrid Executor mode. When true, the LiteEngine runs
+   * Pipeline v2 with the following safety layers wired in:
+   *   1. SafetyInterceptor (Critic Phase 1 deterministic checks) runs before
+   *      every ref-based command in CommandExecutor
+   *   2. SupervisorAgent Tier 1 runs at the start of each pipeline round
+   *      (state hash, Jaccard, wrong-page, forbidden actions)
+   *   3. Forbidden actions propagate from Supervisor to SafetyInterceptor
+   *      so the executor LLM self-corrects via tool_result feedback
+   *
+   * On ANY hybrid error or `success: false`, the engine falls back to the
+   * existing multi-agent orchestrator path (which is itself unchanged).
+   *
+   * Default: false. Safe rollout via config override in staging first.
+   *
+   * NOT YET WIRED in hybrid mode (planned follow-ups):
+   *   - Supervisor Tier 2 AI diagnosis
+   *   - Hard backtrack on wrong-page detection
+   *   - Mandatory action override from Tier 2
+   *   - Vision escalation when isDOMWeak
+   */
+  enableHybridExecutor: false,
 } as const;
+
+/**
+ * PR-Hybrid: Runtime resolver for the hybrid executor kill switch.
+ *
+ * Reads `process.env.LITE_HYBRID_EXECUTOR` at every call (not cached) so ops
+ * can flip the flag by setting the env var and restarting the worker pool,
+ * without a code redeploy. The resolution order is:
+ *
+ *   1. `LITE_HYBRID_EXECUTOR=false` → force OFF (kill switch, highest priority)
+ *   2. `LITE_HYBRID_EXECUTOR=true`  → force ON (staging/canary enablement)
+ *   3. unset / any other value     → fall back to `LITE_ENGINE_FLAGS.enableHybridExecutor`
+ *
+ * Accepted truthy: `true`, `1`, `yes`, `on` (case-insensitive).
+ * Accepted falsy: `false`, `0`, `no`, `off` (case-insensitive).
+ *
+ * Anything else is treated as "not set" and defers to the config default.
+ *
+ * This pattern is intentionally NOT added to the zod env schema — adding a
+ * new required field there requires a code change, which defeats the kill
+ * switch purpose. Direct `process.env` reads are the correct tool here.
+ */
+export function isHybridExecutorEnabled(): boolean {
+  const raw = process.env.LITE_HYBRID_EXECUTOR;
+  if (raw === undefined || raw === '') {
+    return LITE_ENGINE_FLAGS.enableHybridExecutor;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') {
+    return false;
+  }
+  if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') {
+    return true;
+  }
+  // Unknown value — fall back to config default (don't surprise ops with random strings enabling it)
+  return LITE_ENGINE_FLAGS.enableHybridExecutor;
+}
 
 /**
  * Adaptive timeout configuration based on site performance profile
