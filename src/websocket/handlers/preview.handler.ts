@@ -2804,16 +2804,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Snapshot is already kicked off inside refreshPage() via setImmediate —
         // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
-        // Inject a fresh screenshot frame so frontend doesn't show stale/white frame
-        // while CDP screencast catches up after page reload
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical — CDP screencast will resume on its own
-          }
-        });
+        // V13: Re-arm the first-frame guarantee instead of issuing a single
+        // injectFrame. After page.reload() the existing CDP screencast may
+        // emit no frames until the page repaints, so we need the same retry
+        // ladder used at start() to survive transient inject failures.
+        try {
+          const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+          getPreviewVideoStreamRegistry().armFirstFrameGuarantee(previewSessionId);
+        } catch {
+          // Non-critical — CDP screencast will resume on its own
+        }
 
         // V9: Recording hook — flush buffers and update URL baseline after refresh
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -2902,15 +2902,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Snapshot is already kicked off inside goBack() via setImmediate —
         // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
-        // Inject a fresh frame so frontend doesn't show stale content
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical
-          }
-        });
+        // V13: Re-arm first-frame guarantee instead of single injectFrame.
+        try {
+          const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+          getPreviewVideoStreamRegistry().armFirstFrameGuarantee(previewSessionId);
+        } catch {
+          // Non-critical
+        }
 
         // V11: Recording hook — record navigate step for back
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -2979,14 +2977,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // Snapshot is already kicked off inside goForward() via setImmediate —
         // the DOM-update interval (500ms) will pick it up and emit preview:page.
 
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
-            await getPreviewVideoStreamRegistry().injectFrame(previewSessionId);
-          } catch {
-            // Non-critical
-          }
-        });
+        // V13: Re-arm first-frame guarantee instead of single injectFrame.
+        try {
+          const { getPreviewVideoStreamRegistry } = await import('@/services/testing/ui/preview');
+          getPreviewVideoStreamRegistry().armFirstFrameGuarantee(previewSessionId);
+        } catch {
+          // Non-critical
+        }
 
         // V11: Recording hook — record navigate step for forward
         if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -3138,28 +3135,26 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       });
 
       if (result) {
-        emitPageActionResult(socket, previewSessionId, 'reset', true);
-        // V20: page reset is a handshake — the frontend must receive the fresh DOM
-        // even if by coincidence the new page's signature matches the previous. Also
-        // `resetSession` already cleared `lastEmittedSignature` internally, but we
-        // still use the bypass path so the intent is explicit.
-        setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
+        // V13: Restart video + devtools streams on the new page BEFORE we ack
+        // the reset to the client. The pre-V13 flow used setImmediate
+        // fire-and-forget, which left a window where the frontend thought
+        // reset was complete while the new screencast was still being attached.
+        // Awaiting here is cheap (CDP attach + startScreencast is sub-100ms)
+        // and eliminates the race entirely.
+        try {
+          const { getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry, getPreviewSessionService: getSvc } =
+            await import('@/services/testing/ui/preview');
+          const videoReg = getPreviewVideoStreamRegistry();
+          const devtoolsReg = getPreviewDevToolsRegistry();
+          const svc = getSvc();
+          const newPage = svc.getPage(previewSessionId, ensuredUserId);
 
-        // Restart video + devtools streams on the new page (old stream died with old page)
-        setImmediate(async () => {
-          try {
-            const { getPreviewVideoStreamRegistry, getPreviewDevToolsRegistry, getPreviewSessionService: getSvc } =
-              await import('@/services/testing/ui/preview');
-            const videoReg = getPreviewVideoStreamRegistry();
-            const devtoolsReg = getPreviewDevToolsRegistry();
-            const svc = getSvc();
-            const newPage = svc.getPage(previewSessionId, ensuredUserId);
-
-            if (!newPage) return;
-
+          if (newPage) {
             const room = createRoomName('preview', previewSessionId);
 
-            // Stop old (already dead) stream, then start fresh on new page
+            // Stop old (already dead) stream, then start fresh on new page.
+            // startStream() is mutex'd by the registry so concurrent reset
+            // requests cannot create orphaned CDP sessions.
             await videoReg.stopStream(previewSessionId);
             await videoReg.startStream(previewSessionId, ensuredUserId, room, newPage, socket.nsp);
 
@@ -3168,13 +3163,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             devtoolsReg.start(previewSessionId, room, newPage, socket.nsp);
 
             logger.info('[PREVIEW_STREAM] Streams restarted after reset', { previewSessionId });
-          } catch (restartError) {
-            logger.warn('[PREVIEW_STREAM] Failed to restart streams after reset', {
-              previewSessionId,
-              error: restartError instanceof Error ? restartError.message : String(restartError),
-            });
           }
-        });
+        } catch (restartError) {
+          logger.warn('[PREVIEW_STREAM] Failed to restart streams after reset', {
+            previewSessionId,
+            error: restartError instanceof Error ? restartError.message : String(restartError),
+          });
+        }
+
+        emitPageActionResult(socket, previewSessionId, 'reset', true);
+        // V20: page reset is a handshake — the frontend must receive the fresh DOM
+        // even if by coincidence the new page's signature matches the previous. Also
+        // `resetSession` already cleared `lastEmittedSignature` internally, but we
+        // still use the bypass path so the intent is explicit.
+        setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
 
         // V9: Recording — reset destroys old page+context, so recording must stop
         // (resetSession already sets recording=false and clears buffer)
