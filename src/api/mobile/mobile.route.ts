@@ -17,7 +17,7 @@ import multer from 'multer';
 import { deleteMobileApp, getMobileApp, uploadMobileApp } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
-import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession } from './session.controller';
+import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession } from './session.controller';
 
 // ── Multer config for APK/IPA uploads ────────────────────────────
 
@@ -213,6 +213,18 @@ router.post(
   '/sessions/:sessionId/command',
   requireAuth,
   asyncHandler(commandSession),
+);
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/run-test-case
+ * Run all steps of an intent test case on the mobile emulator
+ *
+ * Body: { intentTestCaseId: string }
+ */
+router.post(
+  '/sessions/:sessionId/run-test-case',
+  requireAuth,
+  asyncHandler(runTestCaseOnSession),
 );
 
 // ═══════════════════════════════════════════════════════════════════════════

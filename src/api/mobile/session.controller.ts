@@ -1173,3 +1173,243 @@ export async function claimWarmedSession(
     return null;
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RUN TEST CASE (all steps) ON MOBILE EMULATOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/sessions/:sessionId/run-test-case
+ *
+ * Run all steps of an intent test case on the mobile emulator.
+ * Body: { intentTestCaseId: string }
+ * Returns: { success, totalSteps, passedSteps, failedSteps, skippedSteps, steps, durationMs }
+ */
+export async function runTestCaseOnSession(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { sessionId } = req.params;
+  const { intentTestCaseId } = req.body as { intentTestCaseId?: string };
+
+  if (!sessionId || !intentTestCaseId) {
+    res.status(400).json({ success: false, error: 'sessionId and intentTestCaseId are required' });
+    return;
+  }
+
+  try {
+    // Load test case from DB
+    const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+    const testCase = await IntentTestCaseService.getByIdInternal(intentTestCaseId);
+
+    if (!testCase) {
+      res.status(404).json({ success: false, error: 'Test case not found' });
+      return;
+    }
+
+    const steps = testCase.stepsJson || [];
+    if (!steps.length) {
+      res.status(400).json({ success: false, error: 'Test case has no steps' });
+      return;
+    }
+
+    logger.info('[MOBILE_SESSION] Running test case on emulator', {
+      sessionId,
+      intentTestCaseId,
+      stepCount: steps.length,
+      stepTypes: steps.map((s: any) => s.type),
+      userId,
+    });
+
+    const client = getMobileRunnerClient();
+    const runStart = Date.now();
+
+    // Stream NDJSON so frontend can show per-step progress
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache');
+    const sendEvent = (event: Record<string, unknown>) => {
+      res.write(JSON.stringify(event) + '\n');
+    };
+
+    // Notify frontend which steps will run
+    sendEvent({
+      type: 'started',
+      totalSteps: steps.length,
+      stepIds: steps.map((s: any) => s.id),
+    });
+
+    // Execute steps sequentially using the same lint-then-execute approach
+    // as applySession (single step). This ensures consistent element resolution.
+    const LINT_TYPES = new Set(['click', 'tap', 'double_tap', 'long_press', 'open', 'toggle', 'check', 'uncheck', 'select', 'hover', 'type', 'fill']);
+    const ACTION_TYPE_MAP: Record<string, string> = {
+      click: 'tap', tap: 'tap', double_tap: 'tap', long_press: 'tap',
+      open: 'tap', toggle: 'tap', check: 'tap', uncheck: 'tap',
+      select: 'tap', hover: 'tap', type: 'type_text', fill: 'type_text',
+    };
+    const RAW_CMD_MAP: Record<string, string> = {
+      click: 'tap', tap: 'tap', open: 'tap', toggle: 'tap',
+      check: 'tap', uncheck: 'tap', select: 'tap', hover: 'tap',
+      double_tap: 'double_tap', long_press: 'long_press',
+    };
+    const STEP_TYPE_MAP: Record<string, string> = { tap: 'click', fill: 'type' };
+
+    const stepResults: Array<{ stepId: string; success: boolean; error?: string; durationMs: number }> = [];
+    let passedSteps = 0;
+    let failedSteps = 0;
+    let skippedSteps = 0;
+
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i] as any;
+
+      // If a previous step failed, skip remaining
+      if (failedSteps > 0) {
+        stepResults.push({ stepId: step.id, success: false, error: 'Skipped (previous step failed)', durationMs: 0 });
+        skippedSteps++;
+        sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'skipped', durationMs: 0 });
+        continue;
+      }
+
+      // Notify frontend this step is now running
+      sendEvent({ type: 'step_running', stepId: step.id, stepIndex: i });
+
+      const stepStart = Date.now();
+      const rawType = step.type || 'click';
+      const description = (step.description || '').replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+
+      try {
+        // Fast path: lint to find element, then execute by coordinates (same as applySession)
+        if (description && LINT_TYPES.has(rawType)) {
+          const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
+          const lintResult = await client.lintElement(sessionId, description, lintActionType);
+
+          if (lintResult.status === 'resolved' && lintResult.boundingBox) {
+            const bb = lintResult.boundingBox;
+            const centerX = Math.round(bb.x + bb.width / 2);
+            const centerY = Math.round(bb.y + bb.height / 2);
+
+            const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
+
+            if (rawType === 'type' || rawType === 'fill') {
+              commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
+              if (step.value) {
+                commands.push({
+                  type: 'type_text',
+                  params: {
+                    text: step.value,
+                    clearFirst: !!(step.options?.replaceContent),
+                  },
+                });
+                if (step.options?.pressEnter) {
+                  commands.push({ type: 'press_key', params: { keycode: 'KEYCODE_ENTER' } });
+                }
+              }
+            } else {
+              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { x: centerX, y: centerY } });
+            }
+
+            await client.executeBatchCommands(sessionId, commands);
+            const durationMs = Date.now() - stepStart;
+            stepResults.push({ stepId: step.id, success: true, durationMs });
+            passedSteps++;
+            sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'pass', durationMs });
+
+            logger.info(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} passed (lint path)`, {
+              stepId: step.id, type: rawType, description, durationMs,
+            });
+            continue;
+          }
+          // Lint didn't resolve — fall through to runSteps
+        }
+
+        // Fallback: use runSteps pipeline for this single step
+        const stepType = STEP_TYPE_MAP[rawType] || rawType;
+        const intentStep = {
+          id: step.id,
+          type: stepType,
+          description,
+          value: step.value,
+          assertionText: step.assertionText,
+          options: step.options,
+          bindingHints: step.bindingHints || {},
+        };
+
+        const result = await client.runSteps(sessionId, [intentStep], {
+          screenshotEachStep: true,
+          stopOnFailure: true,
+        });
+
+        const stepResult = result.steps?.[0];
+        const durationMs = Date.now() - stepStart;
+
+        if (stepResult?.success) {
+          stepResults.push({ stepId: step.id, success: true, durationMs });
+          passedSteps++;
+          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'pass', durationMs });
+          logger.info(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} passed (runSteps fallback)`, {
+            stepId: step.id, type: rawType, description, durationMs,
+          });
+        } else {
+          const errorMsg = stepResult?.error || 'Step failed';
+          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
+          failedSteps++;
+          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs });
+          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed`, {
+            stepId: step.id, type: rawType, description, error: errorMsg, durationMs,
+          });
+        }
+      } catch (stepError) {
+        const durationMs = Date.now() - stepStart;
+        const errorMsg = stepError instanceof Error ? stepError.message : String(stepError);
+        stepResults.push({
+          stepId: step.id,
+          success: false,
+          error: errorMsg,
+          durationMs,
+        });
+        failedSteps++;
+        sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs });
+        logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} threw error`, {
+          stepId: step.id, error: errorMsg,
+        });
+      }
+    }
+
+    const totalDurationMs = Date.now() - runStart;
+
+    logger.info('[MOBILE_SESSION] Test case run completed', {
+      sessionId,
+      intentTestCaseId,
+      totalSteps: steps.length,
+      passedSteps,
+      failedSteps,
+      skippedSteps,
+      durationMs: totalDurationMs,
+    });
+
+    sendEvent({
+      type: 'completed',
+      success: failedSteps === 0 && skippedSteps === 0,
+      totalSteps: steps.length,
+      passedSteps,
+      failedSteps,
+      skippedSteps,
+      durationMs: totalDurationMs,
+    });
+    res.end();
+  } catch (error) {
+    logger.error('[MOBILE_SESSION] Run test case failed', {
+      sessionId,
+      intentTestCaseId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to run test case',
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}

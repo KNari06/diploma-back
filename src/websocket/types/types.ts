@@ -993,6 +993,8 @@ export interface PreviewRunStartRequest {
   steps?: PreviewIntentStep[];
   /** Optional: startUrl override (used with inline steps when test case may lack a URL). */
   startUrl?: string;
+  /** Optional: mobile runner session ID for mobile test cases. */
+  mobileSessionId?: string;
 }
 
 /**
