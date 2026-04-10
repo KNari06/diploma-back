@@ -600,6 +600,7 @@ export async function insertTraceFileRecord(params: {
   fileSize: number;
   browser: string;
   status?: string;
+  parsedData?: Record<string, unknown> | null;
 }): Promise<{ id: string }> {
   try {
     const {
@@ -611,6 +612,7 @@ export async function insertTraceFileRecord(params: {
       fileSize,
       browser,
       status = 'uploaded',
+      parsedData = null,
     } = params;
 
     logger.info('[STORAGE] Inserting trace file record', {
@@ -630,6 +632,7 @@ export async function insertTraceFileRecord(params: {
       browser,
       status,
       public_url: null, // Private bucket, use signed URLs
+      ...(parsedData ? { parsed_data: parsedData, status: 'parsed', parsed_at: new Date().toISOString() } : {}),
     };
 
     const payloadWithIntent: Record<string, unknown> = {

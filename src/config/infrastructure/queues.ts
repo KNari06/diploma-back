@@ -481,8 +481,18 @@ export class QueueManager {
     data?: any;
   }) {
     try {
+      // V13: Deterministic jobId prevents duplicate notifications within the
+      // same test execution cycle. Uses testResultId (unique per execution)
+      // when available, falling back to testId. This way re-runs of the same
+      // test generate fresh jobIds (different testResultId) while duplicate
+      // events within one run are deduplicated.
+      const dedupKey = notificationData.data?.testResultId || notificationData.data?.testId || '';
+      const jobId = dedupKey
+        ? `notif-${notificationData.type}-${notificationData.recipient}-${dedupKey}`
+        : undefined;
       const job = await notificationQueue.add('notification', notificationData, {
-        priority: 1, // Lower priority for notifications
+        priority: 1,
+        ...(jobId && { jobId }),
       });
 
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.NOTIFICATION, type: notificationData.type });
@@ -503,8 +513,15 @@ export class QueueManager {
     headers?: Record<string, string>;
   }) {
     try {
+      // V13: Deterministic jobId prevents duplicate webhook deliveries.
+      // Prefer testResultId (unique per execution) so re-runs aren't blocked.
+      const webhookDedupKey = webhookData.data?.testResultId || webhookData.data?.testId || webhookData.data?.runId || '';
+      const webhookJobId = webhookDedupKey
+        ? `webhook-${webhookData.event}-${webhookDedupKey}`
+        : undefined;
       const job = await webhookQueue.add('webhook', webhookData, {
         priority: 2,
+        ...(webhookJobId && { jobId: webhookJobId }),
       });
 
       logQueueEvent('added', job.id!, { queue: QUEUE_NAMES.WEBHOOK, event: webhookData.event });
