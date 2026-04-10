@@ -783,52 +783,67 @@ export class NotificationJobHandler {
   }
 
   /**
-   * Send email notification
+   * Send email notification via SMTP (nodemailer).
    */
   private static async sendEmailNotification(
     recipient: string,
     subject: string,
     message: string
   ) {
-    // In a real implementation, you would integrate with an email service
-    // like SendGrid, AWS SES, or similar
-    logger.info(`Email notification: ${recipient} - ${subject}`);
-    logger.info(`Message: ${message}`);
-
-    // For now, just log the email
-    // TODO: Implement actual email sending
+    const { EmailService } = await import('@/services/core/email.service');
+    const result = await EmailService.sendGenericEmail({
+      recipientEmail: recipient,
+      subject,
+      textContent: message,
+    });
+    if (!result.success) {
+      throw new Error(result.error || 'Email send failed');
+    }
   }
 
   /**
-   * Send Slack notification
+   * Send Slack notification via Incoming Webhook.
+   * `recipient` is expected to be a Slack Incoming Webhook URL.
    */
   private static async sendSlackNotification(
     recipient: string,
     subject: string,
     message: string
   ) {
-    // In a real implementation, you would use Slack Web API
-    logger.info(`Slack notification: ${recipient} - ${subject}`);
-    logger.info(`Message: ${message}`);
-
-    // For now, just log the Slack message
-    // TODO: Implement actual Slack integration
+    if (!recipient.startsWith('https://hooks.slack.com/')) {
+      logger.warn(`[NOTIFICATION] Slack recipient is not a webhook URL, skipping: ${recipient}`);
+      return;
+    }
+    const response = await fetch(recipient, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: `*${subject}*\n${message}` }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Slack webhook failed: ${response.status} ${response.statusText}`);
+    }
+    logger.info(`Slack notification sent: ${recipient} - ${subject}`);
   }
 
   /**
-   * Send webhook notification
+   * Send webhook notification via HTTP POST.
    */
   private static async sendWebhookNotification(
     url: string,
     event: string,
     data: any
   ) {
-    // In a real implementation, you would make HTTP requests to webhook URLs
-    logger.info(`Webhook notification: ${url} - ${event}`);
-    logger.info(`Data: ${JSON.stringify(data, null, 2)}`);
-
-    // For now, just log the webhook
-    // TODO: Implement actual webhook sending
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event, data, timestamp: new Date().toISOString() }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Webhook failed: ${response.status} ${response.statusText}`);
+    }
+    logger.info(`Webhook notification sent: ${url} - ${event}`);
   }
 }
 

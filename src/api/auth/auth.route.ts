@@ -20,7 +20,7 @@ import {
   signup,
   updateProfile,
   updateUserStatus,
-  sendApprovalEmailHandler,
+  verifyEmail,
 } from './auth.controller';
 
 const router = Router();
@@ -588,6 +588,29 @@ router.post('/resend-verification', asyncHandler(async (req: Request, res: Respo
 
 /**
  * @swagger
+ * /api/v1/auth/verify-email:
+ *   get:
+ *     summary: Verify email via token from confirmation link
+ *     description: Exchanges Supabase signup confirmation token for a session. Returns tokens for auto-login.
+ *     tags: [Auth]
+ *     parameters:
+ *       - in: query
+ *         name: token
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Email verified, returns user + tokens
+ *       400:
+ *         description: Invalid or expired token
+ */
+router.get('/verify-email', asyncHandler(async (req: Request, res: Response) => {
+  await verifyEmail(req, res);
+}));
+
+/**
+ * @swagger
  * /api/v1/auth/password/update:
  *   post:
  *     summary: Обновить пароль
@@ -805,11 +828,5 @@ router.get('/users/pending', requireAuth, requireAdmin, asyncHandler(getPendingU
  * Body: { status: 'approved' | 'rejected' | 'pending_approval' }
  */
 router.patch('/users/:userId/status', requireAuth, requireAdmin, asyncHandler(updateUserStatus));
-
-/**
- * Send approval notification email (admin only)
- * Body: { email: string, name?: string }
- */
-router.post('/send-approval-email', requireAuth, requireAdmin, asyncHandler(sendApprovalEmailHandler));
 
 export default router;

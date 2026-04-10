@@ -695,24 +695,34 @@ export const updateUserStatus = async (req: Request, res: Response): Promise<voi
     // Invalidate auth cache so the user's next request picks up the new status
     await invalidateAuthCacheForUser(userId);
 
-    // Fire-and-forget approval email when transitioning into 'approved'.
+    // Fire-and-forget status notification emails.
     // Guarded by the previous status so repeated PATCHes don't spam the user.
-    if (
-      status === 'approved' &&
-      prevUser?.status !== 'approved' &&
-      updatedUser?.email
-    ) {
-      EmailService.sendApprovalEmail({
-        recipientEmail: updatedUser.email,
-        recipientName: updatedUser.name || undefined,
-        frontendUrl: env.FRONTEND_URL,
-      }).catch((err) =>
-        logger.error('[AUTH] Failed to send approval email on status change', {
-          error: err instanceof Error ? err.message : String(err),
-          userId,
-          email: updatedUser.email,
-        })
-      );
+    if (updatedUser?.email && prevUser?.status !== status) {
+      if (status === 'approved') {
+        EmailService.sendApprovalEmail({
+          recipientEmail: updatedUser.email,
+          recipientName: updatedUser.name || undefined,
+          frontendUrl: env.FRONTEND_URL,
+        }).catch((err) =>
+          logger.error('[AUTH] Failed to send approval email on status change', {
+            error: err instanceof Error ? err.message : String(err),
+            userId,
+            email: updatedUser.email,
+          })
+        );
+      } else if (status === 'rejected') {
+        EmailService.sendRejectionEmail({
+          recipientEmail: updatedUser.email,
+          recipientName: updatedUser.name || undefined,
+          frontendUrl: env.FRONTEND_URL,
+        }).catch((err) =>
+          logger.error('[AUTH] Failed to send rejection email on status change', {
+            error: err instanceof Error ? err.message : String(err),
+            userId,
+            email: updatedUser.email,
+          })
+        );
+      }
     }
 
     res.json({
@@ -784,5 +794,83 @@ export const sendApprovalEmailHandler = async (req: Request, res: Response): Pro
   } catch (error: any) {
     logger.error('[AUTH] Send approval email error', { error: error.message });
     res.status(500).json({ success: false, error: 'Failed to send approval email' });
+  }
+};
+
+/**
+ * Verify email via Supabase token (callback from email link).
+ * GET /auth/verify-email?token=...
+ *
+ * Supabase confirm-signup tokens are exchanged via verifyOtp(type: 'signup').
+ * On success we return tokens + user data so the frontend can auto-login.
+ */
+export const verifyEmail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const token = (req.query.token as string) || '';
+
+    if (!token) {
+      res.status(400).json({ success: false, error: 'Verification token is required' });
+      return;
+    }
+
+    // Import supabase client (not admin — we need to exchange the user token)
+    const { supabase } = await import('@/db/supabase');
+
+    const { data, error } = await supabase.auth.verifyOtp({
+      token_hash: token,
+      type: 'signup',
+    });
+
+    if (error) {
+      logger.error('[AUTH] Email verification failed', {
+        error: error.message,
+        code: error.status,
+      });
+      res.status(400).json({
+        success: false,
+        error: error.message || 'Invalid or expired verification link',
+      });
+      return;
+    }
+
+    if (!data.user) {
+      res.status(400).json({ success: false, error: 'Verification failed: no user returned' });
+      return;
+    }
+
+    // Fetch role/status from public.users
+    const { data: userData } = await supabaseAdmin
+      .from('users')
+      .select('role, name, status, avatar_url')
+      .eq('id', data.user.id)
+      .maybeSingle();
+
+    const user = {
+      id: data.user.id,
+      email: data.user.email || '',
+      name: userData?.name || data.user.user_metadata?.name,
+      role: userData?.role || 'user',
+      status: userData?.status || 'pending_approval',
+      avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
+    };
+
+    const tokens = data.session
+      ? {
+          access_token: data.session.access_token,
+          refresh_token: data.session.refresh_token,
+          expires_in: data.session.expires_in ?? 0,
+        }
+      : { access_token: '', refresh_token: '', expires_in: 0 };
+
+    logger.info('[AUTH] Email verified', { userId: data.user.id });
+
+    res.json({
+      success: true,
+      message: 'Email verified successfully',
+      data: { user, tokens },
+    });
+  } catch (error: any) {
+    logger.error('[AUTH] Email verification error', { error: error.message });
+    res.status(500).json({ success: false, error: 'Verification failed' });
   }
 };
