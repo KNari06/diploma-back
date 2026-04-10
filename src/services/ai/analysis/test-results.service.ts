@@ -256,7 +256,7 @@ export class AIService {
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      max_tokens: MAX_TOKENS_ANALYSIS,
+      max_completion_tokens: MAX_TOKENS_ANALYSIS,
       temperature: ANALYSIS_TEMPERATURE,
       response_format: { type: 'json_object' },
     });
@@ -509,7 +509,7 @@ Tone: concise, factual, no jargon. Example:
         messages: [
           { role: 'user', content: prompt },
         ],
-        max_tokens: 500,
+        max_completion_tokens: 500,
         temperature: SUMMARY_TEMPERATURE,
       });
 
@@ -572,7 +572,7 @@ Fill in any gaps with reasonable inferences from the logs. Keep the report under
         messages: [
           { role: 'user', content: prompt },
         ],
-        max_tokens: 1000,
+        max_completion_tokens: 1000,
         temperature: 0.3,
       });
 
@@ -594,7 +594,7 @@ Fill in any gaps with reasonable inferences from the logs. Keep the report under
       await this.openai.chat.completions.create({
         model: env.OPENAI_MODEL,
         messages: [{ role: 'user', content: 'Hello' }],
-        max_tokens: 1,
+        max_completion_tokens: 1,
       });
 
       const latency = Date.now() - startTime;

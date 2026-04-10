@@ -72,7 +72,7 @@ export async function analyzeScreenshotWithVision(
           ],
         },
       ],
-      max_tokens: 2000,
+      max_completion_tokens: 2000,
       temperature: 0.2, // Lower temperature for more consistent analysis
       response_format: { type: 'json_object' },
     });
