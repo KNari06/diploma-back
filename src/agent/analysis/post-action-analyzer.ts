@@ -20,14 +20,10 @@ import OpenAI from 'openai';
 import { Page } from 'playwright';
 import { DynamicAction } from '../types/intelligent-testing.types';
 
-let openaiClient: OpenAI | null = null;
-
-function getOpenAIClient(): OpenAI {
-  // Lazy init: avoid crashing test imports when OPENAI_API_KEY is not set.
-  if (!openaiClient) {
-    openaiClient = new OpenAI();
-  }
-  return openaiClient;
+function getOpenAIClient() {
+  // V13: Use shared proxy client instead of creating a bare instance.
+  const { getSharedOpenAIClient } = require('@/services/ai/core/openai.service');
+  return getSharedOpenAIClient();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -467,7 +463,7 @@ RULES:
           { role: 'system', content: 'You are a QA automation expert. Respond with valid JSON only.' },
           { role: 'user', content: prompt },
         ],
-        max_tokens: 300,
+        max_completion_tokens: 300,
         temperature: 0.1,
         response_format: { type: 'json_object' },
       });

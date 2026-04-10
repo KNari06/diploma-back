@@ -16,21 +16,13 @@
 import { env } from '@/config/environment/env';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import { DynamicAction } from '../types/intelligent-testing.types';
 import { FormAnalysis, PreActionAnalyzer } from '../analysis/pre-action-analyzer';
 import { getLocator } from '../utils/selectors/selector-utils';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
-// ═══════════════════════════════════════════════════════════════════════════
-// AI CLIENT
-// ═══════════════════════════════════════════════════════════════════════════
-
-const openai = new OpenAI({
-  apiKey: env.OPENAI_API_KEY,
-  timeout: 15000,
-  maxRetries: 1,
-});
+const openai = getSharedOpenAIClient();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -567,7 +559,7 @@ export class FormIntelligenceService {
       const response = await openai.chat.completions.create({
         model: AI_CONFIG.formTypeDetection.model,
         temperature: AI_CONFIG.formTypeDetection.temperature,
-        max_tokens: AI_CONFIG.formTypeDetection.maxTokens,
+        max_completion_tokens: AI_CONFIG.formTypeDetection.maxTokens,
         messages: [
           {
             role: 'system',
@@ -829,7 +821,7 @@ Valid types: registration, login, checkout, contact, search, filter, settings, p
       const response = await openai.chat.completions.create({
         model: AI_CONFIG.dependencyDetection.model,
         temperature: AI_CONFIG.dependencyDetection.temperature,
-        max_tokens: AI_CONFIG.dependencyDetection.maxTokens,
+        max_completion_tokens: AI_CONFIG.dependencyDetection.maxTokens,
         messages: [
           {
             role: 'system',
@@ -1527,7 +1519,7 @@ Return {"dependencies": []} if no dependencies found.`,
       const response = await openai.chat.completions.create({
         model: AI_CONFIG.errorFix.model,
         temperature: AI_CONFIG.errorFix.temperature,
-        max_tokens: AI_CONFIG.errorFix.maxTokens,
+        max_completion_tokens: AI_CONFIG.errorFix.maxTokens,
         messages: [
           {
             role: 'system',

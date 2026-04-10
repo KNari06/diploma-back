@@ -13,11 +13,11 @@
 
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { Page } from 'playwright';
 import { DynamicAction } from '../types/intelligent-testing.types';
 import { getLocator, normalizeSelector } from '../utils/selectors/selector-utils';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
 // Lazy import to avoid circular dependency
 let FormIntelligenceService: typeof import('../execution/form-intelligence.service').FormIntelligenceService | null = null;
@@ -29,15 +29,7 @@ async function getFormIntelligence() {
   return FormIntelligenceService;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// AI CLIENT (for fallback when rule-based fails)
-// ═══════════════════════════════════════════════════════════════════════════
-
-const openai = new OpenAI({
-  apiKey: env.OPENAI_API_KEY,
-  timeout: 10000, // Fast timeout for quick decisions
-  maxRetries: 1,
-});
+const openai = getSharedOpenAIClient();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // AI WRAPPER - Unified AI calls with error handling
@@ -89,7 +81,7 @@ async function callAI(options: AICallOptions): Promise<string | null> {
     const response = await openai.chat.completions.create({
       model,
       temperature,
-      max_tokens: maxTokens,
+      max_completion_tokens: maxTokens,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },

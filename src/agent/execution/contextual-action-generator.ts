@@ -12,7 +12,6 @@ import { env } from '@/config/environment/env';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { AICostManager, AIModel } from '@/services/ai/cost/ai-cost-manager.service';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import { z } from 'zod';
 import { StateTracker } from '../safety/state-tracker';
@@ -23,13 +22,9 @@ import {
   TestHint,
   TestState,
 } from '../types/intelligent-testing.types';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
-// OpenAI client with timeout and retry configuration
-const openai = new OpenAI({
-  apiKey: env.OPENAI_API_KEY,
-  timeout: 60000, // 60 seconds timeout for OpenAI API calls
-  maxRetries: 2,  // Retry failed requests up to 2 times
-});
+const openai = getSharedOpenAIClient();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ZOD SCHEMAS FOR VALIDATION
@@ -274,7 +269,7 @@ export class ContextualActionGenerator {
             content: prompt,
           },
         ],
-        max_tokens: maxTokensBudget,
+        max_completion_tokens: maxTokensBudget,
         temperature: 0.4, // Some creativity, but not too much
         response_format: { type: 'json_object' },
       });
@@ -637,7 +632,7 @@ export class ContextualActionGenerator {
             content: prompt,
           },
         ],
-        max_tokens: 800,
+        max_completion_tokens: 800,
         temperature: 0.2,
         response_format: { type: 'json_object' },
       });

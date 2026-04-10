@@ -7,7 +7,6 @@
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import type {
   AIExtractRequest,
@@ -72,11 +71,9 @@ const HELPER_INSTRUCTIONS = {
   PRICING: 'Extract pricing information for all plans.',
 } as const;
 
-const openai = new OpenAI({
-  apiKey: env.OPENAI_API_KEY,
-  timeout: AI_EXTRACT_CONFIG.OPENAI_TIMEOUT,
-  maxRetries: AI_EXTRACT_CONFIG.OPENAI_MAX_RETRIES,
-});
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
+
+const openai = getSharedOpenAIClient();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES - imported from ./types.ts

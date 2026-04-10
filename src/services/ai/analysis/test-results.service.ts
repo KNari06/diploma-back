@@ -2,10 +2,10 @@ import { env } from '@/config/environment/env';
 import { AISummary, BugReport, TestResult } from '@/types';
 import { handleAIError } from '@/utils/core/error-handler';
 import { logAIAnalysis, logger } from '@/utils/core/logger';
-import OpenAI from 'openai';
+import type OpenAI from 'openai';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
 // Constants
-const AI_TIMEOUT = 30000; // 30 seconds
 const MAX_DOM_LENGTH = 5000; // Reduced from 10000 to save tokens
 const MAX_TOKENS_ANALYSIS = env.OPENAI_MAX_TOKENS || 2000;
 const ANALYSIS_TEMPERATURE = 0.3; // Lower for consistency
@@ -21,14 +21,7 @@ export class AIService {
   private openai: OpenAI;
 
   constructor() {
-    if (!env.OPENAI_API_KEY) {
-      throw new Error('OPENAI_API_KEY is not configured');
-    }
-
-    this.openai = new OpenAI({
-      apiKey: env.OPENAI_API_KEY,
-      timeout: AI_TIMEOUT,
-    });
+    this.openai = getSharedOpenAIClient();
   }
 
   /**
