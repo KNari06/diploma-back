@@ -650,9 +650,19 @@ export class IntentStepLintService {
       // P2 FIX: URL validation - bypass cache if page URL changed significantly
       // This prevents reusing evidence from page A on page B (common in SPAs)
       // Check both compiled.context.pageUrl and evidence.pageUrl (from recording)
+      // V13: Also bypass if NEITHER URL is available — we have zero evidence
+      // that the cached ref was generated on this page. Without a URL check,
+      // refs from page A silently match elements on page B.
       let urlMismatch = false;
       const evidenceUrl = stepDraft.compiled?.context?.pageUrl || stepDraft.evidence?.pageUrl;
-      if (evidenceUrl) {
+      if (!evidenceUrl) {
+        // No recorded URL at all — can't verify, treat as mismatch (safe default)
+        urlMismatch = true;
+        logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - no recorded URL to verify', {
+          previewSessionId,
+          cachedRef,
+        });
+      } else {
         const normalizedEvidenceUrl = normalizeUrlForComparison(evidenceUrl);
         const currentUrl = normalizeUrlForComparison(snapshot.url);
 
