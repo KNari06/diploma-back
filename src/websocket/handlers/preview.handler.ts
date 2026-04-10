@@ -3229,82 +3229,77 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
   // Handle network detail request (on-demand body fetch)
   socket.on('preview:network:detail:request', async (data) => {
+    const psid = (data as any)?.previewSessionId || '';
+    const reqId = (data as any)?.id || '';
+    const emptyDetail = { previewSessionId: psid, id: reqId } as any;
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
-
-      const { previewSessionId, id } = data;
-      if (!previewSessionId || !id) return;
+      if (!ensuredUserId || !psid || !reqId) {
+        socket.emit('preview:network:detail', emptyDetail);
+        return;
+      }
 
       const { getPreviewSessionService, getPreviewDevToolsRegistry } =
         await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
       const devtoolsRegistry = getPreviewDevToolsRegistry();
 
-      // Check session ownership
-      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+      if (!sessionService.isSessionOwned(psid, ensuredUserId)) {
+        socket.emit('preview:network:detail', emptyDetail);
         return;
       }
 
-      const collector = devtoolsRegistry.get(previewSessionId);
+      const collector = devtoolsRegistry.get(psid);
       if (!collector) {
-        logger.debug('[WebSocket] DevTools collector not found', { previewSessionId });
+        socket.emit('preview:network:detail', emptyDetail);
         return;
       }
 
-      const detail = collector.getNetworkDetail(id);
-      if (detail) {
-        socket.emit('preview:network:detail', detail);
-      }
+      const detail = collector.getNetworkDetail(reqId);
+      socket.emit('preview:network:detail', detail || emptyDetail);
     } catch (error) {
       logger.debug('[WebSocket] Error in preview:network:detail:request', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
+      socket.emit('preview:network:detail', emptyDetail);
     }
   });
 
   // Handle network list request (on-demand, for initial load)
   socket.on('preview:network:list:request', async (data) => {
+    const psid = (data as any)?.previewSessionId;
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
-
-      const { previewSessionId } = data;
-      if (!previewSessionId) return;
+      if (!ensuredUserId || !psid) {
+        socket.emit('preview:network:list', { previewSessionId: psid, items: [] });
+        return;
+      }
 
       const { getPreviewSessionService, getPreviewDevToolsRegistry } =
         await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
       const devtoolsRegistry = getPreviewDevToolsRegistry();
 
-      // Check session ownership
-      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+      if (!sessionService.isSessionOwned(psid, ensuredUserId)) {
+        socket.emit('preview:network:list', { previewSessionId: psid, items: [] });
         return;
       }
 
-      const collector = devtoolsRegistry.get(previewSessionId);
+      const collector = devtoolsRegistry.get(psid);
       if (!collector) {
-        logger.debug('[WebSocket] DevTools collector not found', { previewSessionId });
+        socket.emit('preview:network:list', { previewSessionId: psid, items: [] });
         return;
       }
 
       const items = collector.getNetworkItems();
-      socket.emit('preview:network:list', {
-        previewSessionId,
-        items,
-      });
-
-      logger.debug('[WebSocket] Emitted network list', {
-        socketId: socket.id,
-        previewSessionId,
-        itemCount: items.length,
-      });
+      socket.emit('preview:network:list', { previewSessionId: psid, items });
     } catch (error) {
       logger.debug('[WebSocket] Error in preview:network:list:request', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
+      socket.emit('preview:network:list', { previewSessionId: psid, items: [] });
     }
   });
 
@@ -3312,11 +3307,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:html:request', async (data) => {
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
-
       const { previewSessionId: rawPsid, domVersion } = data;
       const previewSessionId = rawPsid as string | undefined;
-      if (!previewSessionId) return;
+      if (!ensuredUserId || !previewSessionId) {
+        socket.emit('preview:html:update', { previewSessionId: previewSessionId || '', domVersion: 0, html: '<!-- No session -->', truncated: false });
+        return;
+      }
 
       logger.debug('[WebSocket] HTML request received', {
         socketId: socket.id,
@@ -3329,19 +3325,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const sessionService = getPreviewSessionService();
       const devtoolsRegistry = getPreviewDevToolsRegistry();
 
-      // Check session ownership
       if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        socket.emit('preview:html:update', { previewSessionId, domVersion: 0, html: '<!-- Not authorized -->', truncated: false });
         return;
       }
 
       const currentDomVersion = sessionService.getDomVersion(previewSessionId, ensuredUserId);
 
-      // NOTE: Removed domVersion skip check — always respond to prevent frontend "Loading..." hang.
-      // Previously: if client domVersion >= server domVersion, we silently returned with no response.
-
       const collector = devtoolsRegistry.get(previewSessionId);
       if (!collector) {
-        // Always respond so frontend doesn't hang on "Loading..."
         socket.emit('preview:html:update', { previewSessionId, domVersion: 0, html: '<!-- No collector available -->', truncated: false });
         return;
       }
@@ -3362,25 +3354,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:accessibility:request', async (data) => {
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
-
       const { previewSessionId, domVersion } = data;
-      if (!previewSessionId) return;
+      if (!ensuredUserId || !previewSessionId) {
+        socket.emit('preview:accessibility:update', { previewSessionId: previewSessionId || '', domVersion: 0, tree: [], truncated: false });
+        return;
+      }
 
       const { getPreviewSessionService, getPreviewDevToolsRegistry } =
         await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
       const devtoolsRegistry = getPreviewDevToolsRegistry();
 
-      // Check session ownership
       if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        socket.emit('preview:accessibility:update', { previewSessionId, domVersion: 0, tree: [], truncated: false });
         return;
       }
 
       const currentDomVersion = sessionService.getDomVersion(previewSessionId, ensuredUserId);
-
-      // NOTE: Removed domVersion skip check — always respond to prevent frontend "Loading..." hang.
-      // Previously: if client domVersion >= server domVersion, we silently returned with no response.
 
       const collector = devtoolsRegistry.get(previewSessionId);
       if (!collector) {

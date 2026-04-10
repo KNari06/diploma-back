@@ -15,11 +15,12 @@ import {
   passwordResetRequest,
   passwordUpdate,
   refresh,
+  resendVerification,
   sendMagicLink,
   signup,
   updateProfile,
   updateUserStatus,
-  sendApprovalEmailHandler,
+  verifyEmail,
 } from './auth.controller';
 
 const router = Router();
@@ -46,6 +47,11 @@ const refreshSchema = z.object({
 });
 
 const passwordResetSchema = z.object({
+  email: z.string().email('Invalid email format'),
+  redirectTo: z.string().url().optional(),
+});
+
+const resendVerificationSchema = z.object({
   email: z.string().email('Invalid email format'),
   redirectTo: z.string().url().optional(),
 });
@@ -544,6 +550,67 @@ router.post('/password/reset-request', asyncHandler(async (req: Request, res: Re
 
 /**
  * @swagger
+ * /api/v1/auth/resend-verification:
+ *   post:
+ *     summary: Resend signup verification email
+ *     description: Re-sends the Supabase signup confirmation email to the given address.
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - email
+ *             properties:
+ *               email:
+ *                 type: string
+ *                 format: email
+ *               redirectTo:
+ *                 type: string
+ *                 format: uri
+ *     responses:
+ *       200:
+ *         description: Verification email sent
+ *       400:
+ *         description: Invalid request or resend failed
+ */
+router.post('/resend-verification', asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const validatedData = resendVerificationSchema.parse(req.body);
+    req.body = validatedData;
+    await resendVerification(req, res);
+  } catch (error) {
+    handleValidationError(error);
+  }
+}));
+
+/**
+ * @swagger
+ * /api/v1/auth/verify-email:
+ *   get:
+ *     summary: Verify email via token from confirmation link
+ *     description: Exchanges Supabase signup confirmation token for a session. Returns tokens for auto-login.
+ *     tags: [Auth]
+ *     parameters:
+ *       - in: query
+ *         name: token
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Email verified, returns user + tokens
+ *       400:
+ *         description: Invalid or expired token
+ */
+router.get('/verify-email', asyncHandler(async (req: Request, res: Response) => {
+  await verifyEmail(req, res);
+}));
+
+/**
+ * @swagger
  * /api/v1/auth/password/update:
  *   post:
  *     summary: Обновить пароль
@@ -761,11 +828,5 @@ router.get('/users/pending', requireAuth, requireAdmin, asyncHandler(getPendingU
  * Body: { status: 'approved' | 'rejected' | 'pending_approval' }
  */
 router.patch('/users/:userId/status', requireAuth, requireAdmin, asyncHandler(updateUserStatus));
-
-/**
- * Send approval notification email (admin only)
- * Body: { email: string, name?: string }
- */
-router.post('/send-approval-email', requireAuth, requireAdmin, asyncHandler(sendApprovalEmailHandler));
 
 export default router;
