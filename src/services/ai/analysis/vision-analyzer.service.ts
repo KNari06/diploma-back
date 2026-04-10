@@ -2,10 +2,9 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { buildVisionPrompt } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
-// ✅ IMPORTANT: Set timeout to prevent hanging Vision calls (matches core OpenAI service).
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY, timeout: 60000, maxRetries: 2 });
+const openai = getSharedOpenAIClient();
 
 /**
  * Analyze screenshot using GPT-4o Vision
@@ -72,7 +71,7 @@ export async function analyzeScreenshotWithVision(
           ],
         },
       ],
-      max_tokens: 2000,
+      max_completion_tokens: 2000,
       temperature: 0.2, // Lower temperature for more consistent analysis
       response_format: { type: 'json_object' },
     });

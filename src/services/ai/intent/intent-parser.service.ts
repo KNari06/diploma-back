@@ -5,9 +5,9 @@ import { searchKB } from '@/services/kb/kb.service';
 import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { IntentResult, IntentType, VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
-const openai = new OpenAI({ apiKey: env.OPENAI_API_KEY });
+const openai = getSharedOpenAIClient();
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // CONSTANTS

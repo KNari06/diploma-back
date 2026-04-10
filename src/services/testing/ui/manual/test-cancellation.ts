@@ -41,11 +41,14 @@ export async function getRunningTestsForUser(userId: string): Promise<Test[]> {
           ageMinutes: Math.round(age / 60000),
           userId,
         });
+        // V13: Atomic guard — only finalize if still in a non-terminal state.
+        // Prevents race where both zombie detector and worker finalize the same test.
         Promise.resolve(
           dbService.supabaseAdmin
             .from('tests')
             .update({ status: 'failed', completed_at: new Date().toISOString() })
             .eq('id', test.id)
+            .in('status', ['running', 'queued', 'pending'])
         ).then(() => {
           logger.info('[STALE_TEST] Zombie test marked as failed', { testId: test.id });
         }).catch((err: any) => {
@@ -106,11 +109,14 @@ export async function getRunningTestsForChatSession(chatSessionId: string): Prom
           ageMinutes: Math.round(age / 60000),
           chatSessionId,
         });
+        // V13: Atomic guard — only finalize if still in a non-terminal state.
+        // Prevents race where both zombie detector and worker finalize the same test.
         Promise.resolve(
           dbService.supabaseAdmin
             .from('tests')
             .update({ status: 'failed', completed_at: new Date().toISOString() })
             .eq('id', test.id)
+            .in('status', ['running', 'queued', 'pending'])
         ).then(() => {
           logger.info('[STALE_TEST] Zombie test marked as failed', { testId: test.id });
         }).catch((err: any) => {

@@ -67,6 +67,36 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
       fileSize: `${Math.round(fileSize / 1024)}KB`,
     });
 
+    // Compute quick summary from JSONL before upload (best-effort)
+    let parsedData: Record<string, unknown> | null = null;
+    try {
+      const raw = await fs.readFile(filePath, 'utf-8');
+      const lines = raw.split('\n');
+      let errors = 0, failedSteps = 0, totalSteps = 0, totalEvents = 0;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        totalEvents++;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.stage === 'error' || evt.eventType === 'error') errors++;
+          if (evt.eventType === 'step_result') {
+            totalSteps++;
+            if (evt.payload?.status === 'fail') failedSteps++;
+          }
+          if (evt.eventType === 'run_error_summary') {
+            errors = Math.max(errors, evt.payload?.totalErrors ?? 0);
+          }
+          if (evt.eventType === 'run_end') {
+            if (evt.payload?.totalSteps) totalSteps = evt.payload.totalSteps;
+            if (evt.payload?.failedSteps) failedSteps = evt.payload.failedSteps;
+          }
+        } catch { /* skip malformed */ }
+      }
+      parsedData = { errors, failedSteps, totalSteps, totalEvents };
+    } catch {
+      // Non-fatal — summary will be null
+    }
+
     const uploadResult = await uploadLiteTraceLogToStorage(filePath, userId, fileName);
 
     // trace_files.test_id has a FK on tests(id); intent_test_cases rows live
@@ -86,6 +116,7 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
         storagePath: uploadResult.storagePath,
         fileSize: uploadResult.fileSize,
         browser: traceType === 'editor' ? 'editor-trace' : 'preview-run-trace',
+        parsedData,
       });
     } catch (insertError) {
       logger.error(`${TAG} Failed to insert trace_files record, rolling back storage`, {

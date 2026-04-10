@@ -1802,6 +1802,23 @@ export class PreviewRunService {
         duration,
       });
 
+      // Trace error summary (for admin panel quick view)
+      if (failedSteps > 0 || timedOut || cancelled) {
+        traceWriter.write({
+          stage: 'completion',
+          eventType: 'run_error_summary',
+          spanId: traceWriter.generateSpanId(),
+          parentSpanId: rootSpanId,
+          payload: {
+            totalErrors: failedSteps,
+            failedStepDetails: failedStepDetails.slice(0, 10),
+            cancelled,
+            timedOut,
+            duration,
+          },
+        });
+      }
+
       // Trace run_end
       traceWriter.write({
         stage: 'completion',

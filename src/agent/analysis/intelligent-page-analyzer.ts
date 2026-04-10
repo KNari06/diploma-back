@@ -15,7 +15,6 @@ import {
   MODAL_OVERLAY_SELECTORS,
   POSITIONAL_CANDIDATES_SELECTOR,
 } from '@/agent/utils/selectors/modal-detection';
-import { OpenAI } from 'openai';
 import { Page } from 'playwright';
 import {
     DOMAnalysis,
@@ -24,13 +23,9 @@ import {
     VisionAnalysis,
 } from '../types/intelligent-testing.types';
 import { buildHistorySummary } from '../utils/context/context-compressor';
+import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
 
-// ✅ FIX: Add timeout to prevent hanging requests (default is 10 minutes!)
-const openai = new OpenAI({
-  apiKey: env.OPENAI_API_KEY,
-  timeout: 60000, // 60 seconds timeout for OpenAI API calls
-  maxRetries: 2,  // Retry failed requests up to 2 times
-});
+const openai = getSharedOpenAIClient();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIGURATION: Modal Detection Settings
@@ -2082,7 +2077,7 @@ export class IntelligentPageAnalyzer {
             ],
           },
         ],
-        max_tokens: 2000,
+        max_completion_tokens: 2000,
         temperature: 0.2,
         response_format: { type: 'json_object' },
       });
@@ -2325,7 +2320,7 @@ export class IntelligentPageAnalyzer {
             content: prompt,
           },
         ],
-        max_tokens: 1000,
+        max_completion_tokens: 1000,
         temperature: 0.2,
         response_format: { type: 'json_object' },
       });

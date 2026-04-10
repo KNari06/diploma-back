@@ -1,16 +1,13 @@
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
-import { OpenAI } from 'openai';
+import { getSharedOpenAIClient } from './openai.service';
 
 // Validate API key on module load
 if (!env.OPENAI_API_KEY) {
   throw new Error('OPENAI_API_KEY is not configured');
 }
 
-const openai = new OpenAI({
-  apiKey: env.OPENAI_API_KEY,
-  timeout: 30000, // 30 seconds
-});
+const openai = getSharedOpenAIClient();
 
 // Using text-embedding-3-small (1536 dimensions, fast, HNSW-compatible)
 // Note: text-embedding-3-large (3072 dims) exceeds HNSW limit (2000 dims)

@@ -12,11 +12,50 @@ import { AIUsageTracker, calculateOpenAICost } from '../tracking/ai-usage-tracke
  * - maxRetries: 2 (retry failed requests)
  * - Must be less than server.timeout (180s) to allow proper error handling
  */
-const openai = new OpenAI({
+const _rawOpenai = new OpenAI({
   apiKey: env.OPENAI_API_KEY,
   timeout: 60000, // 60 seconds
   maxRetries: 2, // Retry up to 2 times on failure
 });
+
+/**
+ * V13: Singleton OpenAI client with API-compat proxy.
+ *
+ * Intercepts `chat.completions.create` to automatically normalize
+ * deprecated or renamed parameters so that callers across the codebase
+ * don't need to track OpenAI API changes individually.
+ *
+ * Current normalizations:
+ *   • `max_tokens` → `max_completion_tokens` (required for gpt-5.x models)
+ *
+ * Any future breaking parameter rename gets added here ONCE and all
+ * callers — both through the wrapper and direct SDK calls — are fixed.
+ */
+function createOpenAIProxy(client: OpenAI): OpenAI {
+  const originalCreate = client.chat.completions.create.bind(client.chat.completions);
+
+  client.chat.completions.create = ((params: any, ...rest: any[]) => {
+    // Normalize max_tokens → max_completion_tokens
+    if (params && 'max_tokens' in params && !('max_completion_tokens' in params)) {
+      params.max_completion_tokens = params.max_tokens;
+      delete params.max_tokens;
+    }
+    return originalCreate(params, ...rest);
+  }) as typeof client.chat.completions.create;
+
+  return client;
+}
+
+const openai = createOpenAIProxy(_rawOpenai);
+
+/**
+ * Get the shared, proxy-wrapped OpenAI client.
+ * All files that need direct SDK access should import this instead of
+ * creating their own `new OpenAI()` instance.
+ */
+export function getSharedOpenAIClient(): OpenAI {
+  return openai;
+}
 
 /**
  * ─────────────────────────────────────────────────────────────────────────
