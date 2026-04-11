@@ -803,6 +803,8 @@ interface ApplyResult {
   };
   /** Compiled locator plan was tried but failed (stale plan, DOM changed) */
   compiledFailed?: boolean;
+  /** V15: wait_for resolved via fast-path (URL already changed) and settled DOM before returning */
+  fastPathSettled?: boolean;
 }
 
 /**
@@ -2209,18 +2211,31 @@ export class PreviewStepApplyService {
         if (matcher?.changedFrom) {
           const currentUrl = page.url();
           if (normalizeUrlForComparison(currentUrl) !== normalizeUrlForComparison(matcher.changedFrom)) {
-            // URL already changed — navigation happened, skip wait
-            logger.info('[PREVIEW_APPLY] wait_for: URL already changed, skipping wait', {
+            // URL already changed — navigation happened via expectsNavigation on previous click.
+            // V15: Must still wait for SPA rendering before returning. Without this,
+            // the next step starts before the new page content is rendered (race condition:
+            // URL changed but React/Vue/Angular hasn't hydrated the new route yet).
+            const settleStartMs = Date.now();
+            const settleBudget = Math.min(3000, Math.max(1000, timeoutMs / 2));
+            try {
+              await page.waitForLoadState('load', { timeout: settleBudget });
+            } catch { /* timeout acceptable — DOM may still be usable */ }
+            const remainingSettle = Math.max(500, settleBudget - (Date.now() - settleStartMs));
+            await waitForPageSettled(page, remainingSettle, 500);
+
+            logger.info('[PREVIEW_APPLY] wait_for: URL already changed, settled before continuing', {
               previewSessionId,
               changedFrom: matcher.changedFrom,
-              currentUrl,
+              currentUrl: page.url(),
+              settleMs: Date.now() - settleStartMs,
             });
             return {
               success: true,
               appliedStep: stepDraft,
               urlChanged: true,
-              url: currentUrl,
+              url: page.url(),
               attempts: 1,
+              fastPathSettled: true,
             };
           }
           // URL hasn't changed yet — replace changedFrom with current URL for runtime
@@ -2839,8 +2854,15 @@ export class PreviewStepApplyService {
             });
 
             // Build candidate from compiled result
+            // V15: Extract data-agent-ref from resolved element so evidence shortcut
+            // works on next run (previously stored '' which made evidence cache miss every time)
+            let compiledRef = '';
+            try {
+              compiledRef = await compiledResult.locator!.getAttribute('data-agent-ref') ?? '';
+            } catch { /* element may not have ref attr — that's fine */ }
+
             const compiledCandidate: LintCandidate = {
-              ref: '', // Not needed for execution
+              ref: compiledRef,
               reason: `Compiled locator: ${compiledResult.usedStrategy}`,
               confidence: compiledResult.confidence || 0.9,
               label: '',
@@ -2950,7 +2972,7 @@ export class PreviewStepApplyService {
                   ...stepDraft,
                   evidence: {
                     ...stepDraft.evidence,
-                    lastSuccessRef: '', // Compiled doesn't use refs
+                    lastSuccessRef: compiledRef || '', // V15: Preserve ref for evidence shortcut
                     confidence: compiledResult.confidence || 0.9,
                     resolutionMeta,
                   },

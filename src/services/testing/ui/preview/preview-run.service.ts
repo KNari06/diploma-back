@@ -1289,8 +1289,12 @@ export class PreviewRunService {
             // ─────────────────────────────────────────────────────────────────
             // Lookahead wait: check next step readiness before executing it
             // Uses fast Playwright checks only (no AI/LLM)
+            // V15: Don't skip lookahead after wait_for that resolved via fast-path
+            // (URL already changed before wait_for ran). The fast-path does its own
+            // DOM settle, but lookahead provides extra safety for SPA hydration.
             // ─────────────────────────────────────────────────────────────────
-            if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
+            const skipLookahead = shouldSkipLookaheadAfter(step.type) && !result.fastPathSettled;
+            if (i < stepsToExecute.length - 1 && !skipLookahead && !runState.cancelled) {
               const nextStep = stepsToExecute[i + 1];
               try {
                 const adaptiveSettle = getAdaptiveSettleMs(step.type);
@@ -1578,7 +1582,9 @@ export class PreviewRunService {
                 }
 
                 // Lookahead before next step (same as main success path)
-                if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
+                // V15: Don't skip lookahead after fast-path wait_for
+                const skipLookaheadRetry = shouldSkipLookaheadAfter(step.type) && !retryResult.fastPathSettled;
+                if (i < stepsToExecute.length - 1 && !skipLookaheadRetry && !runState.cancelled) {
                   const nextStep = stepsToExecute[i + 1];
                   try {
                     await raceAbort(waitForStepReadiness(session.page, nextStep, {
@@ -1637,7 +1643,9 @@ export class PreviewRunService {
                   if (finalResult.appliedStep) enrichedSteps.set(finalResult.appliedStep.id, finalResult.appliedStep);
 
                   // Lookahead before next step (same as deterministic retry success path)
-                  if (i < stepsToExecute.length - 1 && !shouldSkipLookaheadAfter(step.type) && !runState.cancelled) {
+                  // V15: Don't skip lookahead after fast-path wait_for
+                  const skipLookaheadFinal = shouldSkipLookaheadAfter(step.type) && !finalResult.fastPathSettled;
+                  if (i < stepsToExecute.length - 1 && !skipLookaheadFinal && !runState.cancelled) {
                     const nextStep = stepsToExecute[i + 1];
                     try {
                       await raceAbort(waitForStepReadiness(session.page, nextStep, {
