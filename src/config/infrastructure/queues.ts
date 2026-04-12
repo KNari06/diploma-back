@@ -478,6 +478,7 @@ export class QueueManager {
     recipient: string;
     subject: string;
     message: string;
+    htmlContent?: string;
     data?: any;
   }) {
     try {

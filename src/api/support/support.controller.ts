@@ -85,29 +85,29 @@ export const submitReport = async (req: Request, res: Response): Promise<void> =
         // Get user email for context
         const userEmail = req.user?.email || 'Unknown';
 
+        // Build rich email once, reuse for all admins
+        const { EmailService } = await import('@/services/core/email.service');
+        const email = EmailService.buildSupportReportEmail({
+          reportId: report.id,
+          title: report.title,
+          category: report.category,
+          details: report.details,
+          userEmail,
+          userId: userId!,
+          workspaceName: reportData.workspace_name,
+          view: reportData.view,
+          submittedAt: report.created_at,
+        });
+
         // Send notification to each admin
         for (const adminEmail of adminEmails) {
           try {
             await QueueManager.addNotificationJob({
               type: 'email',
               recipient: adminEmail,
-              subject: `New User Report: ${report.title}`,
-              message: `
-New user report submitted:
-
-Title: ${report.title}
-Category: ${report.category}
-Status: ${report.status}
-User: ${userEmail} (${userId})
-${reportData.workspace_name ? `Workspace: ${reportData.workspace_name}` : ''}
-${reportData.view ? `View: ${reportData.view}` : ''}
-
-Details:
-${report.details}
-
-Report ID: ${report.id}
-Submitted at: ${report.created_at}
-              `.trim(),
+              subject: email.subject,
+              message: email.text,
+              htmlContent: email.html,
               data: {
                 reportId: report.id,
                 userId,

@@ -41,5 +41,12 @@
       "port": 3444,
       "autoPort": false
     }
+    ,{
+      "name": "email-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["tsx", "scripts/preview-email-templates.ts"],
+      "port": 3555,
+      "autoPort": false
+    }
   ]
 }
