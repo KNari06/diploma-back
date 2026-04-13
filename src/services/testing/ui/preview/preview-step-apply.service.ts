@@ -803,6 +803,8 @@ interface ApplyResult {
   };
   /** Compiled locator plan was tried but failed (stale plan, DOM changed) */
   compiledFailed?: boolean;
+  /** V15: wait_for resolved via fast-path (URL already changed) and settled DOM before returning */
+  fastPathSettled?: boolean;
 }
 
 /**
@@ -923,7 +925,14 @@ async function verifyActionEffect(
       }
 
       case 'click': {
-        // For click, verification is tricky - we assume success if no error
+        // Click verification is inherently ambiguous — clicks can navigate,
+        // open modals, toggle state, or have no visible side effect.
+        // V13: False-positive clicks are caught upstream by:
+        //   • Compiled plan URL-stale check (wrong page → skip compiled)
+        //   • Evidence shortcut URL-mismatch check (wrong page → skip cache)
+        //   • Compiled postcondition check (navigation expected → URL must change)
+        // verifyActionEffect for click remains permissive to avoid
+        // false-negatives on legitimate non-navigating clicks.
         return true;
       }
 
@@ -2202,18 +2211,31 @@ export class PreviewStepApplyService {
         if (matcher?.changedFrom) {
           const currentUrl = page.url();
           if (normalizeUrlForComparison(currentUrl) !== normalizeUrlForComparison(matcher.changedFrom)) {
-            // URL already changed — navigation happened, skip wait
-            logger.info('[PREVIEW_APPLY] wait_for: URL already changed, skipping wait', {
+            // URL already changed — navigation happened via expectsNavigation on previous click.
+            // V15: Must still wait for SPA rendering before returning. Without this,
+            // the next step starts before the new page content is rendered (race condition:
+            // URL changed but React/Vue/Angular hasn't hydrated the new route yet).
+            const settleStartMs = Date.now();
+            const settleBudget = Math.min(3000, Math.max(1000, timeoutMs / 2));
+            try {
+              await page.waitForLoadState('load', { timeout: settleBudget });
+            } catch { /* timeout acceptable — DOM may still be usable */ }
+            const remainingSettle = Math.max(500, settleBudget - (Date.now() - settleStartMs));
+            await waitForPageSettled(page, remainingSettle, 500);
+
+            logger.info('[PREVIEW_APPLY] wait_for: URL already changed, settled before continuing', {
               previewSessionId,
               changedFrom: matcher.changedFrom,
-              currentUrl,
+              currentUrl: page.url(),
+              settleMs: Date.now() - settleStartMs,
             });
             return {
               success: true,
               appliedStep: stepDraft,
               urlChanged: true,
-              url: currentUrl,
+              url: page.url(),
               attempts: 1,
+              fastPathSettled: true,
             };
           }
           // URL hasn't changed yet — replace changedFrom with current URL for runtime
@@ -2791,10 +2813,15 @@ export class PreviewStepApplyService {
       // Skip compiled shortcut if:
       // - Caller flagged skipCompiled (previous step's compiled failed = likely stale plans)
       // - Page URL changed since compiled was generated (plan targets wrong page)
+      // V13: Strict URL check for compiled plans. If the compiled plan was
+      // generated on a different page, the locator strategies are stale —
+      // executing them can "succeed" on a wrong element (e.g. sidebar link
+      // with the same label exists on every page). If the compiled plan
+      // has no pageUrl recorded, treat it as stale to be safe.
       const compiledPageUrl = stepDraft.compiled?.context?.pageUrl;
       const currentPageUrl = page.url();
-      const compiledUrlStale = compiledPageUrl && currentPageUrl
-        && normalizeUrlForComparison(compiledPageUrl) !== normalizeUrlForComparison(currentPageUrl);
+      const compiledUrlStale = !compiledPageUrl
+        || (normalizeUrlForComparison(compiledPageUrl) !== normalizeUrlForComparison(currentPageUrl));
 
       if (
         stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0
@@ -2827,54 +2854,138 @@ export class PreviewStepApplyService {
             });
 
             // Build candidate from compiled result
+            // V15: Extract data-agent-ref from resolved element so evidence shortcut
+            // works on next run (previously stored '' which made evidence cache miss every time)
+            let compiledRef = '';
+            try {
+              compiledRef = await compiledResult.locator!.getAttribute('data-agent-ref') ?? '';
+            } catch { /* element may not have ref attr — that's fine */ }
+
             const compiledCandidate: LintCandidate = {
-              ref: '', // Not needed for execution
+              ref: compiledRef,
               reason: `Compiled locator: ${compiledResult.usedStrategy}`,
               confidence: compiledResult.confidence || 0.9,
               label: '',
             };
 
+            // V13: Postconditions from compiled plan (hoisted for pre/post click checks)
+            const postconditions = stepDraft.compiled?.postconditions || [];
+            const expectedNav = postconditions.includes('navigation') || postconditions.includes('urlChange');
+
+            // V13: Snapshot body child count BEFORE click — used by postcondition
+            // DOM mutation check to detect modals/overlays opened by the click.
+            if (expectedNav) {
+              await page.evaluate(() => {
+                (globalThis as unknown as { __qaitPreClickChildCount?: number }).__qaitPreClickChildCount =
+                  (globalThis as unknown as { document: { body: { children: { length: number } } } }).document.body.children.length;
+              }).catch(() => {});
+            }
+
             // Execute action with compiled locator
             const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation });
 
             if (result.success) {
-              // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
-              if (!skipPostActionWait) {
-                await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+              // V13: Postcondition verification — if the compiled plan
+              // predicted navigation but URL didn't change, the click
+              // likely hit a wrong element (e.g. sidebar link instead of
+              // main content CTA). Treat as compiled-miss and fall through
+              // to lint for proper AI-based resolution.
+              // If URL didn't change immediately, give SPA routers a moment.
+              // pushState/replaceState often fires asynchronously after the
+              // click handler returns — 300ms covers React Router, Next.js,
+              // Vue Router, and most SPA frameworks.
+              let urlActuallyChanged = result.urlChanged;
+              if (expectedNav && !urlActuallyChanged) {
+                await page.waitForTimeout(300).catch(() => {});
+                const urlNow = page.url();
+                urlActuallyChanged = normalizeUrlForComparison(urlNow) !== normalizeUrlForComparison(currentPageUrl);
               }
+              if (expectedNav && !urlActuallyChanged) {
+                // Before falling through, check if DOM visibly changed (modal/popup/
+                // overlay appeared). A <a> tag that opens a modal instead of
+                // navigating is valid — the postcondition heuristic (tag=a →
+                // navigation) was wrong, not the click.
+                //
+                // We ask the browser directly: did body.children.length or any
+                // dialog/modal appear since the click? This is synchronous with
+                // the DOM and doesn't depend on the async snapshot pipeline.
+                let domVisiblyChanged = false;
+                try {
+                  domVisiblyChanged = await page.evaluate(() => {
+                    const g = globalThis as unknown as {
+                      __qaitPreClickChildCount?: number;
+                      document: { body: { children: { length: number } }; querySelectorAll: (s: string) => { length: number } };
+                    };
+                    const currentCount = g.document.body.children.length;
+                    const preCount = g.__qaitPreClickChildCount;
+                    // Clean up marker
+                    delete g.__qaitPreClickChildCount;
+                    // If we have a baseline and it changed, DOM mutated
+                    if (preCount !== undefined && currentCount !== preCount) return true;
+                    // Also check for new dialogs/modals/overlays
+                    const modals = g.document.querySelectorAll(
+                      '[role="dialog"],[role="alertdialog"],dialog[open],[aria-modal="true"]'
+                    );
+                    return modals.length > 0;
+                  });
+                } catch { /* page navigating — counts as change */ domVisiblyChanged = true; }
 
-              // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
-              if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
-                const sess = sessionService.getSession(previewSessionId);
-                if (sess) sess.lastSnapshotEmit = 0;
+                if (domVisiblyChanged) {
+                  logger.debug('[PREVIEW_APPLY] Compiled postcondition: URL unchanged but DOM mutated — accepting', {
+                    previewSessionId, stepId: stepDraft.id,
+                  });
+                  // Accept as success — fall through to the normal success path below
+                } else {
+                  logger.info('[PREVIEW_APPLY] Compiled plan postcondition failed — expected navigation but URL and DOM unchanged', {
+                    previewSessionId,
+                    stepId: stepDraft.id,
+                    postconditions,
+                    url: page.url(),
+                  });
+                  // Fall through to lint instead of returning success
+                  compiledWasTried = true;
+                }
               }
+              // If compiledWasTried was set by postcondition failure above, skip success return
+              if (!compiledWasTried) {
+                // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+                if (!skipPostActionWait) {
+                  await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+                }
 
-              // Build resolution meta for compiled success
-              const resolutionMeta: ResolutionMeta = {
-                allowedCount: 1,
-                usedRules: ['compiled_plan'],
-                usedLLM: false,
-                confidenceTier: 'high' as ConfidenceTier,
-              };
+                // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
+                if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
+                  const sess = sessionService.getSession(previewSessionId);
+                  if (sess) sess.lastSnapshotEmit = 0;
+                }
 
-              // Update step with success evidence
-              const updatedStep: IntentStep = {
-                ...stepDraft,
-                evidence: {
-                  ...stepDraft.evidence,
-                  lastSuccessRef: '', // Compiled doesn't use refs
-                  confidence: compiledResult.confidence || 0.9,
-                  resolutionMeta,
-                },
-              };
+                // Build resolution meta for compiled success
+                const resolutionMeta: ResolutionMeta = {
+                  allowedCount: 1,
+                  usedRules: ['compiled_plan'],
+                  usedLLM: false,
+                  confidenceTier: 'high' as ConfidenceTier,
+                };
 
-              return {
-                success: true,
-                appliedStep: updatedStep,
-                urlChanged: result.urlChanged,
-                url: page.url(),
-                attempts: 1,
-              };
+                // Update step with success evidence
+                const updatedStep: IntentStep = {
+                  ...stepDraft,
+                  evidence: {
+                    ...stepDraft.evidence,
+                    lastSuccessRef: compiledRef || '', // V15: Preserve ref for evidence shortcut
+                    confidence: compiledResult.confidence || 0.9,
+                    resolutionMeta,
+                  },
+                };
+
+                return {
+                  success: true,
+                  appliedStep: updatedStep,
+                  urlChanged: result.urlChanged,
+                  url: page.url(),
+                  attempts: 1,
+                };
+              }
             }
           }
 

@@ -48,7 +48,7 @@ const PREVIEW_VIEWPORT = PREVIEW_SESSION_CONFIG.viewport;
  */
 const ACTION_TO_TAGS: Record<string, string[]> = {
   type: ['input', 'textarea'],
-  click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'summary', 'nav', 'header', 'footer', 'section', 'article'],
+  click: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'canvas', 'summary', 'nav', 'header', 'footer', 'section', 'article'],
   select: ['select'],
   check: ['input'],
   uncheck: ['input'],
@@ -59,6 +59,14 @@ const ACTION_TO_TAGS: Record<string, string[]> = {
   scroll: ['div', 'section', 'main', 'body', 'html'],
   press: ['input', 'textarea', 'button', 'div', 'span'], // FIX #4: contenteditable + role=textbox divs
   upload: ['input', 'button', 'label', 'div', 'span'], // File inputs are often hidden; trigger is a button/label/div
+  // V15: Missing action types — same tag sets as their base actions
+  dblclick: ['button', 'a', 'input', 'div', 'span', 'label', 'li', 'td', 'th', 'img', 'svg', 'canvas', 'summary'],
+  contextmenu: ['button', 'a', 'div', 'span', 'li', 'td', 'th', 'img', 'svg', 'section', 'article'],
+  drag_and_drop: ['div', 'span', 'li', 'img', 'button', 'a', 'td', 'th', 'section', 'article'],
+  // Mobile actions
+  swipe: ['div', 'section', 'main', 'body', 'html', 'ul', 'li', 'span', 'img'],
+  long_press: ['button', 'a', 'div', 'span', 'li', 'td', 'th', 'img', 'svg'],
+  double_tap: ['button', 'a', 'div', 'span', 'li', 'td', 'th', 'img', 'svg'],
 };
 
 /**
@@ -1421,7 +1429,9 @@ async function selectElementWithLLM(params: {
   const startTime = Date.now();
 
   // Check cache
-  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${candidates.slice(0, 5).map(c => c.node.ref).join(',')}`;
+  // V15: Include ALL candidate refs in cache key (not just top 5).
+  // Truncating to 5 caused stale cache hits when the correct element was 6th+.
+  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
     return { ...cached.result, cacheHit: true, latencyMs: Date.now() - startTime };
@@ -1476,14 +1486,17 @@ Select the single best matching element, or return ref=null if the intent does n
     clearTimeout(timeoutId);
 
     // Parse response
+    // V15: Use balanced-brace parser instead of greedy regex.
+    // Greedy /\{[\s\S]*\}/ captures from FIRST '{' to LAST '}', which fails
+    // when LLM returns multiple JSON objects or thinking text with braces.
     const content = response?.content || '';
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    const jsonStr = extractFirstJsonObject(content);
+    if (!jsonStr) {
       logger.warn('[LLM_SELECT] No JSON in response', { preview: content.slice(0, 200) });
       throw new Error('No JSON in LLM response');
     }
 
-    const parsed = JSON.parse(jsonMatch[0]) as {
+    const parsed = JSON.parse(jsonStr) as {
       ref?: string | null;
       confidence?: number;
       reason?: string;

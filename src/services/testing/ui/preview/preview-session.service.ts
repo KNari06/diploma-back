@@ -1745,8 +1745,12 @@ export class PreviewSessionService {
     const now = Date.now();
     const includeScreenshot = options?.includeScreenshot === true; // Default false now
 
-    // Throttle snapshot collection (unless forced)
-    if (!options?.force && now - session.lastSnapshotEmit < SNAPSHOT_THROTTLE_MS) {
+    // Throttle snapshot collection (unless forced or cache was explicitly invalidated).
+    // V15: When lastSnapshotEmit === 0, a DOM-mutating action (click, hover, etc.)
+    // invalidated the cache — we MUST collect fresh DOM, not return stale nodes.
+    // Without this, the next lint sees pre-action DOM (e.g., dropdown still closed).
+    const cacheInvalidated = session.lastSnapshotEmit === 0;
+    if (!options?.force && !cacheInvalidated && now - session.lastSnapshotEmit < SNAPSHOT_THROTTLE_MS) {
       // IMPORTANT:
       // Linting needs domNodes, but collecting a fresh snapshot is expensive.
       // When throttled, return the last known domNodes from session.pageState if explicitly requested.

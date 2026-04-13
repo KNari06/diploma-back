@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS test_platforms (
   user_id TEXT NOT NULL,
 
   -- Platform key (fixed: web_ui or api)
-  platform_key TEXT NOT NULL CHECK (platform_key IN ('web_ui', 'api')),
+  platform_key TEXT NOT NULL CHECK (platform_key IN ('web_ui', 'api', 'mobile')),
 
   -- Metadata
   name TEXT NOT NULL,
@@ -121,6 +121,6 @@ CREATE INDEX IF NOT EXISTS idx_test_modules_platform
 -- COMMENTS
 -- ============================================================================
 
-COMMENT ON TABLE test_platforms IS 'Top-level platform categories: Web UI tests and API tests';
-COMMENT ON COLUMN test_platforms.platform_key IS 'Platform type: web_ui or api';
-COMMENT ON COLUMN test_modules.platform_id IS 'Reference to parent platform (web_ui or api)';
+COMMENT ON TABLE test_platforms IS 'Top-level platform categories: Web UI tests, API tests, and Mobile tests';
+COMMENT ON COLUMN test_platforms.platform_key IS 'Platform type: web_ui, api, or mobile';
+COMMENT ON COLUMN test_modules.platform_id IS 'Reference to parent platform (web_ui, api, or mobile)';

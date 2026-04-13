@@ -508,11 +508,6 @@ export class AIAnalysisJobHandler {
         return;
       }
 
-      // Prepare critical issues summary
-      const issuesSummary = criticalBugs
-        .map((bug: any) => `- ${bug.message || bug.description || 'Unknown issue'}`)
-        .join('\n');
-
       // Resolve recipient email (tests.user_id is a UUID, not an email)
       let recipient = 'admin@qai.so';
       if (test.user_id) {
@@ -533,21 +528,38 @@ export class AIAnalysisJobHandler {
         }
       }
 
+      // Build rich email
+      const { EmailService } = await import('@/services/core/email.service');
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      const bugs = criticalBugs.map((bug: any) => ({
+        severity: bug.severity || 'critical',
+        message: bug.message || bug.description || 'Unknown issue',
+        category: bug.category,
+      }));
+      const email = EmailService.buildCriticalIssuesEmail({
+        testId,
+        testUrl: test.url || 'Unknown URL',
+        bugs,
+        dashboardUrl: `${frontendUrl}/tests/${testId}`,
+      });
+
       // Send critical issue notification
       await QueueManager.addNotificationJob({
         type: 'email',
         recipient,
-        subject: `🚨 Critical Issues Found: ${testId}`,
-        message: `Critical issues detected in test ${testId}:\n${issuesSummary}`,
+        subject: email.subject,
+        message: email.text,
+        htmlContent: email.html,
         data: { testId, criticalBugs, aiSummary },
       });
 
       // Send Slack notification if configured
+      const issuesSummary = bugs.map((b: any) => `- ${b.message}`).join('\n');
       await QueueManager.addNotificationJob({
         type: 'slack',
         recipient: '#qa-alerts',
-        subject: `Critical Issues: ${testId}`,
-        message: `🚨 Critical issues found in test ${testId}: ${criticalBugs.length} issues detected`,
+        subject: `Critical Issues: ${test.url || testId}`,
+        message: `Critical issues found in test on ${test.url || testId}:\n${issuesSummary}`,
         data: { testId, criticalBugs },
       });
 
@@ -752,9 +764,10 @@ export class NotificationJobHandler {
     recipient: string;
     subject: string;
     message: string;
+    htmlContent?: string;
     data?: any;
   }>) {
-    const { type, recipient, subject, message, data } = job.data;
+    const { type, recipient, subject, message, htmlContent, data } = job.data;
 
     logger.info(`Processing notification: ${type} to ${recipient}`);
     logQueueEvent('processing', job.id!, { type, recipient });
@@ -762,7 +775,7 @@ export class NotificationJobHandler {
     try {
       switch (type) {
         case 'email':
-          await this.sendEmailNotification(recipient, subject, message);
+          await this.sendEmailNotification(recipient, subject, message, htmlContent);
           break;
         case 'slack':
           await this.sendSlackNotification(recipient, subject, message);
@@ -788,13 +801,15 @@ export class NotificationJobHandler {
   private static async sendEmailNotification(
     recipient: string,
     subject: string,
-    message: string
+    message: string,
+    htmlContent?: string,
   ) {
     const { EmailService } = await import('@/services/core/email.service');
     const result = await EmailService.sendGenericEmail({
       recipientEmail: recipient,
       subject,
       textContent: message,
+      htmlContent,
     });
     if (!result.success) {
       throw new Error(result.error || 'Email send failed');

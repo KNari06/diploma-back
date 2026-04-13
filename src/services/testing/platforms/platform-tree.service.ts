@@ -25,7 +25,7 @@ interface PaginatedList<T> {
 interface PlatformSummary {
   id: string;
   projectId: string;
-  platformKey: 'web_ui' | 'api';
+  platformKey: 'web_ui' | 'api' | 'mobile';
   name: string;
   description?: string;
 }
@@ -33,7 +33,7 @@ interface PlatformSummary {
 interface ModuleSummary {
   id: string;
   platformId: string;
-  platformKey?: 'web_ui' | 'api';
+  platformKey?: 'web_ui' | 'api' | 'mobile';
   name: string;
   description?: string;
   priority?: string;
@@ -116,7 +116,7 @@ export class PlatformTreeService {
     }
 
     // Custom platform order for UI: web_ui first, then api (then anything else)
-    const preferredOrder: Record<string, number> = { web_ui: 0, api: 1 };
+    const preferredOrder: Record<string, number> = { web_ui: 0, mobile: 1, api: 2 };
     const sortedPlatforms = (platforms || []).slice().sort((a: any, b: any) => {
       const wa = preferredOrder[a.platform_key] ?? 99;
       const wb = preferredOrder[b.platform_key] ?? 99;

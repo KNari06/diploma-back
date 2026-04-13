@@ -643,12 +643,26 @@ export class ManualTestRunJobHandler {
         logger.warn(`[TEST-RUN] Test has no user_id, sending notification to default email: ${testId}`);
       }
 
+      // Build rich email
+      const { EmailService } = await import('@/services/core/email.service');
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
+      const email = EmailService.buildTestFailedEmail({
+        testId,
+        testUrl: test.url || 'Unknown URL',
+        errorMessage,
+        browsers: test.browsers || [],
+        startedAt: test.started_at,
+        failedAt: test.completed_at || new Date().toISOString(),
+        dashboardUrl: `${frontendUrl}/tests/${testId}`,
+      });
+
       // Send notification
       await QueueManager.addNotificationJob({
         type: 'email',
         recipient,
-        subject: `Test Failed: ${testId}`,
-        message: `Test ${testId} failed with error: ${errorMessage}`,
+        subject: email.subject,
+        message: email.text,
+        htmlContent: email.html,
         data: { testId, error: errorMessage },
       });
     } catch (notificationError) {
