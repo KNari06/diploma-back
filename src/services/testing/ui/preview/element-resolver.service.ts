@@ -1063,7 +1063,7 @@ function extractFirstJsonObject(text: string): string | null {
 
 /**
  * Vision-enhanced rescue when deterministic rules excluded ALL elements.
- * When screenshot is available, sends it to Gemini 2.0 Flash Vision for visual identification.
+ * When screenshot is available, sends it to Gemini 2.5 Flash Vision for visual identification.
  * Falls back to text-only Gemini Flash when no screenshot is available.
  *
  * Uses a high-quality prompt with action-type semantics and multilingual awareness,
