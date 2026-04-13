@@ -246,9 +246,10 @@ export async function checkWorkspace(
       // If the session exists but has no workspace_id (legacy/bad data), attach it once and keep it fixed
       if (session?.id && !session.workspace_id && session.user_id === userId) {
         const activeWorkspaceId = await WorkspaceService.getActiveWorkspaceForUser(userId);
-        const fallbackWorkspaceId = activeWorkspaceId
-          ? activeWorkspaceId
-          : (await WorkspaceService.createWorkspaceForUser(userId)).workspace_id;
+        if (!activeWorkspaceId) {
+          throw new Error('User has no workspace. Complete onboarding first.');
+        }
+        const fallbackWorkspaceId = activeWorkspaceId;
 
         const { error: updateError } = await supabaseAdmin
           .from('chat_sessions')
@@ -276,10 +277,8 @@ export async function checkWorkspace(
       return activeWorkspaceId;
     }
 
-    // 3) No workspaces at all -> create one
-    const { workspace_id } = await WorkspaceService.createWorkspaceForUser(userId);
-    logger.info('[CHAT] Created new workspace for chat', { userId, workspace_id });
-    return workspace_id;
+    // 3) No workspaces at all -> error (workspace is created during onboarding)
+    throw new Error('User has no workspace. Complete onboarding first.');
   } catch (workspaceError) {
     // Better error logging for PostgREST/Supabase errors
     const errorDetails = workspaceError instanceof Error
