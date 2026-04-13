@@ -1062,9 +1062,9 @@ async function installAppOnSession(
   const warmupRaw = await redisConnection.get(redisKey);
   const warmup: WarmupData | null = warmupRaw ? JSON.parse(warmupRaw) : null;
 
-  // If the same APK is already installed, just relaunch — skip download + install
+  // If the same APK is already installed (Redis knows), just relaunch — skip download + install
   if (warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
-    logger.debug('[MOBILE_SESSION] Same APK already installed, relaunching', {
+    logger.debug('[MOBILE_SESSION] Same APK already installed (Redis), relaunching', {
       sessionId,
       projectId,
       package: warmup.installedPackage,
@@ -1073,6 +1073,40 @@ async function installAppOnSession(
       { type: 'launch_app', params: { packageName: appPackageOverride || warmup.installedPackage } },
     ], { timeoutMs: 60_000 });
     return;
+  }
+
+  // If Redis expired but we know the package name, check the DEVICE directly.
+  // This avoids expensive re-download + re-install when the app is still on the emulator.
+  const knownPackage = appPackageOverride || mobileApp.packageName;
+  if (knownPackage) {
+    try {
+      const checkResult = await client.executeBatchCommands(sessionId, [
+        { type: 'check_package', params: { packageName: knownPackage } },
+      ], { timeoutMs: 10_000 });
+      const isInstalled = !!(checkResult?.results?.[0] as any)?.data?.installed;
+      if (isInstalled) {
+        logger.info('[MOBILE_SESSION] Package still on device (Redis expired), relaunching without reinstall', {
+          sessionId,
+          projectId,
+          package: knownPackage,
+        });
+        await client.executeBatchCommands(sessionId, [
+          { type: 'launch_app', params: { packageName: knownPackage } },
+        ], { timeoutMs: 60_000 });
+
+        // Restore Redis cache so next warmup skips too
+        if (warmup) {
+          warmup.installedPackage = knownPackage;
+          warmup.appStoragePath = mobileApp.storagePath;
+          await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
+        }
+        return;
+      }
+    } catch (err) {
+      logger.debug('[MOBILE_SESSION] Device package check failed, proceeding with install', {
+        error: (err as Error).message,
+      });
+    }
   }
 
   logger.info('[MOBILE_SESSION] Installing app on session', {
