@@ -255,3 +255,4 @@ deploy:dev:vm:
       echo "🌍 API URL: http://$(hostname -I | awk '{print $1}'):${BACKEND_CONTAINER_PORT}"
   environment:
     name: development/backend-vm
+
