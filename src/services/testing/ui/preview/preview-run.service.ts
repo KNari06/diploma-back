@@ -1374,6 +1374,33 @@ export class PreviewRunService {
               break;
             }
           } else {
+            // Collect FRESH page context at the moment of failure — the page may
+            // have changed since the last navigation (e.g. JS-rendered error page,
+            // maintenance overlay, SPA route change without a full navigation).
+            let failPageSummary = lastNavigationSummary;
+            try {
+              failPageSummary = await collectLightPageSummary(session.page);
+            } catch {
+              // Non-fatal — fall back to lastNavigationSummary
+            }
+
+            // Capture a screenshot at the moment of failure so the user can see
+            // what the page actually looks like (e.g. maintenance page, error modal).
+            let failScreenshotBase64: string | null = null;
+            try {
+              const buf = await session.page.screenshot({
+                type: 'jpeg',
+                quality: 50,
+                fullPage: false,
+                timeout: 3000,
+              });
+              if (buf.length <= 500_000) { // 500KB cap to avoid bloating WS payload
+                failScreenshotBase64 = buf.toString('base64');
+              }
+            } catch {
+              // Non-fatal — screenshot may fail if page crashed
+            }
+
             // Augment error with page context if we navigated earlier.
             // Also include the URL-mismatch hint, but ONLY for the first few
             // steps — login flows are typically 2-4 steps, and showing the
@@ -1381,7 +1408,7 @@ export class PreviewRunService {
             // misleading and confusing.
             const errorWithContext = augmentErrorWithPageContext(
               result.error || 'Step failed',
-              lastNavigationSummary,
+              failPageSummary,
               i < URL_MISMATCH_HINT_MAX_STEPS ? urlMismatchInfo : null,
             );
 
@@ -1391,7 +1418,8 @@ export class PreviewRunService {
               stepId: step.id,
               error: result.error,
               retried,
-              hasPageContext: !!lastNavigationSummary,
+              hasPageContext: !!failPageSummary,
+              hasFailScreenshot: !!failScreenshotBase64,
               hasUrlMismatchHint: i < URL_MISMATCH_HINT_MAX_STEPS && !!urlMismatchInfo,
             });
 
@@ -1409,11 +1437,11 @@ export class PreviewRunService {
                 error: result.error,
                 attempts: result.attempts,
                 retried,
-                pageContext: lastNavigationSummary || undefined,
+                pageContext: failPageSummary || undefined,
               },
             });
 
-            // Emit fail (with augmented error for better UX)
+            // Emit fail (with augmented error + screenshot for better UX)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: i,
@@ -1424,6 +1452,7 @@ export class PreviewRunService {
               error: errorWithContext,
               timestamp: new Date().toISOString(),
               ...(retried ? { retried: true } : {}),
+              ...(failScreenshotBase64 ? { failScreenshot: failScreenshotBase64 } : {}),
             });
             failedSteps++;
             // Capture for summary (truncate to first 5 to bound payload size)
@@ -1673,11 +1702,21 @@ export class PreviewRunService {
             }
           }
 
+          // Collect fresh page context + screenshot at moment of exception
+          let exFailPageSummary = lastNavigationSummary;
+          try { exFailPageSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
+
+          let exFailScreenshot: string | null = null;
+          try {
+            const buf = await session.page.screenshot({ type: 'jpeg', quality: 50, fullPage: false, timeout: 3000 });
+            if (buf.length <= 500_000) exFailScreenshot = buf.toString('base64');
+          } catch { /* non-fatal */ }
+
           // Same URL-mismatch hint policy as the failed-result branch above:
           // only attach the hint to the first few step failures.
           const errorWithContext = augmentErrorWithPageContext(
             originalError,
-            lastNavigationSummary,
+            exFailPageSummary,
             i < URL_MISMATCH_HINT_MAX_STEPS ? urlMismatchInfo : null,
           );
 
@@ -1687,6 +1726,8 @@ export class PreviewRunService {
             stepId: step.id,
             error: originalError,
             retried: exceptionRetried,
+            hasPageContext: !!exFailPageSummary,
+            hasFailScreenshot: !!exFailScreenshot,
             hasUrlMismatchHint: i < URL_MISMATCH_HINT_MAX_STEPS && !!urlMismatchInfo,
           });
 
@@ -1703,11 +1744,11 @@ export class PreviewRunService {
               status: 'exception',
               error: originalError,
               retried: exceptionRetried,
-              pageContext: lastNavigationSummary || undefined,
+              pageContext: exFailPageSummary || undefined,
             },
           });
 
-          // Emit fail
+          // Emit fail (with screenshot for visual debugging)
           webSocketService.emitToUser(userId, 'preview:run:step', {
             previewSessionId,
             stepIndex: i,
@@ -1718,6 +1759,7 @@ export class PreviewRunService {
             error: errorWithContext,
             timestamp: new Date().toISOString(),
             ...(exceptionRetried ? { retried: true } : {}),
+            ...(exFailScreenshot ? { failScreenshot: exFailScreenshot } : {}),
           });
           failedSteps++;
           // Capture for summary (truncate to first 5)
