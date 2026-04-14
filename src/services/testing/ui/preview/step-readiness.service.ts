@@ -402,6 +402,123 @@ async function isLocatorAttachedFast(locator: Locator): Promise<boolean> {
 }
 
 /**
+ * V15: Shadow DOM diagnostic.
+ * Called when the compiled locator is NOT attached. Playwright's user-facing locators
+ * (getByLabel / getByRole / getByPlaceholder / getByTestId / getByText) automatically
+ * pierce OPEN shadow roots — so if the locator miss is due to shadow DOM, it's usually
+ * either (a) a CSS locator that didn't opt in, or (b) a CLOSED shadow root (rare).
+ *
+ * We don't try to auto-recover — Playwright already handles the common case. Instead
+ * we surface a diagnostic so operators can see the page is shadow-heavy and the
+ * compiled plan may need a `getBy*` strategy instead of raw CSS.
+ *
+ * Returns { present, customTags, count } — all numbers bounded. Fail-open empty.
+ */
+interface ShadowDomInfo {
+  present: boolean;
+  /** Custom-element tags seen on the page (indicates web-component usage). Max 5 samples. */
+  customTags: string[];
+  /** Open shadow roots counted via tree-walk. Bounded at 50 to avoid runaway. */
+  openRoots: number;
+  /** Host elements whose shadowRoot is null (likely closed, or native like <details>). */
+  nullRootsOnCustom: number;
+}
+async function probeShadowDom(page: Page): Promise<ShadowDomInfo> {
+  const empty: ShadowDomInfo = { present: false, customTags: [], openRoots: 0, nullRootsOnCustom: 0 };
+  try {
+    return await withHardCap(() => page.evaluate(() => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      const customTagsSet = new Set<string>();
+      let openRoots = 0;
+      let nullRootsOnCustom = 0;
+      const MAX_SCAN = 50; // bound the walk
+      // Breadth-first scan through the light DOM + any open shadow roots we find
+      const stack: any[] = [doc.body];
+      let scanned = 0;
+      while (stack.length && scanned < MAX_SCAN) {
+        const node: any = stack.shift();
+        if (!node) continue;
+        scanned++;
+        const children = node.children as ArrayLike<any> | undefined;
+        if (!children) continue;
+        for (let i = 0; i < children.length; i++) {
+          const el: any = children[i];
+          const tag: string = (el.tagName || '').toLowerCase();
+          if (tag.includes('-')) customTagsSet.add(tag);
+          const sr = el.shadowRoot;
+          if (sr) { openRoots++; stack.push(sr); }
+          else if (tag.includes('-')) { nullRootsOnCustom++; }
+          stack.push(el);
+        }
+      }
+      return {
+        present: openRoots > 0 || customTagsSet.size > 0,
+        customTags: Array.from(customTagsSet).slice(0, 5),
+        openRoots: Math.min(openRoots, MAX_SCAN),
+        nullRootsOnCustom: Math.min(nullRootsOnCustom, MAX_SCAN),
+      };
+    }), 400, empty);
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * V15: Challenge-page detector (Cloudflare, reCAPTCHA interstitial, Vercel "just a moment").
+ * Called before the main readiness pipeline. On match, callers should widen the URL-change
+ * budget instead of waiting for elements on the challenge page — the challenge will redirect
+ * when done, and the target page's DOM will only exist after the redirect.
+ *
+ * Detection is structural (URL patterns + well-known selectors) — fail-open empty on any
+ * error so a probe failure never breaks a normal run.
+ */
+interface ChallengePageInfo {
+  detected: boolean;
+  /** Human-readable tag for logs. 'cloudflare' | 'recaptcha' | 'vercel' | 'generic-interstitial' */
+  kind?: string;
+}
+async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
+  const none: ChallengePageInfo = { detected: false };
+  try {
+    const url = page.url();
+    // URL-based early exit (no DOM roundtrip needed)
+    if (/\/cdn-cgi\/(challenge-platform|trace)/i.test(url)) return { detected: true, kind: 'cloudflare' };
+    if (/^https?:\/\/challenges\.cloudflare\.com\//i.test(url)) return { detected: true, kind: 'cloudflare' };
+
+    // DOM probe — cheap, capped at 400ms
+    return await withHardCap(() => page.evaluate(() => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      // Cloudflare: challenge-running hook, cf-browser-verification, or turnstile wrapper
+      if (doc.querySelector('#cf-challenge-running, .cf-browser-verification, #challenge-form, [id*="cf-turnstile"]')) {
+        return { detected: true, kind: 'cloudflare' };
+      }
+      // reCAPTCHA full-page interstitial (not inline widget — those are fine)
+      const recapFrames = doc.querySelectorAll('iframe[src*="recaptcha"]');
+      if (recapFrames.length > 0) {
+        // Heuristic: interstitial = recaptcha iframe covers >50% viewport
+        for (let i = 0; i < recapFrames.length; i++) {
+          const f: any = recapFrames[i];
+          const r = f.getBoundingClientRect();
+          // @ts-expect-error - window in browser context
+          const vw = window.innerWidth || 1280, vh = window.innerHeight || 720;
+          if (r.width * r.height > vw * vh * 0.5) return { detected: true, kind: 'recaptcha' };
+        }
+      }
+      // Vercel "Just a moment" / generic verification wall
+      const text = (doc.body?.innerText || '').toLowerCase();
+      if (/checking your browser|just a moment|verifying you are human|please wait while we verify/i.test(text)) {
+        return { detected: true, kind: 'generic-interstitial' };
+      }
+      return { detected: false };
+    }), 400, none);
+  } catch {
+    return none;
+  }
+}
+
+/**
  * Check for loading indicators on the page (spinners, skeletons, aria-busy, progressbar).
  * Returns true if any loading indicator is detected.
  *
@@ -921,6 +1038,23 @@ async function comprehensiveReadinessCheck(
     ? await isLocatorAttachedFast(locators[0])
     : false;
 
+  // V15: Shadow DOM diagnostic — when the locator isn't attached, check if the page
+  // uses web components. Playwright's getByLabel/getByRole/etc. auto-pierce OPEN shadow
+  // roots, so a miss usually means either: (a) closed shadow root, or (b) the compiled
+  // plan uses raw CSS that didn't opt in. We don't auto-recover — just log the signal
+  // so operators can see shadow-heavy pages and tune locator strategy if needed.
+  if (locators.length > 0 && !targetAttached) {
+    const shadow = await probeShadowDom(page);
+    if (shadow.present) {
+      logger.info('[STEP_READINESS] Locator not attached on shadow-DOM page', {
+        openRoots: shadow.openRoots,
+        customTags: shadow.customTags,
+        nullRootsOnCustom: shadow.nullRootsOnCustom,
+        hint: 'If the next step fails to find the element, prefer getByRole/getByLabel/getByPlaceholder over raw CSS — they auto-pierce open shadow roots.',
+      });
+    }
+  }
+
   // Phase 2: Target element animation (only if we have a locator and action needs interaction)
   if (targetAttached && NEEDS_VISIBLE_ENABLED.has(actionType)) {
     const animTimeout = Math.min(ANIMATION_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 1000));
@@ -1187,6 +1321,56 @@ export async function waitForStepReadiness(
       actionType: nextStep.type,
     });
     return { ready: true, waited: 0, autoWaitApplied: false, skipReason: `Non-targeting action: ${nextStep.type}` };
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V15 Phase 0: Challenge / interstitial detection (Cloudflare, reCAPTCHA, etc.)
+  // If we're currently on a challenge page, waiting for the next step's elements
+  // is pointless — those elements only exist AFTER the challenge redirects us.
+  // Instead, widen the URL-change watcher and return once we land on a new URL.
+  // Budget: up to 7s (challenges typically take 3-5s).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const challenge = await detectChallengePage(page);
+  if (challenge.detected) {
+    const challengeUrl = page.url();
+    const challengeBudget = Math.min(7000, maxWaitMs - (Date.now() - startTime));
+    logger.info('[STEP_READINESS] Challenge/interstitial detected — widening URL-change watch', {
+      stepId: nextStep.id,
+      kind: challenge.kind,
+      challengeUrl,
+      budget: challengeBudget,
+    });
+    if (challengeBudget > 300) {
+      const redirected = await detectSpaNavigation(page, challengeUrl, challengeBudget);
+      const waited = Date.now() - startTime;
+      if (redirected) {
+        // Landed on a new URL — give DOM a brief settle, then let Phase 3 / the
+        // step's own locator strategy handle the real target.
+        try {
+          await page.waitForLoadState('domcontentloaded', { timeout: 1500 });
+        } catch { /* non-fatal */ }
+        logger.info('[STEP_READINESS] Challenge cleared — proceeding to next step', {
+          stepId: nextStep.id,
+          newUrl: page.url(),
+          waited,
+        });
+      } else {
+        logger.warn('[STEP_READINESS] Challenge did not clear within budget', {
+          stepId: nextStep.id,
+          kind: challenge.kind,
+          waited,
+        });
+      }
+      return {
+        ready: redirected,
+        waited,
+        autoWaitApplied: waited > autoWaitThresholdMs,
+        navigationDetected: redirected,
+        urlChanged: redirected,
+        skipReason: redirected ? undefined : `Challenge page (${challenge.kind}) did not clear`,
+      };
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
