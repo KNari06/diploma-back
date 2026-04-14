@@ -180,6 +180,12 @@ const NAVIGATION_TRIGGER_ACTIONS: Set<IntentActionType> = new Set([
   'press',
   'hover',     // V13: Hover can trigger dropdowns, menus, tooltips — next step needs DOM settle
   'navigate',  // goto triggers full page navigation, needs networkIdle + DOM settle
+  // V15.4: Actions that commonly trigger async DOM work the default 150ms
+  // settle misses. Adding them here gives them the navigation-grade settle
+  // (500ms) and enables SPA-nav race detection:
+  'scroll',          // infinite-scroll/lazy-load lists; horizontal carousels
+  'upload',          // file-upload triggers multipart request + progress UI
+  'drag_and_drop',   // drop handlers commonly open modals, create items, etc.
 ]);
 
 /** Action types that require visible + enabled */
@@ -256,26 +262,68 @@ async function detectSpaNavigation(
   prevUrl: string,
   timeoutMs: number
 ): Promise<boolean> {
+  // V15.5: Hybrid detection — `framenavigated` event gives instant signal for
+  // real navigations; URL polling catches pushState/replaceState (which don't
+  // fire framenavigated). Early-exit if URL stayed stable for QUICK_EXIT_MS —
+  // this spares 1.5s of wasted wait after non-navigating actions like scroll,
+  // upload, drag_and_drop where the URL almost never changes.
+  //
+  // Trade-off: if an SPA kicks off navigation AFTER our quick-exit window
+  // (e.g. debounced click handler fires at 500ms), we miss it. But the outer
+  // retry loop in waitForStepReadiness will still catch the eventual ready
+  // state via DOM settle. So missing a late SPA nav = small overhead, not
+  // a correctness bug.
+  const QUICK_EXIT_MS = 300; // Early-exit budget for clearly-stable URLs
   const deadline = Date.now() + timeoutMs;
   const pollInterval = 50;
+  const startTime = Date.now();
 
-  while (Date.now() < deadline) {
-    try {
-      const currentUrl = page.url();
-      if (currentUrl !== prevUrl) {
-        logger.debug('[STEP_READINESS] SPA navigation detected', {
-          from: prevUrl,
-          to: currentUrl,
-        });
+  // Listener path: `framenavigated` on the main frame is the authoritative
+  // signal for hard navigations (goto, redirects, location.assign).
+  let navigatedViaEvent = false;
+  const onFrameNavigated = (frame: import('playwright').Frame) => {
+    // Only main frame — iframe navigations don't change the tab URL.
+    if (frame === page.mainFrame()) {
+      navigatedViaEvent = true;
+    }
+  };
+  page.on('framenavigated', onFrameNavigated);
+
+  try {
+    while (Date.now() < deadline) {
+      // Event fired → done
+      if (navigatedViaEvent) {
+        logger.debug('[STEP_READINESS] SPA navigation detected (framenavigated)', { from: prevUrl });
         return true;
       }
-    } catch {
-      // Page may be in transition
-    }
-    await new Promise(r => setTimeout(r, pollInterval));
-  }
 
-  return false;
+      // URL poll catches pushState / replaceState
+      try {
+        const currentUrl = page.url();
+        if (currentUrl !== prevUrl) {
+          logger.debug('[STEP_READINESS] SPA navigation detected (url poll)', {
+            from: prevUrl,
+            to: currentUrl,
+          });
+          return true;
+        }
+      } catch {
+        // Page may be in transition
+      }
+
+      // Early-exit after stable window. Most non-navigating actions complete
+      // their synchronous work well under 300ms, so if URL hasn't changed by
+      // then, further polling is pure overhead.
+      if (Date.now() - startTime >= QUICK_EXIT_MS) {
+        return false;
+      }
+
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+    return false;
+  } finally {
+    try { page.off('framenavigated', onFrameNavigated); } catch { /* page closed */ }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

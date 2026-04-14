@@ -209,20 +209,13 @@ export const getTraceEvents = async (req: Request, res: Response): Promise<void>
     return;
   }
 
-  // Determine bucket (same logic as playwright.controller.ts)
-  let bucketName = 'traces';
-  if (
+  // Determine bucket: JSONL / any known trace type → lite-trace-logs,
+  // everything else (Playwright .zip traces) → 'traces'.
+  const isJsonlTrace =
     traceFile.file_name?.endsWith('.jsonl') ||
-    traceFile.browser === 'lite-trace-log' ||
-    traceFile.browser === 'lite'
-  ) {
-    bucketName = 'lite-trace-logs';
-  }
-  // Editor/preview/api-agent traces are always JSONL → caught by .endsWith('.jsonl')
-  // But if somehow the filename doesn't end with .jsonl, check browser field
-  if (ADMIN_VISIBLE_BROWSERS.includes(traceFile.browser)) {
-    bucketName = 'lite-trace-logs';
-  }
+    traceFile.browser === 'lite' ||
+    ADMIN_VISIBLE_BROWSERS.includes(traceFile.browser);
+  const bucketName = isJsonlTrace ? 'lite-trace-logs' : 'traces';
 
   // Download file from storage
   const { data: fileBlob, error: downloadError } = await supabaseAdmin.storage

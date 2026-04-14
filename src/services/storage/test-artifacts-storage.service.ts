@@ -443,14 +443,18 @@ export type TraceType =
  * to the current time and a sanitized basename so uploads never fail for
  * cosmetic reasons.
  */
+/** Regex matching the well-known testId prefixes set by each writer. */
+const TRACE_PREFIX_RE = /^(editor|preview_run|draft_run|api_agent|exploration|lite)_/;
+
 export function buildTraceStoragePath(
   userSegment: string,
   traceType: TraceType,
   originalFileName: string,
 ): { storagePath: string; normalizedFileName: string } {
   const now = new Date();
-  const nowDatePart = now.toISOString().slice(0, 10); // YYYY-MM-DD
-  const nowTimePart = now.toISOString().slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
+  const nowIso = now.toISOString();
+  const nowDatePart = nowIso.slice(0, 10); // YYYY-MM-DD
+  const nowTimePart = nowIso.slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
 
   // LiteTraceWriter format: <date>_<time>_<testId>.jsonl
   // Example: 2026-04-15_14-32-07_editor_550e8400-e29b-41d4-a716-446655440000.jsonl
@@ -462,16 +466,20 @@ export function buildTraceStoragePath(
   const timePart = parsed?.[2] ?? nowTimePart;
   const rawTestId = parsed?.[3] ?? originalFileName.replace(/\.jsonl$/, '');
 
-  // Strip well-known prefixes (editor_, preview_run_, api_agent_, …) so the
-  // shortId is actually readable. Whatever's left is trimmed to the tail,
-  // which is almost always the meaningful UUID suffix.
-  const trimmedTestId = rawTestId.replace(
-    /^(editor|preview_run|draft_run|api_agent|exploration|lite)_/,
-    '',
-  );
-  const shortTestId = trimmedTestId.slice(-8) || 'unknown';
+  // Strip known prefixes repeatedly — covers nested forms like
+  // `editor_preview_<uuid>` (editor session ids are themselves `preview_<uuid>`).
+  let trimmedTestId = rawTestId;
+  while (TRACE_PREFIX_RE.test(trimmedTestId)) {
+    trimmedTestId = trimmedTestId.replace(TRACE_PREFIX_RE, '');
+  }
+  const shortTestId = trimmedTestId.slice(-8) || 'unnamed';
 
-  const normalizedFileName = `${traceType}__${timePart}__${shortTestId}.jsonl`;
+  // 3-hex millisecond suffix disambiguates a retry of the same test within
+  // the same second (the parent filename is second-precision). Without it,
+  // upsert:false would throw 409 on retry and orphan the storage object.
+  const msSuffix = (now.getUTCMilliseconds() & 0xfff).toString(16).padStart(3, '0');
+
+  const normalizedFileName = `${traceType}__${timePart}__${shortTestId}_${msSuffix}.jsonl`;
   const storagePath = `trace-logs/${userSegment}/${datePart}/${normalizedFileName}`;
 
   return { storagePath, normalizedFileName };

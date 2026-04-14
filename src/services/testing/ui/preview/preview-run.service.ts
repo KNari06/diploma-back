@@ -1322,6 +1322,45 @@ export class PreviewRunService {
             trackedUrl = session.page.url();
             trackedUrls.set(session.activeTabIndex, trackedUrl);
 
+            // V15.4: Hover cleanup — move cursor away after hover when next step
+            // doesn't need the hover-triggered UI (tooltip/popover/menu). Without
+            // this, the cursor stays on the hovered element, causing:
+            //   • Visible flicker as snapshot polling re-renders popovers
+            //   • Last-hover-step leaves UI dirty for the user post-run
+            //   • Subsequent type/scroll/navigate fights the popover overlay
+            //
+            // We KEEP the cursor on the element when next step is click/hover/
+            // dblclick — that preserves the "hover menu → click item" pattern
+            // where the item only exists while the menu is held open by hover.
+            if (step.type === 'hover') {
+              const nextStepForHover = stepsToExecute[i + 1];
+              const HOVER_DEPENDENT_NEXT: ReadonlySet<IntentActionType> = new Set([
+                'click', 'dblclick', 'contextmenu', 'hover',
+              ]);
+              const shouldResetMouse = !nextStepForHover
+                || !HOVER_DEPENDENT_NEXT.has(nextStepForHover.type);
+              if (shouldResetMouse) {
+                try {
+                  // Move to (0, 0) — top-left corner. This is OUTSIDE any interactive
+                  // element on every normal layout, so no spurious :hover state is
+                  // triggered elsewhere.
+                  await session.page.mouse.move(0, 0);
+                  logger.debug('[PreviewRun] Hover cursor reset', {
+                    previewSessionId,
+                    stepId: step.id,
+                    nextStepType: nextStepForHover?.type ?? 'none',
+                  });
+                } catch (err) {
+                  // Non-fatal — worst case the cursor stays put and the user
+                  // sees a lingering tooltip. No step failure from this.
+                  logger.debug('[PreviewRun] Hover cursor reset failed (non-fatal)', {
+                    previewSessionId,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
+            }
+
             // Collect page summary after navigation for better error context on subsequent failures
             if (step.type === 'navigate' || result.urlChanged) {
               try {
