@@ -852,6 +852,10 @@ function buildNodeSearchText(node: InteractiveNode): string {
   if (node.containerTitles?.length) parts.push(node.containerTitles.join(' '));
   if (node.autocomplete) parts.push(node.autocomplete);
   if (node.nearestLandmark) parts.push(node.nearestLandmark);
+  // V15: Icon semantic signals — critical for icon-only buttons where no text/aria-label exists.
+  // Splits "lucide-folder" / "icon-folder" / "mdi:folder" into scannable tokens so
+  // intent "folder icon" matches the right element instead of falling back to DOM order.
+  if (node.iconClasses) parts.push(node.iconClasses.replace(/[-_:]/g, ' '));
   return parts.join(' ').toLowerCase();
 }
 
@@ -1132,10 +1136,14 @@ RULES:
 1. Match by semantic meaning of the intent to the element's label/aria-label/placeholder/text/title.
 2. Consider action type — e.g., for "type", only editable fields are valid.
 3. Use multilingual semantic understanding; do NOT translate literally.
-4. ICON BUTTONS: Elements marked "icon-button" have no text — only an icon. Match the user's visual description to the semantic label (e.g., "eye button" = "toggle password visibility", "X" = "close", "trash" = "delete").
+4. ICON BUTTONS: Elements marked "icon-button" have no text — only an icon. To identify which icon:
+   - Look at the "icon: …" visual hint (e.g. "icon: lucide-folder", "icon: mdi:star", "icon: folder-icon"). Match the hint token to the user's description.
+   - Look at the "title:" or "label" field — icon libraries often expose semantic names there.
+   - If multiple icon-buttons look identical (same "icon-button" tag, no icon hint, no label), DO NOT guess by position. Return ref: null with reason "icon-only buttons indistinguishable".
+   - Common icon mappings: "eye" = show/hide password, "X" or "cross" = close, "trash"/"bin" = delete, "pencil" = edit, "folder" = folder/directory, "star" = favorite, "book" = bookmarks/library.
 5. If multiple elements could match, pick the one whose label/text is semantically closest.
 6. Only use refs from the provided list — never invent refs.
-7. If no element is a confident match, return ref as null.
+7. If no element is a confident match, return ref as null. NEVER return the first candidate as a default guess.
 8. Respond ONLY with valid JSON, no markdown or extra text.
 
 OUTPUT FORMAT:
@@ -1156,7 +1164,7 @@ Select the single best matching element. If unsure, return ref: null.`;
 
     // Phase 6: Use vision when screenshot is available for much better accuracy
     if (screenshot) {
-      const visionPrompt = `${systemPrompt}\n\n${userPrompt}\n\nIMPORTANT: Look at the screenshot to visually identify the target element. If the element is visible in the screenshot but NOT in the candidate list, return ref as null and provide bounding box coordinates (x, y, width, height in pixels).\n\nJSON format with optional boundingBox: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief","boundingBox":{"x":0,"y":0,"width":0,"height":0}}`;
+      const visionPrompt = `${systemPrompt}\n\n${userPrompt}\n\nIMPORTANT: Look at the screenshot to visually identify the target element. If the element is visible in the screenshot but NOT in the candidate list, return ref as null and provide bounding box coordinates (x, y, width, height in pixels).\n\nCOORDINATE SPACE: All bounding box coordinates MUST be in screenshot image space — i.e. (0,0) is the top-left pixel of the image you see. Do NOT use page/document coordinates. The caller will translate image coords back to the live page.\n\nJSON format with optional boundingBox: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief","boundingBox":{"x":0,"y":0,"width":0,"height":0}}`;
 
       // V14: Detect mime type from base64 header — JPEG starts with /9j/, PNG with iVBOR
       const mimeType: 'image/jpeg' | 'image/png' = screenshot.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
@@ -1632,6 +1640,88 @@ Select the single best matching element, or return ref=null if the intent does n
  *
  * @returns LintResult with resolution metrics
  */
+/**
+ * V15: Screenshot-space coordinate mapping.
+ * When the screenshot is a clipped viewport (intent-step-lint.service.ts clips to
+ * scrollY-100 .. scrollY+viewportH+200 in PAGE space), vision returns bbox coordinates
+ * in SCREENSHOT space (0-based from clip origin). To map back to DOM, we need the
+ * page-Y of the screenshot's top edge so we can offset vision coords before comparing
+ * to `node.boundingBox` — which is VIEWPORT-space (from getBoundingClientRect).
+ * clipPageTop = page-Y of the screenshot's pixel (0,0).
+ * scrollY = current viewport scroll. To map vision y (screenshot-space) to node.boundingBox y
+ * (viewport-space): viewportY = visionY + clipPageTop - scrollY.
+ * Back-compat: plain base64 string is treated as full-viewport screenshot (clipPageTop = scrollY).
+ */
+export type ScreenshotResult = string | { base64: string; clipPageTop?: number; scrollY?: number };
+
+interface NormalizedScreenshot {
+  base64: string;
+  /** page Y of the screenshot's pixel (0,0). Default: 0 (assume full page / top of viewport). */
+  clipPageTop: number;
+  /** current scroll Y when screenshot was taken. Default: 0. */
+  scrollY: number;
+}
+
+/** Resolve ScreenshotResult or lazy callback to a normalized { base64, clipPageTop, scrollY }. */
+async function resolveScreenshot(
+  src: ScreenshotResult | (() => Promise<ScreenshotResult | null>) | undefined
+): Promise<NormalizedScreenshot | undefined> {
+  if (!src) return undefined;
+  let raw: ScreenshotResult | null;
+  if (typeof src === 'function') {
+    try { raw = await src(); } catch { return undefined; }
+  } else {
+    raw = src;
+  }
+  if (!raw) return undefined;
+  if (typeof raw === 'string') {
+    // Back-compat: assume screenshot == viewport, no offset needed
+    return { base64: raw, clipPageTop: 0, scrollY: 0 };
+  }
+  return {
+    base64: raw.base64,
+    clipPageTop: typeof raw.clipPageTop === 'number' ? raw.clipPageTop : 0,
+    scrollY: typeof raw.scrollY === 'number' ? raw.scrollY : 0,
+  };
+}
+
+/**
+ * Map a vision-returned bounding box (screenshot pixel space) to viewport space
+ * that matches `node.boundingBox` (from getBoundingClientRect).
+ * viewportY = screenshotY + clipPageTop - scrollY.
+ */
+function mapVisionBboxToViewport(
+  bb: { x: number; y: number; width: number; height: number },
+  shot: NormalizedScreenshot
+): { x: number; y: number; width: number; height: number } {
+  const dy = shot.clipPageTop - shot.scrollY;
+  return { x: bb.x, y: bb.y + dy, width: bb.width, height: bb.height };
+}
+
+/**
+ * Sanity-check a vision bbox BEFORE mapping. Gemini occasionally returns page-space
+ * or otherwise absurd coordinates despite the prompt instruction. We require the bbox
+ * to sit within the screenshot bounds (with a small overflow tolerance). The actual
+ * screenshot height isn't available here without decoding the JPEG, so we approximate:
+ * the clip height is at most scrollY_delta (up to 300px beyond viewport) — a reasonable
+ * ceiling. Also reject NaN/negative values.
+ */
+function isVisionBboxReasonable(
+  bb: { x: number; y: number; width: number; height: number } | undefined
+): boolean {
+  if (!bb) return false;
+  const { x, y, width, height } = bb;
+  if (![x, y, width, height].every(v => typeof v === 'number' && Number.isFinite(v))) return false;
+  if (width <= 0 || height <= 0) return false;
+  // Screenshot space is 0-based. Allow small negative overflow (-50) for rounding.
+  if (x < -50 || y < -50) return false;
+  // Upper bound: generous — viewport widths up to 4K, clip heights up to full-page snapshot.
+  // Better to accept a too-large bbox and let containment fail cleanly than reject valid
+  // coords from a big screen. 10000 is safely above any realistic viewport.
+  if (x > 10000 || y > 10000 || width > 10000 || height > 10000) return false;
+  return true;
+}
+
 export async function resolveElement(params: {
   previewSessionId: string;
   stepDraft: IntentStep;
@@ -1640,7 +1730,7 @@ export async function resolveElement(params: {
   /** When true, include candidates in result (for Show Alternatives) */
   includeAlternatives?: boolean;
   /** Phase 6: Screenshot for vision-enhanced rescue (base64 JPEG/PNG or lazy callback) */
-  screenshot?: string | (() => Promise<string | null>);
+  screenshot?: ScreenshotResult | (() => Promise<ScreenshotResult | null>);
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -1648,9 +1738,45 @@ export async function resolveElement(params: {
     domNodes,
     pageUrl,
     includeAlternatives = false,
-    screenshot: screenshotOrFn,
+    screenshot: screenshotOrFnRaw,
   } = params;
   const startTime = Date.now();
+
+  // V15: Memoize screenshot capture within this resolveElement call.
+  // The lazy callback is consumed by up to 3 paths (allowedCount===0 rescue,
+  // proactive-vision for blind icons, vision second-opinion after text LLM). Calling
+  // page.screenshot()+page.evaluate() 3× in the same resolver invocation is wasteful
+  // AND unsafe: scroll position or DOM could mutate between calls, giving divergent
+  // clipPageTop/scrollY values that desync the bbox→viewport mapping.
+  // Capture ONCE, reuse. Null result is also memoized (don't retry a failing callback).
+  let cachedShot: NormalizedScreenshot | undefined | null = undefined;
+  const screenshotOrFn: typeof screenshotOrFnRaw | undefined = (() => {
+    if (!screenshotOrFnRaw) return undefined;
+    if (typeof screenshotOrFnRaw !== 'function') return screenshotOrFnRaw;
+    return async (): Promise<ScreenshotResult | null> => {
+      if (cachedShot !== undefined) {
+        // cachedShot was already resolved (null = prior attempt failed)
+        return cachedShot === null ? null : { base64: cachedShot.base64, clipPageTop: cachedShot.clipPageTop, scrollY: cachedShot.scrollY };
+      }
+      try {
+        const raw = await (screenshotOrFnRaw as () => Promise<ScreenshotResult | null>)();
+        if (!raw) { cachedShot = null; return null; }
+        if (typeof raw === 'string') {
+          cachedShot = { base64: raw, clipPageTop: 0, scrollY: 0 };
+        } else {
+          cachedShot = {
+            base64: raw.base64,
+            clipPageTop: typeof raw.clipPageTop === 'number' ? raw.clipPageTop : 0,
+            scrollY: typeof raw.scrollY === 'number' ? raw.scrollY : 0,
+          };
+        }
+        return { base64: cachedShot.base64, clipPageTop: cachedShot.clipPageTop, scrollY: cachedShot.scrollY };
+      } catch {
+        cachedShot = null;
+        return null;
+      }
+    };
+  })();
 
   logger.debug('[ELEMENT_RESOLVER] Starting resolution', {
     previewSessionId,
@@ -1716,19 +1842,15 @@ export async function resolveElement(params: {
     const excludedNodes = domNodes.filter(n => n.ref && !allowedRefs.has(n.ref));
 
     // V14: Resolve screenshot lazily — only capture when we actually need vision rescue
-    let screenshot: string | undefined;
-    if (typeof screenshotOrFn === 'function') {
-      try { screenshot = (await screenshotOrFn()) ?? undefined; } catch { /* non-critical */ }
-    } else {
-      screenshot = screenshotOrFn;
-    }
+    // V15: Normalized — carries clipPageTop/scrollY for correct bbox-to-viewport mapping
+    const shot = await resolveScreenshot(screenshotOrFn);
 
     const rescueResult = await rescueWithGeminiFlash({
       intentText,
       actionType: stepDraft.type,
       excludedNodes,
       pageUrl,
-      screenshot,
+      screenshot: shot?.base64,
     });
 
     if (rescueResult) {
@@ -1767,8 +1889,10 @@ export async function resolveElement(params: {
 
       // V14: BoundingBox-only result — vision found element by coordinates but not in DOM list.
       // Search ALL domNodes (not just excluded) — vision coordinates may match any element.
-      if (rescueResult.boundingBox) {
-        const bb = rescueResult.boundingBox;
+      if (rescueResult.boundingBox && isVisionBboxReasonable(rescueResult.boundingBox)) {
+        // V15: Vision returns coords in SCREENSHOT space (0-based from clip origin).
+        // `node.boundingBox` is VIEWPORT space (getBoundingClientRect). Map before comparing.
+        const bb = shot ? mapVisionBboxToViewport(rescueResult.boundingBox, shot) : rescueResult.boundingBox;
         const bbCenterX = bb.x + bb.width / 2;
         const bbCenterY = bb.y + bb.height / 2;
 
@@ -1934,6 +2058,158 @@ export async function resolveElement(params: {
   // Mark duplicate elements with [N of M] and promote CONTEXT for disambiguation
   markDuplicatesWithContext(candidatesToProcess);
 
+  // V15: Proactive vision escalation for indistinguishable icon-only buttons.
+  // Trigger when EVERY candidate is an icon-button with no semantic label AND no icon hint —
+  // i.e. text LLM provably cannot tell them apart. In that case skip the text LLM (which would
+  // fall back to DOM order and pick the wrong one) and go straight to vision.
+  // We only fire when ALL primary candidates are blind, not just "2+ blind among labeled peers"
+  // — because if even one candidate has a label, the text LLM can eliminate the blind ones and
+  // match the labeled one, or return null. Gating on "all blind" prevents needless vision calls.
+  const iconOnlyBlind = candidatesToProcess.filter(c => {
+    const n = c.node;
+    if (!n.isIconButton) return false;
+    const hasLabel = !!(n.ariaLabel || n.title || n.labelText || (n.text && n.text.trim().length > 0));
+    const hasIconHint = !!(n.iconClasses && n.iconClasses.trim().length > 0);
+    return !hasLabel && !hasIconHint;
+  });
+  const allCandidatesBlind =
+    candidatesToProcess.length >= 2 &&
+    iconOnlyBlind.length === candidatesToProcess.length;
+  if (allCandidatesBlind && screenshotOrFn) {
+    logger.info('[ELEMENT_RESOLVER] Proactive vision — all candidates are blind icon-only buttons', {
+      previewSessionId,
+      blindIconCount: iconOnlyBlind.length,
+      totalCandidates: candidatesToProcess.length,
+      intentText: intentText.slice(0, 50),
+    });
+    const shot = await resolveScreenshot(screenshotOrFn);
+    if (shot) {
+      const visionResult = await rescueWithGeminiFlash({
+        intentText,
+        actionType: stepDraft.type,
+        // Pass the blind icon candidates so vision matches among them (name is legacy;
+        // `rescueWithGeminiFlash` treats these as the candidate pool, not exclusions).
+        excludedNodes: iconOnlyBlind.map(c => c.node),
+        pageUrl,
+        screenshot: shot.base64,
+      });
+
+      // Path 1: Vision returned a ref directly
+      if (visionResult && visionResult.ref) {
+        const pickedNode = iconOnlyBlind.find(c => c.node.ref === visionResult.ref)?.node
+          || domNodes.find(n => n.ref === visionResult.ref);
+        if (pickedNode) {
+          logger.info('[ELEMENT_RESOLVER] Proactive vision resolved icon-only tab (by ref)', {
+            event: 'proactive_vision',
+            previewSessionId,
+            ref: pickedNode.ref,
+            confidence: visionResult.confidence,
+            reason: visionResult.reason,
+            totalLatencyMs: Date.now() - startTime,
+          });
+          const lintCandidate: LintCandidate = {
+            ref: pickedNode.ref,
+            label: pickedNode.labelText || pickedNode.ariaLabel || pickedNode.text || `<${pickedNode.tag}>`,
+            reason: `Vision match (icon-only): ${visionResult.reason}`,
+            confidence: visionResult.confidence,
+            boundingBox: pickedNode.boundingBox,
+            node: pickedNode,
+          };
+          return {
+            status: visionResult.confidence >= 0.5 ? 'resolved' as LintStatus : 'needs_clarification' as LintStatus,
+            message: `Icon identified by visual analysis: ${visionResult.reason}`,
+            confidence: visionResult.confidence,
+            candidates: [lintCandidate],
+            highlight: [{
+              ref: pickedNode.ref,
+              boundingBox: pickedNode.boundingBox,
+              type: visionResult.confidence >= 0.5 ? 'success' : 'warning',
+            }],
+            cacheHit: false,
+            degradedMode: false,
+            ..._diag,
+          };
+        }
+      }
+
+      // Path 2: Vision returned only a boundingBox — map screenshot space → viewport space
+      // and pick the smallest containing node among the blind icons.
+      if (visionResult && visionResult.boundingBox && isVisionBboxReasonable(visionResult.boundingBox)) {
+        const vbb = mapVisionBboxToViewport(visionResult.boundingBox, shot);
+        const cx = vbb.x + vbb.width / 2;
+        const cy = vbb.y + vbb.height / 2;
+        let best: InteractiveNode | undefined;
+        let bestArea = Infinity;
+        for (const c of iconOnlyBlind) {
+          const nb = c.node.boundingBox;
+          if (!nb) continue;
+          if (cx >= nb.x && cx <= nb.x + nb.width && cy >= nb.y && cy <= nb.y + nb.height) {
+            const area = nb.width * nb.height;
+            if (area < bestArea) { bestArea = area; best = c.node; }
+          }
+        }
+        if (best) {
+          logger.info('[ELEMENT_RESOLVER] Proactive vision resolved icon-only tab (by bbox)', {
+            event: 'proactive_vision_bbox',
+            previewSessionId,
+            ref: best.ref,
+            confidence: visionResult.confidence,
+            visionBBox: visionResult.boundingBox,
+            mappedBBox: vbb,
+            totalLatencyMs: Date.now() - startTime,
+          });
+          const confidence = Math.min(visionResult.confidence, 0.8);
+          const lintCandidate: LintCandidate = {
+            ref: best.ref,
+            label: best.labelText || best.ariaLabel || best.text || `<${best.tag}>`,
+            reason: `Vision match by coordinates: ${visionResult.reason}`,
+            confidence,
+            boundingBox: best.boundingBox,
+            node: best,
+          };
+          return {
+            status: confidence >= 0.5 ? 'resolved' as LintStatus : 'needs_clarification' as LintStatus,
+            message: `Icon identified by visual coordinates: ${visionResult.reason}`,
+            confidence,
+            candidates: [lintCandidate],
+            highlight: [{ ref: best.ref, boundingBox: best.boundingBox, type: confidence >= 0.5 ? 'success' : 'warning' }],
+            cacheHit: false,
+            degradedMode: false,
+            ..._diag,
+          };
+        }
+      }
+
+      // Vision explicitly could not disambiguate — don't waste a second LLM call on the same
+      // problem. Return needs_clarification so the user can pick manually.
+      logger.info('[ELEMENT_RESOLVER] Proactive vision inconclusive on blind icons — stopping', {
+        previewSessionId,
+        visionReason: visionResult?.reason?.slice(0, 120),
+      });
+      const altCandidates: LintCandidate[] = iconOnlyBlind.map(c => ({
+        ref: c.node.ref,
+        label: c.node.labelText || c.node.ariaLabel || c.node.text || `<${c.node.tag}>`,
+        reason: 'Icon-only button — no semantic label, vision could not disambiguate',
+        confidence: 0.3,
+        boundingBox: c.node.boundingBox,
+        node: c.node,
+      }));
+      return {
+        status: 'needs_clarification',
+        message: 'Multiple icon-only buttons with no distinguishing labels — please pick the right one.',
+        confidence: 0,
+        candidates: includeAlternatives ? altCandidates : [],
+        highlight: includeAlternatives
+          ? altCandidates.map(c => ({ ref: c.ref, boundingBox: c.boundingBox, type: 'warning' as const }))
+          : [],
+        cacheHit: false,
+        degradedMode: false,
+        ...(altCandidates.length > 0 ? { alternativesIncluded: true } : {}),
+        ..._diag,
+      };
+    }
+  }
+
   // Compute page signature for cache
   const pageSignature = computePageSignature(pageUrl, domNodes);
 
@@ -2075,15 +2351,10 @@ export async function resolveElement(params: {
             visualCandidateCount: candidatesToProcess.filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton).length,
           });
 
-          // Capture screenshot for vision analysis
-          let visionScreenshot: string | undefined;
-          if (typeof screenshotOrFn === 'function') {
-            try { visionScreenshot = (await screenshotOrFn()) ?? undefined; } catch { /* non-critical */ }
-          } else {
-            visionScreenshot = screenshotOrFn;
-          }
+          // Capture screenshot for vision analysis (normalized with clipPageTop/scrollY)
+          const visionShot = await resolveScreenshot(screenshotOrFn);
 
-          if (visionScreenshot) {
+          if (visionShot) {
             // Pass visual candidates as the node list for vision to match against
             const visualNodes = candidatesToProcess
               .filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton)
@@ -2094,7 +2365,7 @@ export async function resolveElement(params: {
               actionType: stepDraft.type,
               excludedNodes: visualNodes.length > 0 ? visualNodes : allAllowed,
               pageUrl,
-              screenshot: visionScreenshot,
+              screenshot: visionShot.base64,
             });
 
             if (visionResult && visionResult.ref) {

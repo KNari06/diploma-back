@@ -38,7 +38,9 @@ import {
  *
  * Size: ~150KB JPEG vs ~500KB fullPage — optimized for LLM vision tokens.
  */
-async function captureSmartScreenshot(page: Page): Promise<string | null> {
+async function captureSmartScreenshot(
+  page: Page
+): Promise<{ base64: string; clipPageTop: number; scrollY: number } | null> {
   try {
     const dims = await page.evaluate(() => ({
       scrollY: (globalThis as any).scrollY || 0,
@@ -52,9 +54,10 @@ async function captureSmartScreenshot(page: Page): Promise<string | null> {
     const clipHeight = clipBottom - clipTop;
 
     // Guard: clip must have meaningful dimensions
+    // V15: Plain viewport screenshot — its (0,0) sits at page-Y=scrollY, so clipPageTop == scrollY.
     if (clipHeight < 100 || dims.viewportW < 100) {
       const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
-      return buf.toString('base64');
+      return { base64: buf.toString('base64'), clipPageTop: dims.scrollY, scrollY: dims.scrollY };
     }
 
     const buf = await page.screenshot({
@@ -62,12 +65,17 @@ async function captureSmartScreenshot(page: Page): Promise<string | null> {
       type: 'jpeg',
       quality: 70,
     });
-    return buf.toString('base64');
+    return { base64: buf.toString('base64'), clipPageTop: clipTop, scrollY: dims.scrollY };
   } catch {
     // Fallback: plain viewport screenshot if clip fails (page navigating, crashed, etc.)
     try {
       const buf = await page.screenshot({ type: 'jpeg', quality: 70 });
-      return buf.toString('base64');
+      // Best-effort scrollY for fallback; if unreadable, assume 0 (clipPageTop == scrollY still holds).
+      let scrollY = 0;
+      try {
+        scrollY = await page.evaluate(() => (globalThis as any).scrollY || 0);
+      } catch { /* non-critical */ }
+      return { base64: buf.toString('base64'), clipPageTop: scrollY, scrollY };
     } catch {
       return null;
     }

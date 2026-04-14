@@ -813,7 +813,13 @@ export class IntentStepLintService {
             type: 'jpeg',
             quality: 70,
           });
-          return buf.toString('base64');
+          // V15: Return clipPageTop + scrollY so the resolver can map vision bbox
+          // (screenshot-space, 0-based from clip origin) back to viewport-space.
+          return {
+            base64: buf.toString('base64'),
+            clipPageTop: clipTop,
+            scrollY: dims.scrollY,
+          };
         } catch { return null; }
       },
     });
