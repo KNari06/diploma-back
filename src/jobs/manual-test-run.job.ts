@@ -18,7 +18,12 @@ import {
 import { Job } from 'bullmq';
 
 // Constants
-const MAX_RETRIES = env.AGENT_MAX_RETRIES || 2;
+// Retry budget for executePlaywrightTestWithRetry. Default: 1 (one retry).
+// April 2026: lowered from 2 → 1 because an LLM classifier now gates retries
+// on real infra-transient failures only. One retry is plenty for a genuine
+// infra hiccup; more retries mask real product bugs and waste engineer time.
+// Override with AGENT_MAX_RETRIES for debugging on a specific environment.
+const MAX_RETRIES = env.AGENT_MAX_RETRIES ?? 1;
 const DEFAULT_ADMIN_EMAIL = 'admin@qai.so';
 
 /**

@@ -1,6 +1,7 @@
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { executePlaywrightTest } from './test-executor';
+import { classifyRetry, type RetryDecision } from './retry-classifier.service';
 
 /**
  * Errors that are deterministic and should NOT be retried.
@@ -27,11 +28,55 @@ function isDeterministicError(errorMsg: string): boolean {
 }
 
 /**
- * Execute Playwright test with automatic retry
+ * Ask the LLM classifier whether a non-deterministic failure is a genuine
+ * infra-transient issue worth retrying. Wraps `classifyRetry` with safe
+ * logging + a guarantee that exceptions never leak out as a "retry" signal.
+ */
+async function shouldRetryByClassifier(
+  testId: string,
+  errorMessage: string,
+): Promise<RetryDecision | null> {
+  try {
+    const decision = await classifyRetry({ errorMessage });
+    logger.info('[PLAYWRIGHT_RETRY] LLM classifier verdict', {
+      testId,
+      shouldRetry: decision.shouldRetry,
+      category: decision.category,
+      reasoning: decision.reasoning,
+      elapsedMs: decision.elapsedMs,
+      fallbackUsed: !!decision.fallbackUsed,
+    });
+    return decision;
+  } catch (err) {
+    // classifyRetry is designed to never throw, but defend-in-depth: any
+    // unexpected explosion here must not produce a phantom retry.
+    logger.error('[PLAYWRIGHT_RETRY] classifyRetry threw unexpectedly', {
+      testId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Execute Playwright test with automatic retry.
+ *
+ * Retry strategy (April 2026 refactor):
+ *   1. If the error matches NON_RETRYABLE_ERROR_PATTERNS → fail immediately.
+ *   2. Otherwise, ask a fast LLM ("is this a genuine infra issue?").
+ *      Only retry when the classifier returns category=infra_transient.
+ *   3. maxRetries defaults to 1 — one retry is enough for a true infra hiccup;
+ *      anything beyond hides real bugs and wastes engineer time.
+ *
+ * Background: before this refactor we retried up to 3 times on every
+ * non-deterministic failure. QA reported the UI looked like the test was
+ * "cycling" because the frontend rendered each retry as a replay of steps.
+ * Worse, real product bugs (like a missing button) were sometimes masked
+ * when a later retry happened to succeed because of a timing change.
  */
 export async function executePlaywrightTestWithRetry(
   testData: TestJobData,
-  maxRetries: number = 2
+  maxRetries: number = 1
 ): Promise<ReturnType<typeof executePlaywrightTest>> {
   let lastError: any;
 
@@ -113,6 +158,27 @@ export async function executePlaywrightTestWithRetry(
         return result;
       }
 
+      // 🧠 LLM gate: ask the classifier whether this non-deterministic failure
+      // is a genuine infra-transient issue worth retrying. Product bugs and
+      // test issues fall through to an immediate return so QA can see them.
+      // Skip the classifier on the last attempt (nothing to decide).
+      if (attempt < maxRetries && result.error) {
+        const decision = await shouldRetryByClassifier(
+          testData.testId,
+          String(result.error),
+        );
+        if (decision && !decision.shouldRetry) {
+          logger.info('[PLAYWRIGHT_RETRY] LLM classifier says do NOT retry', {
+            testId: testData.testId,
+            attempt: attempt + 1,
+            category: decision.category,
+            reasoning: decision.reasoning,
+            error: result.error,
+          });
+          return result;
+        }
+      }
+
       lastError = result.error;
       logger.warn('[PLAYWRIGHT_RETRY] Test attempt returned failure (retryable)', {
         testId: testData.testId,
@@ -162,6 +228,39 @@ export async function executePlaywrightTestWithRetry(
           }],
           error: error.message,
         };
+      }
+
+      // 🧠 LLM gate: same logic as the result-error path. Thrown exceptions
+      // from the executor are usually genuine infra hiccups (browser closed,
+      // CDP lost, socket reset), but we still want the classifier to confirm
+      // before burning a retry budget.
+      const exceptionMessage = error instanceof Error ? error.message : String(error);
+      if (attempt < maxRetries && exceptionMessage) {
+        const decision = await shouldRetryByClassifier(
+          testData.testId,
+          exceptionMessage,
+        );
+        if (decision && !decision.shouldRetry) {
+          logger.info('[PLAYWRIGHT_RETRY] LLM classifier says do NOT retry (exception path)', {
+            testId: testData.testId,
+            attempt: attempt + 1,
+            category: decision.category,
+            reasoning: decision.reasoning,
+            error: exceptionMessage,
+          });
+          return {
+            success: false,
+            status: 'failed',
+            logs: [],
+            networkLogs: [],
+            errors: [{
+              type: 'other',
+              message: exceptionMessage,
+              timestamp: new Date(),
+            }],
+            error: exceptionMessage,
+          };
+        }
       }
 
       lastError = error;

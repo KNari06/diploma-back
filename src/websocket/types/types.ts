@@ -296,6 +296,13 @@ export interface TestProgressPayload {
   totalSteps?: number;
   completedSteps?: number;
   status?: string; // 'queued' | 'running' | 'completed' | 'failed'
+  /**
+   * Retry attempt number (0 = first run, 1+ = subsequent retries after
+   * executePlaywrightTestWithRetry re-invokes the executor). Frontend uses
+   * this to reset the live step list when a retry begins, so repeated
+   * `test:step:completed` events with the same `step` don't look like cycles.
+   */
+  attempt?: number;
   timestamp: string;
   elapsedTime?: number; // Milliseconds since test start
   estimatedRemaining?: number; // Estimated milliseconds remaining
@@ -307,6 +314,8 @@ export interface TestStepCompletedPayload {
   testId: string;
   browser: string;
   step: number;
+  /** Retry attempt number (0 = first run, 1+ = retries). See TestProgressPayload.attempt. */
+  attempt?: number;
   stepDescription: string;
   success: boolean;
   timestamp: string;
@@ -344,6 +353,17 @@ export interface TestStepCompletedPayload {
     pageSignatureMatched?: boolean;
     /** Self-healing confidence (if healed) */
     healConfidence?: number;
+    /**
+     * Self-heal provenance — populated only when runtimeStatus === 'healed'.
+     * Surfaces "what broke, what AI used instead" so the UI can show a
+     * before→after tooltip on the healed badge.
+     */
+    /** Original selector that failed before self-heal rewrote it. */
+    healedFrom?: string;
+    /** Selector the self-healer resolved to (new working locator). */
+    healedTo?: string;
+    /** Short human-readable description of what changed during heal. */
+    healWhatChanged?: string;
     /** True if step is flagged as needing review */
     needsReview?: boolean;
     /** True if step is flagged as flaky */

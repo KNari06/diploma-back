@@ -2218,6 +2218,11 @@ export class RegressionRunService {
           const step = completedSteps[i];
           const meta = step.data?.runtimeMeta;
           const success = step.data?.success !== false;
+          // Surface self-healing + flakiness so QA can spot fragile steps in
+          // the report. A step is "healed" when its locator had to be rewritten
+          // by self_heal to pass; "flaky" is an independent historical signal
+          // the backend annotates onto the runtimeMeta.
+          const healed = meta?.runtimeStatus === 'healed' || meta?.source === 'self_heal';
           steps.push({
             index: i + 1,
             description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
@@ -2230,6 +2235,15 @@ export class RegressionRunService {
               rootCause: meta?.rootCause,
               networkVerdict: meta?.networkVerdict,
             } : undefined,
+            ...(healed ? { healed: true } : {}),
+            ...(typeof meta?.healConfidence === 'number' ? { healConfidence: meta.healConfidence } : {}),
+            // Forward self-heal before/after provenance. Only meaningful when
+            // healed === true, but we keep the guards independent so a partial
+            // meta still surfaces whatever fields are present.
+            ...(meta?.healedFrom ? { healedFrom: meta.healedFrom } : {}),
+            ...(meta?.healedTo ? { healedTo: meta.healedTo } : {}),
+            ...(meta?.healWhatChanged ? { healWhatChanged: meta.healWhatChanged } : {}),
+            ...(meta?.flaky ? { flaky: true } : {}),
           });
         }
 

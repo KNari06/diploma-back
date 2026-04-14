@@ -739,6 +739,17 @@ export interface StepRuntimeMeta {
   /** Self-healing confidence (if healed) */
   healConfidence?: number;
   /**
+   * Self-heal provenance — what was rewritten and why.
+   * Populated only when runtimeStatus === 'healed'. Surfaced in the run report
+   * so QA can see "this selector was wrong, AI tried this instead".
+   */
+  /** Original selector that failed before self-heal kicked in. */
+  healedFrom?: string;
+  /** Selector the self-healer resolved to. */
+  healedTo?: string;
+  /** Short human-readable description of what changed (from SelfHealingResult.diff.what_changed). */
+  healWhatChanged?: string;
+  /**
    * V6: True if lookahead auto-wait was applied (waited > threshold)
    * Indicates significant inter-step wait due to element not being ready
    */

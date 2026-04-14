@@ -851,6 +851,33 @@ export interface RunReportStep {
     /** V11: Network verdict ('validation_failure' | 'backend_error' | 'expected_error' | 'clean' | 'warning') */
     networkVerdict?: string;
   };
+  /**
+   * True when the step passed only because self-healing rewrote the locator.
+   * Surfaced in the UI as a "healed" badge so QA can spot fragile steps.
+   * Derived from runtimeMeta.runtimeStatus === 'healed' || source === 'self_heal'.
+   */
+  healed?: boolean;
+  /**
+   * Confidence score (0..1) of the self-healing resolution. Only present when
+   * healed is true. UI renders as "healed 95%" etc.
+   */
+  healConfidence?: number;
+  /**
+   * Self-heal before/after provenance — the original selector that failed and
+   * the new selector the self-healer resolved to. Rendered in the run report
+   * as a before→after tooltip on the healed badge. Only present when
+   * healed === true; forwarded from StepRuntimeMeta.healedFrom / healedTo.
+   */
+  healedFrom?: string;
+  healedTo?: string;
+  /** Short human-readable description of what changed during heal. */
+  healWhatChanged?: string;
+  /**
+   * Backend-classified flakiness flag from runtimeMeta.flaky. Independent of
+   * healed — a step can be flaky without having been healed in this run, and
+   * vice versa. Surfaced as a separate yellow badge.
+   */
+  flaky?: boolean;
 }
 
 /**

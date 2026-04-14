@@ -3748,6 +3748,15 @@ export class CommandExecutor {
               usedLocatorStrategy: 'healed',
               healConfidence,
               resolutionPath: 'self_heal',
+              // Self-heal provenance — surfaces before/after to the run report UI.
+              // healingResult.oldSelector is always populated; newSelector is present
+              // on success (guarded here by the surrounding `if success` branch).
+              // `diff.what_changed` is a short human-readable description.
+              ...(healingResult.oldSelector ? { healedFrom: healingResult.oldSelector } : {}),
+              ...(healingResult.newSelector ? { healedTo: healingResult.newSelector } : {}),
+              ...(healingResult.diff?.what_changed
+                ? { healWhatChanged: healingResult.diff.what_changed }
+                : {}),
               // GUARD RAILS: Flag for review even when heal succeeds
               needsReview,
               flaky,
