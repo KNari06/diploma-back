@@ -6,7 +6,11 @@
 
 import { logger } from '@/utils/core/logger';
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
-import { uploadLiteTraceLogToStorage } from '@/services/storage/test-artifacts-storage.service';
+import {
+  uploadLiteTraceLogToStorage,
+  insertTraceFileRecord,
+  deleteLiteTraceLogFromStorage,
+} from '@/services/storage/test-artifacts-storage.service';
 import { isValidUUID } from '@/utils/validation/validation';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -236,7 +240,7 @@ export class ApiAgentTraceService {
       await this.writer.close();
 
       const filePath = this.writer.getFilePath();
-      const fileName = `api_agent_${this.testId}_${this.runId}.jsonl`;
+      const originalFileName = path.basename(filePath);
 
       // Guard: skip upload if file missing or too large
       if (!fs.existsSync(filePath)) {
@@ -254,7 +258,35 @@ export class ApiAgentTraceService {
 
       // Only upload if userId is valid UUID
       if (isValidUUID(this.userId)) {
-        const result = await uploadLiteTraceLogToStorage(filePath, this.userId, fileName);
+        const result = await uploadLiteTraceLogToStorage(
+          filePath,
+          this.userId,
+          originalFileName,
+          'api-agent',
+        );
+
+        // Register the trace in trace_files so it shows up in the admin UI.
+        // testId is nullable (api-agent tests are not stored in `tests`),
+        // so we pass null and rely on the `browser` discriminator for filtering.
+        try {
+          await insertTraceFileRecord({
+            userId: this.userId,
+            testId: null,
+            fileName: result.fileName,
+            storagePath: result.storagePath,
+            fileSize: result.fileSize,
+            browser: 'api-agent-trace',
+            status: 'uploaded',
+          });
+        } catch (insertError) {
+          logger.error('[API_AGENT_TRACE] Failed to register trace in DB, rolling back storage', {
+            error: insertError instanceof Error ? insertError.message : String(insertError),
+            storagePath: result.storagePath,
+          });
+          await deleteLiteTraceLogFromStorage(result.storagePath).catch(() => {});
+          return null;
+        }
+
         logger.info('[API_AGENT_TRACE] Trace uploaded', {
           path: result.storagePath,
           size: result.fileSize,

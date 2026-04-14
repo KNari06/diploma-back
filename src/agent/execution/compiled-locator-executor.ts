@@ -515,12 +515,46 @@ async function tryLocatorEntry(
  * @param timeout Action timeout
  * @returns Result with success status and locator if found
  */
+/**
+ * V15: Tracer contract for per-attempt observability. Structural interface — callers
+ * pass EditorTraceService methods (or any compatible shape). Fire-and-forget; every
+ * call is wrapped in try/catch internally so a broken tracer can't break execution.
+ */
+export interface CompiledExecutorTracer {
+  attempt(data: {
+    stepId: string;
+    attempt: number;
+    strategy: string;
+    value: string;
+    confidence?: number;
+    timeoutMs: number;
+    success: boolean;
+    durationMs: number;
+    failureKind?: 'not_found' | 'ambiguous' | 'fingerprint_mismatch' | 'timeout' | 'error';
+    matchCount?: number;
+    fingerprintScore?: number;
+    error?: string;
+  }): void;
+  reorder(data: { stepId: string; reason: string; before: string[]; after: string[] }): void;
+}
+
 export async function executeCompiledLocatorPlan(
   page: PageLike,
   compiled: CompiledStepPlan | undefined,
   actionType: string,
-  timeout: number = 30000
+  timeout: number = 30000,
+  tracer?: CompiledExecutorTracer,
+  stepId?: string,
 ): Promise<CompiledExecutionResult> {
+  const safeTrace = {
+    attempt: (d: Parameters<CompiledExecutorTracer['attempt']>[0]) => {
+      try { tracer?.attempt(d); } catch { /* non-fatal */ }
+    },
+    reorder: (d: Parameters<CompiledExecutorTracer['reorder']>[0]) => {
+      try { tracer?.reorder(d); } catch { /* non-fatal */ }
+    },
+  };
+  const traceStepId = stepId ?? 'unknown';
   // 1. Check if compiled plan exists
   if (!compiled || !compiled.locatorPlan || compiled.locatorPlan.length === 0) {
     logger.debug('[COMPILED_EXECUTOR] No compiled plan available');
@@ -599,27 +633,41 @@ export async function executeCompiledLocatorPlan(
   if (hasShadowSafe && hasNonShadowSafe) {
     const shadowPresent = await pageUsesShadowDom(page);
     if (shadowPresent) {
+      const before = locatorsToTry.map(e => e.strategy);
       locatorsToTry = reorderForShadowDom(locatorsToTry, true);
+      const after = locatorsToTry.map(e => e.strategy);
+      if (before.some((s, i) => s !== after[i])) {
+        safeTrace.reorder({
+          stepId: traceStepId,
+          reason: 'shadow_dom_detected',
+          before,
+          after,
+        });
+      }
     }
   }
 
   // 4. Try each locator in order
   let sawAmbiguous = false;
   const ambiguityDetails: Array<{ strategy: string; matchCount: number }> = [];
+  let attemptIdx = 0;
   for (const entry of locatorsToTry) {
+    attemptIdx++;
     logger.debug('[COMPILED_EXECUTOR] Trying locator', {
       strategy: entry.strategy,
       value: entry.value.slice(0, 50),
       confidence: entry.confidence,
     });
 
+    const attemptStart = Date.now();
     const result = await tryLocatorEntry(page, entry, timeout);
+    const attemptDur = Date.now() - attemptStart;
 
     if (result.success && result.locator) {
       // Validate fingerprint if available
       if (compiled.targetFingerprint) {
         const matchScore = await quickFingerprintCheck(page, result.locator, compiled.targetFingerprint);
-        
+
         if (matchScore < 0.3) {
           logger.warn('[COMPILED_EXECUTOR] Fingerprint mismatch - element found but may be wrong', {
             strategy: entry.strategy,
@@ -631,6 +679,18 @@ export async function executeCompiledLocatorPlan(
               placeholder: compiled.targetFingerprint.placeholder,
             },
           });
+          safeTrace.attempt({
+            stepId: traceStepId,
+            attempt: attemptIdx,
+            strategy: entry.strategy,
+            value: entry.value.slice(0, 200),
+            confidence: entry.confidence,
+            timeoutMs: timeout,
+            success: false,
+            durationMs: attemptDur,
+            failureKind: 'fingerprint_mismatch',
+            fingerprintScore: Math.round(matchScore * 100) / 100,
+          });
           // Skip this locator, try next one
           continue;
         }
@@ -640,6 +700,17 @@ export async function executeCompiledLocatorPlan(
           matchScore: Math.round(matchScore * 100) / 100,
         });
       }
+
+      safeTrace.attempt({
+        stepId: traceStepId,
+        attempt: attemptIdx,
+        strategy: entry.strategy,
+        value: entry.value.slice(0, 200),
+        confidence: entry.confidence,
+        timeoutMs: timeout,
+        success: true,
+        durationMs: attemptDur,
+      });
 
       logger.info('[COMPILED_EXECUTOR] Locator succeeded', {
         strategy: entry.strategy,
@@ -666,6 +737,28 @@ export async function executeCompiledLocatorPlan(
         matchCount: countMatch ? parseInt(countMatch[1], 10) : 0,
       });
     }
+
+    // Map result.failureKind to tracer enum. `tryLocatorEntry` returns
+    // 'not_found' | 'ambiguous' | 'error' | undefined.
+    const failureKind: 'not_found' | 'ambiguous' | 'error' =
+      (result.failureKind === 'ambiguous' ? 'ambiguous'
+      : result.failureKind === 'error' ? 'error'
+      : 'not_found');
+    safeTrace.attempt({
+      stepId: traceStepId,
+      attempt: attemptIdx,
+      strategy: entry.strategy,
+      value: entry.value.slice(0, 200),
+      confidence: entry.confidence,
+      timeoutMs: timeout,
+      success: false,
+      durationMs: attemptDur,
+      failureKind,
+      matchCount: result.failureKind === 'ambiguous'
+        ? (result.error?.match(/Ambiguous:\s*(\d+)/)?.[1] ? parseInt(result.error.match(/Ambiguous:\s*(\d+)/)![1], 10) : undefined)
+        : undefined,
+      error: result.error?.slice(0, 200),
+    });
 
     logger.debug('[COMPILED_EXECUTOR] Locator failed, trying next', {
       strategy: entry.strategy,

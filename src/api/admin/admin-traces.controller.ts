@@ -15,12 +15,24 @@ const MAX_PAGE_SIZE = 100;
 const BROWSER_TYPE_MAP: Record<string, string> = {
   'editor-trace': 'editor',
   'preview-run-trace': 'preview_run',
+  'lite-trace-log': 'lite',
+  'api-agent-trace': 'api_agent',
 };
 
 const TYPE_TO_BROWSER: Record<string, string> = {
   editor: 'editor-trace',
   preview_run: 'preview-run-trace',
+  lite: 'lite-trace-log',
+  api_agent: 'api-agent-trace',
 };
+
+/** All trace categories currently surfaced to the admin UI. */
+const ADMIN_VISIBLE_BROWSERS = [
+  'editor-trace',
+  'preview-run-trace',
+  'lite-trace-log',
+  'api-agent-trace',
+];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LIST ALL TRACES (admin — cross-user)
@@ -85,8 +97,10 @@ export const listAllTraces = async (req: Request, res: Response): Promise<void> 
       query = query.eq('browser', type);
     }
   } else {
-    // Only show editor/preview traces (not legacy playwright .zip traces)
-    query = query.in('browser', ['editor-trace', 'preview-run-trace']);
+    // Show every trace category we index in storage (editor, preview, lite,
+    // api-agent). Legacy playwright .zip traces live in a different bucket
+    // and are not surfaced here.
+    query = query.in('browser', ADMIN_VISIBLE_BROWSERS);
   }
 
   // Filter by userId (direct) or resolved from email search
@@ -204,9 +218,9 @@ export const getTraceEvents = async (req: Request, res: Response): Promise<void>
   ) {
     bucketName = 'lite-trace-logs';
   }
-  // Editor/preview traces are always JSONL → caught by .endsWith('.jsonl')
+  // Editor/preview/api-agent traces are always JSONL → caught by .endsWith('.jsonl')
   // But if somehow the filename doesn't end with .jsonl, check browser field
-  if (traceFile.browser === 'editor-trace' || traceFile.browser === 'preview-run-trace') {
+  if (ADMIN_VISIBLE_BROWSERS.includes(traceFile.browser)) {
     bucketName = 'lite-trace-logs';
   }
 

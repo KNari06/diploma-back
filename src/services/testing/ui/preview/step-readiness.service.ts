@@ -79,6 +79,77 @@ export interface LookaheadOptions {
    * likely needed that time to load data or render content.
    */
   recordedDelayMs?: number;
+  /**
+   * V15: Optional tracer for lookahead phase observability. When provided, each
+   * phase boundary emits a structured event — this is what lets operators answer
+   * "where did those 15 seconds go?" from the trace alone instead of combing
+   * through stdout. Callback shape matches EditorTraceService.writeLookahead* but
+   * we keep it structural here to avoid a circular import.
+   */
+  tracer?: LookaheadTracer;
+}
+
+/**
+ * V15: Lookahead tracer contract. Implement this (or pass the matching
+ * EditorTraceService methods) to get structured visibility into the
+ * inter-step wait. All methods are fire-and-forget — never throw.
+ */
+export interface LookaheadTracer {
+  start(data: {
+    nextStepId: string;
+    nextActionType: string;
+    prevActionType?: string;
+    prevUrl?: string;
+    maxWaitMs: number;
+    settleMs: number;
+    recordedDelayMs?: number;
+    plannedLocatorStrategies?: string[];
+  }): void;
+  phase(data: {
+    phase: string;
+    durationMs: number;
+    details?: Record<string, any>;
+    hardCapHit?: boolean;
+  }): void;
+  end(data: {
+    nextStepId: string;
+    ready: boolean;
+    totalDurationMs: number;
+    autoWaitApplied: boolean;
+    skipReason?: string;
+    navigationDetected?: boolean;
+    urlChanged?: boolean;
+    xhrInflightAtHandoff?: { count: number; urls: string[] };
+  }): void;
+  /** V15.1: Per-attempt diagnostic inside the retry loop. Optional (old callers compile). */
+  retryAttempt?(data: {
+    nextStepId: string;
+    attempt: number;
+    locatorCount: number;
+    perLocator: Array<{
+      index: number;
+      strategy?: string;
+      value?: string;
+      isVisible?: boolean;
+      isVisibleMs?: number;
+      isEnabled?: boolean;
+      isEnabledMs?: number;
+      count?: number;
+      countMs?: number;
+      hardCapHit?: boolean;
+      ready: boolean;
+    }>;
+    totalMs: number;
+    ready: boolean;
+  }): void;
+  /** V15.1: `pageSettle` timing between retry attempts. Optional. */
+  pageSettle?(data: {
+    context: 'retry_loop' | 'blind_settle' | 'post_nav';
+    budgetMs: number;
+    actualMs: number;
+    domStableThresholdMs: number;
+    budgetExhausted: boolean;
+  }): void;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1205,35 +1276,100 @@ function buildFastLocators(page: Page, step: IntentStep): Locator[] {
  * Uses ONLY fast Playwright checks — no LLM or AI.
  * Playwright's isVisible()/isEnabled()/count() are non-waiting and return instantly.
  */
+/**
+ * V15.1: Diagnostic payload for a single locator's precondition check. Exposed
+ * so the retry loop can emit per-locator events into the trace.
+ */
+interface PreconditionDiag {
+  ready: boolean;
+  isVisible?: boolean;
+  isVisibleMs?: number;
+  isEnabled?: boolean;
+  isEnabledMs?: number;
+  count?: number;
+  countMs?: number;
+  hardCapHit?: boolean;
+}
+
 async function checkPreconditionsSingle(
   locator: Locator,
-  actionType: IntentActionType
+  actionType: IntentActionType,
+  diag?: PreconditionDiag,
 ): Promise<boolean> {
+  // V15 CRITICAL FIX: Playwright's Locator.isVisible() / isEnabled() are NOT
+  // non-waiting when the locator doesn't match. They run actionability checks
+  // (including state polling) with the default actionTimeout (30s). A stale or
+  // mis-recorded compiled locator (e.g. getByLabel("Логин") on an Angular page
+  // where the label isn't wired to the input) will block here for a full 30s
+  // PER CALL — that's exactly the "retry_loop: 30011ms, attempts: 1" symptom
+  // we observed in the trace.
+  //
+  // Hard-cap every locator check at 500ms. Fail-open = "not ready" so the
+  // outer loop either retries (under budget) or exits cleanly (over budget).
+  // V15.1: Populate the `diag` object so callers can emit per-locator trace
+  // events (they measure ms so we can see which subcheck hit the cap).
+  const CHECK_CAP_MS = 500;
   try {
     if (NEEDS_VISIBLE_ENABLED.has(actionType)) {
+      const visStart = Date.now();
+      const enStart = Date.now();
       const [isVisible, isEnabled] = await Promise.all([
-        locator.isVisible(),
-        locator.isEnabled(),
+        withHardCap(() => locator.isVisible(), CHECK_CAP_MS, false),
+        withHardCap(() => locator.isEnabled(), CHECK_CAP_MS, false),
       ]);
-      return isVisible && isEnabled;
+      const visMs = Date.now() - visStart;
+      const enMs = Date.now() - enStart;
+      if (diag) {
+        diag.isVisible = isVisible;
+        diag.isVisibleMs = visMs;
+        diag.isEnabled = isEnabled;
+        diag.isEnabledMs = enMs;
+        // Heuristic: if either check pinned near the cap AND returned false,
+        // that's almost certainly a fail-open — a genuine false is instant.
+        diag.hardCapHit = (visMs >= CHECK_CAP_MS - 50 && !isVisible)
+          || (enMs >= CHECK_CAP_MS - 50 && !isEnabled);
+      }
+      const ready = isVisible && isEnabled;
+      if (diag) diag.ready = ready;
+      return ready;
     }
 
     if (NEEDS_VISIBLE_ONLY.has(actionType)) {
-      return await locator.isVisible();
+      const visStart = Date.now();
+      const isVisible = await withHardCap(() => locator.isVisible(), CHECK_CAP_MS, false);
+      const visMs = Date.now() - visStart;
+      if (diag) {
+        diag.isVisible = isVisible;
+        diag.isVisibleMs = visMs;
+        diag.hardCapHit = visMs >= CHECK_CAP_MS - 50 && !isVisible;
+        diag.ready = isVisible;
+      }
+      return isVisible;
     }
 
     if (NEEDS_ATTACHED_ONLY.has(actionType)) {
-      const count = await locator.count();
-      return count > 0;
+      const countStart = Date.now();
+      const count = await withHardCap(() => locator.count(), CHECK_CAP_MS, 0);
+      const countMs = Date.now() - countStart;
+      const ready = count > 0;
+      if (diag) {
+        diag.count = count;
+        diag.countMs = countMs;
+        diag.hardCapHit = countMs >= CHECK_CAP_MS - 50 && count === 0;
+        diag.ready = ready;
+      }
+      return ready;
     }
 
     // Unknown action type — assume ready
+    if (diag) diag.ready = true;
     return true;
   } catch (error) {
     logger.debug('[STEP_READINESS] Precondition check failed', {
       actionType,
       error: error instanceof Error ? error.message : String(error),
     });
+    if (diag) diag.ready = false;
     return false;
   }
 }
@@ -1246,11 +1382,13 @@ async function checkPreconditionsSingle(
  */
 async function checkPreconditions(
   locators: Locator[],
-  actionType: IntentActionType
+  actionType: IntentActionType,
+  /** V15.1: Optional per-locator diagnostic buckets (same order as `locators`). */
+  diagBuckets?: PreconditionDiag[],
 ): Promise<boolean> {
-  // Check all locators in parallel (isVisible/isEnabled are instant)
+  // Check all locators in parallel (each call internally hard-capped at 500ms).
   const results = await Promise.all(
-    locators.map(loc => checkPreconditionsSingle(loc, actionType))
+    locators.map((loc, i) => checkPreconditionsSingle(loc, actionType, diagBuckets?.[i]))
   );
   return results.some(r => r);
 }
@@ -1292,7 +1430,30 @@ export async function waitForStepReadiness(
     prevActionType,
     prevUrl,
     recordedDelayMs,
+    tracer,
   } = options;
+
+  // V15: All tracer calls go through this safe wrapper — a broken tracer must
+  // never take down the step pipeline.
+  const trace = {
+    start: (data: Parameters<LookaheadTracer['start']>[0]) => {
+      try { tracer?.start(data); } catch { /* non-fatal */ }
+    },
+    phase: (data: Parameters<LookaheadTracer['phase']>[0]) => {
+      try { tracer?.phase(data); } catch { /* non-fatal */ }
+    },
+    end: (data: Parameters<LookaheadTracer['end']>[0]) => {
+      try { tracer?.end(data); } catch { /* non-fatal */ }
+    },
+    // V15.1: Extra-detailed events. Guarded with `?.` because old callers may
+    // implement only the original 3 methods.
+    retryAttempt: (data: NonNullable<Parameters<NonNullable<LookaheadTracer['retryAttempt']>>[0]>) => {
+      try { tracer?.retryAttempt?.(data); } catch { /* non-fatal */ }
+    },
+    pageSettle: (data: NonNullable<Parameters<NonNullable<LookaheadTracer['pageSettle']>>[0]>) => {
+      try { tracer?.pageSettle?.(data); } catch { /* non-fatal */ }
+    },
+  };
 
   // Dynamic DOM stability threshold based on prev action risk
   const domStableThresholdMs = getDomStableThresholdMs(prevActionType, domStableOverride);
@@ -1323,6 +1484,21 @@ export async function waitForStepReadiness(
     return { ready: true, waited: 0, autoWaitApplied: false, skipReason: `Non-targeting action: ${nextStep.type}` };
   }
 
+  // V15: tracer start — emits structured lookahead opening so all subsequent
+  // phase events can be correlated to this step.
+  const plannedStrategies = (nextStep.compiled?.locatorPlan ?? [])
+    .map(e => e.strategy);
+  trace.start({
+    nextStepId: nextStep.id,
+    nextActionType: nextStep.type,
+    prevActionType,
+    prevUrl,
+    maxWaitMs,
+    settleMs,
+    recordedDelayMs,
+    plannedLocatorStrategies: plannedStrategies.length ? plannedStrategies : undefined,
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // V15 Phase 0: Challenge / interstitial detection (Cloudflare, reCAPTCHA, etc.)
   // If we're currently on a challenge page, waiting for the next step's elements
@@ -1331,7 +1507,13 @@ export async function waitForStepReadiness(
   // Budget: up to 7s (challenges typically take 3-5s).
   // ─────────────────────────────────────────────────────────────────────────
 
+  const challengeStart = Date.now();
   const challenge = await detectChallengePage(page);
+  trace.phase({
+    phase: 'challenge_detection',
+    durationMs: Date.now() - challengeStart,
+    details: { detected: challenge.detected, kind: challenge.kind },
+  });
   if (challenge.detected) {
     const challengeUrl = page.url();
     const challengeBudget = Math.min(7000, maxWaitMs - (Date.now() - startTime));
@@ -1342,14 +1524,22 @@ export async function waitForStepReadiness(
       budget: challengeBudget,
     });
     if (challengeBudget > 300) {
+      const waitStart = Date.now();
       const redirected = await detectSpaNavigation(page, challengeUrl, challengeBudget);
-      const waited = Date.now() - startTime;
       if (redirected) {
         // Landed on a new URL — give DOM a brief settle, then let Phase 3 / the
         // step's own locator strategy handle the real target.
         try {
           await page.waitForLoadState('domcontentloaded', { timeout: 1500 });
         } catch { /* non-fatal */ }
+      }
+      trace.phase({
+        phase: 'challenge_wait',
+        durationMs: Date.now() - waitStart,
+        details: { kind: challenge.kind, redirected, newUrl: page.url() },
+      });
+      const waited = Date.now() - startTime;
+      if (redirected) {
         logger.info('[STEP_READINESS] Challenge cleared — proceeding to next step', {
           stepId: nextStep.id,
           newUrl: page.url(),
@@ -1362,7 +1552,7 @@ export async function waitForStepReadiness(
           waited,
         });
       }
-      return {
+      const result = {
         ready: redirected,
         waited,
         autoWaitApplied: waited > autoWaitThresholdMs,
@@ -1370,6 +1560,16 @@ export async function waitForStepReadiness(
         urlChanged: redirected,
         skipReason: redirected ? undefined : `Challenge page (${challenge.kind}) did not clear`,
       };
+      trace.end({
+        nextStepId: nextStep.id,
+        ready: result.ready,
+        totalDurationMs: waited,
+        autoWaitApplied: result.autoWaitApplied,
+        skipReason: result.skipReason,
+        navigationDetected: result.navigationDetected,
+        urlChanged: result.urlChanged,
+      });
+      return result;
     }
   }
 
@@ -1386,7 +1586,13 @@ export async function waitForStepReadiness(
     const spaWaitMs = Math.min(SPA_NAV_DETECT_MS, remainingMs);
 
     if (spaWaitMs > 0) {
+      const spaStart = Date.now();
       navigationDetected = await detectSpaNavigation(page, prevUrl, spaWaitMs);
+      trace.phase({
+        phase: 'spa_nav_detection',
+        durationMs: Date.now() - spaStart,
+        details: { budgetMs: spaWaitMs, detected: navigationDetected, prevUrl },
+      });
 
       if (navigationDetected) {
         // Navigation happened → wait for DOM to be ready (not networkIdle — images/fonts irrelevant).
@@ -1394,15 +1600,22 @@ export async function waitForStepReadiness(
         const postNavMs = Math.min(settleMs, maxWaitMs - (Date.now() - startTime));
         if (postNavMs > 0) {
           logger.debug('[STEP_READINESS] Post-navigation DOM settle', { postNavMs });
+          const settleStart = Date.now();
+          let dceFired = true;
           try {
             await page.waitForLoadState('domcontentloaded', { timeout: postNavMs });
           } catch {
-            // Timeout acceptable — DOM may still be usable
+            dceFired = false; // Timeout acceptable — DOM may still be usable
           }
           const remainingAfterDce = Math.min(postNavMs, maxWaitMs - (Date.now() - startTime));
           if (remainingAfterDce > 0) {
             await waitForDOMStable(page, remainingAfterDce, domStableThresholdMs);
           }
+          trace.phase({
+            phase: 'post_nav_settle',
+            durationMs: Date.now() - settleStart,
+            details: { budgetMs: postNavMs, domcontentloadedFired: dceFired },
+          });
         }
       }
     }
@@ -1424,9 +1637,21 @@ export async function waitForStepReadiness(
   let readinessChecks: ReadinessCheckResult | undefined;
   const remainingForReadiness = maxWaitMs - (Date.now() - startTime);
   if (remainingForReadiness > 500) {
+    const checkStart = Date.now();
     readinessChecks = await comprehensiveReadinessCheck(
       page, locators, nextStep.type, remainingForReadiness
     );
+    trace.phase({
+      phase: 'page_readiness',
+      durationMs: Date.now() - checkStart,
+      details: {
+        loadingCleared: readinessChecks.loadingCleared,
+        iframeReady: readinessChecks.iframeReady,
+        animationDone: readinessChecks.animationDone,
+        elementEnabled: readinessChecks.elementEnabled,
+        overlayClear: readinessChecks.overlayClear,
+      },
+    });
 
     const anyBlocked = !readinessChecks.loadingCleared || !readinessChecks.apiIdle
       || !readinessChecks.elementEnabled || !readinessChecks.iframeReady;
@@ -1446,10 +1671,16 @@ export async function waitForStepReadiness(
       hasEvidence: !!nextStep.evidence?.lastSuccessRef,
     });
 
+    const blindStart = Date.now();
     await blindSettle(page, domStableThresholdMs);
+    trace.phase({
+      phase: 'blind_settle',
+      durationMs: Date.now() - blindStart,
+      details: { hasCompiled: !!nextStep.compiled, hasEvidence: !!nextStep.evidence?.lastSuccessRef },
+    });
 
     const waited = Date.now() - startTime;
-    return {
+    const result = {
       ready: true, // We don't know, but we waited — let executor try
       waited,
       autoWaitApplied: waited > autoWaitThresholdMs,
@@ -1458,6 +1689,16 @@ export async function waitForStepReadiness(
       readinessChecks,
       urlChanged: navigationDetected,
     };
+    trace.end({
+      nextStepId: nextStep.id,
+      ready: result.ready,
+      totalDurationMs: waited,
+      autoWaitApplied: result.autoWaitApplied,
+      skipReason: result.skipReason,
+      navigationDetected: result.navigationDetected,
+      urlChanged: result.urlChanged,
+    });
+    return result;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1477,6 +1718,7 @@ export async function waitForStepReadiness(
 
   let attempt = 0;
   let ready = false;
+  const retryLoopStart = Date.now();
 
   while (attempt <= maxRetries) {
     const elapsed = Date.now() - startTime;
@@ -1491,10 +1733,48 @@ export async function waitForStepReadiness(
       break;
     }
 
-    ready = await checkPreconditions(locators, nextStep.type);
+    const attemptStart = Date.now();
+    // V15.1: Collect per-locator diagnostics so the trace shows WHICH locator
+    // and WHICH sub-check (visible/enabled) burned the time. Without this the
+    // retry_loop event shows only `attempts: 1, durationMs: 30011` and we have
+    // no way to know if it was locator[0] or locator[1] that stalled.
+    const diagBuckets: PreconditionDiag[] = locators.map(() => ({ ready: false }));
+    ready = await checkPreconditions(locators, nextStep.type, diagBuckets);
+    const attemptDur = Date.now() - attemptStart;
+
+    // Emit per-attempt diagnostic. Reference the compiled plan entries (if any)
+    // so the consumer can correlate "locator index 0 / strategy=label" — this is
+    // what makes it obvious a stale `getByLabel("Логин")` was the 30s culprit.
+    //
+    // V15.1: Cap perLocator array at 5 entries. On steps with large compiled
+    // plans (10+ locators × 3-5 retry attempts = 30-50 perLocator arrays per
+    // step) the trace would bloat unnecessarily — the first few locators
+    // dominate the timing signal, slow ones show up in the hardCapHit flag.
+    const PER_LOCATOR_CAP = 5;
+    const planEntries = (nextStep.compiled?.locatorPlan ?? []).filter(e => e.strategy !== 'ref');
+    const perLocator = diagBuckets.slice(0, PER_LOCATOR_CAP).map((d, i) => ({
+      index: i,
+      strategy: planEntries[i]?.strategy,
+      value: planEntries[i]?.value?.slice(0, 80),
+      ...d,
+    }));
+    trace.retryAttempt({
+      nextStepId: nextStep.id,
+      attempt: attempt + 1,
+      locatorCount: locators.length,
+      perLocator,
+      totalMs: attemptDur,
+      ready,
+    });
 
     if (ready) {
       const waited = Date.now() - startTime;
+
+      trace.phase({
+        phase: 'retry_loop',
+        durationMs: Date.now() - retryLoopStart,
+        details: { attempts: attempt + 1, finalState: 'ready', lastAttemptMs: attemptDur },
+      });
 
       // V14: Inter-step delay enforcement — if user waited longer during recording,
       // the page likely needs that time (lazy-loaded data, slow API, debounced render).
@@ -1510,6 +1790,11 @@ export async function waitForStepReadiness(
             additionalWaitMs: remaining,
           });
           await new Promise(r => setTimeout(r, remaining));
+          trace.phase({
+            phase: 'recording_delay_enforced',
+            durationMs: remaining,
+            details: { recordedDelayMs, minWaitFromRecording },
+          });
         }
       }
 
@@ -1519,7 +1804,7 @@ export async function waitForStepReadiness(
         waited: totalWaited,
         attempts: attempt,
       });
-      return {
+      const result = {
         ready: true,
         waited: totalWaited,
         autoWaitApplied: totalWaited > autoWaitThresholdMs,
@@ -1527,6 +1812,15 @@ export async function waitForStepReadiness(
         readinessChecks,
         urlChanged: navigationDetected,
       };
+      trace.end({
+        nextStepId: nextStep.id,
+        ready: result.ready,
+        totalDurationMs: totalWaited,
+        autoWaitApplied: result.autoWaitApplied,
+        navigationDetected: result.navigationDetected,
+        urlChanged: result.urlChanged,
+      });
+      return result;
     }
 
     // Element not ready — apply page settle with dynamic threshold and retry
@@ -1541,11 +1835,31 @@ export async function waitForStepReadiness(
     const thisSettleMs = Math.min(settleMs, remainingTime);
 
     if (thisSettleMs > 0) {
+      // V15.1: Measure the settle so a runaway-mutating SPA (never goes quiet)
+      // can be spotted. `budgetExhausted` = we hit the cap without the observer
+      // reporting DOM-quiet, meaning the page kept mutating.
+      const settleStart = Date.now();
       await pageSettle(page, thisSettleMs, domStableThresholdMs);
+      const settleActual = Date.now() - settleStart;
+      trace.pageSettle({
+        context: 'retry_loop',
+        budgetMs: thisSettleMs,
+        actualMs: settleActual,
+        domStableThresholdMs,
+        // Settle returns when quiet is observed OR budget expires. If we used
+        // ≥90% of budget, the observer never saw quiet.
+        budgetExhausted: settleActual >= thisSettleMs * 0.9,
+      });
     }
 
     attempt++;
   }
+
+  trace.phase({
+    phase: 'retry_loop',
+    durationMs: Date.now() - retryLoopStart,
+    details: { attempts: attempt, finalState: ready ? 'ready' : 'timeout' },
+  });
 
   // ─────────────────────────────────────────────────────────────────────────
   // Final result (element still not ready after all retries)
@@ -1562,7 +1876,7 @@ export async function waitForStepReadiness(
     navigationDetected,
   });
 
-  return {
+  const result = {
     ready,
     waited,
     autoWaitApplied: waited > autoWaitThresholdMs,
@@ -1570,6 +1884,15 @@ export async function waitForStepReadiness(
     readinessChecks,
     urlChanged: navigationDetected,
   };
+  trace.end({
+    nextStepId: nextStep.id,
+    ready: result.ready,
+    totalDurationMs: waited,
+    autoWaitApplied: result.autoWaitApplied,
+    navigationDetected: result.navigationDetected,
+    urlChanged: result.urlChanged,
+  });
+  return result;
 }
 
 /**

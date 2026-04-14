@@ -687,20 +687,44 @@ export class IntentStepLintService {
           // Semantic validation: check that the cached node's label/name still matches
           // the step description. Refs can get reassigned after page navigation (counter resets),
           // so the same ref might point to a completely different element.
+          //
+          // V15.2 CRITICAL FIX: Previously this check ran ONLY when `bindingHints` had
+          // values. If a step had description="IT бөлімі" but no bindingHints (common
+          // for steps captured via natural-language entry rather than DOM inspection),
+          // the check was SKIPPED — and a stale ref that pointed at a completely
+          // different element (e.g. "Менің тапсырмаларым 0") was accepted as a cache
+          // hit. The click then targeted the wrong element yet reported success,
+          // producing the "false passed" symptom we observed in the JUZ40 trace.
+          //
+          // Fix: use description as a fallback source of truth when bindingHints are
+          // absent/empty. The same substring-either-way match is applied.
           let semanticMismatch = false;
-          if (compat.ok && stepDraft.bindingHints) {
+          if (compat.ok) {
             const hints = stepDraft.bindingHints;
             const nodeTexts = [
               cachedNode.labelText, cachedNode.ariaLabel, cachedNode.name,
               cachedNode.placeholder, cachedNode.text,
-            ].filter(Boolean).map(t => t!.toLowerCase());
+            ].filter(Boolean).map(t => t!.toLowerCase().trim()).filter(t => t.length > 0);
 
-            // Check if ANY hint matches ANY node text
-            const hintValues = [hints.label, hints.nearText, hints.autocomplete]
-              .filter(Boolean).map(t => t!.toLowerCase());
+            // Collect expected phrases: bindingHints first, then fall back to description.
+            // We keep description as a secondary signal only (hints are more precise when
+            // available) but ALWAYS include it so the check runs even without hints.
+            const hintValues = [hints?.label, hints?.nearText, hints?.autocomplete]
+              .filter(Boolean).map(t => t!.toLowerCase().trim())
+              .filter(t => t.length >= 2); // ignore empty / 1-char noise
+            const descriptionTokens: string[] = [];
+            const desc = stepDraft.description?.toLowerCase().trim();
+            if (desc && desc.length >= 2) descriptionTokens.push(desc);
 
-            if (hintValues.length > 0 && nodeTexts.length > 0) {
-              const hasMatch = hintValues.some(h =>
+            // Use hints when we have them (more precise); otherwise description.
+            // If neither has any usable token, skip the check (nothing to compare).
+            const phrasesToMatch = hintValues.length > 0 ? hintValues : descriptionTokens;
+
+            if (phrasesToMatch.length > 0 && nodeTexts.length > 0) {
+              // Match is loose: any phrase substring either-way against any node text.
+              // This tolerates minor differences (e.g. "IT бөлімі" vs "IT Бөлімі") but
+              // still catches a hard mismatch like "it бөлімі" vs "Менің тапсырмаларым 0".
+              const hasMatch = phrasesToMatch.some(h =>
                 nodeTexts.some(n => n.includes(h) || h.includes(n))
               );
               if (!hasMatch) {
@@ -708,7 +732,8 @@ export class IntentStepLintService {
                 logger.info('[INTENT_LINT] Evidence shortcut semantic mismatch — ref may have shifted', {
                   previewSessionId,
                   cachedRef,
-                  hints: hintValues.slice(0, 3),
+                  usedSource: hintValues.length > 0 ? 'bindingHints' : 'description',
+                  phrases: phrasesToMatch.slice(0, 3),
                   nodeTexts: nodeTexts.slice(0, 3),
                   stepDescription: stepDraft.description?.slice(0, 50),
                 });

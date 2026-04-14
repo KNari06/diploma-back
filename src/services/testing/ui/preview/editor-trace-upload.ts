@@ -9,6 +9,7 @@ import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import type { TraceType } from '@/services/storage/test-artifacts-storage.service';
 
 interface UploadEditorTraceParams {
   filePath: string;
@@ -17,6 +18,16 @@ interface UploadEditorTraceParams {
   traceType: 'editor' | 'preview_run' | 'draft_run';
   intentTestCaseId?: string;
 }
+
+/**
+ * Map the caller-facing traceType (kept snake_case for frontend compatibility)
+ * to the storage-layer TraceType (dash-free enum used for path prefixing).
+ */
+const TRACE_TYPE_FOR_STORAGE: Record<UploadEditorTraceParams['traceType'], TraceType> = {
+  editor: 'editor',
+  preview_run: 'preview',
+  draft_run: 'draft',
+};
 
 const TAG = '[EDITOR_TRACE_UPLOAD]';
 
@@ -58,12 +69,12 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
       deleteLiteTraceLogFromStorage,
     } = await import('@/services/storage/test-artifacts-storage.service');
 
-    const fileName = path.basename(filePath);
+    const originalFileName = path.basename(filePath);
 
     logger.info(`${TAG} Uploading trace`, {
       previewSessionId,
       traceType,
-      fileName,
+      fileName: originalFileName,
       fileSize: `${Math.round(fileSize / 1024)}KB`,
     });
 
@@ -97,7 +108,13 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
       // Non-fatal — summary will be null
     }
 
-    const uploadResult = await uploadLiteTraceLogToStorage(filePath, userId, fileName);
+    const storageTraceType = TRACE_TYPE_FOR_STORAGE[traceType];
+    const uploadResult = await uploadLiteTraceLogToStorage(
+      filePath,
+      userId,
+      originalFileName,
+      storageTraceType,
+    );
 
     // trace_files.test_id has a FK on tests(id); intent_test_cases rows live
     // in a different table, so we never put an intentTestCaseId there.
@@ -112,7 +129,7 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
         userId,
         testId: null,
         intentTestCaseId: resolvedIntentTestCaseId,
-        fileName,
+        fileName: uploadResult.fileName,
         storagePath: uploadResult.storagePath,
         fileSize: uploadResult.fileSize,
         browser: traceType === 'editor' ? 'editor-trace' : 'preview-run-trace',

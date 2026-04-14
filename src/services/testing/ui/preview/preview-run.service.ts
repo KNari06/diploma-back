@@ -1007,6 +1007,57 @@ export class PreviewRunService {
           },
         });
 
+        // V15: Lightweight page state snapshot for the editor trace — answers
+        // "what state was the page in when this step started?" without needing
+        // to reproduce the session. Fire-and-forget, capped at 200ms hard timeout.
+        void (async () => {
+          try {
+            const stateEditorTrace = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+            if (!stateEditorTrace) return;
+            const stateProbe = await Promise.race([
+              session.page.evaluate(() => {
+                // @ts-expect-error - browser context
+                const doc = document;
+                // @ts-expect-error - browser context
+                const win = window;
+                const keys = Object.keys(doc.documentElement || {}).join(' ');
+                const bodyKeys = doc.body ? Object.keys(doc.body).join(' ') : '';
+                return {
+                  readyState: doc.readyState,
+                  title: (doc.title || '').slice(0, 120),
+                  bodyTextLength: (doc.body?.innerText || '').length,
+                  interactiveElementCount: doc.querySelectorAll(
+                    'a, button, input, textarea, select, [role="button"], [role="link"], [tabindex]'
+                  ).length,
+                  frameworks: {
+                    react: keys.includes('__reactFiber') || bodyKeys.includes('__reactFiber') || !!(win as any).React,
+                    angular: !!(win as any).getAllAngularRootElements || !!(win as any).ng || !!(doc.querySelector('[ng-version]')),
+                    vue: !!(win as any).Vue || !!(win as any).__VUE__,
+                    alpine: !!(win as any).Alpine,
+                    htmx: !!(win as any).htmx,
+                    svelte: !!(win as any).__svelte,
+                  },
+                  // @ts-expect-error - navigator exists in browser context
+                  hasServiceWorker: !!navigator?.serviceWorker?.controller,
+                };
+              }),
+              new Promise<null>(resolve => setTimeout(() => resolve(null), 200)),
+            ]);
+            if (!stateProbe) return;
+            stateEditorTrace.writePageState({
+              stepId: step.id,
+              when: 'step_start',
+              url: session.page.url(),
+              title: stateProbe.title,
+              readyState: stateProbe.readyState,
+              bodyTextLength: stateProbe.bodyTextLength,
+              interactiveElementCount: stateProbe.interactiveElementCount,
+              frameworks: stateProbe.frameworks,
+              hasServiceWorker: stateProbe.hasServiceWorker,
+            });
+          } catch { /* non-fatal diagnostic */ }
+        })();
+
         // Emit step running
         webSocketService.emitToUser(userId, 'preview:run:step', {
           previewSessionId,
@@ -1298,6 +1349,45 @@ export class PreviewRunService {
               const nextStep = stepsToExecute[i + 1];
               try {
                 const adaptiveSettle = getAdaptiveSettleMs(step.type);
+                // V15: Route lookahead phase events into the editor trace so the
+                // inter-step gap is observable in the JSONL trace file instead of stdout only.
+                // V15: Get editor trace safely — a failed import must not kill the lookahead.
+                // The tracer is advisory observability; if unavailable, we just skip trace emission.
+                let lookaheadTracer: any = undefined;
+                let editorTraceForGap: any = null;
+                try {
+                  editorTraceForGap = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+                  if (editorTraceForGap) {
+                    lookaheadTracer = {
+                      start: editorTraceForGap.writeLookaheadStart.bind(editorTraceForGap),
+                      phase: editorTraceForGap.writeLookaheadPhase.bind(editorTraceForGap),
+                      end: editorTraceForGap.writeLookaheadEnd.bind(editorTraceForGap),
+                      // V15.1: extra methods surface what happens inside retry_loop
+                      retryAttempt: editorTraceForGap.writeRetryAttempt.bind(editorTraceForGap),
+                      pageSettle: editorTraceForGap.writePageSettle.bind(editorTraceForGap),
+                    };
+                  }
+                } catch { /* non-fatal */ }
+
+                // V15.1: Emit an inter-step-gap event BEFORE starting lookahead.
+                // `stepStartMs` is when step N began; `Date.now()` is right before
+                // lookahead for N+1. Subtracting gives us (step exec ms + housekeeping
+                // between steps). We don't have a separate post-action timestamp yet,
+                // so we use stepDurationMs which preview-run already tracks.
+                try {
+                  if (editorTraceForGap) {
+                    editorTraceForGap.writeInterStepGap({
+                      prevStepId: step.id,
+                      nextStepId: nextStep.id,
+                      // Rough: time from step_start to now minus the actual step duration.
+                      // A positive gap = post-step housekeeping (settle, collect, trace upload).
+                      gapMs: Math.max(0, (Date.now() - stepStartMs) - stepDurationMs),
+                      accountedFor: [
+                        result.urlChanged ? 'page_summary_collect' : undefined,
+                      ].filter(Boolean) as string[],
+                    });
+                  }
+                } catch { /* non-fatal */ }
                 const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
                   maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
                   settleMs: adaptiveSettle,
@@ -1305,6 +1395,7 @@ export class PreviewRunService {
                   prevActionType: step.type,
                   prevUrl: trackedUrl,
                   recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                  tracer: lookaheadTracer,
                 }), signal);
 
                 // Track actual settle time per action category for adaptive threshold
