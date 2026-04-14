@@ -352,6 +352,54 @@ const ANIMATION_WAIT_TIMEOUT_MS = 1500;
 const OVERLAY_WAIT_TIMEOUT_MS = 1500;
 /** Max time to wait for iframe to load */
 const IFRAME_LOAD_TIMEOUT_MS = 2000;
+/**
+ * V15: Hard cap on a single locator.evaluate() / page.evaluate() inside the readiness
+ * pipeline. Playwright's default actionTimeout (30s) can fire twice in a row
+ * (animationComplete + isDisabledOrInert) when a compiled-plan locator does not
+ * match after SPA navigation — producing the observed 60s stall between steps.
+ * This cap guarantees the readiness check itself never exceeds its own budget,
+ * regardless of global actionTimeout settings.
+ */
+const EVALUATE_HARD_CAP_MS = 500;
+
+/**
+ * V15: Race any async operation against a short deadline. Used to cap
+ * locator.evaluate() / page.evaluate() inside the readiness check so a
+ * non-matching locator can never monopolize the inter-step budget.
+ * On timeout, resolves with the provided `onTimeout` value (fail-open).
+ */
+async function withHardCap<T>(
+  op: () => Promise<T>,
+  capMs: number,
+  onTimeout: T,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      op(),
+      new Promise<T>(resolve => {
+        timer = setTimeout(() => resolve(onTimeout), capMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * V15: Quick "is this locator actually in the DOM right now?" check.
+ * Uses locator.count() which is non-waiting in Playwright. Wrapped in a hard cap
+ * because count() can still block during CDP roundtrips on a busy page.
+ * Returns false on any failure — callers use this as a skip gate, not a signal.
+ */
+async function isLocatorAttachedFast(locator: Locator): Promise<boolean> {
+  try {
+    const count = await withHardCap(() => locator.count(), 250, -1);
+    return count > 0;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Check for loading indicators on the page (spinners, skeletons, aria-busy, progressbar).
@@ -369,7 +417,9 @@ const IFRAME_LOAD_TIMEOUT_MS = 2000;
  */
 async function hasLoadingIndicators(page: Page): Promise<boolean> {
   try {
-    return await page.evaluate(() => {
+    // V15: Hard-cap — page.evaluate can stall during SPA bootstrap/hydration
+    // when Angular/React has not yet yielded the main thread. Fail-open = "no loader".
+    return await withHardCap(() => page.evaluate(() => {
       // @ts-expect-error - browser context
       const doc = document;
       // @ts-expect-error - browser context
@@ -436,7 +486,7 @@ async function hasLoadingIndicators(page: Page): Promise<boolean> {
       if (testIdLoading && isReallyVisible(testIdLoading)) return true;
 
       return false;
-    });
+    }), EVALUATE_HARD_CAP_MS, false);
   } catch {
     return false; // Page navigating or closed
   }
@@ -570,7 +620,10 @@ async function waitForElementAnimationComplete(
 
   while (Date.now() < deadline) {
     try {
-      const isAnimating = await locator.evaluate((el) => {
+      // V15: Hard-cap locator.evaluate — Playwright's default actionTimeout (30s)
+      // kicks in when the locator doesn't match, which alone is longer than this
+      // function's entire budget. Fail-open on timeout = "assume not animating".
+      const isAnimating = await withHardCap(() => locator.evaluate((el) => {
         // @ts-expect-error - browser context
         const win = window;
         const style = win.getComputedStyle(el);
@@ -604,7 +657,7 @@ async function waitForElementAnimationComplete(
         }
 
         return false;
-      });
+      }), EVALUATE_HARD_CAP_MS, false);
 
       if (!isAnimating) return;
     } catch {
@@ -626,7 +679,9 @@ async function waitForElementAnimationComplete(
  */
 async function isElementObstructed(locator: Locator, page: Page): Promise<boolean> {
   try {
-    const box = await locator.boundingBox();
+    // V15: boundingBox() waits for locator to be visible (up to default actionTimeout).
+    // Hard-cap it so a stale ref can't eat 30s. Null return = no bbox = skip check.
+    const box = await withHardCap(() => locator.boundingBox(), EVALUATE_HARD_CAP_MS, null);
     if (!box) return false; // No bounding box → can't check
 
     const centerX = box.x + box.width / 2;
@@ -634,10 +689,15 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
 
     // Set marker to identify target
     const marker = `__sr_overlay_${Date.now()}`;
-    await locator.evaluate((el, attr) => el.setAttribute(attr, '1'), marker);
+    const attrSet = await withHardCap(
+      () => locator.evaluate((el, attr) => el.setAttribute(attr, '1'), marker).then(() => true),
+      EVALUATE_HARD_CAP_MS,
+      false,
+    );
+    if (!attrSet) return false; // Can't tag element → skip obstruction check
 
     try {
-      const obstructed = await page.evaluate(
+      const obstructed = await withHardCap(() => page.evaluate(
         ({ x, y, attr }: { x: number; y: number; attr: string }) => {
           // @ts-ignore - browser context
           const hitEl = document.elementFromPoint(x, y);
@@ -646,10 +706,15 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
           return hitEl.closest(`[${attr}]`) === null;
         },
         { x: centerX, y: centerY, attr: marker }
-      );
+      ), EVALUATE_HARD_CAP_MS, false);
       return obstructed;
     } finally {
-      await locator.evaluate((el, attr) => el.removeAttribute(attr), marker).catch(() => {});
+      // Best-effort cleanup — don't block on it
+      withHardCap(
+        () => locator.evaluate((el, attr) => el.removeAttribute(attr), marker),
+        EVALUATE_HARD_CAP_MS,
+        undefined,
+      ).catch(() => {});
     }
   } catch {
     return false; // Can't check → assume not obstructed
@@ -663,7 +728,10 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
  */
 async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
   try {
-    return await locator.evaluate((el: any) => {
+    // V15: Hard-cap the evaluate. If the locator doesn't match (stale ref, compiled
+    // plan miss, SPA mid-hydration), Playwright would otherwise wait 30s for it to
+    // appear — blowing the whole readiness budget. Fail-open on timeout = "assume enabled".
+    return await withHardCap(() => locator.evaluate((el: any) => {
       if (el.disabled === true) return true;
       if (el.getAttribute('aria-disabled') === 'true') return true;
       if (el.readOnly === true && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return true;
@@ -679,7 +747,7 @@ async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
         if (style.pointerEvents === 'none') return true;
       }
       return false;
-    });
+    }), EVALUATE_HARD_CAP_MS, false);
   } catch {
     return false;
   }
@@ -708,7 +776,9 @@ async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
-      const allReady = await page.evaluate(() => {
+      // V15: Hard-cap — same reasoning as hasLoadingIndicators. Fail-open = "ready"
+      // so the outer loop exits and the caller continues.
+      const allReady = await withHardCap(() => page.evaluate(() => {
         // @ts-expect-error - browser context
         const iframes = document.querySelectorAll('iframe:not([aria-hidden="true"])');
         for (const iframe of iframes) {
@@ -724,7 +794,7 @@ async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise
           }
         }
         return true;
-      });
+      }), EVALUATE_HARD_CAP_MS, true);
 
       if (allReady) return;
       await new Promise(r => setTimeout(r, 300));
@@ -788,16 +858,45 @@ async function comprehensiveReadinessCheck(
     overlayClear: true, elementEnabled: true, iframeReady: true,
   };
 
-  // Phase 1: Page-level checks in parallel (loading + API idle + toast + iframe)
+  // Phase 1: Page-level checks in parallel (visible loaders + iframe)
   const needsFullReady = NEEDS_VISIBLE_ENABLED.has(actionType) || NEEDS_VISIBLE_ONLY.has(actionType);
 
+  // V15: Passive XHR observer — counts in-flight fetch/xhr for diagnostics only.
+  // NOT a blocker. Rationale: waiting for API idle proved to be redundant in practice:
+  //   - visible loaders / skeletons are caught by hasLoadingIndicators
+  //   - disabled forms are caught by isElementDisabledOrInert
+  //   - elements not yet rendered are caught by the Phase 3 retry loop (isVisible/isEnabled)
+  //   - Playwright's own .fill()/.click() actionability is the final safety net
+  // API-idle additionally has blind spots (cross-origin APIs, WebSocket, SSE) and false
+  // "immediately idle" states when the XHR fires *after* our check starts. We log what
+  // was in flight so regressions can be diagnosed, but do not wait on it.
+  const inflight = new Set<string>();
+  let pageOrigin = '';
+  try { pageOrigin = new URL(page.url()).origin; } catch { /* non-critical */ }
+  const onReq = (req: { resourceType: () => string; url: () => string }) => {
+    const type = req.resourceType();
+    if (type !== 'fetch' && type !== 'xhr') return;
+    const url = req.url();
+    // Same-origin only for signal — cross-origin observers add noise
+    if (pageOrigin) {
+      try { if (new URL(url).origin !== pageOrigin) return; } catch { return; }
+    }
+    inflight.add(url);
+  };
+  const onDone = (req: { url: () => string }) => { inflight.delete(req.url()); };
+  page.on('request', onReq);
+  page.on('requestfinished', onDone);
+  page.on('requestfailed', onDone);
+
+  try {
   if (needsFullReady) {
     const loadingTimeout = Math.min(LOADING_INDICATOR_TIMEOUT_MS, remainingMs);
-    const apiTimeout = Math.min(API_IDLE_TIMEOUT_MS, remainingMs);
     const iframeTimeout = Math.min(IFRAME_LOAD_TIMEOUT_MS, remainingMs);
 
     await Promise.allSettled([
-      // Loading indicators
+      // Visible loading indicators (spinners, skeletons, aria-busy, progressbar).
+      // This is the real signal that the page is still loading data — much more
+      // reliable than raw XHR counting, because it reflects UX state.
       hasLoadingIndicators(page).then(async (hasLoading) => {
         if (hasLoading) {
           logger.debug('[STEP_READINESS] Loading indicators detected, waiting...');
@@ -805,21 +904,25 @@ async function comprehensiveReadinessCheck(
           result.loadingCleared = !(await hasLoadingIndicators(page));
         }
       }),
-      // API idle
-      waitForApiIdle(page, apiTimeout).then(() => {
-        result.apiIdle = true;
-      }).catch(() => {
-        result.apiIdle = false;
-      }),
-      // Iframe readiness
+      // Iframe readiness (Stripe, reCAPTCHA, OAuth popups)
       waitForIframeContentReady(page, iframeTimeout).catch(() => {
         result.iframeReady = false;
       }),
     ]);
   }
 
+  // V15: Pre-check — is the target locator actually in the DOM right now?
+  // Compiled-plan label/placeholder locators often miss on a freshly navigated SPA
+  // page (Angular mid-hydration). If the locator isn't attached, animation/disabled/
+  // overlay checks on it would each pay Playwright's 30s action timeout, blowing
+  // the entire readiness budget. Skip element-level checks in that case — the outer
+  // retry loop in waitForStepReadiness will handle waiting for the element itself.
+  const targetAttached = locators.length > 0
+    ? await isLocatorAttachedFast(locators[0])
+    : false;
+
   // Phase 2: Target element animation (only if we have a locator and action needs interaction)
-  if (locators.length > 0 && NEEDS_VISIBLE_ENABLED.has(actionType)) {
+  if (targetAttached && NEEDS_VISIBLE_ENABLED.has(actionType)) {
     const animTimeout = Math.min(ANIMATION_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 1000));
     if (animTimeout > 200) {
       try {
@@ -833,7 +936,7 @@ async function comprehensiveReadinessCheck(
   // Phase 3: Element-level checks (disabled/inert + overlay)
   const clickLikeActions: Set<IntentActionType> = new Set(['click', 'dblclick', 'contextmenu', 'check', 'uncheck', 'toggle', 'open', 'close']);
 
-  if (locators.length > 0 && NEEDS_VISIBLE_ENABLED.has(actionType)) {
+  if (targetAttached && NEEDS_VISIBLE_ENABLED.has(actionType)) {
     // Check disabled/inert state (common: button disabled during form submission)
     const disabledTimeout = Math.min(3000, Math.max(0, remainingMs - 500));
     if (disabledTimeout > 200) {
@@ -847,7 +950,7 @@ async function comprehensiveReadinessCheck(
   }
 
   // Phase 4: Overlay obstruction (only for click-like actions)
-  if (locators.length > 0 && clickLikeActions.has(actionType)) {
+  if (targetAttached && clickLikeActions.has(actionType)) {
     const overlayTimeout = Math.min(OVERLAY_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 500));
     if (overlayTimeout > 200) {
       const obstructed = await isElementObstructed(locators[0], page);
@@ -859,7 +962,22 @@ async function comprehensiveReadinessCheck(
     }
   }
 
-  return result;
+    return result;
+  } finally {
+    // V15: Diagnostic log only — we do NOT wait on these. Surfaces slow APIs
+    // so regressions can be traced without blocking the step pipeline.
+    if (inflight.size > 0) {
+      logger.debug('[STEP_READINESS] XHR still in flight (not blocking)', {
+        count: inflight.size,
+        urls: Array.from(inflight).slice(0, 5),
+      });
+    }
+    try {
+      page.off('request', onReq);
+      page.off('requestfinished', onDone);
+      page.off('requestfailed', onDone);
+    } catch { /* page may be closed */ }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
