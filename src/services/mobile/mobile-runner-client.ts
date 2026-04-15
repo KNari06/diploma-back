@@ -300,6 +300,8 @@ export class MobileRunnerClient {
     elementType?: string;
     screenshot?: string;
     message?: string;
+    /** Compiled locator plan built from the resolved node — persist onto IntentStep. */
+    compiledPlan?: import('./mobile-runner.types').MobileCompiledPlan;
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       body: { intent, actionType },

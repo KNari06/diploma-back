@@ -33,6 +33,10 @@ export interface ClientToServerEvents {
   'preview:step:apply': (data: PreviewStepApplyRequest) => void;
   'preview:step:clarify:select': (data: PreviewClarifySelectRequest) => void;
 
+  // Mobile step operations (applies through the mobile runner over a WS round-trip
+  // instead of a REST call, so the frontend gets the same live-update semantics as web.)
+  'mobile:step:apply': (data: MobileStepApplyRequest) => void;
+
   // Preview run operations (V8: Run from start)
   'preview:run:start': (data: PreviewRunStartRequest) => void;
   'preview:run:cancel': (data: PreviewRunCancelRequest) => void;
@@ -157,6 +161,9 @@ export interface ServerToClientEvents {
   'preview:step:lint:result': (data: PreviewStepLintResultPayload) => void;
   'preview:step:apply:result': (data: PreviewStepApplyResultPayload) => void;
   'preview:step:clarify': (data: PreviewClarifyPayload) => void;
+
+  // Mobile apply result — mirrors preview:step:apply:result shape
+  'mobile:step:apply:result': (data: MobileStepApplyResultPayload) => void;
 
   // Preview run events (V8: Run from start)
   'preview:run:started': (data: PreviewRunStartedPayload) => void;
@@ -1134,6 +1141,41 @@ export interface PreviewStepApplyResultPayload {
   url?: string;
   highlight?: PreviewHighlight[];
   attempts?: number;
+  timestamp: string;
+}
+
+/**
+ * Mobile step apply request (WebSocket)
+ * Parallels PreviewStepApplyRequest but targets a mobile runner session instead of a
+ * browser preview session. Frontend emits `mobile:step:apply`, backend resolves via
+ * mobile-runner-client (lint-then-execute fast path with runSteps fallback), and
+ * replies with `mobile:step:apply:result`.
+ */
+export interface MobileStepApplyRequest {
+  mobileSessionId: string;
+  stepDraft: PreviewIntentStep;
+  /** Optional: auto-persist appliedStep to this test case after successful apply. */
+  intentTestCaseId?: string;
+}
+
+/**
+ * Mobile step apply result payload. Keeps web-parity so one UI code path can
+ * consume either preview:step:apply:result or mobile:step:apply:result.
+ */
+export interface MobileStepApplyResultPayload {
+  success: boolean;
+  error?: string;
+  appliedStep?: PreviewIntentStep;
+  stepResult?: {
+    success: boolean;
+    error?: string;
+    screenshot?: string;
+    resolvedVia?: string;
+    durationMs?: number;
+  };
+  status?: 'passed' | 'failed';
+  /** Echo of the mobile runner session ID so the frontend can match the result to its current session. */
+  mobileSessionId?: string;
   timestamp: string;
 }
 
