@@ -131,6 +131,13 @@ export const AI_TASK_MODELS = {
   // ── Services ──────────────────────────────────────────────────────────
   /** Test failure analysis */
   failureAnalysis: AI_MODELS.fast,
+  /**
+   * Retry gate — classifies test failures as infra (retryable) vs product-bug /
+   * test-issue (not retryable). Runs BEFORE a retry attempt to avoid wasted
+   * reruns that hide real bugs. Must be fast; 3s hard timeout.
+   * Uses Gemini 2.5 Flash for speed + native JSON mode.
+   */
+  retryClassification: 'gemini-2.5-flash' as const,
   /** Coverage analysis */
   coverageAnalysis: AI_MODELS.fast,
   /** Test recommendations */

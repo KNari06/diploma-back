@@ -12,6 +12,7 @@ import {
     sanitizeIntent,
 } from './element-resolver.service';
 import { EditorTraceService } from './editor-trace.service';
+import { evaluateEvidenceShortcut } from './evidence-shortcut.utils';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
     IntentStep,
@@ -641,87 +642,52 @@ export class IntentStepLintService {
 
     // ═══════════════════════════════════════════════════════════════════════════
     // V5: Evidence shortcut - try lastSuccessRef first (when caching is enabled)
+    // V15.7: TTL + URL + semantic checks were extracted to evidence-shortcut.utils.ts
+    // so preview and background share the same policy. Preview-specific bits
+    // (action-type compat via `isEvidenceShortcutNodeCompatible`, LintResult build,
+    // trace emission) stay here.
     // ═══════════════════════════════════════════════════════════════════════════
     const disableCaching = stepDraft.options?.disableCaching === true;
 
     if (!disableCaching && stepDraft.evidence?.lastSuccessRef) {
-      const cachedRef = stepDraft.evidence.lastSuccessRef;
+      const shortcut = evaluateEvidenceShortcut({
+        evidence: stepDraft.evidence,
+        domNodes,
+        currentUrl: snapshot.url,
+        description: stepDraft.description,
+        bindingHints: stepDraft.bindingHints,
+        compiledPageUrl: stepDraft.compiled?.context?.pageUrl,
+        actionType: stepDraft.type,
+      });
 
-      // P2 FIX: URL validation - bypass cache if page URL changed significantly
-      // This prevents reusing evidence from page A on page B (common in SPAs)
-      // Check both compiled.context.pageUrl and evidence.pageUrl (from recording)
-      // V13: Also bypass if NEITHER URL is available — we have zero evidence
-      // that the cached ref was generated on this page. Without a URL check,
-      // refs from page A silently match elements on page B.
-      let urlMismatch = false;
-      const evidenceUrl = stepDraft.compiled?.context?.pageUrl || stepDraft.evidence?.pageUrl;
-      if (!evidenceUrl) {
-        // No recorded URL at all — can't verify, treat as mismatch (safe default)
-        urlMismatch = true;
-        logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - no recorded URL to verify', {
+      if (!shortcut.ok) {
+        // Reason-specific logging preserved for operator diagnostics.
+        // `ttl_expired`/`url_mismatch`/`semantic_mismatch`/`node_disabled` promoted
+        // to info because they indicate real drift we want to see; the rest stay at debug.
+        const level = (shortcut.reason === 'ttl_expired'
+          || shortcut.reason === 'url_mismatch'
+          || shortcut.reason === 'semantic_mismatch'
+          || shortcut.reason === 'node_disabled') ? 'info' : 'debug';
+        logger[level]('[INTENT_LINT_V5] Evidence shortcut bypass', {
           previewSessionId,
-          cachedRef,
+          cachedRef: stepDraft.evidence.lastSuccessRef,
+          reason: shortcut.reason,
+          ...(shortcut.details || {}),
         });
       } else {
-        const normalizedEvidenceUrl = normalizeUrlForComparison(evidenceUrl);
-        const currentUrl = normalizeUrlForComparison(snapshot.url);
+        const { node: cachedNode, ref: cachedRef } = shortcut;
+        // Preview-specific: validate the cached node's tag/role against the action
+        // type. This check isn't portable to background (background uses a simpler
+        // isVisible !== false heuristic) so it stays here and NOT in the utility.
+        const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
 
-        if (normalizedEvidenceUrl !== currentUrl) {
-          urlMismatch = true;
-          logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - URL changed', {
-            previewSessionId,
-            cachedRef,
-            evidenceUrl: normalizedEvidenceUrl.slice(0, 80),
-            currentUrl: currentUrl.slice(0, 80),
-          });
-        }
-      }
-
-      if (!urlMismatch) {
-        const cachedNode = domNodes.find(n => n.ref === cachedRef);
-
-        if (cachedNode) {
-          // V6: Validate cached node is compatible with action type (not just visible/enabled)
-          const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
-
-          // Semantic validation: check that the cached node's label/name still matches
-          // the step description. Refs can get reassigned after page navigation (counter resets),
-          // so the same ref might point to a completely different element.
-          let semanticMismatch = false;
-          if (compat.ok && stepDraft.bindingHints) {
-            const hints = stepDraft.bindingHints;
-            const nodeTexts = [
-              cachedNode.labelText, cachedNode.ariaLabel, cachedNode.name,
-              cachedNode.placeholder, cachedNode.text,
-            ].filter(Boolean).map(t => t!.toLowerCase());
-
-            // Check if ANY hint matches ANY node text
-            const hintValues = [hints.label, hints.nearText, hints.autocomplete]
-              .filter(Boolean).map(t => t!.toLowerCase());
-
-            if (hintValues.length > 0 && nodeTexts.length > 0) {
-              const hasMatch = hintValues.some(h =>
-                nodeTexts.some(n => n.includes(h) || h.includes(n))
-              );
-              if (!hasMatch) {
-                semanticMismatch = true;
-                logger.info('[INTENT_LINT] Evidence shortcut semantic mismatch — ref may have shifted', {
-                  previewSessionId,
-                  cachedRef,
-                  hints: hintValues.slice(0, 3),
-                  nodeTexts: nodeTexts.slice(0, 3),
-                  stepDescription: stepDraft.description?.slice(0, 50),
-                });
-              }
-            }
-          }
-
-        if (compat.ok && !semanticMismatch) {
+        if (compat.ok) {
           logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
             previewSessionId,
             cachedRef,
             nodeTag: cachedNode.tag,
             nodeRole: cachedNode.role,
+            semanticSource: shortcut.semanticSource,
           });
 
           const evidenceResult: LintResult = {
@@ -765,7 +731,7 @@ export class IntentStepLintService {
           return evidenceResult;
         }
 
-        // Evidence ref found but incompatible with action type - bypass cache
+        // Passed shared checks but failed action-type compat — bypass cache.
         logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - node incompatible with action', {
           previewSessionId,
           cachedRef,
@@ -775,14 +741,7 @@ export class IntentStepLintService {
           nodeType: cachedNode.type || cachedNode.inputType,
           reason: compat.reason,
         });
-        } else {
-          // Evidence ref not found in current DOM
-          logger.debug('[INTENT_LINT_V5] Evidence shortcut miss - node not found', {
-            previewSessionId,
-            cachedRef,
-          });
-        }
-      } // if (!urlMismatch)
+      }
     }
 
     // Step 1: Try LLM-based resolver (PRIMARY) with includeAlternatives flag
@@ -813,7 +772,13 @@ export class IntentStepLintService {
             type: 'jpeg',
             quality: 70,
           });
-          return buf.toString('base64');
+          // V15: Return clipPageTop + scrollY so the resolver can map vision bbox
+          // (screenshot-space, 0-based from clip origin) back to viewport-space.
+          return {
+            base64: buf.toString('base64'),
+            clipPageTop: clipTop,
+            scrollY: dims.scrollY,
+          };
         } catch { return null; }
       },
     });

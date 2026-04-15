@@ -234,27 +234,19 @@ export const getWorkspaces = async (req: Request, res: Response): Promise<void> 
     // Get all workspaces where user is a member (with role)
     const userWorkspaces = await WorkspaceAccessService.getUserWorkspaces(userId);
 
-    // If no memberships, check if user has legacy workspaces (owner via user_id) and auto-create if needed
+    // If no memberships, return empty list — workspace creation happens via onboarding
     if (userWorkspaces.length === 0) {
-      logger.info('[WORKSPACE_API] No workspace memberships found, creating default workspace', {
+      logger.info('[WORKSPACE_API] No workspace memberships found', {
         userId: userId,
       });
 
-      await WorkspaceService.checkOrCreateWorkspace(userId);
-
-      // Re-fetch memberships after workspace creation (trigger creates membership)
-      const updatedMemberships = await WorkspaceAccessService.getUserWorkspaces(userId);
-
-      if (updatedMemberships.length === 0) {
-        // Fallback: return empty if still no memberships
-        res.json({
-          success: true,
-          data: [],
-          count: 0,
-          timestamp: new Date().toISOString(),
-        });
-        return;
-      }
+      res.json({
+        success: true,
+        data: [],
+        count: 0,
+        timestamp: new Date().toISOString(),
+      });
+      return;
     }
 
     // Refetch memberships

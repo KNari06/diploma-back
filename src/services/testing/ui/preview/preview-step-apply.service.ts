@@ -9,6 +9,7 @@ import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { FrameLocator, Locator, Page } from 'playwright';
 import { sanitizeIntent } from './element-resolver.service';
+import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
@@ -60,6 +61,15 @@ const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for',
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
 const DOM_MUTATING_ACTIONS = new Set(['hover', 'click', 'open', 'close', 'toggle', 'dblclick', 'contextmenu', 'drag_and_drop']);
+
+/**
+ * V15.3: Actions whose Playwright call uses `noWaitAfter: true` to skip the 15-30s
+ * internal stability wait. Because the action returns the instant the event dispatches
+ * (before any triggered animation settles), we add a tiny 1s safety buffer so event
+ * handlers get to run before we invalidate the snapshot cache and hand off to lookahead.
+ * Anything not in this set keeps the old (full) post-action behaviour.
+ */
+const POST_ACTION_BUFFER_ACTIONS = new Set(['click', 'dblclick', 'contextmenu', 'press', 'type', 'toggle', 'check', 'uncheck', 'open', 'close']);
 
 /**
  * V11: Detect if a modal/popup/overlay is currently blocking the page.
@@ -1571,6 +1581,14 @@ async function executeAction(
         }
         const clickOpts: Parameters<Locator['click']>[0] = {
           timeout,
+          // V15.3: Skip Playwright's post-action stability wait. Without this,
+          // clicking an element that triggers an animation (e.g. Angular stories
+          // modal opening) blocks .click() for up to 15-30s waiting for the
+          // button's boundingBox to stop moving. We don't need that wait here:
+          // the inter-step lookahead already guarantees the NEXT step's target
+          // is ready before the next action fires. Shedding this wait trims
+          // 15s off every click on animated elements.
+          noWaitAfter: true,
           ...(clickModifiers.length > 0 && { modifiers: clickModifiers }),
         };
 
@@ -1656,7 +1674,9 @@ async function executeAction(
       case 'press': {
         const key = step.value || 'Enter';
         if (locator) {
-          await locator.press(key, { timeout });
+          // V15.3: Same rationale as click — skip Playwright's stability wait.
+          // The 1s safety buffer in the caller gives handlers time to process.
+          await locator.press(key, { timeout, noWaitAfter: true });
         } else {
           // Page-level press fallback (Escape, Tab, F5, shortcuts, etc.)
           await page.keyboard.press(key);
@@ -2773,6 +2793,11 @@ export class PreviewStepApplyService {
               lastSuccessRef: selectedRef,
               confidence: 1.0,
               resolutionMeta,
+              // V15.6: Timestamp so the shortcut can reject stale refs.
+              // data-agent-ref values are ephemeral DOM counters; after a long
+              // gap (page reload, server restart + replay) the same ref can
+              // point at a different element even on the same URL.
+              capturedAt: new Date().toISOString(),
             },
             compiled, // NEW: compiled execution plan
           };
@@ -2838,12 +2863,22 @@ export class PreviewStepApplyService {
         try {
           // Import and execute compiled plan
           const { executeCompiledLocatorPlan } = await import('@/agent/execution/compiled-locator-executor');
-          
+
+          // V15: Route per-attempt events into the trace file — answers "which
+          // strategy from the plan actually worked, and how long did losers take?"
+          const editorTrace = EditorTraceService.get(previewSessionId);
+          const compiledTracer = editorTrace ? {
+            attempt: editorTrace.writeCompiledAttempt.bind(editorTrace),
+            reorder: editorTrace.writeCompiledReorder.bind(editorTrace),
+          } : undefined;
+
           const compiledResult = await executeCompiledLocatorPlan(
             page,
             stepDraft.compiled,
             stepDraft.type,
-            3000 // 3s timeout — fast path, if compiled doesn't resolve quickly fall through to lint
+            3000, // 3s timeout — fast path, if compiled doesn't resolve quickly fall through to lint
+            compiledTracer,
+            stepDraft.id,
           );
 
           if (compiledResult.success && compiledResult.locator) {
@@ -2975,6 +3010,7 @@ export class PreviewStepApplyService {
                     lastSuccessRef: compiledRef || '', // V15: Preserve ref for evidence shortcut
                     confidence: compiledResult.confidence || 0.9,
                     resolutionMeta,
+                    capturedAt: new Date().toISOString(), // V15.6: staleness guard
                   },
                 };
 
@@ -3138,6 +3174,31 @@ export class PreviewStepApplyService {
       // This URL represents the page state when elements were found by lint
       const urlBeforeAction = page.url();
 
+      // V15: Trace helper — lazy lookup of the trace writer so we don't pay the
+      // cost when no editor session is active. Every call is wrapped so a broken
+      // tracer (disk full, buffer overflow, JSON serialization error) can never
+      // kill a step. Matches the safety pattern in step-readiness.service.ts and
+      // compiled-locator-executor.ts — tracing is advisory, never load-bearing.
+      const rawTrace = EditorTraceService.get(previewSessionId);
+      const trace = rawTrace ? {
+        writeActionAttempt: (d: Parameters<typeof rawTrace.writeActionAttempt>[0]) => {
+          try { rawTrace.writeActionAttempt(d); } catch { /* non-fatal */ }
+        },
+        writeActionResult: (d: Parameters<typeof rawTrace.writeActionResult>[0]) => {
+          try { rawTrace.writeActionResult(d); } catch { /* non-fatal */ }
+        },
+        writeActionVerify: (d: Parameters<typeof rawTrace.writeActionVerify>[0]) => {
+          try { rawTrace.writeActionVerify(d); } catch { /* non-fatal */ }
+        },
+        // V15.1: fine-grained action timing — surfaces the visible-wait portion
+        // of Playwright's internal actionability sequence so we can see if a
+        // 15s click was spent on "waiting for element visible" vs "waiting for
+        // navigation" vs "waiting for click handler to fire".
+        writeActionTiming: (d: Parameters<typeof rawTrace.writeActionTiming>[0]) => {
+          try { rawTrace.writeActionTiming(d); } catch { /* non-fatal */ }
+        },
+      } : undefined;
+
       for (const candidate of resolvedCandidates) {
         attempts++;
         logger.debug('[PREVIEW_APPLY] Trying candidate', {
@@ -3146,13 +3207,102 @@ export class PreviewStepApplyService {
           confidence: candidate.confidence,
         });
 
+        // V15: emit action_attempt so the trace shows exactly which locator source
+        // drove this click/type/etc. Pre-action timestamp captures Playwright's
+        // total actionability wait (visible + enabled + stable + receives events).
+        trace?.writeActionAttempt({
+          stepId: stepDraft.id,
+          stepType: stepDraft.type,
+          locatorSource: (candidate as any).source === 'compiled' ? 'compiled'
+            : (candidate as any).source === 'evidence' ? 'evidence'
+            : 'resolver',
+          selector: candidate.ref ? `[data-agent-ref="${candidate.ref}"]` : undefined,
+          ref: candidate.ref,
+          attempt: attempts,
+        });
+        const actionStart = Date.now();
+
+        // V15.1: Non-blocking "was it already visible?" probe. This REPLACES an
+        // earlier attempt that used `waitFor({state:'visible', timeout:3000})`
+        // which added up to 3s per candidate when the ref was stale.
+        //
+        // Instead we use `isVisible()` with a 200ms hard cap — it returns instantly
+        // for already-visible elements, and for non-matching refs it bails out
+        // within 200ms instead of waiting 3s. Cost: ~0ms (success) or ~200ms
+        // (stale ref) per candidate, vs 0ms / 3000ms before. That's 15× faster
+        // on failing paths.
+        //
+        // The trade-off: we no longer wait for elements to become visible before
+        // firing the action. That's fine because `executeAction` internally runs
+        // Playwright's actionability sequence which does its own wait. Our probe
+        // is ONLY for diagnostics: we record whether the element was already
+        // actionable so we can tell, post-hoc, whether a slow action was spent
+        // waiting for rendering (pre-wait) vs stability (post-wait).
+        let preWaitVisibleMs: number | undefined;
+        let wasAlreadyVisible: boolean | undefined;
+        try {
+          if (candidate.ref) {
+            const probeStart = Date.now();
+            const selector = `[data-agent-ref="${candidate.ref}"]`;
+            // Promise.race with a 200ms timer — mirror the withHardCap pattern
+            // from step-readiness.service.ts. Don't import withHardCap here to
+            // keep this file's imports minimal.
+            const visiblePromise = page.locator(selector).first().isVisible();
+            wasAlreadyVisible = await Promise.race([
+              visiblePromise,
+              new Promise<boolean>(resolve => setTimeout(() => resolve(false), 200)),
+            ]);
+            preWaitVisibleMs = Date.now() - probeStart;
+          }
+        } catch { /* non-fatal diagnostic */ }
+
+        let playwrightThrew = false;
         const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
+        const actionDur = Date.now() - actionStart;
+        if (!result.success && result.error) playwrightThrew = true;
+
+        // Emit fine-grained action timing before success/failure branches diverge.
+        // `preWaitVisibleMs` is now the probe cost (~0 or ~200ms), not a real wait.
+        // `wasAlreadyVisible` is the diagnostic signal — false means executeAction
+        // had to wait for visibility internally.
+        trace?.writeActionTiming({
+          stepId: stepDraft.id,
+          stepType: stepDraft.type,
+          totalMs: actionDur,
+          preWaitVisibleMs,
+          wasAlreadyVisible,
+          playwrightThrew,
+          method: stepDraft.type,
+        });
 
         if (result.success) {
           // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          let postSettleMs = 0;
+          let postSettleFired = false;
           if (!skipPostActionWait) {
-            await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+            const settleStart = Date.now();
+            postSettleFired = await page.waitForLoadState('domcontentloaded', { timeout: 2000 })
+              .then(() => true)
+              .catch(() => false);
+            postSettleMs = Date.now() - settleStart;
+          } else if (POST_ACTION_BUFFER_ACTIONS.has(stepDraft.type)) {
+            // V15.3: Safety buffer for noWaitAfter actions.
+            // We set `noWaitAfter: true` on click/press to skip Playwright's internal
+            // 15-30s stability wait (which otherwise fires on every animation).
+            // The inter-step lookahead handles readiness for the NEXT step, but a
+            // 1s pause here gives the current page a moment to dispatch event
+            // handlers before snapshot invalidation and lookahead kick in.
+            // This is deliberately short — lookahead does the heavy lifting.
+            await page.waitForTimeout(1000);
           }
+          trace?.writeActionResult({
+            stepId: stepDraft.id,
+            stepType: stepDraft.type,
+            success: true,
+            durationMs: actionDur,
+            postActionSettleMs: postSettleMs || undefined,
+            postActionSettleFired: !skipPostActionWait ? postSettleFired : undefined,
+          });
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
           if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
@@ -3165,6 +3315,7 @@ export class PreviewStepApplyService {
           const stateChange: ApplyResult['stateChange'] = undefined;
 
           if (STATE_VERIFIABLE_ACTIONS.has(stepDraft.type) && candidate.ref) {
+            const verifyStart = Date.now();
             try {
               verified = await verifyActionEffect(page, stepDraft, candidate.ref);
               if (verified) {
@@ -3173,9 +3324,27 @@ export class PreviewStepApplyService {
                   candidateRef: candidate.ref,
                 });
               }
+              trace?.writeActionVerify({
+                stepId: stepDraft.id,
+                stepType: stepDraft.type,
+                verificationMethod: stepDraft.type === 'click' ? 'permissive'
+                  : stepDraft.type === 'check' || stepDraft.type === 'uncheck' ? 'checked'
+                  : stepDraft.type === 'open' || stepDraft.type === 'close' ? 'aria-expanded'
+                  : stepDraft.type === 'toggle' ? 'aria-pressed'
+                  : 'isVisible',
+                verified,
+                durationMs: Date.now() - verifyStart,
+              });
             } catch (verifyError) {
               logger.warn('[PREVIEW_APPLY] Verification failed', {
                 error: verifyError instanceof Error ? verifyError.message : String(verifyError),
+              });
+              trace?.writeActionVerify({
+                stepId: stepDraft.id,
+                stepType: stepDraft.type,
+                verificationMethod: 'none',
+                verified: false,
+                durationMs: Date.now() - verifyStart,
               });
             }
           }
@@ -3238,6 +3407,7 @@ export class PreviewStepApplyService {
               lastSuccessRef: candidate.ref,
               confidence: candidate.confidence,
               resolutionMeta,
+              capturedAt: new Date().toISOString(), // V15.6: staleness guard
             },
             compiled, // NEW: compiled execution plan
           };
@@ -3259,6 +3429,14 @@ export class PreviewStepApplyService {
           };
         }
 
+        // V15: action failed — emit result event before trying next candidate
+        trace?.writeActionResult({
+          stepId: stepDraft.id,
+          stepType: stepDraft.type,
+          success: false,
+          durationMs: actionDur,
+          error: result.error?.slice(0, 200),
+        });
         lastError = result.error;
       }
 

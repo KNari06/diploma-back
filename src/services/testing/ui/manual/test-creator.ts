@@ -74,10 +74,14 @@ export async function getOrCreateUserProject(userId: string): Promise<string> {
   try {
     logger.info('[MANUAL_TEST] Getting/creating project for user', { userId });
 
-    // First, ensure user has a workspace
-    const { workspace_id } = await WorkspaceService.checkOrCreateWorkspace(userId);
+    // Get active workspace — do NOT auto-create (workspace is created during onboarding)
+    const workspace_id = await WorkspaceService.getActiveWorkspaceForUser(userId);
 
-    logger.info('[MANUAL_TEST] Workspace ensured', { userId, workspaceId: workspace_id });
+    if (!workspace_id) {
+      throw new Error('User has no workspace. Complete onboarding first.');
+    }
+
+    logger.info('[MANUAL_TEST] Workspace resolved', { userId, workspaceId: workspace_id });
 
     // Check if user already has a project in this workspace
     const { data: existingProject } = await supabaseAdmin

@@ -1,7 +1,9 @@
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import fs from 'fs/promises';
+import * as path from 'path';
 
 /**
  * Upload video file to Supabase Storage
@@ -348,85 +350,172 @@ export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {
 }
 
 /**
- * Upload replay trace JSONL to Supabase Storage.
- * Contains step-by-step execution details: element resolution, readiness checks,
- * retry attempts, LLM diagnosis, errors — everything needed to debug failures.
+ * Upload a replay-mode JSONL trace log to the unified `lite-trace-logs`
+ * bucket and register it in `trace_files` so it shows up in the admin UI.
+ *
+ * Replay traces carry element resolution details (compiled / LLM / self-heal),
+ * readiness checks, retry attempts, and step failures — everything needed to
+ * diagnose a failed regression run.
+ *
+ * Behavior:
+ * - Anonymous runs (non-UUID userId) fall back to the `anonymous` segment and
+ *   SKIP the DB insert (mirrors the Lite engine path).
+ * - If the DB insert fails on an authenticated run, the storage object is
+ *   deleted to avoid orphaned blobs.
+ * - Local file is best-effort unlinked after a successful upload.
  *
  * @param localPath - Path to local JSONL file (from ReplayTraceWriter)
- * @param testId - Test ID for organizing in storage
- * @param userId - User ID for storage path
- * @returns Public URL of the uploaded file
+ * @param testId - UUID of the `tests` row this replay belongs to (used as FK)
+ * @param userId - User UUID; falls back to anonymous path if not a UUID
+ * @returns Object with storagePath, normalized fileName, fileSize, and optional
+ *          `traceFileId` (present only when a trace_files row was inserted).
  */
 export async function uploadReplayTraceToStorage(
   localPath: string,
   testId: string,
   userId: string,
-): Promise<string> {
-  try {
-    await fs.access(localPath);
+): Promise<{
+  storagePath: string;
+  fileName: string;
+  fileSize: number;
+  traceFileId?: string;
+}> {
+  const isUserUuid = isValidUUID(userId);
+  const isTestUuid = isValidUUID(testId);
 
-    const fileBuffer = await fs.readFile(localPath);
-    const fileSize = fileBuffer.length;
-
-    if (fileSize === 0) {
-      logger.warn('[STORAGE] Replay trace file is empty', { testId, localPath });
-      throw new Error('Replay trace file is empty');
-    }
-
-    const fileName = `replay-trace-${testId}-${Date.now()}.jsonl`;
-    const storagePath = `${userId}/replay-traces/${fileName}`;
-
-    const { error } = await supabaseAdmin.storage
-      .from(env.SUPABASE_BUCKET_NAME)
-      .upload(storagePath, fileBuffer, {
-        contentType: 'application/x-ndjson',
-        upsert: false,
-        cacheControl: '3600',
-      });
-
-    if (error) {
-      throw new Error(`Failed to upload replay trace: ${error.message}`);
-    }
-
-    const { data: urlData } = supabaseAdmin.storage
-      .from(env.SUPABASE_BUCKET_NAME)
-      .getPublicUrl(storagePath);
-
-    logger.info('[STORAGE] Replay trace uploaded successfully', {
-      testId,
-      url: urlData.publicUrl,
-      fileSize: `${Math.round(fileSize / 1024)}KB`,
-    });
-
-    // Clean up local file
-    try {
-      await fs.unlink(localPath);
-    } catch {
-      // Non-fatal
-    }
-
-    return urlData.publicUrl;
-  } catch (error) {
-    logger.error('[STORAGE] Replay trace upload error', {
-      error: error instanceof Error ? error.message : String(error),
-      testId,
-    });
-    throw error;
+  // Branch 1: anonymous / non-UUID user — upload to the shared anon folder,
+  // skip DB bookkeeping (no user to attribute the row to).
+  if (!isUserUuid) {
+    const { storagePath, fileName: normalizedFileName, fileSize } =
+      await uploadLiteTraceLogToStorageAnonymous(localPath, path.basename(localPath), 'replay');
+    return { storagePath, fileName: normalizedFileName, fileSize };
   }
+
+  // Branch 2: authenticated user — upload + DB insert with rollback.
+  const uploadResult = await uploadLiteTraceLogToStorage(
+    localPath,
+    userId,
+    path.basename(localPath),
+    'replay',
+  );
+
+  try {
+    const { id } = await insertTraceFileRecord({
+      userId,
+      // `testId` FK to `tests(id)`; only attach if it's a real UUID. For
+      // synthetic ids we leave it null so the insert doesn't 23503 on FK.
+      testId: isTestUuid ? testId : null,
+      fileName: uploadResult.fileName,
+      storagePath: uploadResult.storagePath,
+      fileSize: uploadResult.fileSize,
+      browser: 'replay-trace',
+      status: 'uploaded',
+    });
+
+    return {
+      storagePath: uploadResult.storagePath,
+      fileName: uploadResult.fileName,
+      fileSize: uploadResult.fileSize,
+      traceFileId: id,
+    };
+  } catch (insertError) {
+    logger.error('[STORAGE] Failed to register replay trace in DB, rolling back storage', {
+      error: insertError instanceof Error ? insertError.message : String(insertError),
+      storagePath: uploadResult.storagePath,
+    });
+    await deleteLiteTraceLogFromStorage(uploadResult.storagePath).catch(() => {});
+    throw insertError;
+  }
+}
+
+/**
+ * Trace type discriminator — drives the file name prefix inside the user's
+ * daily trace folder. Keep the value short, lowercase, alphanumeric with `-`.
+ */
+export type TraceType =
+  | 'lite'
+  | 'editor'
+  | 'preview'
+  | 'draft'
+  | 'api-agent'
+  | 'exploration'
+  | 'replay';
+
+/**
+ * Build the Supabase Storage path for a trace log.
+ *
+ * Structure:
+ *   trace-logs/<userSegment>/<YYYY-MM-DD>/<traceType>__<HH-MM-SS>__<shortTestId>.jsonl
+ *
+ * `userSegment` is the user's UUID for authenticated runs or the literal
+ * `anonymous` for non-UUID runs. RLS policies on the `lite-trace-logs` bucket
+ * rely on the first two path segments (`trace-logs/<userId>`), so we keep
+ * those fixed and add date + typed filename INSIDE the user folder.
+ *
+ * `originalFileName` is expected to follow the LiteTraceWriter convention
+ * `YYYY-MM-DD_HH-MM-SS_<testId>.jsonl`. If it doesn't match, we fall back
+ * to the current time and a sanitized basename so uploads never fail for
+ * cosmetic reasons.
+ */
+/** Regex matching the well-known testId prefixes set by each writer. */
+const TRACE_PREFIX_RE = /^(editor|preview_run|draft_run|api_agent|exploration|lite|replay)_/;
+
+export function buildTraceStoragePath(
+  userSegment: string,
+  traceType: TraceType,
+  originalFileName: string,
+): { storagePath: string; normalizedFileName: string } {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const nowDatePart = nowIso.slice(0, 10); // YYYY-MM-DD
+  const nowTimePart = nowIso.slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
+
+  // LiteTraceWriter format: <date>_<time>_<testId>.jsonl
+  // Example: 2026-04-15_14-32-07_editor_550e8400-e29b-41d4-a716-446655440000.jsonl
+  const parsed = originalFileName.match(
+    /^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_(.+)\.jsonl$/,
+  );
+
+  const datePart = parsed?.[1] ?? nowDatePart;
+  const timePart = parsed?.[2] ?? nowTimePart;
+  const rawTestId = parsed?.[3] ?? originalFileName.replace(/\.jsonl$/, '');
+
+  // Strip known prefixes repeatedly — covers nested forms like
+  // `editor_preview_<uuid>` (editor session ids are themselves `preview_<uuid>`).
+  let trimmedTestId = rawTestId;
+  while (TRACE_PREFIX_RE.test(trimmedTestId)) {
+    trimmedTestId = trimmedTestId.replace(TRACE_PREFIX_RE, '');
+  }
+  const shortTestId = trimmedTestId.slice(-8) || 'unnamed';
+
+  // 3-hex millisecond suffix disambiguates a retry of the same test within
+  // the same second (the parent filename is second-precision). Without it,
+  // upsert:false would throw 409 on retry and orphan the storage object.
+  const msSuffix = (now.getUTCMilliseconds() & 0xfff).toString(16).padStart(3, '0');
+
+  const normalizedFileName = `${traceType}__${timePart}__${shortTestId}_${msSuffix}.jsonl`;
+  const storagePath = `trace-logs/${userSegment}/${datePart}/${normalizedFileName}`;
+
+  return { storagePath, normalizedFileName };
 }
 
 /**
  * Upload Lite trace log (JSONL) to Supabase Storage
  * @param localPath - Path to local JSONL file
  * @param userId - User ID (must be valid UUID)
- * @param fileName - File name (e.g., lite_trace_<timestamp>_<testId>_<runId>.jsonl)
- * @returns Object with storagePath and fileSize
+ * @param fileName - Original file name from LiteTraceWriter
+ *                   (e.g., YYYY-MM-DD_HH-MM-SS_<testId>.jsonl). The storage
+ *                   path is rebuilt from this via buildTraceStoragePath().
+ * @param traceType - Trace category (lite/editor/preview/draft/api-agent/exploration).
+ *                    Defaults to 'lite' for backwards-compatible callers.
+ * @returns Object with storagePath, fileName (normalized) and fileSize
  */
 export async function uploadLiteTraceLogToStorage(
   localPath: string,
   userId: string,
-  fileName: string
-): Promise<{ storagePath: string; fileSize: number }> {
+  fileName: string,
+  traceType: TraceType = 'lite',
+): Promise<{ storagePath: string; fileName: string; fileSize: number }> {
   try {
     // Check if file exists before reading
     try {
@@ -460,7 +549,11 @@ export async function uploadLiteTraceLogToStorage(
       fileSize: `${Math.round(fileSize / 1024)}KB`,
     });
 
-    const storagePath = `trace-logs/${userId}/${fileName}`;
+    const { storagePath, normalizedFileName } = buildTraceStoragePath(
+      userId,
+      traceType,
+      fileName,
+    );
 
     // Upload to Supabase Storage (bucket: lite-trace-logs)
     const { error } = await supabaseAdmin.storage
@@ -475,23 +568,26 @@ export async function uploadLiteTraceLogToStorage(
       logger.error('[STORAGE] Failed to upload Lite trace log', {
         error,
         storagePath,
-        fileName,
+        fileName: normalizedFileName,
+        traceType,
       });
       throw new Error(`Failed to upload Lite trace log: ${error.message}`);
     }
 
     logger.info('[STORAGE] Lite trace log uploaded successfully', {
-      fileName,
+      fileName: normalizedFileName,
       storagePath,
       fileSize,
+      traceType,
     });
 
-    return { storagePath, fileSize };
+    return { storagePath, fileName: normalizedFileName, fileSize };
   } catch (error) {
     logger.error('[STORAGE] Lite trace log upload error', {
       error: error instanceof Error ? error.message : String(error),
       localPath,
       fileName,
+      traceType,
     });
     throw error;
   }
@@ -503,8 +599,9 @@ export async function uploadLiteTraceLogToStorage(
  */
 export async function uploadLiteTraceLogToStorageAnonymous(
   localPath: string,
-  fileName: string
-): Promise<{ storagePath: string; fileSize: number }> {
+  fileName: string,
+  traceType: TraceType = 'lite',
+): Promise<{ storagePath: string; fileName: string; fileSize: number }> {
   try {
     // Check if file exists before reading
     try {
@@ -527,7 +624,11 @@ export async function uploadLiteTraceLogToStorageAnonymous(
       throw new Error('Lite trace log file is empty');
     }
 
-    const storagePath = `trace-logs/anonymous/${fileName}`;
+    const { storagePath, normalizedFileName } = buildTraceStoragePath(
+      'anonymous',
+      traceType,
+      fileName,
+    );
 
     const { error } = await supabaseAdmin.storage
       .from('lite-trace-logs')
@@ -541,23 +642,26 @@ export async function uploadLiteTraceLogToStorageAnonymous(
       logger.error('[STORAGE] Failed to upload Lite trace log (anonymous)', {
         error,
         storagePath,
-        fileName,
+        fileName: normalizedFileName,
+        traceType,
       });
       throw new Error(`Failed to upload Lite trace log: ${error.message}`);
     }
 
     logger.info('[STORAGE] Lite trace log uploaded successfully (anonymous)', {
-      fileName,
+      fileName: normalizedFileName,
       storagePath,
       fileSize,
+      traceType,
     });
 
-    return { storagePath, fileSize };
+    return { storagePath, fileName: normalizedFileName, fileSize };
   } catch (error) {
     logger.error('[STORAGE] Lite trace log upload error (anonymous)', {
       error: error instanceof Error ? error.message : String(error),
       localPath,
       fileName,
+      traceType,
     });
     throw error;
   }

@@ -1007,6 +1007,57 @@ export class PreviewRunService {
           },
         });
 
+        // V15: Lightweight page state snapshot for the editor trace — answers
+        // "what state was the page in when this step started?" without needing
+        // to reproduce the session. Fire-and-forget, capped at 200ms hard timeout.
+        void (async () => {
+          try {
+            const stateEditorTrace = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+            if (!stateEditorTrace) return;
+            const stateProbe = await Promise.race([
+              session.page.evaluate(() => {
+                // @ts-expect-error - browser context
+                const doc = document;
+                // @ts-expect-error - browser context
+                const win = window;
+                const keys = Object.keys(doc.documentElement || {}).join(' ');
+                const bodyKeys = doc.body ? Object.keys(doc.body).join(' ') : '';
+                return {
+                  readyState: doc.readyState,
+                  title: (doc.title || '').slice(0, 120),
+                  bodyTextLength: (doc.body?.innerText || '').length,
+                  interactiveElementCount: doc.querySelectorAll(
+                    'a, button, input, textarea, select, [role="button"], [role="link"], [tabindex]'
+                  ).length,
+                  frameworks: {
+                    react: keys.includes('__reactFiber') || bodyKeys.includes('__reactFiber') || !!(win as any).React,
+                    angular: !!(win as any).getAllAngularRootElements || !!(win as any).ng || !!(doc.querySelector('[ng-version]')),
+                    vue: !!(win as any).Vue || !!(win as any).__VUE__,
+                    alpine: !!(win as any).Alpine,
+                    htmx: !!(win as any).htmx,
+                    svelte: !!(win as any).__svelte,
+                  },
+                  // @ts-expect-error - navigator exists in browser context
+                  hasServiceWorker: !!navigator?.serviceWorker?.controller,
+                };
+              }),
+              new Promise<null>(resolve => setTimeout(() => resolve(null), 200)),
+            ]);
+            if (!stateProbe) return;
+            stateEditorTrace.writePageState({
+              stepId: step.id,
+              when: 'step_start',
+              url: session.page.url(),
+              title: stateProbe.title,
+              readyState: stateProbe.readyState,
+              bodyTextLength: stateProbe.bodyTextLength,
+              interactiveElementCount: stateProbe.interactiveElementCount,
+              frameworks: stateProbe.frameworks,
+              hasServiceWorker: stateProbe.hasServiceWorker,
+            });
+          } catch { /* non-fatal diagnostic */ }
+        })();
+
         // Emit step running
         webSocketService.emitToUser(userId, 'preview:run:step', {
           previewSessionId,
@@ -1271,6 +1322,45 @@ export class PreviewRunService {
             trackedUrl = session.page.url();
             trackedUrls.set(session.activeTabIndex, trackedUrl);
 
+            // V15.4: Hover cleanup — move cursor away after hover when next step
+            // doesn't need the hover-triggered UI (tooltip/popover/menu). Without
+            // this, the cursor stays on the hovered element, causing:
+            //   • Visible flicker as snapshot polling re-renders popovers
+            //   • Last-hover-step leaves UI dirty for the user post-run
+            //   • Subsequent type/scroll/navigate fights the popover overlay
+            //
+            // We KEEP the cursor on the element when next step is click/hover/
+            // dblclick — that preserves the "hover menu → click item" pattern
+            // where the item only exists while the menu is held open by hover.
+            if (step.type === 'hover') {
+              const nextStepForHover = stepsToExecute[i + 1];
+              const HOVER_DEPENDENT_NEXT: ReadonlySet<IntentActionType> = new Set([
+                'click', 'dblclick', 'contextmenu', 'hover',
+              ]);
+              const shouldResetMouse = !nextStepForHover
+                || !HOVER_DEPENDENT_NEXT.has(nextStepForHover.type);
+              if (shouldResetMouse) {
+                try {
+                  // Move to (0, 0) — top-left corner. This is OUTSIDE any interactive
+                  // element on every normal layout, so no spurious :hover state is
+                  // triggered elsewhere.
+                  await session.page.mouse.move(0, 0);
+                  logger.debug('[PreviewRun] Hover cursor reset', {
+                    previewSessionId,
+                    stepId: step.id,
+                    nextStepType: nextStepForHover?.type ?? 'none',
+                  });
+                } catch (err) {
+                  // Non-fatal — worst case the cursor stays put and the user
+                  // sees a lingering tooltip. No step failure from this.
+                  logger.debug('[PreviewRun] Hover cursor reset failed (non-fatal)', {
+                    previewSessionId,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
+              }
+            }
+
             // Collect page summary after navigation for better error context on subsequent failures
             if (step.type === 'navigate' || result.urlChanged) {
               try {
@@ -1298,6 +1388,45 @@ export class PreviewRunService {
               const nextStep = stepsToExecute[i + 1];
               try {
                 const adaptiveSettle = getAdaptiveSettleMs(step.type);
+                // V15: Route lookahead phase events into the editor trace so the
+                // inter-step gap is observable in the JSONL trace file instead of stdout only.
+                // V15: Get editor trace safely — a failed import must not kill the lookahead.
+                // The tracer is advisory observability; if unavailable, we just skip trace emission.
+                let lookaheadTracer: any = undefined;
+                let editorTraceForGap: any = null;
+                try {
+                  editorTraceForGap = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+                  if (editorTraceForGap) {
+                    lookaheadTracer = {
+                      start: editorTraceForGap.writeLookaheadStart.bind(editorTraceForGap),
+                      phase: editorTraceForGap.writeLookaheadPhase.bind(editorTraceForGap),
+                      end: editorTraceForGap.writeLookaheadEnd.bind(editorTraceForGap),
+                      // V15.1: extra methods surface what happens inside retry_loop
+                      retryAttempt: editorTraceForGap.writeRetryAttempt.bind(editorTraceForGap),
+                      pageSettle: editorTraceForGap.writePageSettle.bind(editorTraceForGap),
+                    };
+                  }
+                } catch { /* non-fatal */ }
+
+                // V15.1: Emit an inter-step-gap event BEFORE starting lookahead.
+                // `stepStartMs` is when step N began; `Date.now()` is right before
+                // lookahead for N+1. Subtracting gives us (step exec ms + housekeeping
+                // between steps). We don't have a separate post-action timestamp yet,
+                // so we use stepDurationMs which preview-run already tracks.
+                try {
+                  if (editorTraceForGap) {
+                    editorTraceForGap.writeInterStepGap({
+                      prevStepId: step.id,
+                      nextStepId: nextStep.id,
+                      // Rough: time from step_start to now minus the actual step duration.
+                      // A positive gap = post-step housekeeping (settle, collect, trace upload).
+                      gapMs: Math.max(0, (Date.now() - stepStartMs) - stepDurationMs),
+                      accountedFor: [
+                        result.urlChanged ? 'page_summary_collect' : undefined,
+                      ].filter(Boolean) as string[],
+                    });
+                  }
+                } catch { /* non-fatal */ }
                 const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
                   maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
                   settleMs: adaptiveSettle,
@@ -1305,6 +1434,7 @@ export class PreviewRunService {
                   prevActionType: step.type,
                   prevUrl: trackedUrl,
                   recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                  tracer: lookaheadTracer,
                 }), signal);
 
                 // Track actual settle time per action category for adaptive threshold
@@ -1374,6 +1504,33 @@ export class PreviewRunService {
               break;
             }
           } else {
+            // Collect FRESH page context at the moment of failure — the page may
+            // have changed since the last navigation (e.g. JS-rendered error page,
+            // maintenance overlay, SPA route change without a full navigation).
+            let failPageSummary = lastNavigationSummary;
+            try {
+              failPageSummary = await collectLightPageSummary(session.page);
+            } catch {
+              // Non-fatal — fall back to lastNavigationSummary
+            }
+
+            // Capture a screenshot at the moment of failure so the user can see
+            // what the page actually looks like (e.g. maintenance page, error modal).
+            let failScreenshotBase64: string | null = null;
+            try {
+              const buf = await session.page.screenshot({
+                type: 'jpeg',
+                quality: 50,
+                fullPage: false,
+                timeout: 3000,
+              });
+              if (buf.length <= 500_000) { // 500KB cap to avoid bloating WS payload
+                failScreenshotBase64 = buf.toString('base64');
+              }
+            } catch {
+              // Non-fatal — screenshot may fail if page crashed
+            }
+
             // Augment error with page context if we navigated earlier.
             // Also include the URL-mismatch hint, but ONLY for the first few
             // steps — login flows are typically 2-4 steps, and showing the
@@ -1381,7 +1538,7 @@ export class PreviewRunService {
             // misleading and confusing.
             const errorWithContext = augmentErrorWithPageContext(
               result.error || 'Step failed',
-              lastNavigationSummary,
+              failPageSummary,
               i < URL_MISMATCH_HINT_MAX_STEPS ? urlMismatchInfo : null,
             );
 
@@ -1391,7 +1548,8 @@ export class PreviewRunService {
               stepId: step.id,
               error: result.error,
               retried,
-              hasPageContext: !!lastNavigationSummary,
+              hasPageContext: !!failPageSummary,
+              hasFailScreenshot: !!failScreenshotBase64,
               hasUrlMismatchHint: i < URL_MISMATCH_HINT_MAX_STEPS && !!urlMismatchInfo,
             });
 
@@ -1409,11 +1567,11 @@ export class PreviewRunService {
                 error: result.error,
                 attempts: result.attempts,
                 retried,
-                pageContext: lastNavigationSummary || undefined,
+                pageContext: failPageSummary || undefined,
               },
             });
 
-            // Emit fail (with augmented error for better UX)
+            // Emit fail (with augmented error + screenshot for better UX)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: i,
@@ -1424,6 +1582,7 @@ export class PreviewRunService {
               error: errorWithContext,
               timestamp: new Date().toISOString(),
               ...(retried ? { retried: true } : {}),
+              ...(failScreenshotBase64 ? { failScreenshot: failScreenshotBase64 } : {}),
             });
             failedSteps++;
             // Capture for summary (truncate to first 5 to bound payload size)
@@ -1673,11 +1832,21 @@ export class PreviewRunService {
             }
           }
 
+          // Collect fresh page context + screenshot at moment of exception
+          let exFailPageSummary = lastNavigationSummary;
+          try { exFailPageSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
+
+          let exFailScreenshot: string | null = null;
+          try {
+            const buf = await session.page.screenshot({ type: 'jpeg', quality: 50, fullPage: false, timeout: 3000 });
+            if (buf.length <= 500_000) exFailScreenshot = buf.toString('base64');
+          } catch { /* non-fatal */ }
+
           // Same URL-mismatch hint policy as the failed-result branch above:
           // only attach the hint to the first few step failures.
           const errorWithContext = augmentErrorWithPageContext(
             originalError,
-            lastNavigationSummary,
+            exFailPageSummary,
             i < URL_MISMATCH_HINT_MAX_STEPS ? urlMismatchInfo : null,
           );
 
@@ -1687,6 +1856,8 @@ export class PreviewRunService {
             stepId: step.id,
             error: originalError,
             retried: exceptionRetried,
+            hasPageContext: !!exFailPageSummary,
+            hasFailScreenshot: !!exFailScreenshot,
             hasUrlMismatchHint: i < URL_MISMATCH_HINT_MAX_STEPS && !!urlMismatchInfo,
           });
 
@@ -1703,11 +1874,11 @@ export class PreviewRunService {
               status: 'exception',
               error: originalError,
               retried: exceptionRetried,
-              pageContext: lastNavigationSummary || undefined,
+              pageContext: exFailPageSummary || undefined,
             },
           });
 
-          // Emit fail
+          // Emit fail (with screenshot for visual debugging)
           webSocketService.emitToUser(userId, 'preview:run:step', {
             previewSessionId,
             stepIndex: i,
@@ -1718,6 +1889,7 @@ export class PreviewRunService {
             error: errorWithContext,
             timestamp: new Date().toISOString(),
             ...(exceptionRetried ? { retried: true } : {}),
+            ...(exFailScreenshot ? { failScreenshot: exFailScreenshot } : {}),
           });
           failedSteps++;
           // Capture for summary (truncate to first 5)

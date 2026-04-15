@@ -18,7 +18,12 @@ import {
 import { Job } from 'bullmq';
 
 // Constants
-const MAX_RETRIES = env.AGENT_MAX_RETRIES || 2;
+// Retry budget for executePlaywrightTestWithRetry. Default: 1 (one retry).
+// April 2026: lowered from 2 → 1 because an LLM classifier now gates retries
+// on real infra-transient failures only. One retry is plenty for a genuine
+// infra hiccup; more retries mask real product bugs and waste engineer time.
+// Override with AGENT_MAX_RETRIES for debugging on a specific environment.
+const MAX_RETRIES = env.AGENT_MAX_RETRIES ?? 1;
 const DEFAULT_ADMIN_EMAIL = 'admin@qai.so';
 
 /**
@@ -656,7 +661,7 @@ export class ManualTestRunJobHandler {
         dashboardUrl: `${frontendUrl}/tests/${testId}`,
       });
 
-      // Send notification
+      // Send email notification
       await QueueManager.addNotificationJob({
         type: 'email',
         recipient,
@@ -665,6 +670,44 @@ export class ManualTestRunJobHandler {
         htmlContent: email.html,
         data: { testId, error: errorMessage },
       });
+
+      // Send Telegram notification (if user has it connected)
+      if (test.user_id) {
+        try {
+          const { getTelegramToken, sendTelegramNotification } = await import('@/utils/notifications/telegram-notify');
+          const tokenData = await getTelegramToken(test.user_id);
+          if (tokenData?.external_id) {
+            const testUrl = test.url || 'Unknown URL';
+            const dashboardUrl = `${frontendUrl}/tests/${testId}`;
+
+            // Duration
+            let duration = '';
+            if (test.started_at) {
+              const endTime = test.completed_at || new Date().toISOString();
+              const secs = Math.floor((new Date(endTime).getTime() - new Date(test.started_at).getTime()) / 1000);
+              duration = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+            }
+
+            await sendTelegramNotification(tokenData, {
+              icon: '\u274C',
+              title: 'Test Failed',
+              fields: [
+                { label: 'URL', value: testUrl },
+                { label: 'Browsers', value: (test.browsers || []).join(', ') || '—' },
+                ...(duration ? [{ label: 'Duration', value: duration }] : []),
+              ],
+              error: errorMessage,
+              ctaLabel: 'View test results \u2192',
+              ctaUrl: dashboardUrl,
+            });
+            logger.info(`[TEST-RUN] Sent Telegram failure notification for test: ${testId}`);
+          }
+        } catch (tgError) {
+          logger.warn(`[TEST-RUN] Failed to send Telegram notification for test ${testId}:`, {
+            error: tgError instanceof Error ? tgError.message : String(tgError),
+          });
+        }
+      }
     } catch (notificationError) {
       logger.error(`[TEST-RUN] Failed to send failure notification for test ${testId}:`, notificationError);
     }

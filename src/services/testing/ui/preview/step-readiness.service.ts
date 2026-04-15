@@ -79,6 +79,77 @@ export interface LookaheadOptions {
    * likely needed that time to load data or render content.
    */
   recordedDelayMs?: number;
+  /**
+   * V15: Optional tracer for lookahead phase observability. When provided, each
+   * phase boundary emits a structured event — this is what lets operators answer
+   * "where did those 15 seconds go?" from the trace alone instead of combing
+   * through stdout. Callback shape matches EditorTraceService.writeLookahead* but
+   * we keep it structural here to avoid a circular import.
+   */
+  tracer?: LookaheadTracer;
+}
+
+/**
+ * V15: Lookahead tracer contract. Implement this (or pass the matching
+ * EditorTraceService methods) to get structured visibility into the
+ * inter-step wait. All methods are fire-and-forget — never throw.
+ */
+export interface LookaheadTracer {
+  start(data: {
+    nextStepId: string;
+    nextActionType: string;
+    prevActionType?: string;
+    prevUrl?: string;
+    maxWaitMs: number;
+    settleMs: number;
+    recordedDelayMs?: number;
+    plannedLocatorStrategies?: string[];
+  }): void;
+  phase(data: {
+    phase: string;
+    durationMs: number;
+    details?: Record<string, any>;
+    hardCapHit?: boolean;
+  }): void;
+  end(data: {
+    nextStepId: string;
+    ready: boolean;
+    totalDurationMs: number;
+    autoWaitApplied: boolean;
+    skipReason?: string;
+    navigationDetected?: boolean;
+    urlChanged?: boolean;
+    xhrInflightAtHandoff?: { count: number; urls: string[] };
+  }): void;
+  /** V15.1: Per-attempt diagnostic inside the retry loop. Optional (old callers compile). */
+  retryAttempt?(data: {
+    nextStepId: string;
+    attempt: number;
+    locatorCount: number;
+    perLocator: Array<{
+      index: number;
+      strategy?: string;
+      value?: string;
+      isVisible?: boolean;
+      isVisibleMs?: number;
+      isEnabled?: boolean;
+      isEnabledMs?: number;
+      count?: number;
+      countMs?: number;
+      hardCapHit?: boolean;
+      ready: boolean;
+    }>;
+    totalMs: number;
+    ready: boolean;
+  }): void;
+  /** V15.1: `pageSettle` timing between retry attempts. Optional. */
+  pageSettle?(data: {
+    context: 'retry_loop' | 'blind_settle' | 'post_nav';
+    budgetMs: number;
+    actualMs: number;
+    domStableThresholdMs: number;
+    budgetExhausted: boolean;
+  }): void;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -109,6 +180,12 @@ const NAVIGATION_TRIGGER_ACTIONS: Set<IntentActionType> = new Set([
   'press',
   'hover',     // V13: Hover can trigger dropdowns, menus, tooltips — next step needs DOM settle
   'navigate',  // goto triggers full page navigation, needs networkIdle + DOM settle
+  // V15.4: Actions that commonly trigger async DOM work the default 150ms
+  // settle misses. Adding them here gives them the navigation-grade settle
+  // (500ms) and enables SPA-nav race detection:
+  'scroll',          // infinite-scroll/lazy-load lists; horizontal carousels
+  'upload',          // file-upload triggers multipart request + progress UI
+  'drag_and_drop',   // drop handlers commonly open modals, create items, etc.
 ]);
 
 /** Action types that require visible + enabled */
@@ -143,6 +220,25 @@ const DOM_STABLE_THRESHOLD_MS = STEP_READINESS_CONFIG.domStableThresholdMs;
 const BLIND_SETTLE_MS = STEP_READINESS_CONFIG.blindSettleMs;
 const SPA_NAV_DETECT_MS = STEP_READINESS_CONFIG.spaNavDetectMs;
 const DEFAULTS = STEP_READINESS_CONFIG.defaults;
+
+/**
+ * Maximum time (ms) to wait for Cloudflare/reCAPTCHA/generic interstitial
+ * challenges to clear before proceeding. Configurable via env var for
+ * sites with heavier challenges (e.g. Turnstile on slow networks).
+ *
+ * Default: 7000ms. Set CHALLENGE_BUDGET_MS=12000 for slow sites.
+ * Invalid values (non-numeric, out of range 1000..60000) fall back to default.
+ */
+const CHALLENGE_BUDGET_MS = (() => {
+  const raw = process.env.CHALLENGE_BUDGET_MS;
+  if (!raw) return 7000;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1000 || parsed > 60000) {
+    // Silently fall back to default — prevent misconfig from breaking pipeline
+    return 7000;
+  }
+  return parsed;
+})();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DOM STABILITY THRESHOLD — DYNAMIC
@@ -185,26 +281,68 @@ async function detectSpaNavigation(
   prevUrl: string,
   timeoutMs: number
 ): Promise<boolean> {
+  // V15.5: Hybrid detection — `framenavigated` event gives instant signal for
+  // real navigations; URL polling catches pushState/replaceState (which don't
+  // fire framenavigated). Early-exit if URL stayed stable for QUICK_EXIT_MS —
+  // this spares 1.5s of wasted wait after non-navigating actions like scroll,
+  // upload, drag_and_drop where the URL almost never changes.
+  //
+  // Trade-off: if an SPA kicks off navigation AFTER our quick-exit window
+  // (e.g. debounced click handler fires at 500ms), we miss it. But the outer
+  // retry loop in waitForStepReadiness will still catch the eventual ready
+  // state via DOM settle. So missing a late SPA nav = small overhead, not
+  // a correctness bug.
+  const QUICK_EXIT_MS = 300; // Early-exit budget for clearly-stable URLs
   const deadline = Date.now() + timeoutMs;
   const pollInterval = 50;
+  const startTime = Date.now();
 
-  while (Date.now() < deadline) {
-    try {
-      const currentUrl = page.url();
-      if (currentUrl !== prevUrl) {
-        logger.debug('[STEP_READINESS] SPA navigation detected', {
-          from: prevUrl,
-          to: currentUrl,
-        });
+  // Listener path: `framenavigated` on the main frame is the authoritative
+  // signal for hard navigations (goto, redirects, location.assign).
+  let navigatedViaEvent = false;
+  const onFrameNavigated = (frame: import('playwright').Frame) => {
+    // Only main frame — iframe navigations don't change the tab URL.
+    if (frame === page.mainFrame()) {
+      navigatedViaEvent = true;
+    }
+  };
+  page.on('framenavigated', onFrameNavigated);
+
+  try {
+    while (Date.now() < deadline) {
+      // Event fired → done
+      if (navigatedViaEvent) {
+        logger.debug('[STEP_READINESS] SPA navigation detected (framenavigated)', { from: prevUrl });
         return true;
       }
-    } catch {
-      // Page may be in transition
-    }
-    await new Promise(r => setTimeout(r, pollInterval));
-  }
 
-  return false;
+      // URL poll catches pushState / replaceState
+      try {
+        const currentUrl = page.url();
+        if (currentUrl !== prevUrl) {
+          logger.debug('[STEP_READINESS] SPA navigation detected (url poll)', {
+            from: prevUrl,
+            to: currentUrl,
+          });
+          return true;
+        }
+      } catch {
+        // Page may be in transition
+      }
+
+      // Early-exit after stable window. Most non-navigating actions complete
+      // their synchronous work well under 300ms, so if URL hasn't changed by
+      // then, further polling is pure overhead.
+      if (Date.now() - startTime >= QUICK_EXIT_MS) {
+        return false;
+      }
+
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+    return false;
+  } finally {
+    try { page.off('framenavigated', onFrameNavigated); } catch { /* page closed */ }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -352,6 +490,177 @@ const ANIMATION_WAIT_TIMEOUT_MS = 1500;
 const OVERLAY_WAIT_TIMEOUT_MS = 1500;
 /** Max time to wait for iframe to load */
 const IFRAME_LOAD_TIMEOUT_MS = 2000;
+/**
+ * V15: Hard cap on a single locator.evaluate() / page.evaluate() inside the readiness
+ * pipeline. Playwright's default actionTimeout (30s) can fire twice in a row
+ * (animationComplete + isDisabledOrInert) when a compiled-plan locator does not
+ * match after SPA navigation — producing the observed 60s stall between steps.
+ * This cap guarantees the readiness check itself never exceeds its own budget,
+ * regardless of global actionTimeout settings.
+ */
+const EVALUATE_HARD_CAP_MS = 500;
+
+/**
+ * V15: Race any async operation against a short deadline. Used to cap
+ * locator.evaluate() / page.evaluate() inside the readiness check so a
+ * non-matching locator can never monopolize the inter-step budget.
+ * On timeout, resolves with the provided `onTimeout` value (fail-open).
+ */
+async function withHardCap<T>(
+  op: () => Promise<T>,
+  capMs: number,
+  onTimeout: T,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      op(),
+      new Promise<T>(resolve => {
+        timer = setTimeout(() => resolve(onTimeout), capMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * V15: Quick "is this locator actually in the DOM right now?" check.
+ * Uses locator.count() which is non-waiting in Playwright. Wrapped in a hard cap
+ * because count() can still block during CDP roundtrips on a busy page.
+ * Returns false on any failure — callers use this as a skip gate, not a signal.
+ */
+async function isLocatorAttachedFast(locator: Locator): Promise<boolean> {
+  try {
+    const count = await withHardCap(() => locator.count(), 250, -1);
+    return count > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * V15: Shadow DOM diagnostic.
+ * Called when the compiled locator is NOT attached. Playwright's user-facing locators
+ * (getByLabel / getByRole / getByPlaceholder / getByTestId / getByText) automatically
+ * pierce OPEN shadow roots — so if the locator miss is due to shadow DOM, it's usually
+ * either (a) a CSS locator that didn't opt in, or (b) a CLOSED shadow root (rare).
+ *
+ * We don't try to auto-recover — Playwright already handles the common case. Instead
+ * we surface a diagnostic so operators can see the page is shadow-heavy and the
+ * compiled plan may need a `getBy*` strategy instead of raw CSS.
+ *
+ * Returns { present, customTags, count } — all numbers bounded. Fail-open empty.
+ */
+interface ShadowDomInfo {
+  present: boolean;
+  /** Custom-element tags seen on the page (indicates web-component usage). Max 5 samples. */
+  customTags: string[];
+  /** Open shadow roots counted via tree-walk. Bounded at 50 to avoid runaway. */
+  openRoots: number;
+  /** Host elements whose shadowRoot is null (likely closed, or native like <details>). */
+  nullRootsOnCustom: number;
+}
+async function probeShadowDom(page: Page): Promise<ShadowDomInfo> {
+  const empty: ShadowDomInfo = { present: false, customTags: [], openRoots: 0, nullRootsOnCustom: 0 };
+  try {
+    const probed = await withHardCap(() => page.evaluate(() => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      const customTagsSet = new Set<string>();
+      let openRoots = 0;
+      let nullRootsOnCustom = 0;
+      const MAX_SCAN = 50; // bound the walk
+      // Breadth-first scan through the light DOM + any open shadow roots we find
+      const stack: any[] = [doc.body];
+      let scanned = 0;
+      while (stack.length && scanned < MAX_SCAN) {
+        const node: any = stack.shift();
+        if (!node) continue;
+        scanned++;
+        const children = node.children as ArrayLike<any> | undefined;
+        if (!children) continue;
+        for (let i = 0; i < children.length; i++) {
+          const el: any = children[i];
+          const tag: string = (el.tagName || '').toLowerCase();
+          if (tag.includes('-')) customTagsSet.add(tag);
+          const sr = el.shadowRoot;
+          if (sr) { openRoots++; stack.push(sr); }
+          else if (tag.includes('-')) { nullRootsOnCustom++; }
+          stack.push(el);
+        }
+      }
+      return {
+        present: openRoots > 0 || customTagsSet.size > 0,
+        customTags: Array.from(customTagsSet).slice(0, 5),
+        openRoots: Math.min(openRoots, MAX_SCAN),
+        nullRootsOnCustom: Math.min(nullRootsOnCustom, MAX_SCAN),
+      };
+    }), 400, empty);
+    // Defensive: nullish result (mocked evaluate, browser race) → safe default.
+    return probed ?? empty;
+  } catch {
+    return empty;
+  }
+}
+
+/**
+ * V15: Challenge-page detector (Cloudflare, reCAPTCHA interstitial, Vercel "just a moment").
+ * Called before the main readiness pipeline. On match, callers should widen the URL-change
+ * budget instead of waiting for elements on the challenge page — the challenge will redirect
+ * when done, and the target page's DOM will only exist after the redirect.
+ *
+ * Detection is structural (URL patterns + well-known selectors) — fail-open empty on any
+ * error so a probe failure never breaks a normal run.
+ */
+interface ChallengePageInfo {
+  detected: boolean;
+  /** Human-readable tag for logs. 'cloudflare' | 'recaptcha' | 'vercel' | 'generic-interstitial' */
+  kind?: string;
+}
+async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
+  const none: ChallengePageInfo = { detected: false };
+  try {
+    const url = page.url();
+    // URL-based early exit (no DOM roundtrip needed)
+    if (/\/cdn-cgi\/(challenge-platform|trace)/i.test(url)) return { detected: true, kind: 'cloudflare' };
+    if (/^https?:\/\/challenges\.cloudflare\.com\//i.test(url)) return { detected: true, kind: 'cloudflare' };
+
+    // DOM probe — cheap, capped at 400ms. If probe returns nullish (e.g. mocked
+    // page.evaluate returns undefined), treat as "not detected" — safer default.
+    const probed = await withHardCap(() => page.evaluate(() => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      // Cloudflare: challenge-running hook, cf-browser-verification, or turnstile wrapper
+      if (doc.querySelector('#cf-challenge-running, .cf-browser-verification, #challenge-form, [id*="cf-turnstile"]')) {
+        return { detected: true, kind: 'cloudflare' };
+      }
+      // reCAPTCHA full-page interstitial (not inline widget — those are fine)
+      const recapFrames = doc.querySelectorAll('iframe[src*="recaptcha"]');
+      if (recapFrames.length > 0) {
+        // Heuristic: interstitial = recaptcha iframe covers >50% viewport
+        for (let i = 0; i < recapFrames.length; i++) {
+          const f: any = recapFrames[i];
+          const r = f.getBoundingClientRect();
+          // @ts-expect-error - window in browser context
+          const vw = window.innerWidth || 1280, vh = window.innerHeight || 720;
+          if (r.width * r.height > vw * vh * 0.5) return { detected: true, kind: 'recaptcha' };
+        }
+      }
+      // Vercel "Just a moment" / generic verification wall
+      const text = (doc.body?.innerText || '').toLowerCase();
+      if (/checking your browser|just a moment|verifying you are human|please wait while we verify/i.test(text)) {
+        return { detected: true, kind: 'generic-interstitial' };
+      }
+      return { detected: false };
+    }), 400, none);
+    // Defensive: if the browser returned nullish (e.g. mocked page.evaluate or
+    // Playwright race returned undefined), fall back to the "not detected" shape.
+    return probed ?? none;
+  } catch {
+    return none;
+  }
+}
 
 /**
  * Check for loading indicators on the page (spinners, skeletons, aria-busy, progressbar).
@@ -369,7 +678,9 @@ const IFRAME_LOAD_TIMEOUT_MS = 2000;
  */
 async function hasLoadingIndicators(page: Page): Promise<boolean> {
   try {
-    return await page.evaluate(() => {
+    // V15: Hard-cap — page.evaluate can stall during SPA bootstrap/hydration
+    // when Angular/React has not yet yielded the main thread. Fail-open = "no loader".
+    return await withHardCap(() => page.evaluate(() => {
       // @ts-expect-error - browser context
       const doc = document;
       // @ts-expect-error - browser context
@@ -436,7 +747,7 @@ async function hasLoadingIndicators(page: Page): Promise<boolean> {
       if (testIdLoading && isReallyVisible(testIdLoading)) return true;
 
       return false;
-    });
+    }), EVALUATE_HARD_CAP_MS, false);
   } catch {
     return false; // Page navigating or closed
   }
@@ -570,7 +881,10 @@ async function waitForElementAnimationComplete(
 
   while (Date.now() < deadline) {
     try {
-      const isAnimating = await locator.evaluate((el) => {
+      // V15: Hard-cap locator.evaluate — Playwright's default actionTimeout (30s)
+      // kicks in when the locator doesn't match, which alone is longer than this
+      // function's entire budget. Fail-open on timeout = "assume not animating".
+      const isAnimating = await withHardCap(() => locator.evaluate((el) => {
         // @ts-expect-error - browser context
         const win = window;
         const style = win.getComputedStyle(el);
@@ -604,7 +918,7 @@ async function waitForElementAnimationComplete(
         }
 
         return false;
-      });
+      }), EVALUATE_HARD_CAP_MS, false);
 
       if (!isAnimating) return;
     } catch {
@@ -626,7 +940,9 @@ async function waitForElementAnimationComplete(
  */
 async function isElementObstructed(locator: Locator, page: Page): Promise<boolean> {
   try {
-    const box = await locator.boundingBox();
+    // V15: boundingBox() waits for locator to be visible (up to default actionTimeout).
+    // Hard-cap it so a stale ref can't eat 30s. Null return = no bbox = skip check.
+    const box = await withHardCap(() => locator.boundingBox(), EVALUATE_HARD_CAP_MS, null);
     if (!box) return false; // No bounding box → can't check
 
     const centerX = box.x + box.width / 2;
@@ -634,10 +950,15 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
 
     // Set marker to identify target
     const marker = `__sr_overlay_${Date.now()}`;
-    await locator.evaluate((el, attr) => el.setAttribute(attr, '1'), marker);
+    const attrSet = await withHardCap(
+      () => locator.evaluate((el, attr) => el.setAttribute(attr, '1'), marker).then(() => true),
+      EVALUATE_HARD_CAP_MS,
+      false,
+    );
+    if (!attrSet) return false; // Can't tag element → skip obstruction check
 
     try {
-      const obstructed = await page.evaluate(
+      const obstructed = await withHardCap(() => page.evaluate(
         ({ x, y, attr }: { x: number; y: number; attr: string }) => {
           // @ts-ignore - browser context
           const hitEl = document.elementFromPoint(x, y);
@@ -646,10 +967,15 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
           return hitEl.closest(`[${attr}]`) === null;
         },
         { x: centerX, y: centerY, attr: marker }
-      );
+      ), EVALUATE_HARD_CAP_MS, false);
       return obstructed;
     } finally {
-      await locator.evaluate((el, attr) => el.removeAttribute(attr), marker).catch(() => {});
+      // Best-effort cleanup — don't block on it
+      withHardCap(
+        () => locator.evaluate((el, attr) => el.removeAttribute(attr), marker),
+        EVALUATE_HARD_CAP_MS,
+        undefined,
+      ).catch(() => {});
     }
   } catch {
     return false; // Can't check → assume not obstructed
@@ -663,7 +989,10 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
  */
 async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
   try {
-    return await locator.evaluate((el: any) => {
+    // V15: Hard-cap the evaluate. If the locator doesn't match (stale ref, compiled
+    // plan miss, SPA mid-hydration), Playwright would otherwise wait 30s for it to
+    // appear — blowing the whole readiness budget. Fail-open on timeout = "assume enabled".
+    return await withHardCap(() => locator.evaluate((el: any) => {
       if (el.disabled === true) return true;
       if (el.getAttribute('aria-disabled') === 'true') return true;
       if (el.readOnly === true && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return true;
@@ -679,7 +1008,7 @@ async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
         if (style.pointerEvents === 'none') return true;
       }
       return false;
-    });
+    }), EVALUATE_HARD_CAP_MS, false);
   } catch {
     return false;
   }
@@ -708,7 +1037,9 @@ async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
-      const allReady = await page.evaluate(() => {
+      // V15: Hard-cap — same reasoning as hasLoadingIndicators. Fail-open = "ready"
+      // so the outer loop exits and the caller continues.
+      const allReady = await withHardCap(() => page.evaluate(() => {
         // @ts-expect-error - browser context
         const iframes = document.querySelectorAll('iframe:not([aria-hidden="true"])');
         for (const iframe of iframes) {
@@ -724,7 +1055,7 @@ async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise
           }
         }
         return true;
-      });
+      }), EVALUATE_HARD_CAP_MS, true);
 
       if (allReady) return;
       await new Promise(r => setTimeout(r, 300));
@@ -788,16 +1119,45 @@ async function comprehensiveReadinessCheck(
     overlayClear: true, elementEnabled: true, iframeReady: true,
   };
 
-  // Phase 1: Page-level checks in parallel (loading + API idle + toast + iframe)
+  // Phase 1: Page-level checks in parallel (visible loaders + iframe)
   const needsFullReady = NEEDS_VISIBLE_ENABLED.has(actionType) || NEEDS_VISIBLE_ONLY.has(actionType);
 
+  // V15: Passive XHR observer — counts in-flight fetch/xhr for diagnostics only.
+  // NOT a blocker. Rationale: waiting for API idle proved to be redundant in practice:
+  //   - visible loaders / skeletons are caught by hasLoadingIndicators
+  //   - disabled forms are caught by isElementDisabledOrInert
+  //   - elements not yet rendered are caught by the Phase 3 retry loop (isVisible/isEnabled)
+  //   - Playwright's own .fill()/.click() actionability is the final safety net
+  // API-idle additionally has blind spots (cross-origin APIs, WebSocket, SSE) and false
+  // "immediately idle" states when the XHR fires *after* our check starts. We log what
+  // was in flight so regressions can be diagnosed, but do not wait on it.
+  const inflight = new Set<string>();
+  let pageOrigin = '';
+  try { pageOrigin = new URL(page.url()).origin; } catch { /* non-critical */ }
+  const onReq = (req: { resourceType: () => string; url: () => string }) => {
+    const type = req.resourceType();
+    if (type !== 'fetch' && type !== 'xhr') return;
+    const url = req.url();
+    // Same-origin only for signal — cross-origin observers add noise
+    if (pageOrigin) {
+      try { if (new URL(url).origin !== pageOrigin) return; } catch { return; }
+    }
+    inflight.add(url);
+  };
+  const onDone = (req: { url: () => string }) => { inflight.delete(req.url()); };
+  page.on('request', onReq);
+  page.on('requestfinished', onDone);
+  page.on('requestfailed', onDone);
+
+  try {
   if (needsFullReady) {
     const loadingTimeout = Math.min(LOADING_INDICATOR_TIMEOUT_MS, remainingMs);
-    const apiTimeout = Math.min(API_IDLE_TIMEOUT_MS, remainingMs);
     const iframeTimeout = Math.min(IFRAME_LOAD_TIMEOUT_MS, remainingMs);
 
     await Promise.allSettled([
-      // Loading indicators
+      // Visible loading indicators (spinners, skeletons, aria-busy, progressbar).
+      // This is the real signal that the page is still loading data — much more
+      // reliable than raw XHR counting, because it reflects UX state.
       hasLoadingIndicators(page).then(async (hasLoading) => {
         if (hasLoading) {
           logger.debug('[STEP_READINESS] Loading indicators detected, waiting...');
@@ -805,21 +1165,42 @@ async function comprehensiveReadinessCheck(
           result.loadingCleared = !(await hasLoadingIndicators(page));
         }
       }),
-      // API idle
-      waitForApiIdle(page, apiTimeout).then(() => {
-        result.apiIdle = true;
-      }).catch(() => {
-        result.apiIdle = false;
-      }),
-      // Iframe readiness
+      // Iframe readiness (Stripe, reCAPTCHA, OAuth popups)
       waitForIframeContentReady(page, iframeTimeout).catch(() => {
         result.iframeReady = false;
       }),
     ]);
   }
 
+  // V15: Pre-check — is the target locator actually in the DOM right now?
+  // Compiled-plan label/placeholder locators often miss on a freshly navigated SPA
+  // page (Angular mid-hydration). If the locator isn't attached, animation/disabled/
+  // overlay checks on it would each pay Playwright's 30s action timeout, blowing
+  // the entire readiness budget. Skip element-level checks in that case — the outer
+  // retry loop in waitForStepReadiness will handle waiting for the element itself.
+  const targetAttached = locators.length > 0
+    ? await isLocatorAttachedFast(locators[0])
+    : false;
+
+  // V15: Shadow DOM diagnostic — when the locator isn't attached, check if the page
+  // uses web components. Playwright's getByLabel/getByRole/etc. auto-pierce OPEN shadow
+  // roots, so a miss usually means either: (a) closed shadow root, or (b) the compiled
+  // plan uses raw CSS that didn't opt in. We don't auto-recover — just log the signal
+  // so operators can see shadow-heavy pages and tune locator strategy if needed.
+  if (locators.length > 0 && !targetAttached) {
+    const shadow = await probeShadowDom(page);
+    if (shadow.present) {
+      logger.info('[STEP_READINESS] Locator not attached on shadow-DOM page', {
+        openRoots: shadow.openRoots,
+        customTags: shadow.customTags,
+        nullRootsOnCustom: shadow.nullRootsOnCustom,
+        hint: 'If the next step fails to find the element, prefer getByRole/getByLabel/getByPlaceholder over raw CSS — they auto-pierce open shadow roots.',
+      });
+    }
+  }
+
   // Phase 2: Target element animation (only if we have a locator and action needs interaction)
-  if (locators.length > 0 && NEEDS_VISIBLE_ENABLED.has(actionType)) {
+  if (targetAttached && NEEDS_VISIBLE_ENABLED.has(actionType)) {
     const animTimeout = Math.min(ANIMATION_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 1000));
     if (animTimeout > 200) {
       try {
@@ -833,7 +1214,7 @@ async function comprehensiveReadinessCheck(
   // Phase 3: Element-level checks (disabled/inert + overlay)
   const clickLikeActions: Set<IntentActionType> = new Set(['click', 'dblclick', 'contextmenu', 'check', 'uncheck', 'toggle', 'open', 'close']);
 
-  if (locators.length > 0 && NEEDS_VISIBLE_ENABLED.has(actionType)) {
+  if (targetAttached && NEEDS_VISIBLE_ENABLED.has(actionType)) {
     // Check disabled/inert state (common: button disabled during form submission)
     const disabledTimeout = Math.min(3000, Math.max(0, remainingMs - 500));
     if (disabledTimeout > 200) {
@@ -847,7 +1228,7 @@ async function comprehensiveReadinessCheck(
   }
 
   // Phase 4: Overlay obstruction (only for click-like actions)
-  if (locators.length > 0 && clickLikeActions.has(actionType)) {
+  if (targetAttached && clickLikeActions.has(actionType)) {
     const overlayTimeout = Math.min(OVERLAY_WAIT_TIMEOUT_MS, Math.max(0, remainingMs - 500));
     if (overlayTimeout > 200) {
       const obstructed = await isElementObstructed(locators[0], page);
@@ -859,7 +1240,22 @@ async function comprehensiveReadinessCheck(
     }
   }
 
-  return result;
+    return result;
+  } finally {
+    // V15: Diagnostic log only — we do NOT wait on these. Surfaces slow APIs
+    // so regressions can be traced without blocking the step pipeline.
+    if (inflight.size > 0) {
+      logger.debug('[STEP_READINESS] XHR still in flight (not blocking)', {
+        count: inflight.size,
+        urls: Array.from(inflight).slice(0, 5),
+      });
+    }
+    try {
+      page.off('request', onReq);
+      page.off('requestfinished', onDone);
+      page.off('requestfailed', onDone);
+    } catch { /* page may be closed */ }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -924,12 +1320,42 @@ function buildFastLocators(page: Page, step: IntentStep): Locator[] {
   }
 
   // Priority 2: Fallback to evidence.lastSuccessRef
-  // Skip if ref looks like a preview/background ref (not a stable CSS selector)
+  //
+  // We use this only when the compiled plan is empty (no role/label/testid/css
+  // strategies) — it provides a precondition check via the retry loop so the
+  // step isn't just blind-settled into an executor that may then wait 30s on
+  // a not-yet-rendered element.
+  //
+  // V15.6: Two guards (one stricter than the previous pattern-match):
+  //   1. Reject preview/background ref IDs by pattern — data-agent-ref values
+  //      like "e6", "s12", "bg-1" don't exist during background replay and
+  //      are DOM-counter-unstable across page reloads.
+  //   2. Reject stale evidence by TTL — even a "valid-looking" ref from a
+  //      long-ago recording points at a different element after DOM re-renders.
+  //      When capturedAt is missing (legacy records), we skip the TTL check
+  //      but the pattern check still runs.
+  // Anything that passes both guards is used as a data-agent-ref CSS locator
+  // (same as before). Semantic validation is NOT done here — it's done at
+  // evidence-shortcut time in intent-step-lint and command-executor; here we
+  // only need a cheap existence check for the retry loop.
   if (step.evidence?.lastSuccessRef) {
     const ref = step.evidence.lastSuccessRef;
-    // data-agent-ref values (e.g. "e6", "bg-1") don't exist during replay — skip
+    // Guard 1: preview/background ref patterns (fragile DOM counters)
     if (/^(e\d+|s\d+|bg-\d+)$/.test(ref)) {
       return locators;
+    }
+    // Guard 2: TTL — evidence older than 60 min cannot be trusted
+    const EVIDENCE_REF_TTL_MS = 60 * 60 * 1000;
+    if (step.evidence.capturedAt) {
+      const ageMs = Date.now() - new Date(step.evidence.capturedAt).getTime();
+      if (Number.isFinite(ageMs) && ageMs > EVIDENCE_REF_TTL_MS) {
+        logger.debug('[STEP_READINESS] Evidence ref skipped as fallback — older than TTL', {
+          stepId: step.id,
+          ageMs,
+          ttlMs: EVIDENCE_REF_TTL_MS,
+        });
+        return locators;
+      }
     }
     try {
       const escapedRef = ref.replace(/"/g, '\\"');
@@ -953,35 +1379,100 @@ function buildFastLocators(page: Page, step: IntentStep): Locator[] {
  * Uses ONLY fast Playwright checks — no LLM or AI.
  * Playwright's isVisible()/isEnabled()/count() are non-waiting and return instantly.
  */
+/**
+ * V15.1: Diagnostic payload for a single locator's precondition check. Exposed
+ * so the retry loop can emit per-locator events into the trace.
+ */
+interface PreconditionDiag {
+  ready: boolean;
+  isVisible?: boolean;
+  isVisibleMs?: number;
+  isEnabled?: boolean;
+  isEnabledMs?: number;
+  count?: number;
+  countMs?: number;
+  hardCapHit?: boolean;
+}
+
 async function checkPreconditionsSingle(
   locator: Locator,
-  actionType: IntentActionType
+  actionType: IntentActionType,
+  diag?: PreconditionDiag,
 ): Promise<boolean> {
+  // V15 CRITICAL FIX: Playwright's Locator.isVisible() / isEnabled() are NOT
+  // non-waiting when the locator doesn't match. They run actionability checks
+  // (including state polling) with the default actionTimeout (30s). A stale or
+  // mis-recorded compiled locator (e.g. getByLabel("Логин") on an Angular page
+  // where the label isn't wired to the input) will block here for a full 30s
+  // PER CALL — that's exactly the "retry_loop: 30011ms, attempts: 1" symptom
+  // we observed in the trace.
+  //
+  // Hard-cap every locator check at 500ms. Fail-open = "not ready" so the
+  // outer loop either retries (under budget) or exits cleanly (over budget).
+  // V15.1: Populate the `diag` object so callers can emit per-locator trace
+  // events (they measure ms so we can see which subcheck hit the cap).
+  const CHECK_CAP_MS = 500;
   try {
     if (NEEDS_VISIBLE_ENABLED.has(actionType)) {
+      const visStart = Date.now();
+      const enStart = Date.now();
       const [isVisible, isEnabled] = await Promise.all([
-        locator.isVisible(),
-        locator.isEnabled(),
+        withHardCap(() => locator.isVisible(), CHECK_CAP_MS, false),
+        withHardCap(() => locator.isEnabled(), CHECK_CAP_MS, false),
       ]);
-      return isVisible && isEnabled;
+      const visMs = Date.now() - visStart;
+      const enMs = Date.now() - enStart;
+      if (diag) {
+        diag.isVisible = isVisible;
+        diag.isVisibleMs = visMs;
+        diag.isEnabled = isEnabled;
+        diag.isEnabledMs = enMs;
+        // Heuristic: if either check pinned near the cap AND returned false,
+        // that's almost certainly a fail-open — a genuine false is instant.
+        diag.hardCapHit = (visMs >= CHECK_CAP_MS - 50 && !isVisible)
+          || (enMs >= CHECK_CAP_MS - 50 && !isEnabled);
+      }
+      const ready = isVisible && isEnabled;
+      if (diag) diag.ready = ready;
+      return ready;
     }
 
     if (NEEDS_VISIBLE_ONLY.has(actionType)) {
-      return await locator.isVisible();
+      const visStart = Date.now();
+      const isVisible = await withHardCap(() => locator.isVisible(), CHECK_CAP_MS, false);
+      const visMs = Date.now() - visStart;
+      if (diag) {
+        diag.isVisible = isVisible;
+        diag.isVisibleMs = visMs;
+        diag.hardCapHit = visMs >= CHECK_CAP_MS - 50 && !isVisible;
+        diag.ready = isVisible;
+      }
+      return isVisible;
     }
 
     if (NEEDS_ATTACHED_ONLY.has(actionType)) {
-      const count = await locator.count();
-      return count > 0;
+      const countStart = Date.now();
+      const count = await withHardCap(() => locator.count(), CHECK_CAP_MS, 0);
+      const countMs = Date.now() - countStart;
+      const ready = count > 0;
+      if (diag) {
+        diag.count = count;
+        diag.countMs = countMs;
+        diag.hardCapHit = countMs >= CHECK_CAP_MS - 50 && count === 0;
+        diag.ready = ready;
+      }
+      return ready;
     }
 
     // Unknown action type — assume ready
+    if (diag) diag.ready = true;
     return true;
   } catch (error) {
     logger.debug('[STEP_READINESS] Precondition check failed', {
       actionType,
       error: error instanceof Error ? error.message : String(error),
     });
+    if (diag) diag.ready = false;
     return false;
   }
 }
@@ -994,11 +1485,13 @@ async function checkPreconditionsSingle(
  */
 async function checkPreconditions(
   locators: Locator[],
-  actionType: IntentActionType
+  actionType: IntentActionType,
+  /** V15.1: Optional per-locator diagnostic buckets (same order as `locators`). */
+  diagBuckets?: PreconditionDiag[],
 ): Promise<boolean> {
-  // Check all locators in parallel (isVisible/isEnabled are instant)
+  // Check all locators in parallel (each call internally hard-capped at 500ms).
   const results = await Promise.all(
-    locators.map(loc => checkPreconditionsSingle(loc, actionType))
+    locators.map((loc, i) => checkPreconditionsSingle(loc, actionType, diagBuckets?.[i]))
   );
   return results.some(r => r);
 }
@@ -1040,7 +1533,30 @@ export async function waitForStepReadiness(
     prevActionType,
     prevUrl,
     recordedDelayMs,
+    tracer,
   } = options;
+
+  // V15: All tracer calls go through this safe wrapper — a broken tracer must
+  // never take down the step pipeline.
+  const trace = {
+    start: (data: Parameters<LookaheadTracer['start']>[0]) => {
+      try { tracer?.start(data); } catch { /* non-fatal */ }
+    },
+    phase: (data: Parameters<LookaheadTracer['phase']>[0]) => {
+      try { tracer?.phase(data); } catch { /* non-fatal */ }
+    },
+    end: (data: Parameters<LookaheadTracer['end']>[0]) => {
+      try { tracer?.end(data); } catch { /* non-fatal */ }
+    },
+    // V15.1: Extra-detailed events. Guarded with `?.` because old callers may
+    // implement only the original 3 methods.
+    retryAttempt: (data: NonNullable<Parameters<NonNullable<LookaheadTracer['retryAttempt']>>[0]>) => {
+      try { tracer?.retryAttempt?.(data); } catch { /* non-fatal */ }
+    },
+    pageSettle: (data: NonNullable<Parameters<NonNullable<LookaheadTracer['pageSettle']>>[0]>) => {
+      try { tracer?.pageSettle?.(data); } catch { /* non-fatal */ }
+    },
+  };
 
   // Dynamic DOM stability threshold based on prev action risk
   const domStableThresholdMs = getDomStableThresholdMs(prevActionType, domStableOverride);
@@ -1071,6 +1587,95 @@ export async function waitForStepReadiness(
     return { ready: true, waited: 0, autoWaitApplied: false, skipReason: `Non-targeting action: ${nextStep.type}` };
   }
 
+  // V15: tracer start — emits structured lookahead opening so all subsequent
+  // phase events can be correlated to this step.
+  const plannedStrategies = (nextStep.compiled?.locatorPlan ?? [])
+    .map(e => e.strategy);
+  trace.start({
+    nextStepId: nextStep.id,
+    nextActionType: nextStep.type,
+    prevActionType,
+    prevUrl,
+    maxWaitMs,
+    settleMs,
+    recordedDelayMs,
+    plannedLocatorStrategies: plannedStrategies.length ? plannedStrategies : undefined,
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V15 Phase 0: Challenge / interstitial detection (Cloudflare, reCAPTCHA, etc.)
+  // If we're currently on a challenge page, waiting for the next step's elements
+  // is pointless — those elements only exist AFTER the challenge redirects us.
+  // Instead, widen the URL-change watcher and return once we land on a new URL.
+  // Budget: up to CHALLENGE_BUDGET_MS (default 7s, configurable via env) — challenges typically take 3-5s.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const challengeStart = Date.now();
+  const challenge = await detectChallengePage(page);
+  trace.phase({
+    phase: 'challenge_detection',
+    durationMs: Date.now() - challengeStart,
+    details: { detected: challenge.detected, kind: challenge.kind },
+  });
+  if (challenge.detected) {
+    const challengeUrl = page.url();
+    const challengeBudget = Math.min(CHALLENGE_BUDGET_MS, maxWaitMs - (Date.now() - startTime));
+    logger.info('[STEP_READINESS] Challenge/interstitial detected — widening URL-change watch', {
+      stepId: nextStep.id,
+      kind: challenge.kind,
+      challengeUrl,
+      budget: challengeBudget,
+    });
+    if (challengeBudget > 300) {
+      const waitStart = Date.now();
+      const redirected = await detectSpaNavigation(page, challengeUrl, challengeBudget);
+      if (redirected) {
+        // Landed on a new URL — give DOM a brief settle, then let Phase 3 / the
+        // step's own locator strategy handle the real target.
+        try {
+          await page.waitForLoadState('domcontentloaded', { timeout: 1500 });
+        } catch { /* non-fatal */ }
+      }
+      trace.phase({
+        phase: 'challenge_wait',
+        durationMs: Date.now() - waitStart,
+        details: { kind: challenge.kind, redirected, newUrl: page.url() },
+      });
+      const waited = Date.now() - startTime;
+      if (redirected) {
+        logger.info('[STEP_READINESS] Challenge cleared — proceeding to next step', {
+          stepId: nextStep.id,
+          newUrl: page.url(),
+          waited,
+        });
+      } else {
+        logger.warn('[STEP_READINESS] Challenge did not clear within budget', {
+          stepId: nextStep.id,
+          kind: challenge.kind,
+          waited,
+        });
+      }
+      const result = {
+        ready: redirected,
+        waited,
+        autoWaitApplied: waited > autoWaitThresholdMs,
+        navigationDetected: redirected,
+        urlChanged: redirected,
+        skipReason: redirected ? undefined : `Challenge page (${challenge.kind}) did not clear`,
+      };
+      trace.end({
+        nextStepId: nextStep.id,
+        ready: result.ready,
+        totalDurationMs: waited,
+        autoWaitApplied: result.autoWaitApplied,
+        skipReason: result.skipReason,
+        navigationDetected: result.navigationDetected,
+        urlChanged: result.urlChanged,
+      });
+      return result;
+    }
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Phase 1: SPA navigation detection
   // Runs only after actions that commonly trigger route changes.
@@ -1084,7 +1689,13 @@ export async function waitForStepReadiness(
     const spaWaitMs = Math.min(SPA_NAV_DETECT_MS, remainingMs);
 
     if (spaWaitMs > 0) {
+      const spaStart = Date.now();
       navigationDetected = await detectSpaNavigation(page, prevUrl, spaWaitMs);
+      trace.phase({
+        phase: 'spa_nav_detection',
+        durationMs: Date.now() - spaStart,
+        details: { budgetMs: spaWaitMs, detected: navigationDetected, prevUrl },
+      });
 
       if (navigationDetected) {
         // Navigation happened → wait for DOM to be ready (not networkIdle — images/fonts irrelevant).
@@ -1092,15 +1703,22 @@ export async function waitForStepReadiness(
         const postNavMs = Math.min(settleMs, maxWaitMs - (Date.now() - startTime));
         if (postNavMs > 0) {
           logger.debug('[STEP_READINESS] Post-navigation DOM settle', { postNavMs });
+          const settleStart = Date.now();
+          let dceFired = true;
           try {
             await page.waitForLoadState('domcontentloaded', { timeout: postNavMs });
           } catch {
-            // Timeout acceptable — DOM may still be usable
+            dceFired = false; // Timeout acceptable — DOM may still be usable
           }
           const remainingAfterDce = Math.min(postNavMs, maxWaitMs - (Date.now() - startTime));
           if (remainingAfterDce > 0) {
             await waitForDOMStable(page, remainingAfterDce, domStableThresholdMs);
           }
+          trace.phase({
+            phase: 'post_nav_settle',
+            durationMs: Date.now() - settleStart,
+            details: { budgetMs: postNavMs, domcontentloadedFired: dceFired },
+          });
         }
       }
     }
@@ -1122,9 +1740,21 @@ export async function waitForStepReadiness(
   let readinessChecks: ReadinessCheckResult | undefined;
   const remainingForReadiness = maxWaitMs - (Date.now() - startTime);
   if (remainingForReadiness > 500) {
+    const checkStart = Date.now();
     readinessChecks = await comprehensiveReadinessCheck(
       page, locators, nextStep.type, remainingForReadiness
     );
+    trace.phase({
+      phase: 'page_readiness',
+      durationMs: Date.now() - checkStart,
+      details: {
+        loadingCleared: readinessChecks.loadingCleared,
+        iframeReady: readinessChecks.iframeReady,
+        animationDone: readinessChecks.animationDone,
+        elementEnabled: readinessChecks.elementEnabled,
+        overlayClear: readinessChecks.overlayClear,
+      },
+    });
 
     const anyBlocked = !readinessChecks.loadingCleared || !readinessChecks.apiIdle
       || !readinessChecks.elementEnabled || !readinessChecks.iframeReady;
@@ -1144,10 +1774,16 @@ export async function waitForStepReadiness(
       hasEvidence: !!nextStep.evidence?.lastSuccessRef,
     });
 
+    const blindStart = Date.now();
     await blindSettle(page, domStableThresholdMs);
+    trace.phase({
+      phase: 'blind_settle',
+      durationMs: Date.now() - blindStart,
+      details: { hasCompiled: !!nextStep.compiled, hasEvidence: !!nextStep.evidence?.lastSuccessRef },
+    });
 
     const waited = Date.now() - startTime;
-    return {
+    const result = {
       ready: true, // We don't know, but we waited — let executor try
       waited,
       autoWaitApplied: waited > autoWaitThresholdMs,
@@ -1156,6 +1792,16 @@ export async function waitForStepReadiness(
       readinessChecks,
       urlChanged: navigationDetected,
     };
+    trace.end({
+      nextStepId: nextStep.id,
+      ready: result.ready,
+      totalDurationMs: waited,
+      autoWaitApplied: result.autoWaitApplied,
+      skipReason: result.skipReason,
+      navigationDetected: result.navigationDetected,
+      urlChanged: result.urlChanged,
+    });
+    return result;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1175,6 +1821,7 @@ export async function waitForStepReadiness(
 
   let attempt = 0;
   let ready = false;
+  const retryLoopStart = Date.now();
 
   while (attempt <= maxRetries) {
     const elapsed = Date.now() - startTime;
@@ -1189,10 +1836,48 @@ export async function waitForStepReadiness(
       break;
     }
 
-    ready = await checkPreconditions(locators, nextStep.type);
+    const attemptStart = Date.now();
+    // V15.1: Collect per-locator diagnostics so the trace shows WHICH locator
+    // and WHICH sub-check (visible/enabled) burned the time. Without this the
+    // retry_loop event shows only `attempts: 1, durationMs: 30011` and we have
+    // no way to know if it was locator[0] or locator[1] that stalled.
+    const diagBuckets: PreconditionDiag[] = locators.map(() => ({ ready: false }));
+    ready = await checkPreconditions(locators, nextStep.type, diagBuckets);
+    const attemptDur = Date.now() - attemptStart;
+
+    // Emit per-attempt diagnostic. Reference the compiled plan entries (if any)
+    // so the consumer can correlate "locator index 0 / strategy=label" — this is
+    // what makes it obvious a stale `getByLabel("Логин")` was the 30s culprit.
+    //
+    // V15.1: Cap perLocator array at 5 entries. On steps with large compiled
+    // plans (10+ locators × 3-5 retry attempts = 30-50 perLocator arrays per
+    // step) the trace would bloat unnecessarily — the first few locators
+    // dominate the timing signal, slow ones show up in the hardCapHit flag.
+    const PER_LOCATOR_CAP = 5;
+    const planEntries = (nextStep.compiled?.locatorPlan ?? []).filter(e => e.strategy !== 'ref');
+    const perLocator = diagBuckets.slice(0, PER_LOCATOR_CAP).map((d, i) => ({
+      index: i,
+      strategy: planEntries[i]?.strategy,
+      value: planEntries[i]?.value?.slice(0, 80),
+      ...d,
+    }));
+    trace.retryAttempt({
+      nextStepId: nextStep.id,
+      attempt: attempt + 1,
+      locatorCount: locators.length,
+      perLocator,
+      totalMs: attemptDur,
+      ready,
+    });
 
     if (ready) {
       const waited = Date.now() - startTime;
+
+      trace.phase({
+        phase: 'retry_loop',
+        durationMs: Date.now() - retryLoopStart,
+        details: { attempts: attempt + 1, finalState: 'ready', lastAttemptMs: attemptDur },
+      });
 
       // V14: Inter-step delay enforcement — if user waited longer during recording,
       // the page likely needs that time (lazy-loaded data, slow API, debounced render).
@@ -1208,6 +1893,11 @@ export async function waitForStepReadiness(
             additionalWaitMs: remaining,
           });
           await new Promise(r => setTimeout(r, remaining));
+          trace.phase({
+            phase: 'recording_delay_enforced',
+            durationMs: remaining,
+            details: { recordedDelayMs, minWaitFromRecording },
+          });
         }
       }
 
@@ -1217,7 +1907,7 @@ export async function waitForStepReadiness(
         waited: totalWaited,
         attempts: attempt,
       });
-      return {
+      const result = {
         ready: true,
         waited: totalWaited,
         autoWaitApplied: totalWaited > autoWaitThresholdMs,
@@ -1225,6 +1915,15 @@ export async function waitForStepReadiness(
         readinessChecks,
         urlChanged: navigationDetected,
       };
+      trace.end({
+        nextStepId: nextStep.id,
+        ready: result.ready,
+        totalDurationMs: totalWaited,
+        autoWaitApplied: result.autoWaitApplied,
+        navigationDetected: result.navigationDetected,
+        urlChanged: result.urlChanged,
+      });
+      return result;
     }
 
     // Element not ready — apply page settle with dynamic threshold and retry
@@ -1239,11 +1938,31 @@ export async function waitForStepReadiness(
     const thisSettleMs = Math.min(settleMs, remainingTime);
 
     if (thisSettleMs > 0) {
+      // V15.1: Measure the settle so a runaway-mutating SPA (never goes quiet)
+      // can be spotted. `budgetExhausted` = we hit the cap without the observer
+      // reporting DOM-quiet, meaning the page kept mutating.
+      const settleStart = Date.now();
       await pageSettle(page, thisSettleMs, domStableThresholdMs);
+      const settleActual = Date.now() - settleStart;
+      trace.pageSettle({
+        context: 'retry_loop',
+        budgetMs: thisSettleMs,
+        actualMs: settleActual,
+        domStableThresholdMs,
+        // Settle returns when quiet is observed OR budget expires. If we used
+        // ≥90% of budget, the observer never saw quiet.
+        budgetExhausted: settleActual >= thisSettleMs * 0.9,
+      });
     }
 
     attempt++;
   }
+
+  trace.phase({
+    phase: 'retry_loop',
+    durationMs: Date.now() - retryLoopStart,
+    details: { attempts: attempt, finalState: ready ? 'ready' : 'timeout' },
+  });
 
   // ─────────────────────────────────────────────────────────────────────────
   // Final result (element still not ready after all retries)
@@ -1260,7 +1979,7 @@ export async function waitForStepReadiness(
     navigationDetected,
   });
 
-  return {
+  const result = {
     ready,
     waited,
     autoWaitApplied: waited > autoWaitThresholdMs,
@@ -1268,6 +1987,15 @@ export async function waitForStepReadiness(
     readinessChecks,
     urlChanged: navigationDetected,
   };
+  trace.end({
+    nextStepId: nextStep.id,
+    ready: result.ready,
+    totalDurationMs: waited,
+    autoWaitApplied: result.autoWaitApplied,
+    navigationDetected: result.navigationDetected,
+    urlChanged: result.urlChanged,
+  });
+  return result;
 }
 
 /**

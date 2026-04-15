@@ -471,6 +471,322 @@ export class EditorTraceService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // V15: LOOKAHEAD / STEP READINESS EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+  // These make the inter-step gap observable. Before V15 there was a black hole
+  // between "step N passed" and "step N+1 started" — if a phase stalled (e.g.
+  // Playwright's default 30s actionTimeout firing twice), the only signal was
+  // total elapsed time. Now each phase emits its own event so regressions like
+  // the 60s stall we debugged can be identified in <5 seconds.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Lookahead started for the next step. */
+  writeLookaheadStart(data: {
+    nextStepId: string;
+    nextActionType: string;
+    prevActionType?: string;
+    prevUrl?: string;
+    maxWaitMs: number;
+    settleMs: number;
+    recordedDelayMs?: number;
+    /** Strategies present in nextStep.compiled.locatorPlan (for diagnosing plan quality). */
+    plannedLocatorStrategies?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'lookahead',
+      eventType: 'lookahead_start',
+      payload: data,
+    });
+  }
+
+  /**
+   * A single lookahead phase finished. `phase` names the stage (challenge_detection,
+   * spa_nav_detection, loading_indicators, iframe_ready, shadow_dom_probe,
+   * element_attached_gate, animation_wait, disabled_wait, overlay_wait, retry_loop,
+   * blind_settle). `durationMs` is the wall time this phase took. `hardCapHit` is
+   * set when one of the withHardCap()'d evaluates fell back to its fail-open default
+   * — this is the most important signal when diagnosing stalls.
+   */
+  writeLookaheadPhase(data: {
+    phase: string;
+    durationMs: number;
+    /** Phase-specific details. Keep small — this is per-step per-phase overhead. */
+    details?: Record<string, any>;
+    hardCapHit?: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'lookahead',
+      eventType: 'lookahead_phase',
+      payload: data,
+    });
+  }
+
+  /** Lookahead finished — emits the aggregate result and XHR observer snapshot. */
+  writeLookaheadEnd(data: {
+    nextStepId: string;
+    ready: boolean;
+    totalDurationMs: number;
+    autoWaitApplied: boolean;
+    skipReason?: string;
+    navigationDetected?: boolean;
+    urlChanged?: boolean;
+    /** XHR requests still in flight at handoff — pure diagnostic, we did not wait for them. */
+    xhrInflightAtHandoff?: { count: number; urls: string[] };
+  }): void {
+    this.writer.write({
+      stage: 'lookahead',
+      eventType: 'lookahead_end',
+      payload: data,
+    });
+  }
+
+  /**
+   * V15.1: Per-attempt detail inside the retry_loop. Previously we only saw the
+   * aggregate `retry_loop: durationMs=30011, attempts=1` — which hides WHICH
+   * locator burned the time and on WHICH sub-check (isVisible/isEnabled/count).
+   * With this we can pinpoint whether a stale compiled label/placeholder is
+   * blocking Playwright's actionability wait (dominant cause of the 30s stall).
+   */
+  writeRetryAttempt(data: {
+    nextStepId: string;
+    attempt: number;
+    locatorCount: number;
+    /** Per-locator diagnostic: index in the plan, which sub-checks ran, ms cost, result. */
+    perLocator: Array<{
+      index: number;
+      strategy?: string;
+      value?: string;
+      isVisible?: boolean;
+      isVisibleMs?: number;
+      isEnabled?: boolean;
+      isEnabledMs?: number;
+      count?: number;
+      countMs?: number;
+      hardCapHit?: boolean;
+      ready: boolean;
+    }>;
+    totalMs: number;
+    ready: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'lookahead',
+      eventType: 'retry_attempt',
+      payload: data,
+    });
+  }
+
+  /**
+   * V15.1: `pageSettle` (MutationObserver DOM-stability wait) between retry
+   * attempts. A runaway SPA that never stops mutating will eat the whole budget
+   * here silently. Emit per-settle ms so we can see if settle itself is the
+   * stall rather than the precondition checks.
+   */
+  writePageSettle(data: {
+    context: 'retry_loop' | 'blind_settle' | 'post_nav';
+    budgetMs: number;
+    actualMs: number;
+    domStableThresholdMs: number;
+    /** True when the observer never saw the page go quiet — we hit the budget cap. */
+    budgetExhausted: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'lookahead',
+      eventType: 'page_settle',
+      payload: data,
+    });
+  }
+
+  /**
+   * V15.1: The gap between `action_result` of step N and `lookahead_start` of
+   * step N+1. When lookahead runs inside the step loop this is ~0, but we've
+   * seen ~200-400ms gaps on some kazakh/angular pages that are otherwise
+   * unaccounted for (likely post-action settle + snapshot cache invalidation).
+   */
+  writeInterStepGap(data: {
+    prevStepId: string;
+    nextStepId: string;
+    /** ms between step N's action_result and the start of lookahead for step N+1. */
+    gapMs: number;
+    /** Anything the caller knows the gap was spent on (e.g. `post_action_settle`, `snapshot_invalidate`). */
+    accountedFor?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'step_execution',
+      eventType: 'inter_step_gap',
+      payload: data,
+    });
+  }
+
+  /**
+   * V15.1: Sub-timing INSIDE executeAction. Playwright's `.click()` / `.fill()`
+   * runs its own actionability wait sequence: visible → stable → enabled →
+   * receives events → scrolls into view → action. When a click takes 15s we
+   * can't currently tell which sub-wait was the culprit. This event surfaces
+   * pre/post timings we measure from the caller side.
+   */
+  writeActionTiming(data: {
+    stepId: string;
+    stepType: string;
+    /** Time from "we called locator.click/fill" until Playwright returned. */
+    totalMs: number;
+    /**
+     * Cost of our pre-action visibility probe (not a real wait). Capped at
+     * ~200ms by Promise.race. When small (<200ms) and `wasAlreadyVisible=true`,
+     * the element was ready before executeAction — any slowness inside
+     * `totalMs` was post-wait (stability/navigation). When `wasAlreadyVisible`
+     * is false, executeAction had to wait for rendering internally — that's
+     * usually where 15s+ clicks come from.
+     */
+    preWaitVisibleMs?: number;
+    /** Diagnostic from the non-blocking isVisible probe. */
+    wasAlreadyVisible?: boolean;
+    /** Whether Playwright threw (even if we recovered) — useful for distinguishing real hang vs long wait. */
+    playwrightThrew?: boolean;
+    /** Kind of action dispatched (`click` / `fill` / `type` / `press` / etc). */
+    method?: string;
+  }): void {
+    this.writer.write({
+      stage: 'action',
+      eventType: 'action_timing',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V15: COMPILED LOCATOR PER-ATTEMPT EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+  // The compiled executor tries each strategy in the plan sequentially. Before V15
+  // only the winner was traced — losers and their error modes were lost to stdout.
+  // Now each attempt emits an event so "why did label='Логин' fail but placeholder
+  // succeeded?" is answerable from the trace alone.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeCompiledAttempt(data: {
+    stepId: string;
+    attempt: number;
+    strategy: string;
+    value: string;
+    confidence?: number;
+    timeoutMs: number;
+    success: boolean;
+    durationMs: number;
+    failureKind?: 'not_found' | 'ambiguous' | 'fingerprint_mismatch' | 'timeout' | 'error';
+    matchCount?: number;
+    fingerprintScore?: number;
+    error?: string;
+  }): void {
+    this.writer.write({
+      stage: 'resolution',
+      eventType: 'compiled_attempt',
+      payload: data,
+    });
+  }
+
+  /** Fired when compiled plan entries were reordered (e.g. shadow-DOM-aware priority). */
+  writeCompiledReorder(data: {
+    stepId: string;
+    reason: string;
+    before: string[];
+    after: string[];
+  }): void {
+    this.writer.write({
+      stage: 'resolution',
+      eventType: 'compiled_reorder',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V15: ACTION EXECUTION EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+  // What the Playwright call itself did: how long it waited on each actionability
+  // subcheck (visible / enabled / stable), whether post-action settle fired, and
+  // whether state verification matched expectations.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writeActionAttempt(data: {
+    stepId: string;
+    stepType: string;
+    locatorSource: 'compiled' | 'resolver' | 'evidence' | 'manual';
+    selector?: string;
+    /** The candidate ref used (when resolver path). */
+    ref?: string;
+    attempt: number;
+  }): void {
+    this.writer.write({
+      stage: 'action',
+      eventType: 'action_attempt',
+      payload: data,
+    });
+  }
+
+  writeActionResult(data: {
+    stepId: string;
+    stepType: string;
+    success: boolean;
+    durationMs: number;
+    /** Total wait time attributable to Playwright actionability (when measurable). */
+    actionabilityWaitMs?: number;
+    error?: string;
+    /** Whether post-action waitForLoadState('domcontentloaded') fired within budget. */
+    postActionSettleMs?: number;
+    postActionSettleFired?: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'action',
+      eventType: 'action_result',
+      payload: data,
+    });
+  }
+
+  writeActionVerify(data: {
+    stepId: string;
+    stepType: string;
+    verificationMethod: 'aria-expanded' | 'aria-pressed' | 'aria-checked' | 'checked' | 'isVisible' | 'permissive' | 'none';
+    verified: boolean;
+    durationMs: number;
+    beforeState?: Record<string, any>;
+    afterState?: Record<string, any>;
+  }): void {
+    this.writer.write({
+      stage: 'action',
+      eventType: 'action_verify',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V15: PAGE STATE SNAPSHOT (context for why things hung)
+  // ─────────────────────────────────────────────────────────────────────────
+  // Captured at step_start and whenever a step takes longer than expected.
+  // Answers "what state was the page in when this happened?" without needing
+  // to reproduce the session.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  writePageState(data: {
+    stepId: string;
+    when: 'step_start' | 'slow_step' | 'step_fail';
+    url: string;
+    title?: string;
+    readyState?: string;
+    bodyTextLength?: number;
+    interactiveElementCount?: number;
+    frameworks?: {
+      react?: boolean; angular?: boolean; vue?: boolean;
+      alpine?: boolean; htmx?: boolean; svelte?: boolean;
+    };
+    hasServiceWorker?: boolean;
+    consoleErrorCount?: number;
+    consoleErrorSamples?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'page_state',
+      eventType: 'page_state_snapshot',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // HOVER HIGHLIGHT EVENTS
   // ─────────────────────────────────────────────────────────────────────────
 

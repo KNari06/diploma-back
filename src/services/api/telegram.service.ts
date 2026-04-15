@@ -106,7 +106,8 @@ export async function sendMessage(
   botToken: string,
   chatId: string | number,
   text: string,
-  parseMode: 'HTML' | 'Markdown' | 'MarkdownV2' = 'HTML'
+  parseMode: 'HTML' | 'Markdown' | 'MarkdownV2' = 'HTML',
+  options?: { disableLinkPreview?: boolean },
 ): Promise<TelegramMessage> {
   try {
     logger.info('[TELEGRAM_SERVICE] Sending message', { chatId, textLength: text.length });
@@ -118,6 +119,9 @@ export async function sendMessage(
         chat_id: chatId,
         text,
         parse_mode: parseMode,
+        ...(options?.disableLinkPreview && {
+          link_preview_options: { is_disabled: true },
+        }),
       }),
     });
 

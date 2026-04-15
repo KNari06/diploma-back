@@ -1,3 +1,4 @@
+import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { aiService } from '@/services/ai/analysis/test-results.service';
@@ -530,7 +531,7 @@ export class AIAnalysisJobHandler {
 
       // Build rich email
       const { EmailService } = await import('@/services/core/email.service');
-      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      const frontendUrl = env.FRONTEND_URL || 'http://localhost:3000';
       const bugs = criticalBugs.map((bug: any) => ({
         severity: bug.severity || 'critical',
         message: bug.message || bug.description || 'Unknown issue',
@@ -562,6 +563,39 @@ export class AIAnalysisJobHandler {
         message: `Critical issues found in test on ${test.url || testId}:\n${issuesSummary}`,
         data: { testId, criticalBugs },
       });
+
+      // Send Telegram notification (if user has it connected)
+      if (test.user_id) {
+        try {
+          const { getTelegramToken, sendTelegramNotification } = await import('@/utils/notifications/telegram-notify');
+          const tokenData = await getTelegramToken(test.user_id);
+          if (tokenData?.external_id) {
+            const testUrl = test.url || 'Unknown URL';
+            const dashboardUrl = `${frontendUrl}/tests/${testId}`;
+
+            await sendTelegramNotification(tokenData, {
+              icon: '\u26A0\uFE0F',
+              title: `${bugs.length} Critical Issue${bugs.length > 1 ? 's' : ''} Found`,
+              fields: [
+                { label: 'URL', value: testUrl },
+              ],
+              bugs: bugs.slice(0, 5).map((b: any) => ({
+                severity: b.severity,
+                category: b.category,
+                message: b.message,
+              })),
+              bugsTotal: bugs.length,
+              ctaLabel: 'View AI analysis \u2192',
+              ctaUrl: dashboardUrl,
+            });
+            logger.info(`[AI-ANALYSIS] Sent Telegram critical issues notification for test: ${testId}`);
+          }
+        } catch (tgError) {
+          logger.warn(`[AI-ANALYSIS] Failed to send Telegram notification for test ${testId}:`, {
+            error: tgError instanceof Error ? tgError.message : String(tgError),
+          });
+        }
+      }
 
     } catch (error) {
       logger.error(`[AI-ANALYSIS] Failed to handle critical issues for test ${testId}:`, error);

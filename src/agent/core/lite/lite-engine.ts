@@ -4983,11 +4983,16 @@ export class LiteEngine {
                 '@/services/storage/test-artifacts-storage.service'
               );
 
-              const fileName = path.basename(traceFilePath);
-              const { storagePath, fileSize } = await uploadLiteTraceLogToStorage(
+              const originalFileName = path.basename(traceFilePath);
+              const {
+                storagePath,
+                fileName: storedFileName,
+                fileSize,
+              } = await uploadLiteTraceLogToStorage(
                 traceFilePath,
                 userId,
-                fileName
+                originalFileName,
+                'lite',
               );
 
               let traceFileId: string | undefined;
@@ -4995,7 +5000,7 @@ export class LiteEngine {
                 const { id } = await insertTraceFileRecord({
                   userId,
                   testId,
-                  fileName,
+                  fileName: storedFileName,
                   storagePath,
                   fileSize,
                   browser: 'lite-trace-log',
@@ -5046,8 +5051,12 @@ export class LiteEngine {
                 '@/services/storage/test-artifacts-storage.service'
               );
 
-              const fileName = path.basename(traceFilePath);
-              const { storagePath } = await uploadLiteTraceLogToStorageAnonymous(traceFilePath, fileName);
+              const originalFileName = path.basename(traceFilePath);
+              const { storagePath } = await uploadLiteTraceLogToStorageAnonymous(
+                traceFilePath,
+                originalFileName,
+                'lite',
+              );
 
               logger.info('[LITE_ENGINE] Trace log uploaded for non-UUID run (no DB record)', {
                 testId,

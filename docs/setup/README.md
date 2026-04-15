@@ -50,7 +50,7 @@ QUEUE_RETRY_DELAY=5000
 
 # Agent
 AGENT_TIMEOUT=300000
-AGENT_MAX_RETRIES=3
+AGENT_MAX_RETRIES=1
 AGENT_BASE_URL=http://localhost:3001
 
 # Logging
@@ -78,17 +78,20 @@ npm install
 ## 4. Запуск приложения
 
 ### Development режим:
+
 ```bash
 npm run dev
 ```
 
 ### Production режим:
+
 ```bash
 npm run build
 npm start
 ```
 
 ### Запуск воркера очередей:
+
 ```bash
 npm run worker
 ```
@@ -139,8 +142,8 @@ npm run type-check  # Проверка типов
 
 Все переменные описаны в `env.example`. Основные:
 
-- **SUPABASE_*** - настройки Supabase
+- **SUPABASE\_\*** - настройки Supabase
 - **OPENAI_API_KEY** - ключ для OpenAI API
-- **REDIS_*** - настройки Redis для очередей
+- **REDIS\_\*** - настройки Redis для очередей
 - **JWT_SECRET** - секрет для JWT токенов
 - **API_KEY_SECRET** - секрет для API ключей

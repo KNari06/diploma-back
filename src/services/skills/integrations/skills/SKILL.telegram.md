@@ -16,8 +16,8 @@ tools:
 supported_ai_models:
   - gpt-4o
   - gpt-4o-mini
-  - gemini-2.0-flash
-  - gemini-2.0-pro
+  - gemini-2.5-flash
+  - gemini-2.5-flash-lite
   - claude-sonnet-4-5
   - claude-opus-4
 ---

@@ -284,6 +284,15 @@ export interface StepEvidence {
   /** URL where this evidence was captured (guards against cross-page ref collision in SPAs) */
   pageUrl?: string;
   /**
+   * V15.6: ISO timestamp when this evidence was recorded. Used to reject
+   * stale evidence — data-agent-ref values are DOM-counter-based and unstable
+   * across long gaps (page reloads, server restart + replay, browser restart).
+   * When the cached ref is older than EVIDENCE_REF_TTL_MS, we bypass the
+   * shortcut and go through full LLM resolution. The 60-minute default is
+   * generous enough for same-session replays but catches cross-session staleness.
+   */
+  capturedAt?: string;
+  /**
    * V14: Time between previous step recording and this step recording (ms).
    * Used as a minimum wait hint during replay — if user waited 3s between steps,
    * the page likely needs at least ~2s to be ready.
@@ -738,6 +747,17 @@ export interface StepRuntimeMeta {
   pageSignatureMatched?: boolean;
   /** Self-healing confidence (if healed) */
   healConfidence?: number;
+  /**
+   * Self-heal provenance — what was rewritten and why.
+   * Populated only when runtimeStatus === 'healed'. Surfaced in the run report
+   * so QA can see "this selector was wrong, AI tried this instead".
+   */
+  /** Original selector that failed before self-heal kicked in. */
+  healedFrom?: string;
+  /** Selector the self-healer resolved to. */
+  healedTo?: string;
+  /** Short human-readable description of what changed (from SelfHealingResult.diff.what_changed). */
+  healWhatChanged?: string;
   /**
    * V6: True if lookahead auto-wait was applied (waited > threshold)
    * Indicates significant inter-step wait due to element not being ready

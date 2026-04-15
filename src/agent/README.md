@@ -19,15 +19,18 @@ Backend Process (single Node.js instance)
 ## Modules
 
 ### 1. browser-pool.ts
+
 Manages browser instances for reuse across tests.
 
 **Features:**
+
 - Singleton browser instances per type
 - Auto-reconnect on disconnect
 - Graceful cleanup on shutdown
 - Health monitoring
 
 **Supported browsers:**
+
 - chrome / chromium
 - firefox
 - safari / webkit
@@ -36,14 +39,17 @@ Manages browser instances for reuse across tests.
 - mobile-safari
 
 ### 2. playwright.service.ts
+
 Core Playwright test execution logic.
 
 **Functions:**
+
 - `executePlaywrightTest()` - Run single test
 - `executePlaywrightTestWithRetry()` - Run with auto-retry
 - `getAgentStatus()` - Get agent health
 
 **Features:**
+
 - Mobile emulation (devices)
 - Custom viewport
 - Custom headers
@@ -52,9 +58,11 @@ Core Playwright test execution logic.
 - Timeout management
 
 ### 3. result-collector.ts
+
 Collects test data from Playwright page.
 
 **Collects:**
+
 - Screenshots (base64)
 - DOM (full HTML)
 - Console logs
@@ -63,6 +71,7 @@ Collects test data from Playwright page.
 - Performance metrics
 
 **Usage:**
+
 ```typescript
 const collector = new ResultCollector();
 collector.setupListeners(page);
@@ -102,8 +111,9 @@ AI Analysis (GPT-4o)
 ### Used in:
 
 **src/jobs/manual-test-run.job.ts**
+
 ```typescript
-import { executePlaywrightTestWithRetry } from '@/agent';
+import { executePlaywrightTestWithRetry } from "@/agent";
 
 const result = await executePlaywrightTestWithRetry(testData, maxRetries);
 ```
@@ -115,7 +125,7 @@ const result = await executePlaywrightTestWithRetry(testData, maxRetries);
 ```env
 # Agent settings
 AGENT_TIMEOUT=300000        # 5 minutes
-AGENT_MAX_RETRIES=2         # Retry failed tests
+AGENT_MAX_RETRIES=1        # Retry failed tests
 
 # Not needed anymore (local agent):
 # AGENT_BASE_URL=...
@@ -124,6 +134,7 @@ AGENT_MAX_RETRIES=2         # Retry failed tests
 ### Browser Launch Options
 
 Browsers launch with:
+
 - `headless: true` - No GUI
 - `--no-sandbox` - Docker compatible
 - `--disable-dev-shm-usage` - Prevent memory issues
@@ -187,13 +198,13 @@ const status = await getAgentStatus();
 ### Close Browsers
 
 ```typescript
-import { browserPool } from '@/agent';
+import { browserPool } from "@/agent";
 
 // Close all browsers
 await browserPool.closeAll();
 
 // Close specific browser
-await browserPool.closeBrowser('chrome');
+await browserPool.closeBrowser("chrome");
 
 // Get status
 const status = browserPool.getStatus();
@@ -203,13 +214,13 @@ const status = browserPool.getStatus();
 
 ### vs Separate Agent Service
 
-| Feature | Separate Service | Integrated (This) |
-|---------|-----------------|-------------------|
-| **Deployment** | 2 services | 1 service |
-| **Network** | HTTP overhead | Direct calls |
-| **Complexity** | High | Low |
-| **Scaling** | Horizontal | Vertical |
-| **MVP** | Overkill | Perfect ✅ |
+| Feature        | Separate Service | Integrated (This) |
+| -------------- | ---------------- | ----------------- |
+| **Deployment** | 2 services       | 1 service         |
+| **Network**    | HTTP overhead    | Direct calls      |
+| **Complexity** | High             | Low               |
+| **Scaling**    | Horizontal       | Vertical          |
+| **MVP**        | Overkill         | Perfect ✅        |
 
 ### For MVP
 
@@ -223,6 +234,7 @@ const status = browserPool.getStatus();
 ### For Scale
 
 Can migrate to separate service later when needed:
+
 - Extract `src/agent/` to new project
 - Add HTTP endpoints
 - Deploy separately
@@ -233,11 +245,13 @@ Can migrate to separate service later when needed:
 ### Resource Usage
 
 **Per browser instance:**
+
 - Memory: ~50-100MB
 - CPU: Idle when not testing
 - Disk: Screenshots in base64 (memory only)
 
 **Recommended:**
+
 - Max 3-5 concurrent tests on 2GB RAM server
 - Use browser pool (reuse instances)
 - Close browsers on idle
@@ -258,6 +272,7 @@ Error: Failed to launch browser
 ```
 
 **Solutions:**
+
 ```bash
 # Install Playwright browsers
 npx playwright install
@@ -276,6 +291,7 @@ Error: Cannot allocate memory
 ```
 
 **Solutions:**
+
 - Reduce concurrent tests
 - Close browsers after use
 - Increase Docker memory limit
@@ -288,6 +304,7 @@ Error: Timeout 30000ms exceeded
 ```
 
 **Solutions:**
+
 - Increase `AGENT_TIMEOUT`
 - Check network connectivity
 - Verify URL is accessible

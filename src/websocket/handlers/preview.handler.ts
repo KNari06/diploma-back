@@ -1776,6 +1776,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     ...(el.ref && { lastSuccessRef: el.ref }),
                     confidence: 1.0,
                     pageUrl: initialPageUrl,
+                    capturedAt: new Date().toISOString(), // V15.7: TTL support
                   },
                 };
                 if (built.options && Object.keys(built.options).length === 0) {
@@ -2287,6 +2288,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     ...(focusedEl?.ref && { lastSuccessRef: focusedEl.ref }),
                     confidence: 1.0,
                     pageUrl: page?.url(),
+                    capturedAt: new Date().toISOString(), // V15.7: TTL support
                   },
                 };
                 const room = createRoomName('preview', previewSessionId);
@@ -4028,6 +4030,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   ...(data.ref && { lastSuccessRef: data.ref }),
                   confidence: 1.0,
                   pageUrl: autoPage?.url(),
+                  capturedAt: new Date().toISOString(), // V15.7: TTL support
                 },
               };
 

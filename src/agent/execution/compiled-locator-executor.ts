@@ -29,6 +29,126 @@ import { Frame, Locator, Page } from 'playwright';
  */
 type PageLike = Page | Frame;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// V15: Shadow-aware locator priority
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Raw CSS locators (`.my-form > input`) do NOT automatically pierce shadow DOM.
+// Playwright's user-facing locators (`getByRole` / `getByLabel` / `getByPlaceholder`
+// / `getByTestId` / `getByText`) DO pierce open shadow roots transparently.
+//
+// When a page uses web components (custom elements with `-` in the tag name,
+// or any element with a non-null `shadowRoot`), the compiled plan's CSS entry
+// is much more likely to miss than its semantic siblings. In that case we want
+// to try the semantic entries FIRST and fall back to CSS only if they fail —
+// the opposite of the plan's recorded order on some sites.
+//
+// On pages without shadow DOM, the original plan order is respected (semantic
+// and CSS are both reliable, recorded confidence wins).
+
+/** Strategies that automatically pierce open shadow roots (Playwright guarantee). */
+const SHADOW_SAFE_STRATEGIES = new Set<string>(['role', 'label', 'placeholder', 'testId', 'text']);
+
+/**
+ * Tiny in-memory cache of shadow-DOM presence keyed by URL.
+ * Rationale: probing is ~1 page.evaluate per step. Most runs stay on a handful
+ * of URLs, so caching eliminates the per-step cost after the first hit.
+ * TTL is short because SPA navigation keeps the same URL while the DOM mutates.
+ */
+interface ShadowCacheEntry { present: boolean; at: number }
+const shadowCache = new Map<string, ShadowCacheEntry>();
+const SHADOW_CACHE_TTL_MS = 10_000;
+const SHADOW_PROBE_MAX_NODES = 200;
+const SHADOW_PROBE_HARD_CAP_MS = 200;
+
+/**
+ * Probe the page to determine whether any element is using shadow DOM.
+ * Bounded BFS (up to SHADOW_PROBE_MAX_NODES) — cheap on normal pages, and
+ * short-circuits on the first shadow root found.
+ *
+ * Always fail-open (returns `false` on any error) — a probe failure must never
+ * break locator execution.
+ */
+async function pageUsesShadowDom(page: PageLike): Promise<boolean> {
+  // Page and Frame both expose url(); fall back to a static key on error.
+  let url = '';
+  try { url = (page as Page).url(); } catch { /* Frame may not expose url in edge cases */ }
+  const cacheKey = url || '__no_url__';
+
+  const cached = shadowCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < SHADOW_CACHE_TTL_MS) {
+    return cached.present;
+  }
+
+  let present = false;
+  try {
+    // Race the probe against a hard cap — a hung evaluate cannot stall us past this.
+    const probe = (page as Page).evaluate((maxNodes: number) => {
+      // @ts-expect-error - document exists in browser context
+      const doc = document;
+      const body = doc.body;
+      if (!body) return false;
+      const stack: any[] = [body];
+      let scanned = 0;
+      while (stack.length && scanned < maxNodes) {
+        const node: any = stack.shift();
+        if (!node) continue;
+        scanned++;
+        const kids: ArrayLike<any> | undefined = node.children;
+        if (!kids) continue;
+        for (let i = 0; i < kids.length; i++) {
+          const el: any = kids[i];
+          if (el.shadowRoot) return true;              // open shadow root found
+          const tag: string = (el.tagName || '').toLowerCase();
+          if (tag.includes('-')) return true;          // custom element — likely closed shadow
+          stack.push(el);
+        }
+      }
+      return false;
+    }, SHADOW_PROBE_MAX_NODES);
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    present = await Promise.race([
+      probe,
+      new Promise<boolean>(resolve => {
+        timer = setTimeout(() => resolve(false), SHADOW_PROBE_HARD_CAP_MS);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+  } catch {
+    present = false;
+  }
+
+  shadowCache.set(cacheKey, { present, at: Date.now() });
+  return present;
+}
+
+/**
+ * Return a new LocatorEntry array re-ordered so shadow-safe strategies come first
+ * when the page uses shadow DOM. Otherwise returns the input as-is.
+ *
+ * Order within each group is preserved (stable sort by `confidence`-then-original
+ * position, same as the plan's recorded order).
+ */
+function reorderForShadowDom(entries: LocatorEntry[], shadowPresent: boolean): LocatorEntry[] {
+  if (!shadowPresent) return entries;
+
+  const withIndex = entries.map((e, i) => ({ e, i }));
+  const shadowSafe = withIndex.filter(x => SHADOW_SAFE_STRATEGIES.has(x.e.strategy));
+  const rest = withIndex.filter(x => !SHADOW_SAFE_STRATEGIES.has(x.e.strategy));
+  // Preserve original order within each bucket (stable).
+  const result = [...shadowSafe, ...rest].map(x => x.e);
+  // No-op reordering? Avoid a log line on pages where shadow-safe is already first.
+  const wasReordered = result.some((e, i) => e !== entries[i]);
+  if (wasReordered) {
+    logger.debug('[COMPILED_EXECUTOR] Reordered locator plan for shadow DOM', {
+      before: entries.map(e => e.strategy),
+      after: result.map(e => e.strategy),
+    });
+  }
+  return result;
+}
+
 /**
  * Result from compiled locator execution attempt
  */
@@ -395,12 +515,46 @@ async function tryLocatorEntry(
  * @param timeout Action timeout
  * @returns Result with success status and locator if found
  */
+/**
+ * V15: Tracer contract for per-attempt observability. Structural interface — callers
+ * pass EditorTraceService methods (or any compatible shape). Fire-and-forget; every
+ * call is wrapped in try/catch internally so a broken tracer can't break execution.
+ */
+export interface CompiledExecutorTracer {
+  attempt(data: {
+    stepId: string;
+    attempt: number;
+    strategy: string;
+    value: string;
+    confidence?: number;
+    timeoutMs: number;
+    success: boolean;
+    durationMs: number;
+    failureKind?: 'not_found' | 'ambiguous' | 'fingerprint_mismatch' | 'timeout' | 'error';
+    matchCount?: number;
+    fingerprintScore?: number;
+    error?: string;
+  }): void;
+  reorder(data: { stepId: string; reason: string; before: string[]; after: string[] }): void;
+}
+
 export async function executeCompiledLocatorPlan(
   page: PageLike,
   compiled: CompiledStepPlan | undefined,
   actionType: string,
-  timeout: number = 30000
+  timeout: number = 30000,
+  tracer?: CompiledExecutorTracer,
+  stepId?: string,
 ): Promise<CompiledExecutionResult> {
+  const safeTrace = {
+    attempt: (d: Parameters<CompiledExecutorTracer['attempt']>[0]) => {
+      try { tracer?.attempt(d); } catch { /* non-fatal */ }
+    },
+    reorder: (d: Parameters<CompiledExecutorTracer['reorder']>[0]) => {
+      try { tracer?.reorder(d); } catch { /* non-fatal */ }
+    },
+  };
+  const traceStepId = stepId ?? 'unknown';
   // 1. Check if compiled plan exists
   if (!compiled || !compiled.locatorPlan || compiled.locatorPlan.length === 0) {
     logger.debug('[COMPILED_EXECUTOR] No compiled plan available');
@@ -471,23 +625,49 @@ export async function executeCompiledLocatorPlan(
     });
   }
 
+  // V15: Shadow-aware reordering.
+  // Only probe + reorder when we have BOTH a shadow-safe entry AND a non-shadow-safe
+  // (e.g. css) entry — otherwise reordering is a no-op and the probe is wasted work.
+  const hasShadowSafe = locatorsToTry.some(e => SHADOW_SAFE_STRATEGIES.has(e.strategy));
+  const hasNonShadowSafe = locatorsToTry.some(e => !SHADOW_SAFE_STRATEGIES.has(e.strategy));
+  if (hasShadowSafe && hasNonShadowSafe) {
+    const shadowPresent = await pageUsesShadowDom(page);
+    if (shadowPresent) {
+      const before = locatorsToTry.map(e => e.strategy);
+      locatorsToTry = reorderForShadowDom(locatorsToTry, true);
+      const after = locatorsToTry.map(e => e.strategy);
+      if (before.some((s, i) => s !== after[i])) {
+        safeTrace.reorder({
+          stepId: traceStepId,
+          reason: 'shadow_dom_detected',
+          before,
+          after,
+        });
+      }
+    }
+  }
+
   // 4. Try each locator in order
   let sawAmbiguous = false;
   const ambiguityDetails: Array<{ strategy: string; matchCount: number }> = [];
+  let attemptIdx = 0;
   for (const entry of locatorsToTry) {
+    attemptIdx++;
     logger.debug('[COMPILED_EXECUTOR] Trying locator', {
       strategy: entry.strategy,
       value: entry.value.slice(0, 50),
       confidence: entry.confidence,
     });
 
+    const attemptStart = Date.now();
     const result = await tryLocatorEntry(page, entry, timeout);
+    const attemptDur = Date.now() - attemptStart;
 
     if (result.success && result.locator) {
       // Validate fingerprint if available
       if (compiled.targetFingerprint) {
         const matchScore = await quickFingerprintCheck(page, result.locator, compiled.targetFingerprint);
-        
+
         if (matchScore < 0.3) {
           logger.warn('[COMPILED_EXECUTOR] Fingerprint mismatch - element found but may be wrong', {
             strategy: entry.strategy,
@@ -499,6 +679,18 @@ export async function executeCompiledLocatorPlan(
               placeholder: compiled.targetFingerprint.placeholder,
             },
           });
+          safeTrace.attempt({
+            stepId: traceStepId,
+            attempt: attemptIdx,
+            strategy: entry.strategy,
+            value: entry.value.slice(0, 200),
+            confidence: entry.confidence,
+            timeoutMs: timeout,
+            success: false,
+            durationMs: attemptDur,
+            failureKind: 'fingerprint_mismatch',
+            fingerprintScore: Math.round(matchScore * 100) / 100,
+          });
           // Skip this locator, try next one
           continue;
         }
@@ -508,6 +700,17 @@ export async function executeCompiledLocatorPlan(
           matchScore: Math.round(matchScore * 100) / 100,
         });
       }
+
+      safeTrace.attempt({
+        stepId: traceStepId,
+        attempt: attemptIdx,
+        strategy: entry.strategy,
+        value: entry.value.slice(0, 200),
+        confidence: entry.confidence,
+        timeoutMs: timeout,
+        success: true,
+        durationMs: attemptDur,
+      });
 
       logger.info('[COMPILED_EXECUTOR] Locator succeeded', {
         strategy: entry.strategy,
@@ -534,6 +737,28 @@ export async function executeCompiledLocatorPlan(
         matchCount: countMatch ? parseInt(countMatch[1], 10) : 0,
       });
     }
+
+    // Map result.failureKind to tracer enum. `tryLocatorEntry` returns
+    // 'not_found' | 'ambiguous' | 'error' | undefined.
+    const failureKind: 'not_found' | 'ambiguous' | 'error' =
+      (result.failureKind === 'ambiguous' ? 'ambiguous'
+      : result.failureKind === 'error' ? 'error'
+      : 'not_found');
+    safeTrace.attempt({
+      stepId: traceStepId,
+      attempt: attemptIdx,
+      strategy: entry.strategy,
+      value: entry.value.slice(0, 200),
+      confidence: entry.confidence,
+      timeoutMs: timeout,
+      success: false,
+      durationMs: attemptDur,
+      failureKind,
+      matchCount: result.failureKind === 'ambiguous'
+        ? (result.error?.match(/Ambiguous:\s*(\d+)/)?.[1] ? parseInt(result.error.match(/Ambiguous:\s*(\d+)/)![1], 10) : undefined)
+        : undefined,
+      error: result.error?.slice(0, 200),
+    });
 
     logger.debug('[COMPILED_EXECUTOR] Locator failed, trying next', {
       strategy: entry.strategy,

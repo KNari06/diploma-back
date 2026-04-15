@@ -1450,6 +1450,44 @@ export class SnapshotCollector {
                     }
                   }
                 }
+                // V15: Fallback to data-* icon attributes (Lucide, Feather, Iconify, FA6, Material Symbols)
+                // Covers: <svg data-lucide="folder">, <i data-icon="folder">, <svg data-feather="folder">
+                if (!iconChildLabel) {
+                  const iconHolder = el.querySelector('[data-lucide], [data-feather], [data-icon], [data-iconify-name]')
+                    || (el.matches('[data-lucide], [data-feather], [data-icon], [data-iconify-name]') ? el : null);
+                  if (iconHolder) {
+                    const raw = (
+                      iconHolder.getAttribute('data-lucide') ||
+                      iconHolder.getAttribute('data-feather') ||
+                      iconHolder.getAttribute('data-icon') ||
+                      iconHolder.getAttribute('data-iconify-name') ||
+                      ''
+                    ).trim();
+                    // Strip icon-set prefix (e.g. "mdi:folder" -> "folder") and normalize separators
+                    const normalized = raw.split(':').pop()!.replace(/^icon[-_]/, '').replace(/[-_]/g, ' ').trim();
+                    if (normalized.length > 0 && normalized.length <= 50) iconChildLabel = normalized;
+                  }
+                }
+                // V15: Fallback to semantic class names — covers Lucide/Heroicons/Tabler class-based icons.
+                // <svg class="lucide-folder">, <i class="icon-folder">, <svg class="folder-icon">
+                if (!iconChildLabel) {
+                  const svgOrI = el.querySelector('svg, i');
+                  const classStr = svgOrI?.getAttribute('class') || el.getAttribute('class') || '';
+                  if (classStr) {
+                    // Match known prefixed icon classes first (strong signal)
+                    const prefixed = classStr.match(/\b(?:lucide|heroicon[s]?|tabler|mdi|bi|ri|ti|bx|ph|fa|fas|far|fal|fad|fab|icon)[-_:]([a-z0-9]+(?:[-_][a-z0-9]+)*)/i);
+                    if (prefixed && prefixed[1]) {
+                      const name = prefixed[1].replace(/[-_]/g, ' ').trim();
+                      if (name.length > 0 && name.length <= 50) iconChildLabel = name;
+                    }
+                    // Fallback: any class ending in "-icon" or starting with "icon-" (e.g. "folder-icon")
+                    if (!iconChildLabel) {
+                      const suffixed = classStr.match(/\b([a-z]+)[-_]icon\b|\bicon[-_]([a-z]+)\b/i);
+                      const name = (suffixed?.[1] || suffixed?.[2] || '').toLowerCase().trim();
+                      if (name.length > 0 && name.length <= 50 && name !== 'icon') iconChildLabel = name;
+                    }
+                  }
+                }
               } catch { /* ignore */ }
             }
 
@@ -1625,12 +1663,26 @@ export class SnapshotCollector {
                   const classStr = el.getAttribute('class') || '';
                   const iconChild = el.querySelector('i, svg, span[class*="icon"], span[class*="fa-"]');
                   const childClassStr = iconChild?.getAttribute('class') || '';
-                  const allClasses = `${classStr} ${childClassStr}`.trim();
+                  // V15: Include data-* icon attributes as class-like signals (Lucide/Feather/Iconify runtime)
+                  const dataIconAttrs = [
+                    iconChild?.getAttribute('data-lucide'),
+                    iconChild?.getAttribute('data-feather'),
+                    iconChild?.getAttribute('data-icon'),
+                    iconChild?.getAttribute('data-iconify-name'),
+                    el.getAttribute('data-lucide'),
+                    el.getAttribute('data-feather'),
+                    el.getAttribute('data-icon'),
+                    el.getAttribute('data-iconify-name'),
+                  ].filter(Boolean).join(' ');
+                  const allClasses = `${classStr} ${childClassStr} ${dataIconAttrs}`.trim();
                   if (!allClasses) return undefined;
-                  // Filter to icon-relevant classes
+                  // Filter to icon-relevant classes (prefixed icon libraries + generic "icon" tokens)
                   const iconMatches = allClasses.split(/\s+/).filter((c: string) =>
-                    /^(fa-|fa[srltdb]-|material-icons|mdi-|bi-|icon-|lucide-|heroicon|ri-|ti-|bx-|ph-)/i.test(c) ||
-                    /icon/i.test(c)
+                    /^(fa-|fa[srltdb]-|material-icons|mdi-|bi-|icon-|lucide-|heroicon|ri-|ti-|bx-|ph-|tabler-)/i.test(c) ||
+                    /icon/i.test(c) ||
+                    // V15: suffix-style ("folder-icon") and prefixed iconify ("mdi:folder")
+                    /[a-z]+-icon$/i.test(c) ||
+                    /^[a-z]+:[a-z-]+$/i.test(c)
                   );
                   return iconMatches.length > 0 ? iconMatches.join(' ') : undefined;
                 } catch { return undefined; }

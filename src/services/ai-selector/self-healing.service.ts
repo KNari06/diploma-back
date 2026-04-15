@@ -448,7 +448,7 @@ export class SelfHealingService {
    * Called when LLM-based resolution fails in accurate mode.
    *
    * Sends a page screenshot alongside the interactive node list and intent
-   * to Gemini 2.0 Flash for visual element identification.
+   * to Gemini 2.5 Flash for visual element identification.
    *
    * @returns Matched node ref + confidence, or null if no match
    */
@@ -1077,7 +1077,7 @@ Or if element not in list:
    * Steps:
    * 1. Highlight the found element with a red border
    * 2. Take a screenshot of the element + surrounding area
-   * 3. Send to Gemini 2.0 Flash: "Is the highlighted element correct?"
+   * 3. Send to Gemini 2.5 Flash: "Is the highlighted element correct?"
    * 4. Parse verification result
    * 5. Clean up highlight overlay
    *
