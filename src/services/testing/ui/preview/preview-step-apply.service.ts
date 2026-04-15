@@ -2793,6 +2793,11 @@ export class PreviewStepApplyService {
               lastSuccessRef: selectedRef,
               confidence: 1.0,
               resolutionMeta,
+              // V15.6: Timestamp so the shortcut can reject stale refs.
+              // data-agent-ref values are ephemeral DOM counters; after a long
+              // gap (page reload, server restart + replay) the same ref can
+              // point at a different element even on the same URL.
+              capturedAt: new Date().toISOString(),
             },
             compiled, // NEW: compiled execution plan
           };
@@ -3005,6 +3010,7 @@ export class PreviewStepApplyService {
                     lastSuccessRef: compiledRef || '', // V15: Preserve ref for evidence shortcut
                     confidence: compiledResult.confidence || 0.9,
                     resolutionMeta,
+                    capturedAt: new Date().toISOString(), // V15.6: staleness guard
                   },
                 };
 
@@ -3401,6 +3407,7 @@ export class PreviewStepApplyService {
               lastSuccessRef: candidate.ref,
               confidence: candidate.confidence,
               resolutionMeta,
+              capturedAt: new Date().toISOString(), // V15.6: staleness guard
             },
             compiled, // NEW: compiled execution plan
           };

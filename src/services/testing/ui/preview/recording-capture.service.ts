@@ -1128,6 +1128,8 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         ...(startRef && { lastSuccessRef: startRef }),
         confidence: 1.0,
         pageUrl,
+        // V15.7: Timestamp so evidence TTL check can reject stale refs on replay
+        capturedAt: new Date().toISOString(),
       },
     };
   }
@@ -1163,6 +1165,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         ...(element?.ref && { lastSuccessRef: element.ref }),
         confidence: 1.0,
         pageUrl,
+        capturedAt: new Date().toISOString(), // V15.7: TTL support
       },
     };
   }
@@ -1360,6 +1363,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         ...(element.ref && { lastSuccessRef: element.ref }),
         confidence: 1.0,
         pageUrl,
+        capturedAt: new Date().toISOString(), // V15.7: TTL support
       },
     };
   }
@@ -1474,6 +1478,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         ...(buffer.elementRef && { lastSuccessRef: buffer.elementRef }),
         confidence: 1.0,
         pageUrl: buffer.pageUrl,
+        capturedAt: new Date().toISOString(), // V15.7: TTL support
       },
     };
   }

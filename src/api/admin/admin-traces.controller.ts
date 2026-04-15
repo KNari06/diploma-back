@@ -17,6 +17,7 @@ const BROWSER_TYPE_MAP: Record<string, string> = {
   'preview-run-trace': 'preview_run',
   'lite-trace-log': 'lite',
   'api-agent-trace': 'api_agent',
+  'replay-trace': 'replay',
 };
 
 const TYPE_TO_BROWSER: Record<string, string> = {
@@ -24,6 +25,7 @@ const TYPE_TO_BROWSER: Record<string, string> = {
   preview_run: 'preview-run-trace',
   lite: 'lite-trace-log',
   api_agent: 'api-agent-trace',
+  replay: 'replay-trace',
 };
 
 /** All trace categories currently surfaced to the admin UI. */
@@ -32,6 +34,7 @@ const ADMIN_VISIBLE_BROWSERS = [
   'preview-run-trace',
   'lite-trace-log',
   'api-agent-trace',
+  'replay-trace',
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════

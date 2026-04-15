@@ -399,6 +399,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           url: testData.url, browser: testData.browser,
           commandsCount: testData.commands.length, intelligentMode: false,
           userId: testData.userId, projectId: testData.projectId,
+          // Retry context — essential for distinguishing first attempt from
+          // auto-healing re-runs when parsing a trace later.
+          retryAttempt,
+          isFirstAttempt: retryAttempt === 0,
+          skipCompiledPlan: retryAttempt > 0,
+          videoDisabled: disableVideo,
+          tracingDisabled: disableTracing,
+          chatSessionId: testData.chatSessionId,
         },
       });
 
@@ -437,6 +445,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               consecutiveFailures,
               stoppedAtStep: currentStepIndex,
               remainingSteps: commands.length - currentStepIndex + 1,
+            });
+            // Explicit trace event — otherwise the run_end alone doesn't tell
+            // you at which step the chain broke, or how many steps were left.
+            replayTrace.write({
+              eventType: 'cascading_failure', step: currentStepIndex, totalSteps,
+              payload: {
+                consecutiveFailures,
+                threshold: COMMAND_EXECUTOR_CONFIG.maxConsecutiveFailuresBeforeTermination,
+                stoppedAtStep: currentStepIndex,
+                remainingSteps: commands.length - currentStepIndex + 1,
+              },
             });
             allSuccess = false;
             finalError = `Cascading failure: ${consecutiveFailures} consecutive steps failed`;
@@ -504,6 +523,21 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             if (storeKey && storeValue) {
               executor.setExtractedData(storeKey, storeValue);
             }
+            // Emit step_completed for symmetry — otherwise scratchpad-only
+            // steps would look like "step_start with no matching end" in the
+            // trace. `action: 'store'` is enough to tell readers this is a
+            // meta-step (no Playwright call, no credits).
+            replayTrace.write({
+              eventType: 'step_completed', step: currentStepIndex, totalSteps,
+              payload: {
+                action: 'store',
+                success: true,
+                durationMs: 0,
+                description: intentMeta?.elementDescription,
+                scratchpadKey: storeKey,
+                scratchpadHasValue: !!storeValue,
+              },
+            });
             continue; // Skip Playwright execution and credit deduction — purely data storage
           }
 
@@ -520,6 +554,19 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               logger.warn('[PLAYWRIGHT] Stopping replay: insufficient credits', {
                 testId: testData.testId,
                 stepIndex: currentStepIndex,
+              });
+              // Trace it — otherwise the run ends abruptly with no indication
+              // of _why_ the step never executed.
+              replayTrace.write({
+                eventType: 'step_failed', step: currentStepIndex, totalSteps,
+                payload: {
+                  action,
+                  success: false,
+                  durationMs: 0,
+                  error: finalError,
+                  failedReason: 'insufficient_credits',
+                  description: intentMeta?.elementDescription,
+                },
               });
               break;
             }
@@ -630,6 +677,28 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 },
                 bugScreenshotUrl,
               };
+
+              // Write step_failed to replay trace (matches Case D + catch path).
+              // Without this, silent-backend failures did not appear in the
+              // JSONL trace even though they terminate the run.
+              replayTrace.write({
+                eventType: 'step_failed', step: currentStepIndex, totalSteps,
+                payload: {
+                  action, success: false, durationMs: Date.now() - stepStartedAt,
+                  error: finalError,
+                  rootCause: 'backend',
+                  failedReason: 'silent_backend_failure',
+                  networkEvidence: networkVerdict.fatalErrors,
+                  description: intentMeta?.elementDescription,
+                  url: activePage.url(),
+                  bugScreenshotUrl,
+                  errors: {
+                    console: updatedStepErrors.consoleErrors.length,
+                    network: updatedStepErrors.networkErrors.length,
+                    ui: updatedStepErrors.uiErrors.length,
+                  },
+                },
+              });
 
               try {
                 webSocketService.emitTestStepCompleted(testData.testId, {
@@ -902,6 +971,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               });
             }
 
+            // V15.7: Post-action 1s safety buffer moved to command-executor.ts
+            // (inside executeCommand), so all consumers of CommandExecutor —
+            // test-executor, lite pipeline, intelligent orchestrator — inherit
+            // it automatically. No need to duplicate here.
+
             // Auto-waiting (lookahead) for next step's readiness
             const nextCommand = commands[currentStepIndex]; // currentStepIndex is 1-based, array is 0-based
             if (nextCommand) {
@@ -958,11 +1032,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     },
                   });
                 } catch (lookaheadError) {
-                  // Lookahead failure is non-fatal, log and continue
+                  // Lookahead failure is non-fatal, log and continue.
+                  const lookaheadErrMsg =
+                    lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError);
                   logger.warn('[PLAYWRIGHT] Lookahead wait failed, continuing', {
                     testId: testData.testId,
                     nextStep: currentStepIndex + 1,
-                    error: lookaheadError instanceof Error ? lookaheadError.message : String(lookaheadError),
+                    error: lookaheadErrMsg,
+                  });
+                  // Still trace it — otherwise readiness failures that mask
+                  // downstream step failures become invisible in the JSONL.
+                  replayTrace.write({
+                    eventType: 'lookahead_failed', step: currentStepIndex + 1, totalSteps,
+                    payload: {
+                      prevAction: prevActionType,
+                      error: lookaheadErrMsg,
+                    },
                   });
                 }
               }
@@ -1103,6 +1188,13 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           payload: {
             success: allSuccess, executedSteps: currentStepIndex,
             finalError, aiUsage: replayUsageStats,
+            // Retry + self-heal signals — lets a replay trace explain itself
+            // without having to cross-reference the job row.
+            retryAttempt,
+            needsVideoOnRetry,
+            consecutiveFailures,
+            terminatedEarly:
+              consecutiveFailures >= COMMAND_EXECUTOR_CONFIG.maxConsecutiveFailuresBeforeTermination,
           },
         });
         await replayTrace.close();
@@ -1372,19 +1464,23 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         return { videoUrl: undefined, traceUrl: undefined };
       });
 
-      // V14: Upload replay trace JSONL to Supabase Storage (non-fatal)
+      // V14: Upload replay trace JSONL to Supabase Storage (non-fatal).
+      // `replayTraceUrl` now carries the opaque storage_path (private bucket,
+      // signed URL resolved at read time via the trace_files row).
       let replayTraceUrl: string | undefined;
       try {
         const traceFilePath = replayTrace.getFilePath();
         const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-        replayTraceUrl = await uploadReplayTraceToStorage(
+        const uploadResult = await uploadReplayTraceToStorage(
           traceFilePath,
           testData.testId,
           testData.userId || 'anonymous',
         );
+        replayTraceUrl = uploadResult.storagePath;
         logger.info('[PLAYWRIGHT] Replay trace JSONL uploaded to storage', {
           testId: testData.testId,
-          url: replayTraceUrl,
+          storagePath: uploadResult.storagePath,
+          traceFileId: uploadResult.traceFileId,
         });
       } catch (traceUploadError) {
         logger.debug('[PLAYWRIGHT] Failed to upload replay trace JSONL', {
@@ -1760,14 +1856,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Unregister from TestRunRegistry
       TestRunRegistry.unregister(runKey);
 
-      // V14: Upload replay trace JSONL (best-effort, even on cancellation)
+      // V14: Upload replay trace JSONL (best-effort, even on cancellation).
+      // Stores the opaque storage_path — readers resolve a signed URL via the
+      // trace_files row created on the same call.
       let cancelledReplayTraceUrl: string | undefined;
       if (replayTraceFilePath) {
         try {
           const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-          cancelledReplayTraceUrl = await uploadReplayTraceToStorage(
+          const uploadResult = await uploadReplayTraceToStorage(
             replayTraceFilePath, testData.testId, testData.userId || 'anonymous',
           );
+          cancelledReplayTraceUrl = uploadResult.storagePath;
         } catch { /* non-fatal */ }
       }
 
@@ -1887,14 +1986,17 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     const uploadedArtifacts = await uploadArtifacts(testData, artifacts.videoPath, artifacts.tracePath, [])
       .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
 
-    // V14: Upload replay trace JSONL (best-effort, even on crash)
+    // V14: Upload replay trace JSONL (best-effort, even on crash).
+    // Stores the opaque storage_path — readers resolve a signed URL via the
+    // trace_files row created on the same call.
     let failedReplayTraceUrl: string | undefined;
     if (replayTraceFilePath) {
       try {
         const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-        failedReplayTraceUrl = await uploadReplayTraceToStorage(
+        const uploadResult = await uploadReplayTraceToStorage(
           replayTraceFilePath, testData.testId, testData.userId || 'anonymous',
         );
+        failedReplayTraceUrl = uploadResult.storagePath;
       } catch { /* non-fatal */ }
     }
 

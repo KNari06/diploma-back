@@ -545,7 +545,7 @@ interface ShadowDomInfo {
 async function probeShadowDom(page: Page): Promise<ShadowDomInfo> {
   const empty: ShadowDomInfo = { present: false, customTags: [], openRoots: 0, nullRootsOnCustom: 0 };
   try {
-    return await withHardCap(() => page.evaluate(() => {
+    const probed = await withHardCap(() => page.evaluate(() => {
       // @ts-expect-error - browser context
       const doc = document;
       const customTagsSet = new Set<string>();
@@ -578,6 +578,8 @@ async function probeShadowDom(page: Page): Promise<ShadowDomInfo> {
         nullRootsOnCustom: Math.min(nullRootsOnCustom, MAX_SCAN),
       };
     }), 400, empty);
+    // Defensive: nullish result (mocked evaluate, browser race) → safe default.
+    return probed ?? empty;
   } catch {
     return empty;
   }
@@ -605,8 +607,9 @@ async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
     if (/\/cdn-cgi\/(challenge-platform|trace)/i.test(url)) return { detected: true, kind: 'cloudflare' };
     if (/^https?:\/\/challenges\.cloudflare\.com\//i.test(url)) return { detected: true, kind: 'cloudflare' };
 
-    // DOM probe — cheap, capped at 400ms
-    return await withHardCap(() => page.evaluate(() => {
+    // DOM probe — cheap, capped at 400ms. If probe returns nullish (e.g. mocked
+    // page.evaluate returns undefined), treat as "not detected" — safer default.
+    const probed = await withHardCap(() => page.evaluate(() => {
       // @ts-expect-error - browser context
       const doc = document;
       // Cloudflare: challenge-running hook, cf-browser-verification, or turnstile wrapper
@@ -632,6 +635,9 @@ async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
       }
       return { detected: false };
     }), 400, none);
+    // Defensive: if the browser returned nullish (e.g. mocked page.evaluate or
+    // Playwright race returned undefined), fall back to the "not detected" shape.
+    return probed ?? none;
   } catch {
     return none;
   }
@@ -1295,12 +1301,42 @@ function buildFastLocators(page: Page, step: IntentStep): Locator[] {
   }
 
   // Priority 2: Fallback to evidence.lastSuccessRef
-  // Skip if ref looks like a preview/background ref (not a stable CSS selector)
+  //
+  // We use this only when the compiled plan is empty (no role/label/testid/css
+  // strategies) — it provides a precondition check via the retry loop so the
+  // step isn't just blind-settled into an executor that may then wait 30s on
+  // a not-yet-rendered element.
+  //
+  // V15.6: Two guards (one stricter than the previous pattern-match):
+  //   1. Reject preview/background ref IDs by pattern — data-agent-ref values
+  //      like "e6", "s12", "bg-1" don't exist during background replay and
+  //      are DOM-counter-unstable across page reloads.
+  //   2. Reject stale evidence by TTL — even a "valid-looking" ref from a
+  //      long-ago recording points at a different element after DOM re-renders.
+  //      When capturedAt is missing (legacy records), we skip the TTL check
+  //      but the pattern check still runs.
+  // Anything that passes both guards is used as a data-agent-ref CSS locator
+  // (same as before). Semantic validation is NOT done here — it's done at
+  // evidence-shortcut time in intent-step-lint and command-executor; here we
+  // only need a cheap existence check for the retry loop.
   if (step.evidence?.lastSuccessRef) {
     const ref = step.evidence.lastSuccessRef;
-    // data-agent-ref values (e.g. "e6", "bg-1") don't exist during replay — skip
+    // Guard 1: preview/background ref patterns (fragile DOM counters)
     if (/^(e\d+|s\d+|bg-\d+)$/.test(ref)) {
       return locators;
+    }
+    // Guard 2: TTL — evidence older than 60 min cannot be trusted
+    const EVIDENCE_REF_TTL_MS = 60 * 60 * 1000;
+    if (step.evidence.capturedAt) {
+      const ageMs = Date.now() - new Date(step.evidence.capturedAt).getTime();
+      if (Number.isFinite(ageMs) && ageMs > EVIDENCE_REF_TTL_MS) {
+        logger.debug('[STEP_READINESS] Evidence ref skipped as fallback — older than TTL', {
+          stepId: step.id,
+          ageMs,
+          ttlMs: EVIDENCE_REF_TTL_MS,
+        });
+        return locators;
+      }
     }
     try {
       const escapedRef = ref.replace(/"/g, '\\"');

@@ -7,6 +7,7 @@ import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/inte
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
+import { evaluateEvidenceShortcut } from '@/services/testing/ui/preview/evidence-shortcut.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
 import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
@@ -516,6 +517,13 @@ export class CommandExecutor {
             }
             const clickOpts: Parameters<Locator['click']>[0] = {
               timeout: timeout || 30000,
+              // V15.5: Mirror the preview-step-apply fix. Playwright's default
+              // post-action stability wait can block 15-30s on animated elements
+              // (modals opening, dropdowns expanding). We don't need it here:
+              // the inter-step lookahead in waitForStepReadiness() handles
+              // readiness for the NEXT step, and a small post-action settle is
+              // applied via performPostActionBuffer() below.
+              noWaitAfter: true,
               ...(cmdModifiers.length > 0 && { modifiers: cmdModifiers }),
             };
 
@@ -746,7 +754,8 @@ export class CommandExecutor {
           try {
             await typeSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
             // Use pressSequentially to simulate real keyboard events
-            await typeSmartResult.locator.pressSequentially(String(value), { timeout: timeout || 30000 });
+            // V15.5: noWaitAfter — skip post-type stability wait
+            await typeSmartResult.locator.pressSequentially(String(value), { timeout: timeout || 30000, noWaitAfter: true });
 
             // V10: Smart Enter decision
             const shouldPress = await decideEnterAfterType(typeSmartResult.locator);
@@ -754,7 +763,7 @@ export class CommandExecutor {
               logger.info('[COMMAND_EXECUTOR] Pressing Enter after type', {
                 selector: selector.substring(0, 50),
               });
-              await typeSmartResult.locator.press('Enter', { timeout: timeout || 5000 });
+              await typeSmartResult.locator.press('Enter', { timeout: timeout || 5000, noWaitAfter: true });
             }
           } catch (typeError) {
             logger.warn('[COMMAND_EXECUTOR] Smart locator type failed, trying self-healing', {
@@ -765,12 +774,12 @@ export class CommandExecutor {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector);
-                await locator.pressSequentially(String(value), { timeout: timeout || 30000 });
+                await locator.pressSequentially(String(value), { timeout: timeout || 30000, noWaitAfter: true });
 
                 const shouldPressHealed = await decideEnterAfterType(locator);
                 if (shouldPressHealed) {
                   logger.info('[COMMAND_EXECUTOR] Pressing Enter after type (self-healing)');
-                  await locator.press('Enter', { timeout: timeout || 5000 });
+                  await locator.press('Enter', { timeout: timeout || 5000, noWaitAfter: true });
                 }
               },
               {
@@ -1140,7 +1149,8 @@ export class CommandExecutor {
           const performPress = async (locator: Locator) => {
             await locator.waitFor({ state: 'attached', timeout: timeout || 10000 });
             await this.ensureFocused(locator, 2000);
-            await locator.press(String(value), { timeout: timeout || 30000 });
+            // V15.5: noWaitAfter — skip post-press stability wait
+            await locator.press(String(value), { timeout: timeout || 30000, noWaitAfter: true });
           };
 
           if (isIntentCommand && intentCommand.intentMeta) {
@@ -1572,7 +1582,8 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            await intentFillLocator.fill(String(value), { timeout: timeout || 30000 });
+            // V15.5: noWaitAfter skips post-action stability wait (see clickOpts comment above)
+            await intentFillLocator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
             break;
           }
 
@@ -1581,12 +1592,12 @@ export class CommandExecutor {
           const fillSmartResult = await getSmartLocator(this.page, selector, 'type', description);
           try {
             await fillSmartResult.locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
-            await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000 });
+            await fillSmartResult.locator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
           } catch (fillError) {
             await this.executeWithSelfHealing(
               async () => {
                 const locator = getLocator(this.page, selector!);
-                await locator.fill(String(value), { timeout: timeout || 30000 });
+                await locator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
               },
               { selector, intent: description || `fill with ${value}`, action: 'fill', timeout, value }
             );
@@ -1696,7 +1707,8 @@ export class CommandExecutor {
             await locator.waitFor({ state: 'visible', timeout: timeout || 10000 });
             await this.forceScrollIntoView(locator);
             await this.waitForEnabled(locator, 5000);
-            await locator.click({ timeout: timeout || 30000 });
+            // V15.5: skip Playwright's 15-30s post-action stability wait
+            await locator.click({ timeout: timeout || 30000, noWaitAfter: true });
           };
 
           if (isIntentCommand && intentCommand.intentMeta) {
@@ -2408,7 +2420,8 @@ export class CommandExecutor {
         case 'contextmenu': {
           const performRightClick = async (locator: Locator) => {
             await this.forceScrollIntoView(locator);
-            await locator.click({ button: 'right', timeout: timeout || 30000 });
+            // V15.5: skip stability wait (see noWaitAfter comment above)
+            await locator.click({ button: 'right', timeout: timeout || 30000, noWaitAfter: true });
           };
 
           if (isIntentCommand && intentCommand.intentMeta) {
@@ -2532,6 +2545,32 @@ export class CommandExecutor {
           screenshot: `data:image/png;base64,${screenshot.toString('base64')}`,
           runtimeMeta: isIntentCommand ? this.stepRuntimeMeta.get(intentCommand.intentMeta?.stepId || '') : undefined,
         };
+      }
+
+      // V15.7: Post-action safety buffer for noWaitAfter actions.
+      // Because we pass `noWaitAfter: true` to click/fill/press/etc to skip
+      // Playwright's 15-30s internal stability wait, actions return the moment
+      // the event dispatches — before reactive handlers (Angular change
+      // detection, React setState cascades, form validation) have run.
+      // A 1s buffer gives them time to settle before the caller proceeds to
+      // the next command. Only fires for mutating action types; read-only
+      // actions (assert, wait, getText) skip it to stay fast.
+      //
+      // This is the single-source-of-truth buffer: all consumers of
+      // CommandExecutor (test-executor, lite pipeline, intelligent
+      // orchestrator) inherit it automatically. Preview has its own
+      // equivalent in preview-step-apply.service.ts since it doesn't go
+      // through CommandExecutor.
+      const POST_ACTION_BUFFER_ACTIONS: ReadonlySet<string> = new Set([
+        'click', 'dblclick', 'contextmenu', 'press', 'type', 'fill',
+        'toggle', 'check', 'uncheck', 'open', 'close', 'selectOption',
+      ]);
+      if (POST_ACTION_BUFFER_ACTIONS.has(action)) {
+        try {
+          await this.page.waitForTimeout(1000);
+        } catch {
+          // Non-fatal — page may be navigating
+        }
       }
 
       // ✅ V2: Include runtime metadata for intent-based commands
@@ -3075,6 +3114,10 @@ export class CommandExecutor {
     const newEvidence = {
       lastSuccessSelector: newSelector,
       confidence: healConfidence,
+      // V15.7: Timestamp so evidence TTL check can reject stale refs after
+      // long gaps (page reload, server restart). Preview-step-apply also
+      // writes this — here background stays in parity.
+      capturedAt: new Date().toISOString(),
     };
 
     await IntentTestCaseService.updateStepAfterHeal({
@@ -3308,58 +3351,70 @@ export class CommandExecutor {
           logger.warn('[COMMAND_EXECUTOR] No interactive nodes collected', { stepId });
         } else {
           // Evidence shortcut: if lastSuccessRef exists in current DOM, use it directly (skip LLM)
-          // Same logic as preview lint evidence shortcut, but here in background pipeline.
+          // V15.7: TTL + URL + semantic checks are centralized in
+          // evidence-shortcut.utils.ts (shared with preview pipeline). This
+          // keeps policy identical across both pipelines; only placement and
+          // result-shape differ (preview returns LintResult during lint phase,
+          // background returns {locator, runtimeMeta} during execute phase).
           // Saves 1-2s LLM call when element hasn't changed between runs.
           if (intentMeta.evidence?.lastSuccessRef && retryCtx.attempt === 0) {
-            const cachedRef = intentMeta.evidence.lastSuccessRef;
-            const cachedNode = domNodes.find(n => n.ref === cachedRef);
+            const shortcut = evaluateEvidenceShortcut({
+              evidence: intentMeta.evidence,
+              domNodes,
+              currentUrl: this.page.url(),
+              description: intentMeta.intentDescription,
+              bindingHints: intentMeta.bindingHints,
+              compiledPageUrl: intentMeta.compiled?.context?.pageUrl,
+            });
 
-            if (cachedNode && cachedNode.isVisible !== false) {
-              // Semantic validation: check bindingHints still match (refs can shift after navigation)
-              let semanticOk = true;
-              if (intentMeta.bindingHints) {
-                const hints = intentMeta.bindingHints;
-                const nodeTexts = [cachedNode.labelText, cachedNode.ariaLabel, cachedNode.name, cachedNode.placeholder, cachedNode.text]
-                  .filter(Boolean).map(t => t!.toLowerCase());
-                const hintValues = [hints.label, hints.nearText, hints.autocomplete]
-                  .filter(Boolean).map(t => t!.toLowerCase());
-                if (hintValues.length > 0 && nodeTexts.length > 0) {
-                  semanticOk = hintValues.some(h => nodeTexts.some(n => n.includes(h) || h.includes(n)));
-                }
-              }
+            if (!shortcut.ok) {
+              const level = (shortcut.reason === 'ttl_expired'
+                || shortcut.reason === 'url_mismatch'
+                || shortcut.reason === 'semantic_mismatch') ? 'info' : 'debug';
+              logger[level]('[COMMAND_EXECUTOR] Evidence shortcut bypass', {
+                stepId,
+                cachedRef: intentMeta.evidence.lastSuccessRef,
+                reason: shortcut.reason,
+                ...(shortcut.details || {}),
+              });
+            } else if (shortcut.node.isVisible === false) {
+              // Background has an additional visibility gate that preview handles
+              // via its action-type compat check. Keep it here so we never return
+              // a locator pointing at a hidden element from the background path.
+              logger.debug('[COMMAND_EXECUTOR] Evidence shortcut bypass — cached node not visible', {
+                stepId, cachedRef: shortcut.ref,
+              });
+            } else {
+              const { node: cachedNode, ref: cachedRef } = shortcut;
+              const refLocator = (iframeSelector
+                ? this.page.frameLocator(iframeSelector).locator(`[data-agent-ref="${cachedRef}"]`)
+                : this.page.locator(`[data-agent-ref="${cachedRef}"]`)
+              ).first();
 
-              if (semanticOk) {
-                const refLocator = (iframeSelector
-                  ? this.page.frameLocator(iframeSelector).locator(`[data-agent-ref="${cachedRef}"]`)
-                  : this.page.locator(`[data-agent-ref="${cachedRef}"]`)
-                ).first();
+              try {
+                await refLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 3000) });
 
-                try {
-                  await refLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 3000) });
+                logger.info('[COMMAND_EXECUTOR] Evidence shortcut hit — skipping LLM', {
+                  stepId, cachedRef,
+                  nodeTag: cachedNode.tag,
+                  nodeLabel: (cachedNode.labelText || cachedNode.ariaLabel || '').slice(0, 40),
+                  semanticSource: shortcut.semanticSource,
+                });
 
-                  logger.info('[COMMAND_EXECUTOR] Evidence shortcut hit — skipping LLM', {
-                    stepId, cachedRef,
-                    nodeTag: cachedNode.tag,
-                    nodeLabel: (cachedNode.labelText || cachedNode.ariaLabel || '').slice(0, 40),
-                  });
+                const runtimeMeta: StepRuntimeMeta = {
+                  runtimeStatus: 'executed',
+                  source: 'resolver',
+                  confidenceTier: 'high',
+                  executionMs: Date.now() - startTime,
+                  usedLocatorStrategy: 'evidence_shortcut',
+                  resolutionPath: 'evidence',
+                };
+                this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
-                  const runtimeMeta: StepRuntimeMeta = {
-                    runtimeStatus: 'executed',
-                    source: 'resolver',
-                    confidenceTier: 'high',
-                    executionMs: Date.now() - startTime,
-                    usedLocatorStrategy: 'evidence_shortcut',
-                    resolutionPath: 'evidence',
-                  };
-                  this.stepRuntimeMeta.set(stepId, runtimeMeta);
-
-                  return { locator: refLocator, runtimeMeta };
-                } catch {
-                  // Evidence ref not visible — fall through to full LLM resolution
-                  logger.debug('[COMMAND_EXECUTOR] Evidence shortcut failed (not visible)', { stepId, cachedRef });
-                }
-              } else {
-                logger.debug('[COMMAND_EXECUTOR] Evidence shortcut semantic mismatch', { stepId, cachedRef });
+                return { locator: refLocator, runtimeMeta };
+              } catch {
+                // Evidence ref not visible at action time — fall through to full LLM resolution
+                logger.debug('[COMMAND_EXECUTOR] Evidence shortcut failed (not visible)', { stepId, cachedRef });
               }
             }
           }
@@ -4332,23 +4387,25 @@ export class CommandExecutor {
         await this.ensureTopMostAtCenter(locator, 2000);
         // ✅ Wait for enabled: Ensure element is not disabled
         await this.waitForEnabled(locator, 5000);
-        await locator.click({ timeout: defaultTimeout });
+        // V15.5: noWaitAfter — skip Playwright's 15-30s post-click stability wait.
+        // Lookahead + per-step post-buffer handle readiness for the next step.
+        await locator.click({ timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       case 'dblclick':
-        await locator.dblclick({ timeout: defaultTimeout });
+        await locator.dblclick({ timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       case 'contextmenu':
         await this.forceScrollIntoView(locator);
-        await locator.click({ button: 'right', timeout: defaultTimeout });
+        await locator.click({ button: 'right', timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       case 'type':
         if (value === undefined) throw new Error('Value is required for type action');
         // Use pressSequentially (not fill) to match main handler — fires keydown/keypress/keyup per char
         // Important for autocomplete, OTP, and sites that listen to keyboard events
-        await locator.pressSequentially(String(value), { timeout: defaultTimeout });
+        await locator.pressSequentially(String(value), { timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       case 'select':
@@ -4361,7 +4418,7 @@ export class CommandExecutor {
         if (isNativeHeal) {
           // ✅ Wait for options: Ensure select has options available
           await this.waitForSelectOptions(locator, 5000, 3);
-          await locator.selectOption(String(value), { timeout: defaultTimeout });
+          await locator.selectOption(String(value), { timeout: defaultTimeout, noWaitAfter: true });
         } else {
           // Custom dropdown: click-based selection
           await this.selectFromCustomDropdown(locator, String(value), defaultTimeout);
@@ -4372,17 +4429,23 @@ export class CommandExecutor {
       case 'check':
         // ✅ Wait for enabled: Ensure checkbox is not disabled
         await this.waitForEnabled(locator, 5000);
-        await locator.check({ timeout: defaultTimeout });
+        await locator.check({ timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       case 'uncheck':
         // ✅ Wait for enabled: Ensure checkbox is not disabled
         await this.waitForEnabled(locator, 5000);
-        await locator.uncheck({ timeout: defaultTimeout });
+        await locator.uncheck({ timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       case 'hover':
         await locator.hover({ timeout: defaultTimeout });
+        // Mirror the non-heal hover path: wait for hover-triggered DOM effects
+        // (tooltips, submenus, popovers) to appear and stabilize. Without this,
+        // a healed hover returns before the tooltip has anchored to the correct
+        // trigger, leaving the next snapshot/capture with a stale tooltip ↔
+        // trigger binding (see main hover case at the top of this file).
+        await waitForHoverEffect(this.page);
         break;
 
       case 'focus':
@@ -4397,7 +4460,8 @@ export class CommandExecutor {
         if (value === undefined) throw new Error('Key is required for press action');
         // ✅ Ensure focus: Verify element is focused before pressing key
         await this.ensureFocused(locator, 2000);
-        await locator.press(String(value), { timeout: defaultTimeout });
+        // V15.5: noWaitAfter — same rationale as click
+        await locator.press(String(value), { timeout: defaultTimeout, noWaitAfter: true });
         break;
 
       // ═══════════════════════════════════════════════════════════════

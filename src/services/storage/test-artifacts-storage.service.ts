@@ -1,7 +1,9 @@
 import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { isValidUUID } from '@/utils/validation/validation';
 import fs from 'fs/promises';
+import * as path from 'path';
 
 /**
  * Upload video file to Supabase Storage
@@ -348,70 +350,81 @@ export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {
 }
 
 /**
- * Upload replay trace JSONL to Supabase Storage.
- * Contains step-by-step execution details: element resolution, readiness checks,
- * retry attempts, LLM diagnosis, errors — everything needed to debug failures.
+ * Upload a replay-mode JSONL trace log to the unified `lite-trace-logs`
+ * bucket and register it in `trace_files` so it shows up in the admin UI.
+ *
+ * Replay traces carry element resolution details (compiled / LLM / self-heal),
+ * readiness checks, retry attempts, and step failures — everything needed to
+ * diagnose a failed regression run.
+ *
+ * Behavior:
+ * - Anonymous runs (non-UUID userId) fall back to the `anonymous` segment and
+ *   SKIP the DB insert (mirrors the Lite engine path).
+ * - If the DB insert fails on an authenticated run, the storage object is
+ *   deleted to avoid orphaned blobs.
+ * - Local file is best-effort unlinked after a successful upload.
  *
  * @param localPath - Path to local JSONL file (from ReplayTraceWriter)
- * @param testId - Test ID for organizing in storage
- * @param userId - User ID for storage path
- * @returns Public URL of the uploaded file
+ * @param testId - UUID of the `tests` row this replay belongs to (used as FK)
+ * @param userId - User UUID; falls back to anonymous path if not a UUID
+ * @returns Object with storagePath, normalized fileName, fileSize, and optional
+ *          `traceFileId` (present only when a trace_files row was inserted).
  */
 export async function uploadReplayTraceToStorage(
   localPath: string,
   testId: string,
   userId: string,
-): Promise<string> {
+): Promise<{
+  storagePath: string;
+  fileName: string;
+  fileSize: number;
+  traceFileId?: string;
+}> {
+  const isUserUuid = isValidUUID(userId);
+  const isTestUuid = isValidUUID(testId);
+
+  // Branch 1: anonymous / non-UUID user — upload to the shared anon folder,
+  // skip DB bookkeeping (no user to attribute the row to).
+  if (!isUserUuid) {
+    const { storagePath, fileName: normalizedFileName, fileSize } =
+      await uploadLiteTraceLogToStorageAnonymous(localPath, path.basename(localPath), 'replay');
+    return { storagePath, fileName: normalizedFileName, fileSize };
+  }
+
+  // Branch 2: authenticated user — upload + DB insert with rollback.
+  const uploadResult = await uploadLiteTraceLogToStorage(
+    localPath,
+    userId,
+    path.basename(localPath),
+    'replay',
+  );
+
   try {
-    await fs.access(localPath);
-
-    const fileBuffer = await fs.readFile(localPath);
-    const fileSize = fileBuffer.length;
-
-    if (fileSize === 0) {
-      logger.warn('[STORAGE] Replay trace file is empty', { testId, localPath });
-      throw new Error('Replay trace file is empty');
-    }
-
-    const fileName = `replay-trace-${testId}-${Date.now()}.jsonl`;
-    const storagePath = `${userId}/replay-traces/${fileName}`;
-
-    const { error } = await supabaseAdmin.storage
-      .from(env.SUPABASE_BUCKET_NAME)
-      .upload(storagePath, fileBuffer, {
-        contentType: 'application/x-ndjson',
-        upsert: false,
-        cacheControl: '3600',
-      });
-
-    if (error) {
-      throw new Error(`Failed to upload replay trace: ${error.message}`);
-    }
-
-    const { data: urlData } = supabaseAdmin.storage
-      .from(env.SUPABASE_BUCKET_NAME)
-      .getPublicUrl(storagePath);
-
-    logger.info('[STORAGE] Replay trace uploaded successfully', {
-      testId,
-      url: urlData.publicUrl,
-      fileSize: `${Math.round(fileSize / 1024)}KB`,
+    const { id } = await insertTraceFileRecord({
+      userId,
+      // `testId` FK to `tests(id)`; only attach if it's a real UUID. For
+      // synthetic ids we leave it null so the insert doesn't 23503 on FK.
+      testId: isTestUuid ? testId : null,
+      fileName: uploadResult.fileName,
+      storagePath: uploadResult.storagePath,
+      fileSize: uploadResult.fileSize,
+      browser: 'replay-trace',
+      status: 'uploaded',
     });
 
-    // Clean up local file
-    try {
-      await fs.unlink(localPath);
-    } catch {
-      // Non-fatal
-    }
-
-    return urlData.publicUrl;
-  } catch (error) {
-    logger.error('[STORAGE] Replay trace upload error', {
-      error: error instanceof Error ? error.message : String(error),
-      testId,
+    return {
+      storagePath: uploadResult.storagePath,
+      fileName: uploadResult.fileName,
+      fileSize: uploadResult.fileSize,
+      traceFileId: id,
+    };
+  } catch (insertError) {
+    logger.error('[STORAGE] Failed to register replay trace in DB, rolling back storage', {
+      error: insertError instanceof Error ? insertError.message : String(insertError),
+      storagePath: uploadResult.storagePath,
     });
-    throw error;
+    await deleteLiteTraceLogFromStorage(uploadResult.storagePath).catch(() => {});
+    throw insertError;
   }
 }
 
@@ -425,7 +438,8 @@ export type TraceType =
   | 'preview'
   | 'draft'
   | 'api-agent'
-  | 'exploration';
+  | 'exploration'
+  | 'replay';
 
 /**
  * Build the Supabase Storage path for a trace log.
@@ -444,7 +458,7 @@ export type TraceType =
  * cosmetic reasons.
  */
 /** Regex matching the well-known testId prefixes set by each writer. */
-const TRACE_PREFIX_RE = /^(editor|preview_run|draft_run|api_agent|exploration|lite)_/;
+const TRACE_PREFIX_RE = /^(editor|preview_run|draft_run|api_agent|exploration|lite|replay)_/;
 
 export function buildTraceStoragePath(
   userSegment: string,
