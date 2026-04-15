@@ -66,6 +66,14 @@ export interface EvidenceShortcutInput {
    * can leave this undefined and rely on evidence.pageUrl.
    */
   compiledPageUrl?: string;
+  /**
+   * Action type for this step. When provided and set to a click-like action,
+   * the shortcut rejects disabled nodes (prevents wasted 30s Playwright
+   * stability wait on buttons turned disabled by A/B tests or form validation).
+   * Non-click actions (type, hover, etc.) are unaffected — they have their
+   * own validity semantics (e.g. a readonly input is still valid for hover).
+   */
+  actionType?: string;
 }
 
 /** Reason a shortcut was rejected. Exposed for diagnostic logging at call sites. */
@@ -76,7 +84,8 @@ export type EvidenceShortcutSkipReason =
   | 'no_recorded_url'
   | 'url_mismatch'
   | 'ref_not_in_dom'
-  | 'semantic_mismatch';
+  | 'semantic_mismatch'
+  | 'node_disabled';
 
 export type EvidenceShortcutResult =
   | {
@@ -104,7 +113,7 @@ export type EvidenceShortcutResult =
 export function evaluateEvidenceShortcut(
   input: EvidenceShortcutInput,
 ): EvidenceShortcutResult {
-  const { evidence, domNodes, currentUrl, description, bindingHints, compiledPageUrl } = input;
+  const { evidence, domNodes, currentUrl, description, bindingHints, compiledPageUrl, actionType } = input;
 
   if (!evidence) {
     return { ok: false, reason: 'no_evidence' };
@@ -220,5 +229,40 @@ export function evaluateEvidenceShortcut(
     }
   }
 
+  // ─── 5. Disabled check (click-like actions only) ─────────────────────────
+  // A/B tests, form validation, loading states turn buttons disabled between
+  // runs. Clicking a disabled element waits 30s in Playwright's auto-wait
+  // before timing out — very expensive. We gate by actionType so non-click
+  // actions (type, hover, etc.) still pass through with their own semantics.
+  //
+  // CLICK_LIKE_ACTIONS must match click-like values in IntentActionType
+  // (preview.types.ts). Keep in sync if the union changes.
+  if (actionType && CLICK_LIKE_ACTIONS.has(actionType) && cachedNode.isDisabled) {
+    return {
+      ok: false,
+      reason: 'node_disabled',
+      details: {
+        cachedRef,
+        actionType,
+      },
+    };
+  }
+
   return { ok: true, node: cachedNode, ref: cachedRef, semanticSource };
 }
+
+/**
+ * Click-like IntentActionTypes — for these, interacting with a disabled node
+ * hits Playwright's auto-wait (30s default) before timing out. Rejecting such
+ * a cached ref up front saves that time and triggers LLM re-resolution.
+ */
+const CLICK_LIKE_ACTIONS = new Set<string>([
+  'click',
+  'dblclick',
+  'contextmenu',
+  'toggle',
+  'check',
+  'uncheck',
+  'open',
+  'close',
+]);

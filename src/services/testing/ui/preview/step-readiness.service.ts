@@ -221,6 +221,25 @@ const BLIND_SETTLE_MS = STEP_READINESS_CONFIG.blindSettleMs;
 const SPA_NAV_DETECT_MS = STEP_READINESS_CONFIG.spaNavDetectMs;
 const DEFAULTS = STEP_READINESS_CONFIG.defaults;
 
+/**
+ * Maximum time (ms) to wait for Cloudflare/reCAPTCHA/generic interstitial
+ * challenges to clear before proceeding. Configurable via env var for
+ * sites with heavier challenges (e.g. Turnstile on slow networks).
+ *
+ * Default: 7000ms. Set CHALLENGE_BUDGET_MS=12000 for slow sites.
+ * Invalid values (non-numeric, out of range 1000..60000) fall back to default.
+ */
+const CHALLENGE_BUDGET_MS = (() => {
+  const raw = process.env.CHALLENGE_BUDGET_MS;
+  if (!raw) return 7000;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1000 || parsed > 60000) {
+    // Silently fall back to default — prevent misconfig from breaking pipeline
+    return 7000;
+  }
+  return parsed;
+})();
+
 // ═══════════════════════════════════════════════════════════════════════════
 // DOM STABILITY THRESHOLD — DYNAMIC
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1588,7 +1607,7 @@ export async function waitForStepReadiness(
   // If we're currently on a challenge page, waiting for the next step's elements
   // is pointless — those elements only exist AFTER the challenge redirects us.
   // Instead, widen the URL-change watcher and return once we land on a new URL.
-  // Budget: up to 7s (challenges typically take 3-5s).
+  // Budget: up to CHALLENGE_BUDGET_MS (default 7s, configurable via env) — challenges typically take 3-5s.
   // ─────────────────────────────────────────────────────────────────────────
 
   const challengeStart = Date.now();
@@ -1600,7 +1619,7 @@ export async function waitForStepReadiness(
   });
   if (challenge.detected) {
     const challengeUrl = page.url();
-    const challengeBudget = Math.min(7000, maxWaitMs - (Date.now() - startTime));
+    const challengeBudget = Math.min(CHALLENGE_BUDGET_MS, maxWaitMs - (Date.now() - startTime));
     logger.info('[STEP_READINESS] Challenge/interstitial detected — widening URL-change watch', {
       stepId: nextStep.id,
       kind: challenge.kind,

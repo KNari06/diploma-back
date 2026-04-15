@@ -3365,12 +3365,14 @@ export class CommandExecutor {
               description: intentMeta.intentDescription,
               bindingHints: intentMeta.bindingHints,
               compiledPageUrl: intentMeta.compiled?.context?.pageUrl,
+              actionType: intentMeta.actionType,
             });
 
             if (!shortcut.ok) {
               const level = (shortcut.reason === 'ttl_expired'
                 || shortcut.reason === 'url_mismatch'
-                || shortcut.reason === 'semantic_mismatch') ? 'info' : 'debug';
+                || shortcut.reason === 'semantic_mismatch'
+                || shortcut.reason === 'node_disabled') ? 'info' : 'debug';
               logger[level]('[COMMAND_EXECUTOR] Evidence shortcut bypass', {
                 stepId,
                 cachedRef: intentMeta.evidence.lastSuccessRef,

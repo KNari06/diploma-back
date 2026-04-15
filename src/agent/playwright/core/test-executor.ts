@@ -1002,6 +1002,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     // Pass context for SPA navigation detection + dynamic DOM stability threshold
                     prevActionType,
                     prevUrl: urlBeforeStep,
+                    recordedDelayMs: nextIntentMeta.evidence?.interStepDelayMs,
                   });
 
                   if (lookahead.autoWaitApplied) {

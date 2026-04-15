@@ -657,15 +657,17 @@ export class IntentStepLintService {
         description: stepDraft.description,
         bindingHints: stepDraft.bindingHints,
         compiledPageUrl: stepDraft.compiled?.context?.pageUrl,
+        actionType: stepDraft.type,
       });
 
       if (!shortcut.ok) {
         // Reason-specific logging preserved for operator diagnostics.
-        // `ttl_expired`/`url_mismatch`/`semantic_mismatch` promoted to info because
-        // they indicate real drift we want to see; the rest stay at debug.
+        // `ttl_expired`/`url_mismatch`/`semantic_mismatch`/`node_disabled` promoted
+        // to info because they indicate real drift we want to see; the rest stay at debug.
         const level = (shortcut.reason === 'ttl_expired'
           || shortcut.reason === 'url_mismatch'
-          || shortcut.reason === 'semantic_mismatch') ? 'info' : 'debug';
+          || shortcut.reason === 'semantic_mismatch'
+          || shortcut.reason === 'node_disabled') ? 'info' : 'debug';
         logger[level]('[INTENT_LINT_V5] Evidence shortcut bypass', {
           previewSessionId,
           cachedRef: stepDraft.evidence.lastSuccessRef,
