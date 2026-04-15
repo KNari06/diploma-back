@@ -786,22 +786,13 @@ export async function applySession(req: Request, res: Response): Promise<void> {
   }
 
   try {
-    const client = getMobileRunnerClient();
-
-    const rawStepType = stepDraft.type || stepDraft.kind || 'click';
-
-    // Map frontend step types to runner-compatible types.
-    // Frontend uses "tap" but the runner schema expects "click".
-    const STEP_TYPE_MAP: Record<string, string> = { tap: 'click', fill: 'type' };
-    const stepType = STEP_TYPE_MAP[rawStepType] || rawStepType;
-
-    // Normalize description: strip surrounding quotes
-    const rawDescription = (stepDraft.elementDescription || stepDraft.description || '');
-    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
-
     // Trace logging for mobile editor
     const traceSessionId = `mobile-${sessionId}`;
     const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
+    const rawStepType = stepDraft.type || stepDraft.kind || 'click';
+    const description = (stepDraft.elementDescription || stepDraft.description || '')
+      .replace(/['"]+([^'"]+)['"]+/g, '$1')
+      .trim();
     trace.writeMobileApplyRequest({
       stepId: stepDraft.id || `apply_${Date.now()}`,
       stepType: rawStepType,
@@ -811,115 +802,31 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     });
     const applyStart = Date.now();
 
-    // ── Resolve-then-execute: lint first, then execute by coordinates.
-    // This ensures "Run" uses the EXACT same element as "Find using desc."
-    // and avoids the slow runSteps → smartResolve → LLM pipeline.
-    const FAST_PATH_TYPES = new Set(['click', 'tap', 'double_tap', 'long_press', 'open', 'toggle', 'check', 'uncheck', 'select', 'hover', 'type', 'fill']);
-    if (description && FAST_PATH_TYPES.has(rawStepType)) {
-      const ACTION_TYPE_MAP: Record<string, string> = {
-        click: 'tap', tap: 'tap', double_tap: 'tap', long_press: 'tap',
-        open: 'tap', toggle: 'tap', check: 'tap', uncheck: 'tap',
-        select: 'tap', hover: 'tap', type: 'type_text', fill: 'type_text',
-      };
-      const lintActionType = ACTION_TYPE_MAP[rawStepType] || 'tap';
-      const lintResult = await client.lintElement(sessionId, description, lintActionType);
-
-      if (lintResult.status === 'resolved' && lintResult.boundingBox) {
-        const bb = lintResult.boundingBox;
-        const centerX = Math.round(bb.x + bb.width / 2);
-        const centerY = Math.round(bb.y + bb.height / 2);
-
-        // Build command sequence based on step type
-        const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
-
-        if (rawStepType === 'type' || rawStepType === 'fill') {
-          // Type steps: tap to focus → type text → optionally press Enter
-          commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
-          if (stepDraft.value) {
-            const pressEnter = !!(stepDraft.options?.pressEnter);
-            commands.push({
-              type: 'type_text',
-              params: {
-                text: stepDraft.value,
-                clearFirst: !!(stepDraft.options?.replaceContent),
-              },
-            });
-            if (pressEnter) {
-              commands.push({ type: 'press_key', params: { keycode: 'KEYCODE_ENTER' } });
-            }
-          }
-        } else {
-          // Tap-like steps: single command at coordinates
-          const RAW_CMD_MAP: Record<string, string> = {
-            click: 'tap', tap: 'tap', open: 'tap', toggle: 'tap',
-            check: 'tap', uncheck: 'tap', select: 'tap', hover: 'tap',
-            double_tap: 'double_tap', long_press: 'long_press',
-          };
-          commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { x: centerX, y: centerY } });
-        }
-
-        await client.executeBatchCommands(sessionId, commands);
-        const durationMs = Date.now() - applyStart;
-
-        trace.writeMobileApplyResult({
-          stepId: stepDraft.id || `apply_${Date.now()}`,
-          sessionId,
-          latencyMs: durationMs,
-          result: { success: true, resolvedVia: lintResult.resolvedVia || 'lint', durationMs },
-        });
-
-        res.json({
-          success: true,
-          stepResult: { success: true, resolvedVia: lintResult.resolvedVia || 'lint', durationMs },
-          status: 'passed',
-        });
-        return;
-      }
-      // Lint didn't resolve — fall through to runSteps
-    }
-
-    // Fallback: full runSteps pipeline (re-resolves from scratch)
-    const intentStep = {
-      id: stepDraft.id || `apply_${Date.now()}`,
-      type: stepType,
-      description,
-      value: stepDraft.value,
-      assertionText: stepDraft.assertionText,
-      appPackage: stepDraft.appPackage,
-      options: stepDraft.options,
-      bindingHints: stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {},
-    };
-
-    const result = await client.runSteps(sessionId, [intentStep], {
-      screenshotEachStep: true,
-      stopOnFailure: false,
+    // Delegate to shared service — REST and WS both use this path.
+    const { MobileStepApplyService } = await import('@/services/mobile/mobile-step-apply.service');
+    const output = await MobileStepApplyService.apply({
+      sessionId,
+      stepDraft,
+      userId: req.user!.id,
     });
 
-    const stepResult = result.steps?.[0];
-
-    // Log the result
     trace.writeMobileApplyResult({
-      stepId: intentStep.id,
+      stepId: stepDraft.id || `apply_${Date.now()}`,
       sessionId,
       latencyMs: Date.now() - applyStart,
       result: {
-        success: stepResult?.success ?? false,
-        error: stepResult?.error,
-        resolvedVia: stepResult?.resolvedVia,
-        durationMs: stepResult?.durationMs,
+        success: output.stepResult?.success ?? false,
+        error: output.stepResult?.error,
+        resolvedVia: output.stepResult?.resolvedVia,
+        durationMs: output.stepResult?.durationMs,
       },
     });
 
     res.json({
-      success: true,
-      stepResult: {
-        success: stepResult?.success ?? false,
-        error: stepResult?.error,
-        screenshot: stepResult?.screenshot,
-        resolvedVia: stepResult?.resolvedVia,
-        durationMs: stepResult?.durationMs,
-      },
-      status: stepResult?.success ? 'passed' : 'failed',
+      success: output.success,
+      stepResult: output.stepResult,
+      appliedStep: output.appliedStep,
+      status: output.status,
     });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Apply failed', {
@@ -1315,8 +1222,15 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       const description = (step.description || '').replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
 
       try {
-        // Fast path: lint to find element, then execute by coordinates (same as applySession)
-        if (description && LINT_TYPES.has(rawType)) {
+        // If the step has a compiled plan from a prior apply, skip lint and
+        // go straight to runSteps — the runner's tryCompiledFastPath() will
+        // short-circuit the LLM pipeline in ~5ms, beating a 200-500ms lint
+        // round-trip. Only steps WITHOUT compiled use the lint fast-path.
+        const hasCompiled = !!(step as any).compiled;
+
+        // Fast path: lint to find element, then execute by coordinates (same as applySession).
+        // Only for steps WITHOUT a compiled plan (first run / manual adds).
+        if (!hasCompiled && description && LINT_TYPES.has(rawType)) {
           const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
           const lintResult = await client.lintElement(sessionId, description, lintActionType);
 
@@ -1359,7 +1273,9 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           // Lint didn't resolve — fall through to runSteps
         }
 
-        // Fallback: use runSteps pipeline for this single step
+        // Fallback: use runSteps pipeline for this single step.
+        // CRITICAL: forward `compiled` so the runner's fast-path resolver
+        // can short-circuit LLM on subsequent regression runs.
         const stepType = STEP_TYPE_MAP[rawType] || rawType;
         const intentStep = {
           id: step.id,
@@ -1369,6 +1285,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           assertionText: step.assertionText,
           options: step.options,
           bindingHints: step.bindingHints || {},
+          compiled: (step as any).compiled,
         };
 
         const result = await client.runSteps(sessionId, [intentStep], {
@@ -1386,6 +1303,29 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           logger.info(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} passed (runSteps fallback)`, {
             stepId: step.id, type: rawType, description, durationMs,
           });
+
+          // Auto-persist compiled plan when the runner (re)built one — without this
+          // every regression run re-pays the LLM cost until the user hits Save.
+          if (stepResult.compiledPlan && intentTestCaseId) {
+            try {
+              const { IntentTestCaseService } = await import(
+                '@/services/testing/ui/preview/intent-test-case.service'
+              );
+              const enrichedStep = {
+                ...(step as any),
+                compiled: stepResult.compiledPlan,
+              };
+              await IntentTestCaseService.updateStepFromPreviewApply({
+                intentTestCaseId,
+                appliedStep: enrichedStep,
+              });
+            } catch (persistError) {
+              logger.warn('[MOBILE_SESSION] Failed to auto-persist compiled plan', {
+                stepId: step.id,
+                error: persistError instanceof Error ? persistError.message : String(persistError),
+              });
+            }
+          }
         } else {
           const errorMsg = stepResult?.error || 'Step failed';
           stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });

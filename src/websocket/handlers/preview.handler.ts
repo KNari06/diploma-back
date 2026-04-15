@@ -1437,6 +1437,123 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // MOBILE STEP APPLY — WebSocket equivalent of POST /mobile/sessions/:id/apply.
+  // Parallels `preview:step:apply` so the mobile editor gets the same live-update
+  // flow (no request/response latency for UI state), and the backend auto-persists
+  // the resulting appliedStep to DB when intentTestCaseId is provided.
+  // ═══════════════════════════════════════════════════════════════════════════
+  socket.on('mobile:step:apply', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      if (!checkRateLimit(socket.id, 'apply')) {
+        socket.emit('mobile:step:apply:result', {
+          success: false,
+          error: 'Rate limited. Please slow down.',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { mobileSessionId, stepDraft, intentTestCaseId } = data;
+
+      if (!mobileSessionId || !stepDraft) {
+        socket.emit('mobile:step:apply:result', {
+          success: false,
+          error: 'mobileSessionId and stepDraft are required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Editor trace: log request
+      const traceSessionId = `mobile-${mobileSessionId}`;
+      const trace = EditorTraceService.getOrCreate(traceSessionId, ensuredUserId);
+      const rawStepType = stepDraft.type || (stepDraft as any).kind || 'click';
+      const description = String(
+        (stepDraft as any).elementDescription || stepDraft.description || ''
+      )
+        .replace(/['"]+([^'"]+)['"]+/g, '$1')
+        .trim();
+      trace.writeMobileApplyRequest({
+        stepId: stepDraft.id || `apply_${Date.now()}`,
+        stepType: rawStepType,
+        description,
+        value: (stepDraft as any).value,
+        sessionId: mobileSessionId,
+      });
+      const applyStart = Date.now();
+
+      // Delegate to shared apply service
+      const { MobileStepApplyService } = await import('@/services/mobile/mobile-step-apply.service');
+      const output = await MobileStepApplyService.apply({
+        sessionId: mobileSessionId,
+        stepDraft,
+        userId: ensuredUserId,
+      });
+
+      trace.writeMobileApplyResult({
+        stepId: stepDraft.id || `apply_${Date.now()}`,
+        sessionId: mobileSessionId,
+        latencyMs: Date.now() - applyStart,
+        result: {
+          success: output.stepResult?.success ?? false,
+          error: output.stepResult?.error,
+          resolvedVia: output.stepResult?.resolvedVia,
+          durationMs: output.stepResult?.durationMs,
+        },
+      });
+
+      socket.emit('mobile:step:apply:result', {
+        success: output.success,
+        error: output.stepResult?.error,
+        appliedStep: output.appliedStep as any,
+        stepResult: output.stepResult,
+        status: output.status,
+        mobileSessionId,
+        timestamp: new Date().toISOString(),
+      } as any);
+
+      // Auto-persist to DB if intentTestCaseId provided and apply succeeded.
+      // Matches the web preview:step:apply flow (line ~1329 above).
+      if (output.stepResult?.success && intentTestCaseId && output.appliedStep) {
+        try {
+          const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+          const updated = await IntentTestCaseService.updateStepFromPreviewApply({
+            intentTestCaseId,
+            appliedStep: output.appliedStep as any,
+          });
+
+          if (updated) {
+            logger.info('[WebSocket] Auto-persisted mobile appliedStep to DB', {
+              socketId: socket.id,
+              intentTestCaseId,
+              stepId: output.appliedStep.id,
+            });
+          }
+        } catch (persistError) {
+          logger.error('[WebSocket] Error auto-persisting mobile appliedStep to DB', {
+            socketId: socket.id,
+            intentTestCaseId,
+            error: persistError instanceof Error ? persistError.message : String(persistError),
+          });
+        }
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in mobile:step:apply', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('mobile:step:apply:result', {
+        success: false,
+        error: error instanceof Error ? error.message : 'Mobile apply failed',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // V5: Interactive preview control handlers
   // ═══════════════════════════════════════════════════════════════════════════
 

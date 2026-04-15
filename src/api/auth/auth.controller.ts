@@ -16,6 +16,7 @@ import {
   invalidateAuthCache,
   invalidateAuthCacheForUser,
 } from '@/services/auth/auth.service';
+import { notifyAdminsOfNewUser } from '@/services/auth/new-user-notification.service';
 import { EmailService } from '@/services/core/email.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -844,6 +845,21 @@ export const verifyEmail = async (req: Request, res: Response): Promise<void> =>
       .select('role, name, status, avatar_url')
       .eq('id', data.user.id)
       .maybeSingle();
+
+    // First-time email verification → notify admins (idempotent: only fires
+    // when status is still 'pending_approval' and no prior sign-in exists).
+    const isFirstVerification =
+      (!userData || userData.status === 'pending_approval') &&
+      !data.user.last_sign_in_at;
+    if (isFirstVerification && data.user.email) {
+      notifyAdminsOfNewUser({
+        userId: data.user.id,
+        email: data.user.email,
+        name: userData?.name || data.user.user_metadata?.name || data.user.email.split('@')[0],
+        provider: 'email',
+        signedUpAt: data.user.created_at,
+      });
+    }
 
     const user = {
       id: data.user.id,

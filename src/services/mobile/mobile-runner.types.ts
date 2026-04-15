@@ -108,13 +108,34 @@ export interface MobileIntentStep {
 
 // ── Step Result ──────────────────────────────────────────────────
 
+/**
+ * Compiled mobile locator plan — mirrors qait-mobile-runner's CompiledMobilePlan.
+ * Backend stores this on the IntentStep after successful apply so subsequent runs
+ * can skip the LLM pipeline. See runner/src/types/intent-step.types.ts for builder.
+ */
+export interface MobileCompiledPlan {
+  version: 1;
+  platform: 'android' | 'ios' | 'flutter';
+  compiledAt: string;
+  strategies: Array<Record<string, unknown>>;
+  ordinal?: { index: number; total?: number };
+  fingerprint: {
+    label?: string;
+    role?: string;
+    siblingCount?: number;
+    parentText?: string;
+  };
+}
+
 export interface MobileStepResult {
   stepId: string;
   success: boolean;
   error?: string;
   screenshot?: string; // base64
-  resolvedVia?: 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
+  resolvedVia?: 'compiled' | 'exact_label' | 'exact_text' | 'partial' | 'coordinates' | 'llm' | 'vision' | 'thinking' | 'soft_score' | 'passthrough' | 'skipped' | 'unresolved' | 'low_confidence';
   durationMs: number;
+  /** Freshly-built compiled plan from this run. Persist onto the IntentStep. */
+  compiledPlan?: MobileCompiledPlan;
   /** Error evidence collected during/after this step */
   evidence?: {
     logErrors?: string[];

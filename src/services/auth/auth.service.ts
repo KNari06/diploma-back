@@ -5,6 +5,7 @@ import { AuthTokens, AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import * as crypto from 'crypto';
+import { notifyAdminsOfNewUser } from './new-user-notification.service';
 
 // Supabase JWT expiry is configured in Supabase Dashboard (Auth settings).
 // This is only a fallback for cases when expires_in is missing.
@@ -23,6 +24,43 @@ function warnIfUnexpectedJwtExpiry(expiresIn?: number): void {
       expectedSeconds: DEFAULT_ACCESS_TOKEN_EXPIRES_IN_SECONDS,
       hint: 'Update Supabase Auth setting: JWT expiry limit',
     });
+  }
+}
+
+/**
+ * Detect whether an OAuth session belongs to a first-time sign-up.
+ * Primary signal: public.users has no row yet (dbStatus is undefined) →
+ * the DB trigger will insert a row with status 'pending_approval'.
+ * Fallback: Supabase Auth last_sign_in_at is missing or equals created_at.
+ */
+function isFirstTimeOAuth(
+  supabaseUser: { created_at?: string; last_sign_in_at?: string | null },
+  dbStatus?: string,
+): boolean {
+  if (!dbStatus) return true;
+  const created = supabaseUser.created_at;
+  const lastSignIn = supabaseUser.last_sign_in_at;
+  if (!created) return false;
+  if (!lastSignIn) return true;
+  return created === lastSignIn;
+}
+
+/**
+ * Pick a provider label for the notification payload.
+ * Supabase stores the provider in app_metadata.provider for OAuth identities.
+ */
+function detectOAuthProvider(
+  supabaseUser: { app_metadata?: { provider?: string } | null },
+): 'email' | 'google' | 'github' | 'gitlab' | 'bitbucket' {
+  const provider = supabaseUser.app_metadata?.provider;
+  switch (provider) {
+    case 'google':
+    case 'github':
+    case 'gitlab':
+    case 'bitbucket':
+      return provider;
+    default:
+      return 'email';
   }
 }
 
@@ -72,7 +110,8 @@ export async function signUpWithEmail(
       throw new Error('Sign up failed: no user returned');
     }
 
-    // Check if email confirmation is required
+    // Check if email confirmation is required — admin notification is deferred
+    // to verifyEmail() to avoid alerting on abandoned signups.
     if (!data.session && !data.user.email_confirmed_at) {
       logger.info('[AUTH] User signed up, email confirmation required', {
         userId: data.user.id,
@@ -108,6 +147,15 @@ export async function signUpWithEmail(
       userId: data.user.id,
       email: data.user.email || email.substring(0, 5) + '***',
       confirmed: !!data.user.email_confirmed_at,
+    });
+
+    // Auto-confirmed signup (no email verification required) → notify admins now.
+    notifyAdminsOfNewUser({
+      userId: data.user.id,
+      email: data.user.email || email,
+      name: data.user.user_metadata?.name || name?.trim() || email.split('@')[0],
+      provider: 'email',
+      signedUpAt: data.user.created_at,
     });
 
     return {
@@ -545,6 +593,18 @@ export async function exchangeCodeForSession(
         .eq('id', userData.user.id)
         .maybeSingle();
 
+      // Detect first-time OAuth sign-in → notify admins (non-blocking).
+      // Skip if email is not yet known (rare — provider still resolving identity).
+      if (userData.user.email && isFirstTimeOAuth(userData.user, dbUser?.status)) {
+        notifyAdminsOfNewUser({
+          userId: userData.user.id,
+          email: userData.user.email,
+          name: dbUser?.name || userData.user.user_metadata?.name || userData.user.email.split('@')[0],
+          provider: detectOAuthProvider(userData.user),
+          signedUpAt: userData.user.created_at,
+        });
+      }
+
       return {
         user: {
           id: userData.user.id,
@@ -589,6 +649,18 @@ export async function exchangeCodeForSession(
         .select('role, name, status, avatar_url')
         .eq('id', data.user.id)
         .maybeSingle();
+
+      // Detect first-time OAuth sign-in → notify admins (non-blocking).
+      // Skip if email is not yet known (rare — provider still resolving identity).
+      if (data.user.email && isFirstTimeOAuth(data.user, dbUser?.status)) {
+        notifyAdminsOfNewUser({
+          userId: data.user.id,
+          email: data.user.email,
+          name: dbUser?.name || data.user.user_metadata?.name || data.user.email.split('@')[0],
+          provider: detectOAuthProvider(data.user),
+          signedUpAt: data.user.created_at,
+        });
+      }
 
       return {
         user: {
