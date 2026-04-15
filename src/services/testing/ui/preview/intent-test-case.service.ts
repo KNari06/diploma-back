@@ -229,82 +229,90 @@ export class IntentTestCaseService {
     tags?: string[];
     priority?: 'critical' | 'high' | 'medium' | 'low';
   }): Promise<IntentTestCase> {
-    const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = params;
+    // Serialize concurrent writes to the same test case via the same in-process
+    // mutex used by updateStepFromPreviewApply / updateStepAfterHeal /
+    // batchUpdateStepsFromRun. Without it, a manual Save issued during an
+    // in-flight auto-persist could race and overwrite compiled/evidence fields
+    // that the runner just wrote. No reentrancy risk — none of the already-
+    // mutex'd methods call update() internally.
+    return withTestCaseMutex(params.id, async () => {
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = params;
 
-    const updates: Record<string, any> = {};
-    if (name !== undefined) updates.name = name;
-    if (description !== undefined) updates.description = description;
-    if (startUrl !== undefined) updates.start_url = startUrl;
-    if (url !== undefined) updates.url = url;
-    if (steps !== undefined) {
-      updates.steps_json = this.normalizeSteps(steps);
+      const updates: Record<string, any> = {};
+      if (name !== undefined) updates.name = name;
+      if (description !== undefined) updates.description = description;
+      if (startUrl !== undefined) updates.start_url = startUrl;
+      if (url !== undefined) updates.url = url;
+      if (steps !== undefined) {
+        updates.steps_json = this.normalizeSteps(steps);
 
-      // V7: Log warning for targeting steps lacking compiled/evidence
-      // This helps identify steps that may be unreliable in background runs
-      const targetingActions = ['click', 'type', 'hover', 'select', 'check', 'uncheck'];
-      const stepsWithoutCompiled = steps.filter(step => 
-        targetingActions.includes(step.type) && (!step.compiled || !step.evidence)
-      );
+        // V7: Log warning for targeting steps lacking compiled/evidence
+        // This helps identify steps that may be unreliable in background runs
+        const targetingActions = ['click', 'type', 'hover', 'select', 'check', 'uncheck'];
+        const stepsWithoutCompiled = steps.filter(step =>
+          targetingActions.includes(step.type) && (!step.compiled || !step.evidence)
+        );
 
-      if (stepsWithoutCompiled.length > 0) {
-        logger.warn('[INTENT_TEST_CASE] Saving steps without compiled/evidence data', {
-          id,
-          stepsCount: steps.length,
-          missingCount: stepsWithoutCompiled.length,
-          missingSteps: stepsWithoutCompiled.map(s => ({
-            stepId: s.id,
-            type: s.type,
-            description: s.description?.slice(0, 60),
-            hasCompiled: !!s.compiled,
-            hasEvidence: !!s.evidence,
-          })),
+        if (stepsWithoutCompiled.length > 0) {
+          logger.warn('[INTENT_TEST_CASE] Saving steps without compiled/evidence data', {
+            id,
+            stepsCount: steps.length,
+            missingCount: stepsWithoutCompiled.length,
+            missingSteps: stepsWithoutCompiled.map(s => ({
+              stepId: s.id,
+              type: s.type,
+              description: s.description?.slice(0, 60),
+              hasCompiled: !!s.compiled,
+              hasEvidence: !!s.evidence,
+            })),
+          });
+        }
+      }
+      if (flowId !== undefined) updates.flow_id = flowId;
+      if (status !== undefined) updates.status = status;
+      if (kind !== undefined) updates.kind = kind;
+      if (tags !== undefined) updates.tags = tags;
+      if (priority !== undefined) updates.priority = priority;
+
+      if (Object.keys(updates).length === 0) {
+        throw new Error('No fields to update');
+      }
+
+      logger.info('[INTENT_TEST_CASE] Updating test case', {
+        id,
+        updatedFields: Object.keys(updates),
+      });
+
+      const { data, error } = await supabaseAdmin
+        .from('intent_test_cases')
+        .update(updates)
+        .eq('id', id)
+        .eq('user_id', userId)
+        .select('*')
+        .single();
+
+      if (error) {
+        logger.error('[INTENT_TEST_CASE] Failed to update', { error, id });
+        throw new Error(`Failed to update test case: ${error.message}`);
+      }
+
+      // Invalidate flow mode cache
+      if (data.flow_id) {
+        await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
+      }
+
+      // Mark related negative test cases as stale when steps change
+      if (steps !== undefined) {
+        this.markNegativesStale(id).catch((err) => {
+          logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
+            testCaseId: id,
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
       }
-    }
-    if (flowId !== undefined) updates.flow_id = flowId;
-    if (status !== undefined) updates.status = status;
-    if (kind !== undefined) updates.kind = kind;
-    if (tags !== undefined) updates.tags = tags;
-    if (priority !== undefined) updates.priority = priority;
 
-    if (Object.keys(updates).length === 0) {
-      throw new Error('No fields to update');
-    }
-
-    logger.info('[INTENT_TEST_CASE] Updating test case', {
-      id,
-      updatedFields: Object.keys(updates),
+      return this.mapToIntentTestCase(data);
     });
-
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .update(updates)
-      .eq('id', id)
-      .eq('user_id', userId)
-      .select('*')
-      .single();
-
-    if (error) {
-      logger.error('[INTENT_TEST_CASE] Failed to update', { error, id });
-      throw new Error(`Failed to update test case: ${error.message}`);
-    }
-
-    // Invalidate flow mode cache
-    if (data.flow_id) {
-      await cache.delByPattern(`qait:cache:ptree:flow:${data.flow_id}:*`);
-    }
-
-    // Mark related negative test cases as stale when steps change
-    if (steps !== undefined) {
-      this.markNegativesStale(id).catch((err) => {
-        logger.warn('[INTENT_TEST_CASE] Failed to mark negatives stale', {
-          testCaseId: id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-
-    return this.mapToIntentTestCase(data);
   }
 
   /**
