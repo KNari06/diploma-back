@@ -840,7 +840,7 @@ export interface HealthSummary {
 export interface RunReportStep {
   index: number;
   description: string;
-  status: 'passed' | 'failed' | 'skipped';
+  status: 'passed' | 'failed' | 'warning' | 'skipped';
   durationMs?: number;
   error?: {
     message: string;

@@ -3286,7 +3286,7 @@ export class CommandExecutor {
           iframe: !!iframeSelector,
         });
 
-        this.trace('element_resolution', retryCtx.attempt + 1, {
+        this.trace('element_resolution', intentMeta?.stepIndex ?? retryCtx.attempt + 1, {
           stepId, stage: 'compiled', success: true,
           strategy: compiledResult.usedStrategy,
           confidence: compiledResult.confidence,
@@ -3305,7 +3305,7 @@ export class CommandExecutor {
         signatureMatched: compiledResult.signatureMatched,
       });
 
-      this.trace('element_resolution', retryCtx.attempt + 1, {
+      this.trace('element_resolution', intentMeta?.stepIndex ?? retryCtx.attempt + 1, {
         stepId, stage: 'compiled', success: false,
         skipReason: compiledResult.skipReason,
         expired: compiledResult.expired,
@@ -3480,8 +3480,11 @@ export class CommandExecutor {
                 }
               }
 
+              // V16: Only mark as 'healed' when a compiled plan actually existed and failed.
+              // If no compiled plan was present (no_plan), LLM resolver is the primary path — not healing.
+              const hadCompiledPlan = !!intentMeta?.compiled?.locatorPlan?.length;
               const runtimeMeta: StepRuntimeMeta = {
-                runtimeStatus: 'healed', // Mark as healed since compiled failed
+                runtimeStatus: hadCompiledPlan ? 'healed' : 'executed',
                 source: 'resolver',
                 confidenceTier: topCandidate.confidence >= 0.85 ? 'high' :
                                topCandidate.confidence >= 0.6 ? 'medium' : 'low',
@@ -3502,7 +3505,7 @@ export class CommandExecutor {
                 resolutionPath: 'llm_resolver',
               });
 
-              this.trace('element_resolution', retryCtx.attempt + 1, {
+              this.trace('element_resolution', intentMeta?.stepIndex ?? retryCtx.attempt + 1, {
                 stepId, stage: 'llm_resolver', success: true,
                 confidence: topCandidate.confidence,
                 candidateCount: resolveResult.candidates.length,
@@ -3574,8 +3577,9 @@ export class CommandExecutor {
 
                       await scrollLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
 
+                      const hadCompiledPlanScroll = !!intentMeta?.compiled?.locatorPlan?.length;
                       const runtimeMeta: StepRuntimeMeta = {
-                        runtimeStatus: 'healed',
+                        runtimeStatus: hadCompiledPlanScroll ? 'healed' : 'executed',
                         source: 'resolver',
                         confidenceTier: scrollCandidate.confidence >= 0.85 ? 'high' : 'medium',
                         executionMs: Date.now() - startTime,
@@ -3616,7 +3620,7 @@ export class CommandExecutor {
             message: resolveResult.message,
           });
 
-          this.trace('element_resolution', retryCtx.attempt + 1, {
+          this.trace('element_resolution', intentMeta?.stepIndex ?? retryCtx.attempt + 1, {
             stepId, stage: 'llm_resolver', success: false,
             status: resolveResult.status,
             candidateCount: resolveResult.candidates.length,
@@ -3838,7 +3842,7 @@ export class CommandExecutor {
               verified: healingResult.verified,
             });
 
-            this.trace('element_resolution', retryCtx.attempt + 1, {
+            this.trace('element_resolution', intentMeta?.stepIndex ?? retryCtx.attempt + 1, {
               stepId, stage: 'self_heal', success: true,
               confidence: healConfidence,
               newSelector: healingResult.newSelector,
@@ -4671,20 +4675,37 @@ export class CommandExecutor {
     // Priority: changedFrom > regex > glob > substring > domain
 
     if (matcher.changedFrom) {
-      // V13: Use runtime URL instead of recording-time URL.
-      // The recorded changedFrom may differ from the actual URL at execution time
-      // (different env, query params, etc.) — use current page URL as baseline.
-      const prevUrl = this.page.url();
+      const currentUrl = this.page.url();
+
+      // V16: If URL already differs from the recorded changedFrom value,
+      // navigation already happened (e.g., preceding click with awaitNavigation).
+      // Just wait for page to settle instead of waiting for another URL change.
+      const { normalizeUrlForComparison } = await import(
+        '@/services/testing/ui/preview/auto-wait-for.utils'
+      );
+      if (normalizeUrlForComparison(currentUrl) !== normalizeUrlForComparison(matcher.changedFrom)) {
+        logger.debug('[COMMAND_EXECUTOR] changedFrom: URL already changed, waiting for page settle', {
+          recorded: matcher.changedFrom,
+          current: currentUrl,
+        });
+        await this.page.waitForLoadState('load', { timeout: timeoutMs }).catch(() => {
+          // load may not fire on SPA — fallback to domcontentloaded
+          return this.page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => {});
+        });
+        return;
+      }
+
+      // URL hasn't changed yet — wait for it to change from current
       logger.debug('[COMMAND_EXECUTOR] changedFrom using runtime URL', {
         recorded: matcher.changedFrom,
-        runtime: prevUrl,
+        runtime: currentUrl,
       });
       await this.page.waitForURL(
-        (url) => url.toString() !== prevUrl,
+        (url) => url.toString() !== currentUrl,
         { timeout: timeoutMs, waitUntil: 'load' }
       );
       logger.debug('[COMMAND_EXECUTOR] URL changed from previous value', {
-        prevUrl,
+        prevUrl: currentUrl,
         newUrl: this.page.url(),
       });
       return;

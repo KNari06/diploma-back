@@ -944,6 +944,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 attempt: retryAttempt,
                 stepDescription,
                 success: stepResult.success,
+                // V16: Surface soft failure so frontend can show warning instead of error
+                ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),
                 timestamp: new Date().toISOString(),
                 runtimeMeta: stepResult.runtimeMeta,
               });

@@ -131,6 +131,8 @@ function reduceStepCompletedPayload(payload: any): any {
       step: typeof payload.step === 'number' ? payload.step : undefined,
       stepDescription: truncateString(payload.stepDescription, 2000),
       success: typeof payload.success === 'boolean' ? payload.success : undefined,
+      // V16: Preserve softFailure flag so report shows warning instead of error
+      softFailure: payload.softFailure === true ? true : undefined,
       timestamp: truncateString(payload.timestamp, 64),
       // V11: Preserve runtimeMeta so V11 data survives Redis → Postgres persistence
       runtimeMeta: reduceRuntimeMeta(payload.runtimeMeta),
