@@ -77,10 +77,17 @@ export const getUserCredits = async (req: Request, res: Response): Promise<void>
         totalPurchased: userCredits.total_purchased,
         totalUsed: userCredits.total_used,
         expiresAt: userCredits.subscription_expires_at,
+        // V16: Grace period fields
+        graceLimit: userCredits.grace_limit || 0,
+        overageBalance: userCredits.overage_balance || 0,
+        inGracePeriod: (userCredits.credits_balance || 0) < 0,
+        graceStartedAt: userCredits.grace_started_at || null,
       },
-      message: userCredits.credits_balance === 0
-        ? '💳 Purchase credits to continue'
-        : `✅ You have ${userCredits.credits_balance} credits`,
+      message: (userCredits.credits_balance || 0) < 0
+        ? `⚠️ You are in grace period — ${Math.abs(userCredits.credits_balance || 0)} credits overage`
+        : userCredits.credits_balance === 0
+          ? '💳 Purchase credits to continue'
+          : `✅ You have ${userCredits.credits_balance} credits`,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

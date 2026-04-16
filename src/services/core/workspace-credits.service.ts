@@ -12,7 +12,7 @@ export interface WorkspaceCredits {
   credits_balance: number;
   total_purchased: number;
   total_used: number;
-  subscription_plan: 'free' | 'basic' | 'pro' | 'enterprise' | 'business';
+  subscription_plan: 'free' | 'pilot' | 'small_business' | 'middle_business' | 'enterprise' | 'basic' | 'pro' | 'business';
   subscription_status: 'active' | 'inactive' | 'expired';
   subscription_expires_at: string | null;
   last_credit_usage: string | null;
@@ -22,6 +22,12 @@ export interface WorkspaceCredits {
   period_start_date: string | null;
   warning_80_sent: boolean;
   warning_95_sent: boolean;
+  /** V16: Grace period — max negative balance allowed */
+  grace_limit: number;
+  /** V16: Accumulated overage when balance < 0 */
+  overage_balance: number;
+  /** V16: When grace period started */
+  grace_started_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -99,7 +105,8 @@ export class WorkspaceCreditsService {
       return existingCredits;
     }
 
-    // Create new credits record with 0 balance
+    // Create with free plan and 0 credits.
+    // Pilot/B2B plans are assigned manually by admin via assignPilot() or upgradeToPlan().
     const { data, error } = await supabaseAdmin
       .from('workspace_credits')
       .upsert(
@@ -108,6 +115,7 @@ export class WorkspaceCreditsService {
           credits_balance: 0,
           subscription_plan: 'free',
           subscription_status: 'inactive',
+          grace_limit: 0,
         },
         {
           onConflict: 'workspace_id',
@@ -154,7 +162,9 @@ export class WorkspaceCreditsService {
       }
 
       const balance = Number.isFinite(credits.credits_balance) ? credits.credits_balance : 0;
-      return balance >= requiredCredits;
+      // V16: Grace period — workspace can go negative up to grace_limit
+      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
+      return (balance + graceLimit) >= requiredCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Error checking credits', {
         error: error instanceof Error ? error.message : String(error),
@@ -212,11 +222,16 @@ export class WorkspaceCreditsService {
       const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
       const currentBalance = Number.isFinite(credits.credits_balance) ? credits.credits_balance : 0;
 
-      if (currentBalance < amount) {
-        logger.warn('[WORKSPACE_CREDITS] Insufficient credits for deduction', {
+      // V16: Grace period — allow negative balance up to grace_limit
+      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
+      const effectiveFloor = -graceLimit;
+
+      if (currentBalance - amount < effectiveFloor) {
+        logger.warn('[WORKSPACE_CREDITS] Insufficient credits (grace limit exceeded)', {
           workspaceId,
           currentBalance,
           requiredAmount: amount,
+          graceLimit,
         });
         return null;
       }
@@ -452,6 +467,9 @@ export class WorkspaceCreditsService {
           ? (credits.total_purchased || 0) + amount
           : credits.total_purchased;
 
+      // V16: Clear grace period when credits are added and balance goes positive
+      const clearGrace = newBalance >= 0 && credits.grace_started_at;
+
       // Update credits
       const { data: updatedCredits, error: updateError } = await supabaseAdmin
         .from('workspace_credits')
@@ -460,6 +478,7 @@ export class WorkspaceCreditsService {
           total_purchased: newTotalPurchased,
           credits_purchased_at:
             transactionType === 'purchase' ? new Date().toISOString() : credits.credits_purchased_at,
+          ...(clearGrace ? { overage_balance: 0, grace_started_at: null } : {}),
           updated_at: new Date().toISOString(),
         })
         .eq('workspace_id', workspaceId)
@@ -648,6 +667,151 @@ export class WorkspaceCreditsService {
       logger.error('[WORKSPACE_CREDITS] Exception resetting monthly usage', {
         error: error instanceof Error ? error.message : String(error),
         workspaceId,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * V16: Assign pilot plan to a workspace (admin-only, manual).
+   * Gives 10K credits + 1K grace. Called by admin after approving B2B customer.
+   */
+  static async assignPilot(workspaceId: string): Promise<WorkspaceCredits | null> {
+    try {
+      const { WORKSPACE_PLANS } = await import('./token-calculator.service');
+      const pilot = WORKSPACE_PLANS.pilot;
+
+      const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
+      const currentBalance = Number.isFinite(credits.credits_balance) ? credits.credits_balance : 0;
+      const newBalance = currentBalance + pilot.credits;
+
+      const { data, error } = await supabaseAdmin
+        .from('workspace_credits')
+        .update({
+          credits_balance: newBalance,
+          total_purchased: (credits.total_purchased || 0) + pilot.credits,
+          subscription_plan: 'pilot',
+          subscription_status: 'active',
+          grace_limit: pilot.graceLimit,
+          credits_purchased_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('workspace_id', workspaceId)
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('[WORKSPACE_CREDITS] Error assigning pilot', {
+          error: error.message, workspaceId,
+        });
+        return null;
+      }
+
+      // Record transaction
+      try {
+        await supabaseAdmin.from('workspace_credit_transactions').insert({
+          workspace_id: workspaceId,
+          amount: pilot.credits,
+          balance_after: newBalance,
+          transaction_type: 'bonus',
+          description: `Pilot plan assigned — ${pilot.credits.toLocaleString()} credits`,
+          metadata: { plan: 'pilot', source: 'admin_assign' },
+        });
+      } catch { /* non-fatal */ }
+
+      logger.info('[WORKSPACE_CREDITS] Pilot plan assigned', {
+        workspaceId,
+        credits: pilot.credits,
+        graceLimit: pilot.graceLimit,
+        newBalance,
+      });
+
+      return data;
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Exception assigning pilot', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * V16: Upgrade workspace to a paid B2B plan.
+   * Called after Stripe payment succeeds. Sets credits, grace limit, and plan.
+   */
+  static async upgradeToPlan(
+    workspaceId: string,
+    planSlug: 'small_business' | 'middle_business' | 'enterprise',
+  ): Promise<WorkspaceCredits | null> {
+    try {
+      const { WORKSPACE_PLANS } = await import('./token-calculator.service');
+      const planConfig = WORKSPACE_PLANS[planSlug];
+      if (!planConfig) {
+        logger.error('[WORKSPACE_CREDITS] Unknown B2B plan slug', { workspaceId, planSlug });
+        return null;
+      }
+
+      const credits = await this.getOrCreateWorkspaceCredits(workspaceId);
+      const currentBalance = Number.isFinite(credits.credits_balance) ? credits.credits_balance : 0;
+      const newBalance = currentBalance + planConfig.credits;
+
+      const { data, error } = await supabaseAdmin
+        .from('workspace_credits')
+        .update({
+          credits_balance: newBalance,
+          total_purchased: (credits.total_purchased || 0) + planConfig.credits,
+          subscription_plan: planSlug,
+          subscription_status: 'active',
+          grace_limit: planConfig.graceLimit,
+          monthly_credit_limit: planConfig.credits,
+          credits_used_this_period: 0,
+          period_start_date: new Date().toISOString().split('T')[0],
+          warning_80_sent: false,
+          warning_95_sent: false,
+          // Clear grace if was in grace from pilot
+          overage_balance: newBalance >= 0 ? 0 : credits.overage_balance,
+          grace_started_at: newBalance >= 0 ? null : credits.grace_started_at,
+          credits_purchased_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('workspace_id', workspaceId)
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('[WORKSPACE_CREDITS] Error upgrading plan', {
+          error: error.message, workspaceId, planSlug,
+        });
+        return null;
+      }
+
+      // Record purchase transaction (non-fatal)
+      try {
+        await supabaseAdmin.from('workspace_credit_transactions').insert({
+          workspace_id: workspaceId,
+          amount: planConfig.credits,
+          balance_after: newBalance,
+          transaction_type: 'purchase',
+          description: `Upgraded to ${planSlug} plan — ${planConfig.credits.toLocaleString()} credits`,
+          metadata: { plan: planSlug, price: planConfig.price },
+        });
+      } catch { /* non-fatal */ }
+
+      logger.info('[WORKSPACE_CREDITS] Workspace upgraded', {
+        workspaceId,
+        plan: planSlug,
+        credits: planConfig.credits,
+        graceLimit: planConfig.graceLimit,
+        newBalance,
+      });
+
+      return data;
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Exception upgrading plan', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+        planSlug,
       });
       return null;
     }

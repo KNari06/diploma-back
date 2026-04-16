@@ -2218,6 +2218,7 @@ export class RegressionRunService {
           const step = completedSteps[i];
           const meta = step.data?.runtimeMeta;
           const success = step.data?.success !== false;
+          const isSoftFailure = !success && !!step.data?.softFailure;
           // Surface self-healing + flakiness so QA can spot fragile steps in
           // the report. A step is "healed" when its locator had to be rewritten
           // by self_heal to pass; "flaky" is an independent historical signal
@@ -2226,7 +2227,8 @@ export class RegressionRunService {
           steps.push({
             index: i + 1,
             description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
-            status: success ? 'passed' : 'failed',
+            // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors
+            status: success ? 'passed' : (isSoftFailure ? 'warning' : 'failed'),
             durationMs: meta?.executionMs,
             error: !success ? {
               message: meta?.failureExplanation || meta?.failedReason || 'Step failed',

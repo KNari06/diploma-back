@@ -498,6 +498,8 @@ export interface TestBrowserCompletedPayload {
   status: 'completed' | 'failed';
   duration?: number;
   errorsCount?: number;
+  /** V16: Credits ran out during execution but run was allowed to complete */
+  creditsExhausted?: boolean;
   timestamp: string;
 }
 

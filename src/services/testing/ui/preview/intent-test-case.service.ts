@@ -244,29 +244,72 @@ export class IntentTestCaseService {
       if (startUrl !== undefined) updates.start_url = startUrl;
       if (url !== undefined) updates.url = url;
       if (steps !== undefined) {
-        updates.steps_json = this.normalizeSteps(steps);
+        let mergedSteps = this.normalizeSteps(steps);
 
-        // V7: Log warning for targeting steps lacking compiled/evidence
-        // This helps identify steps that may be unreliable in background runs
-        const targetingActions = ['click', 'type', 'hover', 'select', 'check', 'uncheck'];
-        const stepsWithoutCompiled = steps.filter(step =>
-          targetingActions.includes(step.type) && (!step.compiled || !step.evidence)
+        // V16: Merge compiled/evidence/bindingHints from DB for steps that don't include them.
+        // Frontend state often lacks these backend-generated fields (compiled plans from apply/run,
+        // evidence from execution). Without this merge, any PATCH that includes steps (reorder,
+        // rename, add step) would wipe compiled plans and force LLM fallback on next background run.
+        const hasStepsMissingBackendFields = mergedSteps.some(s =>
+          !s.compiled || !s.evidence
         );
 
-        if (stepsWithoutCompiled.length > 0) {
-          logger.warn('[INTENT_TEST_CASE] Saving steps without compiled/evidence data', {
-            id,
-            stepsCount: steps.length,
-            missingCount: stepsWithoutCompiled.length,
-            missingSteps: stepsWithoutCompiled.map(s => ({
-              stepId: s.id,
-              type: s.type,
-              description: s.description?.slice(0, 60),
-              hasCompiled: !!s.compiled,
-              hasEvidence: !!s.evidence,
-            })),
-          });
+        if (hasStepsMissingBackendFields) {
+          try {
+            const { data: existingRow } = await supabaseAdmin
+              .from('intent_test_cases')
+              .select('steps_json')
+              .eq('id', id)
+              .single();
+
+            if (existingRow?.steps_json) {
+              const existingById = new Map<string, IntentStep>();
+              for (const existing of existingRow.steps_json as IntentStep[]) {
+                existingById.set(existing.id, existing);
+              }
+
+              let preserved = 0;
+              mergedSteps = mergedSteps.map(step => {
+                const existing = existingById.get(step.id);
+                if (!existing) return step;
+
+                let changed = false;
+                const merged = { ...step };
+
+                if (!step.compiled && existing.compiled) {
+                  merged.compiled = existing.compiled;
+                  changed = true;
+                }
+                if (!step.evidence && existing.evidence) {
+                  merged.evidence = existing.evidence;
+                  changed = true;
+                }
+                if (!step.bindingHints && existing.bindingHints) {
+                  merged.bindingHints = existing.bindingHints;
+                  changed = true;
+                }
+
+                if (changed) preserved++;
+                return merged;
+              });
+
+              if (preserved > 0) {
+                logger.info('[INTENT_TEST_CASE] Preserved backend fields from DB during update', {
+                  id,
+                  preservedCount: preserved,
+                  totalSteps: mergedSteps.length,
+                });
+              }
+            }
+          } catch (mergeError) {
+            logger.warn('[INTENT_TEST_CASE] Failed to merge backend fields (non-fatal, saving as-is)', {
+              id,
+              error: mergeError instanceof Error ? mergeError.message : String(mergeError),
+            });
+          }
         }
+
+        updates.steps_json = mergedSteps;
       }
       if (flowId !== undefined) updates.flow_id = flowId;
       if (status !== undefined) updates.status = status;
@@ -608,15 +651,19 @@ export class IntentTestCaseService {
         const stepIndex = steps.findIndex(s => s.id === appliedStep.id);
 
         if (stepIndex === -1) {
-          logger.warn('[INTENT_TEST_CASE] Step not found for preview apply update', {
+          // V16: Step not yet in DB (manually added on frontend, applied before Save).
+          // Append to preserve compiled/evidence — the next PATCH from frontend will
+          // merge via the V16 merge logic in update(), keeping compiled intact.
+          logger.info('[INTENT_TEST_CASE] Step not in DB yet, appending from preview apply', {
             intentTestCaseId,
             stepId: appliedStep.id,
+            hasCompiled: !!appliedStep.compiled,
           });
-          return false;
+          steps.push(appliedStep);
+        } else {
+          // Replace the step entirely with appliedStep
+          steps[stepIndex] = appliedStep;
         }
-
-        // Replace the step entirely with appliedStep
-        steps[stepIndex] = appliedStep;
 
         // Note: auto-wait injection removed here (V8). Auto-waits are now injected:
         // 1. In batchUpdateStepsFromRun() — once after run completes

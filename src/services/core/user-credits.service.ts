@@ -7,9 +7,15 @@ export interface UserCredits {
   credits_balance: number;
   total_purchased: number;
   total_used: number;
-  subscription_plan: 'free' | 'basic' | 'pro' | 'enterprise';
+  subscription_plan: 'free' | 'basic' | 'pro' | 'ultra' | 'enterprise' | 'business';
   subscription_status: 'active' | 'inactive' | 'expired';
   subscription_expires_at: string | null;
+  /** V16: Grace period — max negative balance allowed (plan-dependent) */
+  grace_limit: number;
+  /** V16: Accumulated overage when balance < 0 (cleared on purchase) */
+  overage_balance: number;
+  /** V16: When grace period started (null = not in grace) */
+  grace_started_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -96,6 +102,7 @@ export class UserCreditsService {
           credits_balance: 0,
           subscription_plan: 'free',
           subscription_status: 'inactive',
+          grace_limit: 0, // V16: Free plan has no grace period
         },
         {
           onConflict: 'user_id',
@@ -193,7 +200,9 @@ export class UserCreditsService {
       ? (credits?.credits_balance || 0)
       : 0;
 
-    return balance >= amount;
+    // V16: Grace period — user can go negative up to grace_limit
+    const graceLimit = Number.isFinite(credits?.grace_limit) ? (credits?.grace_limit || 0) : 0;
+    return (balance + graceLimit) >= amount;
   }
 
   /**
@@ -237,30 +246,51 @@ export class UserCreditsService {
         ? (credits.credits_balance || 0)
         : 0;
 
-      if (currentBalance < roundedAmount) {
-        logger.warn('[USER_CREDITS] Insufficient credits', {
+      // V16: Grace period — allow negative balance up to grace_limit.
+      // grace_limit is set per plan (free=0, pro=100, ultra=200, business=1000).
+      const graceLimit = Number.isFinite(credits.grace_limit) ? (credits.grace_limit || 0) : 0;
+      const effectiveFloor = -graceLimit; // e.g., -100 for pro plan
+      const newBalance = Math.round((currentBalance - roundedAmount) * 100) / 100;
+
+      if (newBalance < effectiveFloor) {
+        logger.warn('[USER_CREDITS] Insufficient credits (grace limit exceeded)', {
           userId,
           required: roundedAmount,
           available: currentBalance,
+          graceLimit,
+          wouldBe: newBalance,
+          floor: effectiveFloor,
         });
         return { success: false, newBalance: currentBalance };
       }
 
-      const newBalance = Math.round((currentBalance - roundedAmount) * 100) / 100;
+      const isGraceDeduction = newBalance < 0;
+      const wasAlreadyInGrace = currentBalance < 0;
 
       // Update balance
       const previousTotalUsed = Number.isFinite(credits.total_used)
         ? (credits.total_used || 0)
         : 0;
 
+      const updateFields: Record<string, any> = {
+        credits_balance: newBalance,
+        total_used: Math.round((previousTotalUsed + roundedAmount) * 100) / 100,
+        last_credit_usage: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+
+      // V16: Track overage and grace start
+      if (isGraceDeduction) {
+        // overage_balance = how much user owes (positive number)
+        updateFields.overage_balance = Math.round(Math.abs(newBalance) * 100) / 100;
+        if (!wasAlreadyInGrace) {
+          updateFields.grace_started_at = new Date().toISOString();
+        }
+      }
+
       const { error: updateError } = await supabaseAdmin
         .from('user_credits')
-        .update({
-          credits_balance: newBalance,
-          total_used: Math.round((previousTotalUsed + roundedAmount) * 100) / 100,
-          last_credit_usage: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
+        .update(updateFields)
         .eq('user_id', userId);
 
       if (updateError) {
@@ -272,14 +302,27 @@ export class UserCreditsService {
         return { success: false, newBalance: currentBalance };
       }
 
-      // Record transaction (with token tracking if provided)
-      await this.recordTransaction(userId, -roundedAmount, newBalance, 'usage', description, metadata);
+      // Record transaction (with grace flag)
+      await this.recordTransaction(userId, -roundedAmount, newBalance, 'usage', description, {
+        ...metadata,
+        ...(isGraceDeduction ? { is_grace_deduction: true } : {}),
+      });
+
+      if (isGraceDeduction && !wasAlreadyInGrace) {
+        logger.info('[USER_CREDITS] Grace period started', {
+          userId,
+          balance: newBalance,
+          graceLimit,
+          overageBalance: Math.abs(newBalance),
+        });
+      }
 
       logger.info('[USER_CREDITS] Credits deducted', {
         userId,
         amount: roundedAmount,
         newBalance,
         description,
+        grace: isGraceDeduction || undefined,
         tokensUsed: metadata.tokens_used || 'N/A',
       });
 
@@ -353,6 +396,18 @@ export class UserCreditsService {
           : 0;
         updateData.total_purchased = Math.round((previousTotalPurchased + roundedAmount) * 100) / 100;
         updateData.credits_purchased_at = new Date().toISOString();
+      }
+
+      // V16: Clear grace period state when credits are added (purchase/bonus/refund)
+      if (newBalance >= 0 && credits.grace_started_at) {
+        updateData.overage_balance = 0;
+        updateData.grace_started_at = null;
+        logger.info('[USER_CREDITS] Grace period cleared on credit addition', {
+          userId,
+          type,
+          newBalance,
+          previousOverage: credits.overage_balance,
+        });
       }
       logger.info('[USER_CREDITS] updateData', { updateData });
       const { error: updateError } = await supabaseAdmin
@@ -504,7 +559,7 @@ export class UserCreditsService {
    */
   static async updateSubscription(
     userId: string,
-    plan: 'free' | 'basic' | 'pro' | 'enterprise',
+    plan: 'free' | 'basic' | 'pro' | 'ultra' | 'enterprise' | 'business',
     status: 'active' | 'inactive' | 'expired',
     expiresAt: string | null = null
   ): Promise<boolean> {
@@ -515,7 +570,7 @@ export class UserCreditsService {
         return false;
       }
 
-      const validPlans = ['free', 'basic', 'pro', 'enterprise'];
+      const validPlans = ['free', 'basic', 'pro', 'ultra', 'enterprise', 'business'];
       if (!validPlans.includes(plan)) {
         logger.error('[USER_CREDITS] Invalid plan in updateSubscription', { userId, plan });
         return false;
@@ -527,9 +582,20 @@ export class UserCreditsService {
         return false;
       }
 
+      // V16: Grace limit per plan tier
+      const GRACE_LIMITS: Record<string, number> = {
+        free: 0,
+        basic: 100,
+        pro: 100,
+        ultra: 200,
+        enterprise: 1000,
+        business: 1000,
+      };
+
       const updateData: any = {
         subscription_plan: plan,
         subscription_status: status,
+        grace_limit: GRACE_LIMITS[plan] ?? 0,
         updated_at: new Date().toISOString(),
       };
 

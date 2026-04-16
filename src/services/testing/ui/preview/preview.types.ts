@@ -317,8 +317,8 @@ export interface StepEvidence {
  * Represents one way to find an element (primary or fallback)
  */
 export interface LocatorEntry {
-  /** Strategy type: role, label, testId, placeholder, css, ref */
-  strategy: 'role' | 'label' | 'testId' | 'placeholder' | 'css' | 'ref';
+  /** Strategy type: role, label, testId, placeholder, title, text, css, ref */
+  strategy: 'role' | 'label' | 'testId' | 'placeholder' | 'title' | 'text' | 'css' | 'ref';
   /** Playwright locator string or params */
   value: string;
   /** Optional role name for getByRole */

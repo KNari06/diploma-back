@@ -170,6 +170,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   qualityChecks?: any;
   /** Flag: self-healing was triggered during replay, enable video on next retry */
   needsVideoOnRetry?: boolean;
+  /** V16: Credits ran out during execution but run was allowed to complete */
+  creditsExhausted?: boolean;
 }> {
   let page: Page | null = null;
   let context: BrowserContext | null = null;
@@ -419,6 +421,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       const totalSteps = commands.length;
       let allSuccess = true;
       let finalError: string | undefined;
+      let creditsExhausted = false;
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let replayUsageStats: any = null;
@@ -541,34 +544,23 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             continue; // Skip Playwright execution and credit deduction — purely data storage
           }
 
-          // Deduct 1 credit for step execution
-          if (testData.userId) {
+          // Deduct 1 credit for step execution.
+          // V16: When credits run out mid-run, log warning but continue execution.
+          // Stopping mid-run wastes the work already done and confuses users.
+          // The run completes, and the frontend shows a "credits exhausted" banner.
+          if (testData.userId && !creditsExhausted) {
             const stepCreditResult = await CreditCostTrackerService.deductStepCredit(
               testData.userId,
               testData.testId,
               `Step ${currentStepIndex}/${totalSteps}: ${action}`
             );
             if (!stepCreditResult.success) {
-              allSuccess = false;
-              finalError = 'Insufficient credits to continue test execution';
-              logger.warn('[PLAYWRIGHT] Stopping replay: insufficient credits', {
+              creditsExhausted = true;
+              logger.warn('[PLAYWRIGHT] Credits exhausted mid-run, continuing without deduction', {
                 testId: testData.testId,
                 stepIndex: currentStepIndex,
+                remainingSteps: totalSteps - currentStepIndex,
               });
-              // Trace it — otherwise the run ends abruptly with no indication
-              // of _why_ the step never executed.
-              replayTrace.write({
-                eventType: 'step_failed', step: currentStepIndex, totalSteps,
-                payload: {
-                  action,
-                  success: false,
-                  durationMs: 0,
-                  error: finalError,
-                  failedReason: 'insufficient_credits',
-                  description: intentMeta?.elementDescription,
-                },
-              });
-              break;
             }
           }
 
@@ -944,6 +936,8 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 attempt: retryAttempt,
                 stepDescription,
                 success: stepResult.success,
+                // V16: Surface soft failure so frontend can show warning instead of error
+                ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),
                 timestamp: new Date().toISOString(),
                 runtimeMeta: stepResult.runtimeMeta,
               });
@@ -1521,6 +1515,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         stepRuntimeMeta, // Step-level execution intelligence for reporting
         qualityChecks, // Non-UI quality checks — stored in test_results for user viewing
         needsVideoOnRetry, // Flag: self-healing was triggered, enable video on next retry
+        creditsExhausted, // V16: Credits ran out mid-run but execution continued
       };
     }
 
@@ -1887,6 +1882,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         traceUrl: uploadedArtifacts.traceUrl,
         tracePath: artifacts.tracePath,
         replayTraceUrl: cancelledReplayTraceUrl,
+        creditsExhausted: false,
       };
     }
 
@@ -2023,6 +2019,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       traceUrl: uploadedArtifacts.traceUrl,
       tracePath: artifacts.tracePath,
       replayTraceUrl: failedReplayTraceUrl,
+      creditsExhausted: false,
     };
   }
 }

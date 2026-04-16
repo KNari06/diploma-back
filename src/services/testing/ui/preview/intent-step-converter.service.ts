@@ -175,6 +175,10 @@ function buildPrimarySelector(compiled?: CompiledStepPlan): string | undefined {
       return `[data-testid="${primary.value}"]`;
     case 'placeholder':
       return `[placeholder="${primary.value}"]`;
+    case 'title':
+      return `[title="${primary.value}"]`;
+    case 'text':
+      return `text="${primary.value}"`;
     default:
       return undefined;
   }

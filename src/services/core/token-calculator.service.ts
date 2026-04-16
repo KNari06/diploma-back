@@ -58,8 +58,27 @@ export const TEST_CREDITS = {
 } as const;
 
 /**
- * Subscription plans
+ * Individual subscription plans (user_credits)
  */
+export const INDIVIDUAL_PLANS = {
+  free: { price: 0, credits: 50 },
+  pro: { price: 28.9, credits: 1000 },
+  ultra: { price: 43.9, credits: 1000 },
+} as const;
+
+/**
+ * B2B workspace plans (workspace_credits)
+ * Pilot: onboarding/trial, given on workspace creation
+ * Small/Middle/Enterprise: activated after Stripe payment
+ */
+export const WORKSPACE_PLANS = {
+  pilot: { price: 150, credits: 10_000, graceLimit: 1_000 },
+  small_business: { price: 1_000, credits: 29_000, graceLimit: 3_000 },
+  middle_business: { price: 1_590, credits: 79_000, graceLimit: 8_000 },
+  enterprise: { price: 2_990, credits: 200_000, graceLimit: 20_000 },
+} as const;
+
+/** @deprecated Use INDIVIDUAL_PLANS + WORKSPACE_PLANS instead */
 export const SUBSCRIPTION_PLANS = {
   pro: { price: 28.9, credits: 1000 },
   ultra: { price: 43.9, credits: 1000 },

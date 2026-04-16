@@ -11,15 +11,15 @@
  * 4. Return success with used locator, or failure for fallback
  */
 
-import type {
-  CompiledStepPlan,
-  ConfidenceTier,
-  LocatorEntry,
-  RuntimeSource,
-  StepRuntimeMeta,
-  TargetFingerprint,
+import {
+  isCompiledPlanExpired,
+  type CompiledStepPlan,
+  type ConfidenceTier,
+  type LocatorEntry,
+  type RuntimeSource,
+  type StepRuntimeMeta,
+  type TargetFingerprint,
 } from '@/services/testing/ui/preview/preview.types';
-import { isCompiledPlanExpired } from '@/services/testing/ui/preview/preview.types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
 
@@ -474,6 +474,16 @@ async function tryLocatorEntry(
 
       case 'placeholder':
         locator = page.getByPlaceholder(entry.value);
+        break;
+
+      case 'title':
+        locator = page.getByTitle(entry.value);
+        break;
+
+      case 'text':
+        // exact: false allows partial match (whitespace, case variations).
+        // Fingerprint validation downstream prevents false positives.
+        locator = page.getByText(entry.value, { exact: false });
         break;
 
       default:

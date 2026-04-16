@@ -450,6 +450,8 @@ export class ManualTestRunJobHandler {
         browser,
         status: 'completed',
         errorsCount: result.errors?.length || 0,
+        // V16: Surface credits exhaustion so frontend can show refill banner
+        ...(result.creditsExhausted ? { creditsExhausted: true } : {}),
         timestamp: new Date().toISOString(),
       };
       webSocketService.emitTestBrowserCompleted(testId, browserCompletedPayload);
