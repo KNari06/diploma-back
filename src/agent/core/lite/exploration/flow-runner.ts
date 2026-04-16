@@ -909,6 +909,10 @@ export class FlowRunner {
   /**
    * Check if the page is still on a login form after a login attempt.
    * Validates that the auth state actually changed.
+   *
+   * On evaluation error we conservatively return `true` (assume still on login):
+   * falsely caching a broken auth state causes every downstream auth-gated flow
+   * to fail silently, which is worse than one extra login retry.
    */
   private async isStillOnLoginPage(page: Page): Promise<boolean> {
     try {
@@ -931,7 +935,9 @@ export class FlowRunner {
 
       return hasPasswordField;
     } catch {
-      return false; // If evaluation fails, assume login succeeded
+      // Conservative default: treat as still-on-login so caller retries instead
+      // of caching a possibly-broken auth state.
+      return true;
     }
   }
 
