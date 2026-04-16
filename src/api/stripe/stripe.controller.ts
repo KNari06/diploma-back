@@ -2,7 +2,7 @@ import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { WorkspaceCreditsService } from '@/services/core/workspace-credits.service';
-import { SUBSCRIPTION_PLANS } from '@/services/core/token-calculator.service';
+import { SUBSCRIPTION_PLANS, WORKSPACE_PLANS } from '@/services/core/token-calculator.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import Stripe from 'stripe';
@@ -687,8 +687,22 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
     }
   }
 
-  // Provision workspace credits for Business plan
-  const isBusinessPlan = planCode === 'business' || planCode === 'Business';
+  // V16: Provision workspace credits for B2B plans.
+  // Maps plan codes from Stripe `plans` table to WORKSPACE_PLANS slugs.
+  // Supports both legacy 'business' and new B2B plan codes.
+  // Pilot is admin-only (assignPilot), not purchasable via Stripe
+  type StripePurchasablePlan = 'small_business' | 'middle_business' | 'enterprise';
+  const B2B_PLAN_MAP: Record<string, StripePurchasablePlan> = {
+    business: 'small_business',         // Legacy business → Small Business (29K)
+    Business: 'small_business',
+    small_business: 'small_business',   // $1,000/mo → 29K credits
+    middle_business: 'middle_business', // $1,590/mo → 79K credits
+    enterprise: 'enterprise',           // $2,990/mo → 200K credits
+  };
+
+  const workspacePlanSlug = B2B_PLAN_MAP[planCode];
+  const isBusinessPlan = !!workspacePlanSlug;
+
   if (isBusinessPlan) {
     try {
       // Find the workspace where this user is the owner
@@ -702,70 +716,38 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
       if (ownerMembership) {
         const workspaceId = ownerMembership.workspace_id;
-        const businessCredits = SUBSCRIPTION_PLANS.business.credits; // 30,000
 
-        // Reset monthly usage and provision fresh credits
-        const wsCredits = await WorkspaceCreditsService.getOrCreateWorkspaceCredits(workspaceId);
-        const now = new Date();
+        const result = await WorkspaceCreditsService.upgradeToPlan(workspaceId, workspacePlanSlug);
 
-        const { error: wsUpdateError } = await supabaseAdmin
-          .from('workspace_credits')
-          .update({
-            credits_balance: businessCredits,
-            credits_used_this_period: 0,
-            monthly_credit_limit: businessCredits,
-            period_start_date: now.toISOString().split('T')[0],
-            warning_80_sent: false,
-            warning_95_sent: false,
-            subscription_plan: 'business',
-            subscription_status: 'active',
-            credits_purchased_at: now.toISOString(),
-            updated_at: now.toISOString(),
-          })
-          .eq('workspace_id', workspaceId);
-
-        if (wsUpdateError) {
-          logger.error('[STRIPE_WEBHOOK] Failed to provision business plan workspace credits', {
-            error: wsUpdateError.message,
+        if (result) {
+          logger.info('[STRIPE_WEBHOOK] B2B workspace plan provisioned via upgradeToPlan', {
             workspaceId,
             userId: user.id,
+            plan: workspacePlanSlug,
+            credits: result.credits_balance,
+            graceLimit: result.grace_limit,
+            invoiceId: invoice.id,
           });
         } else {
-          // Record the provisioning transaction
-          await supabaseAdmin.from('workspace_credit_transactions').insert({
-            workspace_id: workspaceId,
-            user_id: user.id,
-            amount: businessCredits,
-            balance_after: businessCredits,
-            transaction_type: 'purchase',
-            description: `Business plan subscription payment`,
-            metadata: {
-              invoice_id: invoice.id,
-              event_type: event.type,
-              plan_code: planCode,
-              type: 'business_plan_renewal',
-              previous_balance: wsCredits.credits_balance,
-              previous_used: wsCredits.credits_used_this_period || 0,
-            },
-          });
-
-          logger.info('[STRIPE_WEBHOOK] Business plan workspace credits provisioned', {
+          logger.error('[STRIPE_WEBHOOK] upgradeToPlan returned null', {
             workspaceId,
             userId: user.id,
-            credits: businessCredits,
+            plan: workspacePlanSlug,
             invoiceId: invoice.id,
           });
         }
       } else {
-        logger.warn('[STRIPE_WEBHOOK] No owned workspace found for business plan user', {
+        logger.warn('[STRIPE_WEBHOOK] No owned workspace found for B2B plan user', {
           userId: user.id,
+          plan: workspacePlanSlug,
           invoiceId: invoice.id,
         });
       }
     } catch (wsError) {
-      logger.error('[STRIPE_WEBHOOK] Exception provisioning business plan workspace credits', {
+      logger.error('[STRIPE_WEBHOOK] Exception provisioning B2B workspace credits', {
         error: wsError instanceof Error ? wsError.message : String(wsError),
         userId: user.id,
+        plan: workspacePlanSlug,
         invoiceId: invoice.id,
       });
       // Don't fail the webhook - user credits were already handled
@@ -784,7 +766,7 @@ async function handleInvoicePaymentSucceeded(event: Stripe.Event): Promise<void>
 
   if (plan?.id) {
     userUpdateData.plan_id = plan.id;
-    userUpdateData.plan = isBusinessPlan ? 'business' : 'pro';
+    userUpdateData.plan = isBusinessPlan ? (workspacePlanSlug || 'business') : 'pro';
     userUpdateData.plan_status = 'paid';
   }
 
