@@ -81,8 +81,35 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    // Check if there's already a warmed session for this project+user
+    // Check if there's already a warmed session for this project+user.
+    // Use SET NX to atomically claim the slot — prevents two concurrent warmup
+    // requests from both reading null and creating duplicate sessions.
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
+    const lockKey = `${redisKey}:lock`;
+    const lockAcquired = await redisConnection.set(lockKey, '1', 'EX', 60, 'NX');
+    if (!lockAcquired) {
+      // Another warmup is in progress — wait briefly then check for the result
+      logger.info('[MOBILE_SESSION] Concurrent warmup detected, waiting for result', { projectId, userId });
+      await new Promise((r) => setTimeout(r, 3000));
+      const waitResult = await redisConnection.get(redisKey);
+      if (waitResult) {
+        const parsed: WarmupData = JSON.parse(waitResult);
+        if (parsed.sessionId && parsed.sessionId !== '_booting') {
+          await redisConnection.del(lockKey);
+          res.json({
+            success: true,
+            sessionId: parsed.sessionId,
+            runnerSocketUrl: parsed.runnerSocketUrl,
+            platform: parsed.platform,
+            reused: true,
+          });
+          return;
+        }
+      }
+      // Lock expired or boot still in progress — fall through to create
+      await redisConnection.del(lockKey);
+    }
+
     const existingRaw = await redisConnection.get(redisKey);
     if (existingRaw) {
       const existing: WarmupData = JSON.parse(existingRaw);
@@ -202,6 +229,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       'EX',
       WARMUP_TTL,
     );
+
+    // Release the warmup lock now that the session is stored
+    await redisConnection.del(lockKey).catch(() => {});
 
     logger.info('[MOBILE_SESSION] Emulator warmed up', {
       projectId,
