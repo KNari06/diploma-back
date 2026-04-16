@@ -45,6 +45,8 @@ export interface CreditCheck {
   required: number;
   available: number;
   shortage: number;
+  /** V16: True when user's balance is negative (using grace period credits) */
+  inGracePeriod?: boolean;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -368,15 +370,22 @@ export class CreditCostTrackerService {
         ? (userCredits?.credits_balance || 0)
         : 0;
 
-      const hasEnough = availableCredits >= requiredCredits;
-      const shortage = hasEnough ? 0 : requiredCredits - availableCredits;
+      // V16: Grace period — include grace_limit in "available" check
+      const graceLimit = Number.isFinite(userCredits?.grace_limit) ? (userCredits?.grace_limit || 0) : 0;
+      const effectiveAvailable = availableCredits + graceLimit;
+      const hasEnough = effectiveAvailable >= requiredCredits;
+      const shortage = hasEnough ? 0 : requiredCredits - effectiveAvailable;
+      const inGracePeriod = availableCredits < 0;
 
       logger.info('[CREDIT_COST_TRACKER] Credit check', {
         userId,
         testType,
         required: requiredCredits,
         available: availableCredits,
+        graceLimit,
+        effectiveAvailable,
         hasEnough,
+        inGracePeriod: inGracePeriod || undefined,
       });
 
       return {
@@ -384,6 +393,7 @@ export class CreditCostTrackerService {
         required: requiredCredits,
         available: availableCredits,
         shortage,
+        inGracePeriod,
       };
     } catch (error) {
       logger.error('[CREDIT_COST_TRACKER] Exception in checkCreditsForTest', {

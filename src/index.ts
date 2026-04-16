@@ -43,6 +43,7 @@ import supportRoutes from '@/api/support/support.routes';
 import testVisualizationRoutes from '@/api/testVisualization/testVisualization.route';
 import userRoutes from '@/api/user/user.routes';
 import waitlistRoutes from '@/api/waitlist/waitlist.route';
+import investorRoutes from '@/api/investor/investor.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
 import invitesRoutes from '@/api/workspace/invites.routes';
 import testCaseRoutes from '@/api/test-case/test-case.routes';
@@ -1297,6 +1298,7 @@ app.use(`/api/${env.API_VERSION}/auth`, authRoutes);
 app.use(`/api/${env.API_VERSION}/workspaces`, workspaceRoutes); // Contains onboarding endpoints
 app.use(`/api/${env.API_VERSION}/invites`, invitesRoutes); // Workspace invites accept endpoint
 app.use(`/api/${env.API_VERSION}/waitlist`, waitlistRoutes); // Waitlist signup
+app.use(`/api/${env.API_VERSION}/investor`, investorRoutes); // Investor report visit tracking
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications (needed for pending users)

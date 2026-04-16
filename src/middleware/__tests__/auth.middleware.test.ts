@@ -217,6 +217,9 @@ describe('auth.middleware', () => {
         subscription_plan: 'free',
         subscription_status: 'active',
         subscription_expires_at: null,
+        grace_limit: 0,
+        overage_balance: 0,
+        grace_started_at: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       });
@@ -247,6 +250,9 @@ describe('auth.middleware', () => {
         subscription_plan: 'pro',
         subscription_status: 'active',
         subscription_expires_at: null,
+        grace_limit: 0,
+        overage_balance: 0,
+        grace_started_at: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       });
@@ -272,6 +278,9 @@ describe('auth.middleware', () => {
           subscription_plan: 'free',
           subscription_status: 'active',
           subscription_expires_at: null,
+          grace_limit: 0,
+          overage_balance: 0,
+          grace_started_at: null,
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
@@ -284,6 +293,9 @@ describe('auth.middleware', () => {
         subscription_plan: 'free',
         subscription_status: 'active',
         subscription_expires_at: null,
+        grace_limit: 0,
+        overage_balance: 0,
+        grace_started_at: null,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       });
