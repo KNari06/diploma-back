@@ -15,6 +15,7 @@
  */
 
 import { FlowQueue } from '../flow-queue';
+import { PerPageBudget } from '../per-page-budget';
 import type { EntryPoint, FlowPriority, FlowComplexity, TestFlowCategory } from '../types';
 import type { StrategistOutput } from '../agents/agent-types';
 
@@ -326,5 +327,151 @@ describe('FlowQueue — concurrent enqueue', () => {
     const accepted = results.filter(Boolean).length;
     expect(accepted).toBe(1);
     expect(q.size()).toBe(1);
+  });
+});
+
+describe('FlowQueue — per-page fairness cap', () => {
+  function drainQueue(q: FlowQueue): EntryPoint[] {
+    const out: EntryPoint[] = [];
+    while (true) {
+      const e = q.dequeue();
+      if (!e) break;
+      out.push(e);
+    }
+    return out;
+  }
+
+  it('prefers under-cap entries even when saturated page has higher priority', () => {
+    // Two page patterns: /products/:id saturated with 3 critical entries,
+    // and /search (low priority) with 1 entry. With a cap of 2 per page,
+    // the third /products/:id entry gets deferred in favor of /search.
+    const entries = [
+      ep({ id: 'p1', name: 'ProdAlpha', priority: 'critical', sourcePageUrl: 'https://shop.com/products/1' }),
+      ep({ id: 'p2', name: 'ProdBeta',  priority: 'critical', sourcePageUrl: 'https://shop.com/products/2' }),
+      ep({ id: 'p3', name: 'ProdGamma', priority: 'critical', sourcePageUrl: 'https://shop.com/products/3' }),
+      ep({ id: 's1', name: 'SearchSigma',  priority: 'low',      sourcePageUrl: 'https://shop.com/search' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    q.setPerPageBudget(new PerPageBudget(2));
+
+    const out = drainQueue(q);
+    // First two: any two /products/:id entries (critical priority wins).
+    expect(out.slice(0, 2).every((e) => e.sourcePageUrl.includes('/products/'))).toBe(true);
+    // Third: /search — the saturated /products bucket was bypassed.
+    expect(out[2].id).toBe('s1');
+    // Fourth: the remaining /products/:id entry (dep-satisfied, saturated
+    // fallback path). Saturated trace fires here.
+    expect(out[3].sourcePageUrl).toContain('/products/');
+  });
+
+  it('dequeue does not deadlock when every remaining entry is saturated', () => {
+    // All three entries on the same page, cap = 1.
+    const entries = [
+      ep({ id: 'a', name: 'FirstOnPage',  sourcePageUrl: 'https://app.com/one' }),
+      ep({ id: 'b', name: 'SecondOnPage', sourcePageUrl: 'https://app.com/one' }),
+      ep({ id: 'c', name: 'ThirdOnPage',  sourcePageUrl: 'https://app.com/one' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    q.setPerPageBudget(new PerPageBudget(1));
+
+    // Saturation must not block progress entirely — we'd rather let extras
+    // through than stall the whole run.
+    const out = drainQueue(q);
+    expect(out).toHaveLength(3);
+  });
+
+  it('emits saturation trace when a page cap is exceeded', () => {
+    const events: any[] = [];
+    const entries = [
+      ep({ id: 'a', name: 'PageAlpha',   sourcePageUrl: 'https://app.com/x' }),
+      ep({ id: 'b', name: 'PageBeta',    sourcePageUrl: 'https://app.com/x' }),
+      ep({ id: 'c', name: 'OtherDelta',  sourcePageUrl: 'https://app.com/y' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    q.setPerPageBudget(new PerPageBudget(1));
+    q.setSaturationTrace((data) => events.push(data));
+
+    drainQueue(q);
+    // One saturation event for whichever entry ended up being the deferred second on /x.
+    expect(events).toHaveLength(1);
+    expect(events[0].pageUrl).toBe('https://app.com/x');
+    expect(events[0].pageFlowCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('collapses multiple numeric-id pages on the same route into one bucket', () => {
+    // Both /products/123 and /products/456 normalize to /products/:id, so
+    // the second one must wait until the lower-priority /category flow runs.
+    const entries = [
+      ep({ id: 'a', name: 'AlphaItem',  sourcePageUrl: 'https://shop.com/products/123' }),
+      ep({ id: 'b', name: 'BetaItem',   sourcePageUrl: 'https://shop.com/products/456' }),
+      ep({ id: 'c', name: 'CategoryNu', sourcePageUrl: 'https://shop.com/category' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    expect(q.size()).toBe(3);
+    q.setPerPageBudget(new PerPageBudget(1));
+
+    const out = drainQueue(q);
+    expect(out).toHaveLength(3);
+
+    const categoryIdx = out.findIndex((e) => e.sourcePageUrl.includes('/category'));
+    const productIdxs = out
+      .map((e, i) => (e.sourcePageUrl.includes('/products/') ? i : -1))
+      .filter((i) => i >= 0);
+    expect(productIdxs).toHaveLength(2);
+    expect(productIdxs[0]).toBeLessThan(categoryIdx);
+    expect(productIdxs[1]).toBeGreaterThan(categoryIdx);
+  });
+
+  it('separates :id vs :uuid route shapes into distinct buckets', () => {
+    // The pattern extractor classifies numeric vs UUID tokens differently
+    // (/products/:id vs /products/:uuid), so a numeric-id page and a
+    // UUID-id page do NOT share a per-page cap. This is intentional —
+    // /posts/:slug and /posts/:id can be semantically different routes.
+    const entries = [
+      ep({ id: 'a', name: 'NumericItem', sourcePageUrl: 'https://shop.com/products/123' }),
+      ep({ id: 'b', name: 'UuidItem',    sourcePageUrl: 'https://shop.com/products/550e8400-e29b-41d4-a716-446655440000' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    q.setPerPageBudget(new PerPageBudget(1));
+
+    // Both should dequeue under the cap (separate buckets).
+    const first = q.dequeue();
+    const second = q.dequeue();
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+  });
+
+  it('no gate installed → old behavior preserved (all entries flow out in priority order)', () => {
+    const entries = [
+      ep({ id: 'a', name: 'FlowOneCritical',    priority: 'critical', sourcePageUrl: 'https://app.com/x' }),
+      ep({ id: 'b', name: 'FlowTwoCritical',    priority: 'critical', sourcePageUrl: 'https://app.com/x' }),
+      ep({ id: 'c', name: 'FlowThreeCritical',  priority: 'critical', sourcePageUrl: 'https://app.com/x' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    // No setPerPageBudget — gate disabled.
+    expect(drainQueue(q)).toHaveLength(3);
+  });
+
+  it('dependency-unmet entries take precedence over saturation fallback', () => {
+    // Entry b depends on "never-completes", entry a shares page with c (cap=1).
+    // After a runs, c is saturated. b is dep-unsat. Dequeue should prefer c
+    // (dep-ok saturated) over b (dep-unsat).
+    const entries = [
+      ep({ id: 'a', name: 'RootFlow',  sourcePageUrl: 'https://app.com/x' }),
+      ep({ id: 'b', name: 'BlockedByDep', dependsOn: 'never-completes', sourcePageUrl: 'https://app.com/y' }),
+      ep({ id: 'c', name: 'SameAsA',  sourcePageUrl: 'https://app.com/x' }),
+    ];
+    const q = FlowQueue.fromEntryPoints(entries);
+    q.setPerPageBudget(new PerPageBudget(1));
+
+    const first = q.dequeue();
+    const second = q.dequeue();
+    const third = q.dequeue();
+    // First: either a or c (dep-ok, under cap) — pick whichever is highest.
+    expect(['a', 'c']).toContain(first?.id);
+    // Second: the other /x entry (dep-ok, saturated fallback) before b (dep-unsat).
+    expect(['a', 'c']).toContain(second?.id);
+    // Last: b (dep-unsat fallback).
+    expect(third?.id).toBe('b');
   });
 });

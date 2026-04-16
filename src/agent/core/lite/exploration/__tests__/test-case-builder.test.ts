@@ -295,6 +295,63 @@ describe('TestCaseBuilder — preconditions', () => {
   });
 });
 
+describe('TestCaseBuilder — network assertions', () => {
+  it('aggregates step-level network calls into test-case assertions', () => {
+    const e = ep({ id: 'login', name: 'LoginFlow', category: 'authentication' });
+    const steps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'fill email', action: 'fill', ref: 'e', value: 'a@b', pageUrl: 'https://ex.com' },
+      {
+        stepNumber: 2, description: 'submit', action: 'click', ref: 'go', pageUrl: 'https://ex.com',
+        networkCalls: [
+          { method: 'POST', urlPattern: 'https://api.ex.com/v1/auth', status: 200, timestampMs: 100 },
+        ],
+      },
+      {
+        stepNumber: 3, description: 'verify', action: 'verify', pageUrl: 'https://ex.com',
+        expectedOutcome: 'logged in',
+        networkCalls: [
+          { method: 'GET', urlPattern: 'https://api.ex.com/v1/profile', status: 200, timestampMs: 200 },
+        ],
+      },
+    ];
+    const builder = new TestCaseBuilder();
+    const r = builder.build(mockTree([e]), [task({ entryPoint: e, discoveredSteps: steps })], mockBudget(), cfg, Date.now() - 100, []);
+    const positive = r.testCases.find((tc) => tc.id === 'login');
+    expect(positive?.assertions).toBeDefined();
+    expect(positive!.assertions!).toHaveLength(2);
+    expect(positive!.assertions![0]).toMatchObject({
+      type: 'network',
+      expect: 'POST https://api.ex.com/v1/auth returns 2xx',
+    });
+  });
+
+  it('omits assertions field when no network calls were captured', () => {
+    const e = ep({ id: '1', name: 'SilentFlow' });
+    const steps: DiscoveredStep[] = [
+      { stepNumber: 1, description: 'click', action: 'click', ref: 'b', pageUrl: 'https://ex.com' },
+    ];
+    const builder = new TestCaseBuilder();
+    const r = builder.build(mockTree([e]), [task({ entryPoint: e, discoveredSteps: steps })], mockBudget(), cfg, Date.now() - 100, []);
+    const positive = r.testCases.find((tc) => tc.id === '1');
+    expect(positive?.assertions).toBeUndefined();
+  });
+
+  it('does not emit assertions for skipped flows with no steps', () => {
+    const e = ep({ id: '1', name: 'Skipper' });
+    const builder = new TestCaseBuilder();
+    const r = builder.build(
+      mockTree([e]),
+      [task({ entryPoint: e, status: 'skipped', goalAchieved: false, discoveredSteps: [] })],
+      mockBudget(),
+      cfg,
+      Date.now() - 100,
+      [],
+    );
+    const positive = r.testCases.find((tc) => tc.id === '1');
+    expect(positive?.assertions).toBeUndefined();
+  });
+});
+
 describe('TestCaseBuilder — robustness against incomplete node data', () => {
   it('does not crash when getAllNodes() returns nodes without entryPoints', () => {
     // Simulates a malformed tree (e.g., from stale checkpoint or incomplete mock)

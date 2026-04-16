@@ -28,6 +28,7 @@ import type {
 } from './types';
 import type { ExplorationTree } from './exploration-tree';
 import type { BudgetTracker } from './budget-tracker';
+import { buildAssertionsFromSteps } from './network-assertions';
 
 /** Categories that typically involve form submission */
 const FORM_CATEGORIES: TestFlowCategory[] = [
@@ -143,6 +144,13 @@ export class TestCaseBuilder {
         }
       : undefined;
 
+    // Derive network-level assertions from calls captured during execution.
+    // Only emit assertions for flows that actually executed steps — a failed
+    // or skipped flow with no steps produces no trustworthy assertions.
+    const assertions = task.discoveredSteps.length > 0
+      ? buildAssertionsFromSteps(task.discoveredSteps)
+      : [];
+
     return {
       id: ep.id,
       name: isBlocked ? `${ep.name} [BLOCKED: ${task.blockerType || 'other'}]` : ep.name,
@@ -163,6 +171,7 @@ export class TestCaseBuilder {
       expectedResult,
       preconditions,
       blocker,
+      assertions: assertions.length > 0 ? assertions : undefined,
     };
   }
 

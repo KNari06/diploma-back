@@ -38,6 +38,9 @@ import { buildParsedSnapshot } from '../agents/parsed-snapshot';
 import { SafetyInterceptor, type SafetyInput } from '../agents/safety-interceptor';
 import { TestBlackboard } from './blackboard';
 import type { CommandName, CommandResult, PipelineConfig } from './types';
+import { checkDomainBoundary } from '../exploration/domain-boundary';
+import { evaluateOverlayGate } from '../exploration/intra-flow-overlay-gate';
+import { OverlayDismisser } from '../exploration/overlay-dismisser';
 
 /**
  * PR-Hybrid: Commands that carry a `ref` parameter and can be intercepted
@@ -299,7 +302,37 @@ export class CommandExecutor {
 
   private async observePage(): Promise<CommandResult> {
     try {
-      const snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+      let snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+
+      // Intra-flow overlay gate: cheap check on the snapshot we just took.
+      // If a cookie banner / chat widget / toast / onboarding popup appeared
+      // since the previous round (SnapshotCollector already produces
+      // obstacleFacts for free), dismiss it and re-collect once. The gate
+      // refuses to act when a legitimate app modal/drawer/paywall is present
+      // so we don't close a confirm dialog the flow needs to interact with.
+      const gate = evaluateOverlayGate(snapshot);
+      if (gate.shouldDismiss) {
+        try {
+          await OverlayDismisser.dismissOverlays(this.page, {
+            maxPasses: 1,
+            maxTimeMs: 1500,
+            mode: 'flow',
+          });
+          // Re-collect once to pick up the cleaned DOM. Best-effort — if
+          // re-collection fails we fall back to the original snapshot so
+          // the round still progresses.
+          try {
+            snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+          } catch { /* keep original snapshot */ }
+          this.blackboard.addInsight(
+            `Intra-flow overlay cleanup: dismissed ${gate.noiseTypes.join(', ')}`,
+          );
+        } catch {
+          // OverlayDismisser / addInsight failures are non-fatal —
+          // continue with whatever snapshot we have.
+        }
+      }
+
       const formatted = SnapshotCollector.format(snapshot);
 
       // Update blackboard with current page state (all agents can read)
@@ -484,6 +517,30 @@ export class CommandExecutor {
     // Clarification gate: detect payment context before click
     const element = snapshot.elements.find(el => el.ref === ref);
     const targetText = element?.name || '';
+
+    // Domain boundary: if the element is an anchor whose href resolves off-app,
+    // refuse pre-click. Without this the agent happily clicks "Sign in with Google"
+    // and burns the whole per-flow timeout on accounts.google.com.
+    // Only checked when the element has an href — pure buttons and in-page JS
+    // handlers may still navigate off-domain, but we cannot predict those.
+    if (element?.href) {
+      const boundary = checkDomainBoundary({
+        targetUrl: element.href,
+        entryUrl: this.blackboard.getUrl(),
+        currentUrl: this.blackboard.getCurrentUrl(),
+      });
+      if (!boundary.allowed) {
+        this.blackboard.addInsight(
+          `External link avoided on "${targetText || ref}" → ${boundary.targetOrigin || element.href}`,
+        );
+        return {
+          success: false,
+          output: '',
+          error: `external_link_avoided: ${boundary.reason}. Prefer in-app navigation.`,
+        };
+      }
+    }
+
     if (isPaymentContext(snapshot, targetText)) {
       this.blackboard.addInsight(`Payment context detected on "${targetText}" — flagged for user`);
       return {
@@ -1135,23 +1192,35 @@ export class CommandExecutor {
    * Check navigation security — block external origins.
    */
   private checkNavigationSecurity(url: string): { allowed: boolean; reason?: string } {
+    // Delegate to the shared domain-boundary helper so the click and navigate
+    // paths agree on what counts as "external". Keep the old wrapper shape so
+    // existing callers don't need to change.
+    //
+    // Note: the shared helper default-allows empty/javascript:/mailto:/tel:
+    // targets — for explicit navigate_to(url) we want the stricter behaviour
+    // of the old code (empty URL rejected elsewhere, non-http schemes should
+    // not reach here in practice). We preserve the "Invalid URL" reason by
+    // guarding against obviously malformed input up front.
+    if (!url || typeof url !== 'string') {
+      return { allowed: false, reason: `Invalid URL: ${url}` };
+    }
     try {
-      const targetOrigin = new URL(url).origin;
-      const goalOrigin = new URL(this.blackboard.getUrl()).origin;
-      const currentUrl = this.blackboard.getCurrentUrl();
-      const currentOrigin = currentUrl ? new URL(currentUrl).origin : goalOrigin;
-
-      if (targetOrigin !== currentOrigin && targetOrigin !== goalOrigin) {
-        return {
-          allowed: false,
-          reason: `Navigation to external origin blocked: ${targetOrigin} (test site: ${goalOrigin}). Use on-page links instead.`,
-        };
-      }
-
-      return { allowed: true };
+      // Force eager parse — the helper would default-allow a junk URL,
+      // but navigate_to must refuse to issue goto() on an unparseable arg.
+      new URL(url);
     } catch {
       return { allowed: false, reason: `Invalid URL: ${url}` };
     }
+    const decision = checkDomainBoundary({
+      targetUrl: url,
+      entryUrl: this.blackboard.getUrl(),
+      currentUrl: this.blackboard.getCurrentUrl(),
+    });
+    if (decision.allowed) return { allowed: true };
+    return {
+      allowed: false,
+      reason: `Navigation to external origin blocked: ${decision.targetOrigin ?? url} (test site: ${(() => { try { return new URL(this.blackboard.getUrl()).origin; } catch { return this.blackboard.getUrl(); } })()}). Use on-page links instead.`,
+    };
   }
 
   /**

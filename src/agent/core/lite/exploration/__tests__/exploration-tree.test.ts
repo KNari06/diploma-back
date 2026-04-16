@@ -41,6 +41,127 @@ function mkEntryPoint(id: string, name: string, goal?: string): EntryPoint {
   };
 }
 
+describe('ExplorationTree — URL pattern dedup', () => {
+  it('dedupes catalogue detail pages with different numeric ids', () => {
+    const tree = new ExplorationTree();
+    const first = tree.addNode({
+      url: 'https://shop.com/products/123',
+      title: '',
+      pageType: 'product',
+      snapshot: mkSnapshot({
+        url: 'https://shop.com/products/123',
+        elements: [mkElement({ ref: 'a', name: 'Buy' })],
+      }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    // Different id, different content elements — but same route pattern.
+    // Without pattern extraction this used to create 50 nodes on a 50-item catalogue.
+    const second = tree.addNode({
+      url: 'https://shop.com/products/456',
+      title: '',
+      pageType: 'product',
+      snapshot: mkSnapshot({
+        url: 'https://shop.com/products/456',
+        elements: [mkElement({ ref: 'b', name: 'Buy' })],
+      }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
+    expect(tree.getNodeCount()).toBe(1);
+  });
+
+  it('dedupes UUID-based resource pages', () => {
+    const tree = new ExplorationTree();
+    const first = tree.addNode({
+      url: 'https://app.com/users/550e8400-e29b-41d4-a716-446655440000',
+      title: '',
+      pageType: '',
+      snapshot: mkSnapshot(),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    const second = tree.addNode({
+      url: 'https://app.com/users/f47ac10b-58cc-4372-a567-0e02b2c3d479',
+      title: '',
+      pageType: '',
+      snapshot: mkSnapshot({ elements: [mkElement({ ref: 'other' })] }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    expect(first).not.toBeNull();
+    expect(second).toBeNull();
+  });
+
+  it('keeps semantically-different routes separate even with same id', () => {
+    const tree = new ExplorationTree();
+    const product = tree.addNode({
+      url: 'https://shop.com/products/42',
+      title: '',
+      pageType: '',
+      snapshot: mkSnapshot({
+        url: 'https://shop.com/products/42',
+        elements: [mkElement({ ref: 'a', name: 'Product page' })],
+      }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    const user = tree.addNode({
+      url: 'https://shop.com/users/42',
+      title: '',
+      pageType: '',
+      snapshot: mkSnapshot({
+        url: 'https://shop.com/users/42',
+        elements: [mkElement({ ref: 'b', name: 'User page' })],
+      }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    expect(product).not.toBeNull();
+    expect(user).not.toBeNull();
+    expect(tree.getNodeCount()).toBe(2);
+  });
+
+  it('preserves human-readable slugs as distinct pages', () => {
+    const tree = new ExplorationTree();
+    const a = tree.addNode({
+      url: 'https://blog.com/posts/how-to-cook-pasta',
+      title: '',
+      pageType: '',
+      snapshot: mkSnapshot({
+        url: 'https://blog.com/posts/how-to-cook-pasta',
+        elements: [mkElement({ ref: 'a', name: 'A' })],
+      }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    const b = tree.addNode({
+      url: 'https://blog.com/posts/getting-started-guide',
+      title: '',
+      pageType: '',
+      snapshot: mkSnapshot({
+        url: 'https://blog.com/posts/getting-started-guide',
+        elements: [mkElement({ ref: 'b', name: 'B' })],
+      }),
+      entryPoints: [],
+      depth: 0,
+      requiresAuth: false,
+    });
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(tree.getNodeCount()).toBe(2);
+  });
+});
+
 describe('ExplorationTree — URL normalization', () => {
   it('treats URLs with different query strings as same page', () => {
     const tree = new ExplorationTree();

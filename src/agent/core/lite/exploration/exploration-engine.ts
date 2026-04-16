@@ -41,6 +41,7 @@ import { RateLimiter } from './rate-limiter';
 import { ExplorationTree } from './exploration-tree';
 import { SurveyAgent } from './survey-agent';
 import { FlowQueue } from './flow-queue';
+import { PerPageBudget, DEFAULT_MAX_FLOWS_PER_PAGE } from './per-page-budget';
 import { FlowRunner } from './flow-runner';
 import { TestCaseBuilder } from './test-case-builder';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
@@ -56,6 +57,13 @@ const CHECKPOINT_EVERY_N_FLOWS = 3;
 export class ExplorationEngine {
   private readonly config: ExplorationConfig;
   private readonly onProgress?: ExplorationProgressCallback;
+  /**
+   * Per-page fairness counter shared across every queue rebuild in this run.
+   * Must outlive individual FlowQueue instances — otherwise a rebuild in
+   * Phase 1.5 / 2.5 would reset the count and a saturated page could
+   * collect another full quota of flows. Null when the gate is disabled.
+   */
+  private perPageBudget: PerPageBudget | null = null;
 
   constructor(
     private readonly browser: Browser,
@@ -87,6 +95,55 @@ export class ExplorationEngine {
         timestamp: Date.now(),
       });
     } catch { /* never let progress reporting crash exploration */ }
+  }
+
+  /**
+   * Attach the dedup + per-page-fairness policies to a freshly built queue.
+   * Called everywhere a FlowQueue is (re)created within a run so both
+   * survey targeted-rebuilds and the Sentinel-driven extra round see the
+   * same saturation state and don't grant a saturated page extra quota.
+   */
+  private attachQueuePolicies(queue: FlowQueue, trace: ExplorationTraceService): void {
+    queue.setDedupTrace((data) => trace.writeQueueDedup(data));
+    if (this.perPageBudget) {
+      queue.setPerPageBudget(this.perPageBudget);
+    }
+  }
+
+  /**
+   * Lazily construct the per-page budget using the configured cap.
+   * Returns the existing instance on subsequent calls so counts persist
+   * across queue rebuilds within a single run.
+   */
+  private ensurePerPageBudget(): PerPageBudget | null {
+    if (this.perPageBudget !== null) return this.perPageBudget;
+    const cap = this.config.budget.maxFlowsPerPage ?? DEFAULT_MAX_FLOWS_PER_PAGE;
+    // Treat non-positive / non-finite values as "disabled" — no gate.
+    if (!Number.isFinite(cap) || cap <= 0) return null;
+    this.perPageBudget = new PerPageBudget(cap);
+    return this.perPageBudget;
+  }
+
+  /**
+   * Build the common context options used by every survey context spawned
+   * by this engine (entry + targeted surveys). Centralized so an auth
+   * fixture is picked up by all three call sites automatically — adding
+   * a fourth context creation should stay correct without remembering
+   * the storageState plumbing.
+   */
+  private buildSurveyContextOptions(): Parameters<Browser['newContext']>[0] {
+    return {
+      viewport: { width: 1280, height: 720 },
+      ignoreHTTPSErrors: true,
+      userAgent: DESKTOP_USER_AGENT,
+      extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
+      // Auth fixture: let even Phase 1 hit auth-gated pages when the user
+      // supplied pre-seeded state. Playwright accepts the same JSON shape
+      // we validated upstream, so no further conversion is needed.
+      ...(this.config.authFixture
+        ? { storageState: this.config.authFixture as any }
+        : {}),
+    };
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -128,12 +185,7 @@ export class ExplorationEngine {
     logger.info('[EXPLORATION] Phase 1: Starting page survey');
     trace.writePhaseStart('survey');
 
-    const surveyContext = await this.browser.newContext({
-      viewport: { width: 1280, height: 720 },
-      ignoreHTTPSErrors: true,
-      userAgent: DESKTOP_USER_AGENT,
-      extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
-    });
+    const surveyContext = await this.browser.newContext(this.buildSurveyContextOptions());
     await surveyContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
     try {
@@ -204,9 +256,13 @@ export class ExplorationEngine {
     const strategist = new ExplorationStrategist(bb);
     bb.currentStrategy = await strategist.plan();
 
+    // Initialize the per-page fairness counter before the first queue is
+    // built so every dequeue throughout the run shares one accounting.
+    this.ensurePerPageBudget();
+
     // Build queue from Strategist output (AI-driven order, not static formula)
     bb.queue = FlowQueue.fromStrategyOutput(allEntryPoints, bb.currentStrategy);
-    bb.queue.setDedupTrace((data) => trace.writeQueueDedup(data));
+    this.attachQueuePolicies(bb.queue, trace);
 
     // Log the full queue order for debugging prioritization
     trace.writeQueueOrder({
@@ -241,12 +297,7 @@ export class ExplorationEngine {
       });
 
       try {
-        const targetedSurveyContext = await this.browser.newContext({
-          viewport: { width: 1280, height: 720 },
-          ignoreHTTPSErrors: true,
-          userAgent: DESKTOP_USER_AGENT,
-          extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
-        });
+        const targetedSurveyContext = await this.browser.newContext(this.buildSurveyContextOptions());
         await targetedSurveyContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
         try {
@@ -266,6 +317,7 @@ export class ExplorationEngine {
           // Rebuild queue with new entry points from targeted survey
           const updatedEntryPoints = bb.tree.getAllEntryPoints();
           bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, bb.currentStrategy);
+          this.attachQueuePolicies(bb.queue, trace);
 
           logger.info('[EXPLORATION] Targeted survey complete', {
             newPages: updatedTree.getNodeCount(),
@@ -396,12 +448,7 @@ export class ExplorationEngine {
         });
 
         try {
-          const targetedSurveyContext = await this.browser.newContext({
-            viewport: { width: 1280, height: 720 },
-            ignoreHTTPSErrors: true,
-            userAgent: DESKTOP_USER_AGENT,
-            extraHTTPHeaders: { ...BROWSER_EXTRA_HEADERS },
-          });
+          const targetedSurveyContext = await this.browser.newContext(this.buildSurveyContextOptions());
           await targetedSurveyContext.addInitScript(BROWSER_STEALTH_SCRIPT);
 
           try {
@@ -421,6 +468,7 @@ export class ExplorationEngine {
             // Rebuild queue with newly discovered entry points
             const updatedEntryPoints = bb.tree.getAllEntryPoints();
             bb.queue = FlowQueue.fromStrategyOutput(updatedEntryPoints, focused);
+            this.attachQueuePolicies(bb.queue, trace);
 
             logger.info('[EXPLORATION] Phase 2.5: Targeted survey complete', {
               newPages: updatedTree.getNodeCount(),
@@ -585,6 +633,12 @@ export class ExplorationEngine {
 
       const queue = FlowQueue.fromEntryPoints(allEntryPoints);
       queue.setDedupTrace((data) => trace.writeQueueDedup(data));
+      // Per-page fairness cap on resume too — counter necessarily resets,
+      // but the cap still prevents a saturation burst after restart.
+      const resumePerPageCap = config.budget.maxFlowsPerPage ?? DEFAULT_MAX_FLOWS_PER_PAGE;
+      if (Number.isFinite(resumePerPageCap) && resumePerPageCap > 0) {
+        queue.setPerPageBudget(new PerPageBudget(resumePerPageCap));
+      }
       trace.writePhaseStart('flow');
       const flowRunner = new FlowRunner(browser, config, budget, config.onProgress, rateLimiter, trace);
 
@@ -637,6 +691,11 @@ export class ExplorationEngine {
       ? FlowQueue.fromCheckpoint(checkpoint.queue)
       : FlowQueue.fromEntryPoints(allEntryPoints);
     queue.setDedupTrace((data) => trace.writeQueueDedup(data));
+    // Per-page fairness cap on resume too (counter starts fresh).
+    const resumePerPageCap2 = config.budget.maxFlowsPerPage ?? DEFAULT_MAX_FLOWS_PER_PAGE;
+    if (Number.isFinite(resumePerPageCap2) && resumePerPageCap2 > 0) {
+      queue.setPerPageBudget(new PerPageBudget(resumePerPageCap2));
+    }
 
     const previousTasks = checkpoint.flowRunner?.completedTasks || [];
     trace.writePhaseStart('flow');
