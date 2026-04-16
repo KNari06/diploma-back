@@ -1,4 +1,4 @@
-import { env } from '@/config/environment/env';
+import { env, isDevelopment } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
@@ -76,15 +76,17 @@ export async function uploadVideoToStorage(
       url: urlData.publicUrl,
     });
 
-    // Clean up local file
-    try {
-      await fs.unlink(localPath);
-      logger.debug('[STORAGE] Local video file deleted', { localPath });
-    } catch (cleanupError) {
-      logger.warn('[STORAGE] Failed to delete local video file', {
-        localPath,
-        error: cleanupError,
-      });
+    // Clean up local file (skip in development to keep files for debugging)
+    if (!isDevelopment) {
+      try {
+        await fs.unlink(localPath);
+        logger.debug('[STORAGE] Local video file deleted', { localPath });
+      } catch (cleanupError) {
+        logger.warn('[STORAGE] Failed to delete local video file', {
+          localPath,
+          error: cleanupError,
+        });
+      }
     }
 
     return urlData.publicUrl;
@@ -179,15 +181,17 @@ export async function uploadTraceToStorage(
       url: urlData.publicUrl,
     });
 
-    // Clean up local file
-    try {
-      await fs.unlink(localPath);
-      logger.debug('[STORAGE] Local trace file deleted', { localPath });
-    } catch (cleanupError) {
-      logger.warn('[STORAGE] Failed to delete local trace file', {
-        localPath,
-        error: cleanupError,
-      });
+    // Clean up local file (skip in development to keep files for debugging)
+    if (!isDevelopment) {
+      try {
+        await fs.unlink(localPath);
+        logger.debug('[STORAGE] Local trace file deleted', { localPath });
+      } catch (cleanupError) {
+        logger.warn('[STORAGE] Failed to delete local trace file', {
+          localPath,
+          error: cleanupError,
+        });
+      }
     }
 
     return urlData.publicUrl;

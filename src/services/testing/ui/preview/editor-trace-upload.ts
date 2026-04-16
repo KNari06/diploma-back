@@ -5,6 +5,7 @@
  * Reuses existing uploadLiteTraceLogToStorage() and insertTraceFileRecord().
  */
 
+import { isDevelopment } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { isValidUUID } from '@/utils/validation/validation';
 import * as fs from 'fs/promises';
@@ -39,6 +40,16 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
   const { filePath, userId, previewSessionId, traceType, intentTestCaseId } = params;
 
   try {
+    // In development, keep trace logs locally for debugging — skip Supabase upload
+    if (isDevelopment) {
+      logger.debug(`${TAG} Skipping upload in development mode, keeping local file`, {
+        filePath,
+        previewSessionId,
+        traceType,
+      });
+      return;
+    }
+
     if (!isValidUUID(userId)) {
       logger.warn(`${TAG} Skipping upload — userId is not a valid UUID`, {
         userId: userId?.substring(0, 8),

@@ -1,3 +1,4 @@
+import { isDevelopment } from '@/config/environment/env';
 import { TestJobData } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { BrowserContext, Page } from 'playwright';
@@ -141,6 +142,16 @@ export async function uploadArtifacts(
   const result: { videoUrl?: string; traceUrl?: string } = {};
   void _screenshotUrls; // Intentionally not used here (screenshots are uploaded elsewhere)
 
+  // In development, keep artifacts locally for debugging — skip Supabase upload
+  if (isDevelopment) {
+    logger.info('[PLAYWRIGHT] Skipping artifact upload in development mode, keeping local files', {
+      testId: testData.testId,
+      videoPath,
+      tracePath,
+    });
+    return result;
+  }
+
   try {
     const { uploadVideoToStorage, uploadTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
 
@@ -173,6 +184,15 @@ export async function uploadIntelligentTestScreenshots(
   const screenshotUrls: string[] = [];
 
   if (!screenshots || screenshots.length === 0) {
+    return screenshotUrls;
+  }
+
+  // In development, skip screenshot uploads to Supabase
+  if (isDevelopment) {
+    logger.debug('[PLAYWRIGHT] Skipping screenshot upload in development mode', {
+      testId: testData.testId,
+      screenshotsCount: screenshots.length,
+    });
     return screenshotUrls;
   }
 
