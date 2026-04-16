@@ -272,6 +272,14 @@ interface InternalSession extends PreviewSession {
   recordingStartUrl?: string;
   /** V14: Timestamp when last recording step was emitted (for inter-step delay calculation) */
   recordingLastStepEmittedAt?: number;
+  /**
+   * Count of NEW recording steps emitted in the current recording session.
+   * Incremented in emitRecordingStep(), decremented when a step is removed
+   * (`preview:recording:step:remove`, typing backspace-all). NOT incremented
+   * on `:step:update` (merges don't create a new step). Reset to 0 by
+   * `setRecording(false)`. Used by the max-steps auto-stop guard.
+   */
+  recordingStepCount?: number;
 
   /** V13: Dialog handling mode — controls how native dialogs are handled */
   dialogMode: 'passive' | 'recording' | 'replay';
@@ -598,6 +606,7 @@ export class PreviewSessionService {
           recordingTypingBuffer: null,
           recordingLastUrl: safeStartUrl,
           recordingDragState: null,
+          recordingStepCount: 0,
           recordingLastTypeStep: null,
           recordingLastScrollStep: null,
           recordingLastHover: null,
@@ -787,6 +796,7 @@ export class PreviewSessionService {
       session.recordingLastUrl = startUrl;
       session.recordingDragState = null;
       session.recordingLastTypeStep = null;
+      session.recordingStepCount = 0;
       session.recordingLastScrollStep = null;
 
       // Close old resources after swap (do not break reset if close fails)
@@ -1984,6 +1994,9 @@ export class PreviewSessionService {
     if (recording) {
       // V14: Reset inter-step delay tracking on recording start
       session.recordingLastStepEmittedAt = undefined;
+      // Reset the per-session step counter at the start of each recording
+      // so the max-steps guard always measures the CURRENT session.
+      session.recordingStepCount = 0;
     } else {
       session.recordingTypingBuffer = null;
       session.recordingDragState = null;
@@ -1991,8 +2004,44 @@ export class PreviewSessionService {
       session.recordingLastScrollStep = null;
       session.recordingLastHover = null;
       session.recordingLastStepEmittedAt = undefined;
+      session.recordingStepCount = 0;
     }
     return true;
+  }
+
+  /**
+   * Get the number of NEW steps emitted in the current recording session.
+   * Excludes :step:update merges (those don't grow the count) and excludes
+   * steps that were removed via :step:remove (decremented). Returns 0 when
+   * recording is not active or the session doesn't exist.
+   */
+  getRecordingStepCount(sessionId: string, userId?: string): number {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingStepCount ?? 0;
+  }
+
+  /**
+   * Increment the recording step counter and return the new value.
+   * Caller (emitRecordingStep) uses the returned count to (a) stamp the
+   * outgoing WS payload and (b) trigger the max-steps auto-stop guard.
+   */
+  incrementRecordingStepCount(sessionId: string, userId: string): number {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return 0;
+    session.recordingStepCount = (session.recordingStepCount ?? 0) + 1;
+    return session.recordingStepCount;
+  }
+
+  /**
+   * Decrement the recording step counter (never below 0). Called when a
+   * previously-emitted step is removed — currently only from the
+   * backspace-all path that emits `preview:recording:step:remove`.
+   */
+  decrementRecordingStepCount(sessionId: string, userId: string): number {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return 0;
+    session.recordingStepCount = Math.max(0, (session.recordingStepCount ?? 0) - 1);
+    return session.recordingStepCount;
   }
 
   /**

@@ -212,7 +212,7 @@ export interface ServerToClientEvents {
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;
-  'preview:recording:step:remove': (data: { previewSessionId: string; stepId: string; timestamp: string }) => void;
+  'preview:recording:step:remove': (data: { previewSessionId: string; stepId: string; stepCount?: number; timestamp: string }) => void;
   'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
 
   // Preview interactive control responses
@@ -1273,6 +1273,13 @@ export interface PreviewRecordingStepPayload {
   step: PreviewIntentStep;
   /** Bounding box for transient highlight on the recorded element */
   highlight?: PreviewBoundingBox;
+  /**
+   * Cumulative count of NEW steps emitted in this recording session after
+   * this one is applied. Stamped server-side so the UI (badge/limit) stays
+   * in sync with the server's max-steps guard. Missing on pre-counter
+   * builds — treat as unknown.
+   */
+  stepCount?: number;
   timestamp: string;
 }
 
@@ -1283,6 +1290,13 @@ export interface PreviewRecordingStepPayload {
 export interface PreviewRecordingStatePayload {
   previewSessionId: string;
   recording: boolean;
+  /**
+   * Server-side reason for an auto-stop. Absent on explicit user stop.
+   *   - 'max_time'  — recording exceeded WEB_RECORDING_MAX_TIME_MS
+   *   - 'max_steps' — recording hit WEB_RECORDING_MAX_STEPS; user must
+   *                   Apply All before recording more
+   */
+  reason?: 'max_time' | 'max_steps';
   timestamp: string;
 }
 

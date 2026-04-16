@@ -21,7 +21,9 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
 import { Job } from 'bullmq';
-import type { MobileTestJobData, MobileRunStepsResponse } from '@/services/mobile/mobile-runner.types';
+import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from '@/services/mobile/mobile-runner.types';
+import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
+import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
@@ -313,6 +315,25 @@ export class MobileTestRunJobHandler {
         } catch { /* non-fatal */ }
       }
 
+      // ── Phase 4.5: Auto-persist compiled plans from successful steps ─────
+      // Mirror of web's preview-run.service.ts batch persist (calls
+      // IntentTestCaseService.batchUpdateStepsFromRun). On mobile, until
+      // this was added, compiled plans were only persisted on apply/heal —
+      // so the first regression run of a freshly-authored test case hit the
+      // LLM for every step. Now every successful run writes freshly-built
+      // compiled plans back to steps_json, and subsequent runs short-circuit
+      // via the runner's compiled-fast-path (~10ms/step).
+      //
+      // Non-fatal: a persist failure must not fail the run.
+      // Mutex-safe: batchUpdateStepsFromRun takes withTestCaseMutex, so it
+      // serializes against updateStepFromPreviewApply / updateStepAfterHeal
+      // that fire from apply and in-run heal paths.
+      await MobileTestRunJobHandler.persistCompiledPlansFromRun(
+        testId,
+        intentSteps,
+        runResult,
+      );
+
       // ── Phase 5: Create test result ───────────────────────────
       const testPassed = runResult.status === 'passed';
 
@@ -484,6 +505,84 @@ export class MobileTestRunJobHandler {
   }
 
   // ── Helpers ─────────────────────────────────────────────────────
+
+  /**
+   * Persist freshly-built compiled plans from a completed run onto the
+   * IntentTestCase.steps_json. Idempotent, non-fatal, mutex-safe.
+   *
+   * Only steps that (a) succeeded and (b) produced a compiledPlan are
+   * written. Original step fields (description, value, options, user-set
+   * bindingHints) are preserved via spread; runner-emitted evidence is
+   * attached under a `runtime` namespace to match the shape
+   * MobileStepApplyService already writes for apply.
+   */
+  private static async persistCompiledPlansFromRun(
+    testId: string,
+    intentSteps: MobileIntentStep[],
+    runResult: MobileRunStepsResponse,
+  ): Promise<void> {
+    if (!testId || !runResult?.steps?.length) return;
+
+    try {
+      const originalById = new Map<string, MobileIntentStep>();
+      for (const s of intentSteps) originalById.set(s.id, s);
+
+      const enrichedSteps = new Map<string, IntentStep>();
+
+      for (const result of runResult.steps) {
+        if (!result.success || !result.compiledPlan) continue;
+        const original = originalById.get(result.stepId);
+        if (!original) continue;
+
+        // Start from the original step to preserve user-supplied fields
+        // (description, value, options, assertionText, bindingHints, etc.),
+        // then overlay runner-emitted artifacts. Cast is safe because
+        // IntentStep is the structural superset used across web and mobile.
+        const enriched: IntentStep = {
+          ...(original as unknown as IntentStep),
+          compiled: result.compiledPlan as unknown as IntentStep['compiled'],
+        };
+
+        if (result.evidence) {
+          enriched.evidence = {
+            ...(original as unknown as IntentStep).evidence,
+            resolvedVia: result.resolvedVia,
+            appliedAt: new Date().toISOString(),
+            // Keep runner-collected logs/console/network errors under a
+            // dedicated key so they don't collide with web StepEvidence fields.
+            runtime: result.evidence,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          } as any;
+        }
+
+        enrichedSteps.set(result.stepId, enriched);
+      }
+
+      if (enrichedSteps.size === 0) {
+        logger.debug('[MOBILE-TEST] No compiled plans to persist', { testId });
+        return;
+      }
+
+      const ok = await IntentTestCaseService.batchUpdateStepsFromRun({
+        intentTestCaseId: testId,
+        enrichedSteps,
+      });
+
+      if (ok) {
+        logger.info('[MOBILE-TEST] Persisted compiled plans from run', {
+          testId,
+          persistedCount: enrichedSteps.size,
+          totalSteps: runResult.steps.length,
+        });
+      }
+    } catch (error) {
+      // Non-fatal: run already succeeded, test_results will still be created.
+      logger.warn('[MOBILE-TEST] Failed to persist compiled plans (non-fatal)', {
+        testId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
   private static async updateTestStatus(
     testId: string,
