@@ -14,7 +14,7 @@ import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
 import multer from 'multer';
-import { deleteMobileApp, getMobileApp, uploadMobileApp } from './mobile.controller';
+import { deleteMobileApp, getMobileApp, listMobileAppBuilds, uploadMobileApp } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
 import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession } from './session.controller';
@@ -81,6 +81,19 @@ router.delete(
   '/projects/:projectId/app',
   requireAuth,
   asyncHandler(deleteMobileApp),
+);
+
+/**
+ * GET /api/v1/mobile/projects/:projectId/builds?platform=android&limit=20
+ *
+ * Phase 5 — list versioned APK/IPA builds for this project. Used by the
+ * plan settings UI to pick which build a regression should pin to, and by
+ * the mobile editor to show upload history.
+ */
+router.get(
+  '/projects/:projectId/builds',
+  requireAuth,
+  asyncHandler(listMobileAppBuilds),
 );
 
 // ═══════════════════════════════════════════════════════════════════════════

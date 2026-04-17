@@ -32,6 +32,63 @@ export interface MobileAppMetadata {
   uploadedAt: string;
 }
 
+/**
+ * Git / build metadata supplied at upload time (Phase 5).
+ * All fields optional — when none are provided the upload stays in the
+ * legacy `projects.settings.mobileApp` slot only. When any are provided
+ * we also insert a row into `mobile_app_builds` for versioned lookup.
+ */
+export interface MobileAppBuildMetadata {
+  branch?: string;
+  commitSha?: string;
+  buildNumber?: string;
+  ciRunId?: string;
+  source?: 'manual' | 'ci' | 'webhook';
+  notes?: string;
+}
+
+/**
+ * A row from `mobile_app_builds` — same shape as MobileAppMetadata plus
+ * git context. Returned by the resolver so `dispatchMobileTest` can build
+ * `MobileTestJobData` identically whether the APK came from the new
+ * versioned table or the legacy settings slot.
+ */
+export interface MobileAppBuildRecord extends MobileAppMetadata {
+  id: string;
+  branch: string | null;
+  commitSha: string | null;
+  buildNumber: string | null;
+  ciRunId: string | null;
+  source: 'manual' | 'ci' | 'webhook';
+}
+
+/**
+ * Context passed to `resolveAppForRun`. Any subset may be absent; the
+ * resolver walks precedence: commitSha > branch > legacy fallback.
+ */
+export interface MobileAppResolveContext {
+  projectId: string;
+  platform: MobilePlatform;
+  /** Exact commit to match. Wins over branch if both provided. */
+  commitSha?: string;
+  /** Branch to match latest-on-branch. */
+  branch?: string;
+}
+
+/**
+ * Normalise a user-supplied string — trim whitespace, treat empty as absent.
+ * Shared by both upload entry points (mobile.controller.ts and ci.controller.ts)
+ * so a blank form field never ends up in the database as an empty string.
+ *
+ * Exported as a const so the `typeof` guard narrows correctly and so callers
+ * that want to import an object-utility can do so from one place.
+ */
+export const trimMobileBuildField = (v: unknown): string | undefined => {
+  if (typeof v !== 'string') return undefined;
+  const t = v.trim();
+  return t.length > 0 ? t : undefined;
+};
+
 // ── Service ────────────────────────────────────────────────────────
 
 export class MobileAppStorageService {
@@ -181,5 +238,206 @@ export class MobileAppStorageService {
 
     const arrayBuffer = await data.arrayBuffer();
     return Buffer.from(arrayBuffer);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════
+  // Phase 5 — versioned builds on `mobile_app_builds`
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Persist an uploaded build into `mobile_app_builds`.
+   *
+   * Called right after `uploadApp` when the caller also supplied any git
+   * metadata (branch / commitSha / buildNumber / ciRunId). Callers that
+   * don't provide git metadata skip this step entirely — the legacy
+   * `projects.settings.mobileApp` slot keeps them working as today.
+   *
+   * Returns the created row. Errors are logged and the row insert is
+   * treated as best-effort: a failure here MUST NOT fail the upload
+   * itself (the APK is already in storage and the legacy slot is set).
+   */
+  static async recordBuild(
+    metadata: MobileAppMetadata,
+    buildMeta: MobileAppBuildMetadata,
+    ctx: { projectId: string; workspaceId?: string; uploadedBy?: string },
+  ): Promise<MobileAppBuildRecord | null> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .insert({
+          project_id: ctx.projectId,
+          workspace_id: ctx.workspaceId ?? null,
+          uploaded_by: ctx.uploadedBy ?? null,
+          platform: metadata.platform,
+          branch: buildMeta.branch ?? null,
+          commit_sha: buildMeta.commitSha ?? null,
+          build_number: buildMeta.buildNumber ?? null,
+          ci_run_id: buildMeta.ciRunId ?? null,
+          storage_path: metadata.storagePath,
+          public_url: metadata.publicUrl,
+          original_name: metadata.originalName,
+          package_name: metadata.packageName ?? null,
+          file_size: metadata.fileSize,
+          source: buildMeta.source ?? 'manual',
+          notes: buildMeta.notes ?? null,
+          uploaded_at: metadata.uploadedAt,
+        })
+        .select('*')
+        .single();
+
+      if (error || !data) {
+        // Duplicate commit_sha is a legitimate case (re-upload of the
+        // exact same commit) — don't spam error logs for it.
+        const isDup = error?.code === '23505'; // unique_violation
+        logger[isDup ? 'info' : 'warn']('[MOBILE_APP_STORAGE] recordBuild non-fatal', {
+          projectId: ctx.projectId,
+          platform: metadata.platform,
+          branch: buildMeta.branch,
+          commitSha: buildMeta.commitSha,
+          error: error?.message,
+        });
+        return null;
+      }
+
+      logger.info('[MOBILE_APP_STORAGE] Recorded build', {
+        buildId: data.id,
+        projectId: ctx.projectId,
+        platform: metadata.platform,
+        branch: buildMeta.branch,
+        commitSha: buildMeta.commitSha,
+        source: buildMeta.source,
+      });
+
+      return this.mapBuildRow(data);
+    } catch (err) {
+      logger.warn('[MOBILE_APP_STORAGE] recordBuild threw', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Resolve which APK/IPA to install for a run.
+   *
+   * Precedence (first match wins):
+   *   1. Exact commit (`commit_sha = ctx.commitSha`) — CI pinned run.
+   *   2. Latest build on the requested branch (`branch = ctx.branch`) —
+   *      git-trigger default ("PR on feat-x → install feat-x APK").
+   *   3. Legacy `projects.settings.mobileApp` — preserves pre-Phase-5
+   *      behaviour for projects that never started versioning.
+   *
+   * Returns null ONLY when no build exists anywhere for the project —
+   * in which case `dispatchMobileTest` will run without installing
+   * anything (same as today when mobileApp is empty).
+   */
+  static async resolveAppForRun(
+    ctx: MobileAppResolveContext,
+  ): Promise<MobileAppBuildRecord | null> {
+    // 1. Commit pin — unique index guarantees at most one row.
+    if (ctx.commitSha) {
+      const { data } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .select('*')
+        .eq('project_id', ctx.projectId)
+        .eq('platform', ctx.platform)
+        .eq('commit_sha', ctx.commitSha)
+        .maybeSingle();
+      if (data) {
+        logger.debug('[MOBILE_APP_STORAGE] resolver matched commit', {
+          projectId: ctx.projectId,
+          commitSha: ctx.commitSha,
+        });
+        return this.mapBuildRow(data);
+      }
+    }
+
+    // 2. Latest on branch.
+    if (ctx.branch) {
+      const { data } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .select('*')
+        .eq('project_id', ctx.projectId)
+        .eq('platform', ctx.platform)
+        .eq('branch', ctx.branch)
+        .order('uploaded_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (data) {
+        logger.debug('[MOBILE_APP_STORAGE] resolver matched branch', {
+          projectId: ctx.projectId,
+          branch: ctx.branch,
+        });
+        return this.mapBuildRow(data);
+      }
+    }
+
+    // 3. Legacy fallback — `projects.settings.mobileApp`. Read and adapt
+    // the shape so the caller sees a uniform `MobileAppBuildRecord`.
+    const { data: project } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id, settings')
+      .eq('id', ctx.projectId)
+      .single();
+
+    const legacy = (project?.settings as any)?.mobileApp as MobileAppMetadata | undefined;
+    if (legacy && legacy.storagePath && legacy.platform === ctx.platform) {
+      logger.debug('[MOBILE_APP_STORAGE] resolver fell back to legacy mobileApp', {
+        projectId: ctx.projectId,
+      });
+      return {
+        id: 'legacy-settings',
+        project_id: ctx.projectId as any, // unused downstream but typed below
+        ...legacy,
+        branch: null,
+        commitSha: null,
+        buildNumber: null,
+        ciRunId: null,
+        source: 'manual',
+      } as unknown as MobileAppBuildRecord;
+    }
+
+    return null;
+  }
+
+  /**
+   * List recent builds for a project (UI history panel).
+   */
+  static async listBuilds(
+    projectId: string,
+    platform: MobilePlatform,
+    limit = 20,
+  ): Promise<MobileAppBuildRecord[]> {
+    const { data, error } = await supabaseAdmin
+      .from('mobile_app_builds')
+      .select('*')
+      .eq('project_id', projectId)
+      .eq('platform', platform)
+      .order('uploaded_at', { ascending: false })
+      .limit(Math.min(Math.max(limit, 1), 200));
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] listBuilds failed', { error });
+      return [];
+    }
+    return (data || []).map((row) => this.mapBuildRow(row));
+  }
+
+  /** Convert a raw `mobile_app_builds` row into the service shape. */
+  private static mapBuildRow(row: any): MobileAppBuildRecord {
+    return {
+      id: row.id,
+      platform: row.platform,
+      packageName: row.package_name ?? undefined,
+      storagePath: row.storage_path,
+      publicUrl: row.public_url,
+      originalName: row.original_name,
+      fileSize: Number(row.file_size ?? 0),
+      uploadedAt: row.uploaded_at,
+      branch: row.branch ?? null,
+      commitSha: row.commit_sha ?? null,
+      buildNumber: row.build_number ?? null,
+      ciRunId: row.ci_run_id ?? null,
+      source: row.source ?? 'manual',
+    };
   }
 }

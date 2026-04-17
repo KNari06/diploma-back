@@ -7,7 +7,23 @@ import { Request, Response } from 'express';
 import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { logger } from '@/utils/core/logger';
-import type { HeatmapMetric, HeatmapRange, TimeSeriesInterval, BugInsightsRange } from '@/services/analytics/analytics.types';
+import type {
+  AnalyticsPlatformFilter,
+  HeatmapMetric,
+  HeatmapRange,
+  TimeSeriesInterval,
+  BugInsightsRange,
+} from '@/services/analytics/analytics.types';
+
+/**
+ * Pull the `platform` query param and normalise it through the service.
+ * Central so every analytics endpoint accepts the same set of values
+ * ('all' | 'web' | 'mobile' | 'mobile_android' | 'api'), rejecting
+ * anything else silently to 'all' (the pre-Phase-7 default).
+ */
+function extractPlatformFilter(req: Request): AnalyticsPlatformFilter {
+  return AnalyticsQueryService.normalisePlatform(req.query.platform);
+}
 
 /**
  * GET /api/v1/analytics/summary
@@ -53,12 +69,14 @@ export async function getSummary(req: Request, res: Response): Promise<void> {
     const projectId = req.query.projectId as string | undefined;
     const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
     const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
+    const platform = extractPlatformFilter(req);
 
     const data = await AnalyticsQueryService.getSummary({
       workspaceId,
       projectId,
       startDate,
       endDate,
+      platform,
     });
 
     res.json({
@@ -123,12 +141,14 @@ export async function getResultsOverview(req: Request, res: Response): Promise<v
     const projectId = req.query.projectId as string | undefined;
     const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
     const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
+    const platform = extractPlatformFilter(req);
 
     const data = await AnalyticsQueryService.getResultsOverview({
       workspaceId,
       projectId,
       startDate,
       endDate,
+      platform,
     });
 
     res.json({
@@ -192,8 +212,9 @@ export async function getRecentFailures(req: Request, res: Response): Promise<vo
 
     const projectId = req.query.projectId as string | undefined;
     const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 10;
+    const platform = extractPlatformFilter(req);
 
-    const data = await AnalyticsQueryService.getRecentFailures(workspaceId, projectId, limit);
+    const data = await AnalyticsQueryService.getRecentFailures(workspaceId, projectId, limit, platform);
 
     res.json({
       success: true,
@@ -255,8 +276,9 @@ export async function getCriticalChecks(req: Request, res: Response): Promise<vo
     }
 
     const projectId = req.query.projectId as string | undefined;
+    const platform = extractPlatformFilter(req);
 
-    const data = await AnalyticsQueryService.getCriticalChecks(workspaceId, projectId);
+    const data = await AnalyticsQueryService.getCriticalChecks(workspaceId, projectId, platform);
 
     res.json({
       success: true,
@@ -330,8 +352,9 @@ export async function getHeatmap(req: Request, res: Response): Promise<void> {
     }
 
     const projectId = req.query.projectId as string | undefined;
+    const platform = extractPlatformFilter(req);
 
-    const data = await AnalyticsQueryService.getHeatmap(workspaceId, metric, range, projectId);
+    const data = await AnalyticsQueryService.getHeatmap(workspaceId, metric, range, projectId, platform);
 
     res.json({
       success: true,
@@ -470,6 +493,7 @@ export async function getTimeSeries(req: Request, res: Response): Promise<void> 
     const projectId = req.query.projectId as string | undefined;
     const startDate = req.query.startDate ? new Date(req.query.startDate as string) : undefined;
     const endDate = req.query.endDate ? new Date(req.query.endDate as string) : undefined;
+    const platform = extractPlatformFilter(req);
 
     const data = await AnalyticsQueryService.getTimeSeries({
       workspaceId,
@@ -477,6 +501,7 @@ export async function getTimeSeries(req: Request, res: Response): Promise<void> 
       startDate,
       endDate,
       interval,
+      platform,
     });
 
     res.json({

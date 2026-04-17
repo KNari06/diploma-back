@@ -19,6 +19,7 @@ import type {
   NegativeSummary,
 } from '@/types/testing.types';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger, formatError } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
 import { topologicalSort } from '@/utils/graph/topological-sort';
@@ -161,8 +162,17 @@ export class RegressionRunService {
 
       try {
         if (isMobile) {
-          // Mobile test → dispatch to mobile runner queue
-          const mobileResult = await this.dispatchMobileTest(intentCase, userId, trigger);
+          // Mobile test → dispatch to mobile runner queue. Parameters are
+          // applied inside dispatchMobileTest before the job is queued so
+          // placeholders in steps resolve to concrete values on the runner
+          // (Phase 6 — same substitution pass as the web path below).
+          const mobileResult = await this.dispatchMobileTest(
+            intentCase,
+            userId,
+            trigger,
+            undefined, // no triggerContext for single-case manual run
+            parameters,
+          );
           testId = mobileResult.testId;
         } else {
           // Web test → dispatch to Playwright queue
@@ -243,7 +253,7 @@ export class RegressionRunService {
       const uiIds = uiCases.map((tc) => tc.testCaseId);
       const { data: rows } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, commands, graph_ref, steps_json, replay_strategy')
+        .select('id, commands, graph_ref, steps_json, setup_steps, teardown_steps, replay_strategy')
         .in('id', uiIds);
 
       for (const row of rows || []) {
@@ -256,6 +266,13 @@ export class RegressionRunService {
           // Step editor test cases: count steps_json (+ 1 for initial goto)
           stepCount = row.steps_json.length + 1;
         }
+        // Phase 3: setup_steps and teardown_steps are prepended / appended
+        // at dispatch time by stitchPhases(). The user is billed for what
+        // runs, so count those too. Empty arrays (default for pre-Phase-3
+        // rows) contribute 0 — byte-identical credit to before.
+        const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
+        const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
+        stepCount += setupCount + teardownCount;
         // Minimum 1 credit per test case even if steps can't be counted
         uiStepCredits += Math.max(stepCount, 1);
       }
@@ -359,17 +376,37 @@ export class RegressionRunService {
     // 3. steps_json conversion (step editor test cases — converted at runtime)
     if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands) && intentCase.commands.length > 0) {
       commands = intentCase.commands;
+      // Pre-compiled commands path: stitch setup/teardown at the command level.
+      // The converter is IntentStep-aware only, so we convert the extras
+      // separately and bracket the main commands. No-op when the feature
+      // flag is off or both extras are empty — see stitchCommandsForTestCase.
+      commands = await this.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
       commands = intentCase.graph_ref.steps;
+      commands = await this.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (Array.isArray(intentCase.steps_json) && intentCase.steps_json.length > 0) {
-      // Convert intent steps to executable Playwright commands (same path as preview runner)
+      // Convert intent steps to executable Playwright commands (same path as preview runner).
+      // Normalise main steps through the shared helper BEFORE stitching, so
+      // every downstream consumer — web converter here, mobile runner via
+      // dispatchMobileTest — sees the same IntentStep shape. stitchPhases
+      // itself only normalises extras (setup/teardown); it trusts the main
+      // array the caller passes in. Without this step the web path and the
+      // mobile path would disagree on how raw JSONB becomes IntentStep.
+      const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
+      const normalisedMain = intentCase.steps_json.map((raw: any, i: number) =>
+        normaliseIntentStep(raw, i),
+      );
+      const { steps: stitchedSteps, counts, didStitch } = stitchPhases(normalisedMain, intentCase);
+
       const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
-      commands = IntentStepConverterService.convertToCommands(intentCase.steps_json, targetUrl, intentCase.id);
+      commands = IntentStepConverterService.convertToCommands(stitchedSteps, targetUrl, intentCase.id);
       logger.info('[REGRESSION_RUN] Converted steps_json to commands', {
         intentTestCaseId: intentCase.id,
         stepsCount: intentCase.steps_json.length,
         commandsCount: commands.length,
         stepsWithCompiled: intentCase.steps_json.filter((s: any) => !!s.compiled).length,
+        phaseStitched: didStitch,
+        phaseCounts: counts,
       });
     } else {
       throw new ValidationError(
@@ -419,6 +456,55 @@ export class RegressionRunService {
     };
   }
 
+  /**
+   * Command-level phase stitching for pre-compiled `commands` and
+   * `graph_ref.steps` replay paths. The steps_json path uses
+   * `stitchPhases` on IntentStep[] BEFORE conversion — richer because
+   * the converter understands all step types. Here we already have
+   * PlaywrightCommand[], so we just convert the setup/teardown
+   * IntentStep[] extras on their own and bracket the main commands.
+   *
+   * No-op when the feature flag is off OR both extras are empty — so
+   * this method is safe to call unconditionally and regressions stay
+   * byte-identical when the flag is off.
+   */
+  private static async stitchCommandsForTestCase(
+    mainCommands: any[],
+    intentCase: any,
+    targetUrl: string,
+  ): Promise<any[]> {
+    const { stitchPhases } = await import('./intent-step-dispatch.service');
+    // Pass an EMPTY main array — we only need the helper to produce the
+    // setup/teardown IntentSteps; main is already in PlaywrightCommand
+    // shape and doesn't round-trip through the converter.
+    const { steps: extras, counts, didStitch } = stitchPhases([], intentCase);
+    if (!didStitch) return mainCommands;
+
+    const setupSteps = extras.filter((s) => s.phase === 'setup');
+    const teardownSteps = extras.filter((s) => s.phase === 'teardown');
+
+    const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
+    const setupCommands = setupSteps.length > 0
+      ? IntentStepConverterService.convertToCommands(setupSteps, targetUrl, intentCase.id)
+      : [];
+    const teardownCommands = teardownSteps.length > 0
+      ? IntentStepConverterService.convertToCommands(teardownSteps, targetUrl, intentCase.id)
+      : [];
+
+    // Main commands inherit an explicit 'main' phase tag so the executor
+    // and report layer treat the boundary consistently (absent = legacy).
+    const taggedMain = mainCommands.map((cmd: any) => ({ ...cmd, phase: 'main' as const }));
+
+    logger.info('[REGRESSION_RUN] Stitched command-level phases', {
+      intentTestCaseId: intentCase.id,
+      setup: setupCommands.length,
+      main: taggedMain.length,
+      teardown: teardownCommands.length,
+      counts,
+    });
+    return [...setupCommands, ...taggedMain, ...teardownCommands];
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MOBILE TEST DISPATCH
   // ═══════════════════════════════════════════════════════════════════════════
@@ -434,6 +520,20 @@ export class RegressionRunService {
     intentCase: any,
     userId: string,
     trigger: string,
+    /**
+     * Phase 5: optional git context from the caller (git-webhook → runPlan).
+     * Undefined for manual / scheduled runs → resolver falls back to
+     * legacy `projects.settings.mobileApp`.
+     */
+    triggerContext?: { branch?: string; commitSha?: string },
+    /**
+     * Phase 6: runtime parameters from the caller (e.g. `runPlan({ parameters })`).
+     * Applied to `intentCase.steps_json` before stitching so placeholders in
+     * step values, options, assertion text and binding hints resolve to
+     * concrete values before the runner ever sees them. Missing / empty is
+     * a no-op — byte-identical to pre-Phase-6 dispatch.
+     */
+    parameters?: Record<string, any>,
   ): Promise<{ testId: string }> {
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
@@ -448,32 +548,61 @@ export class RegressionRunService {
     };
     const browser = BROWSER_MAP[intentCase.platform] ?? 'mobile-android';
 
-    // 2. Fetch project settings for mobile app metadata
+    // 2. Fetch project workspace (needed for MobileTestJobData; the APK
+    // itself comes from the resolver below, not from project settings).
     const { data: project } = await supabaseAdmin
       .from('projects')
-      .select('workspace_id, settings')
+      .select('workspace_id')
       .eq('id', intentCase.project_id)
       .single();
 
-    const mobileApp = (project?.settings as any)?.mobileApp;
+    // Phase 5: resolve which APK to install.
+    // Precedence inside the resolver:
+    //   triggerContext.commitSha > triggerContext.branch > legacy project.settings.mobileApp
+    // Returns null only when the project has NEVER had an APK uploaded —
+    // `appStoragePath` stays undefined and the mobile job handler runs
+    // steps without installing anything (pre-Phase-5 behaviour for empty
+    // projects). The resolver output shape is identical to the legacy
+    // `MobileAppMetadata`, so downstream code is unchanged.
+    const resolvedBuild = await MobileAppStorageService.resolveAppForRun({
+      projectId: intentCase.project_id,
+      platform,
+      branch: triggerContext?.branch,
+      commitSha: triggerContext?.commitSha,
+    });
 
-    // 3. Extract intent steps from steps_json
-    const intentSteps = (intentCase.steps_json || []).map((step: any, index: number) => ({
-      id: step.id || `step_${index}`,
-      type: step.type || 'click',
-      description: step.description || `Step ${index + 1}`,
-      value: step.value,
-      assertionText: step.assertionText,
-      bindingHints: step.bindingHints,
-      options: step.options,
-      isAutoInjected: step.isAutoInjected,
-      expectedOutcome: step.expectedOutcome,
-    }));
+    // 3. Extract intent steps from steps_json via the shared IntentStep
+    // normaliser (single source of truth for which fields survive the
+    // JSONB round-trip — see intent-step-dispatch.service.ts). Then hand off
+    // to stitchPhases so setup_steps / teardown_steps are prepended and
+    // appended with proper `phase` markers. When the case has no extras,
+    // stitchPhases is a no-op and the mobile job data is byte-identical
+    // to what it was before Phase 3.
+    const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    const rawMainSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
+      normaliseIntentStep(step, index),
+    );
+    const { steps: stitchedSteps, counts: phaseCounts, didStitch } =
+      stitchPhases(rawMainSteps, intentCase);
+
+    // Phase 6: apply plan-level parameters to stitched steps (main + setup
+    // + teardown all get the substitution in one pass). Walks every string
+    // leaf recursively so placeholders in options, bindingHints, etc.
+    // resolve too — not just top-level `value`. No-op when `parameters`
+    // is empty, preserving pre-Phase-6 behaviour bit-for-bit.
+    const intentSteps = this.applyParameters(stitchedSteps, parameters ?? {});
 
     if (intentSteps.length === 0) {
       throw new ValidationError(
         `Mobile test case "${intentCase.name}" has no steps (steps_json is empty)`,
       );
+    }
+
+    if (didStitch) {
+      logger.info('[REGRESSION_RUN] Mobile phases stitched', {
+        intentTestCaseId: intentCase.id,
+        counts: phaseCounts,
+      });
     }
 
     // 4. Create test record in DB (same pattern as ci.controller.ts)
@@ -489,14 +618,26 @@ export class RegressionRunService {
         mode: 'lite',
         platform,
         trigger,
-        appPackage: mobileApp?.packageName,
+        appPackage: resolvedBuild?.packageName,
+        // Phase 5: preserve which APK actually ran for this test — helps
+        // when debugging "test failed on prod build vs. on PR branch".
+        ...(resolvedBuild?.branch ? { appBranch: resolvedBuild.branch } : {}),
+        ...(resolvedBuild?.commitSha ? { appCommitSha: resolvedBuild.commitSha } : {}),
+        ...(resolvedBuild?.buildNumber ? { appBuildNumber: resolvedBuild.buildNumber } : {}),
       },
       intelligent_mode: false,
       test_goal: `Regression: ${intentCase.name} (${platform})`,
       commands: [],
     });
 
-    // 5. Build and queue mobile job
+    // 5. Build and queue mobile job.
+    // NOTE on the cast: `stitchPhases` returns web-flavoured IntentStep[]
+    // (its action types are a superset of MobileIntentActionType — e.g.
+    // 'dblclick' exists on web but not mobile). The runner rejects unknown
+    // action types at dispatch, so an unsupported type authored into a
+    // mobile setup_steps/teardown_steps buffer surfaces as a runtime error
+    // at the runner — which is the right place for that check. At the
+    // TypeScript boundary we just unblock the assignment.
     const jobData: MobileTestJobData = {
       testId,
       userId,
@@ -504,12 +645,12 @@ export class RegressionRunService {
       projectId: intentCase.project_id,
       platform,
       browser,
-      intentSteps,
+      intentSteps: intentSteps as unknown as MobileTestJobData['intentSteps'],
       runnerUrl: env.MOBILE_RUNNER_URL,
       runnerApiKey: env.MOBILE_RUNNER_API_KEY,
-      appStoragePath: mobileApp?.storagePath,
-      appOriginalName: mobileApp?.originalName,
-      appPackage: mobileApp?.packageName,
+      appStoragePath: resolvedBuild?.storagePath,
+      appOriginalName: resolvedBuild?.originalName,
+      appPackage: resolvedBuild?.packageName,
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
       metadata: buildMetadataFromTestCase(intentCase),
@@ -523,39 +664,110 @@ export class RegressionRunService {
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
       stepsCount: intentSteps.length,
+      // Phase 5: which build ran, for operator debugging.
+      appBuildId: resolvedBuild?.id,
+      appBranch: resolvedBuild?.branch,
+      appCommitSha: resolvedBuild?.commitSha,
+      appSource: resolvedBuild?.source,
     });
 
     return { testId };
   }
 
   /**
-   * Apply parameters to commands/steps
-   * Replaces {{paramName}} placeholders with actual values
+   * Substitute plan parameters into a string.
    *
-   * @param items - Commands or steps with parameter placeholders
-   * @param parameters - Runtime parameter values
-   * @returns Commands with substituted values
+   * Accepts BOTH placeholder syntaxes in one pass:
+   *   - `{{paramName}}` — the canonical web syntax (what CreateRegressionDialog
+   *     and the Playwright agent have always used).
+   *   - `${paramName}`  — the mobile/runtime-style syntax. The mobile RUNNER
+   *     uses `${key}` for its per-session scratchpad (OTP, clipboard,
+   *     see qait-mobile-runner src/runner/scratchpad.ts), so users who
+   *     authored mobile step values intuitively wrote `${email}`. We
+   *     substitute those HERE at dispatch time — BEFORE the runner gets
+   *     the step — so plan-level parameters win over scratchpad, which is
+   *     what a regression user expects. Scratchpad-only keys (e.g.
+   *     `${otp_code}` captured at runtime) aren't in `parameters`, so
+   *     the placeholder is left intact and the runner resolves it later.
+   *
+   * Unknown keys are left as-is (a warning is logged once per key) so a
+   * typo is visible in the step rather than silently blanked out.
+   */
+  private static substituteParamsInString(
+    input: string,
+    parameters: Record<string, any>,
+  ): string {
+    // Single regex matches both {{name}} and ${name}. Capture group 1
+    // is the {{…}} body; group 2 is the ${…} body. Exactly one fires
+    // per match.
+    const PLACEHOLDER_RE = /\{\{([\w.]+)\}\}|\$\{([\w.]+)\}/g;
+    return input.replace(PLACEHOLDER_RE, (match, doubleBrace?: string, dollar?: string) => {
+      const name = doubleBrace ?? dollar;
+      if (!name) return match;
+      if (Object.prototype.hasOwnProperty.call(parameters, name)
+        && parameters[name] !== undefined
+        && parameters[name] !== null) {
+        return String(parameters[name]);
+      }
+      // Only warn for {{name}} — ${name} may be legitimately runtime-only
+      // (OTP, clipboard) and handled by the runner's scratchpad.
+      if (doubleBrace) {
+        logger.warn('[REGRESSION_RUN] Missing parameter', { paramName: name });
+      }
+      return match;
+    });
+  }
+
+  /**
+   * Deep-apply plan parameters to an arbitrary command/step tree.
+   *
+   * Walks every string leaf in every item and runs `substituteParamsInString`
+   * against it. Arrays and nested objects are traversed recursively so
+   * placeholders in `options.biometricAction`, `bindingHints.label`, or
+   * `metadata.scenarioName` all get the same treatment. Non-string
+   * values (numbers, booleans, dates) are passed through untouched.
+   *
+   * Used by both paths:
+   *   - web `buildTestRequest` (PlaywrightCommand[])
+   *   - mobile `dispatchMobileTest` (IntentStep[])
+   *
+   * The previous implementation only touched top-level `item.value`, which
+   * meant a placeholder in `options.value`, `assertionText`, or a nested
+   * `bindingHints.label` was passed to the runner as a literal string.
+   * Replaying with plan parameters was silently broken for anything but the
+   * simplest `type` step — fixed here.
+   *
+   * @param items      Step/command objects to substitute through.
+   * @param parameters Runtime parameter values, keyed by placeholder name.
    */
   private static applyParameters(
     items: any[],
     parameters: Record<string, any>
   ): any[] {
-    return items.map(item => {
-      const newItem = { ...item };
+    if (!parameters || Object.keys(parameters).length === 0) {
+      return items;
+    }
 
-      // Replace parameter placeholders in value
-      if (newItem.value && typeof newItem.value === 'string') {
-        newItem.value = newItem.value.replace(/\{\{(.+?)\}\}/g, (match: string, paramName: string) => {
-          if (parameters[paramName] !== undefined) {
-            return String(parameters[paramName]);
-          }
-          logger.warn('[REGRESSION_RUN] Missing parameter', { paramName });
-          return match; // Keep placeholder if parameter not provided
-        });
+    const self = this;
+    const walk = (node: any): any => {
+      if (node == null) return node;
+      if (typeof node === 'string') {
+        return self.substituteParamsInString(node, parameters);
       }
+      if (Array.isArray(node)) {
+        return node.map(walk);
+      }
+      if (typeof node === 'object') {
+        const out: Record<string, any> = {};
+        for (const key of Object.keys(node)) {
+          out[key] = walk(node[key]);
+        }
+        return out;
+      }
+      return node; // number, boolean, bigint, symbol — untouched
+    };
 
-      return newItem;
-    });
+    return items.map((item) => walk(item));
   }
 
   /**
@@ -774,8 +986,25 @@ export class RegressionRunService {
     userId: string;
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
+    /**
+     * Phase 5: optional trigger context — threaded from the git webhook
+     * handler so mobile cases can install the APK built from that branch /
+     * commit. Ignored by the web dispatch path (Playwright agent pulls the
+     * site by URL regardless of git context).
+     *
+     * Precedence inside the mobile resolver:
+     *   commitSha > branch > legacy project.settings.mobileApp
+     *
+     * When this context is absent (manual runs, scheduled runs without a
+     * pinned build, pre-Phase-5 callers), the resolver falls back to the
+     * legacy slot — byte-identical to pre-Phase-5 behaviour.
+     */
+    triggerContext?: {
+      branch?: string;
+      commitSha?: string;
+    };
   }): Promise<RunResult> {
-    const { planId, userId, trigger, parameters = {} } = params;
+    const { planId, userId, trigger, parameters = {}, triggerContext } = params;
 
     try {
       logger.info('[REGRESSION_RUN] Running plan', { planId, userId, trigger });
@@ -875,6 +1104,10 @@ export class RegressionRunService {
             moduleId: tc.moduleId,
             flowId: tc.flowId,
             ...(tc.isNegative && { isNegative: true }),
+            // Denormalise platform so reports / WS events can render the
+            // right mobile/web artifacts without joining back to
+            // intent_test_cases on every query.
+            ...(tc.platform ? { platform: tc.platform } : {}),
           }))
         );
       } catch (batchError) {
@@ -906,7 +1139,8 @@ export class RegressionRunService {
         userId,
         trigger,
         parameters,
-        browserOverride
+        browserOverride,
+        triggerContext,
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
         await supabaseAdmin
@@ -1471,7 +1705,13 @@ export class RegressionRunService {
     userId: string,
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook',
     parameters: Record<string, any>,
-    browserOverride?: string
+    browserOverride?: string,
+    /**
+     * Phase 5: optional git context propagated from runPlan. Only consumed
+     * by the mobile branch of the per-case dispatch (see line where
+     * `dispatchMobileTest` is called); web Playwright runs ignore it.
+     */
+    triggerContext?: { branch?: string; commitSha?: string },
   ): Promise<void> {
     const startedAt = new Date().toISOString();
 
@@ -1638,7 +1878,20 @@ export class RegressionRunService {
             let testId: string;
 
             if (isMobile) {
-              const mobileResult = await this.dispatchMobileTest(savedCase, userId, trigger);
+              // Phase 5: forward git triggerContext so the APK resolver can
+              // pick the build matching the branch / commit that kicked off
+              // this run. `triggerContext` is undefined for manual /
+              // scheduled runs → resolver falls back to the legacy slot.
+              // Phase 6: forward plan parameters too — the mobile dispatch
+              // applies them to steps before queueing so placeholders
+              // resolve (same semantics as buildTestRequest for web below).
+              const mobileResult = await this.dispatchMobileTest(
+                savedCase,
+                userId,
+                trigger,
+                triggerContext,
+                parameters,
+              );
               testId = mobileResult.testId;
             } else {
               const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
@@ -2162,6 +2415,43 @@ export class RegressionRunService {
       }
     }
 
+    // Phase 3 — post-hoc phase map.
+    // The step executor doesn't (yet) echo our `phase` marker back in its
+    // event trace. Rather than thread the flag through a second service
+    // we don't own, we reconstruct phase locally: for each test case that
+    // was stitched, grab setup_steps / teardown_steps lengths, and tag the
+    // executed-step timeline by index. When the case has no extras, the
+    // map stays empty and the report falls back to the legacy shape
+    // (no phase field on steps).
+    //
+    // IMPORTANT — assumption: the executor emits `step_completed` events
+    // in the same order it received the commands. The indexing here will
+    // produce wrong phase labels if that ever changes (parallel execution
+    // within a test case, reordering for optimisation, etc.). Today the
+    // Playwright executor is strictly serial per-test-case (Mobile runner
+    // too), so this is safe — but any future change to execution ordering
+    // MUST update this reconstruction or have the executor echo `phase`
+    // on each step event directly.
+    const phaseMapByTestCaseId = new Map<string, Array<'setup' | 'main' | 'teardown'>>();
+    if (testCaseIds.length > 0) {
+      const { data: caseRows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, setup_steps, teardown_steps, steps_json')
+        .in('id', testCaseIds);
+      for (const row of caseRows || []) {
+        const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
+        const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
+        const mainCount = Array.isArray(row.steps_json) ? row.steps_json.length : 0;
+        if (setupCount === 0 && teardownCount === 0) continue; // legacy case — skip
+        const phases: Array<'setup' | 'main' | 'teardown'> = [
+          ...Array(setupCount).fill('setup' as const),
+          ...Array(mainCount).fill('main' as const),
+          ...Array(teardownCount).fill('teardown' as const),
+        ];
+        phaseMapByTestCaseId.set(row.id, phases);
+      }
+    }
+
     // Phase 2: Parallel enrichment fetch
     const [testResultsMap, testReports, executedStepsMap] = await Promise.all([
       this.batchGetTestResults(testIds),
@@ -2221,6 +2511,12 @@ export class RegressionRunService {
         // Build steps
         const rawSteps = executedStepsMap.get(testId) || [];
         const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        // Reconstruct phase from the test case's setup_steps / steps_json /
+        // teardown_steps counts. Indexed by executed-step position so as
+        // long as the executor fires step_completed events in order (it does),
+        // we can label setup / main / teardown without touching the
+        // executor service. Undefined entries fall back to legacy (no phase).
+        const phaseList = phaseMapByTestCaseId.get(exec.testCaseId);
         for (let i = 0; i < completedSteps.length; i++) {
           const step = completedSteps[i];
           const meta = step.data?.runtimeMeta;
@@ -2231,11 +2527,16 @@ export class RegressionRunService {
           // by self_heal to pass; "flaky" is an independent historical signal
           // the backend annotates onto the runtimeMeta.
           const healed = meta?.runtimeStatus === 'healed' || meta?.source === 'self_heal';
+          const phase = phaseList?.[i];
+          // Phase 3: a failing teardown step is a warning, not a failure —
+          // teardown runs best-effort and never flips the overall verdict.
+          const isTeardownFailure = !success && phase === 'teardown';
           steps.push({
             index: i + 1,
             description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
             // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors
-            status: success ? 'passed' : (isSoftFailure ? 'warning' : 'failed'),
+            // Phase 3: teardown failures are also warnings by contract.
+            status: success ? 'passed' : (isSoftFailure || isTeardownFailure ? 'warning' : 'failed'),
             durationMs: meta?.executionMs,
             error: !success ? {
               message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
@@ -2253,6 +2554,7 @@ export class RegressionRunService {
             ...(meta?.healedTo ? { healedTo: meta.healedTo } : {}),
             ...(meta?.healWhatChanged ? { healWhatChanged: meta.healWhatChanged } : {}),
             ...(meta?.flaky ? { flaky: true } : {}),
+            ...(phase ? { phase } : {}),
           });
         }
 
@@ -2402,6 +2704,10 @@ export class RegressionRunService {
         status: exec.status,
         durationMs: exec.durationMs || 0,
         browser: exec.browser || 'chrome',
+        // Raw test case platform — lets the frontend render mobile-specific
+        // artifacts (device screenshots, compiled plan viewer) without an
+        // extra join. Undefined for legacy rows (pre-20260417 migration).
+        ...(exec.platform ? { platform: exec.platform } : {}),
         bugsCount,
         steps,
         artifacts: execArtifacts,

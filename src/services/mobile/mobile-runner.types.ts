@@ -104,6 +104,14 @@ export interface MobileIntentStep {
   options?: MobileIntentStepOptions;
   isAutoInjected?: boolean;
   expectedOutcome?: 'success' | 'error';
+  /**
+   * Lifecycle phase — same semantics as the web `PlaywrightCommand.phase`.
+   * Populated by `stitchPhases()` in `regression-run.service` when a
+   * test case has setup_steps / teardown_steps. The runner forwards it
+   * back on each step result so reports can render phase-separated
+   * timelines. Absent on pre-Phase-3 runs; treat as 'main'.
+   */
+  phase?: 'setup' | 'main' | 'teardown';
 }
 
 // ── Step Result ──────────────────────────────────────────────────

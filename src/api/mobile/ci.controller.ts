@@ -13,7 +13,11 @@ import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
-import { MobileAppStorageService, MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
+import {
+  MobileAppStorageService,
+  MobileAppMetadata,
+  trimMobileBuildField,
+} from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
 import { ProjectService } from '@/services/core/project.service';
 import { logger } from '@/utils/core/logger';
@@ -48,13 +52,33 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     appUrl,
     callbackUrl,
     platform: rawPlatform,
+    // Phase 5: optional git metadata. When provided alongside appUrl, the
+    // resulting APK is also recorded in `mobile_app_builds` so future
+    // git-triggered runs on the same branch / commit can re-use it
+    // without a fresh download.
+    branch: rawBranch,
+    commitSha: rawCommitSha,
+    buildNumber: rawBuildNumber,
+    ciRunId: rawCiRunId,
   } = req.body as {
     savedTestCaseIds?: string[];
     planId?: string;
     appUrl?: string;
     callbackUrl?: string;
     platform?: string;
+    branch?: string;
+    commitSha?: string;
+    buildNumber?: string;
+    ciRunId?: string;
   };
+
+  // Shared normaliser — same helper as mobile.controller.ts so both upload
+  // entry points agree on how to treat blank strings, whitespace, etc.
+  const branch = trimMobileBuildField(rawBranch);
+  const commitSha = trimMobileBuildField(rawCommitSha);
+  const buildNumber = trimMobileBuildField(rawBuildNumber);
+  const ciRunId = trimMobileBuildField(rawCiRunId);
+  const hasBuildMeta = !!(branch || commitSha || buildNumber || ciRunId);
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
@@ -175,11 +199,26 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         appOriginalName = metadata.originalName;
         appPackage = metadata.packageName;
 
+        // Phase 5: record a versioned build when the caller provided git
+        // metadata (same helper used by the interactive upload endpoint).
+        // Best-effort — a failure here MUST NOT fail the CI run (APK
+        // already in storage + legacy slot).
+        if (hasBuildMeta) {
+          await MobileAppStorageService.recordBuild(
+            metadata,
+            { branch, commitSha, buildNumber, ciRunId, source: 'ci' },
+            { projectId, workspaceId, uploadedBy: userId },
+          );
+        }
+
         logger.info('[CI] APK uploaded from URL', {
           projectId,
           appUrl,
           storagePath: appStoragePath,
           size: buffer.length,
+          branch,
+          commitSha,
+          versioned: hasBuildMeta,
         });
       } catch (err) {
         // Release rate limit lock on failure
@@ -205,12 +244,23 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         return;
       }
     } else {
-      // Use existing project APK
-      const mobileApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
-      if (mobileApp?.storagePath) {
-        appStoragePath = mobileApp.storagePath;
-        appOriginalName = mobileApp.originalName;
-        appPackage = mobileApp.packageName;
+      // No fresh upload — use the Phase 5 resolver to pick the existing build.
+      // Precedence inside the resolver (same as webhook / manual runs):
+      //   ctx.commitSha > ctx.branch > legacy project.settings.mobileApp
+      // This lets "CI kicks off a run without uploading but with git context"
+      // reuse a previously-uploaded build for the same commit / branch. When
+      // no git metadata is supplied the resolver falls through to the legacy
+      // slot, matching the pre-Phase-5 behaviour for this branch of the flow.
+      const resolved = await MobileAppStorageService.resolveAppForRun({
+        projectId,
+        platform,
+        branch,
+        commitSha,
+      });
+      if (resolved?.storagePath) {
+        appStoragePath = resolved.storagePath;
+        appOriginalName = resolved.originalName;
+        appPackage = resolved.packageName;
       }
     }
 

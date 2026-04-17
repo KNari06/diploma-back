@@ -260,21 +260,16 @@ export class RegressionSaveService {
       throw new ValidationError('Access denied to this project');
     }
 
-    // Normalize steps — shape must match what `dispatchMobileTest` extracts
-    // (see regression-run.service.ts) and what the step-editor run path
-    // expects. Same whitelist of keys for both platforms; extra keys dropped.
-    const normalizedSteps = steps.map((step: any, index: number) => ({
-      id: step?.id ?? `step_${index + 1}`,
-      type: step?.type ?? 'click',
-      description: step?.description ?? `Step ${index + 1}`,
-      ...(step?.value !== undefined ? { value: step.value } : {}),
-      ...(step?.assertionText ? { assertionText: step.assertionText } : {}),
-      ...(step?.bindingHints ? { bindingHints: step.bindingHints } : {}),
-      ...(step?.compiled ? { compiled: step.compiled } : {}),
-      ...(step?.options ? { options: step.options } : {}),
-      ...(step?.isAutoInjected ? { isAutoInjected: step.isAutoInjected } : {}),
-      ...(step?.expectedOutcome ? { expectedOutcome: step.expectedOutcome } : {}),
-    }));
+    // Normalise steps through the shared IntentStep helper. Same function
+    // is used by `stitchPhases` for setup/teardown extras and by
+    // `dispatchMobileTest` for the mobile body — one source of truth for
+    // which fields survive the JSONB round-trip. No phase at save time;
+    // phase is stamped at dispatch when we know whether we're running
+    // setup/main/teardown.
+    const { normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    const normalizedSteps = steps.map((step: any, index: number) =>
+      normaliseIntentStep(step, index),
+    );
 
     const isMobile = platform.startsWith('mobile_');
     const replayStrategy: 'mobile_steps' | 'steps_editor' = isMobile

@@ -131,12 +131,22 @@ export class GitWebhookJobHandler {
     });
 
     try {
+      // Phase 5: extract commit SHA from the webhook payload so mobile
+      // regressions can install the APK built from *this* commit (or at
+      // least the latest on that branch). Branch already comes out of
+      // `shouldTrigger()` via `decision.branch`.
+      const commitSha = extractCommitShaFromPayload(delivery.payload, provider, deliveryEventType);
+
       let firstRunId: string | null = null;
       for (const { planId, decision } of matchingPlans) {
         const result = await RegressionRunService.runPlan({
           planId,
           userId: project.user_id,
           trigger: 'webhook',
+          triggerContext: {
+            branch: decision.branch,
+            commitSha,
+          },
         });
         if (!firstRunId) firstRunId = result.runId;
         logger.info('[GIT_WEBHOOK_JOB] Plan execution triggered', {
@@ -144,6 +154,8 @@ export class GitWebhookJobHandler {
           runId: result.runId,
           totalTests: result.totalTests,
           deliveryId,
+          branch: decision.branch,
+          commitSha,
         });
       }
 
@@ -321,5 +333,64 @@ async function tryAutoLinkPlanToIntegration(integration: {
     return null;
   }
   return null;
+}
+
+/**
+ * Phase 5 — extract the commit SHA from a raw webhook payload.
+ *
+ * Returns `undefined` when no SHA can be confidently identified; callers
+ * must fall back to branch-only matching in that case. Intentionally
+ * lenient: GitHub and GitLab put the commit in different places depending
+ * on the event, and we'd rather miss-pin a build than crash the run.
+ *
+ *   - GitHub push     → payload.after
+ *   - GitHub PR       → payload.pull_request.head.sha
+ *   - GitHub release  → payload.release.target_commitish (may be a branch name; filter by shape)
+ *   - GitLab push     → payload.after  OR  payload.checkout_sha
+ *   - GitLab MR       → payload.object_attributes.last_commit.id
+ *
+ * The resolver treats a missing commitSha as "use latest on branch", which
+ * is the sane default for most CI pipelines that upload an APK and then
+ * immediately fire the webhook.
+ */
+function extractCommitShaFromPayload(
+  payload: unknown,
+  provider: 'github' | 'gitlab',
+  eventType: string,
+): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const p = payload as Record<string, any>;
+
+  const looksLikeSha = (s: unknown): s is string =>
+    typeof s === 'string' && /^[a-f0-9]{7,40}$/i.test(s);
+
+  try {
+    if (provider === 'github') {
+      if (eventType === 'pull_request') {
+        const sha = p.pull_request?.head?.sha;
+        if (looksLikeSha(sha)) return sha;
+      }
+      if (eventType === 'push') {
+        if (looksLikeSha(p.after)) return p.after;
+      }
+      if (eventType === 'release') {
+        // target_commitish may be a branch name ('main') OR a SHA — only trust shape.
+        if (looksLikeSha(p.release?.target_commitish)) return p.release.target_commitish;
+      }
+    } else if (provider === 'gitlab') {
+      if (eventType === 'merge_request') {
+        const sha = p.object_attributes?.last_commit?.id;
+        if (looksLikeSha(sha)) return sha;
+      }
+      if (eventType === 'push') {
+        if (looksLikeSha(p.checkout_sha)) return p.checkout_sha;
+        if (looksLikeSha(p.after)) return p.after;
+      }
+    }
+  } catch {
+    // payload shape is untrusted — any exception means "no SHA".
+  }
+
+  return undefined;
 }
 

@@ -1038,6 +1038,15 @@ export interface PlaywrightCommand {
   screenshot?: boolean;     // Take screenshot after this action
   continueOnError?: boolean; // Continue test even if this step fails
   awaitNavigation?: boolean; // Wait for navigation after click/submit actions
+  /**
+   * Lifecycle phase: 'setup' | 'main' | 'teardown'. Populated by
+   * `stitchPhases()` in regression-run.service when a test case has
+   * setup_steps / teardown_steps. Absent or 'main' = normal behaviour
+   * (Playwright executor fails the test on error unless `continueOnError`).
+   * Setup phase failure aborts main and still runs teardown.
+   * Teardown phase failure is logged but doesn't flip the verdict.
+   */
+  phase?: 'setup' | 'main' | 'teardown';
   assertion?: {             // For assert actions
     type: 'visible' | 'hidden' | 'text' | 'value' | 'count' | 'url' | 'enabled' | 'disabled';
     expected: string | number | boolean;

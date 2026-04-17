@@ -9,7 +9,9 @@ import { AIUsageQueryService } from '@/services/ai/tracking/ai-usage-query.servi
 import { cache } from '@/utils/core/redis-cache';
 import type {
   AnalyticsFilters,
+  AnalyticsPlatformFilter,
   SummaryData,
+  SummaryPlatformBreakdown,
   ResultsOverview,
   RecentFailure,
   RecentFailuresData,
@@ -249,12 +251,94 @@ export class AnalyticsQueryService {
     return `${diffDays}d ago`;
   }
 
+  // ═══════════════════════════════════════════════════════════════════
+  // Phase 7 — platform filter helpers (single source of truth)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Normalise an incoming platform filter. Unknown / undefined → 'all'.
+   * Exposed as a static so controller + cache-key code share one formula.
+   */
+  static normalisePlatform(value: unknown): AnalyticsPlatformFilter {
+    const VALID: AnalyticsPlatformFilter[] = [
+      'all', 'web', 'mobile', 'mobile_android', 'api',
+    ];
+    if (typeof value === 'string' && (VALID as string[]).includes(value)) {
+      return value as AnalyticsPlatformFilter;
+    }
+    return 'all';
+  }
+
+  /**
+   * Attach a platform filter to a Supabase query on `test_executions`.
+   *
+   * 'web'   → platform IS NULL OR platform = 'web'
+   *   (historical rows predate Phase 2's `platform` column and are all web.)
+   * 'mobile'→ platform LIKE 'mobile_%'  (covers Android today + iOS/RN later).
+   * 'mobile_android' → exact match.
+   * 'all' / 'api' → no filter applied here; the caller handles them.
+   *
+   * Returns the mutated query so calls can stay chainable. Keeping this in
+   * one helper means a future platform tweak (e.g. adding an alias column)
+   * ripples to every analytics query with a single edit.
+   */
+  private static applyPlatformFilter(
+    query: any,
+    platform: AnalyticsPlatformFilter,
+  ): any {
+    switch (platform) {
+      case 'web':
+        // Supabase .or() syntax: `platform.is.null,platform.eq.web`
+        return query.or('platform.is.null,platform.eq.web');
+      case 'mobile':
+        return query.like('platform', 'mobile_%');
+      case 'mobile_android':
+        return query.eq('platform', 'mobile_android');
+      case 'all':
+      case 'api':
+      default:
+        return query;
+    }
+  }
+
+  /**
+   * True when the caller's platform filter wants UI-platform data
+   * (web / mobile / all). 'api' skips every UI query.
+   */
+  private static wantsUiData(platform: AnalyticsPlatformFilter): boolean {
+    return platform !== 'api';
+  }
+
+  /**
+   * True when the caller's filter wants API-test data ('all' or 'api').
+   * Keeps the `platform=web` and `platform=mobile` dashboards clean of
+   * API counts so the UI numbers add up cleanly.
+   */
+  private static wantsApiData(platform: AnalyticsPlatformFilter): boolean {
+    return platform === 'all' || platform === 'api';
+  }
+
+  /**
+   * Bucket a raw `test_executions.platform` value into the three breakdown
+   * slots the SummaryData/ResultsOverview expose. NULL counts as 'web' per
+   * the Phase 7 historical-rows decision.
+   */
+  private static bucketForPlatform(raw: string | null | undefined): 'web' | 'mobile' {
+    if (!raw || raw === 'web') return 'web';
+    if (raw.startsWith('mobile_')) return 'mobile';
+    // Unknown values fall back to 'web' so they stay visible — not ideal
+    // but better than silently vanishing into a hidden bucket.
+    return 'web';
+  }
+
   /**
    * Get summary data (top cards + status + performance)
    */
   static async getSummary(filters: AnalyticsFilters): Promise<SummaryData> {
-    // Cache key includes all filter dimensions so different date ranges don't collide
-    const cKey = `qait:cache:analytics:summary:${filters.workspaceId}:${filters.projectId ?? '*'}:${filters.startDate?.toISOString() ?? '*'}:${filters.endDate?.toISOString() ?? '*'}`;
+    // Phase 7: platform is part of the cache key so a "web only" dashboard
+    // and an "all platforms" dashboard don't clobber each other in Redis.
+    const platform = this.normalisePlatform(filters.platform);
+    const cKey = `qait:cache:analytics:summary:${filters.workspaceId}:${filters.projectId ?? '*'}:${filters.startDate?.toISOString() ?? '*'}:${filters.endDate?.toISOString() ?? '*'}:${platform}`;
     const cached = await cache.get<SummaryData>(cKey);
     if (cached) return cached;
 
@@ -267,14 +351,30 @@ export class AnalyticsQueryService {
         return this.getEmptySummary();
       }
 
+      // Phase 7: when the caller filtered to API-only we skip the UI-platform
+      // executions query outright (empty array avoids pointless WHEREs), and
+      // vice-versa when they filtered to web / mobile only we skip the API
+      // query. Saves a round-trip and avoids counting rows that would later
+      // be filtered out by wantsApiData / wantsUiData anyway.
+      const runUiQuery = this.wantsUiData(platform) && runIds.length > 0;
+      const runApiQuery = this.wantsApiData(platform);
+
       // Parallel queries for performance
       const [executionsResult, runsResult, tokensResult, scheduleResult, apiTestExecs] = await Promise.all([
-        // Test executions (steps) — only query if we have run IDs
-        runIds.length > 0
-          ? supabaseAdmin
-              .from('test_executions')
-              .select('status, duration_ms, run_id, test_case_id')
-              .in('run_id', runIds)
+        // Test executions (steps) — only query if we have run IDs AND the
+        // caller is interested in UI-platform data. Platform filter attaches
+        // via the shared helper so web / mobile / mobile_android share one
+        // code path.
+        // We also select `platform` so the per-platform breakdown can be
+        // computed in-memory without a second trip.
+        runUiQuery
+          ? (() => {
+              const q = supabaseAdmin
+                .from('test_executions')
+                .select('status, duration_ms, run_id, test_case_id, platform')
+                .in('run_id', runIds);
+              return this.applyPlatformFilter(q, platform);
+            })()
           : Promise.resolve({ data: [], error: null }),
 
         // Regression runs
@@ -286,7 +386,7 @@ export class AnalyticsQueryService {
           .lte('started_at', filters.endDate?.toISOString() || new Date().toISOString())
           .order('completed_at', { ascending: false }),
 
-        // AI tokens (reuse existing service)
+        // AI tokens (reuse existing service) — platform-agnostic.
         AIUsageQueryService.getWorkspaceUsageStats(
           filters.workspaceId,
           filters.startDate,
@@ -303,11 +403,17 @@ export class AnalyticsQueryService {
           .limit(1)
           .maybeSingle(),
 
-        // API test executions
-        this.getApiTestExecutions(projectIds, filters.startDate, filters.endDate),
+        // API test executions — only fetch when the caller wants them.
+        runApiQuery
+          ? this.getApiTestExecutions(projectIds, filters.startDate, filters.endDate)
+          : Promise.resolve([] as any[]),
       ]);
 
-      const executions = executionsResult.data || [];
+      // Typed as any[] because the Supabase `.or()` / `.like()` chained
+      // builder widens the inferred row type to `never` in some versions
+      // of the client types — we lose structural info anyway. Fields we
+      // read: status, duration_ms, run_id, test_case_id, platform.
+      const executions: any[] = (executionsResult.data as any[]) || [];
       const runs = runsResult.data || [];
       const tokens = tokensResult;
       const schedule = scheduleResult.data;
@@ -383,6 +489,22 @@ export class AnalyticsQueryService {
           : 0;
       }
 
+      // Phase 7: per-platform breakdown. Each UI execution bucketed by
+      // `test_executions.platform` (NULL and 'web' → web, 'mobile_*' →
+      // mobile). API tests pooled separately. For platform-filtered runs
+      // the non-matching slices stay zero, which is what the stacked-card
+      // UI expects.
+      const byPlatform: SummaryPlatformBreakdown = this.emptyBreakdown();
+      for (const e of executions) {
+        const bucket = this.bucketForPlatform((e as any).platform);
+        byPlatform[bucket].runs += 1;
+        if (e.status === 'passed') byPlatform[bucket].passed += 1;
+        else if (e.status === 'failed') byPlatform[bucket].failed += 1;
+      }
+      byPlatform.api.runs = apiTestsRun;
+      byPlatform.api.passed = apiTestsPassed;
+      byPlatform.api.failed = apiTestsFailed;
+
       const result: SummaryData = {
         summary: {
           testStepsRun,
@@ -412,6 +534,7 @@ export class AnalyticsQueryService {
           failureRate,
           runsPerMinute,
         },
+        byPlatform,
       };
 
       // Cache the result — fire-and-forget (don't block the response)
@@ -455,6 +578,11 @@ export class AnalyticsQueryService {
   /**
    * Get empty summary (when no data)
    */
+  private static emptyBreakdown(): SummaryPlatformBreakdown {
+    const zero = { runs: 0, passed: 0, failed: 0 };
+    return { web: { ...zero }, mobile: { ...zero }, api: { ...zero } };
+  }
+
   private static getEmptySummary(): SummaryData {
     return {
       summary: {
@@ -477,6 +605,7 @@ export class AnalyticsQueryService {
         failureRate: 0,
         runsPerMinute: 0,
       },
+      byPlatform: this.emptyBreakdown(),
     };
   }
 
@@ -484,8 +613,8 @@ export class AnalyticsQueryService {
    * Get results overview (donut chart data)
    */
   static async getResultsOverview(filters: AnalyticsFilters): Promise<ResultsOverview> {
-    // Cache key includes all filter dimensions
-    const cKey = `qait:cache:analytics:results-overview:${filters.workspaceId}:${filters.projectId ?? '*'}:${filters.startDate?.toISOString() ?? '*'}:${filters.endDate?.toISOString() ?? '*'}`;
+    const platform = this.normalisePlatform(filters.platform);
+    const cKey = `qait:cache:analytics:results-overview:${filters.workspaceId}:${filters.projectId ?? '*'}:${filters.startDate?.toISOString() ?? '*'}:${filters.endDate?.toISOString() ?? '*'}:${platform}`;
     const cached = await cache.get<ResultsOverview>(cKey);
     if (cached) return cached;
 
@@ -502,15 +631,25 @@ export class AnalyticsQueryService {
         return { passed: 0, failed: 0, skipped: 0, flaky: 0, total: 0, percentages: { passed: 0, failed: 0, skipped: 0, flaky: 0 } };
       }
 
+      // Phase 7 platform filter — same pattern as getSummary. UI vs API
+      // split lives in `wantsUiData` / `wantsApiData` so "mobile-only"
+      // dashboards don't accidentally pool API tests into the donut.
       const [execResult, apiTestExecs] = await Promise.all([
-        supabaseAdmin
-          .from('test_executions')
-          .select('status, run_id, test_case_id')
-          .in('run_id', runIds),
-        this.getApiTestExecutions(projectIds, filters.startDate, filters.endDate),
+        this.wantsUiData(platform)
+          ? (() => {
+              const q = supabaseAdmin
+                .from('test_executions')
+                .select('status, run_id, test_case_id, platform')
+                .in('run_id', runIds);
+              return this.applyPlatformFilter(q, platform);
+            })()
+          : Promise.resolve({ data: [], error: null }),
+        this.wantsApiData(platform)
+          ? this.getApiTestExecutions(projectIds, filters.startDate, filters.endDate)
+          : Promise.resolve([] as any[]),
       ]);
 
-      const execs = execResult.data || [];
+      const execs: any[] = (execResult.data as any[]) || [];
       const passed = execs.filter((e) => e.status === 'passed').length;
       // Count unique test_case_ids that have at least one failed execution
       const failedTestCaseIds = new Set(
@@ -556,8 +695,16 @@ export class AnalyticsQueryService {
   static async getRecentFailures(
     workspaceId: string,
     projectId?: string,
-    limit: number = 10
+    limit: number = 10,
+    /**
+     * Phase 7 — same platform semantics as getSummary. Keeping this as
+     * a 4th positional arg (optional) rather than switching the signature
+     * to a filter object, so existing callers that don't care about
+     * platform don't break.
+     */
+    platformFilter?: AnalyticsPlatformFilter,
   ): Promise<RecentFailuresData> {
+    const platform = this.normalisePlatform(platformFilter);
     try {
       const projectIds = await this.getWorkspaceProjectIds(workspaceId, projectId);
 
@@ -567,23 +714,26 @@ export class AnalyticsQueryService {
 
       const runIds = await this.getRunIdsForProjects(projectIds);
 
-      // Build regression failures list (only if we have run IDs)
+      // Build regression failures list (only if we have run IDs AND the
+      // caller wants UI-platform data). For platform='api' this block is
+      // skipped entirely — we fall through to the API failures fetch below.
       let result: RecentFailure[] = [];
 
-      if (runIds.length > 0) {
-        // Get recent failed executions
-        const { data: failures } = await supabaseAdmin
+      if (runIds.length > 0 && this.wantsUiData(platform)) {
+        // Get recent failed executions — platform-filtered via helper.
+        const failuresQuery = supabaseAdmin
           .from('test_executions')
-          .select('id, run_id, test_case_id, status, error_message, completed_at')
+          .select('id, run_id, test_case_id, status, error_message, completed_at, platform')
           .in('run_id', runIds)
           .eq('status', 'failed')
           .not('completed_at', 'is', null)
           .order('completed_at', { ascending: false })
           .limit(limit);
+        const { data: failures } = await this.applyPlatformFilter(failuresQuery, platform);
 
         if (failures && failures.length > 0) {
           // Get test case names and priorities (separate query — no FK between tables)
-          const testCaseIds = [...new Set(failures.map((f) => f.test_case_id))];
+          const testCaseIds = [...new Set((failures as any[]).map((f) => f.test_case_id))];
           const [testCasesResult, allExecutionsResult] = await Promise.all([
             supabaseAdmin
               .from('intent_test_cases')
@@ -640,8 +790,11 @@ export class AnalyticsQueryService {
         }
       }
 
-      // Also get failed API test executions
-      const apiFailures = await this.getApiTestFailures(projectIds, limit);
+      // Also get failed API test executions — only when the platform
+      // filter wants them ('all' or 'api').
+      const apiFailures = this.wantsApiData(platform)
+        ? await this.getApiTestFailures(projectIds, limit)
+        : [];
 
       // Merge and sort by date descending, then limit
       const allFailures = [...result, ...apiFailures]
@@ -660,8 +813,18 @@ export class AnalyticsQueryService {
    */
   static async getCriticalChecks(
     workspaceId: string,
-    projectId?: string
+    projectId?: string,
+    /**
+     * Phase 7 — restrict "critical checks" to one platform. 'api' returns
+     * an empty list for now (critical flag lives on `intent_test_cases`,
+     * API tests use `api_test_configs` and have no priority column).
+     */
+    platformFilter?: AnalyticsPlatformFilter,
   ): Promise<CriticalChecksData> {
+    const platform = this.normalisePlatform(platformFilter);
+    // API path has no critical concept yet — return empty rather than pool
+    // with UI criticals and confuse the reader.
+    if (platform === 'api') return { checks: [] };
     try {
       const projectIds = await this.getWorkspaceProjectIds(workspaceId, projectId);
 
@@ -669,21 +832,33 @@ export class AnalyticsQueryService {
         return { checks: [] };
       }
 
-      // Get all critical test cases
-      const { data: criticalCases } = await supabaseAdmin
+      // Get all critical test cases. Filter by intent_test_cases.platform
+      // directly (not the denormalised test_executions.platform) because
+      // we're selecting cases by priority regardless of whether they've
+      // run yet. 'all' skips the filter.
+      let casesQuery = supabaseAdmin
         .from('intent_test_cases')
-        .select('id, name, project_id')
+        .select('id, name, project_id, platform')
         .in('project_id', projectIds)
         .eq('priority', 'critical')
         .eq('status', 'published');
+      if (platform === 'web') {
+        casesQuery = casesQuery.or('platform.is.null,platform.eq.web');
+      } else if (platform === 'mobile') {
+        casesQuery = casesQuery.like('platform', 'mobile_%');
+      } else if (platform === 'mobile_android') {
+        casesQuery = casesQuery.eq('platform', 'mobile_android');
+      }
+      const { data: criticalCases } = await casesQuery;
 
       if (!criticalCases || criticalCases.length === 0) {
         return { checks: [] };
       }
 
-      const criticalCaseIds = criticalCases.map((c) => c.id);
+      const criticalCaseIds = (criticalCases as any[]).map((c) => c.id);
 
-      // Get latest execution for each critical test case
+      // Get latest execution for each critical test case — no need for
+      // platform filter here since criticalCaseIds is already narrowed.
       const { data: latestExecutions } = await supabaseAdmin
         .from('test_executions')
         .select('test_case_id, status, completed_at, run_id')
@@ -736,8 +911,16 @@ export class AnalyticsQueryService {
     workspaceId: string,
     metric: HeatmapMetric,
     range: HeatmapRange,
-    projectId?: string
+    projectId?: string,
+    /**
+     * Phase 7 — restrict the heatmap to one platform.
+     * - 'api'    → only api_test_executions (regression runs skipped).
+     * - 'web' / 'mobile' / 'mobile_android' → filters test_executions.platform.
+     * - 'all'    → mix of both (historical behaviour).
+     */
+    platformFilter?: AnalyticsPlatformFilter,
   ): Promise<HeatmapData> {
+    const platform = this.normalisePlatform(platformFilter);
     try {
       const projectIds = await this.getWorkspaceProjectIds(workspaceId, projectId);
 
@@ -749,80 +932,105 @@ export class AnalyticsQueryService {
       const since = new Date();
       since.setDate(since.getDate() - rangeDays);
 
+      const wantsUi = this.wantsUiData(platform);
+      const wantsApi = this.wantsApiData(platform);
+
       let dailyCounts: Map<string, number>;
 
       if (metric === 'runs') {
+        // regression_runs doesn't carry platform itself — skipping them
+        // for platform=api is enough; for platform='web'/'mobile' we still
+        // count the run (a run may contain mixed cases, but if the user
+        // filtered to 'mobile' we only want to count runs that have at
+        // least one mobile execution — that's the runIds narrowing below
+        // in the failures/flaky branches. For 'runs' we approximate by
+        // counting runs unconditionally when wantsUi is true; a perfectly
+        // accurate platform split would need a run→platform join that
+        // we can add if this approximation proves misleading).
         const [runsResult, apiExecsResult] = await Promise.all([
-          supabaseAdmin
-            .from('regression_runs')
-            .select('started_at')
-            .in('project_id', projectIds)
-            .gte('started_at', since.toISOString())
-            .not('started_at', 'is', null),
-          supabaseAdmin
-            .from('api_test_executions')
-            .select('executed_at')
-            .in('project_id', projectIds)
-            .gte('executed_at', since.toISOString())
-            .not('executed_at', 'is', null),
+          wantsUi
+            ? supabaseAdmin
+                .from('regression_runs')
+                .select('started_at')
+                .in('project_id', projectIds)
+                .gte('started_at', since.toISOString())
+                .not('started_at', 'is', null)
+            : Promise.resolve({ data: [] as any[] }),
+          wantsApi
+            ? supabaseAdmin
+                .from('api_test_executions')
+                .select('executed_at')
+                .in('project_id', projectIds)
+                .gte('executed_at', since.toISOString())
+                .not('executed_at', 'is', null)
+            : Promise.resolve({ data: [] as any[] }),
         ]);
 
         dailyCounts = new Map();
-        for (const run of runsResult.data || []) {
+        for (const run of (runsResult.data as any[]) || []) {
           const dateKey = run.started_at.split('T')[0];
           dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
         }
-        for (const exec of apiExecsResult.data || []) {
+        for (const exec of (apiExecsResult.data as any[]) || []) {
           const dateKey = exec.executed_at.split('T')[0];
           dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
         }
       } else if (metric === 'failures') {
-        const runIds = await this.getRunIdsForProjects(projectIds, since);
+        const runIds = wantsUi ? await this.getRunIdsForProjects(projectIds, since) : [];
         dailyCounts = new Map();
 
-        // Regression test failures + API test failures in parallel
+        // Regression test failures + API test failures in parallel.
+        // UI side: platform-filter via helper so a 'mobile' heatmap shows
+        // only mobile failures. API side: fires only when wantsApi.
         const [regressionFailures, apiFailures] = await Promise.all([
-          runIds.length > 0
-            ? supabaseAdmin
-                .from('test_executions')
-                .select('completed_at')
-                .in('run_id', runIds)
-                .eq('status', 'failed')
-                .not('completed_at', 'is', null)
+          wantsUi && runIds.length > 0
+            ? (() => {
+                const q = supabaseAdmin
+                  .from('test_executions')
+                  .select('completed_at, platform')
+                  .in('run_id', runIds)
+                  .eq('status', 'failed')
+                  .not('completed_at', 'is', null);
+                return this.applyPlatformFilter(q, platform);
+              })()
             : Promise.resolve({ data: [] }),
-          supabaseAdmin
-            .from('api_test_executions')
-            .select('executed_at')
-            .in('project_id', projectIds)
-            .eq('success', false)
-            .gte('executed_at', since.toISOString())
-            .not('executed_at', 'is', null),
+          wantsApi
+            ? supabaseAdmin
+                .from('api_test_executions')
+                .select('executed_at')
+                .in('project_id', projectIds)
+                .eq('success', false)
+                .gte('executed_at', since.toISOString())
+                .not('executed_at', 'is', null)
+            : Promise.resolve({ data: [] }),
         ]);
 
-        for (const exec of regressionFailures.data || []) {
+        for (const exec of (regressionFailures.data as any[]) || []) {
           const dateKey = exec.completed_at.split('T')[0];
           dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
         }
-        for (const exec of apiFailures.data || []) {
+        for (const exec of (apiFailures.data as any[]) || []) {
           const dateKey = exec.executed_at.split('T')[0];
           dailyCounts.set(dateKey, (dailyCounts.get(dateKey) || 0) + 1);
         }
       } else {
-        // flaky metric
-        const runIds = await this.getRunIdsForProjects(projectIds, since);
+        // flaky metric — UI only (api_test_executions has no multi-status
+        // flaky concept — each API execution is one-shot).
+        const runIds = wantsUi ? await this.getRunIdsForProjects(projectIds, since) : [];
         dailyCounts = new Map();
 
         if (runIds.length > 0) {
-          const { data: executions } = await supabaseAdmin
+          const execsQuery = supabaseAdmin
             .from('test_executions')
-            .select('run_id, test_case_id, status, completed_at')
+            .select('run_id, test_case_id, status, completed_at, platform')
             .in('run_id', runIds)
             .not('completed_at', 'is', null);
+          const { data: executions } = await this.applyPlatformFilter(execsQuery, platform);
 
           // Find flaky tests per day
           const groupByDate = new Map<string, Array<any>>();
 
-          for (const exec of executions || []) {
+          for (const exec of (executions as any[]) || []) {
             const dateKey = exec.completed_at.split('T')[0];
             if (!groupByDate.has(dateKey)) {
               groupByDate.set(dateKey, []);
@@ -978,6 +1186,7 @@ export class AnalyticsQueryService {
   static async getTimeSeries(
     filters: AnalyticsFilters & { interval: TimeSeriesInterval }
   ): Promise<TimeSeriesData> {
+    const platform = this.normalisePlatform(filters.platform);
     try {
       const projectIds = await this.getWorkspaceProjectIds(filters.workspaceId, filters.projectId);
 
@@ -997,28 +1206,64 @@ export class AnalyticsQueryService {
       const startIso = filters.startDate?.toISOString() || new Date(Date.now() - lookback).toISOString();
       const endIso = filters.endDate?.toISOString() || new Date().toISOString();
 
-      const [runsResult, apiExecsResult] = await Promise.all([
-        supabaseAdmin
-          .from('regression_runs')
-          .select('started_at, status')
-          .in('project_id', projectIds)
-          .gte('started_at', startIso)
-          .lte('started_at', endIso)
-          .not('started_at', 'is', null)
-          .order('started_at', { ascending: true }),
-        supabaseAdmin
-          .from('api_test_executions')
-          .select('executed_at, success')
-          .in('project_id', projectIds)
-          .gte('executed_at', startIso)
-          .lte('executed_at', endIso)
-          .not('executed_at', 'is', null),
+      // Phase 7: platform filter.
+      // - regression_runs doesn't carry platform directly. A run may contain
+      //   mixed web+mobile cases. For UI platform filters ('web'/'mobile') we
+      //   skip the simplistic runs-count and instead build buckets from
+      //   `test_executions` (which is platform-tagged) to keep the time series
+      //   honest. For 'all' / 'api' we keep the legacy runs-based bucketing.
+      const wantsUi = this.wantsUiData(platform);
+      const wantsApi = this.wantsApiData(platform);
+      const useUiRunsBucketing = platform === 'all'; // only 'all' uses regression_runs as the UI source
+
+      const [runsResult, apiExecsResult, uiExecsResult] = await Promise.all([
+        useUiRunsBucketing
+          ? supabaseAdmin
+              .from('regression_runs')
+              .select('started_at, status')
+              .in('project_id', projectIds)
+              .gte('started_at', startIso)
+              .lte('started_at', endIso)
+              .not('started_at', 'is', null)
+              .order('started_at', { ascending: true })
+          : Promise.resolve({ data: [] as any[] }),
+        wantsApi
+          ? supabaseAdmin
+              .from('api_test_executions')
+              .select('executed_at, success')
+              .in('project_id', projectIds)
+              .gte('executed_at', startIso)
+              .lte('executed_at', endIso)
+              .not('executed_at', 'is', null)
+          : Promise.resolve({ data: [] as any[] }),
+        // Platform-filtered UI executions — used when platform ∈ web/mobile.
+        // Joining through run_id to `regression_runs` on (project, date) is
+        // expensive; instead we constrain by project indirectly via runId
+        // set we already query for failures/flaky.
+        wantsUi && !useUiRunsBucketing
+          ? (async () => {
+              const runIds = await this.getRunIdsForProjects(
+                projectIds,
+                new Date(startIso),
+              );
+              if (runIds.length === 0) return { data: [] as any[] };
+              const q = supabaseAdmin
+                .from('test_executions')
+                .select('completed_at, status, platform')
+                .in('run_id', runIds)
+                .gte('completed_at', startIso)
+                .lte('completed_at', endIso)
+                .not('completed_at', 'is', null);
+              return this.applyPlatformFilter(q, platform);
+            })()
+          : Promise.resolve({ data: [] as any[] }),
       ]);
 
-      const runs = runsResult.data || [];
-      const apiExecs = apiExecsResult.data || [];
+      const runs = (runsResult.data as any[]) || [];
+      const apiExecs = (apiExecsResult.data as any[]) || [];
+      const uiExecs = ((uiExecsResult as any).data as any[]) || [];
 
-      if (runs.length === 0 && apiExecs.length === 0) {
+      if (runs.length === 0 && apiExecs.length === 0 && uiExecs.length === 0) {
         return { points: [], interval: filters.interval };
       }
 
@@ -1026,6 +1271,7 @@ export class AnalyticsQueryService {
       const intervalMs = this.getIntervalMs(filters.interval);
       const buckets = new Map<number, { total: number; passed: number; failed: number; apiTests: number }>();
 
+      // Mode A: runs-based bucketing (platform='all').
       for (const run of runs) {
         const timestamp = new Date(run.started_at).getTime();
         const bucketKey = Math.floor(timestamp / intervalMs) * intervalMs;
@@ -1038,6 +1284,23 @@ export class AnalyticsQueryService {
         bucket.total++;
         if (run.status === 'completed' || run.status === 'passed') bucket.passed++;
         if (run.status === 'failed') bucket.failed++;
+      }
+
+      // Mode B: per-execution bucketing (platform='web'/'mobile'/'mobile_android').
+      // Each execution counts as one "test run" in the chart because the filter
+      // is about platform-of-the-case, not about the wrapping regression run.
+      for (const exec of uiExecs) {
+        const timestamp = new Date(exec.completed_at).getTime();
+        const bucketKey = Math.floor(timestamp / intervalMs) * intervalMs;
+
+        if (!buckets.has(bucketKey)) {
+          buckets.set(bucketKey, { total: 0, passed: 0, failed: 0, apiTests: 0 });
+        }
+
+        const bucket = buckets.get(bucketKey)!;
+        bucket.total++;
+        if (exec.status === 'passed') bucket.passed++;
+        else if (exec.status === 'failed') bucket.failed++;
       }
 
       for (const exec of apiExecs) {

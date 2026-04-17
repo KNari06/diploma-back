@@ -4,6 +4,33 @@
  */
 
 /**
+ * Platform filter value accepted by analytics endpoints.
+ *
+ *   'all'            → include every UI platform (web + mobile_*). Omits API
+ *                      tests unless `includeApi` is set on the caller.
+ *   'web'            → only `intent_test_cases.platform = 'web'` (and legacy
+ *                      rows where `test_executions.platform IS NULL`, which
+ *                      are pre-Phase-2 and therefore implicitly web).
+ *   'mobile'         → any mobile platform (startsWith 'mobile_'). Today
+ *                      that's `mobile_android` only; `mobile_ios` /
+ *                      `mobile_flutter` / `mobile_react_native` slot in
+ *                      automatically once those ship.
+ *   'mobile_android' → the Android-only subset. Useful once iOS lands.
+ *   'api'            → `test_executions.test_type = 'api'` plus the
+ *                      sister `api_test_executions` table. Skips every
+ *                      UI-platform filter.
+ *
+ * Keep this union closed — any new platform value needs a matching query
+ * branch in `analytics-query.service` (see `applyPlatformFilter`).
+ */
+export type AnalyticsPlatformFilter =
+  | 'all'
+  | 'web'
+  | 'mobile'
+  | 'mobile_android'
+  | 'api';
+
+/**
  * Common filter parameters for analytics queries
  */
 export interface AnalyticsFilters {
@@ -11,6 +38,31 @@ export interface AnalyticsFilters {
   projectId?: string;
   startDate?: Date;
   endDate?: Date;
+  /**
+   * Phase 7 — platform dimension. See `AnalyticsPlatformFilter` for the
+   * semantics of each value. Omitting the field is equivalent to 'all'.
+   */
+  platform?: AnalyticsPlatformFilter;
+}
+
+/**
+ * Breakdown slice for a single "scope" (web / mobile / api). Attached to
+ * summary + overview responses so the UI can render a stacked/segmented
+ * view without a second API call. Always present, even when platform
+ * filter is explicit (e.g. platform='web' → byPlatform.web populated,
+ * mobile/api counts zero). Kept shallow on purpose — anything deeper
+ * belongs on its own endpoint.
+ */
+export interface PlatformBreakdownSlice {
+  runs: number;
+  passed: number;
+  failed: number;
+}
+
+export interface SummaryPlatformBreakdown {
+  web: PlatformBreakdownSlice;
+  mobile: PlatformBreakdownSlice;
+  api: PlatformBreakdownSlice;
 }
 
 /**
@@ -43,6 +95,13 @@ export interface SummaryData {
     failureRate: number;
     runsPerMinute: number;
   };
+  /**
+   * Phase 7 — per-platform breakdown of the same totals. Always returned
+   * (so frontends can segment a donut / KPI card without a second call).
+   * Sum of slices equals `summary.totalRuns` etc. for platform='all';
+   * for a specific platform filter the non-matching slices are zero.
+   */
+  byPlatform: SummaryPlatformBreakdown;
 }
 
 /**

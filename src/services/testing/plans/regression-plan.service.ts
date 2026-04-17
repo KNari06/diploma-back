@@ -1443,6 +1443,13 @@ export class RegressionPlanService {
       name: string;
       testType: 'ui' | 'api';
       platformKey: 'web_ui' | 'api';
+      /**
+       * Raw `intent_test_cases.platform` value — `'web'`, `'mobile_android'`,
+       * etc. Present for UI cases so the plan composer can distinguish mobile
+       * from web inside a shared `web_ui` module and so reports can render
+       * mobile-specific artifacts. Null/undefined for API cases.
+       */
+      platform?: string | null;
     }>;
   }> {
     // Phase 1: Fetch modules (scoped by project_id)
@@ -1482,7 +1489,7 @@ export class RegressionPlanService {
 
       supabaseAdmin
         .from('intent_test_cases')
-        .select('id, flow_id, name')
+        .select('id, flow_id, name, platform')
         .eq('project_id', projectId)
         .eq('user_id', userId)
         .order('created_at', { ascending: false }),
@@ -1566,6 +1573,7 @@ export class RegressionPlanService {
       name: string;
       testType: 'ui' | 'api';
       platformKey: 'web_ui' | 'api';
+      platform?: string | null;
     }> = [];
 
     for (const tc of uiTestCases) {
@@ -1578,6 +1586,9 @@ export class RegressionPlanService {
           name: tc.name,
           testType: 'ui',
           platformKey: modulePlatformMap.get(moduleId) || 'web_ui',
+          // Raw per-case platform ('web' | 'mobile_android' | …). Plan
+          // composer shows this as a badge and can filter by it.
+          platform: tc.platform ?? null,
         });
       }
     }
@@ -1592,6 +1603,7 @@ export class RegressionPlanService {
           name: tc.name,
           testType: 'api',
           platformKey: modulePlatformMap.get(moduleId) || 'api',
+          platform: null,
         });
       }
     }
@@ -1631,6 +1643,7 @@ export class RegressionPlanService {
         passRate: 0,
         history: [],
         flakyTests: [],
+        byPlatform: this.emptyHealthBreakdown(),
       };
     }
 
@@ -1655,10 +1668,20 @@ export class RegressionPlanService {
     const currentHealth: PlanHealthReport['currentHealth'] = latestHealth?.state || 'unknown';
     const passRate = latestHealth?.passRate || 0;
 
-    // Detect flaky tests across all these runs
-    const flakyTests = await this.detectFlakyTests(runIds);
+    // Detect flaky tests across all these runs + compute per-platform slices
+    // in a single pass so we don't read `test_executions` twice. The flaky
+    // detector already scans that table; we piggy-back on it to also tally
+    // web / mobile / api totals.
+    const { flakyTests, byPlatform } = await this.detectFlakyWithPlatformBreakdown(runIds);
 
-    return { currentHealth, passRate, history, flakyTests };
+    return { currentHealth, passRate, history, flakyTests, byPlatform };
+  }
+
+  /** Zero-filled slices for empty-state responses. Kept co-located with the
+   *  method that uses it so the shape doesn't drift. */
+  private static emptyHealthBreakdown(): PlanHealthReport['byPlatform'] {
+    const zero = { runs: 0, passed: 0, failed: 0, flakyCount: 0 };
+    return { web: { ...zero }, mobile: { ...zero }, api: { ...zero } };
   }
 
   /**

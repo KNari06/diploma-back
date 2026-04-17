@@ -835,6 +835,10 @@ export async function getRunExecutions(req: AuthenticatedRequest, res: Response)
       testType: exec.testType,
       status: exec.status,
       browser: exec.browser,
+      // Raw platform — null/undefined for legacy rows (pre-20260417 migration);
+      // lets the frontend show a platform badge and pick a mobile-aware
+      // status-viewer for mobile_* executions.
+      platform: exec.platform ?? null,
       durationMs: exec.durationMs,
       errorMessage: exec.errorMessage,
       testId: exec.result?.testId || null,

@@ -73,6 +73,12 @@ export class ExecutionService {
       browser?: string;
       environment?: string;
       isNegative?: boolean;
+      /**
+       * Raw `intent_test_cases.platform` value — denormalised onto the
+       * execution row so reports / WS events can render the right
+       * mobile/web artifacts without extra joins. Optional for API cases.
+       */
+      platform?: string | null;
     }>
   ): Promise<TestExecution[]> {
     if (testCases.length === 0) {
@@ -94,6 +100,7 @@ export class ExecutionService {
       environment: tc.environment || null,
       status: 'pending' as const,
       ...(tc.isNegative && { is_negative: true }),
+      ...(tc.platform ? { platform: tc.platform } : {}),
     }));
 
     const { data, error } = await supabaseAdmin
@@ -295,6 +302,10 @@ export class ExecutionService {
       traceUrl: row.trace_url || undefined,
       browser: row.browser || undefined,
       environment: row.environment || undefined,
+      // Denormalised from intent_test_cases.platform at batch create time
+      // (see createBatch). Null for legacy rows created before the
+      // 20260417_test_executions_platform migration.
+      platform: row.platform || undefined,
       createdAt: row.created_at,
       isNegative: row.is_negative ?? undefined,
     };

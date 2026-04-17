@@ -153,6 +153,26 @@ export class MobileTestRunJobHandler {
         });
       } catch { /* non-fatal */ }
 
+      // Phase 6: Session acquisition can take up to ~60s on a cold start.
+      // Progressively tell the frontend which fallback we're on so "Starting
+      // mobile session…" doesn't feel like a freeze. Progress stays in the
+      // 10-15% band — we're still in the initializing phase, not executing.
+      const emitSessionPhase = (step: string, pct: number) => {
+        try {
+          webSocketService.emitTestProgress(testId, {
+            testId,
+            browser,
+            progress: pct,
+            phase: 'initializing',
+            currentStep: step,
+            status: 'running',
+            timestamp: new Date().toISOString(),
+            userId,
+            sessionId: chatSessionId,
+          });
+        } catch { /* non-fatal */ }
+      };
+
       // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s)
       try {
         const claimed = await client.claimSession(platform);
@@ -169,6 +189,7 @@ export class MobileTestRunJobHandler {
 
       // Try 2: Warmed session (editor eager start)
       if (!sessionId && projectId) {
+        emitSessionPhase(`Checking warmed ${platform} session…`, 11);
         const warmed = await claimWarmedSession(projectId, userId);
         if (warmed && warmed.platform === platform) {
           sessionId = warmed.sessionId;
@@ -179,6 +200,9 @@ export class MobileTestRunJobHandler {
 
       // Try 3: Cold start (fallback — creates new emulator/simulator ~60s)
       if (!sessionId) {
+        // Explicit heads-up: cold starts can take up to a minute, so users
+        // see "Booting emulator…" instead of a long silent pause after 10%.
+        emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
         const session = await client.createSession(platform);
         sessionId = session.sessionId;
         sessionSource = 'cold';
@@ -191,19 +215,26 @@ export class MobileTestRunJobHandler {
 
       // ── Phase 3b: Install app (if project has APK/IPA) ───────
       if (appStoragePath) {
-        try {
-          webSocketService.emitTestProgress(testId, {
-            testId,
-            browser,
-            progress: 15,
-            phase: 'initializing',
-            currentStep: `Installing app on ${platform}...`,
-            status: 'running',
-            timestamp: new Date().toISOString(),
-            userId,
-            sessionId: chatSessionId,
-          });
-        } catch { /* non-fatal */ }
+        // Phase 6: APK install has three distinct sub-steps that each
+        // can take several seconds on a large binary. We surface all three
+        // so the progress bar moves through 13 → 15 → 17% while the job
+        // works — the pre-Phase-6 single 15% emit made a ~30s operation
+        // look like a freeze.
+        const emitInstallStep = (step: string, pct: number) => {
+          try {
+            webSocketService.emitTestProgress(testId, {
+              testId,
+              browser,
+              progress: pct,
+              phase: 'initializing',
+              currentStep: step,
+              status: 'running',
+              timestamp: new Date().toISOString(),
+              userId,
+              sessionId: chatSessionId,
+            });
+          } catch { /* non-fatal */ }
+        };
 
         logger.info('[MOBILE-TEST] Downloading app from storage', {
           testId,
@@ -216,10 +247,12 @@ export class MobileTestRunJobHandler {
             appStoragePath,
           });
         } else {
-          // Download from Supabase Storage
+          // (1) Download APK from Supabase Storage
+          emitInstallStep(`Downloading app binary…`, 13);
           const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
 
-          // Upload to runner
+          // (2) Upload APK to runner
+          emitInstallStep(`Uploading app to ${platform} runner…`, 15);
           const uploadResult = await client.uploadApp(
             appBuffer,
             appOriginalName || 'app.apk',
@@ -230,6 +263,9 @@ export class MobileTestRunJobHandler {
             runnerPath: uploadResult.path,
             size: uploadResult.size,
           });
+
+          // (3) Install + launch on the emulator/simulator
+          emitInstallStep(`Installing ${appPackage}…`, 17);
 
           // Install + launch the app on the emulator/simulator via low-level commands
           await client.executeBatchCommands(sessionId, [

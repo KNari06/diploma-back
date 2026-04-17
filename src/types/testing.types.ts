@@ -719,6 +719,12 @@ export interface TestExecution {
   traceUrl?: string;
   browser?: string;
   environment?: string;
+  /**
+   * Denormalised copy of `intent_test_cases.platform`
+   * ('web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter').
+   * Null/undefined for legacy rows created before 20260417 migration.
+   */
+  platform?: string;
   isNegative?: boolean;
   createdAt: string;
 }
@@ -878,6 +884,16 @@ export interface RunReportStep {
    * vice versa. Surfaced as a separate yellow badge.
    */
   flaky?: boolean;
+  /**
+   * Lifecycle phase this step belonged to when executed. Copied from the
+   * dispatched command/step by the test executor and forwarded through the
+   * per-step trace. Missing / 'main' means "normal body step" — absence is
+   * what legacy runs (before setup_steps / teardown_steps were authored)
+   * always have, so downstream UI must tolerate both shapes. Frontend uses
+   * this to visually group setup/teardown and relax the verdict on
+   * teardown failures.
+   */
+  phase?: 'setup' | 'main' | 'teardown';
 }
 
 /**
@@ -921,6 +937,17 @@ export interface RunReportExecution {
   status: string;
   durationMs: number;
   browser: string;
+  /**
+   * Raw platform of the test case this execution ran.
+   * 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter'.
+   * Denormalised from `test_executions.platform` (which in turn is copied
+   * from `intent_test_cases.platform` at batch create time). Undefined for
+   * legacy rows created before the 20260417 migration.
+   *
+   * Frontend reports use this to route to mobile-specific renderers
+   * (device screenshots, compiled plan viewer) without extra joins.
+   */
+  platform?: string;
   bugsCount: number;
   steps: RunReportStep[];
   artifacts: RunReportExecArtifacts;
@@ -1017,6 +1044,29 @@ export interface FlakyTest {
   failRate: number;
   totalRuns: number;
   failures: number;
+  /**
+   * Phase 7 — raw platform string from `intent_test_cases.platform`
+   * ('web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter').
+   * Absent for legacy rows where the column is NULL; UI should treat
+   * missing as 'web' (that's the pre-Phase-2 historical default).
+   * Needed so a flaky web test and its mobile namesake show up as two
+   * separate flaky entries rather than one pooled count.
+   */
+  platform?: string | null;
+}
+
+/**
+ * Phase 7 — one slice of the plan-health breakdown for a single
+ * platform scope. `runs` is total executions counted into pass-rate,
+ * `passed`/`failed` are that same denominator split by verdict,
+ * `flakyCount` is the number of flaky tests belonging to this scope.
+ * All zero on legacy projects with no platform data — shape stable.
+ */
+export interface PlanHealthPlatformSlice {
+  runs: number;
+  passed: number;
+  failed: number;
+  flakyCount: number;
 }
 
 /**
@@ -1033,6 +1083,21 @@ export interface PlanHealthReport {
     bugsFound: number;
   }>;
   flakyTests: FlakyTest[];
+  /**
+   * Phase 7 — per-platform breakdown aggregated over the same run window
+   * used to compute `passRate` + `history`. Enables the frontend health
+   * widget to say "Mobile: 12 runs, 2 flaky" beside "Web: 40 runs, 3 flaky"
+   * without a second request.
+   *
+   * Always returned (zero-filled slices when a platform has no data in
+   * the window). Sum of `runs` equals overall `passed+failed` — use this
+   * as a sanity check when rendering.
+   */
+  byPlatform: {
+    web: PlanHealthPlatformSlice;
+    mobile: PlanHealthPlatformSlice;
+    api: PlanHealthPlatformSlice;
+  };
 }
 
 // ============================================================================
