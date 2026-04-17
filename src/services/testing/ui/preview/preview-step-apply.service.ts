@@ -26,6 +26,8 @@ import type {
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
+import { smartStepWait } from '../smart-step-wait.service';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
@@ -973,117 +975,15 @@ function buildSelector(step: IntentStep, candidate: LintCandidate): string | und
   return candidate.ref ? `[data-agent-ref="${candidate.ref}"]` : undefined;
 }
 
-/**
- * Wait for element stability before action (unless disabled)
- */
-async function ensureStability(
-  locator: Locator,
-  step: IntentStep,
-  timeout: number
-): Promise<void> {
-  if (step.options?.disableStabilityChecks) {
-    return;
-  }
-  // File inputs are often hidden via CSS; check for attached instead of visible
-  if (step.type === 'upload') {
-    await locator.waitFor({ state: 'attached', timeout });
-  } else {
-    await locator.waitFor({ state: 'visible', timeout });
-  }
-}
+// ensureStability() was removed — its logic (visible/attached waitFor +
+// disableStabilityChecks short-circuit) is now the pre-phase of
+// smartStepWait, which dispatches per-action to actionable/visible/
+// editable/attached phases and runs their fastChecks first.
 
-/**
- * Adaptive post-hover settle: waits for DOM to stabilize after hover triggers
- * tooltips, submenus, or popovers. Instead of a fixed 150ms, we observe the DOM
- * for new elements appearing and wait until mutations stop.
- *
- * Strategy:
- * 1. Snapshot current DOM element count
- * 2. Poll for new visible elements (tooltip, menu, popover patterns)
- * 3. Once detected OR minWaitMs passed — wait for mutations to stop (stableMs gap)
- * 4. Safety cap at maxWaitMs to avoid hanging on non-reactive hovers
- *
- * @returns elapsed time in ms
- */
-async function waitForHoverEffect(
-  page: Page,
-  maxWaitMs = 2000,
-  stableMs = 150,
-): Promise<number> {
-  const start = Date.now();
-
-  // Selectors for elements commonly created by hover (tooltips, menus, popovers)
-  const hoverEffectSelector = [
-    '[role="tooltip"]:visible',
-    '[role="menu"]:visible',
-    '[role="listbox"]:visible',
-    '[role="dialog"]:visible',
-    '[data-radix-popper-content-wrapper]:visible',
-    '[class*="tooltip"]:visible',
-    '[class*="popover"]:visible',
-    '[class*="dropdown"]:visible',
-    '.tippy-box:visible',
-    '.MuiTooltip-tooltip:visible',
-    '.MuiMenu-list:visible',
-    '.ant-tooltip:visible',
-    '.ant-dropdown:visible',
-  ].join(', ');
-
-  // Phase 1: Quick check — did hover produce any visible effect?
-  // Race between effect appearing and a minimum wait (avoids 0ms exit on static hovers)
-  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
-  try {
-    await Promise.race([
-      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
-      page.waitForTimeout(minWaitMs),
-    ]);
-  } catch {
-    // No effect found within maxWaitMs — hover probably doesn't trigger visible DOM changes
-    return Date.now() - start;
-  }
-
-  // Phase 2: Wait for the effect to stabilize (animation to finish).
-  // Use MutationObserver-based idle detection: wait until no new DOM mutations
-  // occur for stableMs. This catches CSS transitions that add/remove classes.
-  const remainingMs = maxWaitMs - (Date.now() - start);
-  if (remainingMs > stableMs) {
-    try {
-      await page.evaluate(
-        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
-          let timer: ReturnType<typeof setTimeout> | null = null;
-          const reset = () => {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(() => {
-              observer.disconnect();
-              resolve();
-            }, stMs);
-          };
-          const MO = (globalThis as any).MutationObserver;
-          const observer = new MO(() => reset());
-          observer.observe((globalThis as any).document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
-          });
-          // Safety cap
-          setTimeout(() => {
-            observer.disconnect();
-            if (timer) clearTimeout(timer);
-            resolve();
-          }, timeoutMs);
-          // Start the idle timer immediately
-          reset();
-        }),
-        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
-      );
-    } catch {
-      // page.evaluate can fail if page navigated — fall through
-    }
-  }
-
-  return Date.now() - start;
-}
+// waitForHoverEffect was duplicated here and in command-executor.ts — now a
+// single shared implementation lives in wait-phases/hover-effect-settle.ts.
+// Imported below as `waitForHoverEffect` to preserve existing call sites
+// without touching their bodies.
 
 /**
  * Dispatch a synthetic file drop event onto a target element.
@@ -1416,9 +1316,25 @@ async function executeAction(
       await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
     }
 
-    // Ensure element stability before action (unless disabled)
-    if (locator && step.type !== 'navigate' && step.type !== 'wait') {
-      await ensureStability(locator, step, timeout);
+    // V16: Pre-action readiness delegated to smartStepWait('pre').
+    //
+    // Replaces ensureStability() with the unified per-action plan: click gets
+    // actionable+modal-clear+iframe-ready, type gets editable, upload gets
+    // attached, etc. Fast-path skips run first, so ready elements pay ~50ms.
+    // The legacy disableStabilityChecks flag still short-circuits the call.
+    if (
+      locator &&
+      step.type !== 'navigate' &&
+      step.type !== 'wait' &&
+      !step.options?.disableStabilityChecks
+    ) {
+      await smartStepWait({
+        page,
+        step,
+        locator,
+        phase: 'pre',
+        timeoutBudget: timeout,
+      });
     }
 
     switch (step.type) {
@@ -2732,9 +2648,15 @@ export class PreviewStepApplyService {
         const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation });
 
         if (result.success) {
-          // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          // V16: Post-action settle via smartStepWait('post'). In run-mode
+          // (skipPostActionWait) the between-step lookahead already does the
+          // heavy lifting, so we skip the full plan here.
           if (!skipPostActionWait) {
-            await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+            await smartStepWait({
+              page,
+              step: stepDraft,
+              phase: 'post',
+            }).catch(() => { /* non-fatal */ });
           }
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -2983,9 +2905,13 @@ export class PreviewStepApplyService {
               }
               // If compiledWasTried was set by postcondition failure above, skip success return
               if (!compiledWasTried) {
-                // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+                // V16: Post-action settle via smartStepWait (see note above).
                 if (!skipPostActionWait) {
-                  await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+                  await smartStepWait({
+                    page,
+                    step: stepDraft,
+                    phase: 'post',
+                  }).catch(() => { /* non-fatal */ });
                 }
 
                 // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -3280,23 +3206,31 @@ export class PreviewStepApplyService {
         });
 
         if (result.success) {
-          // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          // V16: Post-action settle.
+          //
+          // Single-step Apply (!skipPostActionWait): run the full
+          //   smartStepWait('post') plan — dom-settle + loading-clear + any
+          //   action-specific post-phases (value-reflected, state-reflected,
+          //   challenge-clear, etc.). Phase fast-checks skip quickly on a
+          //   quiet page, so this is often cheaper than the old flat 2s
+          //   waitForLoadState.
+          //
+          // Run mode (skipPostActionWait): the between-step lookahead does
+          //   the heavy lifting; we keep only the 1s noWaitAfter safety
+          //   buffer for mutating actions so reactive handlers get a chance
+          //   to dispatch before snapshot invalidation.
           let postSettleMs = 0;
           let postSettleFired = false;
           if (!skipPostActionWait) {
             const settleStart = Date.now();
-            postSettleFired = await page.waitForLoadState('domcontentloaded', { timeout: 2000 })
-              .then(() => true)
-              .catch(() => false);
+            const waitResult = await smartStepWait({
+              page,
+              step: stepDraft,
+              phase: 'post',
+            }).catch(() => null);
             postSettleMs = Date.now() - settleStart;
+            postSettleFired = !!waitResult?.ready;
           } else if (POST_ACTION_BUFFER_ACTIONS.has(stepDraft.type)) {
-            // V15.3: Safety buffer for noWaitAfter actions.
-            // We set `noWaitAfter: true` on click/press to skip Playwright's internal
-            // 15-30s stability wait (which otherwise fires on every animation).
-            // The inter-step lookahead handles readiness for the NEXT step, but a
-            // 1s pause here gives the current page a moment to dispatch event
-            // handlers before snapshot invalidation and lookahead kick in.
-            // This is deliberately short — lookahead does the heavy lifting.
             await page.waitForTimeout(1000);
           }
           trace?.writeActionResult({

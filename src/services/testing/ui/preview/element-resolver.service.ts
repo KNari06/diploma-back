@@ -1485,7 +1485,11 @@ Select the single best matching element, or return ref=null if the intent does n
       {
         model: AI_TASK_MODELS.disambiguation,
         temperature: 0.1,
-        max_tokens: 200,
+        // 200 tokens was too tight: Gemini Flash Lite in JSON mode occasionally
+        // hit MAX_TOKENS before closing the JSON object, producing an empty
+        // response (finishReason=MAX_TOKENS). 500 gives enough headroom for
+        // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
+        max_tokens: 500,
         response_format: { type: 'json_object' },
         abortSignal: controller.signal,
       }

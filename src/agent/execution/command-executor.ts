@@ -8,8 +8,11 @@ import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
 import { evaluateEvidenceShortcut } from '@/services/testing/ui/preview/evidence-shortcut.utils';
+import { waitForHoverEffect } from '@/services/testing/ui/wait-phases/hover-effect-settle';
+import { smartStepWait } from '@/services/testing/ui/smart-step-wait.service';
+import type { IntentActionType } from '@/services/testing/ui/preview/preview.types';
 import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
-import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
@@ -83,86 +86,8 @@ async function captureSmartScreenshot(
   }
 }
 
-/**
- * Adaptive post-hover settle: waits for hover-triggered DOM effects (tooltips, menus, popovers)
- * to appear and stabilize, instead of using a fixed timeout.
- *
- * Phase 1: Quick-poll for known hover-effect selectors (ARIA roles + popular component libraries).
- * Phase 2: MutationObserver-based idle detection — waits until DOM stops mutating for `stableMs`.
- * Safety cap: never waits longer than `maxWaitMs` total.
- */
-async function waitForHoverEffect(
-  page: Page,
-  maxWaitMs = 2000,
-  stableMs = 150,
-): Promise<number> {
-  const start = Date.now();
-
-  const hoverEffectSelector = [
-    '[role="tooltip"]:visible',
-    '[role="menu"]:visible',
-    '[role="listbox"]:visible',
-    '[role="dialog"]:visible',
-    '[data-radix-popper-content-wrapper]:visible',
-    '[class*="tooltip"]:visible',
-    '[class*="popover"]:visible',
-    '[class*="dropdown"]:visible',
-    '.tippy-box:visible',
-    '.MuiTooltip-tooltip:visible',
-    '.MuiMenu-list:visible',
-    '.ant-tooltip:visible',
-    '.ant-dropdown:visible',
-  ].join(', ');
-
-  // Phase 1: Quick check — did hover produce any visible effect?
-  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
-  try {
-    await Promise.race([
-      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
-      page.waitForTimeout(minWaitMs),
-    ]);
-  } catch {
-    return Date.now() - start;
-  }
-
-  // Phase 2: MutationObserver-based idle detection
-  const remainingMs = maxWaitMs - (Date.now() - start);
-  if (remainingMs > stableMs) {
-    try {
-      await page.evaluate(
-        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
-          let timer: ReturnType<typeof setTimeout> | null = null;
-          const reset = () => {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(() => {
-              observer.disconnect();
-              resolve();
-            }, stMs);
-          };
-          const MO = (globalThis as any).MutationObserver;
-          const observer = new MO(() => reset());
-          observer.observe((globalThis as any).document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
-          });
-          setTimeout(() => {
-            observer.disconnect();
-            if (timer) clearTimeout(timer);
-            resolve();
-          }, timeoutMs);
-          reset();
-        }),
-        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
-      );
-    } catch {
-      // page.evaluate can fail if page navigated
-    }
-  }
-
-  return Date.now() - start;
-}
+// waitForHoverEffect used to be duplicated here — now imported from the
+// shared wait-phases/hover-effect-settle.ts (see top of file).
 
 /**
  * Dispatch a synthetic file drop event onto a target element.
@@ -256,6 +181,66 @@ interface RetryContext {
   totalCandidatesEver: number;
   /** Whether scroll-retry was already attempted for lazy content detection */
   scrollAttempted?: boolean;
+}
+
+/**
+ * Map a PlaywrightActionType (command-level verb) to the IntentActionType
+ * that smartStepWait's plan table keys on.
+ *
+ * - 'fill' collapses into 'type' (same semantics in our pipeline)
+ * - 'selectOption' collapses into 'select'
+ * - Read-only / navigation-only / unsupported verbs return null → caller skips
+ *   the post-action settle entirely (no wasted work).
+ */
+function playwrightActionToIntent(
+  action: PlaywrightActionType,
+): IntentActionType | null {
+  switch (action) {
+    case 'click': return 'click';
+    case 'dblclick': return 'dblclick';
+    case 'type':
+    case 'fill':
+      return 'type';
+    case 'select':
+    case 'selectOption':
+      return 'select';
+    case 'check': return 'check';
+    case 'uncheck': return 'uncheck';
+    case 'toggle': return 'toggle';
+    case 'open': return 'open';
+    case 'close': return 'close';
+    case 'hover': return 'hover';
+    case 'press': return 'press';
+    case 'scroll':
+    case 'scrollIntoView':
+      return 'scroll';
+    case 'upload': return 'upload';
+    case 'dragAndDrop': return 'drag_and_drop';
+    // Everything else (goto, waitFor*, screenshot, assert*, getText, extract,
+    // focus/blur, swipe/tap, download) has no mutating effect smartStepWait
+    // needs to settle — skip the call.
+    default: return null;
+  }
+}
+
+/**
+ * Build a minimal IntentStep-shaped object for smartStepWait's post-phase
+ * call. We don't have a real IntentStep inside CommandExecutor — it works
+ * with PlaywrightCommand objects — so we synthesize the minimum fields the
+ * dispatcher and phase fastChecks read: id, type, description, plus compiled
+ * (when available) so post-condition-met can verify postconditions.
+ */
+function buildPostStep(
+  intentType: IntentActionType,
+  intentCommand: IntentPlaywrightCommand | null,
+): IntentStep {
+  const meta = intentCommand?.intentMeta;
+  return {
+    id: meta?.stepId ?? `cmd-${intentType}-${Date.now()}`,
+    type: intentType,
+    description: meta?.intentDescription ?? '',
+    ...(meta?.compiled ? { compiled: meta.compiled } : {}),
+  } as IntentStep;
 }
 
 /**
@@ -2547,29 +2532,27 @@ export class CommandExecutor {
         };
       }
 
-      // V15.7: Post-action safety buffer for noWaitAfter actions.
-      // Because we pass `noWaitAfter: true` to click/fill/press/etc to skip
-      // Playwright's 15-30s internal stability wait, actions return the moment
-      // the event dispatches — before reactive handlers (Angular change
-      // detection, React setState cascades, form validation) have run.
-      // A 1s buffer gives them time to settle before the caller proceeds to
-      // the next command. Only fires for mutating action types; read-only
-      // actions (assert, wait, getText) skip it to stay fast.
+      // V16: Post-action settle delegated to smartStepWait('post').
       //
-      // This is the single-source-of-truth buffer: all consumers of
-      // CommandExecutor (test-executor, lite pipeline, intelligent
-      // orchestrator) inherit it automatically. Preview has its own
-      // equivalent in preview-step-apply.service.ts since it doesn't go
-      // through CommandExecutor.
-      const POST_ACTION_BUFFER_ACTIONS: ReadonlySet<string> = new Set([
-        'click', 'dblclick', 'contextmenu', 'press', 'type', 'fill',
-        'toggle', 'check', 'uncheck', 'open', 'close', 'selectOption',
-      ]);
-      if (POST_ACTION_BUFFER_ACTIONS.has(action)) {
+      // Replaces the V15.7 hardcoded 1s buffer. smartStepWait runs the
+      // per-action-type plan (dom-settle + loading-clear + optional
+      // spa-nav-detect / challenge-clear) with fast-path skips when the
+      // page is already quiet, so well-behaved sites pay less than 1s.
+      // Only mutating actions go through it; read-only (assert/wait/getText)
+      // skip the call entirely to stay fast.
+      const intentType = playwrightActionToIntent(action);
+      if (intentType !== null) {
         try {
-          await this.page.waitForTimeout(1000);
+          await smartStepWait({
+            page: this.page,
+            step: buildPostStep(intentType, intentCommand),
+            // locator intentionally undefined: the element has already been
+            // acted upon; post-phases that need one (animation-done on the
+            // target, state-reflected) will skip via requiresLocator.
+            phase: 'post',
+          });
         } catch {
-          // Non-fatal — page may be navigating
+          // Non-fatal — page may be navigating.
         }
       }
 
