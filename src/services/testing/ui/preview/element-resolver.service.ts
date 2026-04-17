@@ -1488,10 +1488,6 @@ Select the single best matching element, or return ref=null if the intent does n
         max_tokens: 200,
         response_format: { type: 'json_object' },
         abortSignal: controller.signal,
-        // Disambiguation is a classification task — doesn't need long chain-of-thought.
-        // Without this, gpt-5.x spends unpredictable reasoning time (1.5s..7s observed
-        // on identical prompts), causing Find-by-description to time out on first click.
-        reasoning_effort: 'low',
       }
     );
 

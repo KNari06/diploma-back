@@ -162,24 +162,6 @@ export async function getChatCompletionWithMessages(
 
     const model = options?.model || AI_MODELS.fast;
 
-    // Auto-route Gemini models to Gemini SDK
-    if (model.startsWith('gemini-')) {
-      const { getChatCompletionWithGemini } = await import('./gemini.service');
-      const geminiMessages = messages.map(m => ({
-        role: (m.role === 'tool' ? 'user' : m.role) as 'user' | 'assistant' | 'system',
-        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-      }));
-      const response = await getChatCompletionWithGemini({
-        messages: geminiMessages,
-        model: model as any,
-        temperature: options?.temperature,
-        maxTokens: options?.max_tokens,
-        jsonMode: !!options?.response_format,
-        timeout: (options as any)?.timeout,
-      });
-      return { content: response.content, usage: response.usage };
-    }
-
     if (options?.abortSignal?.aborted) {
       throw new Error('Request was cancelled. Please try again.');
     }
@@ -193,6 +175,32 @@ export async function getChatCompletionWithMessages(
           );
         })
       : null;
+
+    // Auto-route Gemini models to Gemini SDK.
+    // Note: Gemini SDK has its own internal `timeout` (default 30s) but does NOT
+    // accept an AbortSignal. We race the Gemini call against our external
+    // abortPromise so callers' AbortController timeouts actually fire for Gemini
+    // too (element-resolver needs this — without it a hung Gemini call would
+    // block the caller for 30s instead of the intended 7s).
+    if (model.startsWith('gemini-')) {
+      const { getChatCompletionWithGemini } = await import('./gemini.service');
+      const geminiMessages = messages.map(m => ({
+        role: (m.role === 'tool' ? 'user' : m.role) as 'user' | 'assistant' | 'system',
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      }));
+      const geminiPromise = getChatCompletionWithGemini({
+        messages: geminiMessages,
+        model: model as any,
+        temperature: options?.temperature,
+        maxTokens: options?.max_tokens,
+        jsonMode: !!options?.response_format,
+        timeout: (options as any)?.timeout,
+      });
+      const response = abortPromise
+        ? await Promise.race([geminiPromise, abortPromise])
+        : await geminiPromise;
+      return { content: response.content, usage: response.usage };
+    }
 
     const maxTokensValue = options?.max_tokens || env.OPENAI_MAX_TOKENS || 1000;
 
@@ -211,19 +219,24 @@ export async function getChatCompletionWithMessages(
     // without duplicating the parameter list.
     // reasoning_effort is only sent for reasoning-capable models (gpt-5.x, o-series).
     // Older chat models reject it as unknown param, so we gate it by model name.
+    // When we do send reasoning_effort, the endpoint enforces reasoning-model rules,
+    // which reject custom temperature (only default=1 allowed). We drop temperature
+    // ONLY in that case; without reasoning_effort the existing temperature behaviour
+    // stays untouched for the other 140+ call sites.
     const isReasoningModel = (m: string) => /^(gpt-5|o\d)/i.test(m);
-    const issueRequest = (modelToUse: string) => openai.chat.completions.create({
-      model: modelToUse,
-      messages,
-      max_completion_tokens: maxTokensValue,
-      temperature: options?.temperature ?? 0.5,
-      ...(options?.response_format && { response_format: options.response_format }),
-      ...(options?.tools && { tools: options.tools }),
-      ...(options?.tool_choice && { tool_choice: options.tool_choice }),
-      ...(options?.reasoning_effort && isReasoningModel(modelToUse)
-        ? { reasoning_effort: options.reasoning_effort }
-        : {}),
-    });
+    const issueRequest = (modelToUse: string) => {
+      const sendReasoningEffort = !!options?.reasoning_effort && isReasoningModel(modelToUse);
+      return openai.chat.completions.create({
+        model: modelToUse,
+        messages,
+        max_completion_tokens: maxTokensValue,
+        ...(sendReasoningEffort ? {} : { temperature: options?.temperature ?? 0.5 }),
+        ...(options?.response_format && { response_format: options.response_format }),
+        ...(options?.tools && { tools: options.tools }),
+        ...(options?.tool_choice && { tool_choice: options.tool_choice }),
+        ...(sendReasoningEffort ? { reasoning_effort: options!.reasoning_effort } : {}),
+      });
+    };
 
     let response;
     // V21: Track which model was ACTUALLY used in the successful call. Logs,
