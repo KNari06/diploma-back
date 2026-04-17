@@ -29,6 +29,7 @@ import { ExecutionService } from '../executions/execution.service';
 import { RegressionPlanService } from '../plans/regression-plan.service';
 import { ManualTestService } from '../ui/manualTest.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
+import { IntelligentTestStorageService } from '../results/intelligent-test-storage.service';
 import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
@@ -534,6 +535,12 @@ export class RegressionRunService {
      * a no-op — byte-identical to pre-Phase-6 dispatch.
      */
     parameters?: Record<string, any>,
+    /**
+     * `test_executions.id` the caller pre-created via `createBatch`. The
+     * mobile job flips it to passed/failed on completion. Undefined for
+     * single-case manual dispatch (no batch) — the job skips the update.
+     */
+    analyticsExecutionId?: string,
   ): Promise<{ testId: string }> {
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
@@ -630,6 +637,18 @@ export class RegressionRunService {
       commands: [],
     });
 
+    // 4b. FK anchor for mobile bug findings (/bug-insights). Without this,
+    // ai-analysis.extractBugPatterns early-returns on "no session" and
+    // mobile runs never contribute to the Patterns tab.
+    const intelligentSessionId = await IntelligentTestStorageService.createSessionAnchor({
+      testId,
+      userId,
+      projectId: intentCase.project_id,
+      goal: `Regression: ${intentCase.name} (${platform})`,
+      startUrl: resolvedBuild?.packageName || `mobile://${platform}`,
+      browser,
+    });
+
     // 5. Build and queue mobile job.
     // NOTE on the cast: `stitchPhases` returns web-flavoured IntentStep[]
     // (its action types are a superset of MobileIntentActionType — e.g.
@@ -654,6 +673,10 @@ export class RegressionRunService {
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
       metadata: buildMetadataFromTestCase(intentCase),
+      // Regression-plan runs own their own run-level status — pass only
+      // the execution id, never analyticsRunId, to avoid double-finalizing.
+      analyticsExecutionId,
+      intelligentSessionId,
     };
 
     await QueueManager.addMobileTestRunJob(jobData);
@@ -1926,12 +1949,16 @@ export class RegressionRunService {
               // Phase 6: forward plan parameters too — the mobile dispatch
               // applies them to steps before queueing so placeholders
               // resolve (same semantics as buildTestRequest for web below).
+              // `execId` lets the mobile job finalize test_executions.status
+              // directly (web relies on TestCompletionHandler which doesn't
+              // match mobile executions cleanly).
               const mobileResult = await this.dispatchMobileTest(
                 savedCase,
                 userId,
                 trigger,
                 triggerContext,
                 parameters,
+                execId,
               );
               testId = mobileResult.testId;
             } else {

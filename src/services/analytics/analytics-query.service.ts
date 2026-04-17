@@ -57,6 +57,24 @@ function formatDuration(ms: number): string {
 
 export class AnalyticsQueryService {
   /**
+   * Invalidate every cached analytics entry for a workspace. Call this after
+   * writing a new `regression_runs` / `test_executions` row from a path that
+   * doesn't go through the regression-plan service (chat-triggered tests,
+   * webhook tests, etc.) so the UI doesn't show stale counts for up to
+   * ANALYTICS_CACHE_TTL seconds. Fire-and-forget — cache failures must not
+   * block the write path.
+   */
+  static invalidateWorkspaceCaches(workspaceId: string): void {
+    if (!workspaceId) return;
+    cache.delByPattern(`qait:cache:analytics:*:${workspaceId}:*`).catch((err) =>
+      logger.warn('[ANALYTICS] Failed to invalidate workspace caches', {
+        workspaceId,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
+
+  /**
    * Helper: Get all project IDs for a workspace
    */
   private static async getWorkspaceProjectIds(

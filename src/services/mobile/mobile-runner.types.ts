@@ -8,6 +8,20 @@
 
 export type MobilePlatform = 'android' | 'ios' | 'flutter';
 
+/**
+ * `intent_test_cases.platform` storage form (also used as the denormalised
+ * `test_executions.platform` column). Distinct from `MobilePlatform`, which
+ * is the short runner-facing form, and from the hyphenated `browser` key
+ * (`mobile-android` etc.) used on the `tests` row.
+ */
+export type MobilePlatformKey = 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+
+export function toMobilePlatformKey(platform: MobilePlatform): MobilePlatformKey {
+  return platform === 'ios' ? 'mobile_ios'
+    : platform === 'flutter' ? 'mobile_flutter'
+    : 'mobile_android';
+}
+
 // ── Session ──────────────────────────────────────────────────────
 
 export interface MobileSessionResponse {
@@ -300,6 +314,21 @@ export interface MobileTestJobData {
   testCaseName?: string;
   /** Test-level metadata forwarded to the mobile runner */
   metadata?: MobileTestMetadata;
+  // ── Analytics linkage ──────────────────────────────────────────
+  /**
+   * When both `analyticsRunId` and `analyticsExecutionId` are set, the job
+   * finalizes the whole run (chat path). Regression-plan callers pass only
+   * the execution id so they can manage run-level status themselves.
+   */
+  analyticsRunId?: string;
+  /** Pre-created `test_executions.id` the job flips to passed/failed. */
+  analyticsExecutionId?: string;
+  /**
+   * Pre-created `intelligent_test_sessions.id`. Without a session row,
+   * `ai-analysis.extractBugPatterns` early-returns and the run never
+   * contributes to /bug-insights.
+   */
+  intelligentSessionId?: string;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

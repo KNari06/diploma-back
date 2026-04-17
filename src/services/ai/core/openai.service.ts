@@ -147,6 +147,11 @@ export async function getChatCompletionWithMessages(
     abortSignal?: AbortSignal;
     tools?: ChatCompletionTool[];
     tool_choice?: 'auto' | 'none' | 'required';
+    // Reasoning effort for gpt-5.x / o-series models.
+    // 'low' drastically reduces hidden chain-of-thought tokens → faster, cheaper,
+    // more predictable latency on short classification-style tasks
+    // (e.g. element disambiguation). Ignored for non-reasoning models.
+    reasoning_effort?: 'low' | 'medium' | 'high';
   }
 ): Promise<OpenAIResponse> {
   try {
@@ -204,6 +209,9 @@ export async function getChatCompletionWithMessages(
     // Helper that issues a single chat.completions.create call. Pulled out so
     // the invalid-model fallback below can re-issue with a different model
     // without duplicating the parameter list.
+    // reasoning_effort is only sent for reasoning-capable models (gpt-5.x, o-series).
+    // Older chat models reject it as unknown param, so we gate it by model name.
+    const isReasoningModel = (m: string) => /^(gpt-5|o\d)/i.test(m);
     const issueRequest = (modelToUse: string) => openai.chat.completions.create({
       model: modelToUse,
       messages,
@@ -212,6 +220,9 @@ export async function getChatCompletionWithMessages(
       ...(options?.response_format && { response_format: options.response_format }),
       ...(options?.tools && { tools: options.tools }),
       ...(options?.tool_choice && { tool_choice: options.tool_choice }),
+      ...(options?.reasoning_effort && isReasoningModel(modelToUse)
+        ? { reasoning_effort: options.reasoning_effort }
+        : {}),
     });
 
     let response;

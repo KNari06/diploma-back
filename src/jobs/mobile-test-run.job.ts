@@ -15,7 +15,8 @@
  */
 
 import { QueueManager } from '@/config/infrastructure/queues';
-import { dbAdminService } from '@/db/supabase';
+import { dbAdminService, supabaseAdmin } from '@/db/supabase';
+import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
@@ -79,6 +80,9 @@ export class MobileTestRunJobHandler {
       appOriginalName,
       ciRunId,
       metadata,
+      analyticsRunId,
+      analyticsExecutionId,
+      intelligentSessionId,
     } = job.data;
 
     // Validate
@@ -394,6 +398,17 @@ export class MobileTestRunJobHandler {
       // Create test result record
       const testResultId = await this.createTestResult(testId, browser, runResult, userId, workspaceId);
 
+      // ── Phase 5.5: Finalize analytics linkage ────────────────
+      await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
+        analyticsExecutionId,
+        analyticsRunId,
+        intelligentSessionId,
+        passed: testPassed,
+        durationMs: runResult.durationMs,
+        totalSteps: runResult.totalSteps,
+        firstError: runResult.steps.find((s) => !s.success)?.error,
+      });
+
       // ── Phase 6: Queue AI analysis ────────────────────────────
       if (testResultId) {
         try {
@@ -485,6 +500,15 @@ export class MobileTestRunJobHandler {
       try {
         await this.updateTestStatus(testId, 'failed', browser);
       } catch { /* ignore */ }
+
+      // Same finalizer as the success path, different outcome.
+      await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
+        analyticsExecutionId,
+        analyticsRunId,
+        intelligentSessionId,
+        passed: false,
+        errorMessage,
+      });
 
       // Emit failure event
       try {
@@ -713,5 +737,115 @@ export class MobileTestRunJobHandler {
       });
       return null;
     }
+  }
+
+  /**
+   * Finalize the pre-created analytics rows for this mobile run.
+   *
+   * Rows are created up front (chat handler, regression-run dispatch) in
+   * 'running' state so the frontend sees a live row immediately. This
+   * helper transitions them to terminal state when the run finishes.
+   *
+   * All three updates are best-effort: a failure here must not fail the
+   * overall job — `test_results` is the authoritative record. Missing
+   * ids are silently skipped so jobs without analytics wiring still work.
+   *
+   * Kept local to the mobile job because web's `TestCompletionHandler`
+   * looks up executions via joins tuned for web and wouldn't match a
+   * mobile row cleanly. An eventual shared finalizer can replace this.
+   */
+  private static async finalizeAnalyticsLinkage(params: {
+    analyticsExecutionId?: string;
+    analyticsRunId?: string;
+    intelligentSessionId?: string;
+    passed: boolean;
+    durationMs?: number;
+    totalSteps?: number;
+    firstError?: string;
+    errorMessage?: string;
+  }): Promise<void> {
+    const {
+      analyticsExecutionId,
+      analyticsRunId,
+      intelligentSessionId,
+      passed,
+      durationMs,
+      totalSteps,
+      firstError,
+      errorMessage,
+    } = params;
+
+    // All three targets are independent — parallelize. allSettled so one
+    // failure doesn't skip the others; per-branch try/catch logs locally.
+    const tasks: Promise<unknown>[] = [];
+
+    if (analyticsExecutionId) {
+      tasks.push((async () => {
+        try {
+          await ExecutionService.updateStatus({
+            id: analyticsExecutionId,
+            status: passed ? 'passed' : 'failed',
+            ...(durationMs !== undefined ? { durationMs } : {}),
+            ...((firstError || errorMessage) ? { errorMessage: firstError || errorMessage } : {}),
+          });
+        } catch (err) {
+          logger.warn('[MOBILE-TEST] Failed to finalize test_executions', {
+            analyticsExecutionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })());
+    }
+
+    // Only flip regression_runs when the caller owns the whole run
+    // (chat handler passes both ids). Regression-plan runs manage their
+    // own run-level status in executeTestCasesAsync and must not be
+    // double-finalized per-case.
+    if (analyticsRunId && analyticsExecutionId) {
+      tasks.push((async () => {
+        try {
+          await supabaseAdmin
+            .from('regression_runs')
+            .update({
+              status: passed ? 'passed' : 'failed',
+              completed_at: new Date().toISOString(),
+            })
+            .eq('id', analyticsRunId)
+            // Don't stomp a run another code path already finalized.
+            .in('status', ['pending', 'running']);
+        } catch (err) {
+          logger.warn('[MOBILE-TEST] Failed to finalize regression_runs', {
+            analyticsRunId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })());
+    }
+
+    if (intelligentSessionId) {
+      tasks.push((async () => {
+        try {
+          await supabaseAdmin
+            .from('intelligent_test_sessions')
+            .update({
+              status: passed ? 'completed' : 'failed',
+              success: passed,
+              completed_at: new Date().toISOString(),
+              ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
+              // A mobile step is an "action"; there's no page-visit analogue,
+              // so pages_visited stays at its default 0.
+              ...(totalSteps !== undefined ? { actions_taken: totalSteps } : {}),
+            })
+            .eq('id', intelligentSessionId);
+        } catch (err) {
+          logger.warn('[MOBILE-TEST] Failed to finalize intelligent_test_sessions', {
+            intelligentSessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })());
+    }
+
+    await Promise.allSettled(tasks);
   }
 }
