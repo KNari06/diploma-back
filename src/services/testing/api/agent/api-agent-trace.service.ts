@@ -4,6 +4,7 @@
  * Reuses LiteTraceWriter infrastructure and uploads to lite-trace-logs bucket
  */
 
+import { isDevelopment } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
 import {
@@ -238,6 +239,14 @@ export class ApiAgentTraceService {
   async closeAndUpload(): Promise<string | null> {
     try {
       await this.writer.close();
+
+      // In development, keep trace logs locally for debugging — skip Supabase upload
+      if (isDevelopment) {
+        logger.debug('[API_AGENT_TRACE] Skipping upload in development mode, keeping local file', {
+          filePath: this.writer.getFilePath(),
+        });
+        return null;
+      }
 
       const filePath = this.writer.getFilePath();
       const originalFileName = path.basename(filePath);

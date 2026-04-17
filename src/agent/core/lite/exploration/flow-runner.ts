@@ -36,11 +36,14 @@ import type {
   FlowExplorationStatus,
   FlowRunnerCheckpoint,
   DiscoveredStep,
+  CapturedApiCall,
   FlowError,
   ErrorClassification,
   BlockerType,
   ExplorationProgressCallback,
 } from './types';
+import type { NetworkSuccess } from '../lite-types';
+import { attributeCallsToSteps } from './network-assertions';
 import { FlowQueue } from './flow-queue';
 import { BudgetTracker } from './budget-tracker';
 import { StateManager } from './state-manager';
@@ -53,6 +56,7 @@ import { ClarificationService } from '@/agent/utils/context/clarification.servic
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Scout } from './agents/scout';
 import type { ScoutInput, ScoutOutput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
+import { normalizeUrlWithPattern } from './url-pattern';
 
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
@@ -106,6 +110,20 @@ export class FlowRunner {
   ) {
     this.stateManager = new StateManager(browser);
     this.scout = new Scout(rateLimiter, trace);
+
+    // If the user supplied a pre-seeded auth fixture, plant it in the
+    // StateManager *before* any flow runs. This makes the first auth-gated
+    // flow skip performLogin() entirely — hasAuthState() returns true.
+    // We also mark loginCompleted so concurrent auth-gated flows don't race
+    // to trigger the redundant login mutex path.
+    if (this.config.authFixture) {
+      this.stateManager.preloadAuthState(this.config.authFixture);
+      this.loginCompleted = true;
+      logger.info('[FLOW_RUNNER] Auth fixture preloaded — login flow will be skipped', {
+        cookies: this.config.authFixture.cookies.length,
+        origins: this.config.authFixture.origins.length,
+      });
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -424,24 +442,38 @@ export class FlowRunner {
     const allocatedRounds = this.budget.roundsPerFlow();
     let context: BrowserContext | null = null;
 
+    // Auth is available if we have either a pre-seeded fixture (already
+    // loaded into StateManager) or credentials (we can run performLogin).
+    // Fixture-only flows MUST still use createAuthenticatedContext, otherwise
+    // the whole pre-seeded path regresses to running on a blank context.
+    const hasAuthAvailable =
+      this.stateManager.hasAuthState() || !!this.config.credentials;
+    const needsAuthContext = entryPoint.requiresAuth && hasAuthAvailable;
+
     this.trace?.writeFlowStart({
       entryPointId: entryPoint.id,
       name: entryPoint.name,
       goal: entryPoint.goal,
       category: entryPoint.category,
       priority: entryPoint.priority,
-      contextType: (entryPoint.requiresAuth && this.config.credentials) ? 'authenticated' : 'clean',
+      contextType: needsAuthContext ? 'authenticated' : 'clean',
       allocatedRounds,
       flowTimeoutMs,
     });
 
     try {
       // 1. Create browser context (with auth if needed)
-      if (entryPoint.requiresAuth && this.config.credentials) {
+      if (needsAuthContext) {
         context = await this.stateManager.createAuthenticatedContext();
 
-        // Use mutex to prevent concurrent login attempts
-        if (!this.stateManager.hasAuthState() && !this.loginCompleted) {
+        // Only attempt live login when we actually have credentials AND no
+        // auth state is cached yet. With a fixture preloaded, hasAuthState()
+        // is already true, so this branch is skipped entirely.
+        if (
+          this.config.credentials &&
+          !this.stateManager.hasAuthState() &&
+          !this.loginCompleted
+        ) {
           await this.withLoginMutex(async () => {
             // Double-check after acquiring mutex (another flow may have completed login)
             if (!this.loginCompleted) {
@@ -560,8 +592,19 @@ export class FlowRunner {
       const pipelineStartTime = Date.now();
       const pipelineResult = await pipeline.run(entryPoint.goal, pipelineConfig);
 
-      // 5. Extract steps from pipeline rounds
-      const discoveredSteps = this.extractSteps(pipelineResult);
+      // 5. Extract steps from pipeline rounds + attribute network calls.
+      //    NetworkTracker has been running since `new NetworkTracker(page)`
+      //    above, so everything captured since `pipelineStartTime` belongs
+      //    to this flow.
+      const { steps: baseSteps, stepsByRound } = this.extractSteps(pipelineResult);
+      const successfulCalls = this.collectSuccessfulCalls(networkTracker, pipelineStartTime);
+      const discoveredSteps = attributeCallsToSteps({
+        steps: baseSteps,
+        stepsByRound,
+        rounds: pipelineResult.rounds,
+        flowStartTime: pipelineStartTime,
+        successfulCalls,
+      });
 
       this.trace?.writeFlowPipelineEnd({
         entryPointId: entryPoint.id,
@@ -719,14 +762,32 @@ export class FlowRunner {
                 maxRounds: Math.max(1, Math.min(5, allocatedRounds)),
                 timeoutMs: Math.max(5_000, flowTimeoutMs - (Date.now() - startTime)),
               };
-              const retryResult = await retryPipeline.run(entryPoint.goal, retryConfig);
+              const retryStartTime = Date.now();
+              const retryNetworkTracker = retryIntegrations.networkTracker;
+              try {
+                const retryResult = await retryPipeline.run(entryPoint.goal, retryConfig);
 
-              if (retryResult.success) {
-                status = 'completed';
-                blockerType = undefined;
-                canUserHelp = undefined;
-                // Merge steps
-                discoveredSteps.push(...this.extractSteps(retryResult));
+                if (retryResult.success) {
+                  status = 'completed';
+                  blockerType = undefined;
+                  canUserHelp = undefined;
+                  // Merge steps — reuse the same attribution pipeline so
+                  // network calls captured during the retry get attached too.
+                  const { steps: retrySteps, stepsByRound: retryStepsByRound } = this.extractSteps(retryResult);
+                  const retryCalls = this.collectSuccessfulCalls(retryNetworkTracker, retryStartTime);
+                  const retryAttributed = attributeCallsToSteps({
+                    steps: retrySteps,
+                    stepsByRound: retryStepsByRound,
+                    rounds: retryResult.rounds,
+                    flowStartTime: retryStartTime,
+                    successfulCalls: retryCalls,
+                  });
+                  discoveredSteps.push(...retryAttributed);
+                }
+              } finally {
+                // Must stop the retry tracker — the outer cleanup only stops
+                // the original tracker, and leaked trackers keep page listeners alive.
+                try { retryNetworkTracker.stopTracking(); } catch { /* best-effort */ }
               }
             } catch (retryError) {
               logger.warn('[FLOW_RUNNER] Retry after user help failed', {
@@ -909,6 +970,10 @@ export class FlowRunner {
   /**
    * Check if the page is still on a login form after a login attempt.
    * Validates that the auth state actually changed.
+   *
+   * On evaluation error we conservatively return `true` (assume still on login):
+   * falsely caching a broken auth state causes every downstream auth-gated flow
+   * to fail silently, which is worse than one extra login retry.
    */
   private async isStillOnLoginPage(page: Page): Promise<boolean> {
     try {
@@ -931,7 +996,9 @@ export class FlowRunner {
 
       return hasPasswordField;
     } catch {
-      return false; // If evaluation fails, assume login succeeded
+      // Conservative default: treat as still-on-login so caller retries instead
+      // of caching a possibly-broken auth state.
+      return true;
     }
   }
 
@@ -942,15 +1009,26 @@ export class FlowRunner {
   /**
    * Extract DiscoveredStep[] from pipeline execution rounds.
    * Filters out infrastructure commands (observe_page, wait_for_page).
+   *
+   * Also returns `stepsByRound`: for each round, the index (in `steps`) of
+   * the last interactive step that round emitted, or null if the round
+   * produced no user-facing step (pure observe rounds). Used by the network
+   * assertion pipeline to attribute captured API calls back to the action
+   * that triggered them.
    */
-  private extractSteps(result: TestPipelineResult): DiscoveredStep[] {
+  private extractSteps(result: TestPipelineResult): {
+    steps: DiscoveredStep[];
+    stepsByRound: Array<number | null>;
+  } {
     const steps: DiscoveredStep[] = [];
+    const stepsByRound: Array<number | null> = [];
     let stepNumber = 0;
 
     for (const round of result.rounds) {
       // Use the page URL from the round's snapshot context
       // The snapshot URL is captured before actions execute
       const roundPageUrl = this.extractUrlFromSnapshot(round.pageSnapshotBefore);
+      let lastStepIdxInRound: number | null = null;
 
       for (const executed of round.commands) {
         // Skip failed commands — they produce noise in the final test case
@@ -960,11 +1038,14 @@ export class FlowRunner {
         if (step) {
           step.stepNumber = ++stepNumber;
           steps.push(step);
+          lastStepIdxInRound = steps.length - 1;
         }
       }
+
+      stepsByRound.push(lastStepIdxInRound);
     }
 
-    return steps;
+    return { steps, stepsByRound };
   }
 
   /**
@@ -974,6 +1055,23 @@ export class FlowRunner {
   private extractUrlFromSnapshot(snapshot: string): string {
     const match = snapshot.match(/URL:\s*(\S+)/i);
     return match?.[1] || '';
+  }
+
+  /**
+   * Pull the successful-responses list from NetworkTracker. Wrapped so a
+   * tracker missing the getter (e.g. a partial test mock) degrades to an
+   * empty list instead of blowing up the flow.
+   */
+  private collectSuccessfulCalls(
+    tracker: NetworkTracker,
+    sinceMs: number,
+  ): NetworkSuccess[] {
+    try {
+      if (typeof tracker?.getSuccessfulResponsesSince !== 'function') return [];
+      return tracker.getSuccessfulResponsesSince(sinceMs) ?? [];
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -1364,12 +1462,7 @@ export class FlowRunner {
   }
 
   private normalizeUrl(url: string): string {
-    try {
-      const u = new URL(url);
-      return `${u.origin}${u.pathname}`.replace(/\/$/, '');
-    } catch {
-      return url;
-    }
+    return normalizeUrlWithPattern(url);
   }
 
   /**

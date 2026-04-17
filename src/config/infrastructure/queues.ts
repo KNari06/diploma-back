@@ -27,6 +27,13 @@ export interface ExplorationJobData {
   workspaceId?: string;
   scopeHint?: string;
   credentials?: { email?: string; username?: string; phone?: string; password: string };
+  /**
+   * Pre-seeded storageState JSON (Playwright shape: cookies + origins with
+   * localStorage). Passed through to ExplorationConfig.authFixture after
+   * validation — invalid shapes are logged and dropped, falling back to
+   * the credentials-based login path.
+   */
+  authFixture?: unknown;
   budget?: Partial<ExplorationBudget>;
   maxConcurrency?: number;
   rateLimiting?: RateLimitingConfig;

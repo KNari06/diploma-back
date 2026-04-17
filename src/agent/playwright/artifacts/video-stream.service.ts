@@ -26,9 +26,9 @@ import { checkTestCancelled } from '../utils/test-cancellation-checker';
 
 const VIDEO_STREAM_CONFIG = {
   // CDP Screencast settings
-  fps: 12,
+  fps: 20,
   maxWidth: 960,
-  quality: 45,
+  quality: 55,
   minQuality: 25, // Minimum quality when degrading
   format: 'jpeg' as const,
 

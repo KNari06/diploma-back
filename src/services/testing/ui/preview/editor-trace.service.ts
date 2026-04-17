@@ -132,7 +132,7 @@ export class EditorTraceService {
     });
   }
 
-  writeRecordingStop(reason: 'user' | 'disconnect'): void {
+  writeRecordingStop(reason: 'user' | 'disconnect' | 'max_time' | 'max_steps'): void {
     this.writer.write({
       stage: 'lifecycle',
       eventType: 'recording_stop',

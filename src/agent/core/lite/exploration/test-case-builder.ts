@@ -28,6 +28,7 @@ import type {
 } from './types';
 import type { ExplorationTree } from './exploration-tree';
 import type { BudgetTracker } from './budget-tracker';
+import { buildAssertionsFromSteps } from './network-assertions';
 
 /** Categories that typically involve form submission */
 const FORM_CATEGORIES: TestFlowCategory[] = [
@@ -100,8 +101,13 @@ export class TestCaseBuilder {
       case 'failed':
         status = 'failed';
         break;
-      case 'skipped':
       case 'timeout':
+        // Timeouts with partial steps are salvageable — keep them as 'failed'
+        // so the discovered steps remain visible. Only truly-empty timeouts
+        // (no steps recorded at all) are 'not_explored'.
+        status = task.discoveredSteps.length > 0 ? 'failed' : 'not_explored';
+        break;
+      case 'skipped':
         status = 'not_explored';
         break;
       default:
@@ -138,6 +144,13 @@ export class TestCaseBuilder {
         }
       : undefined;
 
+    // Derive network-level assertions from calls captured during execution.
+    // Only emit assertions for flows that actually executed steps — a failed
+    // or skipped flow with no steps produces no trustworthy assertions.
+    const assertions = task.discoveredSteps.length > 0
+      ? buildAssertionsFromSteps(task.discoveredSteps)
+      : [];
+
     return {
       id: ep.id,
       name: isBlocked ? `${ep.name} [BLOCKED: ${task.blockerType || 'other'}]` : ep.name,
@@ -158,6 +171,7 @@ export class TestCaseBuilder {
       expectedResult,
       preconditions,
       blocker,
+      assertions: assertions.length > 0 ? assertions : undefined,
     };
   }
 
@@ -295,16 +309,20 @@ export class TestCaseBuilder {
     // Branch-detected entry points during flow exploration are additive.
     const branchPointCount = flowTasks.reduce((sum, t) => sum + t.branchPoints.length, 0);
 
-    // Build discovered pages for history view
+    // Build discovered pages for history view.
+    // Defensive: a malformed/legacy node may lack entryPoints — default to 0
+    // rather than crashing the whole summary build.
     const pages = tree.getAllNodes().map((node) => ({
       url: node.url,
       title: node.title,
       pageType: node.pageType,
-      entryPointCount: node.entryPoints.length,
+      entryPointCount: node.entryPoints?.length ?? 0,
       depth: node.depth,
     }));
 
-    // Build individual flow results for history view
+    // Build individual flow results for history view. Carries assertions +
+    // blocker detail through the summary so the frontend renders them
+    // without a second fetch against the DiscoveredTestCase.
     const flows = testCases
       .filter((tc) => tc.explored)
       .map((tc) => ({
@@ -314,7 +332,10 @@ export class TestCaseBuilder {
         durationMs: tc.estimatedDurationMs,
         stepsCount: tc.steps.length,
         blockerType: tc.blocker?.type,
+        blockerReason: tc.blocker?.reason,
+        canUserHelp: tc.blocker?.canUserHelp,
         errorMessage: tc.blocker?.reason || tc.errors?.[0]?.message,
+        assertions: tc.assertions?.map((a) => ({ type: a.type, expect: a.expect })),
         steps: tc.steps.map((s) => ({
           stepNumber: s.stepNumber,
           action: s.action,
@@ -324,16 +345,27 @@ export class TestCaseBuilder {
         })),
       }));
 
+    // skippedEntryPoints may contain entry points that ALSO appear as
+    // status='skipped' tasks — dedup by id to avoid double-counting.
+    const taskSkippedIds = new Set(
+      flowTasks.filter((t) => t.status === 'skipped').map((t) => t.entryPoint.id),
+    );
+    const extraSkippedFromQueue = skippedEntryPoints.filter((ep) => !taskSkippedIds.has(ep.id)).length;
+
     return {
       pagesSurveyed: tree.getNodeCount(),
       entryPointsDiscovered: tree.getAllEntryPoints().length + branchPointCount,
       flowsExplored: flowTasks.filter((t) =>
-        t.status === 'completed' || t.status === 'failed' || t.status === 'blocked',
+        t.status === 'completed' || t.status === 'failed' || t.status === 'blocked' || t.status === 'timeout',
       ).length,
       flowsPassed: flowTasks.filter((t) => t.goalAchieved).length,
-      flowsFailed: flowTasks.filter((t) => t.status === 'failed' && !t.goalAchieved).length,
+      // A flow fails if: explicitly 'failed', or 'completed' without goal achieved,
+      // or 'timeout' (pipeline ran out of time — still a failure, not a skip).
+      flowsFailed: flowTasks.filter((t) =>
+        !t.goalAchieved && (t.status === 'failed' || t.status === 'completed' || t.status === 'timeout'),
+      ).length,
       flowsBlocked: flowTasks.filter((t) => t.status === 'blocked').length,
-      flowsSkipped: skippedEntryPoints.length + flowTasks.filter((t) => t.status === 'skipped').length,
+      flowsSkipped: extraSkippedFromQueue + flowTasks.filter((t) => t.status === 'skipped').length,
       totalStepsDiscovered: testCases.reduce((sum, tc) => sum + tc.steps.length, 0),
       uniquePages: uniquePages.size,
       categories: Array.from(categories),

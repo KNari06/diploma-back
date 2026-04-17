@@ -1,3 +1,4 @@
+import { isDevelopment } from '@/config/environment/env';
 import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestJobData } from '@/types';
@@ -1230,7 +1231,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
       // Upload screenshot to storage as PNG (same as Lite/Pro modes)
       let finalScreenshotUrl: string | undefined;
-      if (finalScreenshotBuffer) {
+      if (finalScreenshotBuffer && !isDevelopment) {
         try {
           finalScreenshotUrl = await uploadScreenshotBufferToStorage(
             finalScreenshotBuffer,
@@ -1463,25 +1464,27 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // `replayTraceUrl` now carries the opaque storage_path (private bucket,
       // signed URL resolved at read time via the trace_files row).
       let replayTraceUrl: string | undefined;
-      try {
-        const traceFilePath = replayTrace.getFilePath();
-        const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-        const uploadResult = await uploadReplayTraceToStorage(
-          traceFilePath,
-          testData.testId,
-          testData.userId || 'anonymous',
-        );
-        replayTraceUrl = uploadResult.storagePath;
-        logger.info('[PLAYWRIGHT] Replay trace JSONL uploaded to storage', {
-          testId: testData.testId,
-          storagePath: uploadResult.storagePath,
-          traceFileId: uploadResult.traceFileId,
-        });
-      } catch (traceUploadError) {
-        logger.debug('[PLAYWRIGHT] Failed to upload replay trace JSONL', {
-          testId: testData.testId,
-          error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
-        });
+      if (!isDevelopment) {
+        try {
+          const traceFilePath = replayTrace.getFilePath();
+          const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+          const uploadResult = await uploadReplayTraceToStorage(
+            traceFilePath,
+            testData.testId,
+            testData.userId || 'anonymous',
+          );
+          replayTraceUrl = uploadResult.storagePath;
+          logger.info('[PLAYWRIGHT] Replay trace JSONL uploaded to storage', {
+            testId: testData.testId,
+            storagePath: uploadResult.storagePath,
+            traceFileId: uploadResult.traceFileId,
+          });
+        } catch (traceUploadError) {
+          logger.debug('[PLAYWRIGHT] Failed to upload replay trace JSONL', {
+            testId: testData.testId,
+            error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
+          });
+        }
       }
 
       logger.info('[PLAYWRIGHT] Background Replay Mode completed', {
@@ -1856,7 +1859,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Stores the opaque storage_path — readers resolve a signed URL via the
       // trace_files row created on the same call.
       let cancelledReplayTraceUrl: string | undefined;
-      if (replayTraceFilePath) {
+      if (replayTraceFilePath && !isDevelopment) {
         try {
           const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
           const uploadResult = await uploadReplayTraceToStorage(
@@ -1987,7 +1990,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // Stores the opaque storage_path — readers resolve a signed URL via the
     // trace_files row created on the same call.
     let failedReplayTraceUrl: string | undefined;
-    if (replayTraceFilePath) {
+    if (replayTraceFilePath && !isDevelopment) {
       try {
         const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
         const uploadResult = await uploadReplayTraceToStorage(

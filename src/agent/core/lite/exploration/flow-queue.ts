@@ -14,6 +14,7 @@
 
 import type { EntryPoint, FlowPriority, FlowComplexity, QueueCheckpoint } from './types';
 import type { StrategistOutput, StrategistFlowPlan } from './agents/agent-types';
+import { PerPageBudget } from './per-page-budget';
 
 /** Priority weights (higher = explore sooner) */
 const PRIORITY_WEIGHT: Record<FlowPriority, number> = {
@@ -44,6 +45,14 @@ export type DedupTraceCallback = (data: {
   similarity?: number;
 }) => void;
 
+/** Optional callback for per-page saturation tracing */
+export type PageSaturationTraceCallback = (data: {
+  entryPointId: string;
+  entryPointName: string;
+  pageUrl: string;
+  pageFlowCount: number;
+}) => void;
+
 export class FlowQueue {
   private queue: EntryPoint[] = [];
   private completed: Set<string> = new Set();
@@ -51,6 +60,13 @@ export class FlowQueue {
   private allNames: Set<string> = new Set();          // normalized names — dedup across all enqueued+completed
   private mutexPromise: Promise<void> = Promise.resolve();
   private dedupTrace?: DedupTraceCallback;
+  private saturationTrace?: PageSaturationTraceCallback;
+  /**
+   * Per-page fairness cap. Null when disabled. Constructed by setPerPageBudget
+   * before the queue is handed to FlowRunner. Mutated on every successful
+   * dequeue — callers rely on the existing enqueue mutex to serialize writes.
+   */
+  private perPageBudget: PerPageBudget | null = null;
 
   // ═══════════════════════════════════════════════════════════════════════
   // CONSTRUCTION
@@ -126,6 +142,21 @@ export class FlowQueue {
     this.dedupTrace = cb;
   }
 
+  /**
+   * Install a per-page fairness cap. Must be called before runAll — enabling
+   * the gate mid-run is a valid use case (e.g. user directive), but callers
+   * should be aware that already-in-flight flows are not retroactively
+   * counted. Passing null disables the gate.
+   */
+  setPerPageBudget(budget: PerPageBudget | null): void {
+    this.perPageBudget = budget;
+  }
+
+  /** Optional trace callback for per-page saturation diagnostics */
+  setSaturationTrace(cb: PageSaturationTraceCallback): void {
+    this.saturationTrace = cb;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // QUEUE OPERATIONS
   // ═══════════════════════════════════════════════════════════════════════
@@ -142,25 +173,67 @@ export class FlowQueue {
 
   /**
    * Get the next entry point to explore.
-   * Skips entries whose dependencies haven't been completed yet (re-queues them).
+   *
+   * Priority order when picking the next entry:
+   *   1. Dependency satisfied AND source page still under its per-page cap.
+   *   2. Dependency satisfied, even if the page is saturated.
+   *      (Emit a saturation trace so the starvation is observable.)
+   *   3. Anything, if every remaining entry has unmet deps
+   *      (dependency-deadlock fallback — matches prior behaviour).
+   *
+   * The cap is only advisory on dequeue: when a saturated entry IS
+   * returned, we still count it against the page budget so subsequent
+   * dequeue calls prefer other pages. The alternative (starving forever
+   * on a saturated page) would deadlock the whole run when one page
+   * happens to hold every remaining entry — worse than letting a few
+   * extras through.
    */
   dequeue(): EntryPoint | null {
-    // Find first entry without unmet dependencies
+    if (this.queue.length === 0) return null;
+
+    let firstDepSatisfiedIdx = -1;
+
     for (let i = 0; i < this.queue.length; i++) {
       const entry = this.queue[i];
-      if (!entry.dependsOn || this.completed.has(entry.dependsOn)) {
+      const depsOk = !entry.dependsOn || this.completed.has(entry.dependsOn);
+      if (!depsOk) continue;
+
+      if (firstDepSatisfiedIdx === -1) firstDepSatisfiedIdx = i;
+
+      const pageOk = !this.perPageBudget || this.perPageBudget.canReserve(entry);
+      if (pageOk) {
         this.queue.splice(i, 1);
+        this.perPageBudget?.reserve(entry);
         return entry;
       }
     }
 
-    // All remaining entries have unmet dependencies — return first anyway
-    // (the dependency might never complete, so don't deadlock)
-    if (this.queue.length > 0) {
-      return this.queue.shift()!;
+    // No dependency-satisfied + page-fair entry. Prefer a dep-satisfied
+    // (but saturated) entry over a dep-unsatisfied one.
+    if (firstDepSatisfiedIdx !== -1) {
+      const entry = this.queue.splice(firstDepSatisfiedIdx, 1)[0];
+      this.emitSaturationTrace(entry);
+      this.perPageBudget?.reserve(entry);
+      return entry;
     }
 
-    return null;
+    // All remaining entries have unmet dependencies — return first anyway
+    // (the dependency might never complete, so don't deadlock).
+    const entry = this.queue.shift()!;
+    this.perPageBudget?.reserve(entry);
+    return entry;
+  }
+
+  private emitSaturationTrace(entry: EntryPoint): void {
+    if (!this.saturationTrace || !this.perPageBudget) return;
+    try {
+      this.saturationTrace({
+        entryPointId: entry.id,
+        entryPointName: entry.name,
+        pageUrl: entry.sourcePageUrl,
+        pageFlowCount: this.perPageBudget.countFor(entry.sourcePageUrl),
+      });
+    } catch { /* never let tracing break queue operation */ }
   }
 
   /**

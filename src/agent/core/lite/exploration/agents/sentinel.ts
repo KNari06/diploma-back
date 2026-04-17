@@ -144,11 +144,15 @@ export class ExplorationSentinel {
   private fallbackAssessment(): SentinelAssessment {
     const completed = this.bb.completedFlows.length;
     const total = this.bb.tree?.getAllEntryPoints()?.length || 0;
-    const score = total > 0 ? Math.round((completed / total) * 100) : 0;
+    // Clamp to [0, 100]: Scout-discovered branches can push completed past the
+    // initial tree entry point count, which would otherwise yield >100%.
+    const rawScore = total > 0 ? Math.round((completed / total) * 100) : 0;
+    const score = Math.max(0, Math.min(100, rawScore));
     const budgetExhausted = this.bb.budget?.isExhausted?.() ?? true;
 
-    // Continue exploring if coverage is low and budget allows
-    const shouldContinue = score < 75 && !budgetExhausted;
+    // Continue exploring if coverage is low AND budget allows AND there is
+    // anything to continue exploring (entry points > 0). No tree = nothing to do.
+    const shouldContinue = score < 75 && !budgetExhausted && total > 0;
     const uncoveredCategories = shouldContinue ? this.identifyUncoveredCategories() : [];
 
     return {
@@ -156,7 +160,9 @@ export class ExplorationSentinel {
       gaps: uncoveredCategories.map((c) => `Category "${c}" not yet tested`),
       continueExploring: shouldContinue,
       focusNext: uncoveredCategories.length > 0 ? uncoveredCategories : undefined,
-      qualitySummary: `Explored ${completed} of ${total} discovered flows (${score}% coverage). AI assessment unavailable.`,
+      qualitySummary: total === 0
+        ? 'No entry points discovered during survey. AI assessment unavailable.'
+        : `Explored ${completed} of ${total} discovered flows (${score}% coverage). AI assessment unavailable.`,
       recommendations: uncoveredCategories.length > 0
         ? [`Test uncovered categories: ${uncoveredCategories.join(', ')}`]
         : [],

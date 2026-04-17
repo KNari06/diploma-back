@@ -79,6 +79,28 @@ export class StateManager {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
+   * Pre-seed the auth state from an externally-supplied storageState object
+   * (e.g. a user-exported fixture). After this, createAuthenticatedContext()
+   * returns pre-authenticated contexts and FlowRunner skips performLogin()
+   * thanks to hasAuthState() returning true.
+   *
+   * Safe to call even when the fixture is empty — we still mark the state
+   * as present so the login flow is skipped (the engine decides whether
+   * to preload based on isAuthFixtureNonEmpty before calling us).
+   */
+  preloadAuthState(state: object): void {
+    this.authStateJson = state;
+    try {
+      this.cachedAuthState = JSON.stringify(state);
+    } catch {
+      // Non-serializable state should never reach here (validator rejects
+      // it), but degrade gracefully instead of crashing the whole run.
+      this.cachedAuthState = null;
+    }
+    logger.info('[STATE_MANAGER] Auth state preloaded from fixture');
+  }
+
+  /**
    * Save the auth state from a context after successful login.
    * Subsequent calls to createAuthenticatedContext() will use this state.
    */

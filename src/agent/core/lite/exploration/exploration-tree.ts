@@ -21,6 +21,7 @@ import type {
   TreeCheckpoint,
 } from './types';
 import type { LiteSnapshot } from '../lite-types';
+import { normalizeUrlWithPattern } from './url-pattern';
 
 /** Max depth for BFS traversal */
 const MAX_TREE_DEPTH = 3;
@@ -251,28 +252,13 @@ export class ExplorationTree {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Normalize URL: remove query params, trailing slashes.
-   * Preserves hash for hash-routed SPAs (e.g. /#/dashboard, /#/settings).
-   * Groups same-origin paths together.
+   * Normalize URL: drops query strings + trailing slash, preserves hash routes,
+   * and parameterizes id-like segments (/products/123 → /products/:id) so two
+   * different detail pages dedup to one node. Without the pattern step the
+   * BFS can exhaust its budget on a single catalogue.
    */
   private normalizeUrl(url: string): string {
-    try {
-      const parsed = new URL(url);
-      let pathname = parsed.pathname;
-      // Remove trailing slash (except root)
-      if (pathname.length > 1 && pathname.endsWith('/')) {
-        pathname = pathname.slice(0, -1);
-      }
-      // Preserve hash if it looks like a hash route (starts with #/ or #!)
-      // This enables proper dedup for hash-routed SPAs
-      const hash = parsed.hash;
-      const isHashRoute = hash && (/^#[/!]/.test(hash) || /^#\w+$/.test(hash));
-      return isHashRoute
-        ? `${parsed.origin}${pathname}${hash}`
-        : `${parsed.origin}${pathname}`;
-    } catch {
-      return url;
-    }
+    return normalizeUrlWithPattern(url);
   }
 
   /**

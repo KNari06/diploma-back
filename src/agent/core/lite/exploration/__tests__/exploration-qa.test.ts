@@ -61,12 +61,24 @@ function makeFlowTask(overrides?: Partial<FlowExplorationTask>): FlowExploration
   };
 }
 
-/** Creates a mock ExplorationTree */
+/** Creates a mock ExplorationTree with complete node shape (entryPoints, title, pageType). */
 function makeMockTree(nodeCount: number, entryPoints: EntryPoint[]): ExplorationTree {
   return {
     getNodeCount: () => nodeCount,
     getAllEntryPoints: () => entryPoints,
-    getAllNodes: () => entryPoints.map((ep) => ({ url: ep.sourcePageUrl, id: ep.sourceNodeId })),
+    getAllNodes: () =>
+      entryPoints.map((ep) => ({
+        id: ep.sourceNodeId,
+        url: ep.sourcePageUrl,
+        title: '',
+        pageType: 'page',
+        entryPoints: [ep],
+        children: [],
+        depth: 0,
+        requiresAuth: false,
+        contentHash: '',
+        surveyedAt: Date.now(),
+      })),
     toJSON: () => [],
   } as unknown as ExplorationTree;
 }

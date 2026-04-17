@@ -62,6 +62,36 @@ const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
 
 /**
+ * Per-session auto-stop timers for recordings.
+ * Parity with the mobile runner's RecordingStateRegistry — caps how long a
+ * recording can run unattended so abandoned tabs don't leak Playwright
+ * listeners, typing buffers, and editor traces indefinitely. Cleared on
+ * manual stop, disconnect, and when the timer itself fires.
+ */
+const recordingAutoStopTimers = new Map<string, NodeJS.Timeout>();
+/**
+ * Max recording duration. Mirrors mobile's `RECORDING_MAX_TIME_MS` default
+ * (30 min). Override via `WEB_RECORDING_MAX_TIME_MS` env var; set to 0 to
+ * disable (e.g., for long-running dev sessions).
+ */
+const RECORDING_MAX_TIME_MS = (() => {
+  const raw = parseInt(process.env.WEB_RECORDING_MAX_TIME_MS || '1800000', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1800000;
+})();
+
+/**
+ * Max number of NEW steps per recording session. When reached, recording
+ * auto-stops with reason 'max_steps' so the user applies the batch (via the
+ * existing "Apply All" button) before starting a new recording. Keeps the
+ * editor, LLM costs, and compiled-plan persistence in a sane range.
+ * Override via `WEB_RECORDING_MAX_STEPS`; set to 0 to disable.
+ */
+const RECORDING_MAX_STEPS = (() => {
+  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '100', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 100;
+})();
+
+/**
  * V20: Per-socket+session move coalescing state.
  * Multiple `preview:mouse:move` events arriving within one event loop tick are
  * collapsed into a single Playwright call with the latest coordinates.
@@ -116,11 +146,34 @@ function emitRecordingStep(
     }
   } catch { /* non-critical */ }
 
+  // Increment the session step counter. We do this in the single emit helper
+  // (rather than 20+ call sites) so the number stays accurate. Merge updates
+  // go via `preview:recording:step:update` which does NOT route through here.
+  let stepCount = 0;
+  try {
+    stepCount = sessionService.incrementRecordingStepCount(previewSessionId, userId);
+  } catch { /* non-critical */ }
+
   socket.nsp.to(room).emit('preview:recording:step', {
     previewSessionId,
     ...payload,
+    stepCount,
     timestamp: payload.timestamp || new Date().toISOString(),
   } as any);
+
+  // Max-steps auto-stop. Fires exactly once when the count reaches the cap so
+  // the user is forced to "Apply All" before recording more. Non-blocking —
+  // schedule on microtask so we don't race the just-emitted step on the wire.
+  if (RECORDING_MAX_STEPS > 0 && stepCount >= RECORDING_MAX_STEPS) {
+    queueMicrotask(() => {
+      void finalizeRecording(socket, previewSessionId, userId, 'max_steps').catch((err) => {
+        logger.error('[RECORDING] Max-steps finalize failed', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    });
+  }
 }
 
 /**
@@ -222,6 +275,183 @@ function flushPendingTyping(
   sessionService.setRecordingBuffer(previewSessionId, userId, null);
   const timer = recordingTypingTimers.get(previewSessionId);
   if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+}
+
+/**
+ * Shared finalizer for a recording session. Flushes pending typing/scroll
+ * buffers, removes injected page listeners, clears auto-stop/debounce timers,
+ * resets dialog mode, closes the editor trace, and broadcasts
+ * `preview:recording:state { recording: false, reason? }` to the room.
+ *
+ * Called by:
+ *   - `preview:recording:stop` socket handler (reason = 'user')
+ *   - `preview:run:start` socket handler when a recording is still live
+ *     (reason = 'user', intentTestCaseId is forwarded to the trace uploader
+ *     so the trace file gets attached to the run)
+ *   - auto-stop timer when RECORDING_MAX_TIME_MS elapses (reason = 'max_time')
+ *   - emitRecordingStep once the step counter hits RECORDING_MAX_STEPS
+ *     (reason = 'max_steps')
+ *
+ * The disconnect handler does its own best-effort cleanup (the socket is
+ * already gone, so there's nobody to broadcast to) and does not call this.
+ *
+ * Idempotent: safe to call when recording is already false (just no-ops).
+ */
+async function finalizeRecording(
+  socket: TypedSocket,
+  previewSessionId: string,
+  userId: string,
+  reason: 'user' | 'max_time' | 'max_steps',
+  intentTestCaseId?: string,
+): Promise<void> {
+  const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+  const sessionService = getPreviewSessionService();
+
+  if (!sessionService.isRecording(previewSessionId, userId)) return;
+
+  const room = createRoomName('preview', previewSessionId);
+
+  // Always clear the auto-stop timer first so it can't fire mid-finalize.
+  const autoStopTimer = recordingAutoStopTimers.get(previewSessionId);
+  if (autoStopTimer) {
+    clearTimeout(autoStopTimer);
+    recordingAutoStopTimers.delete(previewSessionId);
+  }
+
+  const finalizeTrace = EditorTraceService.get(previewSessionId);
+
+  // Flush pending typing buffer (with merge logic).
+  const buffer = sessionService.getRecordingBuffer(previewSessionId, userId);
+  if (buffer) {
+    const { RecordingCaptureService } = await import(
+      '@/services/testing/ui/preview/recording-capture.service'
+    );
+    const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, userId);
+    const sameElement = lastTypeStep && buffer.elementRef && lastTypeStep.elementRef === buffer.elementRef;
+
+    if (sameElement && lastTypeStep) {
+      const mergedValue = lastTypeStep.value + buffer.text;
+      const step = RecordingCaptureService.flushTypingBuffer({ ...buffer, text: mergedValue });
+      if (step) {
+        step.id = lastTypeStep.id;
+        socket.nsp.to(room).emit('preview:recording:step:update', {
+          previewSessionId, step, timestamp: new Date().toISOString(),
+        });
+        if (finalizeTrace) finalizeTrace.writeStepUpdated(step, `type_merge_on_stop_${reason}`);
+      }
+    } else {
+      const step = RecordingCaptureService.flushTypingBuffer(buffer);
+      if (step) {
+        emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step });
+        if (finalizeTrace) finalizeTrace.writeStepCaptured(step, `type_flush_on_stop_${reason}`);
+      }
+    }
+    sessionService.setRecordingLastTypeStep(previewSessionId, userId, null);
+    sessionService.setRecordingBuffer(previewSessionId, userId, null);
+  }
+
+  // Clear typing debounce timer.
+  const typingTimer = recordingTypingTimers.get(previewSessionId);
+  if (typingTimer) {
+    clearTimeout(typingTimer);
+    recordingTypingTimers.delete(previewSessionId);
+  }
+
+  // Clear scroll timer and flush (with merge logic).
+  const scrollState = recordingScrollTimers.get(previewSessionId);
+  if (scrollState) {
+    clearTimeout(scrollState.timer);
+    recordingScrollTimers.delete(previewSessionId);
+
+    const { RecordingCaptureService: RecCapSvcScroll } = await import(
+      '@/services/testing/ui/preview/recording-capture.service'
+    );
+    const stopScrollPage = sessionService.getPage(previewSessionId, userId);
+    const stopScrollPageUrl = stopScrollPage?.url();
+
+    const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, userId);
+    const withinMergeWindow = lastScrollStep && (Date.now() - lastScrollStep.emittedAt) < RECORDING_SCROLL_MERGE_WINDOW_MS;
+
+    if (withinMergeWindow && lastScrollStep) {
+      const mergedDelta = lastScrollStep.totalDelta + scrollState.deltaY;
+      const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + (scrollState.deltaX || 0);
+      const scrollStep = RecCapSvcScroll.captureScroll(mergedDelta, stopScrollPageUrl, mergedDeltaX);
+      if (scrollStep) {
+        scrollStep.id = lastScrollStep.id;
+        socket.nsp.to(room).emit('preview:recording:step:update', {
+          previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
+        });
+        if (finalizeTrace) finalizeTrace.writeStepUpdated(scrollStep, `scroll_merge_on_stop_${reason}`);
+      }
+    } else {
+      const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY, stopScrollPageUrl, scrollState.deltaX);
+      if (scrollStep) {
+        emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: scrollStep });
+        if (finalizeTrace) finalizeTrace.writeStepCaptured(scrollStep, `scroll_flush_on_stop_${reason}`);
+      }
+    }
+    sessionService.setRecordingLastScrollStep(previewSessionId, userId, null);
+  }
+
+  // Remove injected page listeners.
+  const page = sessionService.getPage(previewSessionId, userId);
+  if (page) {
+    try {
+      const { RecordingCaptureService } = await import(
+        '@/services/testing/ui/preview/recording-capture.service'
+      );
+      await RecordingCaptureService.removeSelectChangeListener(page);
+      const loadHandler = (page as any).__qai_recording_load_handler;
+      if (loadHandler) {
+        page.off('load', loadHandler);
+        delete (page as any).__qai_recording_load_handler;
+      }
+      const fcHandler = (page as any).__qai_recording_filechooser_handler;
+      if (fcHandler) {
+        page.off('filechooser', fcHandler);
+        delete (page as any).__qai_recording_filechooser_handler;
+      }
+      await RecordingCaptureService.removeAutofillListener(page).catch(() => {});
+      const autofillHandler = (page as any).__qai_recording_autofill_handler;
+      if (autofillHandler) {
+        page.off('load', autofillHandler);
+        delete (page as any).__qai_recording_autofill_handler;
+      }
+    } catch {
+      // Page may be closed already — not fatal.
+    }
+  }
+
+  sessionService.setRecording(previewSessionId, userId, false);
+  sessionService.setDialogMode(previewSessionId, userId, 'passive');
+
+  // Editor trace: log stop reason and close writer. When a test-case id is
+  // supplied (run:start path), forward it so the uploaded trace is linked
+  // to the run that triggered the stop.
+  const traceOnStop = EditorTraceService.get(previewSessionId);
+  if (traceOnStop) {
+    traceOnStop.writeRecordingStop(reason);
+    EditorTraceService.close(previewSessionId).then((meta) => {
+      if (meta) uploadEditorTrace({
+        filePath: meta.filePath,
+        userId: meta.userId,
+        previewSessionId,
+        traceType: 'editor',
+        ...(intentTestCaseId ? { intentTestCaseId } : {}),
+      }).catch((err) => logger.error('[EDITOR_TRACE] Upload failed on recording:stop', { previewSessionId, reason, error: err instanceof Error ? err.message : String(err) }));
+    }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on recording:stop', { previewSessionId, reason, error: err instanceof Error ? err.message : String(err) }));
+  }
+
+  socket.nsp.to(room).emit('preview:recording:state', {
+    previewSessionId,
+    recording: false,
+    // Only forward server-initiated reasons — 'user' stays implicit so we
+    // don't mis-trigger the frontend's auto-stop toast on an explicit click.
+    ...(reason === 'max_time' || reason === 'max_steps' ? { reason } : {}),
+    timestamp: new Date().toISOString(),
+  });
+
+  logger.info('[RECORDING] Stopped', { previewSessionId, userId, reason });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2721,9 +2951,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       if (pTrace) pTrace.writeStepUpdated(updatedStep, 'backspace_trim');
                     }
                   } else {
-                    // All text deleted — remove the step entirely
+                    // All text deleted — remove the step entirely. Keep the
+                    // session step counter honest so the max-steps cap only
+                    // counts *surviving* steps the user will have to apply.
+                    const stepCount = sessionService.decrementRecordingStepCount(previewSessionId, ensuredUserId);
                     socket.nsp.to(room).emit('preview:recording:step:remove', {
-                      previewSessionId, stepId: lastTypeStep.id, timestamp: new Date().toISOString(),
+                      previewSessionId, stepId: lastTypeStep.id, stepCount, timestamp: new Date().toISOString(),
                     });
                     if (pTrace) pTrace.writeStepRemoved(lastTypeStep.id, 'all_text_deleted');
                     sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
@@ -3823,86 +4056,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      // V9: Stop recording if active (run replays existing steps, would create duplicates)
+      // V9: Stop recording if active (run replays existing steps, would
+      // create duplicates). Delegates to the shared finalizer so the flush,
+      // listener cleanup, and broadcast stay identical to other stop paths.
+      // The intentTestCaseId is forwarded so the editor trace upload is
+      // linked to the run that just started.
       if (sessionService.isRecording(previewSessionId, userId)) {
-        // Flush pending typing buffer (with merge logic)
-        const buffer = sessionService.getRecordingBuffer(previewSessionId, userId);
-        if (buffer) {
-          const { RecordingCaptureService } = await import(
-            '@/services/testing/ui/preview/recording-capture.service'
-          );
-          const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, userId);
-          const sameElement = lastTypeStep && buffer.elementRef && lastTypeStep.elementRef === buffer.elementRef;
-          const room = createRoomName('preview', previewSessionId);
-
-          const rsTrace = EditorTraceService.get(previewSessionId);
-          if (sameElement && lastTypeStep) {
-            const mergedValue = lastTypeStep.value + buffer.text;
-            const typingStep = RecordingCaptureService.flushTypingBuffer({ ...buffer, text: mergedValue });
-            if (typingStep) {
-              typingStep.id = lastTypeStep.id;
-              socket.nsp.to(room).emit('preview:recording:step:update', {
-                previewSessionId, step: typingStep, timestamp: new Date().toISOString(),
-              });
-              if (rsTrace) rsTrace.writeStepUpdated(typingStep, 'type_merge_on_run_start');
-            }
-          } else {
-            const typingStep = RecordingCaptureService.flushTypingBuffer(buffer);
-            if (typingStep) {
-              emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step: typingStep });
-              if (rsTrace) rsTrace.writeStepCaptured(typingStep, 'type_flush_on_run_start');
-            }
-          }
-          sessionService.setRecordingLastTypeStep(previewSessionId, userId, null);
-          sessionService.setRecordingBuffer(previewSessionId, userId, null);
-        }
-
-        // Clean up timers
-        const typingTimer = recordingTypingTimers.get(previewSessionId);
-        if (typingTimer) { clearTimeout(typingTimer); recordingTypingTimers.delete(previewSessionId); }
-        const scrollState = recordingScrollTimers.get(previewSessionId);
-        if (scrollState) { clearTimeout(scrollState.timer); recordingScrollTimers.delete(previewSessionId); }
-
-        // Remove select listener
-        const page = sessionService.getPage(previewSessionId, userId);
-        if (page) {
-          try {
-            const { RecordingCaptureService } = await import(
-              '@/services/testing/ui/preview/recording-capture.service'
-            );
-            await RecordingCaptureService.removeSelectChangeListener(page);
-            const loadHandler = (page as any).__qai_recording_load_handler;
-            if (loadHandler) {
-              page.off('load', loadHandler);
-              delete (page as any).__qai_recording_load_handler;
-            }
-            // V10 Fix #5: Remove filechooser handler
-            const fcHandler = (page as any).__qai_recording_filechooser_handler;
-            if (fcHandler) {
-              page.off('filechooser', fcHandler);
-              delete (page as any).__qai_recording_filechooser_handler;
-            }
-          } catch { /* page may be closing */ }
-        }
-
-        sessionService.setRecording(previewSessionId, userId, false);
-
-        const room = createRoomName('preview', previewSessionId);
-        socket.nsp.to(room).emit('preview:recording:state', {
-          previewSessionId,
-          recording: false,
-          timestamp: new Date().toISOString(),
-        });
-        // Editor trace: log recording stop on run:start
-        const runStopTrace = EditorTraceService.get(previewSessionId);
-        if (runStopTrace) {
-          runStopTrace.writeRecordingStop('user');
-          EditorTraceService.close(previewSessionId).then((meta) => {
-            if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor', intentTestCaseId })
-              .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on run:start', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
-          }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on run:start', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
-        }
-        logger.info('[RECORDING] Stopped due to run:start', { previewSessionId, userId });
+        await finalizeRecording(socket, previewSessionId, userId, 'user', intentTestCaseId);
       }
 
       logger.info('[WebSocket] Starting preview run', {
@@ -4027,6 +4187,29 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) return;
 
       sessionService.setRecording(previewSessionId, ensuredUserId, true);
+
+      // Arm auto-stop timer. Mirrors the mobile runner's RecordingStateRegistry
+      // so an abandoned recording doesn't leak buffers/listeners forever.
+      // Skipped when RECORDING_MAX_TIME_MS is 0 (disabled via env).
+      if (RECORDING_MAX_TIME_MS > 0) {
+        const prev = recordingAutoStopTimers.get(previewSessionId);
+        if (prev) clearTimeout(prev);
+        const autoStopTimer = setTimeout(() => {
+          recordingAutoStopTimers.delete(previewSessionId);
+          logger.info('[RECORDING] Auto-stop: max recording time reached', {
+            previewSessionId,
+            userId: ensuredUserId,
+            maxMs: RECORDING_MAX_TIME_MS,
+          });
+          void finalizeRecording(socket, previewSessionId, ensuredUserId, 'max_time').catch((err) => {
+            logger.error('[RECORDING] Auto-stop finalize failed', {
+              previewSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }, RECORDING_MAX_TIME_MS);
+        recordingAutoStopTimers.set(previewSessionId, autoStopTimer);
+      }
 
       // V13: Switch dialog handler to recording mode (emit to frontend, wait for user response)
       sessionService.setDialogMode(previewSessionId, ensuredUserId, 'recording');
@@ -4268,139 +4451,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const sessionService = getPreviewSessionService();
 
       if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) return;
-      if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
 
-      const room = createRoomName('preview', previewSessionId);
-
-      // Flush pending typing buffer (with merge logic)
-      const buffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
-      const stopTrace = EditorTraceService.get(previewSessionId);
-      if (buffer) {
-        const { RecordingCaptureService } = await import(
-          '@/services/testing/ui/preview/recording-capture.service'
-        );
-        const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, ensuredUserId);
-        const sameElement = lastTypeStep && buffer.elementRef && lastTypeStep.elementRef === buffer.elementRef;
-
-        if (sameElement && lastTypeStep) {
-          const mergedValue = lastTypeStep.value + buffer.text;
-          const step = RecordingCaptureService.flushTypingBuffer({ ...buffer, text: mergedValue });
-          if (step) {
-            step.id = lastTypeStep.id;
-            socket.nsp.to(room).emit('preview:recording:step:update', {
-              previewSessionId, step, timestamp: new Date().toISOString(),
-            });
-            if (stopTrace) stopTrace.writeStepUpdated(step, 'type_merge_on_stop');
-          }
-        } else {
-          const step = RecordingCaptureService.flushTypingBuffer(buffer);
-          if (step) {
-            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step });
-            if (stopTrace) stopTrace.writeStepCaptured(step, 'type_flush_on_stop');
-          }
-        }
-        sessionService.setRecordingLastTypeStep(previewSessionId, ensuredUserId, null);
-        sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
-      }
-
-      // Clear typing timer
-      const typingTimer = recordingTypingTimers.get(previewSessionId);
-      if (typingTimer) {
-        clearTimeout(typingTimer);
-        recordingTypingTimers.delete(previewSessionId);
-      }
-
-      // Clear scroll timer and flush (V10: with merge logic)
-      const scrollState = recordingScrollTimers.get(previewSessionId);
-      if (scrollState) {
-        clearTimeout(scrollState.timer);
-        recordingScrollTimers.delete(previewSessionId);
-
-        const { RecordingCaptureService: RecCapSvcScroll } = await import(
-          '@/services/testing/ui/preview/recording-capture.service'
-        );
-        // V13: Capture page URL for evidence
-        const stopScrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
-        const stopScrollPageUrl = stopScrollPage?.url();
-
-        const lastScrollStep = sessionService.getRecordingLastScrollStep(previewSessionId, ensuredUserId);
-        const withinMergeWindow = lastScrollStep && (Date.now() - lastScrollStep.emittedAt) < RECORDING_SCROLL_MERGE_WINDOW_MS;
-
-        if (withinMergeWindow && lastScrollStep) {
-          const mergedDelta = lastScrollStep.totalDelta + scrollState.deltaY;
-          const mergedDeltaX = (lastScrollStep.totalDeltaX || 0) + (scrollState.deltaX || 0);
-          const scrollStep = RecCapSvcScroll.captureScroll(mergedDelta, stopScrollPageUrl, mergedDeltaX);
-          if (scrollStep) {
-            scrollStep.id = lastScrollStep.id;
-            socket.nsp.to(room).emit('preview:recording:step:update', {
-              previewSessionId, step: scrollStep, timestamp: new Date().toISOString(),
-            });
-            if (stopTrace) stopTrace.writeStepUpdated(scrollStep, 'scroll_merge_on_stop');
-          }
-        } else {
-          const scrollStep = RecCapSvcScroll.captureScroll(scrollState.deltaY, stopScrollPageUrl, scrollState.deltaX);
-          if (scrollStep) {
-            emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: scrollStep });
-            if (stopTrace) stopTrace.writeStepCaptured(scrollStep, 'scroll_flush_on_stop');
-          }
-        }
-        sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
-      }
-
-      // Remove <select> listener and load handler
-      const page = sessionService.getPage(previewSessionId, ensuredUserId);
-      if (page) {
-        try {
-          const { RecordingCaptureService } = await import(
-            '@/services/testing/ui/preview/recording-capture.service'
-          );
-          await RecordingCaptureService.removeSelectChangeListener(page);
-          // Remove navigation re-injection handler
-          const loadHandler = (page as any).__qai_recording_load_handler;
-          if (loadHandler) {
-            page.off('load', loadHandler);
-            delete (page as any).__qai_recording_load_handler;
-          }
-          // V10 Fix #5: Remove filechooser handler
-          const fcHandler = (page as any).__qai_recording_filechooser_handler;
-          if (fcHandler) {
-            page.off('filechooser', fcHandler);
-            delete (page as any).__qai_recording_filechooser_handler;
-          }
-          // V13: Remove autofill listener
-          await RecordingCaptureService.removeAutofillListener(page).catch(() => {});
-          const autofillHandler = (page as any).__qai_recording_autofill_handler;
-          if (autofillHandler) {
-            page.off('load', autofillHandler);
-            delete (page as any).__qai_recording_autofill_handler;
-          }
-        } catch {
-          // Page may be closed
-        }
-      }
-
-      sessionService.setRecording(previewSessionId, ensuredUserId, false);
-
-      // V13: Reset dialog mode back to passive
-      sessionService.setDialogMode(previewSessionId, ensuredUserId, 'passive');
-
-      // Editor trace: log recording stop and close writer
-      const recStopTrace = EditorTraceService.get(previewSessionId);
-      if (recStopTrace) {
-        recStopTrace.writeRecordingStop('user');
-        EditorTraceService.close(previewSessionId).then((meta) => {
-          if (meta) uploadEditorTrace({ filePath: meta.filePath, userId: meta.userId, previewSessionId, traceType: 'editor' })
-            .catch((err) => logger.error('[EDITOR_TRACE] Upload failed on recording:stop', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
-        }).catch((err) => logger.error('[EDITOR_TRACE] Close failed on recording:stop', { previewSessionId, error: err instanceof Error ? err.message : String(err) }));
-      }
-
-      socket.nsp.to(room).emit('preview:recording:state', {
-        previewSessionId,
-        recording: false,
-        timestamp: new Date().toISOString(),
-      });
-
-      logger.info('[RECORDING] Stopped', { previewSessionId, userId: ensuredUserId });
+      // Delegate to shared finalizer (also used by auto-stop timer).
+      // Idempotent guard inside finalizeRecording handles the
+      // "already stopped" case (e.g., race with auto-stop firing).
+      await finalizeRecording(socket, previewSessionId, ensuredUserId, 'user');
     } catch (error) {
       logger.error('[RECORDING] Stop failed', {
         socketId: socket.id,
@@ -4486,6 +4541,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (typingTimer) { clearTimeout(typingTimer); recordingTypingTimers.delete(previewSessionId); }
           const scrollState = recordingScrollTimers.get(previewSessionId);
           if (scrollState) { clearTimeout(scrollState.timer); recordingScrollTimers.delete(previewSessionId); }
+          // Clear the auto-stop timer; the disconnect path does its own cleanup
+          // below and must not race with a finalizeRecording() fire while the
+          // socket is already gone.
+          const autoStopTimer = recordingAutoStopTimers.get(previewSessionId);
+          if (autoStopTimer) { clearTimeout(autoStopTimer); recordingAutoStopTimers.delete(previewSessionId); }
 
           if (
             canCleanupRecording

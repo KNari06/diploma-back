@@ -40,12 +40,19 @@ export class Scout {
   ) {}
 
   /**
+   * Max retry attempts on rate-limit errors before giving up.
+   * Prevents infinite loops if the limiter keeps signalling retry.
+   */
+  private static readonly MAX_RETRY_ATTEMPTS = 2;
+
+  /**
    * Discover new flows on the current page after a flow completes.
    *
    * @param input - Completed flow context + current page state
+   * @param attempt - Internal retry counter (do not set externally)
    * @returns ScoutOutput with new entry points, pages, and insight
    */
-  async detect(input: ScoutInput): Promise<ScoutOutput> {
+  async detect(input: ScoutInput, attempt = 0): Promise<ScoutOutput> {
     const { completedFlow } = input;
 
     // Skip if AI is degraded or no budget left
@@ -117,17 +124,18 @@ export class Scout {
 
       return result;
     } catch (error) {
-      // Handle rate limits
+      // Handle rate limits with bounded retry (prevents infinite loops)
       if (this.rateLimiter && RateLimiter.isRateLimitError(error as Error)) {
         const rlResult = await this.rateLimiter.recordFailure('openai', error as Error);
-        if (rlResult.shouldRetry) {
-          return this.detect(input);
+        if (rlResult.shouldRetry && attempt < Scout.MAX_RETRY_ATTEMPTS) {
+          return this.detect(input, attempt + 1);
         }
       }
 
       logger.warn('[SCOUT] Branch detection failed', {
         afterFlow: completedFlow.name,
         error: error instanceof Error ? error.message : String(error),
+        attempt,
       });
 
       return { newEntryPoints: [], newPages: [], insight: 'Branch detection failed' };

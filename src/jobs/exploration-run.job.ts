@@ -8,6 +8,7 @@ import type { ExplorationJobData } from '@/config/infrastructure/queues';
 import { ExplorationEngine } from '@/agent/core/lite/exploration/exploration-engine';
 import type { ExplorationConfig, ExplorationResult } from '@/agent/core/lite/exploration/types';
 import { DEFAULT_EXPLORATION_BUDGET } from '@/agent/core/lite/exploration/types';
+import { validateAuthFixture, isAuthFixtureNonEmpty } from '@/agent/core/lite/exploration/auth-fixture';
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
@@ -24,10 +25,36 @@ export class ExplorationRunJobHandler {
       workspaceId,
       scopeHint,
       credentials,
+      authFixture: rawAuthFixture,
       budget,
       maxConcurrency,
       rateLimiting,
     } = job.data;
+
+    // Validate the optional auth fixture before handing it to Playwright.
+    // An invalid fixture is downgraded (not fatal) — we log + emit a
+    // progress warning and fall back to the credentials-based login flow.
+    let validatedAuthFixture: ExplorationConfig['authFixture'];
+    if (rawAuthFixture !== undefined && rawAuthFixture !== null) {
+      const result = validateAuthFixture(rawAuthFixture);
+      if (!result.valid) {
+        logger.warn('[EXPLORATION_JOB] Invalid auth fixture — ignoring, will use credentials login path', {
+          explorationId,
+          errors: result.errors,
+        });
+      } else if (result.fixture && isAuthFixtureNonEmpty(result.fixture)) {
+        validatedAuthFixture = result.fixture;
+        logger.info('[EXPLORATION_JOB] Auth fixture accepted', {
+          explorationId,
+          cookies: result.fixture.cookies.length,
+          origins: result.fixture.origins.length,
+        });
+      } else {
+        logger.info('[EXPLORATION_JOB] Auth fixture was syntactically valid but empty — ignoring', {
+          explorationId,
+        });
+      }
+    }
 
     logger.info('[EXPLORATION_JOB] Starting exploration', {
       explorationId,
@@ -96,6 +123,7 @@ export class ExplorationRunJobHandler {
         workspaceId,
         scopeHint,
         credentials: credentials || undefined,
+        authFixture: validatedAuthFixture,
         budget: { ...DEFAULT_EXPLORATION_BUDGET, ...budget },
         maxConcurrency: maxConcurrency || 2, // Default 2 to avoid OpenAI TPM rate limits
         rateLimiting,

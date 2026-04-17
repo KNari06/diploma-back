@@ -67,6 +67,17 @@ export interface ExplorationConfig {
     phone?: string;
     password: string;
   };
+  /**
+   * Pre-seeded auth state (Playwright storageState shape) that lets the
+   * agent skip the login flow entirely. If both `authFixture` and
+   * `credentials` are provided, the fixture wins — credentials are kept
+   * only as a fallback if the fixture turns out to be expired. Validated
+   * by validateAuthFixture() before being handed to Playwright.
+   *
+   * Shape matches Playwright's BrowserContextOptions.storageState (a JSON
+   * object — the string-path form is NOT accepted over the wire).
+   */
+  authFixture?: import('./auth-fixture').AuthFixture;
   /** Scope hint from user (e.g. "registration flow", "full site") */
   scopeHint?: string;
   /** Budget constraints */
@@ -98,6 +109,14 @@ export interface ExplorationBudget {
   maxFlows: number;
   /** Max total pipeline rounds across all flows. Default: 100 */
   maxTotalPipelineRounds: number;
+  /**
+   * Max flows allowed against a single page pattern (URL normalized via
+   * the pattern extractor — /products/123 and /products/456 share one
+   * bucket). Prevents a chatty SPA dashboard or Scout-discovered branches
+   * on one URL from eating the whole global maxFlows budget while other
+   * surveyed pages get zero coverage. 0 disables the gate. Default: 3.
+   */
+  maxFlowsPerPage?: number;
 }
 
 export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
@@ -106,6 +125,7 @@ export const DEFAULT_EXPLORATION_BUDGET: ExplorationBudget = {
   maxSurveyPages: 10,
   maxFlows: 30,
   maxTotalPipelineRounds: 150,
+  maxFlowsPerPage: 3,
 };
 
 export const DEFAULT_MAX_CONCURRENCY = 5;
@@ -311,6 +331,21 @@ export interface FlowExplorationTask {
 // DISCOVERED STEPS
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Successful XHR/fetch call captured during a step's execution window.
+ * Used as the source for network-level assertions in generated test cases.
+ * URLs are stored as patterns (id-shaped segments replaced) so assertions
+ * are stable across runs.
+ */
+export interface CapturedApiCall {
+  method: string;
+  /** URL pattern (id-shaped segments collapsed, query dropped) */
+  urlPattern: string;
+  status: number;
+  /** Relative timestamp (ms after flow start) */
+  timestampMs: number;
+}
+
 export interface DiscoveredStep {
   /** Step number (1-based) */
   stepNumber: number;
@@ -330,6 +365,27 @@ export interface DiscoveredStep {
   pageUrl: string;
   /** Expected outcome description */
   expectedOutcome?: string;
+  /**
+   * Successful XHR/fetch calls observed in the window following this action.
+   * Empty/undefined for reads (observe_page) and on non-interactive steps.
+   */
+  networkCalls?: CapturedApiCall[];
+}
+
+/**
+ * Single assertion attached to a DiscoveredTestCase — produced by the builder,
+ * consumed by users reviewing exploration output and by downstream replay.
+ */
+export interface TestAssertion {
+  type: 'network' | 'url' | 'console';
+  /** Human-readable expectation, e.g. "POST /api/auth returns 2xx" */
+  expect: string;
+  /** For type=network: the captured call that sourced this assertion */
+  source?: {
+    method?: string;
+    urlPattern?: string;
+    status?: number;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -376,6 +432,12 @@ export interface DiscoveredTestCase {
   expectedResult?: string;
   /** Preconditions for this test case */
   preconditions?: string[];
+  /**
+   * Test-case-level assertions (network / URL / console).
+   * Built by TestCaseBuilder from captured step-level signals. Empty array
+   * when the flow did not produce network activity worth asserting on.
+   */
+  assertions?: TestAssertion[];
   /** Blocker info if flow was blocked (CAPTCHA, 2FA, etc.) */
   blocker?: {
     type: BlockerType;
@@ -579,7 +641,20 @@ export interface ExplorationSummary {
     durationMs?: number;
     stepsCount: number;
     blockerType?: string;
+    /** Human-readable blocker reason (e.g. "CAPTCHA required"). */
+    blockerReason?: string;
+    /** Whether a human can manually unblock this flow. */
+    canUserHelp?: boolean;
     errorMessage?: string;
+    /**
+     * Network-level assertions derived from captured XHR/fetch calls — one
+     * entry per unique method+pattern+status-family tuple. Carried through
+     * the summary so the frontend can render them without a second lookup.
+     */
+    assertions?: Array<{
+      type: 'network' | 'url' | 'console';
+      expect: string;
+    }>;
     steps: Array<{
       stepNumber: number;
       action: string;
