@@ -27,6 +27,17 @@ import { Request, Response } from 'express';
 const WARMUP_PREFIX = 'mobile_warmup:';
 const WARMUP_TTL = 900; // 15 minutes
 
+/**
+ * Pending-install flag: set when an APK is uploaded but the upload-time
+ * `autoBootAndInstall` couldn't reach a running emulator. Stores the
+ * storagePath of the APK that needs installing. Consumed by the next
+ * `installAppOnSession` call (at warmup time) which forces a full install
+ * even if Redis thinks the same APK is cached — because in reality the
+ * emulator may never have actually received it.
+ */
+const PENDING_INSTALL_PREFIX = 'mobile_pending_install:';
+const PENDING_INSTALL_TTL = 3600; // 1 hour
+
 export interface WarmupData {
   sessionId: string;
   runnerUrl: string;
@@ -891,18 +902,31 @@ export async function autoBootAndInstall(
     webSocketService.emitToUser(userId, 'mobile:boot:status', { projectId, stage, message, sessionId });
   };
 
+  // Helper: set pending-install flag so the next warmup re-runs the install.
+  // Used whenever upload-time boot/install can't complete and the user
+  // should still get their APK installed next time they open the editor.
+  const setPendingInstall = async (storagePath: string | undefined) => {
+    if (!storagePath) return;
+    const pendingKey = `${PENDING_INSTALL_PREFIX}${projectId}:${userId}`;
+    await redisConnection.set(pendingKey, storagePath, 'EX', PENDING_INSTALL_TTL).catch(() => {});
+  };
+
   try {
     if (!env.MOBILE_RUNNER_ENABLED) return;
 
     const client = getMobileRunnerClient();
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
+    // Load app so we know which storagePath to pend if we fail early
+    const project = await ProjectService.getProject(projectId, userId);
+    const appStoragePath = project?.settings?.mobileApp?.storagePath;
+
     // Check for existing session
     let sessionId: string | null = null;
     const existingRaw = await redisConnection.get(redisKey);
     if (existingRaw) {
       const existing: WarmupData = JSON.parse(existingRaw);
-      if (existing.sessionId) {
+      if (existing.sessionId && existing.sessionId !== '_booting') {
         const alive = await client.sessionExists(existing.sessionId);
         if (alive) {
           sessionId = existing.sessionId;
@@ -917,7 +941,11 @@ export async function autoBootAndInstall(
 
       const healthy = await client.isHealthy();
       if (!healthy) {
-        emit('error', 'Mobile runner is unavailable');
+        // Runner offline: don't hold the user's response for a 60s timeout.
+        // Mark the APK as pending-install so the next warmup picks it up.
+        await setPendingInstall(appStoragePath);
+        emit('error', 'Mobile runner is offline — the app will install when you open the editor');
+        logger.warn('[MOBILE_AUTO_BOOT] Runner unhealthy, pending install queued', { projectId });
         return;
       }
 
@@ -955,6 +983,12 @@ export async function autoBootAndInstall(
     const message = err instanceof Error ? err.message : String(err);
     emit('error', `Setup failed: ${message}`);
     logger.error('[MOBILE_AUTO_BOOT] Failed', { projectId, userId, error: message });
+
+    // Mark APK as pending so the next warmup re-attempts the install.
+    try {
+      const project = await ProjectService.getProject(projectId, userId);
+      await setPendingInstall(project?.settings?.mobileApp?.storagePath);
+    } catch { /* best-effort */ }
 
     // Clean up the _booting placeholder so warmup doesn't wait forever
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
@@ -999,8 +1033,23 @@ async function installAppOnSession(
   const warmupRaw = await redisConnection.get(redisKey);
   const warmup: WarmupData | null = warmupRaw ? JSON.parse(warmupRaw) : null;
 
-  // If the same APK is already installed (Redis knows), just relaunch — skip download + install
-  if (warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
+  // Check for a pending-install flag (set by autoBootAndInstall when the upload
+  // couldn't reach the emulator). If present AND matches the current APK, we
+  // must NOT trust the Redis/device dedup fast paths — force a full install.
+  const pendingKey = `${PENDING_INSTALL_PREFIX}${projectId}:${userId}`;
+  const pendingStoragePath = await redisConnection.get(pendingKey);
+  const hasPendingInstall = pendingStoragePath === mobileApp.storagePath;
+  if (hasPendingInstall) {
+    logger.info('[MOBILE_SESSION] Pending-install flag detected — forcing full install', {
+      sessionId,
+      projectId,
+      storagePath: mobileApp.storagePath,
+    });
+  }
+
+  // If the same APK is already installed (Redis knows), just relaunch — skip download + install.
+  // BUT: respect the pending-install flag which means we can't trust Redis state.
+  if (!hasPendingInstall && warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
     logger.debug('[MOBILE_SESSION] Same APK already installed (Redis), relaunching', {
       sessionId,
       projectId,
@@ -1014,8 +1063,9 @@ async function installAppOnSession(
 
   // If Redis expired but we know the package name, check the DEVICE directly.
   // This avoids expensive re-download + re-install when the app is still on the emulator.
+  // Skipped when a pending-install flag is set (we don't trust device state in that case).
   const knownPackage = appPackageOverride || mobileApp.packageName;
-  if (knownPackage) {
+  if (knownPackage && !hasPendingInstall) {
     try {
       const checkResult = await client.executeBatchCommands(sessionId, [
         { type: 'check_package', params: { packageName: knownPackage } },
@@ -1094,6 +1144,11 @@ async function installAppOnSession(
     warmup.installedPackage = packageName;
     warmup.appStoragePath = mobileApp.storagePath;
     await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
+  }
+
+  // Pending-install flag (if any) has now been consumed — clear it.
+  if (hasPendingInstall) {
+    await redisConnection.del(pendingKey);
   }
 
   logger.info('[MOBILE_SESSION] App installed on session', {
