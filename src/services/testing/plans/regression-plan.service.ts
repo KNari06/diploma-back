@@ -1685,28 +1685,69 @@ export class RegressionPlanService {
   }
 
   /**
-   * Detect flaky tests across multiple runs
-   * Flaky = fail rate between 10% and 90%
+   * Detect flaky tests across multiple runs + compute per-platform totals
+   * in a single pass. Flaky heuristic unchanged: fail rate 10–90% with
+   * ≥2 runs of the same test case.
+   *
+   * Combines two previously-separate passes (flaky detection + platform
+   * tally) so we only hit `test_executions` once per health report.
+   *
+   * Platform bucketing:
+   *   - `test_executions.platform` (NULL → 'web') for UI rows.
+   *   - `test_type === 'api'` → 'api' slice regardless of platform.
+   *   - `mobile_*` → 'mobile' slice.
+   *
+   * Returns both the flaky list (each entry tagged with its platform)
+   * AND the platform breakdown. Callers that don't need the breakdown
+   * can ignore it — the extra work is a few kB of memory in the shared
+   * scan. Kept as a private helper (old `detectFlakyTests` removed).
    */
-  private static async detectFlakyTests(runIds: string[]): Promise<FlakyTest[]> {
-    if (!runIds.length) return [];
+  private static async detectFlakyWithPlatformBreakdown(
+    runIds: string[],
+  ): Promise<{
+    flakyTests: FlakyTest[];
+    byPlatform: PlanHealthReport['byPlatform'];
+  }> {
+    const byPlatform = this.emptyHealthBreakdown();
+    if (!runIds.length) return { flakyTests: [], byPlatform };
 
+    // Select platform + test_type so we can bucket without a second query.
+    // `test_type` tells us API vs UI; `platform` tells us web vs mobile_*.
     const { data: executions } = await supabaseAdmin
       .from('test_executions')
-      .select('test_case_id, status')
+      .select('test_case_id, status, platform, test_type')
       .in('run_id', runIds)
       .in('status', ['passed', 'failed']);
 
-    if (!executions || executions.length === 0) return [];
+    if (!executions || executions.length === 0) {
+      return { flakyTests: [], byPlatform };
+    }
 
-    // Group by test_case_id
+    // Single pass: tally per-platform AND group by test_case_id for flaky.
     const groups = new Map<string, { total: number; failures: number }>();
-    for (const exec of executions) {
+    // Track the platform of each test case so we can tag the flaky entry
+    // without a second fetch. First-seen wins; executions for the same
+    // case are expected to share a platform, which they do because
+    // `intent_test_cases.platform` is denormalised onto test_executions
+    // at createBatch time (Phase 2).
+    const casePlatform = new Map<string, string | null>();
+
+    for (const exec of executions as any[]) {
+      // Platform bucket
+      const bucket = this.healthBucketFor(exec);
+      byPlatform[bucket].runs++;
+      if (exec.status === 'passed') byPlatform[bucket].passed++;
+      else if (exec.status === 'failed') byPlatform[bucket].failed++;
+
+      // Flaky grouping
       if (!exec.test_case_id) continue;
       const g = groups.get(exec.test_case_id) || { total: 0, failures: 0 };
       g.total++;
       if (exec.status === 'failed') g.failures++;
       groups.set(exec.test_case_id, g);
+      if (!casePlatform.has(exec.test_case_id)) {
+        casePlatform.set(exec.test_case_id, (exec as any).platform ?? null);
+      }
     }
 
     // Filter flaky (fail rate 10%-90%) and require at least 2 runs
@@ -1721,7 +1762,14 @@ export class RegressionPlanService {
       }
     }
 
-    if (!flakyIds.length) return [];
+    if (!flakyIds.length) return { flakyTests: [], byPlatform };
+
+    // Tally flakyCount per bucket using the case-platform map we built
+    // above. Cheaper than joining to intent_test_cases again.
+    for (const id of flakyIds) {
+      const bucket = this.healthBucketForPlatform(casePlatform.get(id) ?? null, false);
+      byPlatform[bucket].flakyCount++;
+    }
 
     // Get names
     const { data: names } = await supabaseAdmin
@@ -1734,7 +1782,7 @@ export class RegressionPlanService {
       nameMap.set(n.id, n.name);
     }
 
-    return flakyIds.map((id) => {
+    const flakyTests: FlakyTest[] = flakyIds.map((id) => {
       const d = flakyData.get(id)!;
       return {
         testCaseId: id,
@@ -1742,7 +1790,32 @@ export class RegressionPlanService {
         failRate: d.failRate,
         totalRuns: d.total,
         failures: d.failures,
+        platform: casePlatform.get(id) ?? null,
       };
     });
+
+    return { flakyTests, byPlatform };
+  }
+
+  /** Which slice of the plan-health breakdown a `test_executions` row
+   *  belongs to. Shared with `healthBucketForPlatform` — a thin wrapper so
+   *  the logic lives in one place. */
+  private static healthBucketFor(exec: {
+    platform?: string | null;
+    test_type?: string;
+  }): 'web' | 'mobile' | 'api' {
+    return this.healthBucketForPlatform(
+      exec.platform ?? null,
+      exec.test_type === 'api',
+    );
+  }
+
+  private static healthBucketForPlatform(
+    platform: string | null | undefined,
+    isApi: boolean,
+  ): 'web' | 'mobile' | 'api' {
+    if (isApi) return 'api';
+    if (platform && platform.startsWith('mobile_')) return 'mobile';
+    return 'web';
   }
 }

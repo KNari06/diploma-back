@@ -992,6 +992,20 @@ export interface RunReportSummary {
   byCategory: Record<string, number>;
   /** V14: Failure classification breakdown (flaky, real_bug, environment, test_drift) */
   byClassification?: Record<string, number>;
+  /**
+   * Phase 7 — count of executions per UI platform in this run.
+   * Derived from `test_executions.platform` (see Phase 2 denormalisation);
+   * NULL rows bucket to 'web'. API tests tracked via `test_type='api'`.
+   *
+   * Shape stays stable — zero-filled slices when a platform has no
+   * executions in this run. Frontend uses it to show "4 web + 1 mobile"
+   * on a run card or in the report header without re-counting executions.
+   */
+  platformBreakdown: {
+    web: { total: number; passed: number; failed: number };
+    mobile: { total: number; passed: number; failed: number };
+    api: { total: number; passed: number; failed: number };
+  };
 }
 
 /**

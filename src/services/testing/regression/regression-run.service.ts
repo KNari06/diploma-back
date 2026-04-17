@@ -878,15 +878,38 @@ export class RegressionRunService {
 
     if (!runs || runs.length === 0) return [];
 
-    // Batch fetch stats for all runs
+    // Batch fetch stats for all runs.
+    // Phase 7: also pull `platform` + `test_type` so each run row can
+    // carry a per-platform composition (web / mobile / api counts).
+    // Same single-query pattern as the existing stats fetch — no new
+    // round-trip, just two extra columns.
     const runIds = runs.map((r: any) => r.id);
     const { data: allExecs } = await supabaseAdmin
       .from('test_executions')
-      .select('run_id, status, duration_ms')
+      .select('run_id, status, duration_ms, platform, test_type')
       .in('run_id', runIds);
 
-    // Group by run_id and compute stats
+    // Bucket a raw `test_executions` row into web/mobile/api. Matches
+    // PlanHealthReport's bucketing exactly (see healthBucketForPlatform
+    // in regression-plan.service); duplicated as a local closure because
+    // the two services don't currently share a util layer and importing
+    // across would create a minor circular risk. When we extract a
+    // shared analytics-util module these should merge.
+    const bucketFor = (exec: any): 'web' | 'mobile' | 'api' => {
+      if (exec.test_type === 'api') return 'api';
+      const p = exec.platform as string | null | undefined;
+      if (p && p.startsWith('mobile_')) return 'mobile';
+      return 'web';
+    };
+    const emptyBreakdown = () => ({
+      web:    { total: 0, passed: 0, failed: 0 },
+      mobile: { total: 0, passed: 0, failed: 0 },
+      api:    { total: 0, passed: 0, failed: 0 },
+    });
+
+    // Group by run_id and compute stats + platform breakdown in one pass.
     const statsMap = new Map<string, any>();
+    const breakdownMap = new Map<string, ReturnType<typeof emptyBreakdown>>();
     const grouped = new Map<string, any[]>();
     for (const exec of allExecs || []) {
       const arr = grouped.get(exec.run_id) || [];
@@ -906,6 +929,18 @@ export class RegressionRunService {
         total, passed, failed, skipped, pending, running, cancelled,
         passRate: completed > 0 ? Math.round((passed / completed) * 100) : 0,
       });
+
+      // Platform breakdown for this run — zero-filled slices for platforms
+      // that don't appear in this run, so the frontend can render a
+      // consistent three-slot strip without null checks.
+      const bd = emptyBreakdown();
+      for (const exec of execs) {
+        const bucket = bucketFor(exec);
+        bd[bucket].total++;
+        if (exec.status === 'passed') bd[bucket].passed++;
+        else if (exec.status === 'failed') bd[bucket].failed++;
+      }
+      breakdownMap.set(rid, bd);
     }
 
     return runs.map((run: any) => {
@@ -931,6 +966,12 @@ export class RegressionRunService {
         passRate: runStats.passRate,
         stats: runStats,
         bugsFound,
+        /**
+         * Phase 7 — runs-list platform composition. Same shape as
+         * `RunReportSummary.platformBreakdown` on the report endpoint;
+         * frontend renders a compact "4 web / 1 mobile" chip.
+         */
+        platformBreakdown: breakdownMap.get(run.id) || emptyBreakdown(),
       };
     });
   }
@@ -2737,6 +2778,36 @@ export class RegressionRunService {
       }
     }
 
+    // Phase 7 — per-platform split for this single run. Built from the
+    // already-mapped `reportExecutions` so we don't re-scan the DB.
+    // Uses the same bucketing as PlanHealthReport (NULL → web,
+    // mobile_* → mobile, everything else depending on execution.source
+    // → api). Keeps the "how many web vs mobile vs api did THIS run do"
+    // question answerable without joining back to intent_test_cases.
+    const platformBreakdown = {
+      web:    { total: 0, passed: 0, failed: 0 },
+      mobile: { total: 0, passed: 0, failed: 0 },
+      api:    { total: 0, passed: 0, failed: 0 },
+    };
+    for (const re of reportExecutions) {
+      const raw = (re as any).platform as string | undefined;
+      // An execution from an API test case doesn't carry a UI platform.
+      // Today we don't have a dedicated `testType` on RunReportExecution,
+      // but the `testCaseId` shape + absent `steps[]` is a reasonable
+      // heuristic; if/when we add a hard `testType` field the check
+      // here should switch to that. For now: treat absent steps as API,
+      // otherwise bucket by platform string.
+      const looksLikeApi = !re.steps || re.steps.length === 0;
+      const bucket: 'web' | 'mobile' | 'api' =
+        looksLikeApi && !raw ? 'api'
+          : raw && raw.startsWith('mobile_') ? 'mobile'
+          : 'web';
+      platformBreakdown[bucket].total++;
+      const status = (re.status || '').toLowerCase();
+      if (status === 'passed' || status === 'completed') platformBreakdown[bucket].passed++;
+      else if (status === 'failed') platformBreakdown[bucket].failed++;
+    }
+
     const summary: RunReportSummary = {
       total: stats.total,
       passed: stats.passed,
@@ -2747,6 +2818,7 @@ export class RegressionRunService {
       bySeverity,
       byCategory,
       byClassification,
+      platformBreakdown,
     };
 
     // Compute duration (guard against negative if clocks are skewed)
