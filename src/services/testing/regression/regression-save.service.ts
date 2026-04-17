@@ -30,18 +30,42 @@ const MAX_COMMAND_LENGTH = 10000;
  */
 export class RegressionSaveService {
   /**
-   * Save a test flow as a reusable test case
+   * Save a test flow as a reusable test case.
    *
-   * @param params.sourceTestId - ID of completed test to save
-   * @param params.userId - User ID for ownership verification
-   * @param params.name - Display name for saved test case
-   * @param params.description - Optional description
-   * @returns Saved test case metadata
-   * @throws {NotFoundError} If source test not found
-   * @throws {ValidationError} If test cannot be saved (not completed, no URL, etc.)
+   * Two modes, determined by which inputs the caller provides:
+   *
+   *   A. From an executed test (web replay):
+   *      — pass `sourceTestId`.
+   *      — service loads the `tests` row, extracts commands/graph_ref,
+   *        and writes an `intent_test_cases` row with `replay_strategy`
+   *        = 'commands' | 'graph_extract'.
+   *
+   *   B. From a recording buffer (mobile, step editor, any platform that
+   *      does not materialize into a `tests` row before save):
+   *      — pass `projectId` + `platform` + `steps` (IntentStep[]).
+   *      — service writes the row directly with `replay_strategy='mobile_steps'`
+   *        (or 'steps_editor' for non-mobile) and `steps_json=steps`. No URL
+   *        check — mobile cases don't need one (runner uses `mobile://<platform>`
+   *        sentinel; step-editor sets URL via a subsequent PATCH if needed).
+   *
+   *   The two modes are mutually exclusive: if both `sourceTestId` and
+   *   `steps` are present, `sourceTestId` wins (the stored commands trump
+   *   a stale local buffer).
+   *
+   * @throws {NotFoundError} If source test not found (mode A) or project missing (mode B)
+   * @throws {ValidationError} If validation fails (no URL in mode A, empty steps in mode B, etc.)
    */
   static async saveTestCase(params: {
-    sourceTestId: string;
+    // mode A — from completed web test
+    sourceTestId?: string;
+    // mode B — from in-memory recording / step editor
+    projectId?: string;
+    platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    steps?: any[];
+    appPackage?: string;
+    startActivity?: string;
+    tags?: string[];
+    // common
     userId: string;
     name: string;
     description?: string;
@@ -49,10 +73,27 @@ export class RegressionSaveService {
   }): Promise<{
     savedTestCaseId: string;
     projectId: string;
-    replayStrategy: 'commands' | 'graph_extract';
+    replayStrategy: 'commands' | 'graph_extract' | 'mobile_steps' | 'steps_editor';
     parametersCount: number;
   }> {
     const { sourceTestId, userId, name, description, kind = 'standalone' } = params;
+
+    // ── Mode dispatch ─────────────────────────────────────────────
+    // If no sourceTestId, we're in "from recording" mode.
+    if (!sourceTestId) {
+      return this.saveFromRecording({
+        projectId: params.projectId,
+        userId,
+        name,
+        description,
+        kind,
+        platform: params.platform,
+        steps: params.steps,
+        appPackage: params.appPackage,
+        startActivity: params.startActivity,
+        tags: params.tags,
+      });
+    }
 
     try {
       logger.info('[REGRESSION_SAVE] Saving test case', {
@@ -140,6 +181,174 @@ export class RegressionSaveService {
     }
   }
 
+
+  /**
+   * Save an in-memory recording / step-editor buffer as a test case.
+   *
+   * Called from `saveTestCase` when the caller did NOT provide `sourceTestId`
+   * (i.e. there is no executed `tests` row to extract commands from).
+   *
+   * Writes directly to `intent_test_cases`:
+   *   - mobile_* platforms → `replay_strategy='mobile_steps'`, `steps_json=steps`.
+   *     Runner reads `steps_json` at dispatch time in `dispatchMobileTest`.
+   *   - web (step editor) → `replay_strategy='steps_editor'`, `steps_json=steps`.
+   *     `IntentStepConverterService.convertToCommands` handles it at run time.
+   *
+   * @throws {NotFoundError}   If project not found
+   * @throws {ValidationError} If access denied, invalid platform, or empty steps
+   */
+  private static async saveFromRecording(params: {
+    projectId?: string;
+    userId: string;
+    name: string;
+    description?: string;
+    kind: 'standalone' | 'regression_member';
+    platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    steps?: any[];
+    appPackage?: string;
+    startActivity?: string;
+    tags?: string[];
+  }): Promise<{
+    savedTestCaseId: string;
+    projectId: string;
+    replayStrategy: 'mobile_steps' | 'steps_editor';
+    parametersCount: number;
+  }> {
+    const {
+      projectId,
+      userId,
+      name,
+      description,
+      kind,
+      platform = 'web',
+      steps,
+      appPackage,
+      startActivity,
+      tags,
+    } = params;
+
+    if (!projectId) {
+      throw new ValidationError(
+        'projectId is required when saving without sourceTestId',
+      );
+    }
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      throw new ValidationError('name is required and must be non-empty');
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new ValidationError('steps must be a non-empty array of IntentStep');
+    }
+    const VALID_PLATFORMS = new Set([
+      'web', 'mobile_android', 'mobile_ios', 'mobile_flutter',
+    ]);
+    if (!VALID_PLATFORMS.has(platform)) {
+      throw new ValidationError(
+        `platform must be one of ${[...VALID_PLATFORMS].join(' | ')}, got '${platform}'`,
+      );
+    }
+
+    // Verify project ownership
+    const { data: project, error: projectError } = await supabaseAdmin
+      .from('projects')
+      .select('id, user_id')
+      .eq('id', projectId)
+      .single();
+    if (projectError || !project) {
+      throw new NotFoundError('Project', projectId);
+    }
+    if (project.user_id !== userId) {
+      throw new ValidationError('Access denied to this project');
+    }
+
+    // Normalize steps — shape must match what `dispatchMobileTest` extracts
+    // (see regression-run.service.ts) and what the step-editor run path
+    // expects. Same whitelist of keys for both platforms; extra keys dropped.
+    const normalizedSteps = steps.map((step: any, index: number) => ({
+      id: step?.id ?? `step_${index + 1}`,
+      type: step?.type ?? 'click',
+      description: step?.description ?? `Step ${index + 1}`,
+      ...(step?.value !== undefined ? { value: step.value } : {}),
+      ...(step?.assertionText ? { assertionText: step.assertionText } : {}),
+      ...(step?.bindingHints ? { bindingHints: step.bindingHints } : {}),
+      ...(step?.compiled ? { compiled: step.compiled } : {}),
+      ...(step?.options ? { options: step.options } : {}),
+      ...(step?.isAutoInjected ? { isAutoInjected: step.isAutoInjected } : {}),
+      ...(step?.expectedOutcome ? { expectedOutcome: step.expectedOutcome } : {}),
+    }));
+
+    const isMobile = platform.startsWith('mobile_');
+    const replayStrategy: 'mobile_steps' | 'steps_editor' = isMobile
+      ? 'mobile_steps'
+      : 'steps_editor';
+
+    // Mobile cases don't have a web URL; use a sentinel so downstream
+    // code that references url/start_url doesn't crash.
+    // `dispatchMobileTest` uses `mobile://${shortPlatform}` itself for the
+    // `tests` row, so this value is display-only.
+    const effectiveUrl = isMobile
+      ? `mobile://${platform.replace('mobile_', '')}`
+      : null;
+
+    logger.info('[REGRESSION_SAVE] Saving from recording buffer', {
+      projectId,
+      userId,
+      name,
+      platform,
+      stepsCount: normalizedSteps.length,
+      replayStrategy,
+      kind,
+    });
+
+    const { data: savedCase, error } = await supabaseAdmin
+      .from('intent_test_cases')
+      .insert({
+        project_id: projectId,
+        user_id: userId,
+        name,
+        description: description || null,
+        status: 'published',
+        kind,
+        platform,
+        replay_strategy: replayStrategy,
+        commands: null,
+        graph_ref: null,
+        steps_json: normalizedSteps,
+        parameters_schema: null,
+        url: effectiveUrl,
+        start_url: effectiveUrl,
+        tags: tags || null,
+        // Mobile app metadata carried inline until we add a dedicated column.
+        ...(isMobile && (appPackage || startActivity)
+          ? {
+              goal: JSON.stringify({
+                appPackage: appPackage || null,
+                startActivity: startActivity || null,
+              }),
+            }
+          : {}),
+      })
+      .select('id')
+      .single();
+
+    if (error || !savedCase) {
+      throw new Error(`Failed to save test case from recording: ${error?.message}`);
+    }
+
+    logger.info('[REGRESSION_SAVE] Test case saved from recording', {
+      intentTestCaseId: savedCase.id,
+      projectId,
+      platform,
+      stepsCount: normalizedSteps.length,
+      replayStrategy,
+    });
+
+    return {
+      savedTestCaseId: savedCase.id,
+      projectId,
+      replayStrategy,
+      parametersCount: 0,
+    };
+  }
 
   /**
    * Get source test and verify access

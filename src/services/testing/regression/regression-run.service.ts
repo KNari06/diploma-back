@@ -604,7 +604,8 @@ export class RegressionRunService {
   static async listSavedTestCases(
     projectId: string,
     userId: string,
-    limit: number = DEFAULT_LIST_LIMIT
+    limit: number = DEFAULT_LIST_LIMIT,
+    platform?: string,
   ): Promise<any[]> {
     // Verify access
     await this.verifyProjectAccess(projectId, userId);
@@ -613,10 +614,16 @@ export class RegressionRunService {
     const safeLimit = Math.min(Math.max(limit, 1), MAX_LIST_LIMIT);
 
     // Now fetches from intent_test_cases (unified table)
-    const { data: cases, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('intent_test_cases')
       .select('*')
-      .eq('project_id', projectId)
+      .eq('project_id', projectId);
+
+    if (platform) {
+      query = query.eq('platform', platform);
+    }
+
+    const { data: cases, error } = await query
       .order('created_at', { ascending: false })
       .limit(safeLimit);
 
