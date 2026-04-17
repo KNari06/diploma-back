@@ -80,7 +80,10 @@ export class MobileTestRunJobHandler {
       appOriginalName,
       ciRunId,
       metadata,
-      analyticsRunId,
+      // `analyticsRunId` is intentionally not destructured: see the
+      // comment inside `finalizeAnalyticsLinkage` for why we don't flip
+      // regression_runs from the job. The field stays on the job data
+      // type so future non-Phase-9 paths can consume it if needed.
       analyticsExecutionId,
       intelligentSessionId,
     } = job.data;
@@ -401,7 +404,6 @@ export class MobileTestRunJobHandler {
       // ── Phase 5.5: Finalize analytics linkage ────────────────
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
         analyticsExecutionId,
-        analyticsRunId,
         intelligentSessionId,
         passed: testPassed,
         durationMs: runResult.durationMs,
@@ -504,7 +506,6 @@ export class MobileTestRunJobHandler {
       // Same finalizer as the success path, different outcome.
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
         analyticsExecutionId,
-        analyticsRunId,
         intelligentSessionId,
         passed: false,
         errorMessage,
@@ -756,7 +757,6 @@ export class MobileTestRunJobHandler {
    */
   private static async finalizeAnalyticsLinkage(params: {
     analyticsExecutionId?: string;
-    analyticsRunId?: string;
     intelligentSessionId?: string;
     passed: boolean;
     durationMs?: number;
@@ -766,7 +766,6 @@ export class MobileTestRunJobHandler {
   }): Promise<void> {
     const {
       analyticsExecutionId,
-      analyticsRunId,
       intelligentSessionId,
       passed,
       durationMs,
@@ -797,30 +796,17 @@ export class MobileTestRunJobHandler {
       })());
     }
 
-    // Only flip regression_runs when the caller owns the whole run
-    // (chat handler passes both ids). Regression-plan runs manage their
-    // own run-level status in executeTestCasesAsync and must not be
-    // double-finalized per-case.
-    if (analyticsRunId && analyticsExecutionId) {
-      tasks.push((async () => {
-        try {
-          await supabaseAdmin
-            .from('regression_runs')
-            .update({
-              status: passed ? 'passed' : 'failed',
-              completed_at: new Date().toISOString(),
-            })
-            .eq('id', analyticsRunId)
-            // Don't stomp a run another code path already finalized.
-            .in('status', ['pending', 'running']);
-        } catch (err) {
-          logger.warn('[MOBILE-TEST] Failed to finalize regression_runs', {
-            analyticsRunId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      })());
-    }
+    // Note: `regression_runs.status` is intentionally NOT finalized here.
+    // Phase 9's `TestCompletionHandlerService.handleTestCompletion` reads
+    // aggregated `test_executions` and updates the run with a correct
+    // summary + emits the run-level WebSocket event + creates a user
+    // notification. If we flipped `regression_runs.status` here first, the
+    // optimistic-lock `.in('status', ['running','pending'])` in that
+    // handler would no-op and the WS/notification would be lost.
+    //
+    // `analyticsRunId` is kept on MobileTestJobData so future code that
+    // needs a pre-known run id (e.g. retry-backed failures that skip
+    // Phase 9) can use it without re-querying.
 
     if (intelligentSessionId) {
       tasks.push((async () => {
