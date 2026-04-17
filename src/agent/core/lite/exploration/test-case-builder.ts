@@ -320,7 +320,9 @@ export class TestCaseBuilder {
       depth: node.depth,
     }));
 
-    // Build individual flow results for history view
+    // Build individual flow results for history view. Carries assertions +
+    // blocker detail through the summary so the frontend renders them
+    // without a second fetch against the DiscoveredTestCase.
     const flows = testCases
       .filter((tc) => tc.explored)
       .map((tc) => ({
@@ -330,7 +332,10 @@ export class TestCaseBuilder {
         durationMs: tc.estimatedDurationMs,
         stepsCount: tc.steps.length,
         blockerType: tc.blocker?.type,
+        blockerReason: tc.blocker?.reason,
+        canUserHelp: tc.blocker?.canUserHelp,
         errorMessage: tc.blocker?.reason || tc.errors?.[0]?.message,
+        assertions: tc.assertions?.map((a) => ({ type: a.type, expect: a.expect })),
         steps: tc.steps.map((s) => ({
           stepNumber: s.stepNumber,
           action: s.action,

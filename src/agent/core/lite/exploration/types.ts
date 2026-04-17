@@ -641,7 +641,20 @@ export interface ExplorationSummary {
     durationMs?: number;
     stepsCount: number;
     blockerType?: string;
+    /** Human-readable blocker reason (e.g. "CAPTCHA required"). */
+    blockerReason?: string;
+    /** Whether a human can manually unblock this flow. */
+    canUserHelp?: boolean;
     errorMessage?: string;
+    /**
+     * Network-level assertions derived from captured XHR/fetch calls — one
+     * entry per unique method+pattern+status-family tuple. Carried through
+     * the summary so the frontend can render them without a second lookup.
+     */
+    assertions?: Array<{
+      type: 'network' | 'url' | 'console';
+      expect: string;
+    }>;
     steps: Array<{
       stepNumber: number;
       action: string;

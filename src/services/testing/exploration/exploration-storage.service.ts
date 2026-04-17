@@ -149,6 +149,16 @@ export class ExplorationStorageService {
     try {
       const records = testCases.map((tc) => {
         const intent = toIntentTestCase(tc, projectId, userId);
+        // Carry network assertions forward into tags as a compact tag
+        // `assert:METHOD:pattern:family`. This lets users filter regression
+        // runs by API touchpoint without a schema migration — the full
+        // TestAssertion shape is lost on round-trip but the operational
+        // information ("this flow hits POST /api/auth") survives. Capped
+        // to keep the tags array reviewable.
+        const assertionTags = (tc.assertions || [])
+          .slice(0, 8)
+          .map((a) => `assert:${a.type}:${a.source?.method ?? ''}:${a.source?.urlPattern ?? ''}:${a.source?.status ? Math.floor(a.source.status / 100) + 'xx' : ''}`);
+        const mergedTags = [...(intent.tags || []), ...assertionTags];
         return {
           project_id: projectId,
           user_id: userId,
@@ -156,7 +166,7 @@ export class ExplorationStorageService {
           description: intent.description || null,
           start_url: intent.startUrl || intent.url || null,
           steps_json: intent.stepsJson || [],
-          tags: intent.tags || [],
+          tags: mergedTags,
           priority: intent.priority || 'medium',
           expected_result: intent.expectedResult || null,
           preconditions: intent.preconditions || null,
