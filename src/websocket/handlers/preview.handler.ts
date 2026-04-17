@@ -1233,13 +1233,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // Import linting service dynamically to avoid circular deps
       const { IntentStepLintService } = await import('@/services/testing/ui/preview/intent-step-lint.service');
 
-      // V5: Use AI-powered linting with includeAlternatives flag
+      // V5: Use AI-powered linting with includeAlternatives flag.
+      // forceFreshSnapshot: this handler serves the Find button and the debounced
+      // typing lint — both are user-triggered moments where the 500ms snapshot
+      // cache can be stale (e.g. a modal just appeared). The per-call fresh
+      // collect adds ~170ms and only runs on explicit user intent.
       const result = await IntentStepLintService.lintStepWithAI({
         previewSessionId,
         stepDraft,
         pageRef,
         userId: ensuredUserId,
         includeAlternatives: !!includeAlternatives,
+        forceFreshSnapshot: true,
       });
 
       // V5: Handle needs_clarification status

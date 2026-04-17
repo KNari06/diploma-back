@@ -3043,12 +3043,16 @@ export class PreviewStepApplyService {
         }
       }
 
-      // Normal flow: Lint the step to get candidates
+      // Normal flow: Lint the step to get candidates.
+      // forceFreshSnapshot: apply is triggered by user clicking Run — the DOM may
+      // have changed since the last snapshot tick (e.g. a dropdown opened during
+      // typing, or a compiled shortcut just ran and mutated the page).
       const lintResult = await IntentStepLintService.lintStepWithAI({
         previewSessionId,
         stepDraft,
         pageRef: params.pageRef,
         userId,
+        forceFreshSnapshot: true,
       });
 
       if (lintResult.status === 'needs_clarification') {

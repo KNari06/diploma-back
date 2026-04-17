@@ -599,8 +599,16 @@ export class IntentStepLintService {
     userId: string;
     /** V5: When true, include full candidate list (for "Show alternatives") */
     includeAlternatives?: boolean;
+    /**
+     * When true, bypass the 500ms snapshot throttle and collect a fresh DOM.
+     * Set by user-triggered lint (Find button, debounced lint after typing) and
+     * by preview apply, where a stale cached DOM can cause false not_found results
+     * (e.g. a modal appeared since the last interval tick).
+     * Defaults to false so library consumers keep the historical throttled behavior.
+     */
+    forceFreshSnapshot?: boolean;
   }): Promise<LintResult> {
-    const { previewSessionId, stepDraft, userId, includeAlternatives = false } = params;
+    const { previewSessionId, stepDraft, userId, includeAlternatives = false, forceFreshSnapshot = false } = params;
 
     logger.debug('[INTENT_LINT] Linting step with LLM resolver', {
       previewSessionId,
@@ -620,12 +628,15 @@ export class IntentStepLintService {
       };
     }
 
-    // Get snapshot (throttled at 500ms — safe because frontend debounce is 2.5s)
-    // fullPage: include elements below viewport — replay can scrollIntoView before interacting
+    // Get snapshot. Throttle is bypassed when the caller signals user intent
+    // (Find button, debounced lint, apply) — the 500ms cache may be stale if a
+    // modal/dropdown just appeared or the user interacted with the page since
+    // the last interval tick. fullPage: include below-viewport elements.
     const sessionService = getPreviewSessionService();
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       includeDomNodes: true,
       fullPage: true,
+      force: forceFreshSnapshot,
     });
 
     if (!snapshot) {
