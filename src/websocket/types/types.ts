@@ -209,6 +209,23 @@ export interface ServerToClientEvents {
     elapsedMs: number;
   }) => void;
 
+  // Login required — emitted when the preview lands on a login / auth
+  // gate (URL match OR visible password field). Frontend uses this to
+  // surface the "Log in now / Use existing Login" chooser over the
+  // preview. Signal (one of):
+  //   'url'  — the URL matches /login|/signin|/auth/ patterns
+  //   'form' — the DOM contains a visible password input
+  //   'both' — both signals agree (highest confidence)
+  // `suggestedDomain` is the canonical hostname suitable for creating
+  // a new Login resource scoped to this site.
+  'preview:auth:required': (data: {
+    previewSessionId: string;
+    signal: 'url' | 'form' | 'both';
+    url: string;
+    suggestedDomain?: string;
+    timestamp: string;
+  }) => void;
+
   // Preview recording events
   'preview:recording:step': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;

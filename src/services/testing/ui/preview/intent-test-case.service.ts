@@ -63,6 +63,43 @@ export class IntentTestCaseService {
       kind,
     });
 
+    // Auto-attach workspace-configured resources (Login, Environment, etc)
+    // that match the test's scope. Fulfils the "use for all new tests on
+    // this site" UX promise set when the user created the resource.
+    // Best-effort — if lookup fails, we still create the test without
+    // bindings; user can attach manually.
+    //
+    // mobile_flutter is intentionally skipped — no resource adapter
+    // supports it yet; enriching with a web/android fallback would
+    // silently bind the wrong profile.
+    let resourceBindings: Array<{ kind: string; resource_id: string; required?: boolean }> = [];
+    const scopePlatform: 'web' | 'android' | 'ios' | null =
+      platform === 'web'
+        ? 'web'
+        : platform === 'mobile_android'
+          ? 'android'
+          : platform === 'mobile_ios'
+            ? 'ios'
+            : null;
+    if (scopePlatform !== null) {
+      try {
+        const { enrichBindingsWithDefaults } = await import('@/services/test-resource/test-resource.service');
+        resourceBindings = (await enrichBindingsWithDefaults({
+          userId,
+          projectId,
+          bindings: [],
+          scope: {
+            platform: scopePlatform,
+            url: startUrl ?? null,
+          },
+        })) as Array<{ kind: string; resource_id: string; required?: boolean }>;
+      } catch (enrichErr) {
+        logger.warn('[INTENT_TEST_CASE] enrichBindingsWithDefaults failed (non-fatal)', {
+          error: enrichErr instanceof Error ? enrichErr.message : String(enrichErr),
+        });
+      }
+    }
+
     const { data, error } = await supabaseAdmin
       .from('intent_test_cases')
       .insert({
@@ -76,6 +113,7 @@ export class IntentTestCaseService {
         status,
         kind,
         platform,
+        resource_bindings: resourceBindings,
       })
       .select('*')
       .single();

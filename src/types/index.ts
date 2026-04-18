@@ -36,6 +36,16 @@ export interface TestRunRequest {
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
   /** Prefilled steps from Smart Test Case Resolver for fast replay */
   prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[];
+  /**
+   * Test resources (Login, Environment, Secret, ...) bound to the source
+   * intent_test_case. Threaded through into TestJobData so the runner
+   * can apply each resource to the browser context before step 1.
+   */
+  resourceBindings?: Array<{
+    kind: string;
+    resource_id: string;
+    required?: boolean;
+  }>;
   /** V2: Additional metadata for linking and reporting */
   metadata?: {
     /** Intent test case ID if run from intent test case */
@@ -360,6 +370,18 @@ export interface TestJobData {
   mode?: 'lite' | 'pro'; // Test execution mode (default: 'lite')
   chatSessionId?: string; // Chat session ID for WebSocket routing isolation
   prefilledSteps?: import('@/services/testing/resolver/resolver.types').PrefilledStep[]; // Smart Resolver prefilled steps
+  /**
+   * Test resources bound to this run (auth logins, environments, secrets, etc).
+   * Resolved from `intent_test_cases.resource_bindings` + workspace defaults
+   * before the job is enqueued. The runner hands this to ResourceApplier
+   * which injects each resource into the browser context before step 1.
+   * `required: true` bindings fail the run if the resource is broken.
+   */
+  resourceBindings?: Array<{
+    kind: string;
+    resource_id: string;
+    required?: boolean;
+  }>;
   /** Internal: retry attempt number (set by test-retry.ts). 0 = initial, 1+ = retry */
   _retryAttempt?: number;
 }

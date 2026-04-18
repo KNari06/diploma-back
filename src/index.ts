@@ -47,6 +47,8 @@ import investorRoutes from '@/api/investor/investor.route';
 import workspaceRoutes from '@/api/workspace/workspace.routes';
 import invitesRoutes from '@/api/workspace/invites.routes';
 import testCaseRoutes from '@/api/test-case/test-case.routes';
+import testResourceRoutes from '@/api/test-resource/test-resource.routes';
+import { registerBuiltinResourceAdapters } from '@/services/test-resource';
 import { requireAuth, requireApproved } from '@/middleware/auth.middleware';
 import { swaggerSpec } from '@/config/api/swagger';
 import { env, isDevelopment } from '@/config/environment/env';
@@ -1314,6 +1316,7 @@ app.use(`/api/${env.API_VERSION}/mobile`, requireAuth, requireApproved, mobileRo
 app.use(`/api/${env.API_VERSION}/manual-test`, requireAuth, requireApproved, manualTestRoutes);
 app.use(`/api/${env.API_VERSION}/intelligent-test`, requireAuth, requireApproved, intelligentTestRoutes);
 app.use(`/api/${env.API_VERSION}/test-case`, requireAuth, requireApproved, testCaseRoutes);
+app.use(`/api/${env.API_VERSION}/test-resource`, requireAuth, requireApproved, testResourceRoutes);
 app.use(`/api/${env.API_VERSION}/chat`, requireAuth, requireApproved, chatRoutes);
 app.use(`/api/${env.API_VERSION}/chat/feedback`, requireAuth, requireApproved, feedbackRoutes);
 app.use(`/api/${env.API_VERSION}/api-test`, requireAuth, requireApproved, apiTestRoutes);
@@ -1389,6 +1392,10 @@ app.use(notFoundHandler);
 
 // Error handler
 app.use(errorHandler);
+
+// Wire resource adapters into the registry once per process. Safe to call
+// before the server starts listening — it's a pure in-memory operation.
+registerBuiltinResourceAdapters();
 
 // Start server
 const startServer = async () => {

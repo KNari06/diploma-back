@@ -517,6 +517,29 @@ export class PreviewSessionService {
           // Non-fatal: preview should work without blocker
         }
 
+        // Register auto-dismiss for known blocking overlays (react-joyride,
+        // intro.js, shepherd, driver.js). These tour libraries put a
+        // full-viewport overlay on top of the page that intercepts pointer
+        // events — Playwright's addLocatorHandler dismisses them before
+        // every actionability check. No cost when no overlay is present.
+        try {
+          const { registerOverlayAutoDismiss } = await import('../auto-dismiss-overlays');
+          await registerOverlayAutoDismiss(page);
+        } catch {
+          // Non-fatal
+        }
+
+        // Attach auth-gate detector. Emits preview:auth:required the
+        // first time the preview lands on a login URL or sees a password
+        // input, so the frontend can prompt the user to pick an existing
+        // Login resource or record a new one.
+        try {
+          const { attachAuthDetector } = await import('./auth-detector');
+          attachAuthDetector(page, sessionId);
+        } catch {
+          // Non-fatal — recording still works without the detector.
+        }
+
         // Stage 2: Load page
         emitProgress('loading_page', 40);
 
@@ -731,6 +754,24 @@ export class PreviewSessionService {
         await setupThirdPartyBlocker(newPage);
       } catch {
         // Non-fatal: preview should work without blocker
+      }
+
+      // Auto-dismiss blocking overlays (tour libraries, cookie banners).
+      // See auto-dismiss-overlays.ts for full rationale.
+      try {
+        const { registerOverlayAutoDismiss } = await import('../auto-dismiss-overlays');
+        await registerOverlayAutoDismiss(newPage);
+      } catch {
+        // Non-fatal
+      }
+
+      // Re-attach auth detector after reset — session id stays the same,
+      // the detector is idempotent via WeakSet on the new page handle.
+      try {
+        const { attachAuthDetector } = await import('./auth-detector');
+        attachAuthDetector(newPage, sessionId);
+      } catch {
+        // Non-fatal
       }
 
       await newPage.goto(startUrl, {

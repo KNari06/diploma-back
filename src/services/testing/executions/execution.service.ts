@@ -121,8 +121,16 @@ export class ExecutionService {
    * @param params - Update parameters
    */
   static async updateStatus(params: UpdateExecutionStatusParams): Promise<void> {
-    const { id, status, durationMs, result, errorMessage, screenshotUrl, traceUrl } =
-      params;
+    const {
+      id,
+      status,
+      durationMs,
+      result,
+      errorMessage,
+      screenshotUrl,
+      traceUrl,
+      executedResources,
+    } = params;
 
     const updates: Record<string, any> = { status };
 
@@ -131,6 +139,9 @@ export class ExecutionService {
     if (errorMessage !== undefined) updates.error_message = errorMessage;
     if (screenshotUrl !== undefined) updates.screenshot_url = screenshotUrl;
     if (traceUrl !== undefined) updates.trace_url = traceUrl;
+    // executed_resources is NOT NULL DEFAULT '[]'::jsonb in the schema;
+    // send the array as-is (supabase-js will JSON-encode the jsonb column).
+    if (executedResources !== undefined) updates.executed_resources = executedResources;
 
     // Set timestamps based on status
     if (status === 'running') {
@@ -151,6 +162,41 @@ export class ExecutionService {
         status,
       });
       throw new Error(`Failed to update execution: ${error.message}`);
+    }
+  }
+
+  /**
+   * Persist executed_resources snapshot onto all test_executions rows
+   * whose `result->>testId` matches this testId. This is the post-run
+   * back-channel from the BullMQ job → regression analytics — the
+   * worker doesn't know the execId(s) but it has the testId.
+   *
+   * Best-effort, non-throwing: a missed snapshot degrades audit trail
+   * but must NEVER fail a successful test.
+   */
+  static async persistExecutedResourcesByTestId(
+    testId: string,
+    executedResources: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    if (!testId || !Array.isArray(executedResources) || executedResources.length === 0) {
+      return;
+    }
+    try {
+      const { error } = await supabaseAdmin
+        .from('test_executions')
+        .update({ executed_resources: executedResources })
+        .eq('result->>testId', testId);
+      if (error) {
+        logger.warn('[EXECUTION_SERVICE] Failed to persist executed_resources', {
+          testId,
+          error: error.message,
+        });
+      }
+    } catch (err) {
+      logger.warn('[EXECUTION_SERVICE] persistExecutedResourcesByTestId threw', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 

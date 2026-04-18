@@ -68,6 +68,7 @@ export class ManualTestRunJobHandler {
       testGoal,
       mode,
       chatSessionId,
+      resourceBindings,
     } = job.data;
 
     // Validate required parameters
@@ -159,6 +160,9 @@ export class ManualTestRunJobHandler {
           intelligentMode,
           testGoal,
           mode,
+          // Resource bindings — applier injects cookies/env before step 1,
+          // supervisor auto-heals if session drops mid-run.
+          resourceBindings,
         },
         MAX_RETRIES
       );
@@ -498,6 +502,23 @@ export class ManualTestRunJobHandler {
         // Continue execution - test result is saved
       }
 
+      // Persist test_resources snapshot (Login, Environment, ...) onto
+      // the matching test_executions row(s). Fire-and-forget internally —
+      // we don't retry because the row may not exist (standalone test,
+      // not part of a regression run), which is legitimate.
+      if (result.executedResources && result.executedResources.length > 0) {
+        try {
+          const { ExecutionService } = await import('@/services/testing/executions/execution.service');
+          await ExecutionService.persistExecutedResourcesByTestId(
+            testId,
+            result.executedResources,
+          );
+        } catch {
+          // non-fatal — persist helper already swallows, this try just
+          // protects against import failure
+        }
+      }
+
       logger.info(`[TEST-RUN] Test completed successfully: ${testId}`, {
         browser,
         logsCount: result.logs?.length || 0,
@@ -604,6 +625,20 @@ export class ManualTestRunJobHandler {
         browser,
         error: statusError instanceof Error ? statusError.message : String(statusError),
       });
+    }
+
+    // Persist test_resources snapshot on failure too — diagnosing a
+    // failed run needs to know which Login / Env was live when it broke.
+    if (result?.executedResources && result.executedResources.length > 0) {
+      try {
+        const { ExecutionService } = await import('@/services/testing/executions/execution.service');
+        await ExecutionService.persistExecutedResourcesByTestId(
+          testId,
+          result.executedResources,
+        );
+      } catch {
+        // non-fatal
+      }
     }
   }
 

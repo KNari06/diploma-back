@@ -1,4 +1,4 @@
-import { recordVisit, updateVisitEngagement, getVisits } from './investor.controller';
+import { recordVisit, updateVisitEngagement, getVisits, deleteVisit, deleteVisitsByVisitor } from './investor.controller';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router, json, text, Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
@@ -57,13 +57,16 @@ const adminVisitsLimiter = rateLimit({
   message: { success: false, error: 'Too many requests' },
 });
 
-router.get('/visits', adminVisitsLimiter, (req: Request, res: Response, next: NextFunction) => {
-  const key = req.query.key;
-  if (!key || typeof key !== 'string') {
+// Admin auth: accepts password via ?key= (GET) or X-Admin-Key header (DELETE).
+// Hashes it server-side and compares with INVESTOR_HASH env var.
+function requireAdminKey(req: Request, res: Response, next: NextFunction) {
+  const key = (typeof req.query.key === 'string' && req.query.key) ||
+              (typeof req.headers['x-admin-key'] === 'string' && req.headers['x-admin-key'] as string) ||
+              '';
+  if (!key) {
     res.status(401).json({ success: false, error: 'Access key required' });
     return;
   }
-  // Hash the provided key and compare with the investor hash from env
   const hash = crypto.createHash('sha256').update(key).digest('hex');
   const expected = process.env.INVESTOR_HASH || '';
   if (!expected || hash !== expected) {
@@ -71,6 +74,35 @@ router.get('/visits', adminVisitsLimiter, (req: Request, res: Response, next: Ne
     return;
   }
   next();
-}, asyncHandler(getVisits));
+}
+
+router.get('/visits', adminVisitsLimiter, requireAdminKey, asyncHandler(getVisits));
+
+/**
+ * DELETE /api/v1/investor/visits/by-visitor
+ * Bulk-delete all visits by (name [+ optional ip/month]). Admin-only.
+ * Body: { name: string, ip?: string, month?: string }
+ * NOTE: must be registered BEFORE DELETE /:id so Express doesn't capture
+ * "by-visitor" as an :id param.
+ */
+const adminDeleteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { success: false, error: 'Too many requests' },
+});
+
+router.delete(
+  '/visits/by-visitor',
+  adminDeleteLimiter,
+  requireAdminKey,
+  json(),
+  asyncHandler(deleteVisitsByVisitor)
+);
+
+/**
+ * DELETE /api/v1/investor/visits/:id
+ * Delete a single visit by UUID. Admin-only.
+ */
+router.delete('/visits/:id', adminDeleteLimiter, requireAdminKey, asyncHandler(deleteVisit));
 
 export default router;

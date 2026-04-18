@@ -29,6 +29,14 @@ import { TestExecutedStepsRedisService } from '@/services/testing/results/test-e
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { setupThirdPartyBlocker } from '../execution/third-party-blocker';
+import {
+  applyBindingsToContext,
+  teardownAppliedResources,
+  checkAndHealIfNeeded,
+  NavigationStatusTracker,
+  type ApplyResult,
+} from '@/services/test-resource';
+import { createCommandExecutorRecipeRunner } from '@/services/test-resource/runtime/recipe-executor';
 
 /**
  * Resolve workspaceId from projectId (for AI usage tracking).
@@ -173,6 +181,22 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   needsVideoOnRetry?: boolean;
   /** V16: Credits ran out during execution but run was allowed to complete */
   creditsExhausted?: boolean;
+  /**
+   * Snapshot of test_resources applied to this run (non-sensitive).
+   * Mirrors ApplyResult.applied with heal_during_run flags flipped by
+   * the supervisor. Caller writes this into test_executions.executed_resources
+   * + regression_runs.executed_resources for reproducibility / audit.
+   * Empty array = run did not bind any resources.
+   */
+  executedResources?: Array<{
+    kind: string;
+    resource_id: string;
+    name: string;
+    required: boolean;
+    status_at_start: string;
+    healed_during_run: boolean;
+    apply_error?: string;
+  }>;
 }> {
   let page: Page | null = null;
   let context: BrowserContext | null = null;
@@ -180,6 +204,40 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
   let videoStreamService: VideoStreamService | null = null;
   /** V14: Hoisted for access in outer catch — replay trace JSONL file path */
   let replayTraceFilePath: string | undefined;
+  /**
+   * Test-Resources binding snapshot. Populated right after context creation,
+   * mutated by the supervisor if a heal happens mid-run, and finally
+   * persisted into test_executions.executed_resources by the caller.
+   * Kept at the top scope so the outer finally can teardown resources
+   * even when a step throws.
+   */
+  let resourceApply: ApplyResult | null = null;
+
+  // Snapshot projector — shared by every return path so the caller always
+  // gets the final, heal-mutated state. Returns undefined when no bindings
+  // were applied (saves JSONB roundtrip for untouched tests).
+  const buildExecutedResourcesSnapshot = ():
+    | Array<{
+        kind: string;
+        resource_id: string;
+        name: string;
+        required: boolean;
+        status_at_start: string;
+        healed_during_run: boolean;
+        apply_error?: string;
+      }>
+    | undefined => {
+    if (!resourceApply || resourceApply.applied.length === 0) return undefined;
+    return resourceApply.applied.map((a) => ({
+      kind: a.binding.kind,
+      resource_id: a.binding.resource_id,
+      name: a.name,
+      required: a.binding.required,
+      status_at_start: a.status_at_start,
+      healed_during_run: a.healed_during_run,
+      apply_error: a.apply_error,
+    }));
+  };
 
   // Create runKey for isolation of parallel browser runs (defined here for access in catch block)
   const runKey = createRunKey(testData.testId, testData.browser);
@@ -217,6 +275,16 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       throw new Error('Failed to create page');
     }
 
+    // Auto-dismiss blocking overlays (react-joyride tours, cookie banners,
+    // intro.js / shepherd / driver.js). Playwright's addLocatorHandler fires
+    // before every actionability check. Zero cost on clean pages.
+    try {
+      const { registerOverlayAutoDismiss } = await import('@/services/testing/ui/auto-dismiss-overlays');
+      await registerOverlayAutoDismiss(page);
+    } catch {
+      // Non-fatal
+    }
+
     // ✅ Block third-party requests (analytics, tracking, chat widgets)
     // This prevents Playwright's waitForNavigation/networkidle from waiting
     // for slow third-party services (Intercom, Google Analytics, etc.)
@@ -249,6 +317,53 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       context,
       page,
     });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Test Resources — apply bindings (Login, Environment, Secret, ...) to
+    // the browser context BEFORE the first navigation. This is what makes
+    // a test start already-authenticated: cookies + localStorage injected
+    // here survive the upcoming page.goto().
+    //
+    // Order matters:
+    //   1. Context created (above)   — empty session
+    //   2. Resources applied (here)  — inject session/env/secrets
+    //   3. navigateToUrl (below)     — first request carries cookies
+    //
+    // Missing/stale resources are healed under a per-resource mutex so
+    // 10 parallel tests that all use "Admin login" share ONE heal. The
+    // supervisor hook is wired inside LiteEngine per-step; here we only
+    // do the pre-run apply.
+    // ═══════════════════════════════════════════════════════════════════════
+    if (testData.resourceBindings && testData.resourceBindings.length > 0) {
+      try {
+        resourceApply = await applyBindingsToContext({
+          userId: testData.userId ?? '',
+          projectId: testData.projectId,
+          context,
+          page,
+          bindings: testData.resourceBindings,
+          // Pre-run heal path: the supervisor isn't wired yet (no step
+          // loop running). For the MVP we let stale auth resources fall
+          // through to markBroken rather than replay a recipe with no
+          // executor — the supervisor between steps will heal on the
+          // first live loss anyway.
+        });
+        logger.info('[PLAYWRIGHT] Test resources applied', {
+          testId: testData.testId,
+          applied: resourceApply.applied.length,
+          skipped: resourceApply.skipped.length,
+        });
+      } catch (resErr) {
+        // Hard-fail: a `required: true` binding couldn't be applied.
+        // Better to surface immediately than have a test fail
+        // mysteriously on step 1.
+        logger.error('[PLAYWRIGHT] Required resource binding failed', {
+          testId: testData.testId,
+          error: resErr instanceof Error ? resErr.message : String(resErr),
+        });
+        throw resErr;
+      }
+    }
 
     // Enable Performance Observers for Web Vitals collection (must run before navigation)
     try {
@@ -438,9 +553,74 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Cascading failure detection — stop early if N consecutive steps fail
       let consecutiveFailures = 0;
 
+      // ═══════════════════════════════════════════════════════════════════
+      // Supervisor wiring — auth-loss detection between steps.
+      //
+      // The tracker attaches ONE page.on('response') listener that remembers
+      // the last navigation status (401/403 = strong auth-loss signal).
+      // checkAndHealIfNeeded combines that with a URL pattern + password-
+      // input probe, then replays the recipe under a per-resource mutex
+      // if all signals agree. Healthy runs pay nothing more than a URL
+      // regex test per step.
+      //
+      // Only auth kind can heal today; the supervisor is a no-op if no
+      // auth binding was resolved. Leaves the door open for environment/
+      // oauth_token heals later (same interface).
+      // ═══════════════════════════════════════════════════════════════════
+      // Page and context are non-null here — we're inside the
+      // Background-Replay block which runs AFTER setupBrowserContext() +
+      // context.newPage(). Non-null assertions match the pattern used
+      // elsewhere in this function (see `let activePage = page!` below).
+      const navTracker = new NavigationStatusTracker();
+      navTracker.attach(page!);
+      const authResource = resourceApply
+        ? Array.from(resourceApply.resources.values()).find((r) => r.kind === 'auth')
+        : undefined;
+      const recipeRunner = createCommandExecutorRecipeRunner();
+
       try {
         for (const command of commands) {
           currentStepIndex++;
+
+          // ── Check for auth loss BEFORE each step. Healthy → no-op.
+          //    On heal success, retry is implicit — the same command
+          //    will now run against the re-authenticated session. No
+          //    explicit retry-count here: heal itself is idempotent and
+          //    the per-resource mutex prevents thundering herd.
+          if (authResource && resourceApply) {
+            try {
+              const healed = await checkAndHealIfNeeded(
+                {
+                  userId: testData.userId ?? '',
+                  projectId: testData.projectId,
+                  page: page!,
+                  context: context!,
+                  authResource,
+                  recipeExecutor: recipeRunner,
+                  appliedSnapshot: resourceApply.applied,
+                },
+                navTracker,
+              );
+              if (healed) {
+                logger.info('[PLAYWRIGHT] Auth healed mid-run — continuing', {
+                  testId: testData.testId,
+                  stepIndex: currentStepIndex,
+                  resourceId: authResource.id,
+                });
+              }
+            } catch (healErr) {
+              // Heal failure is fatal — the session is gone and we can't
+              // get it back. Fail the test with a clear reason; outer
+              // handler will mark the run as failed.
+              const reason = healErr instanceof Error ? healErr.message : String(healErr);
+              logger.error('[PLAYWRIGHT] Auth heal failed mid-run', {
+                testId: testData.testId,
+                stepIndex: currentStepIndex,
+                error: reason,
+              });
+              throw new Error(`Session lost and could not be restored: ${reason}`);
+            }
+          }
 
           // Check cascading failure threshold before executing next step
           if (consecutiveFailures >= COMMAND_EXECUTOR_CONFIG.maxConsecutiveFailuresBeforeTermination) {
@@ -1519,6 +1699,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         qualityChecks, // Non-UI quality checks — stored in test_results for user viewing
         needsVideoOnRetry, // Flag: self-healing was triggered, enable video on next retry
         creditsExhausted, // V16: Credits ran out mid-run but execution continued
+        executedResources: buildExecutedResourcesSnapshot(),
       };
     }
 
@@ -1774,6 +1955,27 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       }
     }
 
+    // Teardown applied resources BEFORE context is closed by artifact
+    // cleanup. Adapters that own external state (e.g. data_fixture API
+    // cleanup, file download deletion) need the context live.
+    if (resourceApply && context && page) {
+      try {
+        await teardownAppliedResources({
+          userId: testData.userId ?? '',
+          projectId: testData.projectId,
+          page,
+          context,
+          resources: resourceApply.resources,
+          runVariables: resourceApply.runVariables,
+        });
+      } catch (trErr) {
+        logger.debug('[PLAYWRIGHT] Resource teardown failed (non-fatal)', {
+          testId: testData.testId,
+          error: trErr instanceof Error ? trErr.message : String(trErr),
+        });
+      }
+    }
+
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};
     try {
@@ -1805,13 +2007,19 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     TestRunRegistry.setCompleted(runKey);
     TestRunRegistry.unregister(runKey);
 
-    // Format and return result
-    return formatTestResult(intelligentResult, {
-      videoUrl: uploadedArtifacts.videoUrl,
-      videoPath: artifacts.videoPath,
-      traceUrl: uploadedArtifacts.traceUrl,
-      tracePath: artifacts.tracePath,
-    });
+    // Format and return result. Spread the resource snapshot on top so
+    // callers (regression-run, completion-handler) can persist the
+    // executed_resources column without needing to know which code path
+    // produced the result.
+    return {
+      ...formatTestResult(intelligentResult, {
+        videoUrl: uploadedArtifacts.videoUrl,
+        videoPath: artifacts.videoPath,
+        traceUrl: uploadedArtifacts.traceUrl,
+        tracePath: artifacts.tracePath,
+      }),
+      executedResources: buildExecutedResourcesSnapshot(),
+    };
 
   } catch (error) {
     // Handle cancellation
@@ -1886,6 +2094,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         tracePath: artifacts.tracePath,
         replayTraceUrl: cancelledReplayTraceUrl,
         creditsExhausted: false,
+        executedResources: buildExecutedResourcesSnapshot(),
       };
     }
 
@@ -1970,6 +2179,25 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       }
     }
 
+    // Teardown applied resources BEFORE context is closed (error path).
+    if (resourceApply && context && page) {
+      try {
+        await teardownAppliedResources({
+          userId: testData.userId ?? '',
+          projectId: testData.projectId,
+          page,
+          context,
+          resources: resourceApply.resources,
+          runVariables: resourceApply.runVariables,
+        });
+      } catch (trErr) {
+        logger.debug('[PLAYWRIGHT] Resource teardown failed during error cleanup', {
+          testId: testData.testId,
+          error: trErr instanceof Error ? trErr.message : String(trErr),
+        });
+      }
+    }
+
     // Collect artifacts and cleanup (best-effort)
     let artifacts: { videoPath?: string; tracePath?: string } = {};
     try {
@@ -2023,6 +2251,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       tracePath: artifacts.tracePath,
       replayTraceUrl: failedReplayTraceUrl,
       creditsExhausted: false,
+      executedResources: buildExecutedResourcesSnapshot(),
     };
   }
 }

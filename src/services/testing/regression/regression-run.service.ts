@@ -440,6 +440,13 @@ export class RegressionRunService {
     commands = this.applyParameters(resolvedCommands, parameters);
 
     // Build request
+    // Resource bindings (Login, Environment, Secret, ...) travel with the
+    // test request so the runner can apply them before the first step.
+    // select('*') above already pulled this column.
+    const resourceBindings = Array.isArray(intentCase.resource_bindings)
+      ? intentCase.resource_bindings
+      : [];
+
     return {
       url: targetUrl,
       projectId: intentCase.project_id,
@@ -449,6 +456,7 @@ export class RegressionRunService {
       testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
       options: sourceTest?.options || {},
+      resourceBindings,
       metadata: {
         intentTestCaseId: intentCase.id,
         intentTestCaseName: intentCase.name,

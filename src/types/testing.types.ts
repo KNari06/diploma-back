@@ -754,6 +754,14 @@ export interface UpdateExecutionStatusParams {
   errorMessage?: string;
   screenshotUrl?: string;
   traceUrl?: string;
+  /**
+   * Non-sensitive snapshot of test_resources bound to this execution.
+   * Shape: Array<{ kind, resource_id, name, required, status_at_start,
+   * healed_during_run, apply_error? }>. Persisted to
+   * test_executions.executed_resources for reproducibility / audit.
+   * Empty / undefined = run had no resource bindings.
+   */
+  executedResources?: Array<Record<string, unknown>>;
 }
 
 // ============================================================================
