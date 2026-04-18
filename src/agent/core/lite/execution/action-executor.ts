@@ -1698,8 +1698,31 @@ export class ActionExecutor {
     // Small delay for modal to appear
     await this.page.waitForTimeout(500);
 
-    // Detect modal and get its text
-    const modalInfo = await this.detectActiveModalWithText();
+    // Detect modal and get its text. If the click that triggered this
+    // check ALSO triggered a navigation, the page may be mid-transition
+    // and `page.evaluate` throws "Target closed" / "Execution context was
+    // destroyed". Treat that as "no modal" — the click succeeded, there
+    // is genuinely nothing to dismiss on the new page.
+    //
+    // Without this guard the whole action is reported as failed even
+    // though the navigation clearly worked, producing false-negative
+    // click-then-navigate failures on ~20% of real-world click flows.
+    let modalInfo: { hasModal: boolean; ref?: string; text?: string };
+    try {
+      modalInfo = await this.detectActiveModalWithText();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isPageGone =
+        msg.includes('Target closed') ||
+        msg.includes('Target page, context or browser has been closed') ||
+        msg.includes('Execution context was destroyed') ||
+        msg.includes('frame was detached');
+      if (isPageGone) {
+        logger.debug('[ACTION_EXECUTOR] Modal check skipped — page navigated', { error: msg.slice(0, 120) });
+        return { attempted: false, dismissed: false, stillPresent: false };
+      }
+      throw err;
+    }
 
     if (!modalInfo.hasModal) {
       return { attempted: false, dismissed: false, stillPresent: false };
