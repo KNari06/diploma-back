@@ -186,21 +186,25 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             sessionId: existing.sessionId,
           });
 
+          // Run install+launch_app BEFORE responding, so the preview stream shows
+          // the app already open. On a reused session this usually hits the fast
+          // path (Redis match or device check) and just issues launch_app.
+          try {
+            await installAppOnSession(client, existing.sessionId, projectId, userId, appPackage);
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              projectId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+
           res.json({
             success: true,
             sessionId: existing.sessionId,
             runnerSocketUrl: existing.runnerSocketUrl,
             platform: existing.platform,
             reused: true,
-          });
-
-          // Retry app install in background (idempotent — runner ignores if already installed)
-          installAppOnSession(client, existing.sessionId, projectId, userId, appPackage).catch((err) => {
-            logger.warn('[MOBILE_SESSION] Background app install on reused session failed (non-fatal)', {
-              sessionId: existing.sessionId,
-              projectId,
-              error: err instanceof Error ? err.message : String(err),
-            });
           });
 
           return;
@@ -219,8 +223,24 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    // Create session on runner
-    const session = await client.createSession(platform);
+    // Try pool first (instant claim of a pre-booted emulator); fall back to
+    // createSession only if the pool is disabled / exhausted / unreachable.
+    // Mirrors the 3-tier pattern used by mobile-test-run.job.ts.
+    let session: Awaited<ReturnType<typeof client.createSession>>;
+    try {
+      session = await client.claimSession(platform);
+      logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
+        projectId,
+        sessionId: session.sessionId,
+        platform,
+      });
+    } catch (poolErr) {
+      logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
+        projectId,
+        error: poolErr instanceof Error ? poolErr.message : String(poolErr),
+      });
+      session = await client.createSession(platform);
+    }
 
     // Derive socket URL from runner URL
     const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
@@ -251,24 +271,25 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       platform,
     });
 
-    // Install the project's mobile app onto the emulator (best-effort, non-blocking).
-    // This runs after we return the response so the frontend can connect to the stream
-    // while the app downloads, uploads, and installs.
+    // Install the project's mobile app and run launch_app BEFORE returning, so the
+    // preview stream shows the app already open when the frontend connects.
+    // Non-fatal: on failure we still return the session so the user can retry.
+    try {
+      await installAppOnSession(client, session.sessionId, projectId, userId, appPackage);
+    } catch (err) {
+      logger.warn('[MOBILE_SESSION] App install/launch during warmup failed (non-fatal)', {
+        sessionId: session.sessionId,
+        projectId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     res.status(201).json({
       success: true,
       sessionId: session.sessionId,
       runnerSocketUrl,
       platform,
       reused: false,
-    });
-
-    // Fire-and-forget: install app in background
-    installAppOnSession(client, session.sessionId, projectId, userId, appPackage).catch((err) => {
-      logger.warn('[MOBILE_SESSION] Background app install failed (non-fatal)', {
-        sessionId: session.sessionId,
-        projectId,
-        error: err instanceof Error ? err.message : String(err),
-      });
     });
   } catch (error) {
     logger.error('[MOBILE_SESSION] Warmup failed', {
@@ -1087,6 +1108,12 @@ async function installAppOnSession(
           warmup.appStoragePath = mobileApp.storagePath;
           await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
         }
+
+        // Persist packageName to project settings so future warmups can hit
+        // this fast path even after Redis expires (knownPackage may have come
+        // from appPackageOverride when mobileApp.packageName was null).
+        await persistPackageName(projectId, userId, mobileApp, knownPackage);
+
         return;
       }
     } catch (err) {
@@ -1124,18 +1151,23 @@ async function installAppOnSession(
         apkPath: uploaded.path,
         reinstall: true, // use -r as safety net — if uninstall failed silently, install still works
         clearData: true, // always wipe app data for clean state after install
+        autoLaunch: false, // always launch via an explicit launch_app command below for determinism
         ...(shouldUninstallOld ? { uninstallOldPackage: oldPackage } : {}),
-        ...(explicitPackage ? { autoLaunch: false } : {}),
       },
     },
   ], { timeoutMs: 120_000 }); // 2 min — adb install can take 60s+ for large APKs
 
-  const detected = (installResult?.results?.[0] as any)?.packageName as string | undefined;
+  // Runner wraps every command result as { success, data, durationMs, ... }.
+  // The install handler returns { installed, packageName } inside `data`.
+  const detected = (installResult?.results?.[0] as any)?.data?.packageName as string | undefined;
   const packageName = explicitPackage || detected;
 
-  if (explicitPackage) {
+  // Always issue an explicit launch_app — never rely on install's auto-launch.
+  // Gives us one deterministic code path regardless of whether we knew the
+  // package name up front.
+  if (packageName) {
     await client.executeBatchCommands(sessionId, [
-      { type: 'launch_app', params: { packageName: explicitPackage } },
+      { type: 'launch_app', params: { packageName } },
     ], { timeoutMs: 60_000 });
   }
 
@@ -1144,6 +1176,13 @@ async function installAppOnSession(
     warmup.installedPackage = packageName;
     warmup.appStoragePath = mobileApp.storagePath;
     await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
+  }
+
+  // Persist packageName to project.settings.mobileApp so future warmups can
+  // use the check_package fast path even after Redis TTL expires, avoiding a
+  // full APK re-download on every expiry.
+  if (packageName) {
+    await persistPackageName(projectId, userId, mobileApp, packageName);
   }
 
   // Pending-install flag (if any) has now been consumed — clear it.
@@ -1156,6 +1195,42 @@ async function installAppOnSession(
     projectId,
     packageName: packageName || '(auto-launched by runner)',
   });
+}
+
+/**
+ * Write the detected Android package name back to `project.settings.mobileApp`
+ * so subsequent warmups (after Redis TTL expiry) can hit the `check_package`
+ * fast path instead of re-downloading the APK. No-op when the value is
+ * already up to date. Failures are logged but swallowed — this is a cache
+ * warm, not a correctness-critical write.
+ */
+async function persistPackageName(
+  projectId: string,
+  userId: string,
+  currentMobileApp: { packageName?: string } & Record<string, unknown>,
+  packageName: string,
+): Promise<void> {
+  if (!packageName || currentMobileApp.packageName === packageName) return;
+  try {
+    await ProjectService.updateProject(projectId, userId, {
+      settings: {
+        mobileApp: {
+          ...currentMobileApp,
+          packageName,
+        } as unknown as Record<string, unknown>,
+      },
+    });
+    logger.info('[MOBILE_SESSION] Persisted packageName to project settings', {
+      projectId,
+      packageName,
+    });
+  } catch (err) {
+    logger.warn('[MOBILE_SESSION] Failed to persist packageName (non-fatal)', {
+      projectId,
+      packageName,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
