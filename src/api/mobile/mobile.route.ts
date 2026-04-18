@@ -14,7 +14,14 @@ import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
 import multer from 'multer';
-import { deleteMobileApp, getMobileApp, listMobileAppBuilds, uploadMobileApp } from './mobile.controller';
+import {
+  deleteMobileApp,
+  getMobileApp,
+  getProjectPermissionPolicy,
+  listMobileAppBuilds,
+  setProjectPermissionPolicy,
+  uploadMobileApp,
+} from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
 import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession } from './session.controller';
@@ -81,6 +88,28 @@ router.delete(
   '/projects/:projectId/app',
   requireAuth,
   asyncHandler(deleteMobileApp),
+);
+
+/**
+ * GET  /api/v1/mobile/projects/:projectId/permission-policy
+ * PUT  /api/v1/mobile/projects/:projectId/permission-policy
+ *
+ * Project-level default runtime-permission policy for Android sessions:
+ *   - auto_allow (default): pre-grant on install + auto-tap Allow on any dialog
+ *   - auto_deny: auto-tap Don't allow
+ *   - manual: no automation; explicit permission_dialog steps only
+ *
+ * Individual test cases may override this default.
+ */
+router.get(
+  '/projects/:projectId/permission-policy',
+  requireAuth,
+  asyncHandler(getProjectPermissionPolicy),
+);
+router.put(
+  '/projects/:projectId/permission-policy',
+  requireAuth,
+  asyncHandler(setProjectPermissionPolicy),
 );
 
 /**

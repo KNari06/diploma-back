@@ -27,6 +27,36 @@ import { Request, Response } from 'express';
 const WARMUP_PREFIX = 'mobile_warmup:';
 const WARMUP_TTL = 900; // 15 minutes
 
+type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
+const VALID_PERMISSION_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
+
+/**
+ * Resolve the effective permission policy for a session at warmup time.
+ *
+ * Precedence: test-level override (set later during run) > project default >
+ * runner default ('auto_allow'). Since we don't know which test will run
+ * during warmup, we seed the session with the project default; per-test
+ * overrides can PATCH the runner at run start if they differ.
+ *
+ * Returns `null` if the stored value is missing or invalid — callers then
+ * leave the session on the runner default (avoiding a round-trip).
+ */
+async function resolveProjectPermissionPolicy(
+  projectId: string,
+  userId: string,
+): Promise<MobilePermissionPolicy | null> {
+  try {
+    const project = await ProjectService.getProject(projectId, userId);
+    const stored = project?.settings?.mobilePermissionPolicy;
+    if (typeof stored === 'string' && (VALID_PERMISSION_POLICIES as readonly string[]).includes(stored)) {
+      return stored as MobilePermissionPolicy;
+    }
+  } catch {
+    // Swallow — network/db hiccup falls through to the runner default.
+  }
+  return null;
+}
+
 /**
  * Pending-install flag: set when an APK is uploaded but the upload-time
  * `autoBootAndInstall` couldn't reach a running emulator. Stores the
@@ -221,6 +251,22 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
     // Create session on runner
     const session = await client.createSession(platform);
+
+    // Propagate project-level permission policy to the runner. Best-effort:
+    // the runner defaults to 'auto_allow' when the patch fails, which is the
+    // same behaviour a newly-created project gets, so we never block warmup
+    // on this call. Tests may later override the policy at run time.
+    try {
+      const policy = await resolveProjectPermissionPolicy(projectId, userId);
+      if (policy) {
+        await client.setPermissionPolicy(session.sessionId, policy);
+      }
+    } catch (err) {
+      logger.debug('[MOBILE_SESSION] Failed to propagate permission policy (non-fatal)', {
+        sessionId: session.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     // Derive socket URL from runner URL
     const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');

@@ -264,3 +264,70 @@ export async function deleteMobileApp(req: Request, res: Response): Promise<void
 
   res.json({ success: true, message: 'App deleted' });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PERMISSION POLICY  (project-level default)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
+
+const VALID_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
+
+function isValidPolicy(value: unknown): value is MobilePermissionPolicy {
+  return typeof value === 'string' && (VALID_POLICIES as readonly string[]).includes(value);
+}
+
+/**
+ * GET /api/v1/mobile/projects/:projectId/permission-policy
+ *
+ * Returns the project-level default permission policy. Individual tests
+ * may override it via their own settings; unset tests inherit this value.
+ * Defaults to 'auto_allow' when nothing is stored yet.
+ */
+export async function getProjectPermissionPolicy(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  const { projectId } = req.params;
+  const project = await ProjectService.getProject(projectId, userId);
+  if (!project) {
+    res.status(404).json({ success: false, error: 'Project not found' });
+    return;
+  }
+  const stored = project.settings?.mobilePermissionPolicy;
+  const policy: MobilePermissionPolicy = isValidPolicy(stored) ? stored : 'auto_allow';
+  res.json({ success: true, policy });
+}
+
+/**
+ * PUT /api/v1/mobile/projects/:projectId/permission-policy
+ * Body: { policy: 'auto_allow' | 'auto_deny' | 'manual' }
+ *
+ * Updates the project-level default. Persisted at
+ * `project.settings.mobilePermissionPolicy`.
+ */
+export async function setProjectPermissionPolicy(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  const { projectId } = req.params;
+  const { policy } = req.body ?? {};
+  if (!isValidPolicy(policy)) {
+    res.status(400).json({
+      success: false,
+      error: `policy must be one of: ${VALID_POLICIES.join(', ')}`,
+    });
+    return;
+  }
+  await ProjectService.updateProject(projectId, userId, {
+    settings: {
+      mobilePermissionPolicy: policy,
+    },
+  });
+  logger.info('[MOBILE_API] Permission policy updated', { projectId, policy });
+  res.json({ success: true, policy });
+}

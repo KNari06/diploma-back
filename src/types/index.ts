@@ -326,6 +326,8 @@ export interface ProjectCreateRequest {
     mobileApp?: Record<string, unknown> | null;
     /** CI/CD API key metadata — set via CI key management API */
     ciApiKey?: { hash: string; prefix: string; createdAt: string } | null;
+    /** Project-level runtime-permission policy for Android sessions. */
+    mobilePermissionPolicy?: 'auto_allow' | 'auto_deny' | 'manual' | null;
   };
 }
 
