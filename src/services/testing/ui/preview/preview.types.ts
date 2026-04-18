@@ -1042,6 +1042,15 @@ export interface IntentTestCase {
   teardownSteps?: any[];
   expectedResult?: string;
 
+  // Test Resources (Login / Environment / Secret / ...). Array of
+  // { kind, resource_id, required? } — surfaces intent_test_cases.resource_bindings
+  // to the UI without an extra fetch.
+  resourceBindings?: Array<{
+    kind: string;
+    resource_id: string;
+    required?: boolean;
+  }>;
+
   // Provenance (when saved from a completed test)
   sourceTestId?: string;
   sourceIntelligentSessionId?: string;

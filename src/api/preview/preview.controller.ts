@@ -332,7 +332,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     }
 
     const { id } = req.params;
-    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = req.body;
+    const { name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings } = req.body;
 
     logger.info('[PREVIEW_CONTROLLER] Updating intent test case', {
       intentTestCaseId: id,
@@ -456,6 +456,9 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
       kind: kind !== undefined ? (String(kind) as any) : undefined,
       tags: Array.isArray(tags) ? tags : undefined,
       priority: priority !== undefined && priority !== null ? (String(priority) as any) : undefined,
+      // Accept only arrays; `undefined` leaves the column untouched.
+      // [] is valid and means "detach all resource bindings".
+      resourceBindings: Array.isArray(resourceBindings) ? resourceBindings : undefined,
     });
 
     logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {

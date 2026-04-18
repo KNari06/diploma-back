@@ -266,6 +266,12 @@ export class IntentTestCaseService {
     kind?: 'standalone' | 'regression_member';
     tags?: string[];
     priority?: 'critical' | 'high' | 'medium' | 'low';
+    /**
+     * Optional replacement for the full resource bindings array
+     * (Login / Environment / Secret / ...). Sending `[]` detaches all
+     * resources. Undefined leaves the column untouched.
+     */
+    resourceBindings?: Array<{ kind: string; resource_id: string; required?: boolean }>;
   }): Promise<IntentTestCase> {
     // Serialize concurrent writes to the same test case via the same in-process
     // mutex used by updateStepFromPreviewApply / updateStepAfterHeal /
@@ -274,13 +280,20 @@ export class IntentTestCaseService {
     // that the runner just wrote. No reentrancy risk — none of the already-
     // mutex'd methods call update() internally.
     return withTestCaseMutex(params.id, async () => {
-      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority } = params;
+      const { id, userId, name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings } = params;
 
       const updates: Record<string, any> = {};
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
       if (startUrl !== undefined) updates.start_url = startUrl;
       if (url !== undefined) updates.url = url;
+      if (resourceBindings !== undefined) {
+        // Allow [] to detach all; reject non-array.
+        if (!Array.isArray(resourceBindings)) {
+          throw new Error('resourceBindings must be an array');
+        }
+        updates.resource_bindings = resourceBindings;
+      }
       if (steps !== undefined) {
         let mergedSteps = this.normalizeSteps(steps);
 
@@ -507,6 +520,13 @@ export class IntentTestCaseService {
       setupSteps: row.setup_steps || undefined,
       teardownSteps: row.teardown_steps || undefined,
       expectedResult: row.expected_result || undefined,
+
+      // Test Resources bindings (Login / Environment / Secret / ...)
+      // Surfaced so the editor's Login picker can read/write the current
+      // selection without a separate fetch.
+      resourceBindings: Array.isArray(row.resource_bindings)
+        ? row.resource_bindings
+        : [],
 
       // Provenance
       sourceTestId: row.source_test_id || undefined,
