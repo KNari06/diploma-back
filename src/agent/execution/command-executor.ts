@@ -2488,17 +2488,35 @@ export class CommandExecutor {
 
         // V18: Coordinate-based click (canvas, maps, charts — no element selector)
         case 'clickAt': {
-          const coords = value ? JSON.parse(String(value)) : null;
+          // `value` is a JSON-stringified {x, y}. Wrapping JSON.parse in
+          // try/catch so a user-typed garbage value (e.g. "500, 300" with a
+          // space — not valid JSON) produces an actionable error rather
+          // than a cryptic SyntaxError bubbling out of the executor.
+          let coords: { x?: unknown; y?: unknown } | null = null;
+          try {
+            coords = value ? JSON.parse(String(value)) : null;
+          } catch (parseErr) {
+            throw new Error(
+              `clickAt: value must be JSON {x, y} — got "${String(value).slice(0, 60)}" (${parseErr instanceof Error ? parseErr.message : 'parse error'})`,
+            );
+          }
           if (!coords || !Number.isFinite(coords.x) || !Number.isFinite(coords.y)) {
             throw new Error('clickAt requires {x, y} coordinates in value');
           }
-          await this.page.mouse.click(coords.x, coords.y);
+          await this.page.mouse.click(coords.x as number, coords.y as number);
           break;
         }
 
         // V18: Swipe gesture (mobile web — mouse drag simulation)
         case 'swipe': {
-          const swipeData = value ? JSON.parse(String(value)) : null;
+          let swipeData: any = null;
+          try {
+            swipeData = value ? JSON.parse(String(value)) : null;
+          } catch (parseErr) {
+            throw new Error(
+              `swipe: value must be JSON {start:{x,y}, end:{x,y}} — got "${String(value).slice(0, 60)}" (${parseErr instanceof Error ? parseErr.message : 'parse error'})`,
+            );
+          }
           if (!swipeData || !swipeData.start || !swipeData.end) {
             throw new Error('swipe requires {start: {x,y}, end: {x,y}} in value');
           }
