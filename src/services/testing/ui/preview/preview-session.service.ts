@@ -2751,6 +2751,15 @@ export class PreviewSessionService {
           markIntentionalGoto(previewSessionId, newUrl);
         } catch { /* non-fatal */ }
 
+        // Overlay auto-dismiss on popups too. Without this, a popup
+        // whose host site ships a tour library (joyride etc.) would
+        // have no handler registered, so every action inside the popup
+        // would fight the overlay on its own.
+        try {
+          const { registerOverlayAutoDismiss } = await import('../auto-dismiss-overlays');
+          await registerOverlayAutoDismiss(newPage);
+        } catch { /* non-fatal */ }
+
         // Wait for new page DOM to be ready before allowing snapshot collection.
         // domcontentloaded is sufficient — 'load' waits for all subresources (images,
         // fonts, iframes) and can hang 8s+ on media-heavy pages. Halved timeout from

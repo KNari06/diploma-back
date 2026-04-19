@@ -15,18 +15,39 @@
  *     use self-contained `locator.click` / `page.keyboard.press`
  *   - Registered once per page lifetime (survives navigations)
  *
- * We register a single "best-effort ESC + click-close-buttons" handler per
- * overlay pattern. On a clean page (no overlays) the handlers NEVER fire, so
- * there's zero cost to the happy path.
+ * We register a single "remove-then-click-close-button" handler per overlay
+ * pattern. On a clean page (no overlays) the handlers NEVER fire, so there's
+ * zero cost to the happy path.
  *
- * Opt-out: steps that legitimately target an overlay (e.g. a test for the
- * cookie banner itself) should set step.options.disableAutoDismiss — enforced
- * at the caller level, NOT here, because Playwright's addLocatorHandler is
- * page-scoped and can't read per-step flags.
+ * Re-mount protection: the handler fires at most DISMISS_TIMES_CAP times per
+ * page lifetime. Tour libraries whose parent component stays mounted will
+ * re-render the portal after every remove(), producing an infinite
+ * addLocatorHandler loop. The cap prevents that; after the cap is hit
+ * Playwright's own actionability errors take over and the agent either
+ * retries via the resolver or surfaces the failure to the user.
+ *
+ * NOTE: there is no per-step "disable auto-dismiss" escape hatch. A previous
+ * iteration of this module documented one but nothing ever consumed
+ * step.options.disableAutoDismiss, so the claim was removed. Tests that
+ * legitimately target a tour overlay should delete the overlay pattern from
+ * OVERLAY_PATTERNS (or guard the registration call) before running.
  */
 
 import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
+
+/**
+ * Maximum times a single handler fires per page lifetime.
+ *
+ * Why cap: React tour components (`<Joyride run={true} />`, `Shepherd.js`
+ * hooks, etc.) keep their host React component mounted and re-render the
+ * portal on every state change. `dismissViaRemove` takes the portal out of
+ * the DOM, React's reconciler puts it back on the next commit, Playwright's
+ * next actionability check matches again, handler fires again, infinite
+ * loop until the action's 10s timeout. Five fires is enough to progress
+ * through a typical multi-step tour and small enough to prevent loops.
+ */
+const DISMISS_TIMES_CAP = 5;
 
 // ─── Overlay registry ─────────────────────────────────────────────────────
 //
@@ -46,16 +67,6 @@ interface OverlayPattern {
    */
   dismiss: Array<(page: Page) => Promise<boolean>>;
 }
-
-/** Press Escape. Works for most modal-style dialogs and tour steps. */
-const dismissViaEscape = async (page: Page): Promise<boolean> => {
-  try {
-    await page.keyboard.press('Escape', { delay: 0 });
-    return true;
-  } catch {
-    return false;
-  }
-};
 
 /**
  * Click any Close/Skip/Dismiss button inside the overlay subtree. Matches
@@ -111,17 +122,45 @@ const dismissViaRemove = (rootSelector: string) =>
 
 // ─── Known overlay patterns ──────────────────────────────────────────────
 
+// Ordering rationale (applies to every pattern):
+//   1. dismissViaRemove FIRST — surgical, zero side effects: touches only
+//      the tour library's own DOM subtree.
+//   2. dismissViaCloseButton — also scoped to the tour library.
+//   3. dismissViaEscape has been REMOVED from every pattern. Rationale:
+//      `page.keyboard.press('Escape')` is a page-wide keyboard event,
+//      not a tour-library action. It closes every overlay listening for
+//      Escape — which includes every Radix/Headless/shadcn Dialog (the
+//      whole "Купить урок" modal family). A repro: on Repetino the
+//      tutors page ships a dormant joyride portal; when the user opens
+//      the purchase modal on top and the agent tries a click, the
+//      joyride addLocatorHandler fires, Escape closes the PURCHASE
+//      modal, refs detach, click times out 10s waiting for stale
+//      `[data-agent-ref="e217"]`. See terminal log
+//      2026-04-19 17:16:06–17:16:23. dismissViaRemove would have worked
+//      on joyride alone and never touched the purchase modal.
 const OVERLAY_PATTERNS: OverlayPattern[] = [
   // react-joyride (product tour library). "spotlight" overlay tricks
   // elementFromPoint into returning the target, but edges still intercept
   // clicks — addLocatorHandler catches it cleanly.
+  //
+  // Selector covers: the dim layer (`.react-joyride__overlay`), any
+  // descendant of the portal node (`#react-joyride-portal > *`), the
+  // spotlight cutout (`.react-joyride__spotlight`), and the floater
+  // popper wrapper (`.__floater__` — used by react-joyride v2+ to
+  // position the tooltip; often the actual click-intercepting element).
+  // Removing the portal wipes all of them in one operation.
   {
     name: 'react-joyride',
-    selector: '.react-joyride__overlay, [data-test-id="overlay"].react-joyride__overlay, #react-joyride-portal > *',
+    selector: [
+      '.react-joyride__overlay',
+      '.react-joyride__spotlight',
+      '[data-test-id="overlay"].react-joyride__overlay',
+      '#react-joyride-portal > *',
+      '.__floater__',
+    ].join(', '),
     dismiss: [
-      dismissViaEscape,
+      dismissViaRemove('#react-joyride-portal, .__floater__'),
       dismissViaCloseButton('.react-joyride__tooltip'),
-      dismissViaRemove('#react-joyride-portal'),
     ],
   },
   // intro.js — similar tour library.
@@ -129,9 +168,8 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
     name: 'intro-js',
     selector: '.introjs-overlay, .introjs-tooltipReferenceLayer',
     dismiss: [
-      dismissViaEscape,
-      dismissViaCloseButton('.introjs-tooltip'),
       dismissViaRemove('.introjs-overlay,.introjs-tooltipReferenceLayer'),
+      dismissViaCloseButton('.introjs-tooltip'),
     ],
   },
   // shepherd.js — yet another tour library, used by GitLab among others.
@@ -139,9 +177,8 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
     name: 'shepherd',
     selector: '.shepherd-modal-overlay-container, .shepherd-element',
     dismiss: [
-      dismissViaEscape,
-      dismissViaCloseButton('.shepherd-element'),
       dismissViaRemove('.shepherd-modal-overlay-container,.shepherd-element'),
+      dismissViaCloseButton('.shepherd-element'),
     ],
   },
   // driver.js — yet another. Covers the long tail of tour-style overlays.
@@ -149,9 +186,8 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
     name: 'driver-js',
     selector: '#driver-page-overlay, .driver-popover',
     dismiss: [
-      dismissViaEscape,
-      dismissViaCloseButton('.driver-popover'),
       dismissViaRemove('#driver-page-overlay,.driver-popover'),
+      dismissViaCloseButton('.driver-popover'),
     ],
   },
 ];
@@ -199,10 +235,14 @@ export async function registerOverlayAutoDismiss(page: Page): Promise<void> {
             overlay: pattern.name,
           });
         },
-        // `times: undefined` → run for every action until the handler is
-        // removed. `noWaitAfter: true` → don't wait for animations after
-        // dismiss, so we don't eat into the action timeout budget.
-        { noWaitAfter: true },
+        // `times: DISMISS_TIMES_CAP` → run at most N times per page to
+        // prevent an infinite handler loop when the host React component
+        // immediately re-mounts a removed portal (see DISMISS_TIMES_CAP
+        // docstring). `noWaitAfter: true` → don't wait for the overlay
+        // to become hidden after the handler runs; paired with the cap,
+        // this is the right knob — waiting would give a re-mount-loop
+        // library another chance to pump handler invocations.
+        { noWaitAfter: true, times: DISMISS_TIMES_CAP },
       );
     } catch (err) {
       // Usually happens when the page is already closed / browser crashed.
