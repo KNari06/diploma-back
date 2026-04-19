@@ -1524,6 +1524,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               await IntentTestCaseService.updateStepFromPreviewApply({
                 intentTestCaseId,
                 appliedStep: enrichedStep,
+                userId,
               });
             } catch (persistError) {
               logger.warn('[MOBILE_SESSION] Failed to auto-persist compiled plan', {

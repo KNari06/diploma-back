@@ -32,6 +32,45 @@ function withTestCaseMutex<T>(testCaseId: string, fn: () => Promise<T>): Promise
 }
 
 /**
+ * Verify caller can write to a test case.
+ *
+ * Stops cross-test-case writes when the client sends a stale `intentTestCaseId`
+ * (localStorage cache, React state desync) that resolves to a different
+ * workspace than the one the user is currently in.
+ *
+ * Returns true if either the user owns the test case directly or is an active
+ * member of the workspace that hosts the test case's project.
+ */
+async function canWriteTestCase(
+  testCaseOwnerId: string,
+  testCaseProjectId: string,
+  userId: string,
+): Promise<boolean> {
+  if (testCaseOwnerId === userId) return true;
+
+  try {
+    const { data: project } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', testCaseProjectId)
+      .maybeSingle();
+
+    const workspaceId = (project as any)?.workspace_id as string | undefined;
+    if (!workspaceId) return false;
+
+    const { WorkspaceAccessService } = await import('@/services/core/workspace-access.service');
+    return await WorkspaceAccessService.isMember(userId, workspaceId);
+  } catch (err) {
+    logger.warn('[INTENT_TEST_CASE] Access check failed — denying write', {
+      testCaseProjectId,
+      userId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
  * Service for managing intent test cases
  */
 export class IntentTestCaseService {
@@ -555,9 +594,10 @@ export class IntentTestCaseService {
     stepId: string;
     compiled: CompiledStepPlan;
     evidence: StepEvidence;
+    userId?: string;
   }): Promise<boolean> {
     return withTestCaseMutex(params.intentTestCaseId, async () => {
-    const { intentTestCaseId, stepId, compiled, evidence } = params;
+    const { intentTestCaseId, stepId, compiled, evidence, userId } = params;
 
     logger.info('[INTENT_TEST_CASE] Updating step after successful heal', {
       intentTestCaseId,
@@ -566,10 +606,11 @@ export class IntentTestCaseService {
     });
 
     try {
-      // Get current test case (without userId check - this is internal runtime call)
+      // Fetch steps + ownership fields in one round-trip so the access
+      // check below (when userId is supplied) doesn't cost an extra query.
       const { data: row, error: fetchError } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('steps_json')
+        .select('steps_json, user_id, project_id')
         .eq('id', intentTestCaseId)
         .single();
 
@@ -579,6 +620,20 @@ export class IntentTestCaseService {
           error: fetchError?.message,
         });
         return false;
+      }
+
+      if (userId) {
+        const allowed = await canWriteTestCase(row.user_id, row.project_id, userId);
+        if (!allowed) {
+          logger.warn('[INTENT_TEST_CASE] Heal update rejected — user not in test case workspace', {
+            intentTestCaseId,
+            stepId,
+            userId,
+            ownerId: row.user_id,
+            projectId: row.project_id,
+          });
+          return false;
+        }
       }
 
       const steps: IntentStep[] = row.steps_json || [];
@@ -673,13 +728,17 @@ export class IntentTestCaseService {
    *
    * @param intentTestCaseId The test case ID
    * @param appliedStep The full IntentStep from preview:step:apply:result
+   * @param userId Optional — when supplied, rejects the write if the user
+   *               neither owns the test case nor is a member of its workspace.
+   *               Prevents cross-test-case writes from stale client state.
    */
   static async updateStepFromPreviewApply(params: {
     intentTestCaseId: string;
     appliedStep: IntentStep;
+    userId?: string;
   }): Promise<boolean> {
     return withTestCaseMutex(params.intentTestCaseId, async () => {
-      const { intentTestCaseId, appliedStep } = params;
+      const { intentTestCaseId, appliedStep, userId } = params;
 
       logger.info('[INTENT_TEST_CASE] Updating step from preview apply', {
         intentTestCaseId,
@@ -690,10 +749,11 @@ export class IntentTestCaseService {
       });
 
       try {
-        // Get current test case (without userId check - this is internal call from preview)
+        // Fetch steps + ownership fields in one round-trip so the access
+        // check below doesn't cost an extra query.
         const { data: row, error: fetchError } = await supabaseAdmin
           .from('intent_test_cases')
-          .select('steps_json')
+          .select('steps_json, user_id, project_id')
           .eq('id', intentTestCaseId)
           .single();
 
@@ -703,6 +763,22 @@ export class IntentTestCaseService {
             error: fetchError?.message,
           });
           return false;
+        }
+
+        // Access gate: only when caller passes userId. Existing internal
+        // callers (background auto-heal paths) keep working unchanged.
+        if (userId) {
+          const allowed = await canWriteTestCase(row.user_id, row.project_id, userId);
+          if (!allowed) {
+            logger.warn('[INTENT_TEST_CASE] Preview apply rejected — user not in test case workspace', {
+              intentTestCaseId,
+              stepId: appliedStep.id,
+              userId,
+              ownerId: row.user_id,
+              projectId: row.project_id,
+            });
+            return false;
+          }
         }
 
         const steps: IntentStep[] = row.steps_json || [];

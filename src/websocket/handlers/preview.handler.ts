@@ -1569,6 +1569,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             const updated = await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
               appliedStep: result.appliedStep!,
+              userId: ensuredUserId,
             });
 
             if (updated) {
@@ -1758,6 +1759,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const updated = await IntentTestCaseService.updateStepFromPreviewApply({
             intentTestCaseId,
             appliedStep: output.appliedStep as any,
+            userId: ensuredUserId,
           });
 
           if (updated) {
