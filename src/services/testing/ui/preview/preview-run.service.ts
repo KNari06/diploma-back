@@ -699,6 +699,15 @@ export class PreviewRunService {
     let caughtRunError: unknown = null;
 
     try {
+      // Disable the external-nav trap for the duration of the run. Recorded
+      // tests legitimately cross origins (OAuth hand-off, payment providers)
+      // and the trap would revert those mid-replay. Guaranteed paired with
+      // `resumeTrap` in the finally block below because we're inside try now.
+      try {
+        const { suspendTrap } = await import('./external-nav-trap');
+        suspendTrap(previewSessionId);
+      } catch { /* non-fatal */ }
+
       // 4. Get session page
       const session = sessionService.getSession(previewSessionId);
       if (!session?.page) {
@@ -773,6 +782,14 @@ export class PreviewRunService {
         startUrl,
         needsReload,
       });
+
+      // Test-run pre-navigation is user-intent. Tell the external-nav trap
+      // to accept the new landing origin as the fresh baseline so a
+      // test that starts from a cross-origin URL isn't reverted on load.
+      try {
+        const { markIntentionalGoto } = await import('./external-nav-trap');
+        markIntentionalGoto(previewSessionId, startUrl);
+      } catch { /* non-fatal */ }
 
       try {
         if (needsReload) {
@@ -2065,6 +2082,16 @@ export class PreviewRunService {
       if (activeRuns.get(previewSessionId) === runState) {
         activeRuns.delete(previewSessionId);
       }
+
+      // Re-enable the external-nav trap now that the run is done. If the
+      // final step left us on a post-run URL that happens to be cross-
+      // origin (e.g. OAuth callback completed on an auth provider) the
+      // trap's baseline was kept fresh during suspension, so subsequent
+      // USER clicks still get protected correctly.
+      try {
+        const { resumeTrap } = await import('./external-nav-trap');
+        resumeTrap(previewSessionId);
+      } catch { /* non-fatal */ }
 
       webSocketService.emitToUser(userId, 'preview:run:completed', {
         previewSessionId,

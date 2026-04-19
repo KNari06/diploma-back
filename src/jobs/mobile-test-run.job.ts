@@ -72,7 +72,6 @@ export class MobileTestRunJobHandler {
       platform,
       browser,
       appPackage,
-      intentSteps,
       geminiApiKey,
       runnerUrl,
       runnerApiKey,
@@ -86,7 +85,20 @@ export class MobileTestRunJobHandler {
       // type so future non-Phase-9 paths can consume it if needed.
       analyticsExecutionId,
       intelligentSessionId,
+      // Track 5 (shared resources): raw bindings only — the worker
+      // compiles them on its own so plaintext secrets never land in Redis.
+      resourceBindings,
     } = job.data;
+
+    // `intentSteps` stays a `let` because Track 5 resource compilation
+    // may prepend setup steps to it (see below). Without bindings this is
+    // byte-identical to job.data.intentSteps.
+    let intentSteps = job.data.intentSteps;
+    // Snapshot of applied/skipped resources — written to
+    // test_executions.executed_resources on job completion (success or
+    // failure). Built after compile; starts undefined so the no-bindings
+    // fast path skips writeback entirely.
+    let executedResources: Array<Record<string, unknown>> | undefined;
 
     // Validate
     if (!testId || !intentSteps?.length) {
@@ -127,6 +139,64 @@ export class MobileTestRunJobHandler {
     let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
 
     try {
+      // ── Track 5: Compile shared resources into setup steps ──
+      // MUST run inside the main try block — otherwise a compile throw
+      // skips the unified error handler below, leaving `test_executions`
+      // stuck in 'pending' and regression runs never finalizing.
+      //
+      // Runs BEFORE any session acquisition so a `required: true` failure
+      // doesn't waste an emulator boot. Decrypt + compile live inside the
+      // worker process — Redis only ever sees `{kind, resource_id}`.
+      if (resourceBindings && resourceBindings.length > 0) {
+        const { ResourceStepCompilerService } = await import(
+          '@/services/test-resource/resource-step-compiler.service'
+        );
+        const compileResult = await ResourceStepCompilerService.compileForMobile({
+          bindings: resourceBindings as Parameters<
+            typeof ResourceStepCompilerService.compileForMobile
+          >[0]['bindings'],
+          userId,
+          projectId: projectId ?? '',
+          platform,
+        });
+
+        // Prepend compiled setup steps. Type cast mirrors the one in
+        // dispatchMobileTest — compiled steps use mobile-only action
+        // types (network / geolocation / upload) not in the web
+        // IntentActionType.
+        if (compileResult.steps.length > 0) {
+          intentSteps = [
+            ...(compileResult.steps as unknown as typeof intentSteps),
+            ...intentSteps,
+          ] as typeof intentSteps;
+        }
+
+        // Pre-build audit snapshot (identical shape to web's AppliedBinding).
+        executedResources = [
+          ...compileResult.applied.map((a) => ({
+            binding: a.binding,
+            name: a.name,
+            kind: a.kind,
+            status_at_start: a.status_at_start,
+            captured_at: a.captured_at,
+            healed_during_run: a.healed_during_run,
+            ...(a.apply_error ? { apply_error: a.apply_error } : {}),
+          })),
+          ...compileResult.skipped.map((s) => ({
+            binding: s.binding,
+            skipped_reason: s.reason,
+          })),
+        ];
+
+        logger.info('[MOBILE-TEST] Resources compiled into setup', {
+          testId,
+          bindingsIn: resourceBindings.length,
+          stepsOut: compileResult.steps.length,
+          applied: compileResult.applied.length,
+          skipped: compileResult.skipped.length,
+        });
+      }
+
       // ── Phase 1: Emit progress ────────────────────────────────
       try {
         webSocketService.emitTestProgress(testId, {
@@ -411,6 +481,14 @@ export class MobileTestRunJobHandler {
         firstError: runResult.steps.find((s) => !s.success)?.error,
       });
 
+      // ── Phase 5.6: Persist test_resources snapshot ───────────
+      // Mirrors manual-test-run.job.ts:509-520. Non-fatal — the test
+      // result is the source of truth, audit data just enriches it.
+      await MobileTestRunJobHandler.persistExecutedResourcesSnapshot(
+        testId,
+        executedResources,
+      );
+
       // ── Phase 6: Queue AI analysis ────────────────────────────
       if (testResultId) {
         try {
@@ -510,6 +588,14 @@ export class MobileTestRunJobHandler {
         passed: false,
         errorMessage,
       });
+
+      // Persist snapshot even on job-level failure (session couldn't
+      // start, runner unreachable, etc.). Operators need to know which
+      // resources were meant to be live so they can triage quickly.
+      await MobileTestRunJobHandler.persistExecutedResourcesSnapshot(
+        testId,
+        executedResources,
+      );
 
       // Emit failure event
       try {
@@ -833,5 +919,32 @@ export class MobileTestRunJobHandler {
     }
 
     await Promise.allSettled(tasks);
+  }
+
+  /**
+   * Persist the compiled-at-dispatch resources snapshot onto every
+   * matching `test_executions` row. Uses the same service method web
+   * uses (`ExecutionService.persistExecutedResourcesByTestId`) so the
+   * `executed_resources` column shape is platform-uniform and downstream
+   * readers (UI, /bug-insights) don't branch on platform.
+   *
+   * Non-fatal — the test result is the source of truth, audit data just
+   * enriches it. Missing / empty snapshot is a legitimate no-op (the case
+   * had no resource_bindings). Wrapped in its own try so a failure here
+   * can't mask a real test failure upstream.
+   */
+  private static async persistExecutedResourcesSnapshot(
+    testId: string,
+    snapshot?: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    if (!snapshot || snapshot.length === 0) return;
+    try {
+      await ExecutionService.persistExecutedResourcesByTestId(testId, snapshot);
+    } catch (err) {
+      logger.warn('[MOBILE-TEST] Failed to persist executed_resources snapshot', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 }

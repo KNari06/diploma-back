@@ -702,6 +702,91 @@ export async function captureState(
   logger.info('[TEST_RESOURCE] Captured state', { id, heal: !!opts.heal });
 }
 
+/**
+ * Lightweight pre-flight: check whether the resources behind a bindings
+ * array are present + not broken + scope-compatible with the run platform,
+ * WITHOUT touching `sensitive` / decrypt. Used by the mobile dispatcher to
+ * fail-fast on `required: true` bindings before creating any DB rows —
+ * decryption is deferred to the worker so plaintext never lands in Redis.
+ *
+ * Returns `{ ok: boolean, reasons: Array<{resourceId, reason}> }` — empty
+ * reasons + ok=true means every required binding will load. Soft failures
+ * (not required) are NOT included — caller doesn't need to know about them
+ * until the worker compiles.
+ */
+export async function validateBindingsPreflight(
+  bindings: ResourceBinding[],
+  userId: string,
+  runPlatform: 'android' | 'ios' | 'flutter',
+): Promise<{ ok: boolean; reasons: Array<{ resourceId: string; reason: string }> }> {
+  const required = bindings.filter((b) => b.required === true);
+  if (required.length === 0) return { ok: true, reasons: [] };
+
+  const ids = Array.from(new Set(required.map((b) => b.resource_id)));
+  const { data, error } = await supabaseAdmin
+    .from('test_resources')
+    .select('id, name, status, scope')
+    .in('id', ids)
+    .eq('user_id', userId);
+
+  if (error) {
+    return {
+      ok: false,
+      reasons: [{ resourceId: '*', reason: `DB error: ${error.message}` }],
+    };
+  }
+
+  const byId = new Map<string, { id: string; name: string; status: string; scope: Record<string, unknown> | null }>();
+  for (const row of (data ?? []) as Array<{ id: string; name: string; status: string; scope: Record<string, unknown> | null }>) {
+    byId.set(row.id, row);
+  }
+
+  const reasons: Array<{ resourceId: string; reason: string }> = [];
+
+  for (const binding of required) {
+    const row = byId.get(binding.resource_id);
+    if (!row) {
+      reasons.push({
+        resourceId: binding.resource_id,
+        reason: `required ${binding.kind} binding not found`,
+      });
+      continue;
+    }
+    if (row.status === 'broken') {
+      reasons.push({
+        resourceId: binding.resource_id,
+        reason: `required ${binding.kind} "${row.name}" is broken`,
+      });
+      continue;
+    }
+    // Scope platform check — mirrors isPlatformCompatible in the compiler.
+    // No scope.platform set = platform-agnostic (legacy) — allow.
+    const scopePlatform =
+      row.scope && typeof row.scope === 'object'
+        ? (row.scope as Record<string, unknown>).platform
+        : undefined;
+    if (scopePlatform && typeof scopePlatform === 'string') {
+      const compatible =
+        (scopePlatform === 'android' && (runPlatform === 'android' || runPlatform === 'flutter')) ||
+        (scopePlatform === 'ios' && runPlatform === 'ios');
+      if (!compatible) {
+        // Platform mismatch is a configuration error — keep it a warning-level
+        // skip at compile time (compiler soft-skips). Preflight deliberately
+        // DOES NOT fail here so 'required: true' with mixed platforms doesn't
+        // abort the whole run. Logged loudly instead.
+        logger.warn('[TEST_RESOURCE] Preflight: required binding platform mismatch — will soft-skip at compile', {
+          resourceId: row.id,
+          resourceName: row.name,
+          scopePlatform,
+          runPlatform,
+        });
+      }
+    }
+  }
+
+  return { ok: reasons.length === 0, reasons };
+}
+
 export async function markBroken(
   id: string,
   userId: string,

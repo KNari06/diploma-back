@@ -17,6 +17,13 @@ export * as TestResourceService from './test-resource.service';
 export * from './types';
 export { applyBindingsToContext, teardownAppliedResources } from './resource-applier';
 export type { BindingInput, AppliedBinding, ApplyResult } from './resource-applier';
+export { ResourceStepCompilerService } from './resource-step-compiler.service';
+export type {
+  CompileResult,
+  CompiledResourceStep,
+  AppliedBindingSnapshot,
+  SkippedBindingSnapshot,
+} from './resource-step-compiler.service';
 export {
   checkAndHealIfNeeded,
   looksLikeAuthLoss,

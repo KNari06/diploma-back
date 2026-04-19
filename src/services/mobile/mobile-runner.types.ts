@@ -329,6 +329,22 @@ export interface MobileTestJobData {
    * contributes to /bug-insights.
    */
   intelligentSessionId?: string;
+  /**
+   * Raw bindings reference (echoed from `intent_test_cases.resource_bindings`).
+   *
+   * SECURITY CONTRACT: the job payload carries ONLY `{kind, resource_id,
+   * required?}`. Decryption + compilation into setup IntentSteps happens
+   * inside the worker (mobile-test-run.job.ts:process) — plaintext secrets
+   * NEVER land in Redis. If you ever add a sibling field here that holds
+   * decrypted data, re-read the Track 5 notes in
+   * `memory/project_deferred_tracks_plan.md` first; that invariant is the
+   * whole point of Option A.
+   */
+  resourceBindings?: Array<{
+    kind: string;
+    resource_id: string;
+    required?: boolean;
+  }>;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

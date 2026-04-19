@@ -82,6 +82,146 @@ const SLOW_LOAD_THRESHOLD_MS = 5000;
 const PROGRESS_EMIT_INTERVAL_MS = 3000;
 
 /**
+ * V16: External-navigation probe for preview click interception.
+ *
+ * When a user clicks inside the preview iframe at (x, y), walk up from the hit
+ * element to the nearest `<a>` and inspect its `href` + `target`. If that link
+ * would strand the user — i.e. it would navigate the single Playwright page
+ * cross-origin (the user can't get back because the preview address bar has no
+ * history) OR it uses a custom protocol the preview can't honour (kaspi://,
+ * tg://, mailto:, tel:, etc.) — return a block verdict so the click handler
+ * can short-circuit before `page.mouse.click` fires the navigation.
+ *
+ * Returns null when the click target is not an external/deeplink anchor: the
+ * click should proceed normally. All intra-origin links, JS-driven buttons,
+ * forms, and arbitrary clicks are allowed through.
+ */
+async function probeExternalAnchorAt(
+  page: Page,
+  x: number,
+  y: number,
+): Promise<{
+  kind: 'external_origin' | 'external_protocol';
+  href: string;
+  hostname?: string;
+  protocol: string;
+  targetLabel?: string;
+  linkText?: string;
+} | null> {
+  try {
+    return await page.evaluate(
+      ({ x: px, y: py }) => {
+        const g = globalThis as unknown as {
+          document: {
+            elementFromPoint: (x: number, y: number) => unknown;
+            location: { origin: string; hostname: string; protocol: string };
+          };
+        };
+        const el = g.document.elementFromPoint(px, py) as unknown as {
+          closest: (sel: string) => null | {
+            getAttribute: (n: string) => string | null;
+            textContent: string | null;
+            href?: string;
+          };
+        } | null;
+        if (!el) return null;
+        const anchor = el.closest('a[href]');
+        if (!anchor) return null;
+
+        const rawHref = anchor.getAttribute('href') || '';
+        const target = anchor.getAttribute('target') || '';
+        const textContent = (anchor.textContent || '').trim().slice(0, 80);
+
+        // Empty, in-page jump, or JavaScript-only href — let it fire.
+        if (!rawHref || rawHref.startsWith('#') || rawHref.toLowerCase().startsWith('javascript:')) {
+          return null;
+        }
+
+        // Resolve relative/absolute hrefs against the current document so
+        // "/foo" and "https://same-host/foo" both round-trip to absolute URLs
+        // via the anchor's own href property (browsers do this for us).
+        const resolvedHref: string = (anchor as { href?: string }).href || rawHref;
+
+        // Parse via URL to reliably extract protocol + hostname. If it throws,
+        // the href is a custom-protocol deeplink Chromium can't resolve — still
+        // block, because page.mouse.click would otherwise try to navigate.
+        let protocol = '';
+        let hostname = '';
+        try {
+          const u = new URL(resolvedHref, g.document.location.origin);
+          protocol = u.protocol;
+          hostname = u.hostname;
+        } catch {
+          // Unparseable → treat as custom protocol (kaspi://, tg://, etc).
+          const schemeMatch = rawHref.match(/^([a-z][a-z0-9+.\-]*):/i);
+          protocol = schemeMatch ? schemeMatch[1].toLowerCase() + ':' : '';
+          return {
+            kind: 'external_protocol' as const,
+            href: rawHref,
+            protocol,
+            targetLabel: target || undefined,
+            linkText: textContent || undefined,
+          };
+        }
+
+        // Non-web protocols are always blocked (mailto, tel, sms, custom).
+        if (protocol !== 'http:' && protocol !== 'https:') {
+          return {
+            kind: 'external_protocol' as const,
+            href: resolvedHref,
+            protocol,
+            hostname: hostname || undefined,
+            targetLabel: target || undefined,
+            linkText: textContent || undefined,
+          };
+        }
+
+        // Same-origin http(s) is fine — navigate normally.
+        // Treat subdomain variants of the same registrable name as same-origin
+        // to avoid false positives on www./m./dev./staging. prefixes. Compare
+        // by the last two labels of each hostname — a coarse heuristic that
+        // accepts x.com ↔ www.x.com, dev.x.com ↔ x.com, etc. without pulling
+        // in a full public-suffix list. Multi-label ccTLDs (foo.co.uk vs
+        // bar.co.uk) can over-match, but tolerating one occasional unblocked
+        // external click is better than blocking the common subdomain case.
+        const here = g.document.location.hostname;
+        const lastTwo = (h: string) => h.split('.').slice(-2).join('.');
+        if (
+          hostname === here ||
+          hostname.endsWith('.' + here) ||
+          here.endsWith('.' + hostname) ||
+          lastTwo(hostname) === lastTwo(here)
+        ) return null;
+
+        // Cross-origin http(s) opened inline (no target=_blank) strands the
+        // user. Block. Note: target=_blank cases are handled separately by
+        // Chromium opening a new page; we only care about the inline case.
+        if (!target || target === '_self') {
+          return {
+            kind: 'external_origin' as const,
+            href: resolvedHref,
+            protocol,
+            hostname,
+            linkText: textContent || undefined,
+          };
+        }
+
+        // target=_blank / named targets → new tab, original page survives.
+        return null;
+      },
+      { x, y },
+    );
+  } catch (err) {
+    // Page navigating, context destroyed, or eval rejected — fail open so
+    // a legitimate click is never silently dropped by a probe glitch.
+    logger.debug('[PREVIEW_SESSION] probeExternalAnchorAt eval failed, failing open', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
  * Navigate to URL with WebSocket progress events for slow loads.
  * Emits 'preview:loading' events every 3s after 5s threshold.
  * Replaces raw page.goto with user-visible progress feedback.
@@ -540,6 +680,20 @@ export class PreviewSessionService {
           // Non-fatal — recording still works without the detector.
         }
 
+        // V16: Attach external-navigation trap. Catches cross-origin nav
+        // that the pre-click anchor interceptor missed (JS-driven
+        // location.href, window.open without target, form submits to
+        // external origins). Reverts the nav and emits a notice event.
+        try {
+          const { attachExternalNavTrap, markIntentionalGoto } = await import('./external-nav-trap');
+          attachExternalNavTrap(page, sessionId, safeStartUrl);
+          // The upcoming initial goto is user-intent — open the grace window.
+          markIntentionalGoto(sessionId, safeStartUrl);
+        } catch {
+          // Non-fatal — preview still works; user just gets stranded on
+          // the rare JS-driven external nav instead of auto-recovering.
+        }
+
         // Stage 2: Load page
         emitProgress('loading_page', 40);
 
@@ -774,6 +928,17 @@ export class PreviewSessionService {
         // Non-fatal
       }
 
+      // V16: Re-attach external-nav trap on the fresh page. Session id is
+      // reused, but the WeakSet tracks pages by reference so the new page
+      // gets its own listener.
+      try {
+        const { attachExternalNavTrap, markIntentionalGoto } = await import('./external-nav-trap');
+        attachExternalNavTrap(newPage, sessionId, startUrl);
+        markIntentionalGoto(sessionId, startUrl);
+      } catch {
+        // Non-fatal
+      }
+
       await newPage.goto(startUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
@@ -881,6 +1046,14 @@ export class PreviewSessionService {
       const currentUrl = session.page.url();
       logger.info('[PREVIEW_SESSION] Refreshing page', { sessionId, url: currentUrl });
 
+      // Refresh is user-intent; suppress the external-nav trap so a
+      // server-side redirect that bounces to a different origin (OAuth,
+      // session expiry) isn't reverted.
+      try {
+        const { markIntentionalGoto } = await import('./external-nav-trap');
+        markIntentionalGoto(sessionId, currentUrl);
+      } catch { /* non-fatal */ }
+
       // Use domcontentloaded — networkidle can hang 5-10s on sites with analytics/WS
       await session.page.reload({
         waitUntil: 'domcontentloaded',
@@ -940,6 +1113,13 @@ export class PreviewSessionService {
       const startMs = Date.now();
       const previousUrl = session.page.url();
       logger.info('[PREVIEW_SESSION] Navigating back', { sessionId, currentUrl: previousUrl });
+
+      // History navigation is user-intent — let the trap accept the
+      // target URL instead of treating it as a stranded redirect.
+      try {
+        const { markIntentionalGoto } = await import('./external-nav-trap');
+        markIntentionalGoto(sessionId, previousUrl);
+      } catch { /* non-fatal */ }
 
       const response = await session.page.goBack({
         waitUntil: 'domcontentloaded',
@@ -1003,6 +1183,13 @@ export class PreviewSessionService {
       const startMs = Date.now();
       const previousUrl = session.page.url();
       logger.info('[PREVIEW_SESSION] Navigating forward', { sessionId, currentUrl: previousUrl });
+
+      // History navigation is user-intent — let the trap accept the
+      // target URL instead of treating it as a stranded redirect.
+      try {
+        const { markIntentionalGoto } = await import('./external-nav-trap');
+        markIntentionalGoto(sessionId, previousUrl);
+      } catch { /* non-fatal */ }
 
       const response = await session.page.goForward({
         waitUntil: 'domcontentloaded',
@@ -1361,9 +1548,32 @@ export class PreviewSessionService {
           return { success: true, needsSnapshot: false };
         }
 
-        case 'click':
+        case 'click': {
+          // V16: Intercept clicks on external-navigation anchors BEFORE they
+          // fire. External http(s) links opened inline strand the user (the
+          // preview address bar has no "back" history), and custom-protocol
+          // deeplinks (kaspi://, tg://, mailto:) navigate to nothing visible
+          // while replacing the preview with about:blank. Probe first; if the
+          // anchor is a foot-gun, surface a user-facing error and skip the
+          // click entirely so the original page stays authorable.
+          const blocker = await probeExternalAnchorAt(session.page, clampedX, clampedY);
+          if (blocker) {
+            const linkLabel = blocker.linkText ? `"${blocker.linkText}" ` : '';
+            const message = blocker.kind === 'external_protocol'
+              ? `Link ${linkLabel}uses protocol "${blocker.protocol}" which can't be followed inside the preview. It would work in a real browser.`
+              : `Link ${linkLabel}opens ${blocker.hostname || 'an external site'} in the same tab and would leave the preview with no way back. Record a step to stop here, or set target="_blank" on the site.`;
+            logger.info('[PREVIEW_SESSION] Blocked external-navigation click', {
+              sessionId,
+              kind: blocker.kind,
+              hostname: blocker.hostname,
+              protocol: blocker.protocol,
+              href: blocker.href.slice(0, 200),
+            });
+            return { success: false, error: message, needsSnapshot: false };
+          }
           await session.page.mouse.click(clampedX, clampedY, { button: safeButton, clickCount: safeClickCount });
           return { success: true, needsSnapshot: true };
+        }
 
         case 'down':
           await session.page.mouse.move(clampedX, clampedY);
@@ -2489,6 +2699,21 @@ export class PreviewSessionService {
         this.attachPageDownloadHandler(newPage, previewSessionId);
         this.attachTabCloseListener(newPage, previewSessionId);
 
+        // V16: Auth detector + external-nav trap for the popup. Popups are
+        // frequently payment/OAuth flows that cross-origin-redirect; without
+        // these the user gets no safety net once we've switched to the popup.
+        // A popup IS an intentional cross-origin nav by the user's click —
+        // rebase the trap baseline on the popup's landing URL.
+        try {
+          const { attachAuthDetector } = await import('./auth-detector');
+          attachAuthDetector(newPage, previewSessionId);
+        } catch { /* non-fatal */ }
+        try {
+          const { attachExternalNavTrap, markIntentionalGoto } = await import('./external-nav-trap');
+          attachExternalNavTrap(newPage, previewSessionId, newUrl);
+          markIntentionalGoto(previewSessionId, newUrl);
+        } catch { /* non-fatal */ }
+
         // Wait for new page DOM to be ready before allowing snapshot collection.
         // domcontentloaded is sufficient — 'load' waits for all subresources (images,
         // fonts, iframes) and can hang 8s+ on media-heavy pages. Halved timeout from
@@ -2891,6 +3116,16 @@ export class PreviewSessionService {
   }
 
   /**
+   * Get the underlying BrowserContext. Used by the Test Resources layer to
+   * apply (cookies/localStorage) or capture (storageState) a Login against
+   * the live preview. Auth is enforced the same way as `getPage`.
+   */
+  getContext(sessionId: string, userId?: string): BrowserContext | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.context || null;
+  }
+
+  /**
    * Navigate to URL in session
    */
   async navigate(sessionId: string, url: string, userId?: string): Promise<{
@@ -2907,6 +3142,13 @@ export class PreviewSessionService {
       const startMs = Date.now();
       const safeUrl = sanitizeUrl(url);
       logger.info('[PREVIEW_SESSION] Navigating to URL', { sessionId, url: safeUrl });
+
+      // Address-bar / programmatic navigate is user-intent — mark it so the
+      // external-nav trap accepts the new origin as the fresh baseline.
+      try {
+        const { markIntentionalGoto } = await import('./external-nav-trap');
+        markIntentionalGoto(sessionId, safeUrl);
+      } catch { /* non-fatal */ }
 
       await session.page.goto(safeUrl, {
         waitUntil: 'domcontentloaded',

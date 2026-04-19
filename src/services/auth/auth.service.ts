@@ -4,8 +4,24 @@ import { supabase, supabaseAdmin } from '@/db/supabase';
 import { AuthTokens, AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
+import {
+  validateBusinessEmail,
+  BUSINESS_EMAIL_ERROR_CODES,
+} from '@/utils/validation/businessEmail';
 import * as crypto from 'crypto';
 import { notifyAdminsOfNewUser } from './new-user-notification.service';
+
+// Thrown when signup is rejected because the email domain is a free/consumer
+// or disposable provider. The controller catches this and returns a 400
+// with the `code` so the frontend can localize the message.
+export class BusinessEmailError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = 'BusinessEmailError';
+    this.code = code;
+  }
+}
 
 // Supabase JWT expiry is configured in Supabase Dashboard (Auth settings).
 // This is only a fallback for cases when expires_in is missing.
@@ -83,6 +99,19 @@ export async function signUpWithEmail(
 
   if (!password || typeof password !== 'string' || password.length < 6) {
     throw new Error('Password must be at least 6 characters long');
+  }
+
+  // Business-email gate — block free providers (Gmail, Yandex, etc.) and
+  // disposable services (Mailinator et al.). Mirrored on the frontend so
+  // most users never hit this path; this is the authoritative check.
+  const businessCheck = validateBusinessEmail(email);
+  if (!businessCheck.ok) {
+    const code = BUSINESS_EMAIL_ERROR_CODES[businessCheck.reason];
+    const message =
+      businessCheck.reason === 'disposable'
+        ? 'Disposable email addresses are not allowed. Please use your work email.'
+        : 'Please use a work email. Free providers like Gmail, Yahoo or Outlook are not accepted.';
+    throw new BusinessEmailError(code, message);
   }
 
   try {

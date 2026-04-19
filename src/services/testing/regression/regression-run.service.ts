@@ -620,6 +620,51 @@ export class RegressionRunService {
       });
     }
 
+    // 3b. Shared resources (Login / Environment / Secret / ...) — Option A.
+    //
+    // SECURITY: Compilation + decryption happens in the WORKER
+    // (mobile-test-run.job.ts), NOT here. The dispatcher puts only
+    // `{kind, resource_id, required?}` into the BullMQ payload so
+    // plaintext secrets never land in Redis (which is typically
+    // unencrypted-at-rest and has long job history retention).
+    //
+    // What we DO run here: a lightweight DB-only preflight that loads
+    // `id, name, status, scope` (no decrypt!) for every `required: true`
+    // binding. If any required binding is missing or broken we throw
+    // BEFORE `createTest`, keeping the abort clean (no DB detritus, no
+    // UI "failed" row). Platform mismatch is intentionally not a fatal
+    // preflight error — the compiler soft-skips with a loud warning.
+    const rawBindings = Array.isArray(intentCase.resource_bindings)
+      ? (intentCase.resource_bindings as Array<{
+          kind: string;
+          resource_id: string;
+          required?: boolean;
+        }>)
+      : [];
+    if (rawBindings.length > 0) {
+      const { validateBindingsPreflight } = await import(
+        '@/services/test-resource/test-resource.service'
+      );
+      const pre = await validateBindingsPreflight(
+        rawBindings as Parameters<typeof validateBindingsPreflight>[0],
+        userId,
+        platform,
+      );
+      if (!pre.ok) {
+        // Fail-fast BEFORE createTest. Every failure is a `required: true`
+        // binding that can't possibly be applied — pretending to run the
+        // test would just waste emulator time and produce a confusing
+        // "tap login failed" error.
+        const summary = pre.reasons
+          .map((r) => `${r.resourceId}: ${r.reason}`)
+          .slice(0, 5)
+          .join('; ');
+        throw new ValidationError(
+          `Mobile test case "${intentCase.name}" has failed resource preflight: ${summary}`,
+        );
+      }
+    }
+
     // 4. Create test record in DB (same pattern as ci.controller.ts)
     const testId = uuidv4();
     await dbAdminService.createTest({
@@ -685,6 +730,11 @@ export class RegressionRunService {
       // the execution id, never analyticsRunId, to avoid double-finalizing.
       analyticsExecutionId,
       intelligentSessionId,
+      // SECURITY: only the raw reference is threaded through Redis. The
+      // worker calls ResourceStepCompilerService.compileForMobile on its
+      // own — decrypts, prepends setup steps, builds the audit snapshot.
+      // Secrets therefore never appear in BullMQ job data.
+      ...(rawBindings.length > 0 ? { resourceBindings: rawBindings } : {}),
     };
 
     await QueueManager.addMobileTestRunJob(jobData);
@@ -695,6 +745,7 @@ export class RegressionRunService {
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
       stepsCount: intentSteps.length,
+      resourceBindingsCount: rawBindings.length,
       // Phase 5: which build ran, for operator debugging.
       appBuildId: resolvedBuild?.id,
       appBranch: resolvedBuild?.branch,

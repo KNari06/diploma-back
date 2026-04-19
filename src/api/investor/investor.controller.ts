@@ -181,7 +181,7 @@ export const recordVisit = async (req: Request, res: Response): Promise<void> =>
 export const updateVisitEngagement = async (req: Request, res: Response): Promise<void> => {
   try {
     const { sessionId } = req.params;
-    const { timeOnPageSec, maxScrollPct } = req.body;
+    const { timeOnPageSec, maxScrollPct, deckClicked } = req.body;
 
     if (!sessionId) {
       res.status(400).json({ success: false, error: 'Session ID is required' });
@@ -195,8 +195,9 @@ export const updateVisitEngagement = async (req: Request, res: Response): Promis
     const incomingScroll = typeof maxScrollPct === 'number'
       ? Math.min(100, Math.max(0, Math.round(maxScrollPct)))
       : null;
+    const deckClick = deckClicked === true || deckClicked === 1;
 
-    if (incomingTime == null && incomingScroll == null) {
+    if (incomingTime == null && incomingScroll == null && !deckClick) {
       res.status(200).json({ success: true, message: 'Nothing to update' });
       return;
     }
@@ -206,7 +207,7 @@ export const updateVisitEngagement = async (req: Request, res: Response): Promis
     // incoming beacon only reflects the current session's engagement.
     const { data: current } = await supabaseAdmin
       .from('investor_visits')
-      .select('time_on_page_sec, max_scroll_pct')
+      .select('time_on_page_sec, max_scroll_pct, deck_clicks')
       .eq('session_id', sessionId)
       .maybeSingle();
 
@@ -223,6 +224,10 @@ export const updateVisitEngagement = async (req: Request, res: Response): Promis
     }
     if (incomingScroll != null) {
       updateData.max_scroll_pct = Math.max(current.max_scroll_pct || 0, incomingScroll);
+    }
+    if (deckClick) {
+      updateData.deck_clicks = (current.deck_clicks || 0) + 1;
+      updateData.last_deck_click_at = new Date().toISOString();
     }
 
     const { error } = await supabaseAdmin

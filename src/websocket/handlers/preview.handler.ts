@@ -4427,11 +4427,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       }
 
-      // Emit state to all subscribers
+      // Emit state to all subscribers. Stamp the server-side step cap so the
+      // UI can render an `X/N` badge without a separate config fetch.
       const room = createRoomName('preview', previewSessionId);
       socket.nsp.to(room).emit('preview:recording:state', {
         previewSessionId,
         recording: true,
+        maxSteps: RECORDING_MAX_STEPS,
         timestamp: new Date().toISOString(),
       });
 
@@ -4505,6 +4507,411 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Test Resources — Phase 4 live preview wiring
+  //
+  //   preview:apply-resource — inject a saved Login (cookies + localStorage)
+  //     into the live preview context. Drives the LoginRequiredOverlay's
+  //     "Apply existing" button so the user can keep authoring from an
+  //     authenticated state without re-typing credentials.
+  //
+  //   preview:save-login — snapshot the preview's current storageState as
+  //     a Login resource. Creates when no `resourceId` is sent, updates
+  //     (re-captures) otherwise. This is the backend half of the overlay's
+  //     "I logged in — save this" workflow.
+  //
+  // Both guards:
+  //   • session must be owned by the socket user
+  //   • no active test run on the session (would race with replay)
+  // Both emit an ack (`:result` event) so the frontend can toast success
+  // or show a specific error instead of hanging on a spinner.
+  // ═══════════════════════════════════════════════════════════════════════════
+  socket.on('preview:apply-resource' as any, async (data: {
+    previewSessionId: string;
+    resourceId: string;
+  }) => {
+    const emitResult = (payload: {
+      success: boolean;
+      resourceId: string;
+      resourceName?: string;
+      error?: string;
+    }): void => {
+      try {
+        socket.emit('preview:apply-resource:result', {
+          previewSessionId: data?.previewSessionId,
+          ...payload,
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* non-fatal */ }
+    };
+
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) {
+        emitResult({ success: false, resourceId: data?.resourceId, error: 'Unauthorized' });
+        return;
+      }
+
+      const { previewSessionId, resourceId } = data || {};
+      if (!previewSessionId || !resourceId) {
+        emitResult({ success: false, resourceId: resourceId || '', error: 'Missing previewSessionId or resourceId' });
+        return;
+      }
+
+      if (!checkRateLimit(socket.id, 'apply')) {
+        emitResult({ success: false, resourceId, error: 'Rate limited' });
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        emitResult({ success: false, resourceId, error: 'Session not owned by user' });
+        return;
+      }
+
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitResult({ success: false, resourceId, error: 'Cannot apply a resource while a run is in progress' });
+        return;
+      }
+
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      const context = sessionService.getContext(previewSessionId, ensuredUserId);
+      const sessionMeta = sessionService.getSession(previewSessionId);
+      if (!page || !context || !sessionMeta) {
+        emitResult({ success: false, resourceId, error: 'Preview session has no active page/context' });
+        return;
+      }
+
+      const [{ loadDecrypted }, { requireResourceAdapter }] = await Promise.all([
+        import('@/services/test-resource/test-resource.service'),
+        import('@/services/test-resource/adapter-registry'),
+      ]);
+
+      const resource = await loadDecrypted(resourceId, ensuredUserId);
+      if (!resource) {
+        emitResult({ success: false, resourceId, error: 'Resource not found or not owned by user' });
+        return;
+      }
+      if (resource.kind !== 'auth') {
+        // Phase 4 only ships auth; other kinds can't be live-applied to a
+        // preview because they need a test-execution context (env vars,
+        // device emulation, scenario setup, etc.).
+        emitResult({
+          success: false,
+          resourceId,
+          resourceName: resource.name,
+          error: `Only auth resources can be applied to a preview (got "${resource.kind}")`,
+        });
+        return;
+      }
+      if (resource.status === 'broken') {
+        emitResult({
+          success: false,
+          resourceId,
+          resourceName: resource.name,
+          error: `Login "${resource.name}" is marked broken — re-record it first`,
+        });
+        return;
+      }
+
+      // Cookies arrive cross-origin (Login scope may differ from preview's
+      // current page). The external-nav trap would otherwise revert the
+      // post-apply reload — tell it this next navigation is user-intended.
+      try {
+        const { markIntentionalGoto } = await import('@/services/testing/ui/preview/external-nav-trap');
+        markIntentionalGoto(previewSessionId, page.url());
+      } catch { /* non-fatal */ }
+
+      const adapter = requireResourceAdapter('auth');
+      try {
+        await adapter.apply(
+          {
+            userId: ensuredUserId,
+            projectId: sessionMeta.projectId,
+            page,
+            context,
+            runVariables: new Map(),
+          },
+          resource,
+        );
+      } catch (err) {
+        emitResult({
+          success: false,
+          resourceId,
+          resourceName: resource.name,
+          error: `Failed to apply login: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+
+      // Reload the current page so the app re-reads cookies/localStorage and
+      // renders in the authenticated state. Skip the reload if we're still
+      // on about:blank — nothing to re-render.
+      try {
+        if (page.url() && page.url() !== 'about:blank') {
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+        }
+      } catch (err) {
+        // Apply succeeded, reload failed — still report success so the user
+        // can manually navigate. Cookies are injected either way.
+        logger.warn('[WebSocket] apply-resource reload failed (non-fatal)', {
+          previewSessionId,
+          resourceId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      emitResult({ success: true, resourceId, resourceName: resource.name });
+      logger.info('[WebSocket] Applied login to preview', {
+        previewSessionId,
+        resourceId,
+        resourceName: resource.name,
+      });
+    } catch (error) {
+      logger.error('[WebSocket] preview:apply-resource handler error', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      emitResult({
+        success: false,
+        resourceId: data?.resourceId || '',
+        error: 'Internal error',
+      });
+    }
+  });
+
+  socket.on('preview:save-login' as any, async (data: {
+    previewSessionId: string;
+    resourceId?: string;
+    name?: string;
+    description?: string;
+    domain?: string;
+    ttlSeconds?: number;
+    setAsDefault?: boolean;
+  }) => {
+    const emitResult = (payload: {
+      success: boolean;
+      resource?: {
+        id: string;
+        name: string;
+        kind: 'auth';
+        status: 'active' | 'stale' | 'broken';
+        capturedAt?: string;
+        expiresAt?: string;
+        scope?: Record<string, unknown>;
+      };
+      updated?: boolean;
+      error?: string;
+    }): void => {
+      try {
+        socket.emit('preview:save-login:result', {
+          previewSessionId: data?.previewSessionId,
+          ...payload,
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* non-fatal */ }
+    };
+
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) {
+        emitResult({ success: false, error: 'Unauthorized' });
+        return;
+      }
+
+      const { previewSessionId, resourceId, name, description, domain, ttlSeconds, setAsDefault } = data || {};
+      if (!previewSessionId) {
+        emitResult({ success: false, error: 'Missing previewSessionId' });
+        return;
+      }
+      if (!resourceId && !name) {
+        emitResult({ success: false, error: 'A new login needs a name; pass resourceId to update an existing one' });
+        return;
+      }
+
+      if (!checkRateLimit(socket.id, 'apply')) {
+        emitResult({ success: false, error: 'Rate limited' });
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        emitResult({ success: false, error: 'Session not owned by user' });
+        return;
+      }
+
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        emitResult({ success: false, error: 'Cannot save a login while a run is in progress' });
+        return;
+      }
+
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      const context = sessionService.getContext(previewSessionId, ensuredUserId);
+      const sessionMeta = sessionService.getSession(previewSessionId);
+      if (!page || !context || !sessionMeta) {
+        emitResult({ success: false, error: 'Preview session has no active page/context' });
+        return;
+      }
+
+      const projectId = sessionMeta.projectId;
+      if (!projectId) {
+        emitResult({ success: false, error: 'Preview session is not bound to a project' });
+        return;
+      }
+
+      const previewUrl = page.url();
+      if (!previewUrl || previewUrl === 'about:blank') {
+        emitResult({ success: false, error: 'Navigate to the logged-in page first — blank previews have no session to save' });
+        return;
+      }
+
+      // Derive the scope default from the current preview URL. The caller
+      // can override via `domain` when the login host differs from the
+      // page host (e.g. subdomain SSO).
+      let fallbackDomain: string | undefined;
+      try { fallbackDomain = new URL(previewUrl).hostname; } catch { /* ignore */ }
+
+      const adapter = (await import('@/services/test-resource/adapter-registry')).requireResourceAdapter('auth');
+      if (!adapter.capture) {
+        emitResult({ success: false, error: 'Auth adapter does not support capture — update the backend' });
+        return;
+      }
+      let captured: { config: Record<string, unknown>; sensitive: Record<string, unknown> };
+      try {
+        const raw = await adapter.capture({
+          userId: ensuredUserId,
+          projectId,
+          page,
+          context,
+          runVariables: new Map(),
+        });
+        captured = {
+          config: (raw.config ?? {}) as Record<string, unknown>,
+          sensitive: (raw.sensitive ?? {}) as Record<string, unknown>,
+        };
+      } catch (err) {
+        emitResult({
+          success: false,
+          error: `Failed to capture login state: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        return;
+      }
+
+      const testResourceService = await import('@/services/test-resource/test-resource.service');
+      try {
+        if (resourceId) {
+          // Update path: re-capture into an existing resource. The service
+          // helper takes positional args and returns void — we re-read
+          // through loadDecrypted to echo the updated row to the caller.
+          await testResourceService.captureState(
+            resourceId,
+            ensuredUserId,
+            { config: captured.config, sensitive: captured.sensitive },
+            { heal: false },
+          );
+          const refreshed = await testResourceService.loadDecrypted(resourceId, ensuredUserId);
+          if (!refreshed) {
+            emitResult({ success: false, error: 'Resource disappeared after capture' });
+            return;
+          }
+          emitResult({
+            success: true,
+            updated: true,
+            resource: {
+              id: refreshed.id,
+              name: refreshed.name,
+              kind: 'auth',
+              status: refreshed.status,
+              capturedAt: refreshed.expiresAt && refreshed.ttlSeconds
+                ? new Date(refreshed.expiresAt.getTime() - refreshed.ttlSeconds * 1000).toISOString()
+                : undefined,
+              expiresAt: refreshed.expiresAt?.toISOString(),
+              scope: refreshed.scope as unknown as Record<string, unknown>,
+            },
+          });
+          logger.info('[WebSocket] Re-captured login', {
+            previewSessionId, resourceId, name: refreshed.name,
+          });
+        } else {
+          // Create path: brand-new Login scoped to the current hostname
+          // (or the caller's override). TTL defaults to 7 days if omitted
+          // — mirrors the LoginsSettings "new login" default.
+          const created = await testResourceService.createResource({
+            userId: ensuredUserId,
+            projectId,
+            kind: 'auth',
+            name: name!,
+            description,
+            scope: {
+              platform: 'web',
+              domain: domain || fallbackDomain,
+            },
+            config: captured.config,
+            sensitive: captured.sensitive,
+            ttlSeconds: ttlSeconds ?? 7 * 24 * 60 * 60,
+            refreshMethod: 'manual',
+          });
+
+          // Optional default upsert — mirrors the REST controller's logic
+          // so the "Set as default" checkbox in the overlay works without
+          // a second round-trip.
+          if (setAsDefault === true) {
+            try {
+              await testResourceService.setDefaultResource({
+                userId: ensuredUserId,
+                projectId,
+                resourceId: created.id,
+                kind: 'auth',
+                platform: 'web',
+                url: domain || fallbackDomain || null,
+                appPackage: null,
+                urlPattern: null,
+              });
+            } catch (err) {
+              // Non-fatal: creation succeeded, default wiring is separate.
+              logger.warn('[WebSocket] save-login setAsDefault failed', {
+                previewSessionId, id: created.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+
+          emitResult({
+            success: true,
+            updated: false,
+            resource: {
+              id: created.id,
+              name: created.name,
+              kind: 'auth',
+              status: created.status,
+              capturedAt: created.capturedAt,
+              expiresAt: created.expiresAt,
+              scope: created.scope as unknown as Record<string, unknown>,
+            },
+          });
+          logger.info('[WebSocket] Saved new login from preview', {
+            previewSessionId, resourceId: created.id, name: created.name,
+          });
+        }
+      } catch (err) {
+        emitResult({
+          success: false,
+          error: `Failed to persist login: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    } catch (error) {
+      logger.error('[WebSocket] preview:save-login handler error', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      emitResult({ success: false, error: 'Internal error' });
     }
   });
 
