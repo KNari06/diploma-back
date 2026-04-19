@@ -95,6 +95,10 @@ export interface ClientToServerEvents {
 
   // V15: Multi-tab events (client → server)
   'preview:tab:switch': (data: { previewSessionId: string; tabIndex: number }) => void;
+  // Close a popup/secondary tab. Root tab (index 0) can't be closed via
+  // this event — server refuses. Backend responds by rebroadcasting
+  // `preview:tab:closed` with the updated tabs list.
+  'preview:tab:close': (data: { previewSessionId: string; tabIndex: number }) => void;
 
   // Preview DevTools (on-demand requests)
   'preview:network:detail:request': (data: PreviewNetworkDetailRequest) => void;

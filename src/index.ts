@@ -158,7 +158,7 @@ app.use(cors({
   credentials: true,
   // Include HEAD for common browser/proxy behavior. Keep TRACE/CONNECT disabled for security.
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-User-ID', 'X-Admin-Key'],
 }));
 
 // ✅ FIX: Helper function to check if origin is allowed
@@ -189,7 +189,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID, X-Admin-Key');
       return originalStatus.call(this, code);
     };
 
@@ -198,7 +198,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID, X-Admin-Key');
       return originalJson.call(this, body);
     };
 
@@ -207,7 +207,7 @@ app.use((req: express.Request, res: express.Response, next: express.NextFunction
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID, X-Admin-Key');
       return originalSend.call(this, body);
     };
   }
@@ -1412,7 +1412,7 @@ const startServer = async () => {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-User-ID, X-Admin-Key');
       }
       res.status(503).json({
         success: false,

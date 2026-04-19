@@ -3442,6 +3442,64 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     }
   });
 
+  // V-PhaseB: Close a secondary/popup tab. The frontend's tab bar puts a
+  // "×" button on every non-root tab; it emits this event. Root tab is
+  // protected server-side (`closeTab` refuses when pages.length <= 1) so
+  // the UI can't accidentally orphan the session. Rebroadcasts the
+  // updated tab list to everyone subscribed to the preview room so
+  // multiple-connected-clients (editor + devtools panel) stay in sync.
+  socket.on('preview:tab:close', async (data: { previewSessionId?: string; tabIndex?: number }) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+      if (!checkRateLimit(socket.id, 'pageAction')) return;
+
+      const previewSessionId = validateInputRequest(data, socket.id, ensuredUserId);
+      if (!previewSessionId) return;
+
+      const tabIndex = data.tabIndex;
+      if (typeof tabIndex !== 'number' || !Number.isFinite(tabIndex) || tabIndex < 0) {
+        logger.warn('[WebSocket] Invalid tab close request', { previewSessionId, tabIndex });
+        return;
+      }
+
+      logger.info('[WebSocket] Tab close requested', { previewSessionId, tabIndex, userId: ensuredUserId });
+
+      const { getPreviewSessionService: getSessionSvc } = await import('@/services/testing/ui/preview');
+      const sessionService = getSessionSvc();
+      const closed = await sessionService.closeTab(previewSessionId, ensuredUserId, tabIndex);
+
+      if (!closed) {
+        // closeTab() returns false on: invalid index, last tab (root guard),
+        // or unauthorized. Log for debug and emit nothing — client keeps its
+        // existing tab list which already reflects reality.
+        logger.warn('[WebSocket] Tab close refused', { previewSessionId, tabIndex });
+        return;
+      }
+
+      const tabsInfo = sessionService.getTabsInfo(previewSessionId, ensuredUserId);
+      const session = sessionService.getSession(previewSessionId);
+      const room = createRoomName('preview', previewSessionId);
+
+      // Emit to ROOM (not only this socket) so every connected client sees
+      // the closure. closeTab() already fired onPageSwitch internally when
+      // the active tab was the closed one, which restarts video/devtools
+      // on the newly-active page via preview.handler's session callback.
+      socket.nsp.to(room).emit('preview:tab:closed', {
+        previewSessionId,
+        tabs: tabsInfo,
+        activeTabIndex: session?.activeTabIndex ?? 0,
+        closedTabIndex: tabIndex,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error('[WebSocket] Error in preview:tab:close', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
   // Handle page reset
   socket.on('preview:page:reset', async (data) => {
     try {
@@ -3467,6 +3525,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
+
+      // Editor trace — capture reset entry so future regressions in the
+      // reset path (video freeze, stale page handle, etc.) show up in the
+      // JSONL without needing to grep server logs.
+      const resetEntryTrace = EditorTraceService.get(previewSessionId);
+      const resetStart = Date.now();
+      const resetFromUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url();
+      resetEntryTrace?.writeSessionReset({ phase: 'start', fromUrl: resetFromUrl });
 
       // V9: Capture recording state BEFORE reset (reset clears it)
       const wasRecording = sessionService.isRecording(previewSessionId, ensuredUserId);
@@ -3509,10 +3575,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           if (newPage) {
             const room = createRoomName('preview', previewSessionId);
 
-            // Stop old (already dead) stream, then start fresh on new page.
-            // startStream() is mutex'd by the registry so concurrent reset
-            // requests cannot create orphaned CDP sessions.
-            await videoReg.stopStream(previewSessionId);
+            // Start fresh stream on the new page. Do NOT call stopStream()
+            // first — startStream() internally:
+            //   1) reads the current stream's seq counter,
+            //   2) stops it,
+            //   3) constructs a new stream with the inherited seq.
+            // Pre-stopping here would delete the old stream from the map
+            // BEFORE startStream can read its seq, so the replacement
+            // would restart counting at 0. Because the frontend
+            // deduplicates frames by `seq > lastSeq` and keeps its seq
+            // state across reset (sessionId is stable), those seq=0..N
+            // frames would all be dropped as "out of order" until the
+            // counter caught up — manifesting as a frozen preview for
+            // 5-10s after every Reset. The mutex inside startStream()
+            // already guards against concurrent resets.
             await videoReg.startStream(previewSessionId, ensuredUserId, room, newPage, socket.nsp);
 
             // Restart devtools collectors on new page
@@ -3534,6 +3610,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         // `resetSession` already cleared `lastEmittedSignature` internally, but we
         // still use the bypass path so the intent is explicit.
         setImmediate(() => emitSnapshotForHandshake(socket, previewSessionId, ensuredUserId));
+
+        resetEntryTrace?.writeSessionReset({
+          phase: 'end',
+          fromUrl: resetFromUrl,
+          toUrl: sessionService.getPage(previewSessionId, ensuredUserId)?.url(),
+          success: true,
+          durationMs: Date.now() - resetStart,
+        });
 
         // V9: Recording — reset destroys old page+context, so recording must stop
         // (resetSession already sets recording=false and clears buffer)
@@ -3568,6 +3652,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       } else {
         emitPageActionResult(socket, previewSessionId, 'reset', false, 'Reset failed or session not found');
+        resetEntryTrace?.writeSessionReset({
+          phase: 'end',
+          fromUrl: resetFromUrl,
+          success: false,
+          error: 'Reset failed or session not found',
+          durationMs: Date.now() - resetStart,
+        });
       }
     } catch (error) {
       logger.error('[WebSocket] Error in preview:page:reset', {

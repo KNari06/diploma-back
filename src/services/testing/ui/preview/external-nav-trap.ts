@@ -183,40 +183,72 @@ export function attachExternalNavTrap(page: Page, sessionId: string, baselineUrl
     const current = perPage.get(page);
     if (!current) return;
 
-    // Trap is disabled while an automated run is in progress. Recorded tests
-    // may legitimately cross origins (OAuth, payment provider handoff) and
-    // reverting mid-run would break the replay. At least refresh the safe
-    // checkpoint so a post-run user-triggered revert has something useful
-    // to fall back to.
-    if (suppressedSessions.has(current.sessionId)) {
-      current.lastSafeUrl = url;
-      current.baselineUrl = url;
-      current.baselineOrigin = navOrigin;
-      return;
-    }
-
     const now = Date.now();
 
+    // Snapshot the PRE-mutation baseline so the editor-trace `fromUrl`
+    // shows the real transition (from-URL → to-URL). Previous pass wrote
+    // `fromUrl: current.baselineUrl` AFTER we overwrote it to `url`, so
+    // suppressed/intent branches logged fromUrl=toUrl (looked bogus).
+    const fromBaseline = current.baselineUrl;
+
+    // Editor trace — lazy-loaded so this module doesn't depend on the
+    // trace service load order. Every decision below fires exactly one
+    // event so the JSONL shows why a given nav was reverted / accepted.
+    const writeTrap = async (
+      action: 'reverted' | 'allowed_intent' | 'allowed_same_app' | 'suppressed_during_run',
+      extra?: { recoveredTo?: string; reason?: string },
+    ) => {
+      try {
+        const { EditorTraceService } = await import('./editor-trace.service');
+        EditorTraceService.get(current.sessionId)?.writeExternalNavTrap({
+          action,
+          fromUrl: fromBaseline,
+          toUrl: url,
+          ...extra,
+        });
+      } catch { /* trace is advisory */ }
+    };
+
     // Our own revert just fired — clear the guard and update baseline.
+    // Checked BEFORE suppression so we always recognise the revert loop.
     if (current.reverting) {
       current.reverting = false;
       current.lastSafeUrl = url;
       return;
     }
 
-    // User-intended navigations (address bar, preview reset) extend the
-    // intent window. Any nav that lands inside it is accepted and becomes
-    // the new baseline.
+    // User-intended navigations (address bar, preview reset, back/forward,
+    // refresh, Phase-4 apply-login) extend the intent window. A user
+    // action MUST beat suppression — otherwise users can't interact with
+    // the preview at all during a running test (back button was already
+    // reported broken by a user precisely because suppression fired
+    // first). Any nav that lands inside the intent window is accepted
+    // and becomes the new baseline.
     if (now < current.intentUntil) {
       current.baselineOrigin = navOrigin;
       current.baselineUrl = url;
       current.lastSafeUrl = url;
+      void writeTrap('allowed_intent', { reason: 'within_intent_window' });
+      return;
+    }
+
+    // Trap is disabled while an automated run is in progress. Recorded
+    // tests may legitimately cross origins (OAuth, payment provider
+    // handoff) and reverting mid-run would break the replay. We keep the
+    // safe checkpoint + baseline fresh so a post-run user-triggered
+    // revert has something useful to fall back to.
+    if (suppressedSessions.has(current.sessionId)) {
+      current.lastSafeUrl = url;
+      current.baselineUrl = url;
+      current.baselineOrigin = navOrigin;
+      void writeTrap('suppressed_during_run', { reason: 'run_in_progress' });
       return;
     }
 
     // Same-app navigation — allowed, refresh the safe-url checkpoint.
     if (isSameApp(url, current.baselineUrl)) {
       current.lastSafeUrl = url;
+      void writeTrap('allowed_same_app');
       return;
     }
 
@@ -227,6 +259,7 @@ export function attachExternalNavTrap(page: Page, sessionId: string, baselineUrl
       to: url,
       safeUrl: current.lastSafeUrl,
     });
+    void writeTrap('reverted', { recoveredTo: current.lastSafeUrl });
 
     current.reverting = true;
     try {

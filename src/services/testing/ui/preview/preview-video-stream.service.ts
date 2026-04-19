@@ -230,6 +230,18 @@ export class PreviewVideoStreamService {
         resolution: `${PREVIEW_VIDEO_CONFIG.maxWidth}x${PREVIEW_VIDEO_CONFIG.maxHeight}`,
       });
 
+      // Editor trace — mark CDP attach so post-reset video regressions
+      // (seq reset, stale page ref, CDP session detached) are visible in
+      // the JSONL log without crawling the main server log.
+      try {
+        const { EditorTraceService } = await import('./editor-trace.service');
+        EditorTraceService.get(this.previewSessionId)?.writeVideoStreamEvent({
+          phase: 'attach',
+          pageUrl: this.lastGuaranteedUrl ?? undefined,
+          seq: this.seq,
+        });
+      } catch { /* trace is advisory */ }
+
       // V13: Seed lastGuaranteedUrl with the page's current URL so the
       // immediately-following framenavigated event for THIS same URL does not
       // re-arm the guarantee. We only want main-frame nav to a NEW URL to
@@ -279,6 +291,17 @@ export class PreviewVideoStreamService {
       framesEmitted: this.framesEmitted,
       framesDropped: this.framesDropped,
     });
+
+    // Editor trace — pair with the attach event so session-scoped JSONL
+    // shows the full screencast lifecycle (attach → first_frame → detach).
+    try {
+      const { EditorTraceService } = await import('./editor-trace.service');
+      EditorTraceService.get(this.previewSessionId)?.writeVideoStreamEvent({
+        phase: 'detach',
+        reason: this.cdpSessionClosed ? 'page_close' : 'explicit_stop',
+        seq: this.seq,
+      });
+    } catch { /* trace is advisory */ }
 
     // Stop CDP screencast
     if (this.cdpSession && !this.cdpSessionClosed) {
@@ -407,6 +430,16 @@ export class PreviewVideoStreamService {
           clearTimeout(this.ensureFirstFrameTimer);
           this.ensureFirstFrameTimer = null;
         }
+        // Editor trace — measures how long the preview sat blank after
+        // attach. A sudden regression here (e.g. 5s+ gap after reset) is
+        // a strong hint that inheritedSeq broke or the page reference
+        // is stale. Fire-and-forget so the paint path isn't blocked.
+        import('./editor-trace.service').then(({ EditorTraceService }) => {
+          EditorTraceService.get(this.previewSessionId)?.writeVideoStreamEvent({
+            phase: 'first_frame',
+            seq: this.seq,
+          });
+        }).catch(() => { /* trace is advisory */ });
       }
 
       // Resume if was paused
@@ -870,6 +903,19 @@ export class PreviewVideoStreamRegistry {
             inheritedSeq,
           });
         }
+
+        // Editor trace — `inheritedSeq === undefined` is a smoking-gun
+        // signal for the reset-video-freeze regression class (no seq
+        // continuity → frontend drops all post-reset frames). Explicitly
+        // logging `null` on that path so greps can find it.
+        try {
+          const { EditorTraceService } = await import('./editor-trace.service');
+          EditorTraceService.get(previewSessionId)?.writeVideoStreamEvent({
+            phase: 'restart',
+            inheritedSeq: inheritedSeq ?? null,
+            reason: oldStream ? 'replaced_existing' : 'no_prior_stream',
+          });
+        } catch { /* trace is advisory */ }
 
         const started = await stream.start(page, nsp);
 

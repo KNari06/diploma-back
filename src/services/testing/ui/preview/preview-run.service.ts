@@ -632,7 +632,6 @@ export class PreviewRunService {
       abortController: new AbortController(),
     };
     const signal = runState.abortController.signal;
-    activeRuns.set(previewSessionId, runState);
 
     let startedEmitted = false;
     let timedOut = false;
@@ -697,6 +696,15 @@ export class PreviewRunService {
     // Capture any error thrown inside the run loop so the finally block
     // can record it in the returned summary (used by chat tools/AI agents).
     let caughtRunError: unknown = null;
+
+    // Publish the activeRuns lock as the LAST statement before `try` so
+    // that any sync throw above cannot leak the entry. The finally handler
+    // will always delete it via the identity check on runState. A prior
+    // layout published the lock 50+ lines earlier — if LiteTraceWriter's
+    // constructor (fs.mkdirSync) or any other pre-try line threw, the
+    // lock stayed set forever and every subsequent Run rejected with
+    // "Run already in progress" until the server was restarted.
+    activeRuns.set(previewSessionId, runState);
 
     try {
       // Disable the external-nav trap for the duration of the run. Recorded

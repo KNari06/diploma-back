@@ -6,17 +6,23 @@ import crypto from 'crypto';
 
 const router = Router();
 
-// Rate limiters — public endpoints, prevent abuse
+// Rate limiters — public endpoints, prevent abuse.
+// `validate.trustProxy: false` silences the express-rate-limit v7 warning
+// about the global `app.set('trust proxy', true)` config — we know that
+// header-spoofable IPs can bypass these limits, which is acceptable for
+// a low-traffic investor-report tracker.
 const visitLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
   message: { success: false, error: 'Too many requests' },
+  validate: { trustProxy: false },
 });
 
 const engagementLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 30,
   message: { success: false, error: 'Too many requests' },
+  validate: { trustProxy: false },
 });
 
 // Middleware to handle beacon requests that may arrive as text/plain
@@ -41,10 +47,15 @@ router.post('/visit', visitLimiter, asyncHandler(recordVisit));
 
 /**
  * PATCH /api/v1/investor/visit/:sessionId
- * Update engagement metrics for a visit (public, rate-limited)
- * Uses custom body parser to handle beacon text/plain Content-Type
+ * Update engagement metrics for a visit (public, rate-limited).
+ * Uses custom body parser to handle beacon text/plain Content-Type.
+ *
+ * POST alias exists because `navigator.sendBeacon()` is hard-coded to POST —
+ * the browser cannot send PATCH via beacon, so the same handler is registered
+ * under both verbs for the same path.
  */
 router.patch('/visit/:sessionId', engagementLimiter, ...beaconBodyParser, asyncHandler(updateVisitEngagement));
+router.post('/visit/:sessionId', engagementLimiter, ...beaconBodyParser, asyncHandler(updateVisitEngagement));
 
 /**
  * GET /api/v1/investor/visits?key=<password>&month=<optional>
@@ -55,10 +66,13 @@ const adminVisitsLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 20,
   message: { success: false, error: 'Too many requests' },
+  validate: { trustProxy: false },
 });
 
 // Admin auth: accepts password via ?key= (GET) or X-Admin-Key header (DELETE).
-// Hashes it server-side and compares with INVESTOR_HASH env var.
+// Hashes it server-side and compares with ADMIN_HASH (preferred, separate
+// admin password). Falls back to INVESTOR_HASH if ADMIN_HASH is not set —
+// that way single-password setups still work.
 function requireAdminKey(req: Request, res: Response, next: NextFunction) {
   const key = (typeof req.query.key === 'string' && req.query.key) ||
               (typeof req.headers['x-admin-key'] === 'string' && req.headers['x-admin-key'] as string) ||
@@ -68,8 +82,13 @@ function requireAdminKey(req: Request, res: Response, next: NextFunction) {
     return;
   }
   const hash = crypto.createHash('sha256').update(key).digest('hex');
-  const expected = process.env.INVESTOR_HASH || '';
-  if (!expected || hash !== expected) {
+  const adminHash = process.env.ADMIN_HASH || '';
+  const investorHash = process.env.INVESTOR_HASH || '';
+  // Prefer ADMIN_HASH; fall back to INVESTOR_HASH only if ADMIN_HASH unset
+  const matches = adminHash
+    ? hash === adminHash
+    : (investorHash && hash === investorHash);
+  if (!matches) {
     res.status(403).json({ success: false, error: 'Invalid access key' });
     return;
   }
@@ -89,6 +108,7 @@ const adminDeleteLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
   message: { success: false, error: 'Too many requests' },
+  validate: { trustProxy: false },
 });
 
 router.delete(

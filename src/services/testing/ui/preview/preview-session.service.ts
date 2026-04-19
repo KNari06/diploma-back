@@ -805,6 +805,7 @@ export class PreviewSessionService {
 
         // Handle page crash (renderer process OOM, infinite loop, etc.)
         this.attachCrashHandler(page, sessionId);
+        this.attachFrameNavigatedTrace(page, sessionId);
 
         // Handle download attempts (headless can't download — notify frontend)
         this.attachPageDownloadHandler(page, sessionId);
@@ -981,6 +982,7 @@ export class PreviewSessionService {
       // Re-attach handlers on new context/page
       this.attachPopupHandler(newContext, sessionId);
       this.attachCrashHandler(newPage, sessionId);
+      this.attachFrameNavigatedTrace(newPage, sessionId);
       this.attachPageDownloadHandler(newPage, sessionId);
       this.attachTabCloseListener(newPage, sessionId);
 
@@ -1132,6 +1134,40 @@ export class PreviewSessionService {
       // (pushState/replaceState don't produce network responses).
       // Check URL change to distinguish: if URL changed, back worked (SPA case).
       if (!response && newUrl === previousUrl) {
+        // V-Phase4: "No history" on this page does NOT necessarily mean the
+        // user has nowhere to go. When a site opened a popup (window.open
+        // or target=_blank) we've swapped `session.page` to the popup, but
+        // the previous tab is still alive in `session.pages[]`. A real
+        // browser's back button wouldn't work on that popup either — but
+        // the user expects "take me back to where I was before clicking
+        // the payment link". So fall back to closing the current tab and
+        // activating the previous one; closeTab emits the right tab
+        // events and restarts video on the now-active page.
+        if (session.pages.length > 1 && session.activeTabIndex > 0) {
+          const previousTabIndex = session.activeTabIndex - 1;
+          const closedIndex = session.activeTabIndex;
+          logger.info('[PREVIEW_SESSION] goBack fell back to closing popup tab', {
+            sessionId, closedIndex, switchingToIndex: previousTabIndex, popupUrl: previousUrl,
+          });
+          const closed = await this.closeTab(sessionId, userId, closedIndex);
+          if (closed) {
+            const restoredUrl = session.page.url();
+            logPerformance('preview.goBack', Date.now() - startMs, {
+              sessionId, from: previousUrl, to: restoredUrl, via: 'popup_close',
+            });
+            setImmediate(() => {
+              this.getSnapshot(sessionId, userId, {
+                force: true, includeDomNodes: true, onlyIfChanged: false,
+              }).catch(() => { /* non-fatal */ });
+            });
+            return {
+              url: restoredUrl,
+              domVersion: session.domVersion,
+              pageSignature: session.lastPageSignature,
+              changed: restoredUrl !== previousUrl,
+            };
+          }
+        }
         logger.debug('[PREVIEW_SESSION] No history to go back', { sessionId });
         return null;
       }
@@ -2696,6 +2732,7 @@ export class PreviewSessionService {
         // Attach handlers to new page
         this.attachDialogHandler(newPage, previewSessionId);
         this.attachCrashHandler(newPage, previewSessionId);
+        this.attachFrameNavigatedTrace(newPage, previewSessionId);
         this.attachPageDownloadHandler(newPage, previewSessionId);
         this.attachTabCloseListener(newPage, previewSessionId);
 
@@ -3034,6 +3071,38 @@ export class PreviewSessionService {
 
       // Destroy entire session (browser process is likely unstable)
       this.stopSession(previewSessionId).catch(() => {});
+    });
+  }
+
+  /**
+   * Editor trace — mirror every main-frame `framenavigated` into the JSONL
+   * log. This is the ground-truth URL timeline (browser-observed, not our
+   * inferred state) and is invaluable for correlating action outcomes
+   * with unexpected navigations. Sub-frame (iframe) navigations are
+   * ignored so the log isn't flooded with ad/analytics frames.
+   *
+   * Wired at the same three sites as crash/download handlers: initial
+   * session start, session reset, and popup adoption.
+   */
+  private attachFrameNavigatedTrace(page: Page, previewSessionId: string): void {
+    page.on('framenavigated', (frame) => {
+      try {
+        const isMain = frame.parentFrame() === null;
+        if (!isMain) return;
+        const url = frame.url();
+        if (!url || url === 'about:blank') return;
+        // Import lazily — the trace service already handles missing-session
+        // gracefully, and we don't want this listener to import-cycle at
+        // module load time.
+        import('./editor-trace.service').then(({ EditorTraceService }) => {
+          EditorTraceService.get(previewSessionId)?.writeFrameNavigated({
+            url,
+            isMainFrame: true,
+          });
+        }).catch(() => { /* trace is advisory */ });
+      } catch {
+        /* frame may be detached mid-handler */
+      }
     });
   }
 
