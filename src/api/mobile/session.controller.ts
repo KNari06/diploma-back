@@ -80,6 +80,30 @@ export interface WarmupData {
   appStoragePath?: string;
 }
 
+/**
+ * Emit a `preview:session:progress` WebSocket event so the AI editor's
+ * PreviewLoadingProgress component can render a real progress bar while
+ * the emulator warms up. Mirrors the event shape already used by the web
+ * preview path. Non-fatal — a socket hiccup must never fail warmup.
+ *
+ * Stage strings recognised by the frontend (in order):
+ *   launching_browser → stage 1 (emulator ready)
+ *   loading_page      → stage 2 (APK install in progress)
+ *   extracting_elements → stage 3 (launching app)
+ *   ready             → stage 4 (complete)
+ */
+function emitWarmupProgress(
+  userId: string,
+  stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready',
+  progress: number,
+): void {
+  try {
+    webSocketService.emitToUser(userId, 'preview:session:progress', { stage, progress });
+  } catch {
+    // Best-effort — never let a socket error break warmup.
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WARM-UP SESSION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -219,6 +243,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // Run install+launch_app BEFORE responding, so the preview stream shows
           // the app already open. On a reused session this usually hits the fast
           // path (Redis match or device check) and just issues launch_app.
+          emitWarmupProgress(userId, 'launching_browser', 15);
           try {
             await installAppOnSession(client, existing.sessionId, projectId, userId, appPackage);
           } catch (err) {
@@ -228,6 +253,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          emitWarmupProgress(userId, 'ready', 100);
 
           res.json({
             success: true,
@@ -271,6 +297,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       });
       session = await client.createSession(platform);
     }
+
+    // Emulator is up — nudge the loader past the "preparing env" stage.
+    emitWarmupProgress(userId, 'launching_browser', 15);
 
     // Propagate project-level permission policy to the runner. Best-effort:
     // the runner defaults to 'auto_allow' when the patch fails, which is the
@@ -329,6 +358,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    emitWarmupProgress(userId, 'ready', 100);
 
     res.status(201).json({
       success: true,
@@ -1087,6 +1117,9 @@ async function installAppOnSession(
   userId: string,
   appPackageOverride?: string,
 ): Promise<void> {
+  // Nudge the UI past "preparing env" as soon as install logic starts.
+  emitWarmupProgress(userId, 'launching_browser', 25);
+
   const project = await ProjectService.getProject(projectId, userId);
   const mobileApp = project?.settings?.mobileApp;
 
@@ -1122,6 +1155,7 @@ async function installAppOnSession(
       projectId,
       package: warmup.installedPackage,
     });
+    emitWarmupProgress(userId, 'extracting_elements', 75);
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName: appPackageOverride || warmup.installedPackage } },
     ], { timeoutMs: 60_000 });
@@ -1144,6 +1178,7 @@ async function installAppOnSession(
           projectId,
           package: knownPackage,
         });
+        emitWarmupProgress(userId, 'extracting_elements', 75);
         await client.executeBatchCommands(sessionId, [
           { type: 'launch_app', params: { packageName: knownPackage } },
         ], { timeoutMs: 60_000 });
@@ -1175,6 +1210,7 @@ async function installAppOnSession(
     originalName: mobileApp.originalName,
     oldPackage: warmup?.installedPackage || '(none)',
   });
+  emitWarmupProgress(userId, 'loading_page', 45);
 
   const fileBuffer = await MobileAppStorageService.downloadApp(mobileApp.storagePath);
   const uploaded = await client.uploadApp(fileBuffer, mobileApp.originalName);
@@ -1212,6 +1248,7 @@ async function installAppOnSession(
   // Gives us one deterministic code path regardless of whether we knew the
   // package name up front.
   if (packageName) {
+    emitWarmupProgress(userId, 'extracting_elements', 75);
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName } },
     ], { timeoutMs: 60_000 });
