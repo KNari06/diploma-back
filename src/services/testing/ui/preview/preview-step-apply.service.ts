@@ -26,6 +26,8 @@ import type {
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
+import { smartStepWait } from '../smart-step-wait.service';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
 
@@ -303,6 +305,100 @@ async function verifyModalActuallyBlocks(
     });
     return { blocked: false, reason: 'eval_failed_fail_open' };
   }
+}
+
+/**
+ * V16: Promo-banner / floating-overlay detection (no ARIA signature required).
+ *
+ * `verifyModalActuallyBlocks` is the ground-truth hit-test but today it only
+ * runs when `detectModalBlockingFromSession` produces a modal — and that helper
+ * needs the snapshot collector to have flagged something as `isInsideActiveModal`.
+ * Fixed-position promo banners ("пробный урок - 50%" + "Подробнее" at the
+ * bottom of the viewport) never receive that flag, so the modal gate never
+ * opens and Playwright ends up retrying a covered target for 40s before the
+ * user sees any feedback.
+ *
+ * This helper closes that gap. Given resolved candidates (what the user is
+ * trying to click), find a plausible overlay node from the cached domNodes:
+ * anything visible with `isTopMostAtCenter === true` that is NOT an ancestor
+ * of, descendant of, or identical to the candidate. Then let
+ * `verifyModalActuallyBlocks` do its three-signal hit-test against the best
+ * such overlay to confirm the block geometrically.
+ *
+ * Returns an overlay record compatible with `modalBlocking` when a block is
+ * confirmed by the browser; null otherwise.
+ */
+async function detectOverlayBlockingCandidate(
+  page: Page,
+  previewSessionId: string,
+  candidateRefs: string[],
+): Promise<{ modalRef: string; modalText?: string; boundingBox?: { x: number; y: number; width: number; height: number }; occludingText?: string } | null> {
+  if (candidateRefs.length === 0) return null;
+
+  const sessionService = getPreviewSessionService();
+  const session = sessionService.getSession(previewSessionId);
+  const domNodes = session?.pageState?.domNodes;
+  if (!domNodes || domNodes.length === 0) return null;
+
+  const candidateSet = new Set(candidateRefs);
+  const candidateAncestors = new Set<string>();
+  for (const ref of candidateRefs) {
+    const node = domNodes.find(n => n.ref === ref);
+    for (const anc of node?.parentRefChain || []) candidateAncestors.add(anc);
+  }
+
+  // Pick overlay candidates: visible, topmost at center, not the target itself
+  // and not related by DOM hierarchy. Sort by area (largest first) — a big
+  // bottom banner that covers multiple targets is a better culprit than a
+  // 24px close button.
+  const overlayCandidates = domNodes
+    .filter(n =>
+      n.isVisible === true &&
+      n.isTopMostAtCenter === true &&
+      n.ref && !candidateSet.has(n.ref) && !candidateAncestors.has(n.ref) &&
+      !!n.boundingBox && n.boundingBox.width > 0 && n.boundingBox.height > 0,
+    )
+    .sort((a, b) => {
+      const aArea = (a.boundingBox!.width * a.boundingBox!.height);
+      const bArea = (b.boundingBox!.width * b.boundingBox!.height);
+      return bArea - aArea;
+    })
+    .slice(0, 5); // cap — hit-test each one
+
+  if (overlayCandidates.length === 0) return null;
+
+  for (const overlay of overlayCandidates) {
+    if (!overlay.ref) continue;
+    const verdict = await verifyModalActuallyBlocks(page, candidateRefs, overlay.ref);
+    if (!verdict.blocked) continue;
+
+    // Build a human-readable label for the overlay. Prefer the richest nearby
+    // text — a bare "Закрыть" is less informative than "пробный урок - 50% /
+    // Подробнее". Pull text from the overlay itself plus its immediate
+    // neighbours that share `isTopMostAtCenter`.
+    const neighbours = domNodes
+      .filter(n =>
+        n.ref !== overlay.ref &&
+        n.isTopMostAtCenter === true &&
+        n.isVisible === true &&
+        !candidateSet.has(n.ref || '') &&
+        (n.text || n.ariaLabel || n.labelText),
+      )
+      .slice(0, 4);
+    const label = [overlay.text, ...neighbours.map(n => n.text || n.ariaLabel || n.labelText)]
+      .filter(Boolean)
+      .join(' / ')
+      .slice(0, 120);
+
+    return {
+      modalRef: overlay.ref,
+      modalText: label || verdict.occludingText || undefined,
+      boundingBox: overlay.boundingBox,
+      occludingText: verdict.occludingText,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -924,11 +1020,44 @@ async function verifyActionEffect(
       }
 
       case 'type': {
-        // Verify the input contains the expected value (not just non-empty)
-        const actualValue = await locator.inputValue().catch(() => '');
-        if (step.value === '') return true; // Empty type is valid
-        if (actualValue.length === 0) return false; // Expected non-empty but got empty
-        // Check actual value matches expected (trim to handle whitespace diffs)
+        // Cap inputValue() — Playwright's default is 30s, which hangs when the
+        // input auto-detaches on submit (e.g. OTP / one-time-code fields unmount
+        // the moment the final digit completes the pattern). 1.5s is plenty for
+        // an attached input; longer is a sign the element is gone.
+        const SHORT = 1500;
+        let actualValue: string | null = null;
+        try {
+          actualValue = await locator.inputValue({ timeout: SHORT });
+        } catch {
+          // Read timed out — could be detach (OTP auto-submit) or just a slow
+          // page. Disambiguate by asking the DOM whether the element is still
+          // attached. If count()===0, it's truly gone; if >=1, the 1.5s wasn't
+          // enough and we must not report success falsely.
+          let present = true;
+          try {
+            const count = await locator.count();
+            present = count > 0;
+          } catch {
+            // count() itself failed — page navigating or frame destroyed.
+            // Treat as detached: the only way to reach here after a successful
+            // type action is a navigation triggered by that action.
+            present = false;
+          }
+          if (!present) {
+            // Auto-submitting inputs (OTP, one-time-code, single-digit PIN)
+            // disappear the moment the expected value length is entered. The
+            // upstream `type` action already returned success (otherwise we'd
+            // have thrown before the verify step), so treat the post-type
+            // detach as confirmed submit.
+            return (step.value || '').length > 0;
+          }
+          // Element still attached but unreadable within 1.5s — fall through
+          // to the normal comparison with empty actualValue so a slow but
+          // functional input is not falsely passed.
+          actualValue = '';
+        }
+        if (step.value === '') return true;
+        if (!actualValue || actualValue.length === 0) return false;
         const expected = (step.value || '').trim();
         const actual = actualValue.trim();
         return actual === expected || actual.includes(expected) || expected.includes(actual);
@@ -973,117 +1102,15 @@ function buildSelector(step: IntentStep, candidate: LintCandidate): string | und
   return candidate.ref ? `[data-agent-ref="${candidate.ref}"]` : undefined;
 }
 
-/**
- * Wait for element stability before action (unless disabled)
- */
-async function ensureStability(
-  locator: Locator,
-  step: IntentStep,
-  timeout: number
-): Promise<void> {
-  if (step.options?.disableStabilityChecks) {
-    return;
-  }
-  // File inputs are often hidden via CSS; check for attached instead of visible
-  if (step.type === 'upload') {
-    await locator.waitFor({ state: 'attached', timeout });
-  } else {
-    await locator.waitFor({ state: 'visible', timeout });
-  }
-}
+// ensureStability() was removed — its logic (visible/attached waitFor +
+// disableStabilityChecks short-circuit) is now the pre-phase of
+// smartStepWait, which dispatches per-action to actionable/visible/
+// editable/attached phases and runs their fastChecks first.
 
-/**
- * Adaptive post-hover settle: waits for DOM to stabilize after hover triggers
- * tooltips, submenus, or popovers. Instead of a fixed 150ms, we observe the DOM
- * for new elements appearing and wait until mutations stop.
- *
- * Strategy:
- * 1. Snapshot current DOM element count
- * 2. Poll for new visible elements (tooltip, menu, popover patterns)
- * 3. Once detected OR minWaitMs passed — wait for mutations to stop (stableMs gap)
- * 4. Safety cap at maxWaitMs to avoid hanging on non-reactive hovers
- *
- * @returns elapsed time in ms
- */
-async function waitForHoverEffect(
-  page: Page,
-  maxWaitMs = 2000,
-  stableMs = 150,
-): Promise<number> {
-  const start = Date.now();
-
-  // Selectors for elements commonly created by hover (tooltips, menus, popovers)
-  const hoverEffectSelector = [
-    '[role="tooltip"]:visible',
-    '[role="menu"]:visible',
-    '[role="listbox"]:visible',
-    '[role="dialog"]:visible',
-    '[data-radix-popper-content-wrapper]:visible',
-    '[class*="tooltip"]:visible',
-    '[class*="popover"]:visible',
-    '[class*="dropdown"]:visible',
-    '.tippy-box:visible',
-    '.MuiTooltip-tooltip:visible',
-    '.MuiMenu-list:visible',
-    '.ant-tooltip:visible',
-    '.ant-dropdown:visible',
-  ].join(', ');
-
-  // Phase 1: Quick check — did hover produce any visible effect?
-  // Race between effect appearing and a minimum wait (avoids 0ms exit on static hovers)
-  const minWaitMs = STEP_READINESS_CONFIG.domStableThresholdMs.assertion; // 150ms
-  try {
-    await Promise.race([
-      page.waitForSelector(hoverEffectSelector, { state: 'visible', timeout: maxWaitMs }),
-      page.waitForTimeout(minWaitMs),
-    ]);
-  } catch {
-    // No effect found within maxWaitMs — hover probably doesn't trigger visible DOM changes
-    return Date.now() - start;
-  }
-
-  // Phase 2: Wait for the effect to stabilize (animation to finish).
-  // Use MutationObserver-based idle detection: wait until no new DOM mutations
-  // occur for stableMs. This catches CSS transitions that add/remove classes.
-  const remainingMs = maxWaitMs - (Date.now() - start);
-  if (remainingMs > stableMs) {
-    try {
-      await page.evaluate(
-        ({ stableMs: stMs, timeoutMs }) => new Promise<void>((resolve) => {
-          let timer: ReturnType<typeof setTimeout> | null = null;
-          const reset = () => {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(() => {
-              observer.disconnect();
-              resolve();
-            }, stMs);
-          };
-          const MO = (globalThis as any).MutationObserver;
-          const observer = new MO(() => reset());
-          observer.observe((globalThis as any).document.body, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class', 'style', 'aria-hidden', 'hidden', 'data-state'],
-          });
-          // Safety cap
-          setTimeout(() => {
-            observer.disconnect();
-            if (timer) clearTimeout(timer);
-            resolve();
-          }, timeoutMs);
-          // Start the idle timer immediately
-          reset();
-        }),
-        { stableMs, timeoutMs: Math.min(remainingMs, maxWaitMs) },
-      );
-    } catch {
-      // page.evaluate can fail if page navigated — fall through
-    }
-  }
-
-  return Date.now() - start;
-}
+// waitForHoverEffect was duplicated here and in command-executor.ts — now a
+// single shared implementation lives in wait-phases/hover-effect-settle.ts.
+// Imported below as `waitForHoverEffect` to preserve existing call sites
+// without touching their bodies.
 
 /**
  * Dispatch a synthetic file drop event onto a target element.
@@ -1416,9 +1443,25 @@ async function executeAction(
       await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
     }
 
-    // Ensure element stability before action (unless disabled)
-    if (locator && step.type !== 'navigate' && step.type !== 'wait') {
-      await ensureStability(locator, step, timeout);
+    // V16: Pre-action readiness delegated to smartStepWait('pre').
+    //
+    // Replaces ensureStability() with the unified per-action plan: click gets
+    // actionable+modal-clear+iframe-ready, type gets editable, upload gets
+    // attached, etc. Fast-path skips run first, so ready elements pay ~50ms.
+    // The legacy disableStabilityChecks flag still short-circuits the call.
+    if (
+      locator &&
+      step.type !== 'navigate' &&
+      step.type !== 'wait' &&
+      !step.options?.disableStabilityChecks
+    ) {
+      await smartStepWait({
+        page,
+        step,
+        locator,
+        phase: 'pre',
+        timeoutBudget: timeout,
+      });
     }
 
     switch (step.type) {
@@ -1728,6 +1771,13 @@ async function executeAction(
       case 'navigate': {
         if (!step.value) throw new Error('No URL for navigate action');
         const safeUrl = sanitizeUrl(step.value);
+        // Explicit navigate step is user-intent — suppress the external-nav
+        // trap for this transition so cross-origin URLs (e.g. OAuth start,
+        // intentional deeplink) are not reverted.
+        try {
+          const { markIntentionalGotoByPage } = await import('./external-nav-trap');
+          markIntentionalGotoByPage(page);
+        } catch { /* non-fatal */ }
         try {
           await page.goto(safeUrl, { waitUntil: 'load', timeout: STEP_APPLY_CONFIG.navigateTimeoutMs });
         } catch (navError) {
@@ -2054,6 +2104,16 @@ export class PreviewStepApplyService {
       descriptionPreview: sanitizeIntent(stepDraft).slice(0, 80),
       selectedRef: selectedRef || 'none (will lint)',
     });
+
+    // Every single-step Apply is user-intent: the user clicked "Apply" in
+    // the editor, so any cross-origin navigation that results (even from a
+    // click step) is an intentional consequence of that action. Mark intent
+    // once per apply so the external-nav trap gives the step a 3s window to
+    // settle without reverting.
+    try {
+      const { markIntentionalGoto } = await import('./external-nav-trap');
+      markIntentionalGoto(previewSessionId, '');
+    } catch { /* non-fatal */ }
 
     try {
       const sessionService = getPreviewSessionService();
@@ -2732,9 +2792,15 @@ export class PreviewStepApplyService {
         const result = await executeAction(page, stepDraft, confirmedCandidate, undefined, { expectsNavigation });
 
         if (result.success) {
-          // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          // V16: Post-action settle via smartStepWait('post'). In run-mode
+          // (skipPostActionWait) the between-step lookahead already does the
+          // heavy lifting, so we skip the full plan here.
           if (!skipPostActionWait) {
-            await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+            await smartStepWait({
+              page,
+              step: stepDraft,
+              phase: 'post',
+            }).catch(() => { /* non-fatal */ });
           }
 
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -2983,9 +3049,13 @@ export class PreviewStepApplyService {
               }
               // If compiledWasTried was set by postcondition failure above, skip success return
               if (!compiledWasTried) {
-                // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+                // V16: Post-action settle via smartStepWait (see note above).
                 if (!skipPostActionWait) {
-                  await page.waitForLoadState('domcontentloaded', { timeout: 2000 }).catch(() => { });
+                  await smartStepWait({
+                    page,
+                    step: stepDraft,
+                    phase: 'post',
+                  }).catch(() => { /* non-fatal */ });
                 }
 
                 // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -3043,12 +3113,16 @@ export class PreviewStepApplyService {
         }
       }
 
-      // Normal flow: Lint the step to get candidates
+      // Normal flow: Lint the step to get candidates.
+      // forceFreshSnapshot: apply is triggered by user clicking Run — the DOM may
+      // have changed since the last snapshot tick (e.g. a dropdown opened during
+      // typing, or a compiled shortcut just ran and mutated the page).
       const lintResult = await IntentStepLintService.lintStepWithAI({
         previewSessionId,
         stepDraft,
         pageRef: params.pageRef,
         userId,
+        forceFreshSnapshot: true,
       });
 
       if (lintResult.status === 'needs_clarification') {
@@ -3137,9 +3211,13 @@ export class PreviewStepApplyService {
             occludingText: verdict.occludingText,
             candidateRefs: candidateRefs.join(', '),
           });
+          const modalLabel = modalDetected.modalText?.trim() || verdict.occludingText;
+          const modalError = modalLabel
+            ? `A popup "${modalLabel.slice(0, 80)}" is covering the target. Dismiss it in the preview or interact with elements inside it first.`
+            : 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.';
           return {
             success: false,
-            error: 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.',
+            error: modalError,
             highlight: [
               ...(modalDetected.boundingBox ? [{
                 boundingBox: modalDetected.boundingBox,
@@ -3165,6 +3243,68 @@ export class PreviewStepApplyService {
       }
       // If target IS inside the modal (anyInsideModal=true) or no modal detected
       // or modal-blocking was disproven by hit-test, proceed normally.
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // V16: Promo-banner / floating-overlay detection.
+      // The modal path above only fires when the snapshot collector flags
+      // something as `isInsideActiveModal` — that misses fixed-position promo
+      // banners, cookie strips, sticky CTAs, etc. which our collector treats
+      // as regular chrome. When the top candidate is NOT topmost-at-center,
+      // something fixed is painting over it; run a hit-test to confirm and
+      // fail fast with a banner-aware error so the user doesn't wait 40s for
+      // Playwright to give up on a covered button.
+      // ═══════════════════════════════════════════════════════════════════════
+      const topCandidate = resolvedCandidates[0];
+      const topCandidateNode = topCandidate?.ref
+        ? sessionService.getSession(previewSessionId)?.pageState?.domNodes?.find(n => n.ref === topCandidate.ref)
+        : undefined;
+      const topCandidateCovered = topCandidateNode?.isVisible === true &&
+        topCandidateNode?.isTopMostAtCenter === false;
+
+      // Run overlay detection whenever the top candidate is visibly covered,
+      // independent of whether a modal was previously detected. The detector
+      // explicitly skips the candidate's own ancestors, so an in-modal button
+      // being covered by a *different* floating banner will still be caught.
+      if (topCandidateCovered) {
+        const overlayCandidateRefs = resolvedCandidates.map(c => c.ref).filter((r): r is string => !!r);
+        const overlay = await detectOverlayBlockingCandidate(page, previewSessionId, overlayCandidateRefs);
+        if (overlay) {
+          const bannerLabel = overlay.modalText || overlay.occludingText;
+          const targetLabel = topCandidate?.node?.text || topCandidate?.node?.ariaLabel || topCandidate?.node?.labelText;
+          const errorParts = [
+            targetLabel ? `Can't reach "${targetLabel}" —` : `Target element is covered —`,
+            bannerLabel ? `overlay "${bannerLabel}" is painting on top of it.` : `a floating overlay is painting on top of it.`,
+            `Close the overlay in the preview, then re-run this step.`,
+          ];
+          logger.info('[PREVIEW_APPLY] Overlay blocking target — verified by hit-test', {
+            previewSessionId,
+            overlayRef: overlay.modalRef,
+            overlayText: bannerLabel?.slice(0, 80),
+            candidateRef: topCandidate?.ref,
+          });
+          return {
+            success: false,
+            error: errorParts.join(' '),
+            highlight: [
+              ...(overlay.boundingBox ? [{
+                boundingBox: overlay.boundingBox,
+                type: 'warning' as const,
+              }] : []),
+              ...resolvedCandidates.map(c => ({
+                ref: c.ref,
+                boundingBox: c.boundingBox,
+                type: 'error' as const,
+              })),
+            ],
+            modalBlocking: {
+              modalRef: overlay.modalRef,
+              modalText: overlay.modalText,
+              boundingBox: overlay.boundingBox,
+            },
+            attempts: 0,
+          };
+        }
+      }
 
       // Try candidates in order (reuse resolvedCandidates from modal check above)
       let lastError: string | undefined;
@@ -3276,23 +3416,31 @@ export class PreviewStepApplyService {
         });
 
         if (result.success) {
-          // V12: Post-action settle — skip in Run mode (lookahead handles it), keep for single-step
+          // V16: Post-action settle.
+          //
+          // Single-step Apply (!skipPostActionWait): run the full
+          //   smartStepWait('post') plan — dom-settle + loading-clear + any
+          //   action-specific post-phases (value-reflected, state-reflected,
+          //   challenge-clear, etc.). Phase fast-checks skip quickly on a
+          //   quiet page, so this is often cheaper than the old flat 2s
+          //   waitForLoadState.
+          //
+          // Run mode (skipPostActionWait): the between-step lookahead does
+          //   the heavy lifting; we keep only the 1s noWaitAfter safety
+          //   buffer for mutating actions so reactive handlers get a chance
+          //   to dispatch before snapshot invalidation.
           let postSettleMs = 0;
           let postSettleFired = false;
           if (!skipPostActionWait) {
             const settleStart = Date.now();
-            postSettleFired = await page.waitForLoadState('domcontentloaded', { timeout: 2000 })
-              .then(() => true)
-              .catch(() => false);
+            const waitResult = await smartStepWait({
+              page,
+              step: stepDraft,
+              phase: 'post',
+            }).catch(() => null);
             postSettleMs = Date.now() - settleStart;
+            postSettleFired = !!waitResult?.ready;
           } else if (POST_ACTION_BUFFER_ACTIONS.has(stepDraft.type)) {
-            // V15.3: Safety buffer for noWaitAfter actions.
-            // We set `noWaitAfter: true` on click/press to skip Playwright's internal
-            // 15-30s stability wait (which otherwise fires on every animation).
-            // The inter-step lookahead handles readiness for the NEXT step, but a
-            // 1s pause here gives the current page a moment to dispatch event
-            // handlers before snapshot invalidation and lookahead kick in.
-            // This is deliberately short — lookahead does the heavy lifting.
             await page.waitForTimeout(1000);
           }
           trace?.writeActionResult({

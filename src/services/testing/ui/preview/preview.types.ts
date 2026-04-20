@@ -579,6 +579,20 @@ export interface IntentStep {
   isAutoInjected?: boolean;
   /** V15: Tab index this step targets (0 = initial tab, 1+ = popups). Omit or 0 for single-tab backward compat. */
   tabIndex?: number;
+  /**
+   * Lifecycle phase this step belongs to. Populated by `stitchPhases()` at
+   * dispatch time when a test case has `setup_steps` / `teardown_steps`.
+   * Absent on author-time steps and on test cases without extras —
+   * downstream code treats missing / 'main' as the default.
+   *
+   *   - 'setup':    runs before main. If it fails, main is skipped but
+   *                 teardown still runs, and the whole test fails.
+   *   - 'main':     the actual case body (what users author today).
+   *   - 'teardown': runs after main, even if main failed. A failing
+   *                 teardown is logged as a warning but does NOT flip
+   *                 the overall verdict (main phase owns pass/fail).
+   */
+  phase?: 'setup' | 'main' | 'teardown';
 }
 
 /**
@@ -1027,6 +1041,15 @@ export interface IntentTestCase {
   setupSteps?: any[];
   teardownSteps?: any[];
   expectedResult?: string;
+
+  // Test Resources (Login / Environment / Secret / ...). Array of
+  // { kind, resource_id, required? } — surfaces intent_test_cases.resource_bindings
+  // to the UI without an extra fetch.
+  resourceBindings?: Array<{
+    kind: string;
+    resource_id: string;
+    required?: boolean;
+  }>;
 
   // Provenance (when saved from a completed test)
   sourceTestId?: string;

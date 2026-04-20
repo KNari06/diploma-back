@@ -27,6 +27,47 @@ import { Request, Response } from 'express';
 const WARMUP_PREFIX = 'mobile_warmup:';
 const WARMUP_TTL = 900; // 15 minutes
 
+type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
+const VALID_PERMISSION_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
+
+/**
+ * Resolve the effective permission policy for a session at warmup time.
+ *
+ * Precedence: test-level override (set later during run) > project default >
+ * runner default ('auto_allow'). Since we don't know which test will run
+ * during warmup, we seed the session with the project default; per-test
+ * overrides can PATCH the runner at run start if they differ.
+ *
+ * Returns `null` if the stored value is missing or invalid — callers then
+ * leave the session on the runner default (avoiding a round-trip).
+ */
+async function resolveProjectPermissionPolicy(
+  projectId: string,
+  userId: string,
+): Promise<MobilePermissionPolicy | null> {
+  try {
+    const project = await ProjectService.getProject(projectId, userId);
+    const stored = project?.settings?.mobilePermissionPolicy;
+    if (typeof stored === 'string' && (VALID_PERMISSION_POLICIES as readonly string[]).includes(stored)) {
+      return stored as MobilePermissionPolicy;
+    }
+  } catch {
+    // Swallow — network/db hiccup falls through to the runner default.
+  }
+  return null;
+}
+
+/**
+ * Pending-install flag: set when an APK is uploaded but the upload-time
+ * `autoBootAndInstall` couldn't reach a running emulator. Stores the
+ * storagePath of the APK that needs installing. Consumed by the next
+ * `installAppOnSession` call (at warmup time) which forces a full install
+ * even if Redis thinks the same APK is cached — because in reality the
+ * emulator may never have actually received it.
+ */
+const PENDING_INSTALL_PREFIX = 'mobile_pending_install:';
+const PENDING_INSTALL_TTL = 3600; // 1 hour
+
 export interface WarmupData {
   sessionId: string;
   runnerUrl: string;
@@ -175,21 +216,25 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             sessionId: existing.sessionId,
           });
 
+          // Run install+launch_app BEFORE responding, so the preview stream shows
+          // the app already open. On a reused session this usually hits the fast
+          // path (Redis match or device check) and just issues launch_app.
+          try {
+            await installAppOnSession(client, existing.sessionId, projectId, userId, appPackage);
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              projectId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+
           res.json({
             success: true,
             sessionId: existing.sessionId,
             runnerSocketUrl: existing.runnerSocketUrl,
             platform: existing.platform,
             reused: true,
-          });
-
-          // Retry app install in background (idempotent — runner ignores if already installed)
-          installAppOnSession(client, existing.sessionId, projectId, userId, appPackage).catch((err) => {
-            logger.warn('[MOBILE_SESSION] Background app install on reused session failed (non-fatal)', {
-              sessionId: existing.sessionId,
-              projectId,
-              error: err instanceof Error ? err.message : String(err),
-            });
           });
 
           return;
@@ -208,8 +253,40 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       return;
     }
 
-    // Create session on runner
-    const session = await client.createSession(platform);
+    // Try pool first (instant claim of a pre-booted emulator); fall back to
+    // createSession only if the pool is disabled / exhausted / unreachable.
+    // Mirrors the 3-tier pattern used by mobile-test-run.job.ts.
+    let session: Awaited<ReturnType<typeof client.createSession>>;
+    try {
+      session = await client.claimSession(platform);
+      logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
+        projectId,
+        sessionId: session.sessionId,
+        platform,
+      });
+    } catch (poolErr) {
+      logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
+        projectId,
+        error: poolErr instanceof Error ? poolErr.message : String(poolErr),
+      });
+      session = await client.createSession(platform);
+    }
+
+    // Propagate project-level permission policy to the runner. Best-effort:
+    // the runner defaults to 'auto_allow' when the patch fails, which is the
+    // same behaviour a newly-created project gets, so we never block warmup
+    // on this call. Tests may later override the policy at run time.
+    try {
+      const policy = await resolveProjectPermissionPolicy(projectId, userId);
+      if (policy) {
+        await client.setPermissionPolicy(session.sessionId, policy);
+      }
+    } catch (err) {
+      logger.debug('[MOBILE_SESSION] Failed to propagate permission policy (non-fatal)', {
+        sessionId: session.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     // Derive socket URL from runner URL
     const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
@@ -240,24 +317,25 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       platform,
     });
 
-    // Install the project's mobile app onto the emulator (best-effort, non-blocking).
-    // This runs after we return the response so the frontend can connect to the stream
-    // while the app downloads, uploads, and installs.
+    // Install the project's mobile app and run launch_app BEFORE returning, so the
+    // preview stream shows the app already open when the frontend connects.
+    // Non-fatal: on failure we still return the session so the user can retry.
+    try {
+      await installAppOnSession(client, session.sessionId, projectId, userId, appPackage);
+    } catch (err) {
+      logger.warn('[MOBILE_SESSION] App install/launch during warmup failed (non-fatal)', {
+        sessionId: session.sessionId,
+        projectId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     res.status(201).json({
       success: true,
       sessionId: session.sessionId,
       runnerSocketUrl,
       platform,
       reused: false,
-    });
-
-    // Fire-and-forget: install app in background
-    installAppOnSession(client, session.sessionId, projectId, userId, appPackage).catch((err) => {
-      logger.warn('[MOBILE_SESSION] Background app install failed (non-fatal)', {
-        sessionId: session.sessionId,
-        projectId,
-        error: err instanceof Error ? err.message : String(err),
-      });
     });
   } catch (error) {
     logger.error('[MOBILE_SESSION] Warmup failed', {
@@ -891,18 +969,31 @@ export async function autoBootAndInstall(
     webSocketService.emitToUser(userId, 'mobile:boot:status', { projectId, stage, message, sessionId });
   };
 
+  // Helper: set pending-install flag so the next warmup re-runs the install.
+  // Used whenever upload-time boot/install can't complete and the user
+  // should still get their APK installed next time they open the editor.
+  const setPendingInstall = async (storagePath: string | undefined) => {
+    if (!storagePath) return;
+    const pendingKey = `${PENDING_INSTALL_PREFIX}${projectId}:${userId}`;
+    await redisConnection.set(pendingKey, storagePath, 'EX', PENDING_INSTALL_TTL).catch(() => {});
+  };
+
   try {
     if (!env.MOBILE_RUNNER_ENABLED) return;
 
     const client = getMobileRunnerClient();
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
+    // Load app so we know which storagePath to pend if we fail early
+    const project = await ProjectService.getProject(projectId, userId);
+    const appStoragePath = project?.settings?.mobileApp?.storagePath;
+
     // Check for existing session
     let sessionId: string | null = null;
     const existingRaw = await redisConnection.get(redisKey);
     if (existingRaw) {
       const existing: WarmupData = JSON.parse(existingRaw);
-      if (existing.sessionId) {
+      if (existing.sessionId && existing.sessionId !== '_booting') {
         const alive = await client.sessionExists(existing.sessionId);
         if (alive) {
           sessionId = existing.sessionId;
@@ -917,7 +1008,11 @@ export async function autoBootAndInstall(
 
       const healthy = await client.isHealthy();
       if (!healthy) {
-        emit('error', 'Mobile runner is unavailable');
+        // Runner offline: don't hold the user's response for a 60s timeout.
+        // Mark the APK as pending-install so the next warmup picks it up.
+        await setPendingInstall(appStoragePath);
+        emit('error', 'Mobile runner is offline — the app will install when you open the editor');
+        logger.warn('[MOBILE_AUTO_BOOT] Runner unhealthy, pending install queued', { projectId });
         return;
       }
 
@@ -955,6 +1050,12 @@ export async function autoBootAndInstall(
     const message = err instanceof Error ? err.message : String(err);
     emit('error', `Setup failed: ${message}`);
     logger.error('[MOBILE_AUTO_BOOT] Failed', { projectId, userId, error: message });
+
+    // Mark APK as pending so the next warmup re-attempts the install.
+    try {
+      const project = await ProjectService.getProject(projectId, userId);
+      await setPendingInstall(project?.settings?.mobileApp?.storagePath);
+    } catch { /* best-effort */ }
 
     // Clean up the _booting placeholder so warmup doesn't wait forever
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
@@ -999,8 +1100,23 @@ async function installAppOnSession(
   const warmupRaw = await redisConnection.get(redisKey);
   const warmup: WarmupData | null = warmupRaw ? JSON.parse(warmupRaw) : null;
 
-  // If the same APK is already installed (Redis knows), just relaunch — skip download + install
-  if (warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
+  // Check for a pending-install flag (set by autoBootAndInstall when the upload
+  // couldn't reach the emulator). If present AND matches the current APK, we
+  // must NOT trust the Redis/device dedup fast paths — force a full install.
+  const pendingKey = `${PENDING_INSTALL_PREFIX}${projectId}:${userId}`;
+  const pendingStoragePath = await redisConnection.get(pendingKey);
+  const hasPendingInstall = pendingStoragePath === mobileApp.storagePath;
+  if (hasPendingInstall) {
+    logger.info('[MOBILE_SESSION] Pending-install flag detected — forcing full install', {
+      sessionId,
+      projectId,
+      storagePath: mobileApp.storagePath,
+    });
+  }
+
+  // If the same APK is already installed (Redis knows), just relaunch — skip download + install.
+  // BUT: respect the pending-install flag which means we can't trust Redis state.
+  if (!hasPendingInstall && warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
     logger.debug('[MOBILE_SESSION] Same APK already installed (Redis), relaunching', {
       sessionId,
       projectId,
@@ -1014,8 +1130,9 @@ async function installAppOnSession(
 
   // If Redis expired but we know the package name, check the DEVICE directly.
   // This avoids expensive re-download + re-install when the app is still on the emulator.
+  // Skipped when a pending-install flag is set (we don't trust device state in that case).
   const knownPackage = appPackageOverride || mobileApp.packageName;
-  if (knownPackage) {
+  if (knownPackage && !hasPendingInstall) {
     try {
       const checkResult = await client.executeBatchCommands(sessionId, [
         { type: 'check_package', params: { packageName: knownPackage } },
@@ -1037,6 +1154,12 @@ async function installAppOnSession(
           warmup.appStoragePath = mobileApp.storagePath;
           await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
         }
+
+        // Persist packageName to project settings so future warmups can hit
+        // this fast path even after Redis expires (knownPackage may have come
+        // from appPackageOverride when mobileApp.packageName was null).
+        await persistPackageName(projectId, userId, mobileApp, knownPackage);
+
         return;
       }
     } catch (err) {
@@ -1074,18 +1197,23 @@ async function installAppOnSession(
         apkPath: uploaded.path,
         reinstall: true, // use -r as safety net — if uninstall failed silently, install still works
         clearData: true, // always wipe app data for clean state after install
+        autoLaunch: false, // always launch via an explicit launch_app command below for determinism
         ...(shouldUninstallOld ? { uninstallOldPackage: oldPackage } : {}),
-        ...(explicitPackage ? { autoLaunch: false } : {}),
       },
     },
   ], { timeoutMs: 120_000 }); // 2 min — adb install can take 60s+ for large APKs
 
-  const detected = (installResult?.results?.[0] as any)?.packageName as string | undefined;
+  // Runner wraps every command result as { success, data, durationMs, ... }.
+  // The install handler returns { installed, packageName } inside `data`.
+  const detected = (installResult?.results?.[0] as any)?.data?.packageName as string | undefined;
   const packageName = explicitPackage || detected;
 
-  if (explicitPackage) {
+  // Always issue an explicit launch_app — never rely on install's auto-launch.
+  // Gives us one deterministic code path regardless of whether we knew the
+  // package name up front.
+  if (packageName) {
     await client.executeBatchCommands(sessionId, [
-      { type: 'launch_app', params: { packageName: explicitPackage } },
+      { type: 'launch_app', params: { packageName } },
     ], { timeoutMs: 60_000 });
   }
 
@@ -1096,11 +1224,59 @@ async function installAppOnSession(
     await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
   }
 
+  // Persist packageName to project.settings.mobileApp so future warmups can
+  // use the check_package fast path even after Redis TTL expires, avoiding a
+  // full APK re-download on every expiry.
+  if (packageName) {
+    await persistPackageName(projectId, userId, mobileApp, packageName);
+  }
+
+  // Pending-install flag (if any) has now been consumed — clear it.
+  if (hasPendingInstall) {
+    await redisConnection.del(pendingKey);
+  }
+
   logger.info('[MOBILE_SESSION] App installed on session', {
     sessionId,
     projectId,
     packageName: packageName || '(auto-launched by runner)',
   });
+}
+
+/**
+ * Write the detected Android package name back to `project.settings.mobileApp`
+ * so subsequent warmups (after Redis TTL expiry) can hit the `check_package`
+ * fast path instead of re-downloading the APK. No-op when the value is
+ * already up to date. Failures are logged but swallowed — this is a cache
+ * warm, not a correctness-critical write.
+ */
+async function persistPackageName(
+  projectId: string,
+  userId: string,
+  currentMobileApp: { packageName?: string } & Record<string, unknown>,
+  packageName: string,
+): Promise<void> {
+  if (!packageName || currentMobileApp.packageName === packageName) return;
+  try {
+    await ProjectService.updateProject(projectId, userId, {
+      settings: {
+        mobileApp: {
+          ...currentMobileApp,
+          packageName,
+        } as unknown as Record<string, unknown>,
+      },
+    });
+    logger.info('[MOBILE_SESSION] Persisted packageName to project settings', {
+      projectId,
+      packageName,
+    });
+  } catch (err) {
+    logger.warn('[MOBILE_SESSION] Failed to persist packageName (non-fatal)', {
+      projectId,
+      packageName,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1348,6 +1524,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               await IntentTestCaseService.updateStepFromPreviewApply({
                 intentTestCaseId,
                 appliedStep: enrichedStep,
+                userId,
               });
             } catch (persistError) {
               logger.warn('[MOBILE_SESSION] Failed to auto-persist compiled plan', {

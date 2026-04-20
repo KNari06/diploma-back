@@ -545,4 +545,54 @@ export class IntelligentTestStorageService {
       throw error;
     }
   }
+
+  /**
+   * Create a minimal session row that exists only as an FK anchor for
+   * later `intelligent_test_findings`. Used by paths that don't produce
+   * the rich page_visits / actions data (currently all mobile dispatchers)
+   * so that ai-analysis's `extractBugPatterns` has a session_id to attach
+   * findings to — otherwise /bug-insights skips the run.
+   *
+   * Best-effort: returns undefined on failure, never throws.
+   */
+  static async createSessionAnchor(params: {
+    testId: string;
+    userId: string;
+    projectId: string;
+    goal: string;
+    startUrl: string;
+    browser: string;
+  }): Promise<string | undefined> {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('intelligent_test_sessions')
+        .insert({
+          test_id: params.testId,
+          user_id: params.userId,
+          project_id: params.projectId,
+          goal: params.goal,
+          start_url: params.startUrl,
+          mode: 'fast',
+          status: 'running',
+          browser: params.browser,
+        })
+        .select('id')
+        .single();
+
+      if (error || !data) {
+        logger.warn('[INTELLIGENT_STORAGE] Failed to create session anchor', {
+          testId: params.testId,
+          error: error?.message,
+        });
+        return undefined;
+      }
+      return data.id;
+    } catch (err) {
+      logger.warn('[INTELLIGENT_STORAGE] Session anchor creation threw (non-fatal)', {
+        testId: params.testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return undefined;
+    }
+  }
 }

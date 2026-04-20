@@ -1,56 +1,6 @@
-import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
-
-/**
- * Encryption key derived from environment secret
- */
-function getEncryptionKey(): Buffer {
-  const secret = env.ENCRYPTION_SECRET || 'default-secret-change-in-production';
-  return scryptSync(secret, 'salt', 32);
-}
-
-/**
- * Encrypt text using AES-256-GCM
- */
-function encrypt(text: string): string {
-  const key = getEncryptionKey();
-  const iv = randomBytes(16);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-
-  let encrypted = cipher.update(text, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-
-  const authTag = cipher.getAuthTag();
-
-  // Return: iv:authTag:encrypted
-  return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted}`;
-}
-
-/**
- * Decrypt text
- */
-function decrypt(encryptedText: string): string {
-  try {
-    const key = getEncryptionKey();
-    const [ivHex, authTagHex, encrypted] = encryptedText.split(':');
-
-    const iv = Buffer.from(ivHex, 'hex');
-    const authTag = Buffer.from(authTagHex, 'hex');
-
-    const decipher = createDecipheriv('aes-256-gcm', key, iv);
-    decipher.setAuthTag(authTag);
-
-    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-
-    return decrypted;
-  } catch (error) {
-    logger.error('Decryption failed', { error });
-    throw new Error('Failed to decrypt credentials');
-  }
-}
+import { encryptString as encrypt, decryptString as decrypt } from '@/utils/security/crypto';
 
 /**
  * Store credentials securely

@@ -113,6 +113,44 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           insertPayload.platform = platform; // 'mobile_android' | 'mobile_ios'
         }
 
+        // Auto-attach workspace-configured resources matching this flow's
+        // scope (e.g. Login for this domain). See test_resource feature.
+        //
+        // mobile_flutter is intentionally skipped — no resource adapter
+        // supports it yet; falling back to web/ios defaults would silently
+        // bind the wrong profile.
+        const scopePlatform: 'web' | 'android' | 'ios' | null =
+          !isMobilePlatform
+            ? 'web'
+            : platform === 'mobile_android'
+              ? 'android'
+              : platform === 'mobile_ios'
+                ? 'ios'
+                : null;
+        if (scopePlatform !== null) {
+          try {
+            const { enrichBindingsWithDefaults } = await import(
+              '@/services/test-resource/test-resource.service'
+            );
+            const bindings = await enrichBindingsWithDefaults({
+              userId,
+              projectId,
+              bindings: [],
+              scope: {
+                platform: scopePlatform,
+                url: sanitizedBaseUrl,
+              },
+            });
+            if (bindings.length > 0) {
+              insertPayload.resource_bindings = bindings;
+            }
+          } catch (enrichErr) {
+            logger.warn('[FLOWS_API] Resource enrichment failed (non-fatal)', {
+              error: enrichErr instanceof Error ? enrichErr.message : String(enrichErr),
+            });
+          }
+        }
+
         const { data: testCase, error: testCaseError } = await supabaseAdmin
           .from('intent_test_cases')
           .insert(insertPayload)

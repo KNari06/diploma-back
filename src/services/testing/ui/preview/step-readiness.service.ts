@@ -248,7 +248,7 @@ const CHALLENGE_BUDGET_MS = (() => {
  * Compute DOM stability threshold based on the previous action's risk profile.
  * Override with explicit domStableThresholdMs if provided.
  */
-function getDomStableThresholdMs(
+export function getDomStableThresholdMs(
   prevActionType: IntentActionType | undefined,
   explicitOverride: number | undefined
 ): number {
@@ -276,7 +276,7 @@ function getDomStableThresholdMs(
  *
  * Returns true if URL changed (navigation detected), false if timed out.
  */
-async function detectSpaNavigation(
+export async function detectSpaNavigation(
   page: Page,
   prevUrl: string,
   timeoutMs: number
@@ -366,7 +366,7 @@ async function waitForNetworkIdle(page: Page, timeoutMs: number): Promise<void> 
  * Wait for DOM to stabilize (no mutations for `stabilityThreshold` ms).
  * Uses MutationObserver in the browser context.
  */
-async function waitForDOMStable(
+export async function waitForDOMStable(
   page: Page,
   timeoutMs: number,
   stabilityThreshold: number
@@ -441,7 +441,7 @@ async function waitForDOMStable(
  * We only care about DOM mutations (element availability), NOT images/fonts/analytics.
  * The domStableThresholdMs is dynamically chosen based on prev action profile.
  */
-async function pageSettle(
+export async function pageSettle(
   page: Page,
   settleMs: number,
   domStableThresholdMs: number
@@ -463,7 +463,7 @@ async function pageSettle(
  * to settle (networkIdle + DOM stable). This covers the case where a new step
  * has no compiled plan yet (first run after recording).
  */
-async function blindSettle(page: Page, domStableThresholdMs: number): Promise<void> {
+export async function blindSettle(page: Page, domStableThresholdMs: number): Promise<void> {
   logger.debug('[STEP_READINESS] No locator available — applying blind settle', {
     blindSettleMs: BLIND_SETTLE_MS,
     domStableThresholdMs,
@@ -506,7 +506,7 @@ const EVALUATE_HARD_CAP_MS = 500;
  * non-matching locator can never monopolize the inter-step budget.
  * On timeout, resolves with the provided `onTimeout` value (fail-open).
  */
-async function withHardCap<T>(
+export async function withHardCap<T>(
   op: () => Promise<T>,
   capMs: number,
   onTimeout: T,
@@ -613,12 +613,12 @@ async function probeShadowDom(page: Page): Promise<ShadowDomInfo> {
  * Detection is structural (URL patterns + well-known selectors) — fail-open empty on any
  * error so a probe failure never breaks a normal run.
  */
-interface ChallengePageInfo {
+export interface ChallengePageInfo {
   detected: boolean;
   /** Human-readable tag for logs. 'cloudflare' | 'recaptcha' | 'vercel' | 'generic-interstitial' */
   kind?: string;
 }
-async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
+export async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
   const none: ChallengePageInfo = { detected: false };
   try {
     const url = page.url();
@@ -676,7 +676,7 @@ async function detectChallengePage(page: Page): Promise<ChallengePageInfo> {
  * 7. Disabled form submit buttons with loading text pattern
  * 8. data-testid loading patterns (data-testid*="loading", data-testid*="spinner")
  */
-async function hasLoadingIndicators(page: Page): Promise<boolean> {
+export async function hasLoadingIndicators(page: Page): Promise<boolean> {
   try {
     // V15: Hard-cap — page.evaluate can stall during SPA bootstrap/hydration
     // when Angular/React has not yet yielded the main thread. Fail-open = "no loader".
@@ -757,7 +757,7 @@ async function hasLoadingIndicators(page: Page): Promise<boolean> {
  * Wait for all loading indicators to disappear.
  * Polls `hasLoadingIndicators` until clean or timeout.
  */
-async function waitForLoadingIndicatorsClear(page: Page, timeoutMs: number): Promise<void> {
+export async function waitForLoadingIndicatorsClear(page: Page, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -873,7 +873,7 @@ export async function waitForApiIdle(page: Page, timeoutMs: number): Promise<voi
  *
  * Checks: animationName, transitionDuration, animationPlayState on the element + parent.
  */
-async function waitForElementAnimationComplete(
+export async function waitForElementAnimationComplete(
   locator: Locator,
   timeoutMs: number
 ): Promise<void> {
@@ -938,7 +938,7 @@ async function waitForElementAnimationComplete(
  *
  * Returns true if element is obstructed.
  */
-async function isElementObstructed(locator: Locator, page: Page): Promise<boolean> {
+export async function isElementObstructed(locator: Locator, page: Page): Promise<boolean> {
   try {
     // V15: boundingBox() waits for locator to be visible (up to default actionTimeout).
     // Hard-cap it so a stale ref can't eat 30s. Null return = no bbox = skip check.
@@ -987,7 +987,7 @@ async function isElementObstructed(locator: Locator, page: Page): Promise<boolea
  * Covers: disabled attribute, aria-disabled="true", readonly, inert.
  * Returns true if element is in a non-interactable state.
  */
-async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
+export async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
   try {
     // V15: Hard-cap the evaluate. If the locator doesn't match (stale ref, compiled
     // plan miss, SPA mid-hydration), Playwright would otherwise wait 30s for it to
@@ -1018,7 +1018,7 @@ async function isElementDisabledOrInert(locator: Locator): Promise<boolean> {
  * Wait for element to become enabled (not disabled/inert).
  * Polls until enabled or timeout.
  */
-async function waitForElementEnabled(locator: Locator, timeoutMs: number): Promise<void> {
+export async function waitForElementEnabled(locator: Locator, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const disabled = await isElementDisabledOrInert(locator);
@@ -1032,7 +1032,7 @@ async function waitForElementEnabled(locator: Locator, timeoutMs: number): Promi
  * Check if the target element is inside an iframe that hasn't finished loading.
  * This is common with embedded forms (Stripe, reCAPTCHA, OAuth).
  */
-async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise<void> {
+export async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise<void> {
   try {
     const deadline = Date.now() + timeoutMs;
 
@@ -1069,7 +1069,7 @@ async function waitForIframeContentReady(page: Page, timeoutMs: number): Promise
  * Wait for overlay to clear from target element.
  * Polls elementFromPoint until target is topmost or timeout.
  */
-async function waitForOverlayClear(
+export async function waitForOverlayClear(
   locator: Locator,
   page: Page,
   timeoutMs: number

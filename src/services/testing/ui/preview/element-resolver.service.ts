@@ -1483,9 +1483,13 @@ Select the single best matching element, or return ref=null if the intent does n
         { role: 'user', content: userPrompt },
       ],
       {
-        model: AI_TASK_MODELS.disambiguation, // gemini-2.5-flash-lite
+        model: AI_TASK_MODELS.disambiguation,
         temperature: 0.1,
-        max_tokens: 200,
+        // 200 tokens was too tight: Gemini Flash Lite in JSON mode occasionally
+        // hit MAX_TOKENS before closing the JSON object, producing an empty
+        // response (finishReason=MAX_TOKENS). 500 gives enough headroom for
+        // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
+        max_tokens: 500,
         response_format: { type: 'json_object' },
         abortSignal: controller.signal,
       }
@@ -2503,9 +2507,18 @@ export async function resolveElement(params: {
             node: c.node,
           }));
 
+        // UX: when every visible candidate is inside an active modal, the real target
+        // is likely in the backing page and was hard-excluded by the snapshot collector.
+        // Surface this to the user instead of the generic "description does not match".
+        const allInsideModal = candidatesToProcess.length > 0
+          && candidatesToProcess.every(c => c.node.isInsideActiveModal === true);
+        const notFoundMessage = allInsideModal
+          ? 'Active modal is blocking the page — close it or pick an element inside the modal.'
+          : (llmResult.reason || 'No matching element found by AI');
+
         return {
           status: 'not_found',
-          message: llmResult.reason || 'No matching element found by AI',
+          message: notFoundMessage,
           confidence: 0,
           candidates: llmNotFoundSuggestions,
           highlight: [],

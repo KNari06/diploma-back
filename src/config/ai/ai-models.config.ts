@@ -53,8 +53,15 @@ export const AI_MODELS = {
  */
 export const AI_TASK_MODELS = {
   // ── Editor Mode / Preview ──────────────────────────────────────────────
-  /** LLM disambiguation when multiple candidates match */
-  disambiguation: AI_MODELS.fast,
+  /**
+   * LLM disambiguation when multiple candidates match.
+   * Gemini 2.5 Flash Lite: non-reasoning model → predictable ~300-800ms latency,
+   * strong multilingual support (critical — intents come in RU/EN/KZ/CN/etc),
+   * cheap ($0.10 input / $0.40 output per 1M). Picked over gpt-5.x because the
+   * latter's hidden chain-of-thought made latency swing 1.5s..7s on identical
+   * prompts, causing Find-by-description to time out on first click.
+   */
+  disambiguation: 'gemini-2.5-flash-lite' as const,
   /** Intent step linting (element resolution) */
   intentLint: AI_MODELS.fast,
   /** AI check assertion evaluation */

@@ -15,10 +15,13 @@
 
 import { redisConnection, QueueManager } from '@/config/infrastructure/queues';
 import { env } from '@/config/environment/env';
-import { dbAdminService } from '@/db/supabase';
+import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { MobilePlatform, MobileIntentStep, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
+import { toMobilePlatformKey } from '@/services/mobile/mobile-runner.types';
+import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
+import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -52,6 +55,82 @@ async function releaseLock(chatSessionId: string): Promise<void> {
     await redisConnection.del(`${MOBILE_TEST_LOCK_PREFIX}${chatSessionId}`);
   } catch {
     // best-effort
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ANALYTICS ANCHOR
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Create the `regression_runs` + `test_executions` pair that anchors this
+ * chat-triggered mobile test in the analytics stack. Sibling of the inline
+ * block in `src/api/chat/ai_test/handler.ts` (web). Both handlers should
+ * eventually share a single service; for now they mirror each other.
+ *
+ * Best-effort: returns blank ids on failure. Caller skips the cache
+ * invalidation and lets the job finish without analytics visibility.
+ */
+async function createChatAnalyticsAnchor(params: {
+  projectId: string;
+  userId: string;
+  testId: string;
+  browser: string;
+  platform: string;
+}): Promise<{ analyticsRunId?: string; analyticsExecutionId?: string }> {
+  try {
+    const { data: run, error: runErr } = await supabaseAdmin
+      .from('regression_runs')
+      .insert({
+        project_id: params.projectId,
+        user_id: params.userId,
+        trigger: 'chat',
+        status: 'running',
+        started_at: new Date().toISOString(),
+        test_id: params.testId,
+      })
+      .select('id')
+      .single();
+
+    if (runErr || !run) {
+      logger.warn('[MOBILE_TEST] Failed to create analytics regression_run', {
+        error: runErr?.message,
+        testId: params.testId,
+      });
+      return {};
+    }
+
+    const { data: exec, error: execErr } = await supabaseAdmin
+      .from('test_executions')
+      .insert({
+        run_id: run.id,
+        test_type: 'ui',
+        test_case_id: null,
+        status: 'running',
+        started_at: new Date().toISOString(),
+        browser: params.browser,
+        platform: params.platform,
+        result: { testId: params.testId, type: 'mobile', trigger: 'chat' },
+      })
+      .select('id')
+      .single();
+
+    if (execErr || !exec) {
+      logger.warn('[MOBILE_TEST] Failed to create analytics test_execution', {
+        error: execErr?.message,
+        runId: run.id,
+        testId: params.testId,
+      });
+      return { analyticsRunId: run.id };
+    }
+
+    return { analyticsRunId: run.id, analyticsExecutionId: exec.id };
+  } catch (err) {
+    logger.warn('[MOBILE_TEST] Analytics anchor creation threw (non-fatal)', {
+      error: err instanceof Error ? err.message : String(err),
+      testId: params.testId,
+    });
+    return {};
   }
 }
 
@@ -251,6 +330,42 @@ export async function handleMobileTest(
       }
     }
 
+    // ── Step 6.5: Create analytics + bug-insights linkage ─────────
+    // Chat-triggered mobile tests bypass regression-run.service, so they
+    // need their own regression_runs + test_executions rows (analytics)
+    // and an intelligent_test_sessions anchor (bug-insights). All three
+    // are best-effort — a failure must not block the run from queueing.
+    //
+    // The analytics chain (run→execution, FK-dependent) runs in parallel
+    // with the independent session-anchor insert to keep hot-path p50
+    // under two sequential round-trips instead of three.
+    const mobilePlatformKey = toMobilePlatformKey(platform);
+
+    const [analyticsIds, intelligentSessionId] = await Promise.all([
+      createChatAnalyticsAnchor({
+        projectId,
+        userId,
+        testId,
+        browser,
+        platform: mobilePlatformKey,
+      }),
+      IntelligentTestStorageService.createSessionAnchor({
+        testId,
+        userId,
+        projectId,
+        goal: testGoal,
+        startUrl: appPackage || `mobile://${platform}`,
+        browser,
+      }),
+    ]);
+    const { analyticsRunId, analyticsExecutionId } = analyticsIds;
+
+    // Invalidate cached analytics so the new run is visible immediately
+    // instead of waiting up to ANALYTICS_CACHE_TTL for the entry to expire.
+    if (analyticsRunId) {
+      AnalyticsQueryService.invalidateWorkspaceCaches(workspace_id);
+    }
+
     // ── Step 7: Queue BullMQ job ──────────────────────────────────
     const jobData: MobileTestJobData = {
       testId,
@@ -267,6 +382,10 @@ export async function handleMobileTest(
       runnerApiKey: env.MOBILE_RUNNER_API_KEY,
       appStoragePath,
       appOriginalName,
+      // Analytics parity: job finalizes the execution row + session on completion
+      analyticsRunId,
+      analyticsExecutionId,
+      intelligentSessionId,
     };
 
     await QueueManager.addMobileTestRunJob(jobData);

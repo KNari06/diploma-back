@@ -60,23 +60,60 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function saveTestCase(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { sourceTestId, name, description, kind, flowId } = req.body;
+    const {
+      // Mode A — replay from a completed web test
+      sourceTestId,
+      // Mode B — save an in-memory recording (mobile or step editor)
+      projectId,
+      platform,
+      steps,
+      appPackage,
+      startActivity,
+      tags,
+      // Common
+      name,
+      description,
+      kind,
+      flowId,
+    } = req.body;
 
-    // Validate required inputs
-    if (!sourceTestId || !name) {
+    // Exactly one mode must be provided
+    const hasMode_A = !!sourceTestId;
+    const hasMode_B = !!(projectId && Array.isArray(steps) && steps.length > 0);
+    if (!hasMode_A && !hasMode_B) {
       res.status(400).json({
         success: false,
-        error: 'sourceTestId and name are required',
+        error:
+          'Provide either `sourceTestId` (replay mode) or `projectId` + `steps[]` (recording mode).',
       });
+      return;
+    }
+    if (!name) {
+      res.status(400).json({ success: false, error: 'name is required' });
       return;
     }
 
     const userId = getUserId(req);
 
-    logger.info('[REGRESSION_API] Saving test case', { sourceTestId, name, userId, flowId });
+    logger.info('[REGRESSION_API] Saving test case', {
+      mode: hasMode_A ? 'from_test' : 'from_recording',
+      sourceTestId,
+      projectId,
+      platform,
+      stepsCount: Array.isArray(steps) ? steps.length : 0,
+      name,
+      userId,
+      flowId,
+    });
 
     const result = await RegressionSaveService.saveTestCase({
       sourceTestId,
+      projectId,
+      platform,
+      steps,
+      appPackage,
+      startActivity,
+      tags,
       userId,
       name,
       description,
@@ -223,7 +260,7 @@ export async function runRegression(req: AuthenticatedRequest, res: Response): P
  */
 export async function listSavedTestCases(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId } = req.query;
+    const { projectId, platform } = req.query;
 
     if (!projectId || typeof projectId !== 'string') {
       res.status(400).json({
@@ -235,7 +272,12 @@ export async function listSavedTestCases(req: AuthenticatedRequest, res: Respons
 
     const userId = getUserId(req);
 
-    const cases = await RegressionRunService.listSavedTestCases(projectId, userId);
+    const cases = await RegressionRunService.listSavedTestCases(
+      projectId,
+      userId,
+      undefined,
+      typeof platform === 'string' ? platform : undefined,
+    );
 
     // Map to camelCase response format with dependsOn
     const mappedCases = cases.map(mapSavedTestCaseToResponse);
@@ -793,6 +835,10 @@ export async function getRunExecutions(req: AuthenticatedRequest, res: Response)
       testType: exec.testType,
       status: exec.status,
       browser: exec.browser,
+      // Raw platform — null/undefined for legacy rows (pre-20260417 migration);
+      // lets the frontend show a platform badge and pick a mobile-aware
+      // status-viewer for mobile_* executions.
+      platform: exec.platform ?? null,
       durationMs: exec.durationMs,
       errorMessage: exec.errorMessage,
       testId: exec.result?.testId || null,

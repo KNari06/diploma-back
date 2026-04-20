@@ -11,6 +11,7 @@ import {
   signInWithMagicLink,
   signOut,
   signUpWithEmail,
+  BusinessEmailError,
   updatePassword,
   updateUserProfile,
   invalidateAuthCache,
@@ -48,6 +49,18 @@ export const signup = async (req: Request, res: Response): Promise<void> => {
       data: result,
     });
   } catch (error: any) {
+    // Business-email rejection is a client-fixable validation error — surface
+    // the code so frontends can show a localized toast.
+    if (error instanceof BusinessEmailError) {
+      logger.info('[AUTH] Signup rejected: non-business email', { code: error.code });
+      res.status(400).json({
+        success: false,
+        code: error.code,
+        error: error.message,
+      });
+      return;
+    }
+
     logger.error('Signup error', error);
     res.status(400).json({
       success: false,

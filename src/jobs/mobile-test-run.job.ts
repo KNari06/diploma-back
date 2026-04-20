@@ -15,7 +15,8 @@
  */
 
 import { QueueManager } from '@/config/infrastructure/queues';
-import { dbAdminService } from '@/db/supabase';
+import { dbAdminService, supabaseAdmin } from '@/db/supabase';
+import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { logQueueEvent, logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
@@ -71,7 +72,6 @@ export class MobileTestRunJobHandler {
       platform,
       browser,
       appPackage,
-      intentSteps,
       geminiApiKey,
       runnerUrl,
       runnerApiKey,
@@ -79,7 +79,26 @@ export class MobileTestRunJobHandler {
       appOriginalName,
       ciRunId,
       metadata,
+      // `analyticsRunId` is intentionally not destructured: see the
+      // comment inside `finalizeAnalyticsLinkage` for why we don't flip
+      // regression_runs from the job. The field stays on the job data
+      // type so future non-Phase-9 paths can consume it if needed.
+      analyticsExecutionId,
+      intelligentSessionId,
+      // Track 5 (shared resources): raw bindings only — the worker
+      // compiles them on its own so plaintext secrets never land in Redis.
+      resourceBindings,
     } = job.data;
+
+    // `intentSteps` stays a `let` because Track 5 resource compilation
+    // may prepend setup steps to it (see below). Without bindings this is
+    // byte-identical to job.data.intentSteps.
+    let intentSteps = job.data.intentSteps;
+    // Snapshot of applied/skipped resources — written to
+    // test_executions.executed_resources on job completion (success or
+    // failure). Built after compile; starts undefined so the no-bindings
+    // fast path skips writeback entirely.
+    let executedResources: Array<Record<string, unknown>> | undefined;
 
     // Validate
     if (!testId || !intentSteps?.length) {
@@ -120,6 +139,64 @@ export class MobileTestRunJobHandler {
     let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
 
     try {
+      // ── Track 5: Compile shared resources into setup steps ──
+      // MUST run inside the main try block — otherwise a compile throw
+      // skips the unified error handler below, leaving `test_executions`
+      // stuck in 'pending' and regression runs never finalizing.
+      //
+      // Runs BEFORE any session acquisition so a `required: true` failure
+      // doesn't waste an emulator boot. Decrypt + compile live inside the
+      // worker process — Redis only ever sees `{kind, resource_id}`.
+      if (resourceBindings && resourceBindings.length > 0) {
+        const { ResourceStepCompilerService } = await import(
+          '@/services/test-resource/resource-step-compiler.service'
+        );
+        const compileResult = await ResourceStepCompilerService.compileForMobile({
+          bindings: resourceBindings as Parameters<
+            typeof ResourceStepCompilerService.compileForMobile
+          >[0]['bindings'],
+          userId,
+          projectId: projectId ?? '',
+          platform,
+        });
+
+        // Prepend compiled setup steps. Type cast mirrors the one in
+        // dispatchMobileTest — compiled steps use mobile-only action
+        // types (network / geolocation / upload) not in the web
+        // IntentActionType.
+        if (compileResult.steps.length > 0) {
+          intentSteps = [
+            ...(compileResult.steps as unknown as typeof intentSteps),
+            ...intentSteps,
+          ] as typeof intentSteps;
+        }
+
+        // Pre-build audit snapshot (identical shape to web's AppliedBinding).
+        executedResources = [
+          ...compileResult.applied.map((a) => ({
+            binding: a.binding,
+            name: a.name,
+            kind: a.kind,
+            status_at_start: a.status_at_start,
+            captured_at: a.captured_at,
+            healed_during_run: a.healed_during_run,
+            ...(a.apply_error ? { apply_error: a.apply_error } : {}),
+          })),
+          ...compileResult.skipped.map((s) => ({
+            binding: s.binding,
+            skipped_reason: s.reason,
+          })),
+        ];
+
+        logger.info('[MOBILE-TEST] Resources compiled into setup', {
+          testId,
+          bindingsIn: resourceBindings.length,
+          stepsOut: compileResult.steps.length,
+          applied: compileResult.applied.length,
+          skipped: compileResult.skipped.length,
+        });
+      }
+
       // ── Phase 1: Emit progress ────────────────────────────────
       try {
         webSocketService.emitTestProgress(testId, {
@@ -153,6 +230,26 @@ export class MobileTestRunJobHandler {
         });
       } catch { /* non-fatal */ }
 
+      // Phase 6: Session acquisition can take up to ~60s on a cold start.
+      // Progressively tell the frontend which fallback we're on so "Starting
+      // mobile session…" doesn't feel like a freeze. Progress stays in the
+      // 10-15% band — we're still in the initializing phase, not executing.
+      const emitSessionPhase = (step: string, pct: number) => {
+        try {
+          webSocketService.emitTestProgress(testId, {
+            testId,
+            browser,
+            progress: pct,
+            phase: 'initializing',
+            currentStep: step,
+            status: 'running',
+            timestamp: new Date().toISOString(),
+            userId,
+            sessionId: chatSessionId,
+          });
+        } catch { /* non-fatal */ }
+      };
+
       // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s)
       try {
         const claimed = await client.claimSession(platform);
@@ -169,6 +266,7 @@ export class MobileTestRunJobHandler {
 
       // Try 2: Warmed session (editor eager start)
       if (!sessionId && projectId) {
+        emitSessionPhase(`Checking warmed ${platform} session…`, 11);
         const warmed = await claimWarmedSession(projectId, userId);
         if (warmed && warmed.platform === platform) {
           sessionId = warmed.sessionId;
@@ -179,6 +277,9 @@ export class MobileTestRunJobHandler {
 
       // Try 3: Cold start (fallback — creates new emulator/simulator ~60s)
       if (!sessionId) {
+        // Explicit heads-up: cold starts can take up to a minute, so users
+        // see "Booting emulator…" instead of a long silent pause after 10%.
+        emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
         const session = await client.createSession(platform);
         sessionId = session.sessionId;
         sessionSource = 'cold';
@@ -191,19 +292,26 @@ export class MobileTestRunJobHandler {
 
       // ── Phase 3b: Install app (if project has APK/IPA) ───────
       if (appStoragePath) {
-        try {
-          webSocketService.emitTestProgress(testId, {
-            testId,
-            browser,
-            progress: 15,
-            phase: 'initializing',
-            currentStep: `Installing app on ${platform}...`,
-            status: 'running',
-            timestamp: new Date().toISOString(),
-            userId,
-            sessionId: chatSessionId,
-          });
-        } catch { /* non-fatal */ }
+        // Phase 6: APK install has three distinct sub-steps that each
+        // can take several seconds on a large binary. We surface all three
+        // so the progress bar moves through 13 → 15 → 17% while the job
+        // works — the pre-Phase-6 single 15% emit made a ~30s operation
+        // look like a freeze.
+        const emitInstallStep = (step: string, pct: number) => {
+          try {
+            webSocketService.emitTestProgress(testId, {
+              testId,
+              browser,
+              progress: pct,
+              phase: 'initializing',
+              currentStep: step,
+              status: 'running',
+              timestamp: new Date().toISOString(),
+              userId,
+              sessionId: chatSessionId,
+            });
+          } catch { /* non-fatal */ }
+        };
 
         logger.info('[MOBILE-TEST] Downloading app from storage', {
           testId,
@@ -216,10 +324,12 @@ export class MobileTestRunJobHandler {
             appStoragePath,
           });
         } else {
-          // Download from Supabase Storage
+          // (1) Download APK from Supabase Storage
+          emitInstallStep(`Downloading app binary…`, 13);
           const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
 
-          // Upload to runner
+          // (2) Upload APK to runner
+          emitInstallStep(`Uploading app to ${platform} runner…`, 15);
           const uploadResult = await client.uploadApp(
             appBuffer,
             appOriginalName || 'app.apk',
@@ -230,6 +340,9 @@ export class MobileTestRunJobHandler {
             runnerPath: uploadResult.path,
             size: uploadResult.size,
           });
+
+          // (3) Install + launch on the emulator/simulator
+          emitInstallStep(`Installing ${appPackage}…`, 17);
 
           // Install + launch the app on the emulator/simulator via low-level commands
           await client.executeBatchCommands(sessionId, [
@@ -358,6 +471,24 @@ export class MobileTestRunJobHandler {
       // Create test result record
       const testResultId = await this.createTestResult(testId, browser, runResult, userId, workspaceId);
 
+      // ── Phase 5.5: Finalize analytics linkage ────────────────
+      await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
+        analyticsExecutionId,
+        intelligentSessionId,
+        passed: testPassed,
+        durationMs: runResult.durationMs,
+        totalSteps: runResult.totalSteps,
+        firstError: runResult.steps.find((s) => !s.success)?.error,
+      });
+
+      // ── Phase 5.6: Persist test_resources snapshot ───────────
+      // Mirrors manual-test-run.job.ts:509-520. Non-fatal — the test
+      // result is the source of truth, audit data just enriches it.
+      await MobileTestRunJobHandler.persistExecutedResourcesSnapshot(
+        testId,
+        executedResources,
+      );
+
       // ── Phase 6: Queue AI analysis ────────────────────────────
       if (testResultId) {
         try {
@@ -449,6 +580,22 @@ export class MobileTestRunJobHandler {
       try {
         await this.updateTestStatus(testId, 'failed', browser);
       } catch { /* ignore */ }
+
+      // Same finalizer as the success path, different outcome.
+      await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
+        analyticsExecutionId,
+        intelligentSessionId,
+        passed: false,
+        errorMessage,
+      });
+
+      // Persist snapshot even on job-level failure (session couldn't
+      // start, runner unreachable, etc.). Operators need to know which
+      // resources were meant to be live so they can triage quickly.
+      await MobileTestRunJobHandler.persistExecutedResourcesSnapshot(
+        testId,
+        executedResources,
+      );
 
       // Emit failure event
       try {
@@ -676,6 +823,128 @@ export class MobileTestRunJobHandler {
         error: error instanceof Error ? error.message : String(error),
       });
       return null;
+    }
+  }
+
+  /**
+   * Finalize the pre-created analytics rows for this mobile run.
+   *
+   * Rows are created up front (chat handler, regression-run dispatch) in
+   * 'running' state so the frontend sees a live row immediately. This
+   * helper transitions them to terminal state when the run finishes.
+   *
+   * All three updates are best-effort: a failure here must not fail the
+   * overall job — `test_results` is the authoritative record. Missing
+   * ids are silently skipped so jobs without analytics wiring still work.
+   *
+   * Kept local to the mobile job because web's `TestCompletionHandler`
+   * looks up executions via joins tuned for web and wouldn't match a
+   * mobile row cleanly. An eventual shared finalizer can replace this.
+   */
+  private static async finalizeAnalyticsLinkage(params: {
+    analyticsExecutionId?: string;
+    intelligentSessionId?: string;
+    passed: boolean;
+    durationMs?: number;
+    totalSteps?: number;
+    firstError?: string;
+    errorMessage?: string;
+  }): Promise<void> {
+    const {
+      analyticsExecutionId,
+      intelligentSessionId,
+      passed,
+      durationMs,
+      totalSteps,
+      firstError,
+      errorMessage,
+    } = params;
+
+    // All three targets are independent — parallelize. allSettled so one
+    // failure doesn't skip the others; per-branch try/catch logs locally.
+    const tasks: Promise<unknown>[] = [];
+
+    if (analyticsExecutionId) {
+      tasks.push((async () => {
+        try {
+          await ExecutionService.updateStatus({
+            id: analyticsExecutionId,
+            status: passed ? 'passed' : 'failed',
+            ...(durationMs !== undefined ? { durationMs } : {}),
+            ...((firstError || errorMessage) ? { errorMessage: firstError || errorMessage } : {}),
+          });
+        } catch (err) {
+          logger.warn('[MOBILE-TEST] Failed to finalize test_executions', {
+            analyticsExecutionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })());
+    }
+
+    // Note: `regression_runs.status` is intentionally NOT finalized here.
+    // Phase 9's `TestCompletionHandlerService.handleTestCompletion` reads
+    // aggregated `test_executions` and updates the run with a correct
+    // summary + emits the run-level WebSocket event + creates a user
+    // notification. If we flipped `regression_runs.status` here first, the
+    // optimistic-lock `.in('status', ['running','pending'])` in that
+    // handler would no-op and the WS/notification would be lost.
+    //
+    // `analyticsRunId` is kept on MobileTestJobData so future code that
+    // needs a pre-known run id (e.g. retry-backed failures that skip
+    // Phase 9) can use it without re-querying.
+
+    if (intelligentSessionId) {
+      tasks.push((async () => {
+        try {
+          await supabaseAdmin
+            .from('intelligent_test_sessions')
+            .update({
+              status: passed ? 'completed' : 'failed',
+              success: passed,
+              completed_at: new Date().toISOString(),
+              ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
+              // A mobile step is an "action"; there's no page-visit analogue,
+              // so pages_visited stays at its default 0.
+              ...(totalSteps !== undefined ? { actions_taken: totalSteps } : {}),
+            })
+            .eq('id', intelligentSessionId);
+        } catch (err) {
+          logger.warn('[MOBILE-TEST] Failed to finalize intelligent_test_sessions', {
+            intelligentSessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })());
+    }
+
+    await Promise.allSettled(tasks);
+  }
+
+  /**
+   * Persist the compiled-at-dispatch resources snapshot onto every
+   * matching `test_executions` row. Uses the same service method web
+   * uses (`ExecutionService.persistExecutedResourcesByTestId`) so the
+   * `executed_resources` column shape is platform-uniform and downstream
+   * readers (UI, /bug-insights) don't branch on platform.
+   *
+   * Non-fatal — the test result is the source of truth, audit data just
+   * enriches it. Missing / empty snapshot is a legitimate no-op (the case
+   * had no resource_bindings). Wrapped in its own try so a failure here
+   * can't mask a real test failure upstream.
+   */
+  private static async persistExecutedResourcesSnapshot(
+    testId: string,
+    snapshot?: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    if (!snapshot || snapshot.length === 0) return;
+    try {
+      await ExecutionService.persistExecutedResourcesByTestId(testId, snapshot);
+    } catch (err) {
+      logger.warn('[MOBILE-TEST] Failed to persist executed_resources snapshot', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 }

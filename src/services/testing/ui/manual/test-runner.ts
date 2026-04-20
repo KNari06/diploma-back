@@ -134,6 +134,9 @@ export async function runTest(testRequest: TestRunRequest): Promise<ApiResponse<
           mode: effectiveMode, // Test execution mode (supports fallback to options.mode)
           chatSessionId: testRequest.chatSessionId, // Pass chat session ID for WebSocket routing isolation
           prefilledSteps: (testRequest as any).prefilledSteps, // Smart Resolver: prefilled steps for fast replay
+          // Resource bindings (Login, Environment, Secret, ...) — runner
+          // applies each to the browser context before navigation.
+          resourceBindings: testRequest.resourceBindings,
         });
 
         queuedBrowsers.push(browser);

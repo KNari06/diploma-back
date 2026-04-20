@@ -26,11 +26,20 @@ import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { OverallBuilderService } from '@/services/testing/visualization/overall-builder.service';
 import { cache } from '@/utils/core/redis-cache';
 import { logger } from '@/utils/core/logger';
+import type { AnalyticsPlatformFilter } from '@/services/analytics/analytics.types';
 
 const CACHE_TTL_SECONDS = 60; // 1 minute — fresh enough for dashboard, eliminates burst
 
-function cacheKey(workspaceId: string, userId: string): string {
-  return `qait:cache:dashboard:summary:ws:${workspaceId}:u:${userId}`;
+/**
+ * Phase 7: cache key now keys on platform too, otherwise a user who opens
+ * "Web" and then "Mobile" in quick succession would get the first one's
+ * cached response for both. platform='all' → empty string so existing
+ * cache keys stay stable (and so clients that don't pass platform don't
+ * cause a fresh miss).
+ */
+function cacheKey(workspaceId: string, userId: string, platform: AnalyticsPlatformFilter): string {
+  const suffix = platform === 'all' ? '' : `:p:${platform}`;
+  return `qait:cache:dashboard:summary:ws:${workspaceId}:u:${userId}${suffix}`;
 }
 
 /**
@@ -39,6 +48,10 @@ function cacheKey(workspaceId: string, userId: string): string {
 export async function getDashboardSummary(req: Request, res: Response): Promise<void> {
   const userId = req.user?.id;
   const workspaceId = req.query.workspaceId as string;
+  // Phase 7: dashboard now accepts the same platform filter as every other
+  // analytics endpoint. Unknown / missing → 'all' (pre-Phase-7 default),
+  // so clients that never heard of this param keep working unchanged.
+  const platform = AnalyticsQueryService.normalisePlatform(req.query.platform);
 
   // ── Validation ────────────────────────────────────────────────────────────
   if (!userId) {
@@ -74,7 +87,7 @@ export async function getDashboardSummary(req: Request, res: Response): Promise<
   }
 
   // ── Cache hit ─────────────────────────────────────────────────────────────
-  const key = cacheKey(workspaceId, userId);
+  const key = cacheKey(workspaceId, userId, platform);
   const cached = await cache.get<object>(key);
   if (cached) {
     res.json({ success: true, data: cached, cached: true, timestamp: new Date().toISOString() });
@@ -87,12 +100,19 @@ export async function getDashboardSummary(req: Request, res: Response): Promise<
     const projects = await ProjectService.getProjectsByWorkspace(workspaceId, userId);
     const projectId: string | undefined = projects?.[0]?.id;
 
-    // Step 2: fire all project-independent and project-dependent queries in parallel
+    // Step 2: fire all project-independent and project-dependent queries in parallel.
+    // Analytics services are platform-aware (Phase 7) — we forward the filter
+    // so "Web" / "Mobile" / "API" dashboards actually differ.
+    // The other services (overall builder, runs list, schedules) are
+    // intentionally NOT filtered: test nodes and upcoming schedules are
+    // structural/config-level, not execution-level — filtering them by
+    // platform would hide a plan that contains mobile cases just because
+    // the user is looking at "Web" metrics. Recent runs is kept unfiltered
+    // for the same reason (a plan with mixed cases has one run row).
     const [summaryData, resultsOverviewData, testNodesData, recentRunsData, schedulesData] =
       await Promise.allSettled([
-        // Analytics — workspaceId only, no projectId needed
-        AnalyticsQueryService.getSummary({ workspaceId, projectId }),
-        AnalyticsQueryService.getResultsOverview({ workspaceId, projectId }),
+        AnalyticsQueryService.getSummary({ workspaceId, projectId, platform }),
+        AnalyticsQueryService.getResultsOverview({ workspaceId, projectId, platform }),
 
         // Project-specific (skip gracefully if no projectId)
         projectId
@@ -167,6 +187,10 @@ export async function getDashboardSummary(req: Request, res: Response): Promise<
 /**
  * POST /api/v1/dashboard/invalidate
  * Invalidate dashboard cache for the current workspace (call after run completion, etc.)
+ *
+ * Phase 7: platform is a cache dimension now, so we have to drop the keys
+ * for ALL platform values. Done with `delByPattern` instead of deleting
+ * a single fully-qualified key.
  */
 export async function invalidateDashboardCache(req: Request, res: Response): Promise<void> {
   const userId = req.user?.id;
@@ -177,6 +201,8 @@ export async function invalidateDashboardCache(req: Request, res: Response): Pro
     return;
   }
 
-  await cache.del(cacheKey(workspaceId, userId));
+  // Match the 'all' (legacy, no suffix) AND every per-platform variant.
+  const pattern = `qait:cache:dashboard:summary:ws:${workspaceId}:u:${userId}*`;
+  await cache.delByPattern(pattern);
   res.json({ success: true, timestamp: new Date().toISOString() });
 }

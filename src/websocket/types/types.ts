@@ -41,6 +41,35 @@ export interface ClientToServerEvents {
   'preview:run:start': (data: PreviewRunStartRequest) => void;
   'preview:run:cancel': (data: PreviewRunCancelRequest) => void;
 
+  // Test Resources — live preview actions (Phase 4):
+  //
+  //   apply-resource: inject a saved Login (cookies + localStorage) into
+  //     the live preview context so the user can keep authoring from an
+  //     authenticated state without re-typing credentials. Server responds
+  //     with `preview:apply-resource:result`.
+  //
+  //   save-login: snapshot the preview's current storageState as a Login
+  //     resource. Creates a new resource when `resourceId` is omitted, or
+  //     updates (re-captures) an existing one when provided. Server
+  //     responds with `preview:save-login:result`.
+  'preview:apply-resource': (data: {
+    previewSessionId: string;
+    resourceId: string;
+  }) => void;
+  'preview:save-login': (data: {
+    previewSessionId: string;
+    /** Update existing resource when set; otherwise create a new one. */
+    resourceId?: string;
+    /** Required on create, ignored on update. */
+    name?: string;
+    description?: string;
+    /** Scope hints — backend falls back to current URL's hostname. */
+    domain?: string;
+    ttlSeconds?: number;
+    /** If true AND creating, upsert workspace default for the scope. */
+    setAsDefault?: boolean;
+  }) => void;
+
   // Preview interactive control (mouse/keyboard)
   'preview:mouse:move': (data: PreviewMouseMoveRequest) => void;
   'preview:mouse:click': (data: PreviewMouseClickRequest) => void;
@@ -66,6 +95,10 @@ export interface ClientToServerEvents {
 
   // V15: Multi-tab events (client → server)
   'preview:tab:switch': (data: { previewSessionId: string; tabIndex: number }) => void;
+  // Close a popup/secondary tab. Root tab (index 0) can't be closed via
+  // this event — server refuses. Backend responds by rebroadcasting
+  // `preview:tab:closed` with the updated tabs list.
+  'preview:tab:close': (data: { previewSessionId: string; tabIndex: number }) => void;
 
   // Preview DevTools (on-demand requests)
   'preview:network:detail:request': (data: PreviewNetworkDetailRequest) => void;
@@ -207,6 +240,70 @@ export interface ServerToClientEvents {
     progress: number;     // 0-100
     url?: string;
     elapsedMs: number;
+  }) => void;
+
+  // Login required — emitted when the preview lands on a login / auth
+  // gate (URL match OR visible password field). Frontend uses this to
+  // surface the "Log in now / Use existing Login" chooser over the
+  // preview. Signal (one of):
+  //   'url'  — the URL matches /login|/signin|/auth/ patterns
+  //   'form' — the DOM contains a visible password input
+  //   'both' — both signals agree (highest confidence)
+  // `suggestedDomain` is the canonical hostname suitable for creating
+  // a new Login resource scoped to this site.
+  'preview:auth:required': (data: {
+    previewSessionId: string;
+    signal: 'url' | 'form' | 'both';
+    url: string;
+    suggestedDomain?: string;
+    timestamp: string;
+  }) => void;
+
+  // Fires when the external-navigation trap reverts a cross-origin main-frame
+  // navigation that wasn't user-initiated (e.g. a JS-driven location.href to
+  // a payment gateway, a button.onclick redirect, a form submit). The trap
+  // already restored the page to the prior safe URL before emitting this —
+  // the frontend just shows a toast so the user knows what happened.
+  'preview:external-nav:blocked': (data: {
+    previewSessionId: string;
+    blockedUrl: string;
+    blockedHostname: string;
+    baselineUrl: string;
+    baselineHostname: string;
+    timestamp: string;
+  }) => void;
+
+  // Ack for `preview:apply-resource`. `resource` is included on success so
+  // the frontend can update its local cache (e.g. bump lastUsedAt) without
+  // a round-trip. `error` is a user-facing message on failure.
+  'preview:apply-resource:result': (data: {
+    previewSessionId: string;
+    success: boolean;
+    resourceId: string;
+    resourceName?: string;
+    error?: string;
+    timestamp: string;
+  }) => void;
+
+  // Ack for `preview:save-login`. On success, `resource` echoes the stored
+  // row (minus sensitive fields) so the frontend can list/attach it without
+  // an extra GET. On failure, `error` carries a short human-readable reason.
+  'preview:save-login:result': (data: {
+    previewSessionId: string;
+    success: boolean;
+    resource?: {
+      id: string;
+      name: string;
+      kind: 'auth';
+      status: 'active' | 'stale' | 'broken';
+      capturedAt?: string;
+      expiresAt?: string;
+      scope?: Record<string, unknown>;
+    };
+    /** True when we updated an existing row, false when we created one. */
+    updated?: boolean;
+    error?: string;
+    timestamp: string;
   }) => void;
 
   // Preview recording events
@@ -1297,6 +1394,12 @@ export interface PreviewRecordingStatePayload {
    *                   Apply All before recording more
    */
   reason?: 'max_time' | 'max_steps';
+  /**
+   * Server-side step cap for this recording session. Sent only on
+   * `recording: true` so the UI can render an `X/N` badge without a
+   * separate config fetch. 0 = cap disabled. Missing on pre-cap builds.
+   */
+  maxSteps?: number;
   timestamp: string;
 }
 

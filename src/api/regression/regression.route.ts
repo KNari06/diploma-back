@@ -85,7 +85,14 @@ const router = Router();
  *       422:
  *         description: Test is not replayable
  */
-// Save FROM execution: takes `sourceTestId` (completed test) -> creates intent_test_cases (status=published) for replay.
+// Save a test case. Two modes:
+//   A. Replay mode: pass `sourceTestId` (a completed `tests` row) — backend
+//      extracts commands/graph_ref and writes an intent_test_case with
+//      replay_strategy='commands' | 'graph_extract'.
+//   B. Recording mode: pass `projectId` + `platform` + `steps` (IntentStep[]) —
+//      backend writes the row directly with replay_strategy='mobile_steps'
+//      (for mobile_*) or 'steps_editor' (for web). No `tests` row required.
+//      Used for mobile recordings and step-editor authored cases.
 router.post('/save', requireAuth, saveTestCase);
 
 /**

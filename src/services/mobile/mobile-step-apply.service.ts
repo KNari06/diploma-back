@@ -124,11 +124,20 @@ export class MobileStepApplyService {
           const bb = lintResult.boundingBox;
           const centerX = Math.round(bb.x + bb.width / 2);
           const centerY = Math.round(bb.y + bb.height / 2);
+          // Forward the resolver's confidence onto the command so the runner
+          // can decide whether to trust these coords on the next replay or
+          // re-resolve via vision/LLM (release-build layout shifts, DPR
+          // changes, etc.). See runner TapParams.coordsConfidence.
+          const coordsConfidence = typeof lintResult.confidence === 'number'
+            ? lintResult.confidence
+            : undefined;
+          const coordParams: Record<string, unknown> = { x: centerX, y: centerY };
+          if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
 
           const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
 
           if (rawStepType === 'type' || rawStepType === 'fill') {
-            commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
+            commands.push({ type: 'tap', params: { ...coordParams } });
             if (stepDraft.value) {
               commands.push({
                 type: 'type_text',
@@ -142,7 +151,7 @@ export class MobileStepApplyService {
               }
             }
           } else {
-            commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { x: centerX, y: centerY } });
+            commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { ...coordParams } });
           }
 
           await client.executeBatchCommands(sessionId, commands);

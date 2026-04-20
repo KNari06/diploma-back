@@ -202,6 +202,15 @@ export async function getChatCompletionWithGemini(params: {
     const response = genResult.response;
     const text = response.text();
 
+    // Surface non-STOP finish reasons as explicit errors instead of silently
+    // returning empty text. Observed: MAX_TOKENS and SAFETY produce empty text
+    // which downstream parsers mistake for "invalid response", masking the
+    // real cause. Typical fix: raise maxOutputTokens or soften the prompt.
+    const finishReason = response.candidates?.[0]?.finishReason;
+    if (!text && finishReason && finishReason !== 'STOP') {
+      throw new Error(`Gemini returned empty response (finishReason=${finishReason})`);
+    }
+
     const usage = response.usageMetadata || {
       promptTokenCount: 0,
       candidatesTokenCount: 0,

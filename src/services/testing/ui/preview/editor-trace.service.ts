@@ -164,6 +164,93 @@ export class EditorTraceService {
     });
   }
 
+  /**
+   * Session reset — user clicked the "Reset" button. Emitted at entry
+   * (phase='start') and exit (phase='end'). The `end` event carries
+   * success/error so a failed reset shows up without greping the server
+   * log. Makes regressions like the V-Phase4 video-freeze-after-reset
+   * discoverable from the editor trace alone.
+   */
+  writeSessionReset(data: {
+    phase: 'start' | 'end';
+    fromUrl?: string;
+    toUrl?: string;
+    success?: boolean;
+    error?: string;
+    durationMs?: number;
+  }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'session_reset',
+      payload: { previewSessionId: this.previewSessionId, ...data },
+    });
+  }
+
+  /**
+   * Video screencast lifecycle. Four transitions worth recording:
+   *   attach   — CDP Page.startScreencast succeeded for a given page
+   *   detach   — CDP listener removed (page close, explicit stop)
+   *   restart  — replacement stream created for a new page; `inheritedSeq`
+   *              tells us whether frame numbering continues or resets
+   *              (resetting is a common regression — see the double-stop
+   *              bug where `inheritedSeq` came back undefined).
+   *   first_frame — first actual CDP frame received after attach/restart
+   *              (so we can see exactly how long users stared at a blank
+   *              preview before the video pipeline came alive).
+   */
+  writeVideoStreamEvent(data: {
+    phase: 'attach' | 'detach' | 'restart' | 'first_frame';
+    reason?: string;
+    seq?: number;
+    inheritedSeq?: number | null;
+    pageUrl?: string;
+    durationMs?: number;
+  }): void {
+    this.writer.write({
+      stage: 'video',
+      eventType: 'stream_' + data.phase,
+      payload: { previewSessionId: this.previewSessionId, ...data },
+    });
+  }
+
+  /**
+   * Main-frame navigation detected (Playwright `framenavigated`). Mirrors
+   * what the browser itself saw, independent of the `navigation` event
+   * above (which is fired by OUR goto wrappers). Useful when the page
+   * JS-navigates on its own and we want to correlate that with snapshot
+   * results / action outcomes.
+   */
+  writeFrameNavigated(data: {
+    url: string;
+    isMainFrame: boolean;
+    trigger?: 'unknown' | 'page_load' | 'spa' | 'redirect';
+  }): void {
+    this.writer.write({
+      stage: 'lifecycle',
+      eventType: 'frame_navigated',
+      payload: data,
+    });
+  }
+
+  /**
+   * External-nav trap fired — a cross-origin navigation was reverted
+   * (payment link, window.open, form submit, etc.). `action` distinguishes
+   * a real revert from a suppressed-during-run pass-through.
+   */
+  writeExternalNavTrap(data: {
+    action: 'reverted' | 'allowed_intent' | 'allowed_same_app' | 'suppressed_during_run';
+    fromUrl: string;
+    toUrl: string;
+    recoveredTo?: string;
+    reason?: string;
+  }): void {
+    this.writer.write({
+      stage: 'safety',
+      eventType: 'external_nav_trap',
+      payload: data,
+    });
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // SNAPSHOT EVENTS
   // ─────────────────────────────────────────────────────────────────────────

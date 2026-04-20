@@ -221,7 +221,15 @@ export function convertIntentStepToCommand(
     description: step.description,
     timeout: step.options?.timeout || 30000,
     continueOnError: step.isAutoInjected === true
-      || (step.type === 'wait_for' && !!step.options?.urlMatcher?.changedFrom),
+      || (step.type === 'wait_for' && !!step.options?.urlMatcher?.changedFrom)
+      // Teardown steps never fail the overall verdict — they run
+      // best-effort after the body. If a teardown step throws, we want
+      // the executor to log it and move on rather than abort.
+      || step.phase === 'teardown',
+    // Propagate the lifecycle phase marker from IntentStep so the
+    // executor (and the downstream RunReportStep) can distinguish
+    // setup / main / teardown. Absent on pre-Phase-3 runs.
+    ...(step.phase ? { phase: step.phase } : {}),
 
     // Intent metadata for runtime resolution
     intentMeta: {

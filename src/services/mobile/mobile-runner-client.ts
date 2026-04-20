@@ -102,6 +102,26 @@ export class MobileRunnerClient {
     }
   }
 
+  /**
+   * Update the runtime-permission policy for a live session.
+   *
+   * - 'auto_allow' (default): pre-grant on install + ambient watcher auto-Allows
+   * - 'auto_deny': watcher auto-Dismisses runtime permission dialogs
+   * - 'manual': no automation — explicit permission_dialog steps only
+   *
+   * Non-fatal: if the runner rejects or is unreachable we just log and move on;
+   * the session will fall back to the runner-side default ('auto_allow').
+   */
+  async setPermissionPolicy(
+    sessionId: string,
+    policy: 'auto_allow' | 'auto_deny' | 'manual',
+  ): Promise<void> {
+    await this.request('PATCH', `/api/sessions/${sessionId}/permission-policy`, {
+      body: { policy },
+      timeoutMs: 5000,
+    });
+  }
+
   // ── Session Pool operations ──────────────────────────────────────
 
   /**
