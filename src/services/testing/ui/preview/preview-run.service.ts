@@ -605,12 +605,24 @@ export class PreviewRunService {
       intentTestCaseId?: string;
       persistAppliedSteps?: boolean;
       chatSessionId?: string;
+      /**
+       * Whether to clear cookies + localStorage + sessionStorage before the run.
+       * 'always' (default) — clear every run so each start is deterministic; prevents a
+       *   successful login from a prior run carrying over and pushing the replay into a
+       *   different code path (e.g. /login → /dashboard), which would silently "pass"
+       *   against the wrong page.
+       * 'never' — keep the current context state. Use for tests that expect a persistent
+       *   session (e.g. manually logged in by the user before recording, or tests chained
+       *   together). Test Resources with kind='auth' should drive this later.
+       */
+      authReset?: 'always' | 'never';
       /** @internal Skip ownership check when caller (runSavedSteps) already verified */
       _skipOwnershipCheck?: boolean;
     },
   ): Promise<PreviewRunSummary> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
+    const authReset: 'always' | 'never' = options?.authReset ?? 'always';
 
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
@@ -799,6 +811,130 @@ export class PreviewRunService {
         markIntentionalGoto(previewSessionId, startUrl);
       } catch { /* non-fatal */ }
 
+      // Auth reset (Phase 0).
+      //
+      // Rationale: without this, a prior run that logged the user in leaves cookies +
+      // localStorage populated. The next run of the same login-flow test lands on the
+      // authenticated page instead of /login, LLM picks some generic elements, and
+      // steps "pass" against the wrong page. See log analysis 2026-04-20 for the
+      // original fake-pass incident.
+      //
+      // We must clear BOTH cookies AND localStorage/sessionStorage BEFORE the goto —
+      // otherwise app JS runs at goto-time, reads the stale auth token, and can even
+      // mint a brand-new session cookie via /api/refresh. Clearing after goto is too
+      // late.
+      //
+      // localStorage is origin-scoped, so we can only clear it while the page is on
+      // the target origin. If the session's current page is already same-origin with
+      // startUrl (the common case for repeated runs of the same test) we can clear
+      // pre-goto. Otherwise we fall back to post-goto + reload, which is still correct
+      // because nothing on the current page can mint auth tokens for startUrl's
+      // origin.
+      //
+      // We snapshot counts BEFORE clearing so the UI warning tells the user something
+      // actually happened — silent cleanup makes a failing second run look like a
+      // mysterious regression.
+      //
+      // Cost: +1 reload (~500ms) only when post-goto storage cleanup was required.
+      // Same-origin sessions and pristine contexts pay near-zero.
+      const normalizedStartUrl = (() => {
+        try { return new URL(startUrl); } catch { return null; }
+      })();
+      const normalizedCurrentPageUrl = (() => {
+        try { return new URL(session.page.url()); } catch { return null; }
+      })();
+      const currentPageIsSameOrigin =
+        !!normalizedStartUrl
+        && !!normalizedCurrentPageUrl
+        && normalizedCurrentPageUrl.origin === normalizedStartUrl.origin;
+
+      let clearedCookieCount = 0;
+      let clearedLocalStorageKeyCount = 0;
+      let clearedSessionStorageKeyCount = 0;
+      let postGotoStorageClearNeeded = false;
+      const shouldClearAuth = authReset === 'always';
+
+      if (shouldClearAuth) {
+        // 1. Clear cookies — context-level, no page navigation required.
+        try {
+          const ctx = session.page.context();
+          const cookiesBefore = await ctx.cookies();
+          clearedCookieCount = cookiesBefore.length;
+          if (clearedCookieCount > 0) {
+            await ctx.clearCookies();
+          }
+        } catch (clearErr) {
+          logger.warn('[PreviewRun] Failed to clear cookies (proceeding anyway)', {
+            previewSessionId,
+            error: clearErr instanceof Error ? clearErr.message : String(clearErr),
+          });
+        }
+
+        // 2. Clear localStorage/sessionStorage. If same-origin, clear NOW (pre-goto) so
+        //    the upcoming goto/reload runs against a truly empty slate. If different
+        //    origin, we can't touch the target origin's storage yet — defer to
+        //    post-goto.
+        if (currentPageIsSameOrigin) {
+          try {
+            const counts = await session.page.evaluate(() => {
+              // @ts-expect-error - localStorage exists in browser context
+              const localCount = localStorage.length;
+              // @ts-expect-error - sessionStorage exists in browser context
+              const sessionCount = sessionStorage.length;
+              // @ts-expect-error - localStorage exists in browser context
+              try { localStorage.clear(); } catch { /* storage may be disabled */ }
+              // @ts-expect-error - sessionStorage exists in browser context
+              try { sessionStorage.clear(); } catch { /* storage may be disabled */ }
+              return { localCount, sessionCount };
+            });
+            clearedLocalStorageKeyCount = counts.localCount ?? 0;
+            clearedSessionStorageKeyCount = counts.sessionCount ?? 0;
+          } catch (storageErr) {
+            logger.warn('[PreviewRun] Failed to pre-clear page storage (will retry post-goto)', {
+              previewSessionId,
+              error: storageErr instanceof Error ? storageErr.message : String(storageErr),
+            });
+            postGotoStorageClearNeeded = true;
+          }
+        } else {
+          // Cross-origin current page — can't touch target origin's storage yet,
+          // so we must check + wipe after goto. We flag regardless of cookie count
+          // because localStorage-only auth (JWT stored in localStorage with no
+          // cookies) is a common OAuth pattern and cookie count won't tell us
+          // anything about it.
+          postGotoStorageClearNeeded = true;
+        }
+
+        if (clearedCookieCount > 0 || clearedLocalStorageKeyCount > 0 || clearedSessionStorageKeyCount > 0) {
+          logger.info('[PreviewRun] Cleared auth state before run', {
+            previewSessionId,
+            cookiesCleared: clearedCookieCount,
+            localStorageKeysCleared: clearedLocalStorageKeyCount,
+            sessionStorageKeysCleared: clearedSessionStorageKeyCount,
+            storageClearPhase: currentPageIsSameOrigin ? 'pre-goto' : 'post-goto-pending',
+          });
+        }
+      }
+
+      // Notify the UI BEFORE we navigate whenever we have final numbers: cookies +
+      // same-origin storage were both handled pre-goto. Cross-origin runs defer the
+      // emit to the post-goto branch below, once storage counts are known — avoids
+      // sending "cookiesCleared: 12, localStorage: 0" when localStorage on the
+      // target origin was actually 8. The correlated in-run signal is worth the
+      // ~200ms delay for that specific case.
+      const totalClearedArtifacts =
+        clearedCookieCount + clearedLocalStorageKeyCount + clearedSessionStorageKeyCount;
+      if (shouldClearAuth && totalClearedArtifacts > 0 && !postGotoStorageClearNeeded) {
+        webSocketService.emitToUser(userId, 'preview:run:auth-reset', {
+          previewSessionId,
+          cookiesCleared: clearedCookieCount,
+          localStorageKeysCleared: clearedLocalStorageKeyCount,
+          sessionStorageKeysCleared: clearedSessionStorageKeyCount,
+          reason: 'authReset=always — each run starts from a clean slate. Set authReset=never in the run options if your test expects a persistent session.',
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       try {
         if (needsReload) {
           await raceAbort(session.page.reload({
@@ -810,6 +946,70 @@ export class PreviewRunService {
             waitUntil: 'domcontentloaded',
             timeout: 30000,
           }), signal);
+        }
+
+        // Post-goto cleanup path — used when the session's current page was on a
+        // different origin than startUrl (so we couldn't pre-clear localStorage), OR
+        // when the pre-goto clear threw. We always check storage, but only pay for a
+        // second reload if something was actually present — the target origin may
+        // have no localStorage at all (common: first time the test runs against a
+        // new domain in this session).
+        if (shouldClearAuth && postGotoStorageClearNeeded) {
+          try {
+            const counts = await session.page.evaluate(() => {
+              // @ts-expect-error - localStorage exists in browser context
+              const localCount = localStorage.length;
+              // @ts-expect-error - sessionStorage exists in browser context
+              const sessionCount = sessionStorage.length;
+              // @ts-expect-error - localStorage exists in browser context
+              try { localStorage.clear(); } catch { /* storage may be disabled */ }
+              // @ts-expect-error - sessionStorage exists in browser context
+              try { sessionStorage.clear(); } catch { /* storage may be disabled */ }
+              return { localCount, sessionCount };
+            });
+            clearedLocalStorageKeyCount = counts.localCount ?? 0;
+            clearedSessionStorageKeyCount = counts.sessionCount ?? 0;
+            const hadStorage =
+              clearedLocalStorageKeyCount > 0 || clearedSessionStorageKeyCount > 0;
+            if (hadStorage) {
+              // App already ran with stale storage on the first goto — reload so it
+              // re-initializes empty.
+              await raceAbort(session.page.reload({
+                waitUntil: 'domcontentloaded',
+                timeout: 30000,
+              }), signal);
+              logger.info('[PreviewRun] Post-goto storage cleanup + reload complete', {
+                previewSessionId,
+                localStorageKeysCleared: clearedLocalStorageKeyCount,
+                sessionStorageKeysCleared: clearedSessionStorageKeyCount,
+              });
+            }
+
+            // Emit the UI warning now with FINAL counts — covers both the
+            // "cookies + storage" case (reload was needed) and the "cookies only,
+            // storage was empty on target origin" case (no reload, but user still
+            // deserves to know cookies got wiped). Skipped only when nothing at
+            // all was cleared.
+            if (
+              clearedCookieCount > 0
+              || clearedLocalStorageKeyCount > 0
+              || clearedSessionStorageKeyCount > 0
+            ) {
+              webSocketService.emitToUser(userId, 'preview:run:auth-reset', {
+                previewSessionId,
+                cookiesCleared: clearedCookieCount,
+                localStorageKeysCleared: clearedLocalStorageKeyCount,
+                sessionStorageKeysCleared: clearedSessionStorageKeyCount,
+                reason: 'authReset=always — each run starts from a clean slate. Set authReset=never in the run options if your test expects a persistent session.',
+                timestamp: new Date().toISOString(),
+              });
+            }
+          } catch (storageErr) {
+            logger.warn('[PreviewRun] Failed to clear page storage post-goto (proceeding anyway)', {
+              previewSessionId,
+              error: storageErr instanceof Error ? storageErr.message : String(storageErr),
+            });
+          }
         }
 
         // Wait until the page is **actually interactive for a bot**, not just

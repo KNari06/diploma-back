@@ -216,6 +216,19 @@ export interface ServerToClientEvents {
   'preview:run:step': (data: PreviewRunStepPayload) => void;
   'preview:run:completed': (data: PreviewRunCompletedPayload) => void;
   'preview:run:cancelled': (data: { previewSessionId: string }) => void;
+  // Emitted right before the run starts when authReset='always' found and cleared
+  // cookies and/or localStorage/sessionStorage from a prior run. UI should show a
+  // small info banner so the user isn't surprised that their logged-in session got
+  // wiped. Any of the three counters can be 0 (e.g. pure-cookie session has no
+  // localStorage keys; pure-localStorage JWT has no cookies).
+  'preview:run:auth-reset': (data: {
+    previewSessionId: string;
+    cookiesCleared: number;
+    localStorageKeysCleared: number;
+    sessionStorageKeysCleared: number;
+    reason: string;
+    timestamp: string;
+  }) => void;
 
   // Preview DevTools events (server -> client)
   'preview:console:update': (data: PreviewConsoleUpdatePayload) => void;
