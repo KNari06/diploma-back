@@ -1,5 +1,5 @@
 import { IntentParserContext } from '@/ai/prompts/index';
-import { searchKB } from '@/services/kb/kb.service';
+import { expandChunkForLLM, searchKB } from '@/services/kb/kb.service';
 import {
     extractSelectorsFromTraces,
     findTracesByUrl,
@@ -51,10 +51,12 @@ export async function enrichContextForCommands(
         context.documentation = ragResults.chunks
           .filter((chunk) => chunk && typeof chunk === 'object' && chunk.content)
           .map((chunk) => {
-            // KBChunk has source_file or file_name, but not title
+            // KBChunk has source_file or file_name, but not title.
+            // Use expandChunkForLLM so GPT sees the full parent section
+            // (better context) instead of just the matched fragment.
             const title = chunk.source_file || chunk.file_name || '';
-            const content = chunk.content || '';
-            return title ? `${title}\n${content}` : content;
+            const text = expandChunkForLLM(chunk);
+            return title ? `${title}\n${text}` : text;
           })
           .filter((doc) => doc.trim().length > 0); // Filter empty docs
 

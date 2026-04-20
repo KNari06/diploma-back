@@ -165,6 +165,19 @@ export interface ServerToClientEvents {
   // Regression run events
   'regression:run:progress': (data: RegressionRunProgressPayload) => void;
 
+  /**
+   * Regression Doctor finished aggregating drift patterns for a completed
+   * run. `findingsCount` is 0 when no drift patterns were found — the UI
+   * should still refresh its "Doctor findings" panel to hide any stale
+   * spinner from an in-flight request. Payload is intentionally minimal;
+   * the UI fetches full findings via GET /api/regression/:runId/doctor.
+   */
+  'regression:doctor:ready': (data: {
+    runId: string;
+    findingsCount: number;
+    timestamp: string;
+  }) => void;
+
   // Exploration events
   'exploration:progress': (data: ExplorationProgressPayload) => void;
   'exploration:completed': (data: ExplorationCompletedPayload) => void;

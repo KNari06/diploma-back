@@ -1,0 +1,57 @@
+{"id":"pw-getbyrole-1","query":"what selector should I use for a login button","must_cite":["en/playwright-2026/locators-getByRole-first.md"]}
+{"id":"pw-getbyrole-2","query":"should I use CSS selectors or data-testid","must_cite":["en/playwright-2026/locators-getByRole-first.md"]}
+{"id":"pw-getbyrole-3","query":"how to find element by accessible role","must_cite":["en/playwright-2026/locators-getByRole-first.md"]}
+{"id":"pw-assert-1","query":"how do I assert that text says Welcome","must_cite":["en/playwright-2026/web-first-assertions.md"]}
+{"id":"pw-assert-2","query":"toHaveText vs toContainText","must_cite":["en/playwright-2026/web-first-assertions.md"]}
+{"id":"pw-assert-3","query":"how to assert URL after navigation","must_cite":["en/playwright-2026/web-first-assertions.md"]}
+{"id":"pw-assert-4","query":"expect.poll example for non-locator values","must_cite":["en/playwright-2026/web-first-assertions.md"]}
+{"id":"pw-handler-1","query":"cookie banner keeps blocking my clicks","must_cite":["en/playwright-2026/locator-handler.md","en/troubleshooting/click-intercepted.md"]}
+{"id":"pw-handler-2","query":"dismiss popup automatically during test","must_cite":["en/playwright-2026/locator-handler.md"]}
+{"id":"pw-handler-3","query":"addLocatorHandler usage","must_cite":["en/playwright-2026/locator-handler.md"]}
+{"id":"pw-structure-1","query":"how should I organize my test files","must_cite":["en/playwright-2026/test-structure.md"]}
+{"id":"pw-structure-2","query":"when to use beforeEach","must_cite":["en/playwright-2026/test-structure.md"]}
+{"id":"pw-structure-3","query":"playwright config example with retries and projects","must_cite":["en/playwright-2026/test-structure.md"]}
+{"id":"recipe-login-1","query":"how do I avoid logging in for every test","must_cite":["en/recipes/login-with-storagestate.md"]}
+{"id":"recipe-login-2","query":"storageState reuse authenticated session","must_cite":["en/recipes/login-with-storagestate.md"]}
+{"id":"recipe-login-3","query":"save login cookies and reuse them","must_cite":["en/recipes/login-with-storagestate.md"]}
+{"id":"recipe-api-1","query":"test runs assertion before API data loads","must_cite":["en/recipes/wait-for-api-then-assert.md"]}
+{"id":"recipe-api-2","query":"how to wait for specific fetch response","must_cite":["en/recipes/wait-for-api-then-assert.md"]}
+{"id":"recipe-api-3","query":"mock API response with route fulfill","must_cite":["en/recipes/wait-for-api-then-assert.md"]}
+{"id":"recipe-modal-1","query":"confirm dialog test pattern","must_cite":["en/recipes/handle-modal-overlay.md"]}
+{"id":"recipe-modal-2","query":"how to close a modal with Escape","must_cite":["en/recipes/handle-modal-overlay.md"]}
+{"id":"recipe-upload-1","query":"file upload in playwright","must_cite":["en/recipes/upload-file-fallback-chain.md"]}
+{"id":"recipe-upload-2","query":"drag and drop file upload simulation","must_cite":["en/recipes/upload-file-fallback-chain.md"]}
+{"id":"recipe-upload-3","query":"setInputFiles for hidden file input","must_cite":["en/recipes/upload-file-fallback-chain.md"]}
+{"id":"recipe-flaky-1","query":"my test sometimes fails sometimes passes","must_cite":["en/recipes/flaky-test-diagnosis.md"]}
+{"id":"recipe-flaky-2","query":"how to reproduce flaky test locally","must_cite":["en/recipes/flaky-test-diagnosis.md"]}
+{"id":"recipe-flaky-3","query":"repeat-each flag to find intermittent failure","must_cite":["en/recipes/flaky-test-diagnosis.md"]}
+{"id":"anti-timeout-1","query":"can I use waitForTimeout to wait for element","must_cite":["en/antipatterns/avoid-wait-for-timeout.md"]}
+{"id":"anti-timeout-2","query":"is sleep okay in playwright tests","must_cite":["en/antipatterns/avoid-wait-for-timeout.md"]}
+{"id":"anti-networkidle-1","query":"waitForLoadState networkidle hangs","must_cite":["en/antipatterns/avoid-networkidle.md"]}
+{"id":"anti-networkidle-2","query":"page has polling should I wait for networkidle","must_cite":["en/antipatterns/avoid-networkidle.md"]}
+{"id":"anti-cdp-1","query":"can I use newCDPSession for accessibility tree","must_cite":["en/antipatterns/avoid-raw-cdp-session.md"]}
+{"id":"anti-cdp-2","query":"video screencast broke after I called Accessibility.enable","must_cite":["en/antipatterns/avoid-raw-cdp-session.md"]}
+{"id":"anti-ws-1","query":"frontend stuck on loading spinner websocket","must_cite":["en/antipatterns/avoid-silent-websocket-return.md"]}
+{"id":"anti-ws-2","query":"socket.on handler silent return","must_cite":["en/antipatterns/avoid-silent-websocket-return.md"]}
+{"id":"trouble-click-1","query":"click intercepted error playwright","must_cite":["en/troubleshooting/click-intercepted.md"]}
+{"id":"trouble-click-2","query":"element is obscured by another element","must_cite":["en/troubleshooting/click-intercepted.md"]}
+{"id":"trouble-notfound-1","query":"locator timeout element not found","must_cite":["en/troubleshooting/element-not-found.md"]}
+{"id":"trouble-notfound-2","query":"element is inside iframe how to find it","must_cite":["en/troubleshooting/element-not-found.md"]}
+{"id":"trouble-notfound-3","query":"shadow DOM playwright locator","must_cite":["en/troubleshooting/element-not-found.md"]}
+{"id":"trouble-timeout-1","query":"test times out in CI but passes locally","must_cite":["en/troubleshooting/timeout-errors.md"]}
+{"id":"trouble-timeout-2","query":"page.goto navigation timeout","must_cite":["en/troubleshooting/timeout-errors.md"]}
+{"id":"qait-caps-1","query":"what can QAIT do","must_cite":["en/qait-platform/capabilities.md"]}
+{"id":"qait-caps-2","query":"does QAIT support API testing","must_cite":["en/qait-platform/capabilities.md"]}
+{"id":"qait-caps-3","query":"live editor feature in QAIT","must_cite":["en/qait-platform/capabilities.md"]}
+{"id":"qait-int-1","query":"can I connect Jira","must_cite":["en/qait-platform/integrations.md"]}
+{"id":"qait-int-2","query":"post test results to Slack","must_cite":["en/qait-platform/integrations.md"]}
+{"id":"qait-int-3","query":"Telegram notification integration","must_cite":["en/qait-platform/integrations.md"]}
+{"id":"qait-safety-1","query":"do you need approval before deleting a test","must_cite":["en/qait-platform/safety-model.md"]}
+{"id":"qait-safety-2","query":"destructive operation permanent warning","must_cite":["en/qait-platform/safety-model.md"]}
+
+{"id":"multi-overlay-1","query":"how to handle popups and overlays that appear during tests","must_cite":["en/playwright-2026/locator-handler.md","en/recipes/handle-modal-overlay.md"]}
+{"id":"multi-wait-1","query":"my test waits too long and is unreliable when waiting for the page","must_cite":["en/antipatterns/avoid-wait-for-timeout.md","en/antipatterns/avoid-networkidle.md"]}
+{"id":"multi-flaky-1","query":"intermittent test failure debugging","must_cite":["en/recipes/flaky-test-diagnosis.md","en/troubleshooting/timeout-errors.md"]}
+{"id":"multi-selector-1","query":"button click not working best locator strategy","must_cite":["en/playwright-2026/locators-getByRole-first.md","en/troubleshooting/click-intercepted.md"]}
+{"id":"multi-platform-1","query":"QAIT features and how to connect Jira","must_cite":["en/qait-platform/capabilities.md","en/qait-platform/integrations.md"]}
+{"id":"multi-auth-1","query":"login flow in tests with storage state and beforeEach","must_cite":["en/recipes/login-with-storagestate.md","en/playwright-2026/test-structure.md"]}

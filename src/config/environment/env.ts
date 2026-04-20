@@ -87,6 +87,14 @@ const envSchema = z.object({
   // Google Gemini
   GEMINI_API_KEY: z.string().optional(),
 
+  // Phase 2.3 — KB reranker. Off by default; safe to leave disabled in prod
+  // until evals prove a lift. When 'cohere', COHERE_API_KEY must be set.
+  // 'bge' is a placeholder for a future self-hosted adapter.
+  KB_RERANKER: z.enum(['off', 'cohere', 'bge']).default('off'),
+  COHERE_API_KEY: z.string().optional(),
+  KB_RERANKER_MODEL: z.string().default('rerank-english-v3.0'),
+  KB_RERANKER_TIMEOUT_MS: z.string().transform(Number).default('500'),
+
   // AI Provider Configuration
   // Which provider to use for fast tasks (keyword extraction, classification)
   AI_PROVIDER_FAST: z.enum(['gemini', 'openai']).default('gemini'),

@@ -5,10 +5,12 @@ import { connection, QUEUE_NAMES, testRunQueue } from '@/config/infrastructure/q
 import { GitWebhookJobHandler } from '@/jobs/git-webhook.job';
 import { AIAnalysisJobHandler, NotificationJobHandler, WebhookJobHandler } from '@/jobs/ai-analysis.job';
 import { AllureImportJobHandler } from '@/jobs/allure-import.job';
+import { AutoLearnJobHandler } from '@/jobs/auto-learn.job';
 import { ExplorationRunJobHandler } from '@/jobs/exploration-run.job';
 import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manual-test-run.job';
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { processNegativeGeneration } from '@/jobs/negative-generation.job';
+import { RegressionDoctorJobHandler } from '@/jobs/regression-doctor.job';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
@@ -156,6 +158,30 @@ const aiAnalysisWorker = new Worker(
     }
 
     return await AIAnalysisJobHandler.process(job);
+  },
+  workerOptions
+);
+
+// Regression Doctor worker — one job per completed regression run. Reads
+// every test_results.ai_summary under the run, groups drift patterns,
+// runs an LLM analysis per group, persists findings. See
+// src/jobs/regression-doctor.job.ts for the full pipeline.
+const regressionDoctorWorker = new Worker(
+  QUEUE_NAMES.REGRESSION_DOCTOR,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[REGRESSION_DOCTOR_WORKER] Processing job: ${job.id}`, {
+      runId: job.data?.runId,
+    });
+
+    if (!RegressionDoctorJobHandler || typeof RegressionDoctorJobHandler.process !== 'function') {
+      throw new Error('RegressionDoctorJobHandler.process is not a function');
+    }
+
+    return await RegressionDoctorJobHandler.process(job);
   },
   workerOptions
 );
@@ -348,6 +374,30 @@ const allureImportWorker = new Worker(
   }
 );
 
+// Phase 5 — auto-learn worker. Lightweight: reads executed_steps, extracts
+// facts, batch-embeds, upserts. No browser, no heavy I/O. Standard
+// workerOptions (same concurrency as ai-analysis).
+const autoLearnWorker = new Worker(
+  QUEUE_NAMES.AUTO_LEARN,
+  async (job) => {
+    if (!job || !job.id) {
+      throw new Error('Invalid job: missing id');
+    }
+
+    logger.info(`[AUTO_LEARN_WORKER] Processing job: ${job.id}`, {
+      testId: job.data?.testId,
+      projectId: job.data?.projectId,
+    });
+
+    if (!AutoLearnJobHandler || typeof AutoLearnJobHandler.process !== 'function') {
+      throw new Error('AutoLearnJobHandler.process is not a function');
+    }
+
+    return await AutoLearnJobHandler.process(job);
+  },
+  workerOptions
+);
+
 // Negative test generation worker
 const negativeGenerationWorker = new Worker(
   QUEUE_NAMES.NEGATIVE_GENERATION,
@@ -489,6 +539,7 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
 setupWorkerEvents(testRunWorker, 'TestRun');
 setupWorkerEvents(testResultWorker, 'TestResult');
 setupWorkerEvents(aiAnalysisWorker, 'AIAnalysis');
+setupWorkerEvents(regressionDoctorWorker, 'RegressionDoctor');
 setupWorkerEvents(notificationWorker, 'Notification');
 setupWorkerEvents(webhookWorker, 'Webhook');
 setupWorkerEvents(gitWebhookWorker, 'GitWebhook');
@@ -496,6 +547,7 @@ setupWorkerEvents(explorationWorker, 'Exploration');
 setupWorkerEvents(mobileTestRunWorker, 'MobileTestRun');
 setupWorkerEvents(negativeGenerationWorker, 'NegativeGeneration');
 setupWorkerEvents(allureImportWorker, 'AllureImport');
+setupWorkerEvents(autoLearnWorker, 'AutoLearn');
 
 // Graceful shutdown
 let isShuttingDown = false;
@@ -525,6 +577,7 @@ const gracefulShutdown = async (signal: string) => {
       testRunWorker.close(),
       testResultWorker.close(),
       aiAnalysisWorker.close(),
+      regressionDoctorWorker.close(),
       notificationWorker.close(),
       webhookWorker.close(),
       gitWebhookWorker.close(),
@@ -532,6 +585,7 @@ const gracefulShutdown = async (signal: string) => {
       mobileTestRunWorker.close(),
       negativeGenerationWorker.close(),
       allureImportWorker.close(),
+      autoLearnWorker.close(),
       // Abort all active test runs (closes contexts, stops video streams)
       (async () => {
         try {
@@ -639,11 +693,13 @@ logger.info(`📋 Listening to queues: ${Object.values(QUEUE_NAMES).join(', ')}`
 export {
   aiAnalysisWorker,
   allureImportWorker,
+  autoLearnWorker,
   explorationWorker,
   gitWebhookWorker,
   mobileTestRunWorker,
   negativeGenerationWorker,
   notificationWorker,
+  regressionDoctorWorker,
   testResultWorker,
   testRunWorker,
   webhookWorker

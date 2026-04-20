@@ -1,6 +1,7 @@
 import { logger } from '@/utils/core/logger';
 import { cosineSimilarity } from '@/utils/text-processing/vector';
 import fs from 'fs/promises';
+import MiniSearch from 'minisearch';
 import path from 'path';
 
 export interface LocalKBChunk {
@@ -10,6 +11,17 @@ export interface LocalKBChunk {
   source_file: string;
   language: string; // 'en', 'ru', 'neutral'
   tags?: string[];
+  /**
+   * Stable slug of the parent section heading. Chunks in the same section
+   * share a parent_id. Undefined for legacy chunks built before parent-doc
+   * retrieval landed.
+   */
+  parent_id?: string;
+  /**
+   * Full text of the parent section. Used by RAG callers to expand a
+   * precise small-chunk match into richer context for the LLM.
+   */
+  parent_text?: string;
   metadata?: any;
   similarity?: number;
 }
@@ -23,6 +35,56 @@ export interface LocalKBData {
 
 let globalKBCache: LocalKBChunk[] | null = null;
 let isInitialized = false;
+
+/**
+ * BM25 keyword index built alongside the vector cache. Used by hybrid
+ * search to catch exact-token matches (error codes, API paths, identifiers)
+ * that dense embeddings often miss.
+ */
+let keywordIndex: MiniSearch<LocalKBChunk> | null = null;
+
+function buildKeywordIndex(chunks: LocalKBChunk[]): MiniSearch<LocalKBChunk> | null {
+  if (!chunks || chunks.length === 0) return null;
+
+  try {
+    const index = new MiniSearch<LocalKBChunk>({
+      idField: 'id',
+      fields: ['content'], // indexed
+      storeFields: ['id'], // returned on hits (we rejoin via the main cache)
+      searchOptions: {
+        boost: { content: 1 },
+        fuzzy: 0.2, // typo tolerance
+        prefix: true, // prefix match: "addLocat" finds "addLocatorHandler"
+      },
+    });
+    index.addAll(chunks);
+    return index;
+  } catch (error) {
+    logger.warn('[LOCAL_KB] Failed to build keyword index (hybrid disabled)', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * Reciprocal Rank Fusion — canonical formula for merging multiple ranked lists
+ * into one. Score per item = Σ 1/(k + rank_i), k=60 by convention.
+ */
+function reciprocalRankFusion(
+  lists: Array<Array<{ id: string }>>,
+  k = 60
+): Map<string, number> {
+  const scores = new Map<string, number>();
+  for (const list of lists) {
+    list.forEach((item, rank) => {
+      if (!item?.id) return;
+      const prev = scores.get(item.id) ?? 0;
+      scores.set(item.id, prev + 1 / (k + rank + 1));
+    });
+  }
+  return scores;
+}
 
 /**
  * Load global KB from local JSON file
@@ -121,12 +183,19 @@ export async function loadGlobalKB(): Promise<LocalKBChunk[]> {
     }
 
     globalKBCache = validChunks;
+    keywordIndex = buildKeywordIndex(validChunks);
     isInitialized = true;
+
+    logger.info('[LOCAL_KB] Loaded', {
+      chunks: validChunks.length,
+      keywordIndexBuilt: keywordIndex !== null,
+    });
 
     return globalKBCache;
   } catch (error) {
     logger.error('Failed to load global KB', { error });
     globalKBCache = [];
+    keywordIndex = null;
     isInitialized = true;
     return [];
   }
@@ -252,10 +321,114 @@ export async function searchLocalGlobalKB(
 }
 
 /**
+ * Hybrid search: merges dense (cosine) and sparse (BM25) retrieval using
+ * Reciprocal Rank Fusion. Catches cases where semantic similarity alone
+ * misses exact keyword matches (error codes, API paths, identifiers).
+ *
+ * Falls back to pure vector search if the keyword index is unavailable
+ * (e.g. indexing failed) or if `query` is empty.
+ *
+ * Contract is the same as `searchLocalGlobalKB` — returns a ranked
+ * `LocalKBChunk[]` with `similarity` set (fused score in [0, 1]).
+ */
+export async function searchLocalGlobalKBHybrid(
+  query: string,
+  queryEmbedding: number[],
+  options: {
+    threshold?: number;
+    limit?: number;
+    language?: 'en' | 'ru' | 'neutral';
+    /** Pool size pulled from each retriever before RRF merge. Default 20. */
+    poolSize?: number;
+  } = {}
+): Promise<LocalKBChunk[]> {
+  // Ensure KB is loaded
+  await loadGlobalKB();
+
+  const trimmedQuery = typeof query === 'string' ? query.trim() : '';
+  const poolSize = Math.max(5, Math.min(options.poolSize ?? 20, 100));
+
+  // If no keyword index or empty query — degrade to pure vector search
+  if (!keywordIndex || trimmedQuery.length === 0) {
+    return searchLocalGlobalKB(queryEmbedding, {
+      threshold: options.threshold,
+      limit: options.limit,
+      language: options.language,
+    });
+  }
+
+  // Pull bigger pools from each retriever; final ranking comes from RRF
+  const vectorPool = await searchLocalGlobalKB(queryEmbedding, {
+    threshold: 0, // collect all, let RRF + final threshold cut
+    limit: poolSize,
+    language: options.language,
+  });
+
+  let keywordPool: Array<{ id: string }> = [];
+  try {
+    keywordPool = keywordIndex.search(trimmedQuery, { combineWith: 'OR' }).slice(0, poolSize);
+  } catch (error) {
+    logger.warn('[LOCAL_KB] Keyword search failed (falling back to vector only)', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // Nothing from either side
+  if (vectorPool.length === 0 && keywordPool.length === 0) {
+    return [];
+  }
+
+  // Fuse ranks
+  const fused = reciprocalRankFusion([
+    vectorPool.map((c) => ({ id: c.id })),
+    keywordPool,
+  ]);
+
+  // Join back to full chunk data (vector pool has everything we need)
+  const byId = new Map<string, LocalKBChunk>(vectorPool.map((c) => [c.id, c]));
+  for (const kw of keywordPool) {
+    if (!byId.has(kw.id)) {
+      const chunk = (globalKBCache ?? []).find((c) => c.id === kw.id);
+      if (chunk) byId.set(chunk.id, chunk);
+    }
+  }
+
+  // Apply language filter to any BM25-only hits (vectorPool already filtered)
+  const language = options.language;
+  const filteredByLang = language
+    ? Array.from(byId.values()).filter(
+        (c) => c.language === language || c.language === 'neutral'
+      )
+    : Array.from(byId.values());
+
+  // Attach fused score as similarity, sort, apply threshold + limit
+  const threshold = Math.max(0, Math.min(options.threshold ?? 0, 1));
+  const limit = Math.max(1, Math.min(options.limit ?? 5, 100));
+
+  const ranked = filteredByLang
+    .map((chunk) => ({ ...chunk, similarity: fused.get(chunk.id) ?? 0 }))
+    .filter((c) => c.similarity > threshold)
+    .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0))
+    .slice(0, limit);
+
+  logger.debug('[LOCAL_KB] Hybrid search completed', {
+    query: trimmedQuery.substring(0, 50),
+    vectorPool: vectorPool.length,
+    keywordPool: keywordPool.length,
+    fusedUnique: byId.size,
+    returned: ranked.length,
+    topScore: ranked[0]?.similarity ?? 0,
+  });
+
+  return ranked;
+}
+
+/**
  * Reload global KB (for updates)
  */
 export async function reloadGlobalKB(): Promise<void> {
   globalKBCache = null;
+  keywordIndex = null;
   isInitialized = false;
   await loadGlobalKB();
   logger.info('Global KB reloaded');

@@ -1,0 +1,125 @@
+{
+  "generatedAt": "2026-04-20T08:26:11.224Z",
+  "totalQueries": 56,
+  "k": 5,
+  "metrics": {
+    "hitAt1": 0.5178571428571429,
+    "hitAtK": 0.9107142857142857,
+    "mrr": 0.6782738095238097,
+    "recallAtK": 0.8839285714285714
+  },
+  "byCategory": {
+    "playwright-2026": {
+      "hitAt1": 0.5333333333333333,
+      "hitAtK": 0.9333333333333333,
+      "mrr": 0.6855555555555556,
+      "recallAtK": 0.9,
+      "count": 15
+    },
+    "recipes": {
+      "hitAt1": 0.5,
+      "hitAtK": 0.9375,
+      "mrr": 0.7083333333333334,
+      "recallAtK": 0.90625,
+      "count": 16
+    },
+    "antipatterns": {
+      "hitAt1": 0.3333333333333333,
+      "hitAtK": 0.8888888888888888,
+      "mrr": 0.5592592592592592,
+      "recallAtK": 0.8333333333333334,
+      "count": 9
+    },
+    "troubleshooting": {
+      "hitAt1": 0.42857142857142855,
+      "hitAtK": 0.7142857142857143,
+      "mrr": 0.5238095238095238,
+      "recallAtK": 0.7142857142857143,
+      "count": 7
+    },
+    "qait-platform": {
+      "hitAt1": 0.7777777777777778,
+      "hitAtK": 1,
+      "mrr": 0.8518518518518517,
+      "recallAtK": 1,
+      "count": 9
+    }
+  },
+  "misses": [
+    {
+      "id": "pw-getbyrole-1",
+      "query": "what selector should I use for a login button",
+      "expected": [
+        "en/playwright-2026/locators-getByRole-first.md"
+      ],
+      "retrieved": [
+        "en/recipes/login-with-storagestate.md",
+        "en/playwright-2026/test-structure.md",
+        "en/recipes/login-with-storagestate.md",
+        "en/qait-platform/capabilities.md",
+        "en/playwright-2026/test-structure.md"
+      ]
+    },
+    {
+      "id": "recipe-api-1",
+      "query": "test runs assertion before API data loads",
+      "expected": [
+        "en/recipes/wait-for-api-then-assert.md"
+      ],
+      "retrieved": [
+        "en/recipes/flaky-test-diagnosis.md",
+        "en/recipes/flaky-test-diagnosis.md",
+        "en/troubleshooting/timeout-errors.md",
+        "en/qait-platform/capabilities.md",
+        "en/troubleshooting/element-not-found.md"
+      ]
+    },
+    {
+      "id": "anti-timeout-2",
+      "query": "is sleep okay in playwright tests",
+      "expected": [
+        "en/antipatterns/avoid-wait-for-timeout.md"
+      ],
+      "retrieved": [
+        "en/recipes/flaky-test-diagnosis.md",
+        "en/recipes/upload-file-fallback-chain.md",
+        "en/troubleshooting/element-not-found.md",
+        "en/recipes/login-with-storagestate.md",
+        "en/recipes/login-with-storagestate.md"
+      ]
+    },
+    {
+      "id": "trouble-click-1",
+      "query": "click intercepted error playwright",
+      "expected": [
+        "en/troubleshooting/click-intercepted.md"
+      ],
+      "retrieved": [
+        "en/troubleshooting/timeout-errors.md",
+        "en/recipes/flaky-test-diagnosis.md",
+        "en/playwright-2026/locator-handler.md",
+        "en/recipes/login-with-storagestate.md",
+        "en/playwright-2026/test-structure.md"
+      ]
+    },
+    {
+      "id": "trouble-click-2",
+      "query": "element is obscured by another element",
+      "expected": [
+        "en/troubleshooting/click-intercepted.md"
+      ],
+      "retrieved": [
+        "en/troubleshooting/timeout-errors.md",
+        "en/troubleshooting/element-not-found.md",
+        "en/recipes/upload-file-fallback-chain.md",
+        "en/troubleshooting/element-not-found.md",
+        "en/antipatterns/avoid-wait-for-timeout.md"
+      ]
+    }
+  ],
+  "env": {
+    "kbChunks": 128,
+    "kbModel": "text-embedding-3-small",
+    "kbVersion": "1.0.0"
+  }
+}

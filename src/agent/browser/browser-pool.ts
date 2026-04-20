@@ -3,11 +3,15 @@ import { logger } from '@/utils/core/logger';
 import { BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE } from '@/config/testing/playwright-tuning';
 import { Browser, chromium, firefox, webkit } from 'playwright';
 
+const RECYCLE_AFTER_CONTEXTS = Number(process.env.PLAYWRIGHT_BROWSER_RECYCLE_AFTER) || 150;
+
 /**
  * Browser pool manager for reusing browser instances
  */
 class BrowserPool {
   private browsers: Map<BrowserType, Browser> = new Map();
+  /** Tracks how many times each browser has been handed out (≈ contexts created) */
+  private useCounts: Map<BrowserType, number> = new Map();
 
   /**
    * Get or create browser instance
@@ -31,11 +35,35 @@ class BrowserPool {
     if (this.browsers.has(browserType)) {
       const browser = this.browsers.get(browserType)!;
       if (browser.isConnected()) {
-        logger.debug('Reusing existing browser instance', { browserType });
-        return browser;
+        // Recycle if the browser has served enough runs AND has no live contexts.
+        // Chromium accumulates memory per-context over time (playwright#21079);
+        // restarting the browser between idle windows releases it.
+        const uses = this.useCounts.get(browserType) || 0;
+        if (uses >= RECYCLE_AFTER_CONTEXTS && browser.contexts().length === 0) {
+          logger.info('Recycling browser instance after threshold', {
+            browserType,
+            uses,
+            threshold: RECYCLE_AFTER_CONTEXTS,
+          });
+          try {
+            await browser.close();
+          } catch (err) {
+            logger.warn('Failed to close browser during recycle', {
+              browserType,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          this.browsers.delete(browserType);
+          this.useCounts.delete(browserType);
+        } else {
+          logger.debug('Reusing existing browser instance', { browserType, uses });
+          this.useCounts.set(browserType, uses + 1);
+          return browser;
+        }
       } else {
         // Browser disconnected, remove from pool
         this.browsers.delete(browserType);
+        this.useCounts.delete(browserType);
       }
     }
 
@@ -48,6 +76,7 @@ class BrowserPool {
     });
 
     this.browsers.set(browserType, browser);
+    this.useCounts.set(browserType, 1);
     return browser;
   }
 
@@ -69,6 +98,7 @@ class BrowserPool {
     }
 
     this.browsers.clear();
+    this.useCounts.clear();
   }
 
   /**
@@ -86,6 +116,7 @@ class BrowserPool {
         logger.error('Failed to close browser', { browserType, error });
       }
       this.browsers.delete(browserType);
+      this.useCounts.delete(browserType);
     }
   }
 

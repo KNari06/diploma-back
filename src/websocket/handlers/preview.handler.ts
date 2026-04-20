@@ -4622,6 +4622,46 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   // Both emit an ack (`:result` event) so the frontend can toast success
   // or show a specific error instead of hanging on a spinner.
   // ═══════════════════════════════════════════════════════════════════════════
+
+  // Frontend signals "user clicked Skip on the login overlay" — silence
+  // the auth-detector on that hostname for 30 minutes. Without this,
+  // any navigation back to the same host would re-fire the overlay and
+  // the user would feel harassed. Missing session / ownership = no-op:
+  // the detector is best-effort UX, not a security boundary.
+  socket.on('preview:auth:dismiss' as any, async (data: {
+    previewSessionId: string;
+    hostname?: string;
+    url?: string;
+  }) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+      if (!data?.previewSessionId) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(data.previewSessionId, ensuredUserId)) return;
+
+      let host = (data.hostname || '').toLowerCase();
+      if (!host && data.url) {
+        try { host = new URL(data.url).hostname.toLowerCase(); } catch { /* ignore */ }
+      }
+      if (!host) return;
+
+      const { markDismissed } = await import('@/services/testing/ui/preview/auth-detector');
+      markDismissed(data.previewSessionId, host);
+      logger.info('[WebSocket] preview:auth:dismiss recorded', {
+        previewSessionId: data.previewSessionId,
+        hostname: host,
+        userId: ensuredUserId,
+      });
+    } catch (err) {
+      logger.debug('[WebSocket] preview:auth:dismiss handler threw (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
   socket.on('preview:apply-resource' as any, async (data: {
     previewSessionId: string;
     resourceId: string;
@@ -4741,6 +4781,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         });
         return;
       }
+
+      // Silence the auth-detector for 10s. The upcoming reload fires
+      // framenavigated + load, and cookies aren't visible to the first
+      // render — without this cooldown the detector would re-fire the
+      // overlay in the gap between "reload starts" and "app re-auths".
+      try {
+        const { markApplyCooldown } = await import('@/services/testing/ui/preview/auth-detector');
+        markApplyCooldown(previewSessionId);
+      } catch { /* non-fatal */ }
 
       // Reload the current page so the app re-reads cookies/localStorage and
       // renders in the authenticated state. Skip the reload if we're still

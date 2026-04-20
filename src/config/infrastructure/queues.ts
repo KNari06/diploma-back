@@ -150,6 +150,12 @@ export const QUEUE_NAMES = {
   TEST_RUN: 'test-run',
   TEST_RESULT: 'test-result',
   AI_ANALYSIS: 'ai-analysis',
+  // Regression Doctor — per-run drift pattern aggregation. Runs AFTER all
+  // per-test Bug Inspector jobs (ai-analysis) finish, reads the
+  // driftSignals each one produced, groups them into patterns, and
+  // writes regression_doctor_findings. Separate queue so it can have
+  // different retry/priority semantics from the fast per-test analysis.
+  REGRESSION_DOCTOR: 'regression-doctor',
   NOTIFICATION: 'notification',
   WEBHOOK: 'webhook',
   GIT_WEBHOOK: 'git-webhook',
@@ -157,6 +163,9 @@ export const QUEUE_NAMES = {
   MOBILE_TEST_RUN: 'mobile-test-run',
   NEGATIVE_GENERATION: 'negative-generation',
   ALLURE_IMPORT: 'allure-import',
+  // Phase 5 — auto-learn from trace. One job per successful test run;
+  // extracts facts from executed_steps, upserts into project_kb_chunks.
+  AUTO_LEARN: 'auto-learn',
 } as const;
 
 // Test run queue - for executing tests
@@ -198,6 +207,36 @@ export const aiAnalysisQueue = new Queue<{ testResultId: string; testId: string 
     backoff: {
       type: 'exponential',
       delay: 5000,
+    },
+  },
+});
+
+// Regression Doctor queue — ONE job per completed regression run. Payload
+// carries only (runId, projectId, userId); the handler fetches every
+// test_results row under the run, reads their ai_summary.driftSignals,
+// groups by pattern, calls the LLM once per group, and writes
+// regression_doctor_findings rows.
+//
+// Capacity sizing: a run-level job (not per-test) so volume is low
+// (dozens per day vs tens of thousands for ai-analysis). Longer backoff
+// because a 5s retry for an LLM failure usually hits the same rate limit;
+// 10s first retry + exponential gives the upstream service room to
+// recover. Keep 25 completed / 10 failed — Doctor findings are persisted
+// elsewhere, so the queue itself doesn't need long-running history.
+export const regressionDoctorQueue = new Queue<{
+  runId: string;
+  projectId: string;
+  userId: string;
+}>(QUEUE_NAMES.REGRESSION_DOCTOR, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 25,
+    removeOnFail: 10,
+    attempts: 2,
+    backoff: {
+      type: 'exponential',
+      delay: 10000,
     },
   },
 });
@@ -298,6 +337,27 @@ export const allureImportQueue = new Queue<AllureImportJobData>(QUEUE_NAMES.ALLU
   },
 });
 
+// Phase 5 — auto-learn queue. Enqueued alongside ai-analysis on test
+// success. Payload is minimal (testId + projectId); the handler fetches
+// executed_steps and does the extraction work.
+//
+// Priority 8: lower than ai-analysis (5) — auto-learn is pure improvement,
+// not blocking. Same retry semantics as ai-analysis because the failure
+// mode (transient OpenAI embed error) is the same.
+export const autoLearnQueue = new Queue<{ testId: string; projectId: string }>(QUEUE_NAMES.AUTO_LEARN, {
+  connection,
+  prefix: env.QUEUE_PREFIX,
+  defaultJobOptions: {
+    removeOnComplete: 50,
+    removeOnFail: 25,
+    attempts: 2,
+    backoff: {
+      type: 'exponential',
+      delay: 5000,
+    },
+  },
+});
+
 // Negative test generation queue — AI generates boundary/negative test cases
 export const negativeGenerationQueue = new Queue<NegativeGenerationJobData>(QUEUE_NAMES.NEGATIVE_GENERATION, {
   connection,
@@ -316,9 +376,11 @@ export const negativeGenerationQueue = new Queue<NegativeGenerationJobData>(QUEU
 // Queue events for monitoring
 export const allureImportQueueEvents = new QueueEvents(QUEUE_NAMES.ALLURE_IMPORT, { connection, prefix: env.QUEUE_PREFIX });
 export const negativeGenerationQueueEvents = new QueueEvents(QUEUE_NAMES.NEGATIVE_GENERATION, { connection, prefix: env.QUEUE_PREFIX });
+export const autoLearnQueueEvents = new QueueEvents(QUEUE_NAMES.AUTO_LEARN, { connection, prefix: env.QUEUE_PREFIX });
 export const testRunQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 export const testResultQueueEvents = new QueueEvents(QUEUE_NAMES.TEST_RESULT, { connection, prefix: env.QUEUE_PREFIX });
 export const aiAnalysisQueueEvents = new QueueEvents(QUEUE_NAMES.AI_ANALYSIS, { connection, prefix: env.QUEUE_PREFIX });
+export const regressionDoctorQueueEvents = new QueueEvents(QUEUE_NAMES.REGRESSION_DOCTOR, { connection, prefix: env.QUEUE_PREFIX });
 export const explorationQueueEvents = new QueueEvents(QUEUE_NAMES.EXPLORATION, { connection, prefix: env.QUEUE_PREFIX });
 export const mobileTestRunQueueEvents = new QueueEvents(QUEUE_NAMES.MOBILE_TEST_RUN, { connection, prefix: env.QUEUE_PREFIX });
 
@@ -473,6 +535,46 @@ export class QueueManager {
       return job;
     } catch (error) {
       logger.error('Failed to add AI analysis job:', error);
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
+   * Add Regression Doctor job — ONE per completed regression run.
+   *
+   * Idempotency: `jobId` = `doctor-${runId}` so a duplicate enqueue from
+   * the completion hook (e.g. BullMQ retry after status flip) is a no-op
+   * rather than a duplicate LLM run. BullMQ refuses to add two jobs with
+   * the same id.
+   *
+   * Priority: lower than per-test AI analysis (priority=10 here vs 5 for
+   * aiAnalysisQueue) because the per-test jobs must complete BEFORE
+   * Doctor runs — otherwise Doctor sees partial ai_summary.driftSignals.
+   * The completion hook is what actually enforces ordering; priority is
+   * just belt-and-suspenders.
+   */
+  static async addRegressionDoctorJob(params: {
+    runId: string;
+    projectId: string;
+    userId: string;
+  }) {
+    try {
+      const job = await regressionDoctorQueue.add(
+        'regression-doctor',
+        params,
+        {
+          priority: 10,
+          jobId: `doctor-${params.runId}`,
+        },
+      );
+
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.REGRESSION_DOCTOR,
+        runId: params.runId,
+      });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add Regression Doctor job:', error);
       throw handleQueueError(error);
     }
   }
@@ -709,6 +811,34 @@ export class QueueManager {
   }
 
   /**
+   * Add auto-learn job to queue (Phase 5).
+   *
+   * Enqueued on every successful test run, idempotent via jobId=`learn-${testId}`.
+   * BullMQ refuses duplicate IDs — retrying the same test is a no-op, which is
+   * the correct semantics (same executed_steps → same facts).
+   *
+   * The handler itself also checks the projects.settings.autoLearnFromTests
+   * flag and skips cleanly when disabled, so enqueue is cheap regardless of
+   * whether the feature is opted-in per project.
+   */
+  static async addAutoLearnJob(params: { testId: string; projectId: string }) {
+    try {
+      const job = await autoLearnQueue.add('auto-learn', params, {
+        priority: 8,
+        jobId: `learn-${params.testId}`,
+      });
+      logQueueEvent('added', job.id!, {
+        queue: QUEUE_NAMES.AUTO_LEARN,
+        testId: params.testId,
+      });
+      return job;
+    } catch (error) {
+      logger.error('Failed to add auto-learn job:', error);
+      throw handleQueueError(error);
+    }
+  }
+
+  /**
    * Add negative generation job to queue
    */
   static async addNegativeGenerationJob(jobData: NegativeGenerationJobData) {
@@ -852,6 +982,8 @@ export class QueueManager {
         return negativeGenerationQueue;
       case QUEUE_NAMES.ALLURE_IMPORT:
         return allureImportQueue;
+      case QUEUE_NAMES.AUTO_LEARN:
+        return autoLearnQueue;
       default:
         throw new Error(`Unknown queue: ${queueName}`);
     }
@@ -926,11 +1058,12 @@ export const gracefulShutdown = async () => {
         mobileTestRunQueue.close(),
         negativeGenerationQueue.close(),
         allureImportQueue.close(),
+        autoLearnQueue.close(),
       ]);
 
       closeQueueResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun', 'negativeGeneration', 'allureImport'];
+          const queueNames = ['testRun', 'testResult', 'aiAnalysis', 'notification', 'webhook', 'gitWebhook', 'exploration', 'mobileTestRun', 'negativeGeneration', 'allureImport', 'autoLearn'];
           logger.warn(`Failed to close ${queueNames[index]} queue`, { error: result.reason });
         }
       });
@@ -944,11 +1077,12 @@ export const gracefulShutdown = async () => {
         mobileTestRunQueueEvents.close(),
         negativeGenerationQueueEvents.close(),
         allureImportQueueEvents.close(),
+        autoLearnQueueEvents.close(),
       ]);
 
       closeQueueEventsResults.forEach((result, index) => {
         if (result.status === 'rejected') {
-          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents', 'negativeGenerationEvents', 'allureImportEvents'];
+          const eventNames = ['testRunEvents', 'testResultEvents', 'aiAnalysisEvents', 'explorationEvents', 'mobileTestRunEvents', 'negativeGenerationEvents', 'allureImportEvents', 'autoLearnEvents'];
           logger.warn(`Failed to close ${eventNames[index]}`, { error: result.reason });
         }
       });

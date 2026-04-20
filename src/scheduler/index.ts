@@ -8,6 +8,7 @@
  */
 
 import { env } from '@/config/environment/env';
+import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
 
@@ -21,13 +22,17 @@ async function main(): Promise<void> {
     intervalMs: 60000,
   });
 
-  // Start loop
+  // Start loop — per-minute sweep for due schedules
   TestSchedulerJobHandler.start(60000);
+
+  // Phase 5 — nightly auto-learn retirement. 24h interval, 30d TTL.
+  AutoLearnRetireJob.start();
 
   const shutdown = (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
       TestSchedulerJobHandler.stop();
+      AutoLearnRetireJob.stop();
     } finally {
       process.exit(0);
     }

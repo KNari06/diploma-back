@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { requireAuth } from '@/middleware/auth.middleware';
+import * as analyticsController from './analytics.controller';
+import * as autoLearnController from './auto-learn.controller';
 import * as kbController from './kb.controller';
 
 const router = Router();
@@ -12,18 +14,29 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = [
+    // MIME types we accept directly. YAML has multiple common MIME strings so
+    // we also fall back to extension-based allow-list for edge cases (curl,
+    // browsers that upload yaml as application/octet-stream, etc.).
+    const allowedMime = [
       'text/plain',
       'application/pdf',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // .docx
       'application/json',
       'text/markdown',
+      'application/x-yaml',
+      'text/yaml',
+      'text/x-yaml',
+      'application/yaml',
     ];
 
-    if (allowedTypes.includes(file.mimetype) || file.originalname.endsWith('.md')) {
+    const nameLower = file.originalname.toLowerCase();
+    const allowedExt = ['.md', '.markdown', '.yaml', '.yml', '.txt', '.pdf', '.docx', '.json'];
+    const matchesExt = allowedExt.some((ext) => nameLower.endsWith(ext));
+
+    if (allowedMime.includes(file.mimetype) || matchesExt) {
       cb(null, true);
     } else {
-      cb(new Error('Invalid file type. Allowed: txt, pdf, docx, json, md'));
+      cb(new Error('Invalid file type. Allowed: txt, pdf, docx, json, md, yaml, yml'));
     }
   },
 });
@@ -219,5 +232,132 @@ router.get('/stats', kbController.getKBStats);
  *         description: Admin access required
  */
 router.post('/rebuild', kbController.rebuildKB);
+
+/**
+ * @swagger
+ * /api/v1/kb/analytics/stats:
+ *   get:
+ *     summary: Retrieval stats overview (admin only)
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: days
+ *         schema: { type: integer, minimum: 1, maximum: 365, default: 7 }
+ *     responses:
+ *       200: { description: Stats }
+ *       403: { description: Admin access required }
+ */
+router.get('/analytics/stats', analyticsController.getRetrievalStats);
+
+/**
+ * @swagger
+ * /api/v1/kb/analytics/dead-files:
+ *   get:
+ *     summary: Files retrieved often but correlated with bad feedback (admin)
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: days
+ *         schema: { type: integer, default: 30 }
+ *       - in: query
+ *         name: minRetrievals
+ *         schema: { type: integer, default: 10 }
+ *       - in: query
+ *         name: dislikeRatio
+ *         schema: { type: number, minimum: 0, maximum: 1, default: 0.25 }
+ *     responses:
+ *       200: { description: Dead-file candidates }
+ *       403: { description: Admin access required }
+ */
+router.get('/analytics/dead-files', analyticsController.getDeadFiles);
+
+/**
+ * @swagger
+ * /api/v1/kb/analytics/events:
+ *   get:
+ *     summary: Raw retrieval events, paginated, most recent first (admin)
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+ *       - in: query
+ *         name: offset
+ *         schema: { type: integer, minimum: 0, default: 0 }
+ *     responses:
+ *       200: { description: Event rows }
+ *       403: { description: Admin access required }
+ */
+router.get('/analytics/events', analyticsController.listRetrievalEvents);
+
+/**
+ * @swagger
+ * /api/v1/kb/auto-learn/status:
+ *   get:
+ *     summary: Auto-learn toggle state + chunk stats for a project
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: projectId
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200: { description: Status }
+ *       403: { description: Project access denied }
+ */
+router.get('/auto-learn/status', autoLearnController.getAutoLearnStatus);
+
+/**
+ * @swagger
+ * /api/v1/kb/auto-learn/toggle:
+ *   put:
+ *     summary: Enable/disable auto-learn for a project
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               projectId: { type: string, format: uuid }
+ *               enabled:   { type: boolean }
+ *     responses:
+ *       200: { description: Toggle result }
+ *       403: { description: Project access denied }
+ */
+router.put('/auto-learn/toggle', autoLearnController.toggleAutoLearn);
+
+/**
+ * @swagger
+ * /api/v1/kb/auto-learn/chunks:
+ *   get:
+ *     summary: List current auto-learned chunks for a project
+ *     tags: [Knowledge Base]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: projectId
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+ *     responses:
+ *       200: { description: Chunks }
+ *       403: { description: Project access denied }
+ */
+router.get('/auto-learn/chunks', autoLearnController.listAutoLearnChunks);
 
 export default router;

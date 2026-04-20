@@ -65,11 +65,37 @@ export interface TextChunk {
   chunkIndex: number;
   totalChunks: number;
   tokenCount: number;
+  /**
+   * Parent section identifier (stable slug of the section heading).
+   * Chunks sharing a parentId belong to the same logical section.
+   */
+  parentId?: string;
+  /**
+   * Full text of the parent section. When RAG retrieves this chunk, the
+   * consumer should send `parentText` to the LLM instead of `content` —
+   * the small chunk gives precision, the parent gives context.
+   */
+  parentText?: string;
   metadata: {
     sectionTitle?: string;
     startChar: number;
     endChar: number;
   };
+}
+
+/**
+ * Slugify a heading into a stable parent identifier.
+ * "Basic usage" → "basic-usage"; "Don't use waitForTimeout" → "dont-use-waitfortimeout"
+ */
+function slugifyHeading(heading: string): string {
+  return heading
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '') // strip diacritics
+    .replace(/[^a-z0-9\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 80) || 'section';
 }
 
 /**
@@ -263,14 +289,17 @@ export function chunkMarkdown(content: string, fileName: string): TextChunk[] {
 
   for (const section of sections) {
     const sectionText = `${section.heading}\n\n${section.content}`.trim();
+    const parentId = slugifyHeading(section.heading);
 
-    // If section is small, keep it as one chunk
+    // If section is small, keep it as one chunk. The chunk IS its parent.
     if (countTokens(sectionText) <= CHUNK_SIZE) {
       allChunks.push({
         content: sectionText,
         chunkIndex: allChunks.length,
         totalChunks: 0, // Will be updated later
         tokenCount: countTokens(sectionText),
+        parentId,
+        parentText: sectionText,
         metadata: {
           sectionTitle: section.heading,
           startChar: 0,
@@ -278,11 +307,17 @@ export function chunkMarkdown(content: string, fileName: string): TextChunk[] {
         },
       });
     } else {
-      // Section is large, split it
+      // Section is large: emit small chunks for retrieval precision, but tag
+      // each with the full section text so RAG can expand to parent later.
       const sectionChunks = chunkText(sectionText, {
         fileName,
         sectionTitle: section.heading,
       });
+
+      for (const chunk of sectionChunks) {
+        chunk.parentId = parentId;
+        chunk.parentText = sectionText;
+      }
 
       allChunks.push(...sectionChunks);
     }

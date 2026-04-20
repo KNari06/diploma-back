@@ -173,6 +173,41 @@ export interface QualityCheckReport {
 
 export type FailureClassification = 'flaky' | 'real_bug' | 'environment' | 'test_drift';
 
+/**
+ * Shape of a test drift — structured, machine-readable signal that the
+ * downstream Regression Doctor (aggregation job) uses to group failures
+ * across multiple tests into one "product change" pattern.
+ *
+ * Populated by the Bug Inspector (per-test AI analysis) only when
+ * `failureClassification === 'test_drift'`. Absent otherwise.
+ *
+ * Why these fields:
+ *   • urlPattern — normalized URL (`/tutors/:id` not `/tutors/cmbi1pgyz…`)
+ *     so two failures on different tutor pages group as one pattern.
+ *   • targetElementKey — stable key for the element the step targeted:
+ *     `"button:Подготовка к ВОУД"` / `"input:email"`. Concrete refs
+ *     (e217) are useless for grouping across tests.
+ *   • errorShape — coarse classification of HOW the step failed. Four
+ *     values cover ~95% of drift modes observed in practice.
+ *   • beforeState / afterState — the "did the world change mid-action?"
+ *     signal that often distinguishes a genuine overlay from a flaky
+ *     selector.
+ */
+export interface DriftSignals {
+  /** Normalized URL (GUID/ID segments replaced with `:id`). */
+  urlPattern: string;
+  /** Stable identifier for the target element (tag:text, aria:label, etc). */
+  targetElementKey: string;
+  /** Coarse failure shape — used as a grouping key alongside url+element. */
+  errorShape:
+    | 'selector_not_found'     // resolver returned nothing — element gone or renamed
+    | 'timeout_on_visible'     // element was visible but click didn't connect
+    | 'covered_by_overlay'     // element present but obscured by a new modal/overlay
+    | 'value_mismatch';        // verify step saw different value than recorded
+  beforeState?: { visible: boolean; covered: boolean };
+  afterState?: { visible: boolean; domChanged: boolean };
+}
+
 export interface AISummary {
   summary: string;
   bugs: BugReport[];
@@ -185,6 +220,12 @@ export interface AISummary {
   causedByStep?: number | null;
   failureClassification?: FailureClassification | null;
   classificationEvidence?: string[];
+  /**
+   * Phase-1 addition: structured drift signals consumed by the
+   * Regression Doctor. Populated ONLY when failureClassification
+   * === 'test_drift'. Undefined on passed tests or non-drift failures.
+   */
+  driftSignals?: DriftSignals | null;
 }
 
 export interface BugReport {
