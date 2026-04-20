@@ -8,6 +8,7 @@ import { Router } from 'express';
 import {
     createFlow,
     deleteFlow,
+    duplicateFlow,
     getFlow,
     listFlows,
     reorderFlows,
@@ -193,5 +194,31 @@ router.post('/reorder', requireAuth, reorderFlows);
 router.get('/:id', requireAuth, getFlow);
 router.patch('/:id', requireAuth, updateFlow);
 router.delete('/:id', requireAuth, deleteFlow);
+
+/**
+ * @swagger
+ * /api/v1/flows/{id}/duplicate:
+ *   post:
+ *     summary: Duplicate a flow (deep-copy flow + all test cases)
+ *     description: |
+ *       Creates a new flow in the same module with all test cases copied.
+ *       The new flow's name is suffixed with " (Copy)".
+ *     tags: [Flows]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Flow duplicated successfully
+ *       404:
+ *         description: Source flow not found
+ */
+router.post('/:id/duplicate', requireAuth, duplicateFlow);
 
 export default router;

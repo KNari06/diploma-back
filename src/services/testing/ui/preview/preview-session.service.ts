@@ -1952,14 +1952,10 @@ export class PreviewSessionService {
       if (probed.resolvedVia === 'directHit') return null;
       if (!probed.boundingBox) return null;
 
-      const label = (
-        probed.ariaLabel
-        || probed.labelText
-        || probed.text
-        || probed.placeholder
-        || probed.role
-        || probed.tag
-      )?.slice(0, 40) || probed.tag;
+      // Hover caps label at 40 chars to fit the floating tooltip; record/DB path uses 60.
+      // `getProbedLabel` returns null for literal tag-only fallbacks so we can surface a
+      // 'element' placeholder instead of "div"/"svg".
+      const label = RecordingCaptureService.getProbedLabel(probed, 40) || 'element';
 
       return {
         tag: probed.tag,

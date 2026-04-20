@@ -52,6 +52,8 @@ export interface ProbedElement {
   containerText?: string;
   /** V18: title attribute — fallback identifier for icon-only buttons */
   title?: string;
+  /** alt attribute — fallback for <img> clicks (e.g. <img alt="Profile"/>) */
+  alt?: string;
   /** V18: data-testid/data-test/data-cy — stable test identifier */
   testId?: string;
   /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
@@ -329,6 +331,8 @@ const PROBE_AT_POINT_FN = `
 
   // V18: Collect title and data-testid for behavioral elements with no text/label
   var titleAttr = target.getAttribute('title') || undefined;
+  // alt attribute — fallback for <img> targets where textContent is empty
+  var altAttr = target.getAttribute('alt') || undefined;
   var testId = target.getAttribute('data-testid')
     || target.getAttribute('data-test')
     || target.getAttribute('data-test-id')
@@ -346,6 +350,7 @@ const PROBE_AT_POINT_FN = `
     name: target.getAttribute('name') || undefined,
     ref: target.getAttribute('data-agent-ref') || undefined,
     title: titleAttr,
+    alt: altAttr,
     testId: testId,
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
@@ -415,6 +420,8 @@ const PROBE_FOCUSED_FN = `
     placeholder: target.getAttribute('placeholder') || undefined,
     name: target.getAttribute('name') || undefined,
     ref: target.getAttribute('data-agent-ref') || undefined,
+    title: target.getAttribute('title') || undefined,
+    alt: target.getAttribute('alt') || undefined,
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
@@ -805,34 +812,51 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Tags and roles whose textContent is a meaningful label for the element.
-   * V15: Expanded from just a/button to all interactive widget roles.
+   * Single source of truth for human-readable element labels.
+   *
+   * Matches the hover-highlight logic (preview-session.service.ts:probeInteractiveElementAt):
+   * `text` is used for ALL tags, not just a/button/summary. This is what makes hover show
+   * "Войти" for a <div>Войти</div> — the recorder now does the same.
+   *
+   * Returns `null` when the best candidate would be the literal tag name (e.g. "div", "svg").
+   * Callers decide how to render that — typically as 'element' placeholder, which signals to
+   * the user that the step is fragile. Background LLM refinement (preview.handler.ts:2154)
+   * typically upgrades the step to a better ancestor within 1–2 seconds of the click.
    */
-  private static TEXT_LABEL_TAGS = new Set(['a', 'button', 'summary', 'th', 'label', 'legend']);
-  private static TEXT_LABEL_ROLES = new Set([
-    'button', 'link', 'tab', 'menuitem', 'menuitemcheckbox',
-    'menuitemradio', 'option', 'switch', 'treeitem',
-  ]);
+  static getProbedLabel(element: ProbedElement | null, maxLen = 60): string | null {
+    if (!element) return null;
+    // Each candidate is trimmed and skipped if it collapses to empty or to the tag name itself
+    // (self-referential noise like <div>div</div>). This way whitespace-only `text` falls through
+    // to `role` / other fallbacks instead of short-circuiting the whole chain.
+    const candidates = [
+      element.ariaLabel,
+      element.labelText,
+      element.text,
+      element.alt,         // <img alt="…">
+      element.title,       // icon-only buttons with tooltip
+      element.placeholder,
+      element.name,
+      element.testId,
+      element.role,
+    ];
+    for (const c of candidates) {
+      if (!c) continue;
+      const trimmed = c.trim();
+      if (!trimmed) continue;
+      if (trimmed === element.tag) continue;
+      return trimmed.slice(0, maxLen);
+    }
+    return null;
+  }
 
   static getElementLabel(element: ProbedElement | null): string {
-    if (!element) return 'element';
-    return (
-      element.ariaLabel
-      || element.labelText
-      || (this.TEXT_LABEL_TAGS.has(element.tag) || (element.role && this.TEXT_LABEL_ROLES.has(element.role))
-        ? element.text
-        : undefined)
-      || element.placeholder
-      || element.title   // V18: title attribute as fallback for icon-only buttons
-      || element.name
-      || element.role
-      || element.tag
-    )?.slice(0, 60) || 'element';
+    return this.getProbedLabel(element, 60) || 'element';
   }
 
   /**
    * Build a human-readable description for a recorded step.
-   * Priority: ariaLabel > labelText > text > placeholder > role+tag
+   * Priority: ariaLabel > labelText > text > alt > title > placeholder > name > testId > role.
+   * Falls back to 'element' when the probe yielded nothing more specific than the tag name.
    */
   static buildDescription(actionType: IntentActionType, element: ProbedElement | null, value?: string): string {
     if (!element) {
@@ -844,18 +868,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       return `${actionType} element`;
     }
 
-    // Determine the best label for the element (V15: reuse TEXT_LABEL_TAGS/ROLES for consistency)
-    const label = element.ariaLabel
-      || element.labelText
-      || (this.TEXT_LABEL_TAGS.has(element.tag) || (element.role && this.TEXT_LABEL_ROLES.has(element.role))
-        ? element.text
-        : undefined)
-      || element.placeholder
-      || element.name
-      || element.role
-      || element.tag;
-
-    const shortLabel = label ? label.slice(0, 60) : 'element';
+    const shortLabel = this.getProbedLabel(element, 60) || 'element';
 
     switch (actionType) {
       case 'click':

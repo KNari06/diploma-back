@@ -288,6 +288,107 @@ export class FlowService {
   }
 
   /**
+   * Deep-copy a flow and all its intent_test_cases into the same module.
+   * Appends "(Copy)" to the flow name. API test configs are not copied —
+   * no flow currently creates them at duplication time.
+   * @param sourceFlowId - Flow ID to duplicate
+   * @param userId - User ID for access control
+   * @returns Newly created flow
+   */
+  static async duplicate(sourceFlowId: string, userId: string): Promise<TestFlow> {
+    logger.info('[FLOW_SERVICE] Duplicating flow', { sourceFlowId, userId });
+
+    const { data: source, error: srcErr } = await supabaseAdmin
+      .from('test_flows')
+      .select('*')
+      .eq('id', sourceFlowId)
+      .eq('user_id', userId)
+      .single();
+
+    if (srcErr || !source) {
+      logger.error('[FLOW_SERVICE] Source flow not found for duplicate', { error: srcErr, sourceFlowId });
+      throw new Error('Flow not found');
+    }
+
+    const { data: maxOrder } = await supabaseAdmin
+      .from('test_flows')
+      .select('order_index')
+      .eq('module_id', source.module_id)
+      .order('order_index', { ascending: false })
+      .limit(1)
+      .single();
+
+    const nextOrderIndex = maxOrder ? (maxOrder.order_index ?? 0) + 1 : 0;
+    const copiedName = `${source.name} (Copy)`;
+
+    const { data: newFlow, error: insErr } = await supabaseAdmin
+      .from('test_flows')
+      .insert({
+        module_id: source.module_id,
+        user_id: userId,
+        name: copiedName,
+        description: source.description,
+        order_index: nextOrderIndex,
+        flow_type: source.flow_type,
+        platform: source.platform,
+        tags: source.tags || [],
+        priority: source.priority,
+        preconditions: source.preconditions || [],
+        expected_result: source.expected_result,
+      })
+      .select('*')
+      .single();
+
+    if (insErr || !newFlow) {
+      logger.error('[FLOW_SERVICE] Failed to insert duplicated flow', { error: insErr });
+      throw new Error(`Failed to duplicate flow: ${insErr?.message ?? 'unknown error'}`);
+    }
+
+    const { data: sourceTestCases, error: tcErr } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('*')
+      .eq('flow_id', sourceFlowId)
+      .eq('user_id', userId);
+
+    if (tcErr) {
+      logger.error('[FLOW_SERVICE] Failed to list source test cases; rolling back', {
+        error: tcErr,
+        sourceFlowId,
+      });
+      await supabaseAdmin.from('test_flows').delete().eq('id', newFlow.id).eq('user_id', userId);
+      throw new Error(`Failed to duplicate flow: ${tcErr.message}`);
+    }
+
+    if (sourceTestCases && sourceTestCases.length > 0) {
+      const copies = sourceTestCases.map((tc) => {
+        const { id, created_at, updated_at, flow_id, ...rest } = tc;
+        return { ...rest, flow_id: newFlow.id };
+      });
+
+      const { error: tcInsErr } = await supabaseAdmin.from('intent_test_cases').insert(copies);
+
+      if (tcInsErr) {
+        logger.error('[FLOW_SERVICE] Failed to insert duplicated test cases; rolling back flow', {
+          error: tcInsErr,
+          newFlowId: newFlow.id,
+        });
+        await supabaseAdmin.from('test_flows').delete().eq('id', newFlow.id).eq('user_id', userId);
+        throw new Error(`Failed to duplicate flow: ${tcInsErr.message}`);
+      }
+    }
+
+    await cache.delByPattern(`qait:cache:ptree:module:${source.module_id}:*`);
+
+    logger.info('[FLOW_SERVICE] Duplicated flow', {
+      sourceFlowId,
+      newFlowId: newFlow.id,
+      testCaseCount: sourceTestCases?.length ?? 0,
+    });
+
+    return this.mapToTestFlow(newFlow);
+  }
+
+  /**
    * Get all test case IDs in a flow
    * UI test cases are now sourced from intent_test_cases (unified table).
    * @param flowId - Flow ID
