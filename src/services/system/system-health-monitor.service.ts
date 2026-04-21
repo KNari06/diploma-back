@@ -41,7 +41,17 @@ export interface SystemHealthSnapshot {
 
 const POLL_INTERVAL_MS = 60_000;            // 1 minute when healthy
 const POLL_INTERVAL_DOWN_MS = 15_000;       // 15s when degraded — recover faster
-const PROBE_TIMEOUT_MS = 5_000;             // hard cap on a single probe
+/**
+ * Hard cap on a single probe. 5s was too tight — shared Supabase pools
+ * occasionally take 6–9s on a cold first call after idle, producing
+ * spurious maintenance-mode flips that clear on the next poll. 10s
+ * leaves headroom for those cold spikes without hiding real outages.
+ * Paired with PROBE_RETRY_DELAY_MS below: a failed probe retries once
+ * before the monitor concludes 'down'.
+ */
+const PROBE_TIMEOUT_MS = 10_000;
+/** Single retry gap — enough for the upstream pool to warm up. */
+const PROBE_RETRY_DELAY_MS = 1_500;
 
 class SystemHealthMonitorImpl {
   private snapshot: SystemHealthSnapshot = {
@@ -134,6 +144,40 @@ class SystemHealthMonitorImpl {
   }
 
   /**
+   * Race `quietSupabaseProbe()` against `PROBE_TIMEOUT_MS`. Returns
+   * `{ok, error?}` instead of throwing so the retry loop can inspect
+   * both attempts. Clears the timeout handle on success to avoid
+   * keeping the event loop alive.
+   *
+   * Note: Promise.race does NOT cancel the losing supabase request —
+   * it finishes silently in the background. Acceptable because at
+   * most one zombie request per attempt and probeOnce gates concurrent
+   * probes via `inFlight`.
+   */
+  private async raceProbe(): Promise<{ ok: boolean; error?: unknown }> {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+      const ok = await Promise.race<boolean>([
+        this.quietSupabaseProbe(),
+        new Promise<boolean>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error('supabase probe timeout')),
+            PROBE_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      return { ok };
+    } catch (err) {
+      return { ok: false, error: err };
+    } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
+    }
+  }
+
+  /**
    * Run one probe with a hard timeout. Multiple parallel probes are coalesced
    * via the `inFlight` flag — if a probe is taking longer than the polling
    * interval, we skip the next tick instead of stacking requests.
@@ -145,33 +189,31 @@ class SystemHealthMonitorImpl {
     const checkedAt = new Date().toISOString();
     let healthy = false;
     let probeError: unknown;
-    // Hard timeout guard variable so we can clear the timer in the success
-    // path and avoid keeping the event loop alive past the probe.
-    let timeoutHandle: NodeJS.Timeout | null = null;
 
     try {
-      // Race the supabase ping against a hard timeout so a hung TCP connection
-      // doesn't lock the monitor for minutes. Note: Promise.race does NOT cancel
-      // the losing supabase request — it'll keep running in the background and
-      // finish (or error) silently. That's acceptable: at most one zombie
-      // request per probe interval, and the next probe is gated by `inFlight`.
-      healthy = await Promise.race<boolean>([
-        this.quietSupabaseProbe(),
-        new Promise<boolean>((_, reject) => {
-          timeoutHandle = setTimeout(
-            () => reject(new Error('supabase probe timeout')),
-            PROBE_TIMEOUT_MS,
-          );
-        }),
-      ]);
+      // First attempt.
+      const first = await this.raceProbe();
+      if (first.ok) {
+        healthy = true;
+      } else {
+        // Single retry absorbs cold-pool spikes (first REST call after
+        // Supabase shared-pool idle can take 6–9s → we'd flip to
+        // maintenance mode, then recover next tick). A 1.5s pause lets
+        // the pool warm up; if the second attempt also fails we treat
+        // it as a genuine outage. At most 2 × PROBE_TIMEOUT_MS per
+        // probeOnce, which is still way under the 60s poll interval.
+        await new Promise((resolve) => setTimeout(resolve, PROBE_RETRY_DELAY_MS));
+        const second = await this.raceProbe();
+        if (second.ok) {
+          healthy = true;
+        } else {
+          probeError = second.error ?? first.error;
+        }
+      }
     } catch (err) {
-      healthy = false;
+      // Defensive — raceProbe resolves both branches, but guard anyway.
       probeError = err;
     } finally {
-      if (timeoutHandle) {
-        clearTimeout(timeoutHandle);
-        timeoutHandle = null;
-      }
       this.inFlight = false;
     }
 

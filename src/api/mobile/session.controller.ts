@@ -1490,6 +1490,15 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                 commands.push({
                   type: 'type_text',
                   params: {
+                    // Forward coordinates so the runner's dispatch picks the
+                    // 'coordinates' branch (re-tap + waitForKeyboardReady +
+                    // typeText) instead of 'direct' blind input. Without x/y
+                    // the IME may still be animating after the preceding tap
+                    // and the first characters get dropped — VTE then reads
+                    // back stale text and burns two retries typing the same
+                    // wrong value.
+                    x: centerX,
+                    y: centerY,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
                   },

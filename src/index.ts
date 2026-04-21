@@ -1465,35 +1465,57 @@ const startServer = async () => {
       });
     }
 
-    // Test database connection with timeout
-    try {
-      const dbCheckPromise = testSupabaseConnection();
-      const dbTimeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Database connection timeout')), 10000)
-      );
+    // Test database connection with per-attempt timeout + retry-once.
+    //
+    // Historically a single 10s timeout killed the dev server when
+    // Supabase had a cold-start latency spike (first REST call after
+    // pool idle can take 7-12s on shared infra). The retry absorbs
+    // that: second attempt rides the now-warm pool and returns in
+    // <500ms. If BOTH attempts time out, the actual outage is real
+    // enough to exit on.
+    const DB_ATTEMPT_TIMEOUT_MS = 15_000; // up from 10s to cover cold pool
+    const DB_MAX_ATTEMPTS = 2;
+    const probeDbOnce = async (): Promise<boolean> => {
+      return Promise.race([
+        testSupabaseConnection(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Database connection timeout')), DB_ATTEMPT_TIMEOUT_MS),
+        ),
+      ]);
+    };
 
-      const dbConnected = await Promise.race([dbCheckPromise, dbTimeoutPromise]);
-      if (!dbConnected) {
-        if (env.NODE_ENV === 'production') {
-          logger.warn('[SERVER] Database connection unavailable on startup. Running in limited mode.');
-        } else {
-          logger.error('[SERVER] Failed to connect to database. Exiting...');
-          process.exit(1);
-        }
-      } else {
-        logger.info('✓ Database connection verified');
-      }
-    } catch (dbError) {
-      if (env.NODE_ENV === 'production') {
-        logger.warn('[SERVER] Database connection failed on startup. Running in limited mode.', {
-          error: dbError instanceof Error ? dbError.message : String(dbError),
+    let dbConnected = false;
+    let lastDbError: unknown;
+    for (let attempt = 1; attempt <= DB_MAX_ATTEMPTS; attempt++) {
+      try {
+        dbConnected = await probeDbOnce();
+        if (dbConnected) break;
+      } catch (err) {
+        lastDbError = err;
+        logger.warn('[SERVER] Database probe failed', {
+          attempt,
+          maxAttempts: DB_MAX_ATTEMPTS,
+          error: err instanceof Error ? err.message : String(err),
         });
-      } else {
-        logger.error('[SERVER] Database connection failed', {
-          error: dbError instanceof Error ? dbError.message : String(dbError),
-        });
-        process.exit(1);
       }
+      if (attempt < DB_MAX_ATTEMPTS) {
+        // Short pause lets the upstream pool spin up; don't flood with
+        // back-to-back tries if the first one failed on the connect step.
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+      }
+    }
+
+    if (dbConnected) {
+      logger.info('✓ Database connection verified');
+    } else if (env.NODE_ENV === 'production') {
+      logger.warn('[SERVER] Database connection unavailable on startup. Running in limited mode.', {
+        error: lastDbError instanceof Error ? lastDbError.message : String(lastDbError ?? 'unknown'),
+      });
+    } else {
+      logger.error('[SERVER] Database connection failed after retries. Exiting...', {
+        error: lastDbError instanceof Error ? lastDbError.message : String(lastDbError ?? 'unknown'),
+      });
+      process.exit(1);
     }
 
     // Test queue connection (non-blocking in development)
