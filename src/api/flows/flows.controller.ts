@@ -282,6 +282,24 @@ export async function updateFlow(req: AuthenticatedRequest, res: Response): Prom
 }
 
 /**
+ * Duplicate a flow (deep-copy flow + all intent_test_cases).
+ * Appends " (Copy)" to the flow name.
+ */
+export async function duplicateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { id } = req.params;
+    const userId = getUserId(req);
+
+    const flow = await FlowService.duplicate(id, userId);
+
+    res.json({ success: true, data: { flow }, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[FLOWS_API] Failed to duplicate flow', { error });
+    handleError(res, error, 'Failed to duplicate flow');
+  }
+}
+
+/**
  * Delete a flow
  */
 export async function deleteFlow(req: AuthenticatedRequest, res: Response): Promise<void> {

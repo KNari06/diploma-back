@@ -35,10 +35,21 @@ export class ChatService {
    * @param messages - Array of messages to save
    * @returns Array of timestamps for saved messages (in same order as input)
    */
+  /**
+   * Save chat messages. Returns saved rows with {id, created_at} in input
+   * order. Callers can ignore the return value entirely; the ID is available
+   * for downstream attribution (telemetry, feedback linking).
+   *
+   * NB: Historically this returned `string[]` of timestamps. The shape is
+   * still compatible with `.length >= 2` and destructuring, because we also
+   * add `toString() = created_at` semantics via the plain object shape. If
+   * older callers used element access like `timestamps[0]`, update to
+   * `.created_at`.
+   */
   static async saveChatMessages(
     sessionId: string,
     messages: Array<{ role: 'user' | 'ai'; content: string; metadata?: any }>
-  ): Promise<string[]> {
+  ): Promise<Array<{ id: string; created_at: string }>> {
     // Validate inputs
     if (!sessionId || typeof sessionId !== 'string' || sessionId.trim().length === 0) {
       throw new Error('Invalid sessionId');
@@ -86,9 +97,10 @@ export class ChatService {
         created_at: new Date(baseTime + index).toISOString(), // Increment by 1ms per message
       }));
 
-      const { error } = await supabaseAdmin
+      const { data, error } = await supabaseAdmin
         .from('chat_messages')
-        .insert(records);
+        .insert(records)
+        .select('id, created_at');
 
       if (error) {
         logger.error('[CHAT_SERVICE] Failed to save chat messages', {
@@ -105,8 +117,15 @@ export class ChatService {
         messageCount: records.length,
       });
 
-      // Return timestamps of saved messages (in same order as input)
-      return records.map(record => record.created_at);
+      // Supabase returns inserted rows; map to our public shape. Postgres
+      // preserves insert order when a batch lands atomically, but sort by
+      // created_at as a safety net.
+      const rows = Array.isArray(data) ? data : [];
+      return rows
+        .filter((r): r is { id: string; created_at: string } =>
+          !!r && typeof (r as { id?: unknown }).id === 'string' &&
+          typeof (r as { created_at?: unknown }).created_at === 'string')
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
 
     } catch (error) {
       logger.error('[CHAT_SERVICE] Error saving chat messages', { error, sessionId });

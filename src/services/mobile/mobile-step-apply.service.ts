@@ -142,6 +142,14 @@ export class MobileStepApplyService {
               commands.push({
                 type: 'type_text',
                 params: {
+                  // Pass the same coordinates the preceding tap used so the
+                  // runner's dispatch takes the coordinates branch: re-tap +
+                  // waitForKeyboardReady + typeText. Without x/y it falls into
+                  // the 'direct' branch and blind-fires `adb shell input text`
+                  // before the IME is actually up — text lands in whatever
+                  // field previously held focus (symptom in prod: VTE reads
+                  // back stale text and triggers two retries).
+                  ...coordParams,
                   text: stepDraft.value,
                   clearFirst: !!(stepDraft.options?.replaceContent),
                 },

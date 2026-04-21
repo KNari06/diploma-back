@@ -325,6 +325,43 @@ EXTENDED OUTPUT FIELDS (add alongside existing fields):
 "failureClassification": "real_bug"|"flaky"|"environment"|"test_drift"|null,
 "classificationEvidence": ["<reason1>", "<reason2>"]
 
+DRIFT SIGNALS (ONLY when failureClassification === "test_drift"):
+Add a "driftSignals" object so a downstream aggregator can group this
+failure with similar drifts in other tests of the same regression run.
+Normalized, machine-readable — NOT prose.
+
+"driftSignals": {
+  "urlPattern": "<normalized URL — replace GUID/numeric id segments with ':id'>",
+  "targetElementKey": "<stable key: '<tag>:<visible text or aria-label>' e.g. 'button:Подготовка к ВОУД', 'input:email', 'a:Sign in'>",
+  "errorShape": "selector_not_found"|"timeout_on_visible"|"covered_by_overlay"|"value_mismatch",
+  "beforeState": { "visible": <bool>, "covered": <bool> },   // optional, omit if unknown
+  "afterState":  { "visible": <bool>, "domChanged": <bool> } // optional, omit if unknown
+}
+
+errorShape rules:
+- "selector_not_found": resolver returned nothing / element removed / renamed.
+- "timeout_on_visible": element found & visible but click never completed.
+- "covered_by_overlay": element present but an overlay/modal intercepts the click
+  (new banner, tour, cookie consent, promo popup).
+- "value_mismatch": the step was a verify/assert that saw a different value.
+
+If failureClassification !== "test_drift", OMIT driftSignals entirely (do not
+include null — just skip the key).
+
+DRIFT EXAMPLE:
+Input: status=failed, errors=[], stepTimeline=[{step:12,action:"click",desc:"click podgotovka k VOUD",status:"failed",error:"Timeout 10000ms exceeded waiting for locator"}]
+Output (excerpt):
+{
+  ...
+  "failureClassification": "test_drift",
+  "classificationEvidence": ["no console/network errors", "step timed out waiting for a previously-resolving selector"],
+  "driftSignals": {
+    "urlPattern": "/tutors/:id",
+    "targetElementKey": "button:Подготовка к ВОУД",
+    "errorShape": "selector_not_found"
+  }
+}
+
 FEW-SHOT EXAMPLE:
 
 Input: status=completed, errors=[{type:"console",message:"TypeError: Cannot read property 'map' of undefined",source:"app.js:142"}], logs=["Navigated to /dashboard","Clicked Reports tab","Error in console"], networkLogs=[{url:"/api/reports",status:500,method:"GET"}]
@@ -404,6 +441,7 @@ ${context}`;
         column: bug.column || undefined,
       }));
 
+      const failureClassification = this.validateClassification(parsed.failureClassification);
       return {
         summary: parsed.summary || 'No summary provided',
         bugs,
@@ -414,8 +452,15 @@ ${context}`;
         // V14: Step-aware root cause analysis
         rootCauseStep: typeof parsed.rootCauseStep === 'number' ? parsed.rootCauseStep : null,
         causedByStep: typeof parsed.causedByStep === 'number' ? parsed.causedByStep : null,
-        failureClassification: this.validateClassification(parsed.failureClassification),
+        failureClassification,
         classificationEvidence: Array.isArray(parsed.classificationEvidence) ? parsed.classificationEvidence : [],
+        // Phase-1: drift signals — only meaningful when classification is test_drift.
+        // Even if the LLM mistakenly returns driftSignals on a non-drift classification,
+        // we strip them here so the downstream aggregator never sees noise.
+        driftSignals:
+          failureClassification === 'test_drift'
+            ? this.validateDriftSignals(parsed.driftSignals)
+            : null,
       };
     } catch (error) {
       logger.error('[AI_SERVICE] Failed to parse AI response', { error });
@@ -455,6 +500,47 @@ ${context}`;
   private validateClassification(classification: any): 'flaky' | 'real_bug' | 'environment' | 'test_drift' | null {
     const valid = ['flaky', 'real_bug', 'environment', 'test_drift'];
     return valid.includes(classification) ? classification : null;
+  }
+
+  /**
+   * Validate / shape the `driftSignals` object returned by the LLM.
+   * Only the three required primitives (urlPattern, targetElementKey,
+   * errorShape) are strict. `beforeState` / `afterState` are optional
+   * and silently dropped if malformed — they're diagnostic only.
+   *
+   * Returns null if any required field is missing/invalid. The upstream
+   * caller (parseAIResponse) already guards on
+   * `failureClassification === 'test_drift'` before invoking this helper,
+   * so null here means "the LLM labelled it drift but didn't produce
+   * usable signals" — Regression Doctor will ignore the record.
+   */
+  private validateDriftSignals(raw: any): import('@/types').DriftSignals | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const urlPattern = typeof raw.urlPattern === 'string' ? raw.urlPattern.trim() : '';
+    const targetElementKey = typeof raw.targetElementKey === 'string' ? raw.targetElementKey.trim() : '';
+    const validShapes = ['selector_not_found', 'timeout_on_visible', 'covered_by_overlay', 'value_mismatch'];
+    const errorShape = validShapes.includes(raw.errorShape) ? raw.errorShape : null;
+    if (!urlPattern || !targetElementKey || !errorShape) return null;
+
+    const normalizeState = (s: any): { visible: boolean; covered?: boolean; domChanged?: boolean } | undefined => {
+      if (!s || typeof s !== 'object') return undefined;
+      if (typeof s.visible !== 'boolean') return undefined;
+      const out: { visible: boolean; covered?: boolean; domChanged?: boolean } = { visible: s.visible };
+      if (typeof s.covered === 'boolean') out.covered = s.covered;
+      if (typeof s.domChanged === 'boolean') out.domChanged = s.domChanged;
+      return out;
+    };
+
+    const before = normalizeState(raw.beforeState);
+    const after = normalizeState(raw.afterState);
+
+    return {
+      urlPattern,
+      targetElementKey,
+      errorShape: errorShape as import('@/types').DriftSignals['errorShape'],
+      ...(before ? { beforeState: { visible: before.visible, covered: before.covered ?? false } } : {}),
+      ...(after ? { afterState: { visible: after.visible, domChanged: after.domChanged ?? false } } : {}),
+    };
   }
 
   /**

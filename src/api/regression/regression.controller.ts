@@ -7,11 +7,19 @@ import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/t
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { RegressionSaveService } from '@/services/testing/regression/regression-save.service';
+import {
+  applyDoctorFinding,
+  ApplyAccessError,
+  ApplyConflictError,
+  ApplyNotFoundError,
+} from '@/services/regression-doctor/apply.service';
+import { revertDoctorFinding } from '@/services/regression-doctor/revert.service';
 import { FullTestDataService } from '@/services/testing/ui/manual/full-test-data.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { Priority } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
+import { webSocketService } from '@/websocket/core/websocket.service';
 import { Request, Response } from 'express';
 
 /**
@@ -1152,6 +1160,455 @@ export async function getSharedReport(req: Request, res: Response): Promise<void
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to get shared report', { error });
     handleControllerError(res, error, 'Failed to get shared report');
+  }
+}
+
+/**
+ * List Regression Doctor findings for a specific run.
+ *
+ * GET /api/v1/regression/runs/:runId/doctor
+ *
+ * Phase-1: read-only. Returns every finding (open / applied / dismissed)
+ * so the UI can render full history for a run — the Bulk Fix UI filters
+ * client-side based on status. RLS enforces ownership; the query just
+ * scopes to the run.
+ */
+export async function getRunDoctorFindings(
+  req: AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    const { runId } = req.params;
+    if (!runId || typeof runId !== 'string') {
+      res.status(400).json({ success: false, error: 'runId is required' });
+      return;
+    }
+    const userId = getUserId(req);
+
+    // Ownership check — users can only see findings for runs they own.
+    // We verify via regression_runs.user_id rather than relying solely on
+    // RLS so we can return a clean 404 instead of an empty array when
+    // the user doesn't own the run.
+    const { data: run } = await supabaseAdmin
+      .from('regression_runs')
+      .select('id, user_id')
+      .eq('id', runId)
+      .maybeSingle();
+
+    if (!run) {
+      res.status(404).json({ success: false, error: 'Run not found' });
+      return;
+    }
+    if (run.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+
+    const { data: findings, error } = await supabaseAdmin
+      .from('regression_doctor_findings')
+      .select('*')
+      .eq('run_id', runId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch findings: ${error.message}`);
+    }
+
+    res.json({
+      success: true,
+      data: findings || [],
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get doctor findings', { error });
+    handleControllerError(res, error, 'Failed to get doctor findings');
+  }
+}
+
+/**
+ * Mark a Regression Doctor finding as dismissed.
+ *
+ * POST /api/v1/regression/doctor/findings/:findingId/dismiss
+ * body: { reason?: string }
+ *
+ * "Dismissed" means the user acknowledged the drift but does not want
+ * the patch applied (e.g. they're fixing it a different way). The
+ * finding stays in DB for observability but is hidden from "open"
+ * filters in the UI.
+ */
+export async function dismissDoctorFinding(
+  req: AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    const { findingId } = req.params;
+    const { reason } = req.body || {};
+
+    if (!findingId || typeof findingId !== 'string') {
+      res.status(400).json({ success: false, error: 'findingId is required' });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    // Verify ownership before update. We query + check instead of relying
+    // on RLS so a wrong-owner attempt gets a clean 404 rather than a
+    // silent 0-rows update.
+    const { data: finding } = await supabaseAdmin
+      .from('regression_doctor_findings')
+      .select('id, user_id, status')
+      .eq('id', findingId)
+      .maybeSingle();
+
+    if (!finding) {
+      res.status(404).json({ success: false, error: 'Finding not found' });
+      return;
+    }
+    if (finding.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+    if (finding.status !== 'open') {
+      res.status(409).json({
+        success: false,
+        error: `Finding already ${finding.status}`,
+      });
+      return;
+    }
+
+    const { error } = await supabaseAdmin
+      .from('regression_doctor_findings')
+      .update({
+        status: 'dismissed',
+        dismissed_reason: typeof reason === 'string' ? reason.slice(0, 500) : null,
+      })
+      .eq('id', findingId);
+
+    if (error) {
+      throw new Error(`Failed to dismiss finding: ${error.message}`);
+    }
+
+    res.json({ success: true, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to dismiss finding', { error });
+    handleControllerError(res, error, 'Failed to dismiss finding');
+  }
+}
+
+/**
+ * Apply a Regression Doctor finding's proposed patch to affected test cases.
+ *
+ * POST /api/v1/regression/doctor/findings/:findingId/apply
+ * body: { testCaseIds?: string[] }
+ *
+ * Behavior:
+ *   • If `testCaseIds` is omitted, the server applies to the full
+ *     `affected_test_ids` list from the finding.
+ *   • Per-test outcomes are returned even when some fail — the UI renders
+ *     a mixed summary ("Applied 13, skipped 2").
+ *   • The finding flips to `applied` iff at least one test was patched.
+ *   • Emits `regression:doctor:ready` so other open report tabs refresh
+ *     (same channel used when the doctor first populates findings).
+ *
+ * Typed errors from the service map to:
+ *   ApplyNotFoundError → 404
+ *   ApplyAccessError   → 403
+ *   ApplyConflictError → 409
+ * Everything else → 500 via handleControllerError.
+ */
+export async function applyDoctorFindingHandler(
+  req: AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    const { findingId } = req.params;
+    const { testCaseIds } = req.body || {};
+
+    if (!findingId || typeof findingId !== 'string') {
+      res.status(400).json({ success: false, error: 'findingId is required' });
+      return;
+    }
+    // Accept undefined or a string array. Any other shape is a 400 so the
+    // client finds the bug early — silently falling back to "apply to all"
+    // on a malformed payload is worse than a clean validation error.
+    if (testCaseIds !== undefined) {
+      if (!Array.isArray(testCaseIds) || !testCaseIds.every((id) => typeof id === 'string')) {
+        res.status(400).json({
+          success: false,
+          error: 'testCaseIds must be an array of strings when provided',
+        });
+        return;
+      }
+    }
+
+    const userId = getUserId(req);
+
+    const result = await applyDoctorFinding({
+      findingId,
+      userId,
+      testCaseIds: Array.isArray(testCaseIds) ? testCaseIds : undefined,
+    });
+
+    // Nudge the UI — same event the doctor job emits on first run, so all
+    // open report tabs for this run re-fetch findings + executions.
+    // The finding row carries the runId, so we need to read it back quickly
+    // to route the event. Cheap single-row read; acceptable even on the
+    // happy path because the controller already did heavy lifting.
+    try {
+      const { data: finding } = await supabaseAdmin
+        .from('regression_doctor_findings')
+        .select('run_id')
+        .eq('id', findingId)
+        .maybeSingle();
+      if (finding?.run_id) {
+        webSocketService.emitToUser(userId, 'regression:doctor:ready', {
+          runId: finding.run_id,
+          // findingsCount here means "any doctor-related state changed"; the
+          // client re-fetches, so the number is informational.
+          findingsCount: 0,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (wsErr) {
+      // Non-fatal: the DB update already landed.
+      logger.debug('[REGRESSION_API] WS nudge failed post-apply', {
+        findingId,
+        error: wsErr instanceof Error ? wsErr.message : String(wsErr),
+      });
+    }
+
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date(),
+    });
+
+    logger.info('[REGRESSION_API] Doctor finding applied', {
+      findingId,
+      userId,
+      totalRequested: result.totalRequested,
+      applied: result.results.filter((r) => r.status === 'applied').length,
+      skipped: result.results.filter((r) => r.status === 'skipped').length,
+      errored: result.results.filter((r) => r.status === 'error').length,
+      findingStatus: result.findingStatus,
+    });
+  } catch (error) {
+    if (error instanceof ApplyNotFoundError) {
+      res.status(404).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof ApplyAccessError) {
+      res.status(403).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof ApplyConflictError) {
+      res.status(409).json({ success: false, error: error.message });
+      return;
+    }
+    logger.error('[REGRESSION_API] Failed to apply doctor finding', { error });
+    handleControllerError(res, error, 'Failed to apply doctor finding');
+  }
+}
+
+/**
+ * Revert a previously-applied Regression Doctor finding.
+ *
+ * POST /api/v1/regression/doctor/findings/:findingId/revert
+ * body: { snapshotIds?: string[] }
+ *
+ * Restores each patched test case to its pre-apply `steps_json` using
+ * the snapshots written during the original Bulk Apply. Safety
+ * guarantees (see revert.service.ts):
+ *   • Tests edited manually after the apply are skipped with
+ *     `modified_after_apply` — we never silently overwrite user work.
+ *   • Optimistic concurrency prevents clobbering parallel writes.
+ *   • Successfully reverted snapshots are deleted (the apply they
+ *     documented no longer exists). Skipped snapshots stay so the
+ *     audit trail reflects "we tried and couldn't".
+ *   • Finding flips back to 'open' iff EVERY snapshot was reverted
+ *     (full revert). Partial reverts keep it 'applied'.
+ *
+ * Emits `regression:doctor:ready` so any open report tab re-fetches
+ * the finding state.
+ *
+ * Typed errors from the service map to:
+ *   ApplyNotFoundError → 404
+ *   ApplyAccessError   → 403
+ *   ApplyConflictError → 409 (not applied / no snapshots / empty selection)
+ */
+export async function revertDoctorFindingHandler(
+  req: AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    const { findingId } = req.params;
+    const { snapshotIds } = req.body || {};
+
+    if (!findingId || typeof findingId !== 'string') {
+      res.status(400).json({ success: false, error: 'findingId is required' });
+      return;
+    }
+    if (snapshotIds !== undefined) {
+      if (
+        !Array.isArray(snapshotIds) ||
+        !snapshotIds.every((id) => typeof id === 'string')
+      ) {
+        res.status(400).json({
+          success: false,
+          error: 'snapshotIds must be an array of strings when provided',
+        });
+        return;
+      }
+    }
+
+    const userId = getUserId(req);
+
+    const result = await revertDoctorFinding({
+      findingId,
+      userId,
+      snapshotIds: Array.isArray(snapshotIds) ? snapshotIds : undefined,
+    });
+
+    // WS nudge — same channel Apply uses. Cheap run_id lookup off the
+    // finding row; non-fatal if it misses.
+    try {
+      const { data: finding } = await supabaseAdmin
+        .from('regression_doctor_findings')
+        .select('run_id')
+        .eq('id', findingId)
+        .maybeSingle();
+      if (finding?.run_id) {
+        webSocketService.emitToUser(userId, 'regression:doctor:ready', {
+          runId: finding.run_id,
+          findingsCount: 0,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (wsErr) {
+      logger.debug('[REGRESSION_API] WS nudge failed post-revert', {
+        findingId,
+        error: wsErr instanceof Error ? wsErr.message : String(wsErr),
+      });
+    }
+
+    res.json({ success: true, data: result, timestamp: new Date() });
+
+    logger.info('[REGRESSION_API] Doctor finding reverted', {
+      findingId,
+      userId,
+      totalRequested: result.totalRequested,
+      reverted: result.results.filter((r) => r.status === 'reverted').length,
+      skipped: result.results.filter((r) => r.status === 'skipped').length,
+      errored: result.results.filter((r) => r.status === 'error').length,
+      findingStatus: result.findingStatus,
+      remainingSnapshots: result.remainingSnapshots,
+    });
+  } catch (error) {
+    if (error instanceof ApplyNotFoundError) {
+      res.status(404).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof ApplyAccessError) {
+      res.status(403).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof ApplyConflictError) {
+      res.status(409).json({ success: false, error: error.message });
+      return;
+    }
+    logger.error('[REGRESSION_API] Failed to revert doctor finding', { error });
+    handleControllerError(res, error, 'Failed to revert doctor finding');
+  }
+}
+
+/**
+ * List pre-apply snapshots captured for a Regression Doctor finding.
+ *
+ * GET /api/v1/regression/doctor/findings/:findingId/snapshots
+ *
+ * Returned rows back the "Review what changed" UI — one snapshot per
+ * test case that was successfully patched by a Bulk Apply. Each row
+ * carries the exact `steps_before` / `steps_after` JSON blobs so the
+ * frontend can render a step-level diff without re-deriving it.
+ *
+ * Ownership is enforced via the finding's user_id before we hit the
+ * snapshots table — a wrong-owner attempt gets a clean 403 rather
+ * than a silent empty array.
+ */
+export async function getDoctorFindingSnapshots(
+  req: AuthenticatedRequest,
+  res: Response,
+): Promise<void> {
+  try {
+    const { findingId } = req.params;
+    if (!findingId || typeof findingId !== 'string') {
+      res.status(400).json({ success: false, error: 'findingId is required' });
+      return;
+    }
+
+    const userId = getUserId(req);
+
+    // Ownership check via the parent finding. Explicit query keeps the
+    // 404 / 403 response semantics clean — RLS alone would return an
+    // empty array in both cases and the UI can't tell them apart.
+    const { data: finding } = await supabaseAdmin
+      .from('regression_doctor_findings')
+      .select('id, user_id')
+      .eq('id', findingId)
+      .maybeSingle();
+
+    if (!finding) {
+      res.status(404).json({ success: false, error: 'Finding not found' });
+      return;
+    }
+    if (finding.user_id !== userId) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+
+    const { data: snapshots, error } = await supabaseAdmin
+      .from('regression_doctor_apply_snapshots')
+      .select(
+        'id, test_case_id, steps_before, steps_after, change_description, before_updated_at, created_at',
+      )
+      .eq('finding_id', findingId)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      throw new Error(`Failed to fetch snapshots: ${error.message}`);
+    }
+
+    // Hydrate with test case names so the UI doesn't need a second
+    // round-trip. Small N (≤ affected test count), single batched query.
+    const testCaseIds = Array.from(
+      new Set((snapshots || []).map((s) => s.test_case_id as string)),
+    );
+    const namesMap = new Map<string, string>();
+    if (testCaseIds.length > 0) {
+      const { data: names } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, name')
+        .in('id', testCaseIds);
+      for (const row of names || []) {
+        namesMap.set(row.id as string, (row.name as string) || '');
+      }
+    }
+
+    const payload = (snapshots || []).map((s) => ({
+      id: s.id,
+      testCaseId: s.test_case_id,
+      testCaseName: namesMap.get(s.test_case_id as string) || null,
+      stepsBefore: s.steps_before,
+      stepsAfter: s.steps_after,
+      changeDescription: s.change_description,
+      beforeUpdatedAt: s.before_updated_at,
+      createdAt: s.created_at,
+    }));
+
+    res.json({ success: true, data: payload, timestamp: new Date() });
+  } catch (error) {
+    logger.error('[REGRESSION_API] Failed to get doctor snapshots', { error });
+    handleControllerError(res, error, 'Failed to get doctor snapshots');
   }
 }
 

@@ -27,6 +27,40 @@ import { Request, Response } from 'express';
 const WARMUP_PREFIX = 'mobile_warmup:';
 const WARMUP_TTL = 900; // 15 minutes
 
+/**
+ * Runner-side Socket.IO handshake auth for the browser to attach.
+ *
+ * The mobile runner has an `io.use()` middleware that rejects connections
+ * without `auth.apiKey` when `API_KEY` is set on its side (runner env). We
+ * return the key in the warmup response so the frontend can pass it via
+ * `io(url, { auth: { apiKey } })`. Empty string when the runner is in open-
+ * auth mode (dev) — the middleware short-circuits on missing config.
+ *
+ * Yes, this value ends up in the browser. It's intentional — the runner is
+ * a per-tenant preview service behind nginx + TLS, not a zero-trust endpoint.
+ * If stronger isolation becomes required we'll proxy WebSocket traffic
+ * through this backend and drop the shared key entirely.
+ */
+function getRunnerAuth(): string {
+  return env.MOBILE_RUNNER_API_KEY ?? '';
+}
+
+/**
+ * Derive the current WebSocket URL for the runner from the **live** env.
+ *
+ * Why not just read `existing.runnerSocketUrl` from Redis? Because warmup
+ * entries live 15 minutes, so if the runner moves (env change, DNS flip,
+ * fresh deploy that repointed `MOBILE_RUNNER_URL`) every cached entry keeps
+ * handing the old URL to the frontend until the TTL elapses. That exact
+ * class of regression ate a prod debugging session on 2026-04-21 — the
+ * only fix was a manual `redis-cli flushdb`. Now we recompute on every
+ * response so cache staleness can never again point browsers at a dead
+ * runner.
+ */
+function currentRunnerSocketUrl(): string {
+  return env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+}
+
 type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
 const VALID_PERMISSION_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
 
@@ -80,6 +114,30 @@ export interface WarmupData {
   appStoragePath?: string;
 }
 
+/**
+ * Emit a `preview:session:progress` WebSocket event so the AI editor's
+ * PreviewLoadingProgress component can render a real progress bar while
+ * the emulator warms up. Mirrors the event shape already used by the web
+ * preview path. Non-fatal — a socket hiccup must never fail warmup.
+ *
+ * Stage strings recognised by the frontend (in order):
+ *   launching_browser → stage 1 (emulator ready)
+ *   loading_page      → stage 2 (APK install in progress)
+ *   extracting_elements → stage 3 (launching app)
+ *   ready             → stage 4 (complete)
+ */
+function emitWarmupProgress(
+  userId: string,
+  stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready',
+  progress: number,
+): void {
+  try {
+    webSocketService.emitToUser(userId, 'preview:session:progress', { stage, progress });
+  } catch {
+    // Best-effort — never let a socket error break warmup.
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WARM-UP SESSION
 // ═══════════════════════════════════════════════════════════════════════════
@@ -92,6 +150,7 @@ export interface WarmupData {
  * Returns: { sessionId, runnerSocketUrl }
  */
 export async function warmupSession(req: Request, res: Response): Promise<void> {
+  const warmupStart = Date.now();
   const userId = req.user?.id;
   if (!userId) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -111,6 +170,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+
+  logger.info('[MOBILE_SESSION] warmup request', {
+    userId,
+    projectId,
+    platform,
+    appPackage: appPackage ?? null,
+    runnerUrl: env.MOBILE_RUNNER_URL,
+    runnerAuthEnabled: !!env.MOBILE_RUNNER_API_KEY,
+  });
 
   try {
     // Feature flag check
@@ -137,10 +205,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         const parsed: WarmupData = JSON.parse(waitResult);
         if (parsed.sessionId && parsed.sessionId !== '_booting') {
           await redisConnection.del(lockKey);
+          const runnerSocketUrl = currentRunnerSocketUrl();
+          logger.info('[MOBILE_SESSION] warmup response (path=concurrent_wait)', {
+            userId, projectId,
+            sessionId: parsed.sessionId,
+            runnerSocketUrl,
+            tookMs: Date.now() - warmupStart,
+          });
           res.json({
             success: true,
             sessionId: parsed.sessionId,
-            runnerSocketUrl: parsed.runnerSocketUrl,
+            runnerSocketUrl,
+            runnerApiKey: getRunnerAuth(),
             platform: parsed.platform,
             reused: true,
           });
@@ -181,11 +257,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         if (bootedSessionId) {
           const refreshRaw = await redisConnection.get(redisKey);
           const refreshed: WarmupData = refreshRaw ? JSON.parse(refreshRaw) : existing;
-          logger.info('[MOBILE_SESSION] Auto-boot completed, reusing session', { projectId, sessionId: bootedSessionId });
+          const runnerSocketUrl = currentRunnerSocketUrl();
+          logger.info('[MOBILE_SESSION] warmup response (path=booting_wait)', {
+            userId, projectId,
+            sessionId: bootedSessionId,
+            runnerSocketUrl,
+            tookMs: Date.now() - warmupStart,
+          });
           res.json({
             success: true,
             sessionId: bootedSessionId,
-            runnerSocketUrl: refreshed.runnerSocketUrl,
+            runnerSocketUrl,
+            runnerApiKey: getRunnerAuth(),
             platform: refreshed.platform,
             reused: true,
           });
@@ -219,6 +302,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // Run install+launch_app BEFORE responding, so the preview stream shows
           // the app already open. On a reused session this usually hits the fast
           // path (Redis match or device check) and just issues launch_app.
+          emitWarmupProgress(userId, 'launching_browser', 15);
           try {
             await installAppOnSession(client, existing.sessionId, projectId, userId, appPackage);
           } catch (err) {
@@ -228,11 +312,20 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          emitWarmupProgress(userId, 'ready', 100);
 
+          const runnerSocketUrl = currentRunnerSocketUrl();
+          logger.info('[MOBILE_SESSION] warmup response (path=cached_reuse)', {
+            userId, projectId,
+            sessionId: existing.sessionId,
+            runnerSocketUrl,
+            tookMs: Date.now() - warmupStart,
+          });
           res.json({
             success: true,
             sessionId: existing.sessionId,
-            runnerSocketUrl: existing.runnerSocketUrl,
+            runnerSocketUrl,
+            runnerApiKey: getRunnerAuth(),
             platform: existing.platform,
             reused: true,
           });
@@ -272,6 +365,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       session = await client.createSession(platform);
     }
 
+    // Emulator is up — nudge the loader past the "preparing env" stage.
+    emitWarmupProgress(userId, 'launching_browser', 15);
+
     // Propagate project-level permission policy to the runner. Best-effort:
     // the runner defaults to 'auto_allow' when the patch fails, which is the
     // same behaviour a newly-created project gets, so we never block warmup
@@ -288,8 +384,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       });
     }
 
-    // Derive socket URL from runner URL
-    const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+    const runnerSocketUrl = currentRunnerSocketUrl();
 
     // Store mapping in Redis
     const warmupData: WarmupData = {
@@ -329,11 +424,20 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    emitWarmupProgress(userId, 'ready', 100);
+
+    logger.info('[MOBILE_SESSION] warmup response (path=fresh_create)', {
+      userId, projectId,
+      sessionId: session.sessionId,
+      runnerSocketUrl,
+      tookMs: Date.now() - warmupStart,
+    });
 
     res.status(201).json({
       success: true,
       sessionId: session.sessionId,
       runnerSocketUrl,
+      runnerApiKey: getRunnerAuth(),
       platform,
       reused: false,
     });
@@ -1019,7 +1123,7 @@ export async function autoBootAndInstall(
       // Set a "booting" placeholder in Redis BEFORE starting the emulator.
       // This prevents warmupSession from creating a duplicate emulator if
       // the user opens the editor while the boot is still in progress.
-      const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+      const runnerSocketUrl = currentRunnerSocketUrl();
       const bootingData: WarmupData = {
         sessionId: '_booting',
         runnerUrl: env.MOBILE_RUNNER_URL,
@@ -1087,6 +1191,9 @@ async function installAppOnSession(
   userId: string,
   appPackageOverride?: string,
 ): Promise<void> {
+  // Nudge the UI past "preparing env" as soon as install logic starts.
+  emitWarmupProgress(userId, 'launching_browser', 25);
+
   const project = await ProjectService.getProject(projectId, userId);
   const mobileApp = project?.settings?.mobileApp;
 
@@ -1122,6 +1229,7 @@ async function installAppOnSession(
       projectId,
       package: warmup.installedPackage,
     });
+    emitWarmupProgress(userId, 'extracting_elements', 75);
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName: appPackageOverride || warmup.installedPackage } },
     ], { timeoutMs: 60_000 });
@@ -1144,6 +1252,7 @@ async function installAppOnSession(
           projectId,
           package: knownPackage,
         });
+        emitWarmupProgress(userId, 'extracting_elements', 75);
         await client.executeBatchCommands(sessionId, [
           { type: 'launch_app', params: { packageName: knownPackage } },
         ], { timeoutMs: 60_000 });
@@ -1175,6 +1284,7 @@ async function installAppOnSession(
     originalName: mobileApp.originalName,
     oldPackage: warmup?.installedPackage || '(none)',
   });
+  emitWarmupProgress(userId, 'loading_page', 45);
 
   const fileBuffer = await MobileAppStorageService.downloadApp(mobileApp.storagePath);
   const uploaded = await client.uploadApp(fileBuffer, mobileApp.originalName);
@@ -1212,6 +1322,7 @@ async function installAppOnSession(
   // Gives us one deterministic code path regardless of whether we knew the
   // package name up front.
   if (packageName) {
+    emitWarmupProgress(userId, 'extracting_elements', 75);
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName } },
     ], { timeoutMs: 60_000 });
@@ -1453,6 +1564,15 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                 commands.push({
                   type: 'type_text',
                   params: {
+                    // Forward coordinates so the runner's dispatch picks the
+                    // 'coordinates' branch (re-tap + waitForKeyboardReady +
+                    // typeText) instead of 'direct' blind input. Without x/y
+                    // the IME may still be animating after the preceding tap
+                    // and the first characters get dropped — VTE then reads
+                    // back stale text and burns two retries typing the same
+                    // wrong value.
+                    x: centerX,
+                    y: centerY,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
                   },

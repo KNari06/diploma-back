@@ -669,13 +669,22 @@ export class PreviewSessionService {
           // Non-fatal
         }
 
-        // Attach auth-gate detector. Emits preview:auth:required the
-        // first time the preview lands on a login URL or sees a password
-        // input, so the frontend can prompt the user to pick an existing
-        // Login resource or record a new one.
+        // Attach auth-gate detector. Emits preview:auth:required when
+        // the page looks like a login gate, so the frontend can prompt
+        // the user to pick an existing Login resource or record a new one.
+        //
+        // v2: pass projectId/userId so the detector can read workspace-
+        // configured URL patterns (workspace_resource_defaults.url_pattern)
+        // as an additional positive signal. Also pass an isRecording
+        // probe — while the user is mid-recording we silence the detector
+        // so it doesn't prompt during the very act of capturing a login.
         try {
           const { attachAuthDetector } = await import('./auth-detector');
-          attachAuthDetector(page, sessionId);
+          attachAuthDetector(page, sessionId, {
+            projectId,
+            userId,
+            isRecording: () => this.sessions.get(sessionId)?.recording === true,
+          });
         } catch {
           // Non-fatal — recording still works without the detector.
         }
@@ -922,9 +931,15 @@ export class PreviewSessionService {
 
       // Re-attach auth detector after reset — session id stays the same,
       // the detector is idempotent via WeakSet on the new page handle.
+      // Pass the same context it had originally so workspace URL
+      // patterns and the recording-suppression guard keep working.
       try {
         const { attachAuthDetector } = await import('./auth-detector');
-        attachAuthDetector(newPage, sessionId);
+        attachAuthDetector(newPage, sessionId, {
+          projectId: session.projectId,
+          userId: session.userId,
+          isRecording: () => this.sessions.get(sessionId)?.recording === true,
+        });
       } catch {
         // Non-fatal
       }
@@ -1937,14 +1952,10 @@ export class PreviewSessionService {
       if (probed.resolvedVia === 'directHit') return null;
       if (!probed.boundingBox) return null;
 
-      const label = (
-        probed.ariaLabel
-        || probed.labelText
-        || probed.text
-        || probed.placeholder
-        || probed.role
-        || probed.tag
-      )?.slice(0, 40) || probed.tag;
+      // Hover caps label at 40 chars to fit the floating tooltip; record/DB path uses 60.
+      // `getProbedLabel` returns null for literal tag-only fallbacks so we can surface a
+      // 'element' placeholder instead of "div"/"svg".
+      const label = RecordingCaptureService.getProbedLabel(probed, 40) || 'element';
 
       return {
         tag: probed.tag,
@@ -2743,7 +2754,12 @@ export class PreviewSessionService {
         // rebase the trap baseline on the popup's landing URL.
         try {
           const { attachAuthDetector } = await import('./auth-detector');
-          attachAuthDetector(newPage, previewSessionId);
+          const sessionForPopup = this.sessions.get(previewSessionId);
+          attachAuthDetector(newPage, previewSessionId, {
+            projectId: sessionForPopup?.projectId,
+            userId: sessionForPopup?.userId,
+            isRecording: () => this.sessions.get(previewSessionId)?.recording === true,
+          });
         } catch { /* non-fatal */ }
         try {
           const { attachExternalNavTrap, markIntentionalGoto } = await import('./external-nav-trap');

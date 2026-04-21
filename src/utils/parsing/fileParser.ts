@@ -229,6 +229,10 @@ export async function parseFile(filePath: string, originalName: string): Promise
       case 'md':
       case 'markdown':
         return await parseMarkdownFile(filePath);
+      case 'yaml':
+      case 'yml':
+        // No OpenAPI adapter claimed it — treat as plain text.
+        return await parseTextFile(filePath);
       default:
         // Fallback to text parsing
         logger.warn('Unknown file type, treating as text', { extension });
@@ -245,7 +249,8 @@ export async function parseFile(filePath: string, originalName: string): Promise
  * Validate file type
  */
 export function isValidFileType(fileName: string): boolean {
-  const validExtensions = ['txt', 'pdf', 'docx', 'json', 'md', 'markdown'];
+  // yaml/yml added for OpenAPI specs; format-adapter layer routes them.
+  const validExtensions = ['txt', 'pdf', 'docx', 'json', 'md', 'markdown', 'yaml', 'yml'];
   const extension = fileName.split('.').pop()?.toLowerCase();
   return extension ? validExtensions.includes(extension) : false;
 }

@@ -19,7 +19,7 @@ import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapp
 import { generateEmbeddings } from '@/services/ai/core/embedding.service';
 
 /** Credits charged for generating a bug report when bugs are found */
-const BUG_REPORT_CREDITS = 5;
+export const BUG_REPORT_CREDITS = 5;
 
 // Types for better type safety
 interface BugSeverity {
@@ -97,10 +97,12 @@ export class AIAnalysisJobHandler {
         integrationContext: integrationContext || undefined,
       });
 
-      // Save AI summary to database
-      await dbAdminService.updateTestResult(testResultId, {
-        ai_summary: aiSummary,
-      });
+      // Idempotency guard: if a previous job run already charged for the bug
+      // report, don't charge again on BullMQ retry. The flag lives inside
+      // ai_summary (JSONB) so no schema migration is needed — attempts=2 on
+      // this queue otherwise means transient post-deduct failures (WebSocket,
+      // Jira push, DB hiccups) re-run the whole handler and re-charge.
+      const alreadyCharged = !!(testResult as any)?.ai_summary?.bugReportChargedAt;
 
       // Emit WebSocket: AI bugs found (one by one, non-fatal)
       if (aiSummary.bugs && aiSummary.bugs.length > 0) {
@@ -122,9 +124,18 @@ export class AIAnalysisJobHandler {
           }
         }
 
-        // Charge for bug report generation (5 credits)
+        // Charge for bug report generation (5 credits) — one-time per test_result.
         const bugReportUserId = testResult?.tests?.user_id;
-        if (bugReportUserId) {
+        if (bugReportUserId && !alreadyCharged) {
+          // Persist the charge marker BEFORE deducting. If the deduct succeeds
+          // and a later step fails, retry sees the marker and skips. If the
+          // deduct itself fails, the marker is still set — but that's the
+          // safer failure mode (user is NOT charged on retry either).
+          const chargedAt = new Date().toISOString();
+          await dbAdminService.updateTestResult(testResultId, {
+            ai_summary: { ...aiSummary, bugReportChargedAt: chargedAt, bugReportCredits: BUG_REPORT_CREDITS },
+          });
+
           try {
             await CreditCostTrackerService.deductCreditsForTest({
               userId: bugReportUserId,
@@ -148,8 +159,22 @@ export class AIAnalysisJobHandler {
               testResultId,
             });
           }
+        } else if (alreadyCharged) {
+          logger.info('[AI-ANALYSIS] Skipping bug report charge — already charged on prior attempt', {
+            testResultId,
+            chargedAt: (testResult as any)?.ai_summary?.bugReportChargedAt,
+          });
         }
       }
+
+      // Save AI summary to database (after charge — preserve bugReportChargedAt
+      // marker if it was set in the block above).
+      const finalSummary = alreadyCharged
+        ? { ...aiSummary, bugReportChargedAt: (testResult as any).ai_summary.bugReportChargedAt, bugReportCredits: (testResult as any).ai_summary.bugReportCredits ?? BUG_REPORT_CREDITS }
+        : aiSummary;
+      await dbAdminService.updateTestResult(testResultId, {
+        ai_summary: finalSummary,
+      });
 
       // Emit WebSocket: AI analysis completed (non-fatal)
       try {

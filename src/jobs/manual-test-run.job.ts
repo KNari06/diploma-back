@@ -487,6 +487,25 @@ export class ManualTestRunJobHandler {
         // Continue execution - test result is saved, WebSocket events sent
       }
 
+      // Phase 5 — auto-learn from trace. Only on successful runs (this path
+      // is handleSuccessfulTest). Feature-flagged per project inside the
+      // handler, so unconditional enqueue is cheap. Never fails the test.
+      // project_id isn't passed into this method, so we resolve it via the
+      // already-imported dbAdminService — same pattern ai-analysis.job uses.
+      try {
+        const test = (await dbAdminService.getTest(testId)) as { project_id?: string } | null;
+        const projectIdForLearn = test?.project_id;
+        if (projectIdForLearn) {
+          await QueueManager.addAutoLearnJob({ testId, projectId: projectIdForLearn });
+          logger.debug(`[TEST-RUN] Auto-learn job queued`, { testId, projectId: projectIdForLearn });
+        }
+      } catch (learnJobError) {
+        logger.warn(`[TEST-RUN] Failed to queue auto-learn job (non-fatal)`, {
+          error: learnJobError instanceof Error ? learnJobError.message : String(learnJobError),
+          testId,
+        });
+      }
+
       // ///improvement: Update overall test status synchronously to prevent race condition
       // This ensures test status is updated immediately after result is created
       try {

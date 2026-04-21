@@ -505,13 +505,17 @@ export async function handleGeneralChat(
   // Launch all independent fetches in parallel
   const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult, integrationResult] =
     await Promise.allSettled([
-      // 1. KB search (non-fatal)
-      searchKB(message, projectId, { matchThreshold: 0.45, matchCount: 5 })
+      // 1. KB search (non-fatal) — telemetry fields let us attribute feedback later
+      searchKB(message, projectId, {
+        matchThreshold: 0.45,
+        matchCount: 5,
+        telemetry: { userId, sessionId: chatSessionId ?? null, callSite: 'chat-general' },
+      })
         .catch((err: Error) => {
           logger.warn('[GENERAL_CHAT] KB search failed, continuing without KB context', {
             error: err.message,
           });
-          return { chunks: [], sources: { global: [], project: [] } };
+          return { chunks: [], citations: [], sources: { global: [], project: [] } };
         }),
 
       // 2. Agent memory — summaries from old conversations
@@ -1335,10 +1339,19 @@ You can still help with general questions, saved test cases, and test management
       },
     ]);
 
-    // Extract timestamps: first is user message, second is AI reply
+    // Extract timestamps + IDs: first is user message, second is AI reply
     if (timestamps.length >= 2) {
-      userMessageTimestamp = timestamps[0];
-      aiReplyTimestamp = timestamps[1];
+      userMessageTimestamp = timestamps[0].created_at;
+      aiReplyTimestamp = timestamps[1].created_at;
+
+      // Link the assistant message to the retrieval event we logged earlier.
+      // Fire-and-forget — telemetry must never block the response.
+      const aiMessageId = timestamps[1].id;
+      if (chatSessionId && aiMessageId) {
+        import('@/services/kb/retrieval-telemetry.service')
+          .then((mod) => mod.linkMessageToLastRetrieval(chatSessionId, aiMessageId))
+          .catch(() => { /* telemetry is non-fatal */ });
+      }
     }
 
     // Auto-generate title for new chats (after first user message)

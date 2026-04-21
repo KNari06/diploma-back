@@ -120,35 +120,116 @@ const dismissViaRemove = (rootSelector: string) =>
     }
   };
 
+/**
+ * Inject a persistent `<style>` tag that neutralises the overlay via CSS.
+ * Works where `dismissViaRemove` fails: React tour libraries (Joyride,
+ * Shepherd, Driver) re-mount removed portals on every render, which
+ * exhausts addLocatorHandler's DISMISS_TIMES_CAP (5) and lets the
+ * overlay intercept the next click — the exact pathology seen in
+ * production Repetino runs (onboarding joyride re-mounting between
+ * every agent click → 22+ Playwright retries, action times out 10s).
+ *
+ * CSS injection is idempotent (same ID replaces prior tag) and
+ * stateless from React's perspective — the `<style>` lives outside
+ * the React subtree so reconciler never undoes it. `!important` beats
+ * inline styles the library sets (Joyride writes z-index inline).
+ * Pointer-events: none is the critical one — it lets clicks pass
+ * THROUGH the overlay to the intended target without actually hiding
+ * the visual (harmless in headless). Display: none is belt-and-
+ * suspenders for snapshotting tools that trust visibility over
+ * pointer interactivity.
+ *
+ * Returns true if the style tag was installed (or already present).
+ */
+const dismissViaCssOverride = (id: string, css: string) =>
+  async (page: Page): Promise<boolean> => {
+    try {
+      return await page.evaluate(
+        ({ id, css }) => {
+          // @ts-expect-error — browser context
+          let tag = document.getElementById(id) as any;
+          if (!tag) {
+            // @ts-expect-error — browser context
+            tag = document.createElement('style');
+            tag.id = id;
+            // @ts-expect-error — browser context
+            (document.head || document.documentElement).appendChild(tag);
+          }
+          if (tag.textContent !== css) tag.textContent = css;
+          return true;
+        },
+        { id, css },
+      );
+    } catch {
+      return false;
+    }
+  };
+
 // ─── Known overlay patterns ──────────────────────────────────────────────
 
 // Ordering rationale (applies to every pattern):
-//   1. dismissViaRemove FIRST — surgical, zero side effects: touches only
-//      the tour library's own DOM subtree.
-//   2. dismissViaCloseButton — also scoped to the tour library.
-//   3. dismissViaEscape has been REMOVED from every pattern. Rationale:
-//      `page.keyboard.press('Escape')` is a page-wide keyboard event,
-//      not a tour-library action. It closes every overlay listening for
-//      Escape — which includes every Radix/Headless/shadcn Dialog (the
-//      whole "Купить урок" modal family). A repro: on Repetino the
-//      tutors page ships a dormant joyride portal; when the user opens
-//      the purchase modal on top and the agent tries a click, the
-//      joyride addLocatorHandler fires, Escape closes the PURCHASE
-//      modal, refs detach, click times out 10s waiting for stale
-//      `[data-agent-ref="e217"]`. See terminal log
-//      2026-04-19 17:16:06–17:16:23. dismissViaRemove would have worked
-//      on joyride alone and never touched the purchase modal.
+//   1. dismissViaCssOverride FIRST — stateless. Injects a `<style>` tag
+//      outside the React subtree that neutralises the overlay via
+//      `pointer-events: none !important; display: none !important`.
+//      React reconciler never un-applies this (style lives outside
+//      React's virtual DOM), so re-mount loops that previously ate up
+//      the addLocatorHandler DISMISS_TIMES_CAP can't happen. Production
+//      trigger: Repetino "стать репетитором" click timed out 10s on
+//      joyride's re-mounting portal (2026-04-21 log) — remove() fired
+//      5× and the cap saved us from an infinite loop, but the overlay
+//      stayed alive and the click never landed.
+//   2. dismissViaRemove — surgical fallback for sites where CSS
+//      override can't get past `!important`-on-inline-style edge cases.
+//   3. dismissViaCloseButton — last, touches the tour library's own UI.
+//   4. dismissViaEscape was REMOVED. `page.keyboard.press('Escape')`
+//      is a page-wide event that also closes every Radix/Headless/
+//      shadcn Dialog listening for Escape — seen on Repetino tutors
+//      where the joyride handler nuked the purchase modal the user
+//      had just opened, detaching refs mid-action.
+const JOYRIDE_CSS_ID = '__qai_dismiss_joyride__';
+const JOYRIDE_CSS = `
+  #react-joyride-portal, #react-joyride-portal *,
+  .__floater__, .__floater__ *,
+  .react-joyride__overlay, .react-joyride__spotlight,
+  [data-test-id="overlay"].react-joyride__overlay {
+    pointer-events: none !important;
+    display: none !important;
+    visibility: hidden !important;
+  }
+`;
+
+const INTRO_JS_CSS_ID = '__qai_dismiss_introjs__';
+const INTRO_JS_CSS = `
+  .introjs-overlay, .introjs-tooltipReferenceLayer,
+  .introjs-tooltip, .introjs-helperLayer {
+    pointer-events: none !important;
+    display: none !important;
+    visibility: hidden !important;
+  }
+`;
+
+const SHEPHERD_CSS_ID = '__qai_dismiss_shepherd__';
+const SHEPHERD_CSS = `
+  .shepherd-modal-overlay-container, .shepherd-element {
+    pointer-events: none !important;
+    display: none !important;
+    visibility: hidden !important;
+  }
+`;
+
+const DRIVER_CSS_ID = '__qai_dismiss_driverjs__';
+const DRIVER_CSS = `
+  #driver-page-overlay, .driver-popover, .driver-highlighted-element {
+    pointer-events: none !important;
+    display: none !important;
+    visibility: hidden !important;
+  }
+`;
+
 const OVERLAY_PATTERNS: OverlayPattern[] = [
-  // react-joyride (product tour library). "spotlight" overlay tricks
-  // elementFromPoint into returning the target, but edges still intercept
-  // clicks — addLocatorHandler catches it cleanly.
-  //
-  // Selector covers: the dim layer (`.react-joyride__overlay`), any
-  // descendant of the portal node (`#react-joyride-portal > *`), the
-  // spotlight cutout (`.react-joyride__spotlight`), and the floater
-  // popper wrapper (`.__floater__` — used by react-joyride v2+ to
-  // position the tooltip; often the actual click-intercepting element).
-  // Removing the portal wipes all of them in one operation.
+  // react-joyride (product tour library). CSS override is effective
+  // here because joyride writes z-index inline but not pointer-events,
+  // so our `!important` rule wins. Remove is kept as a safety net.
   {
     name: 'react-joyride',
     selector: [
@@ -159,6 +240,7 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
       '.__floater__',
     ].join(', '),
     dismiss: [
+      dismissViaCssOverride(JOYRIDE_CSS_ID, JOYRIDE_CSS),
       dismissViaRemove('#react-joyride-portal, .__floater__'),
       dismissViaCloseButton('.react-joyride__tooltip'),
     ],
@@ -168,6 +250,7 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
     name: 'intro-js',
     selector: '.introjs-overlay, .introjs-tooltipReferenceLayer',
     dismiss: [
+      dismissViaCssOverride(INTRO_JS_CSS_ID, INTRO_JS_CSS),
       dismissViaRemove('.introjs-overlay,.introjs-tooltipReferenceLayer'),
       dismissViaCloseButton('.introjs-tooltip'),
     ],
@@ -177,6 +260,7 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
     name: 'shepherd',
     selector: '.shepherd-modal-overlay-container, .shepherd-element',
     dismiss: [
+      dismissViaCssOverride(SHEPHERD_CSS_ID, SHEPHERD_CSS),
       dismissViaRemove('.shepherd-modal-overlay-container,.shepherd-element'),
       dismissViaCloseButton('.shepherd-element'),
     ],
@@ -186,6 +270,7 @@ const OVERLAY_PATTERNS: OverlayPattern[] = [
     name: 'driver-js',
     selector: '#driver-page-overlay, .driver-popover',
     dismiss: [
+      dismissViaCssOverride(DRIVER_CSS_ID, DRIVER_CSS),
       dismissViaRemove('#driver-page-overlay,.driver-popover'),
       dismissViaCloseButton('.driver-popover'),
     ],

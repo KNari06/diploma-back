@@ -156,11 +156,18 @@ export async function uploadProjectKB(req: Request, res: Response): Promise<void
     const result = await kbService.uploadProjectKB(file.path, file.originalname, projectId, userId);
 
     successResponse(res, {
-      message: 'Project KB file uploaded successfully',
+      message: result.previousVersionsRetired > 0
+        ? `Uploaded v${result.fileVersion} (${result.previousVersionsRetired} previous version${result.previousVersionsRetired === 1 ? '' : 's'} retired)`
+        : 'Project KB file uploaded successfully',
       fileName: file.originalname,
       name: file.originalname,
       chunkCount: result.chunkCount,
       chunks: result.chunkCount,
+      // New fields from Phase 4 — callers can surface to the user
+      format: result.format,
+      summary: result.summary,
+      fileVersion: result.fileVersion,
+      previousVersionsRetired: result.previousVersionsRetired,
       status: 'ready',
     });
   } catch (error: any) {
@@ -472,11 +479,14 @@ export async function getDocumentChunks(req: Request, res: Response): Promise<vo
       return;
     }
 
+    // Preview shows the CURRENT version only. History is available via
+    // explicit ?version=N (added in a later pass once a UI needs it).
     const { data, error } = await supabaseAdmin
       .from('project_kb_chunks')
-      .select('id, content, metadata')
+      .select('id, content, metadata, file_version, format')
       .eq('project_id', projectId)
       .eq('file_name', fileName)
+      .eq('is_current', true)
       .order('metadata->chunkIndex', { ascending: true });
 
     if (error) {
@@ -485,14 +495,21 @@ export async function getDocumentChunks(req: Request, res: Response): Promise<vo
       return;
     }
 
-    const chunks = (data || []).map((row, idx) => ({
+    const rows = Array.isArray(data) ? data : [];
+    const chunks = rows.map((row, idx) => ({
       id: row.id,
       index: row.metadata?.chunkIndex ?? idx,
       content: row.content,
       tokenCount: row.metadata?.tokenCount,
     }));
 
-    successResponse(res, { fileName, totalChunks: chunks.length, chunks });
+    successResponse(res, {
+      fileName,
+      totalChunks: chunks.length,
+      fileVersion: rows.length > 0 ? rows[0].file_version : undefined,
+      format: rows.length > 0 ? rows[0].format : undefined,
+      chunks,
+    });
   } catch (error: any) {
     logger.error('[KB_API] Get document chunks failed', { error });
     if (res.headersSent) return;

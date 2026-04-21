@@ -2,13 +2,17 @@ import { requireAuth } from '@/middleware/auth.middleware';
 import { sharedReportRateLimiter } from '@/middleware/rate-limiter.middleware';
 import { Router } from 'express';
 import {
+  applyDoctorFindingHandler,
   cancelRun,
   createShareLink,
+  dismissDoctorFinding,
   generateNegatives,
+  getDoctorFindingSnapshots,
   getExecutionDetail,
   getNegatives,
   getNegativesStatus,
   getPlanHealth,
+  getRunDoctorFindings,
   getRunExecutions,
   getRunReport,
   getRunStats,
@@ -16,6 +20,7 @@ import {
   getTestCaseCommands,
   listRuns,
   listSavedTestCases,
+  revertDoctorFindingHandler,
   runByPriority,
   runByTag,
   runFlow,
@@ -554,6 +559,220 @@ router.post('/runs/:runId/share', requireAuth, createShareLink);
  *         description: Shared report not found
  */
 router.get('/shared/:shareToken', sharedReportRateLimiter, getSharedReport);
+
+// ============================================================================
+// REGRESSION DOCTOR (Phase-1 — drift aggregation findings)
+// ============================================================================
+
+/**
+ * @swagger
+ * /api/v1/regression/runs/{runId}/doctor:
+ *   get:
+ *     summary: List Regression Doctor findings for a run
+ *     description: |
+ *       Returns drift patterns detected by the Regression Doctor after the
+ *       run completed. Each finding represents one product change that
+ *       affected multiple tests. Findings include a diagnosis, confidence
+ *       score, optional proposed patch, and the list of affected test
+ *       case ids.
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: runId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: List of findings (may be empty)
+ *       404:
+ *         description: Run not found
+ *       403:
+ *         description: Forbidden
+ */
+router.get('/runs/:runId/doctor', requireAuth, getRunDoctorFindings);
+
+/**
+ * @swagger
+ * /api/v1/regression/doctor/findings/{findingId}/dismiss:
+ *   post:
+ *     summary: Dismiss a Regression Doctor finding
+ *     description: |
+ *       Marks the finding as dismissed. The user acknowledged the drift
+ *       but does not want the patch applied automatically.
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: findingId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason:
+ *                 type: string
+ *                 maxLength: 500
+ *     responses:
+ *       200:
+ *         description: Dismissed
+ *       404:
+ *         description: Finding not found
+ *       403:
+ *         description: Forbidden
+ *       409:
+ *         description: Finding not in 'open' state
+ */
+router.post('/doctor/findings/:findingId/dismiss', requireAuth, dismissDoctorFinding);
+
+/**
+ * @swagger
+ * /api/v1/regression/doctor/findings/{findingId}/apply:
+ *   post:
+ *     summary: Apply a Regression Doctor finding's proposed patch
+ *     description: |
+ *       Applies the finding's `proposed_patch` to every affected test case
+ *       (or a caller-supplied subset). Each test case is processed with
+ *       optimistic concurrency — if the user edited the test between the
+ *       finding being created and Apply being clicked, that specific test
+ *       is skipped with `concurrent_edit` and the rest proceed.
+ *
+ *       Per-test outcomes are returned so the UI can render a mixed
+ *       summary. The finding flips to `applied` iff at least one test
+ *       case was patched. A pre-apply snapshot is written to
+ *       `regression_doctor_apply_snapshots` for each successful patch.
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: findingId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               testCaseIds:
+ *                 type: array
+ *                 description: Optional subset of affected test case ids.
+ *                 items:
+ *                   type: string
+ *                   format: uuid
+ *     responses:
+ *       200:
+ *         description: Apply result with per-test outcomes.
+ *       400:
+ *         description: Invalid payload.
+ *       403:
+ *         description: Finding not owned by user.
+ *       404:
+ *         description: Finding not found.
+ *       409:
+ *         description: Finding not in an applicable state (already applied / dismissed / no patch / no affected tests).
+ */
+router.post('/doctor/findings/:findingId/apply', requireAuth, applyDoctorFindingHandler);
+
+/**
+ * @swagger
+ * /api/v1/regression/doctor/findings/{findingId}/snapshots:
+ *   get:
+ *     summary: List pre-apply snapshots for a Doctor finding
+ *     description: |
+ *       Returns the list of snapshots captured when Bulk Apply ran on
+ *       this finding. Each row includes the exact `steps_before` /
+ *       `steps_after` JSON so the frontend can render a step-level
+ *       diff without a second round-trip. Also hydrates test case names.
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: findingId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Snapshots (may be empty for findings never applied).
+ *       403:
+ *         description: Finding not owned by user.
+ *       404:
+ *         description: Finding not found.
+ */
+router.get(
+  '/doctor/findings/:findingId/snapshots',
+  requireAuth,
+  getDoctorFindingSnapshots,
+);
+
+/**
+ * @swagger
+ * /api/v1/regression/doctor/findings/{findingId}/revert:
+ *   post:
+ *     summary: Revert an applied Regression Doctor finding
+ *     description: |
+ *       Restores the pre-apply `steps_json` on each patched test case
+ *       using the snapshots written by the original Bulk Apply. Tests
+ *       that the user edited manually after Apply are skipped with
+ *       `modified_after_apply` — we never overwrite manual work. Per-test
+ *       outcomes are returned for UI summary.
+ *
+ *       Full revert (every snapshot reverted) flips the finding back to
+ *       `open`; partial revert leaves it in `applied` state.
+ *     tags: [Regression]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: findingId
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               snapshotIds:
+ *                 type: array
+ *                 description: Optional subset of snapshot ids to revert.
+ *                 items:
+ *                   type: string
+ *                   format: uuid
+ *     responses:
+ *       200:
+ *         description: Revert result with per-snapshot outcomes.
+ *       400:
+ *         description: Invalid payload.
+ *       403:
+ *         description: Finding not owned by user.
+ *       404:
+ *         description: Finding not found.
+ *       409:
+ *         description: Finding is not in an applied state, or no snapshots to revert.
+ */
+router.post(
+  '/doctor/findings/:findingId/revert',
+  requireAuth,
+  revertDoctorFindingHandler,
+);
 
 // ============================================================================
 // NEGATIVE TESTING

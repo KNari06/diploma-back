@@ -176,16 +176,45 @@ describe('probeInteractiveElementAt', () => {
   });
 
   it('getElementLabel priority chain is correct', () => {
-    // ariaLabel > labelText > text (for button) > placeholder > title > name > role > tag
+    // ariaLabel > labelText > text > alt > title > placeholder > name > testId > role
     expect(RecordingCaptureService.getElementLabel({ tag: 'button', ariaLabel: 'Submit' } as any)).toBe('Submit');
     expect(RecordingCaptureService.getElementLabel({ tag: 'input', labelText: 'Email' } as any)).toBe('Email');
     expect(RecordingCaptureService.getElementLabel({ tag: 'button', text: 'Sign In' } as any)).toBe('Sign In');
+    // Text is now used for ALL tags (matches hover-highlight logic) — this is the key fix
+    // for "Click 'div'" → "Click 'Войти'" on custom <div>-based buttons.
+    expect(RecordingCaptureService.getElementLabel({ tag: 'div', text: 'Войти' } as any)).toBe('Войти');
+    expect(RecordingCaptureService.getElementLabel({ tag: 'span', text: 'Save' } as any)).toBe('Save');
+    // <img alt="…"> — new probe field, was missing before.
+    expect(RecordingCaptureService.getElementLabel({ tag: 'img', alt: 'Profile photo' } as any)).toBe('Profile photo');
     expect(RecordingCaptureService.getElementLabel({ tag: 'input', placeholder: 'Search...' } as any)).toBe('Search...');
     expect(RecordingCaptureService.getElementLabel({ tag: 'div', title: 'Attach file' } as any)).toBe('Attach file');
     expect(RecordingCaptureService.getElementLabel({ tag: 'input', name: 'email' } as any)).toBe('email');
+    expect(RecordingCaptureService.getElementLabel({ tag: 'div', testId: 'submit-btn' } as any)).toBe('submit-btn');
     expect(RecordingCaptureService.getElementLabel({ tag: 'div', role: 'button' } as any)).toBe('button');
-    expect(RecordingCaptureService.getElementLabel({ tag: 'div' } as any)).toBe('div');
+    // Literal tag-only fallback collapses to 'element' — the step is fragile and background
+    // LLM refinement will upgrade it within 1–2s.
+    expect(RecordingCaptureService.getElementLabel({ tag: 'div' } as any)).toBe('element');
+    expect(RecordingCaptureService.getElementLabel({ tag: 'svg' } as any)).toBe('element');
+    // Self-referential text ("<div>div</div>") should not masquerade as a real label.
+    expect(RecordingCaptureService.getElementLabel({ tag: 'div', text: 'div' } as any)).toBe('element');
+    // Whitespace-only text falls through.
+    expect(RecordingCaptureService.getElementLabel({ tag: 'div', text: '   ', role: 'button' } as any)).toBe('button');
     expect(RecordingCaptureService.getElementLabel(null)).toBe('element');
+  });
+
+  it('getProbedLabel returns null for unusable labels (signalling fragile step)', () => {
+    expect(RecordingCaptureService.getProbedLabel(null)).toBeNull();
+    expect(RecordingCaptureService.getProbedLabel({ tag: 'div' } as any)).toBeNull();
+    expect(RecordingCaptureService.getProbedLabel({ tag: 'div', text: '' } as any)).toBeNull();
+    expect(RecordingCaptureService.getProbedLabel({ tag: 'div', text: '   ' } as any)).toBeNull();
+    // When text equals tag, it's noise — not a real label.
+    expect(RecordingCaptureService.getProbedLabel({ tag: 'span', text: 'span' } as any)).toBeNull();
+  });
+
+  it('getProbedLabel respects custom maxLen (hover uses 40, description uses 60)', () => {
+    const longText = 'a'.repeat(100);
+    expect(RecordingCaptureService.getProbedLabel({ tag: 'div', text: longText } as any, 40)).toHaveLength(40);
+    expect(RecordingCaptureService.getProbedLabel({ tag: 'div', text: longText } as any, 60)).toHaveLength(60);
   });
 });
 

@@ -259,6 +259,12 @@ export class CommandExecutor {
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
   private selfHealingConfidenceThreshold: number = COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
   private maxHealAttempts: number = COMMAND_EXECUTOR_CONFIG.maxHealAttempts;
+  // Shared heal-credit budget across BOTH the intent-path heal (tryGetLocatorForIntentCommand)
+  // and the selector-path heal (executeWithSelfHealing). Each successful auto-applied heal
+  // charges 1 credit; when this counter reaches maxHealAttempts we stop charging even if
+  // subsequent heals happen. Without this, a failing step could be charged by both paths
+  // independently (2-3 credits per step instead of 1).
+  private instanceHealChargesSpent: number = 0;
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   private maxDomNodes?: number; // Configurable DOM node limit (saves memory in replay mode)
   /** Runtime metadata for each step (keyed by stepId) */
@@ -3708,14 +3714,10 @@ export class CommandExecutor {
     if (this.selfHealingEnabled && retryCtx.healAttempts < this.maxHealAttempts) {
       retryCtx.healAttempts++;
 
-      // Deduct 1 credit for self-heal retry
-      if (this.metadata.userId) {
-        await CreditCostTrackerService.deductStepCredit(
-          this.metadata.userId,
-          `heal_intent_${Date.now()}`,
-          `Intent self-heal: ${intentMeta?.intentDescription?.substring(0, 50)}`
-        );
-      }
+      // NOTE: Credit deduction moved below — we only charge on SUCCESSFUL auto-applied
+      // heals (confidence threshold met), not on every attempt. Failed/blocked heals
+      // are free, matching executeWithSelfHealing's behavior and preventing per-attempt
+      // overcharge during retries.
 
       try {
         // Fast mode first
@@ -3833,6 +3835,17 @@ export class CommandExecutor {
             };
             this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
+            // Deduct 1 credit for successful auto-applied heal — bounded by
+            // maxHealAttempts across BOTH paths via instanceHealChargesSpent.
+            if (this.metadata.userId && this.instanceHealChargesSpent < this.maxHealAttempts) {
+              this.instanceHealChargesSpent++;
+              await CreditCostTrackerService.deductStepCredit(
+                this.metadata.userId,
+                `heal_intent_${Date.now()}`,
+                `Intent self-heal: ${intentMeta?.intentDescription?.substring(0, 50)}`
+              );
+            }
+
             logger.info('[COMMAND_EXECUTOR] Self-healing succeeded', {
               stepId,
               newSelector: healingResult.newSelector,
@@ -3841,6 +3854,7 @@ export class CommandExecutor {
               needsReview,
               flaky,
               verified: healingResult.verified,
+              healChargesSpent: this.instanceHealChargesSpent,
             });
 
             this.trace('element_resolution', intentMeta?.stepIndex ?? retryCtx.attempt + 1, {
@@ -4186,8 +4200,11 @@ export class CommandExecutor {
       const meetsConfidenceThreshold = healConfidence >= this.selfHealingConfidenceThreshold;
 
       if (healingResult.autoApplied && meetsConfidenceThreshold) {
-        // Deduct 1 credit for self-heal retry
-        if (this.metadata.userId) {
+        // Deduct 1 credit for self-heal retry — shared budget with intent-path heal
+        // (instanceHealChargesSpent) so a single failing step can't be charged by
+        // both paths independently.
+        if (this.metadata.userId && this.instanceHealChargesSpent < this.maxHealAttempts) {
+          this.instanceHealChargesSpent++;
           await CreditCostTrackerService.deductStepCredit(
             this.metadata.userId,
             `heal_${Date.now()}`,

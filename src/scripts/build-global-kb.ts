@@ -26,6 +26,8 @@ interface Chunk {
   chunkIndex: number;
   totalChunks: number;
   tokenCount?: number;
+  parentId?: string;
+  parentText?: string;
 }
 
 async function buildGlobalKB() {
@@ -467,6 +469,8 @@ async function buildGlobalKB() {
         source_file: chunk.source_file,
         language: chunk.language,
         tags: extractTags(chunk.content),
+        parent_id: chunk.parentId,
+        parent_text: chunk.parentText,
         metadata: {
           chunkIndex: chunk.chunkIndex,
           totalChunks: chunk.totalChunks,
