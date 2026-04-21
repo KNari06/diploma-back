@@ -41,6 +41,12 @@ export interface ClientToServerEvents {
   'preview:run:start': (data: PreviewRunStartRequest) => void;
   'preview:run:cancel': (data: PreviewRunCancelRequest) => void;
 
+  // Inspect the preview context's auth/session state (cookies + storage
+  // key counts) WITHOUT mutating anything. Used by the Run button to
+  // detect an active session before starting a run and ask the user
+  // whether to keep or clear it. Response: `preview:session:state`.
+  'preview:session:inspect': (data: PreviewSessionInspectRequest) => void;
+
   // Test Resources — live preview actions (Phase 4):
   //
   //   apply-resource: inject a saved Login (cookies + localStorage) into
@@ -227,6 +233,37 @@ export interface ServerToClientEvents {
     localStorageKeysCleared: number;
     sessionStorageKeysCleared: number;
     reason: string;
+    timestamp: string;
+  }) => void;
+
+  // Response to `preview:session:inspect`. Contains non-sensitive counts
+  // + sameOrigin flag so the frontend can decide whether to prompt the
+  // user before a Run. Counts are zero if the context is pristine.
+  //
+  // `sameOrigin` tells the UI whether the Playwright context is already
+  // on the test's target origin — when false, localStorage/sessionStorage
+  // cannot be inspected (origin-scoped). In that case storage counts
+  // are 0 even if data exists; the banner should hint this as
+  // "cookies only (localStorage will be checked after navigation)".
+  'preview:session:state': (data: {
+    previewSessionId: string;
+    cookieCount: number;
+    localStorageKeyCount: number;
+    sessionStorageKeyCount: number;
+    currentUrl: string;
+    sameOriginAsStartUrl: boolean;
+    /**
+     * Names of cookies visible in the context (not values). Lets the UI
+     * say "Session cookies: sessionid, csrftoken" when the user hovers
+     * for detail. Capped to 20 names; trailing ones elided.
+     */
+    cookieNames: string[];
+    /**
+     * Present if the client asked for a same-origin storage snapshot
+     * AND the page is same-origin. Omitted otherwise. Values are never
+     * returned — just keys — so this payload is safe to log/persist.
+     */
+    localStorageKeys?: string[];
     timestamp: string;
   }) => void;
 
@@ -1154,12 +1191,33 @@ export interface PreviewRunStartRequest {
   startUrl?: string;
   /** Optional: mobile runner session ID for mobile test cases. */
   mobileSessionId?: string;
+  /**
+   * Optional: override authReset behavior per-run. When omitted, backend
+   * uses its default ('never' — preserve cookies/storage between runs).
+   * 'always' = wipe cookies + localStorage + sessionStorage before run
+   * (use when test needs a deterministic first-visit state).
+   * 'never'  = keep session so repeat runs of a login flow continue
+   * from the authenticated page (default behavior pre-2026-04-20).
+   *
+   * Frontend sources this from the SessionDetectedBanner UI — user
+   * explicitly chooses when an active session is detected before Run.
+   */
+  authReset?: 'always' | 'never';
 }
 
 /**
  * V8: Request to cancel running preview run
  */
 export interface PreviewRunCancelRequest {
+  previewSessionId: string;
+}
+
+/**
+ * Request to inspect the preview context's session state without mutating
+ * anything. Frontend sends this when the user clicks Run so we can show
+ * a banner if an active session is detected. Response: `preview:session:state`.
+ */
+export interface PreviewSessionInspectRequest {
   previewSessionId: string;
 }
 

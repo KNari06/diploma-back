@@ -495,6 +495,8 @@ export class PreviewRunService {
     options?: {
       inlineSteps?: IntentStep[];
       startUrl?: string;
+      /** Optional per-run authReset override (see `runStepsOnPreview` docs). */
+      authReset?: 'always' | 'never';
     },
   ): Promise<PreviewRunSummary> {
     // ─── Early guards (fail-fast before any DB work) ───────────────────
@@ -574,6 +576,7 @@ export class PreviewRunService {
         intentTestCaseId,
         persistAppliedSteps: true,
         _skipOwnershipCheck: true, // Already verified above
+        authReset: options?.authReset,
       },
     );
   }
@@ -607,13 +610,24 @@ export class PreviewRunService {
       chatSessionId?: string;
       /**
        * Whether to clear cookies + localStorage + sessionStorage before the run.
-       * 'always' (default) — clear every run so each start is deterministic; prevents a
-       *   successful login from a prior run carrying over and pushing the replay into a
-       *   different code path (e.g. /login → /dashboard), which would silently "pass"
-       *   against the wrong page.
-       * 'never' — keep the current context state. Use for tests that expect a persistent
-       *   session (e.g. manually logged in by the user before recording, or tests chained
-       *   together). Test Resources with kind='auth' should drive this later.
+       * 'always' — clear every run so each start is deterministic; prevents a
+       *   successful login from a prior run carrying over and pushing the replay
+       *   into a different code path (e.g. /login → /dashboard), which would
+       *   silently "pass" against the wrong page.
+       * 'never' (DEFAULT) — keep the current context state. Use for tests that
+       *   expect a persistent session (user manually logged in before recording,
+       *   chained tests, or SPAs that gate content on localStorage flags).
+       *
+       * Default rationale: originally this shipped as 'always' default but that
+       * broke every site whose first-visit experience differs from repeat
+       * visits — the wipe deleted localStorage keys like `joyride:seen`,
+       * re-triggering an onboarding tour whose overlay intercepts every click
+       * with a Playwright timeout. See repro 2026-04-21 on repetino.kz tutors
+       * page. Flipping the default to 'never' restores pre-2026-04-20 behaviour
+       * while keeping the explicit opt-in for tests that need a clean slate.
+       *
+       * Test Resources with kind='auth' will drive this per-test-case once the
+       * UI toggle lands.
        */
       authReset?: 'always' | 'never';
       /** @internal Skip ownership check when caller (runSavedSteps) already verified */
@@ -622,7 +636,7 @@ export class PreviewRunService {
   ): Promise<PreviewRunSummary> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
-    const authReset: 'always' | 'never' = options?.authReset ?? 'always';
+    const authReset: 'always' | 'never' = options?.authReset ?? 'never';
 
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {

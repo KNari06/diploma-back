@@ -87,8 +87,8 @@ const RECORDING_MAX_TIME_MS = (() => {
  * Override via `WEB_RECORDING_MAX_STEPS`; set to 0 to disable.
  */
 const RECORDING_MAX_STEPS = (() => {
-  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '100', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 100;
+  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '50', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 50;
 })();
 
 /**
@@ -3939,7 +3939,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:run:start', async (data) => {
     try {
       const userId = getUserId(socket);
-      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient } = data;
+      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset } = data;
 
       // Validate input
       if (!previewSessionId || !intentTestCaseId) {
@@ -4172,9 +4172,22 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       // Start run (async, emits progress via WebSocket)
       // If inline steps are provided (Apply All flow), save them first and use directly.
-      const runOptions = (Array.isArray(inlineSteps) && inlineSteps.length > 0)
-        ? { inlineSteps, startUrl: inlineStartUrl }
-        : undefined;
+      //
+      // authReset is forwarded when the client provided one via the
+      // SessionDetectedBanner UI. When omitted we pass `undefined`
+      // so the service's own default ('never' as of 2026-04-21) applies.
+      // Validate explicitly — random strings from a tampered client must
+      // not reach the service.
+      const safeAuthReset: 'always' | 'never' | undefined =
+        clientAuthReset === 'always' || clientAuthReset === 'never'
+          ? clientAuthReset
+          : undefined;
+      const hasInline = Array.isArray(inlineSteps) && inlineSteps.length > 0;
+      const runOptions = hasInline
+        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset }
+        : safeAuthReset
+          ? { authReset: safeAuthReset }
+          : undefined;
       PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
         logger.error('[WebSocket] Preview run failed', {
           previewSessionId,
@@ -4196,6 +4209,155 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       socket.emit('error', {
         code: 'INTERNAL_ERROR',
         message: error instanceof Error ? error.message : 'Internal error',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+
+  /**
+   * Handle `preview:session:inspect` — read-only snapshot of the preview
+   * context's session state. Called by the UI right before a Run so we
+   * can decide whether to show the "Active session detected" banner.
+   *
+   * Returns counts only, not values:
+   *   - cookieCount, sessionStorageKeyCount, localStorageKeyCount (if same-origin)
+   *   - cookieNames (up to 20), localStorageKeys (if same-origin)
+   *   - sameOriginAsStartUrl so the UI knows whether localStorage is
+   *     actually visible in the count (cross-origin pages hide it)
+   *
+   * Never mutates anything. Safe to call many times per session.
+   * Mobile sessions skip this check (different runner path).
+   */
+  socket.on('preview:session:inspect', async (data) => {
+    try {
+      const userId = getUserId(socket);
+      if (!userId) {
+        socket.emit('error', {
+          code: 'UNAUTHORIZED',
+          message: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      const { previewSessionId } = data ?? {};
+      if (!previewSessionId) {
+        socket.emit('error', {
+          code: 'INVALID_INPUT',
+          message: 'previewSessionId is required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { getPreviewSessionService } = await import(
+        '@/services/testing/ui/preview/preview-session.service'
+      );
+      const sessionService = getPreviewSessionService();
+      // Check ownership FIRST (before touching session.page) so an
+      // unauthenticated caller can't learn whether a session exists
+      // based on the error code we return.
+      if (!sessionService.isSessionOwned(previewSessionId, userId)) {
+        socket.emit('error', {
+          code: 'FORBIDDEN',
+          message: 'Session not owned by user',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      const session = sessionService.getSession(previewSessionId);
+      if (!session) {
+        socket.emit('error', {
+          code: 'SESSION_NOT_FOUND',
+          message: 'Preview session not found or expired',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Cookies are context-scoped — can be read regardless of current URL.
+      let cookieCount = 0;
+      let cookieNames: string[] = [];
+      try {
+        const cookies = await session.page.context().cookies();
+        cookieCount = cookies.length;
+        cookieNames = cookies.slice(0, 20).map((c) => c.name);
+      } catch (err) {
+        logger.debug('[WebSocket] inspect: cookie read failed', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      // Storage is origin-scoped. We can only read it reliably when the
+      // current page is on the same origin as the test's startUrl. If the
+      // session hasn't navigated yet (about:blank) or is cross-origin,
+      // return 0 and flag `sameOriginAsStartUrl=false` so the UI explains
+      // "cookies only" instead of silently under-reporting.
+      let currentUrl = '';
+      try { currentUrl = session.page.url(); } catch { /* page closed */ }
+
+      // startUrl is stored on the session via start payload. Fall back to
+      // the page's origin if not set so the comparison still works.
+      const startUrl = session.startUrl || currentUrl;
+      let sameOriginAsStartUrl = false;
+      try {
+        if (startUrl && currentUrl && currentUrl !== 'about:blank') {
+          sameOriginAsStartUrl = new URL(startUrl).origin === new URL(currentUrl).origin;
+        }
+      } catch { /* malformed url */ }
+
+      let localStorageKeyCount = 0;
+      let sessionStorageKeyCount = 0;
+      let localStorageKeys: string[] | undefined;
+      if (sameOriginAsStartUrl) {
+        try {
+          const storage = await session.page.evaluate(() => {
+            // @ts-expect-error - browser context
+            const ls = localStorage;
+            // @ts-expect-error - browser context
+            const ss = sessionStorage;
+            const keys: string[] = [];
+            for (let i = 0; i < Math.min(ls.length, 20); i++) {
+              const k = ls.key(i);
+              if (k !== null) keys.push(k);
+            }
+            return {
+              lsCount: ls.length,
+              ssCount: ss.length,
+              keys,
+            };
+          });
+          localStorageKeyCount = storage.lsCount ?? 0;
+          sessionStorageKeyCount = storage.ssCount ?? 0;
+          localStorageKeys = storage.keys;
+        } catch (err) {
+          // Storage read can fail in edge cases (disabled by policy,
+          // page mid-navigation, etc.) — don't fail the whole inspect.
+          logger.debug('[WebSocket] inspect: storage read failed', {
+            previewSessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      socket.emit('preview:session:state', {
+        previewSessionId,
+        cookieCount,
+        localStorageKeyCount,
+        sessionStorageKeyCount,
+        currentUrl,
+        sameOriginAsStartUrl,
+        cookieNames,
+        localStorageKeys,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.warn('[WebSocket] preview:session:inspect failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      socket.emit('error', {
+        code: 'INSPECT_FAILED',
+        message: err instanceof Error ? err.message : 'Failed to inspect session',
         timestamp: new Date().toISOString(),
       });
     }

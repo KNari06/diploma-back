@@ -205,7 +205,10 @@ const PROBE_AT_POINT_FN = `
       hasReactClick: hasReactClick,
       hasDraggable: hasDraggable,
       isContentEditable: isContentEditable,
-      text: (walk.textContent || '').trim().slice(0, 80),
+      // innerText skips script/style/template and display:none children;
+      // textContent would leak JSON-LD, inline CSS, offscreen microcopy.
+      // Non-HTML nodes (SVG etc.) lack innerText — fall back.
+      text: ((walk.innerText != null ? walk.innerText : walk.textContent) || '').trim().slice(0, 80),
       ariaLabel: walk.getAttribute('aria-label') || ''
     });
     walk = walk.parentElement;
@@ -343,7 +346,11 @@ const PROBE_AT_POINT_FN = `
     tag: tag,
     role: target.getAttribute('role') || undefined,
     type: target.getAttribute('type') || undefined,
-    text: (target.textContent || '').trim().slice(0, 80) || undefined,
+    // Use innerText so hidden/script/style children don't leak into the
+    // step description or binding hints (hints.text flows to the resolver's
+    // LLM prompt at replay time). Fall back to textContent for SVG and
+    // other non-HTMLElement nodes where innerText is undefined.
+    text: ((target.innerText != null ? target.innerText : target.textContent) || '').trim().slice(0, 80) || undefined,
     ariaLabel: target.getAttribute('aria-label') || undefined,
     labelText: labelText,
     placeholder: target.getAttribute('placeholder') || undefined,
@@ -414,7 +421,9 @@ const PROBE_FOCUSED_FN = `
     tag: tag,
     role: target.getAttribute('role') || undefined,
     type: target.getAttribute('type') || undefined,
-    text: (target.textContent || '').trim().slice(0, 80) || undefined,
+    // innerText over textContent — hides <script>/<style>/<template> and
+    // display:none children that would otherwise leak into hints.text.
+    text: ((target.innerText != null ? target.innerText : target.textContent) || '').trim().slice(0, 80) || undefined,
     ariaLabel: target.getAttribute('aria-label') || undefined,
     labelText: labelText,
     placeholder: target.getAttribute('placeholder') || undefined,
@@ -766,7 +775,9 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             tag: tag,
             role: walk.getAttribute('role') || undefined,
             type: walk.getAttribute('type') || undefined,
-            text: (walk.textContent || '').trim().slice(0, 80) || undefined,
+            // innerText skips <script>/<style> and hidden children (see
+            // the identical comment on PROBE_CLICK_FN above).
+            text: ((walk.innerText != null ? walk.innerText : walk.textContent) || '').trim().slice(0, 80) || undefined,
             ariaLabel: walk.getAttribute('aria-label') || undefined,
             labelText: labelText,
             placeholder: walk.getAttribute('placeholder') || undefined,
@@ -825,25 +836,40 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
    */
   static getProbedLabel(element: ProbedElement | null, maxLen = 60): string | null {
     if (!element) return null;
-    // Each candidate is trimmed and skipped if it collapses to empty or to the tag name itself
-    // (self-referential noise like <div>div</div>). This way whitespace-only `text` falls through
-    // to `role` / other fallbacks instead of short-circuiting the whole chain.
-    const candidates = [
-      element.ariaLabel,
-      element.labelText,
-      element.text,
-      element.alt,         // <img alt="…">
-      element.title,       // icon-only buttons with tooltip
-      element.placeholder,
-      element.name,
-      element.testId,
-      element.role,
+    // Candidates are tried in priority order. We skip values that collapse
+    // to empty OR to the element's own tag name. For free-text fields
+    // (`text`, `labelText`, `alt`, `title`, `placeholder`, `name`) we also
+    // skip bare layout-tag-name leaf text because it's almost always noise
+    // from stray `<div>div</div>` fragments or leaked `<style>` content.
+    //
+    // We deliberately do NOT filter `role`, `ariaLabel`, or `testId`:
+    // those are intentional semantic labels where "button"/"link"/"nav"
+    // are the CORRECT answer (e.g. `role="button"` on a <div> should yield
+    // "button", not fall through to 'element').
+    const TAG_LIKE_NOISE = new Set([
+      'div', 'span', 'a', 'button', 'img', 'svg', 'i', 'p', 'li', 'ul', 'ol',
+      'section', 'article', 'header', 'footer', 'nav', 'main', 'aside',
+    ]);
+    const elTagLc = (element.tag || '').toLowerCase();
+    // Tuples of (value, isFreeText) — only free-text fields get the noise filter.
+    const candidates: Array<[string | undefined, boolean]> = [
+      [element.ariaLabel, false],
+      [element.labelText, true],
+      [element.text, true],
+      [element.alt, true],         // <img alt="…">
+      [element.title, true],       // icon-only buttons with tooltip
+      [element.placeholder, true],
+      [element.name, true],
+      [element.testId, false],
+      [element.role, false],
     ];
-    for (const c of candidates) {
+    for (const [c, isFreeText] of candidates) {
       if (!c) continue;
       const trimmed = c.trim();
       if (!trimmed) continue;
-      if (trimmed === element.tag) continue;
+      const lc = trimmed.toLowerCase();
+      if (lc === elTagLc) continue; // always skip self-referential noise
+      if (isFreeText && TAG_LIKE_NOISE.has(lc)) continue;
       return trimmed.slice(0, maxLen);
     }
     return null;
@@ -1282,7 +1308,9 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
           var tag = best.tagName.toLowerCase();
           return {
             tag: tag,
-            text: (best.textContent || '').trim().slice(0, 80) || undefined,
+            // innerText to avoid pulling in hidden/script/style descendants
+            // when LLM falls back to a nearby element.
+            text: ((best.innerText != null ? best.innerText : best.textContent) || '').trim().slice(0, 80) || undefined,
             role: best.getAttribute('role') || undefined,
             ariaLabel: best.getAttribute('aria-label') || undefined,
             id: best.getAttribute('id') || undefined

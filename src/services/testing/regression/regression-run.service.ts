@@ -2,6 +2,8 @@ import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
+import { BUG_REPORT_CREDITS } from '@/jobs/ai-analysis.job';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
@@ -284,7 +286,15 @@ export class RegressionRunService {
       uiStepCredits += missingCount;
     }
 
-    const totalRequired = uiStepCredits + apiCount * apiCreditCost;
+    // ai-analysis.job charges BUG_REPORT_CREDITS per UI test_result where bugs
+    // are found. A regression run with N UI tests can incur up to N × 5 extra
+    // credits after execution. Before this line was added, the estimate only
+    // counted steps and users hit "insufficient credits" mid-run when the
+    // post-analysis charge landed. We use the worst case (all UI tests find
+    // bugs) to prevent that failure mode — users with tight balances see a
+    // slightly conservative upfront estimate, which is the safer trade.
+    const bugReportBudget = uiCases.length * BUG_REPORT_CREDITS;
+    const totalRequired = uiStepCredits + apiCount * apiCreditCost + bugReportBudget;
 
     if (totalRequired <= 0) return;
 
@@ -292,7 +302,7 @@ export class RegressionRunService {
     const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
     if (creditCheck.available < totalRequired) {
       throw new ValidationError(
-        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost}), Available: ${creditCheck.available}`
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.available}`
       );
     }
 
@@ -302,6 +312,7 @@ export class RegressionRunService {
       uiTestCount: uiCases.length,
       uiStepCredits,
       apiCount,
+      bugReportBudget,
       totalEstimated: totalRequired,
       available: creditCheck.available,
     });
@@ -1978,6 +1989,11 @@ export class RegressionRunService {
         }
 
         // Execute test (existing logic preserved)
+        // Track upfront-deducted credits we must refund if the dispatch code
+        // throws catastrophically (service crash, network partition, DB
+        // unreachable) — distinct from a normal API-reported failure where
+        // the request was still sent.
+        let refundOnCrash: { amount: number; testCaseId: string } | undefined;
         try {
           // For non-UI tests, mark execution as running before dispatch.
           // For UI tests, we defer this to after runTest() so we can write
@@ -2064,10 +2080,17 @@ export class RegressionRunService {
               throw new Error('Insufficient credits for API test');
             }
 
+            // Track for refund on catastrophic failure — see catch block below.
+            refundOnCrash = { amount: apiCreditCost, testCaseId: testCase.testCaseId };
+
             // Run API test via existing configuration-based executor
             const apiExecution = await ApiConfigService.executeWithConfig(userId, {
               test_config_id: testCase.testCaseId,
             } as any);
+
+            // Normal completion (success OR API-reported failure) — keep the charge;
+            // the request was dispatched and the user got a verdict back.
+            refundOnCrash = undefined;
 
             const passed = !!apiExecution?.success;
             if (passed) {
@@ -2111,6 +2134,35 @@ export class RegressionRunService {
           });
 
           failedOrSkippedIds.add(testCase.testCaseId);
+
+          // Refund upfront-deducted credits on catastrophic dispatch failure.
+          // `refundOnCrash` is cleared after normal completion (pass OR fail),
+          // so we only refund when the code never reached a verdict — e.g. the
+          // executor threw before sending the request. We do NOT refund on
+          // credit errors (nothing to refund: the deduction itself failed).
+          if (refundOnCrash && !isCreditError) {
+            try {
+              await UserCreditsService.addCredits(
+                userId,
+                refundOnCrash.amount,
+                'refund',
+                `Refund: regression ${refundOnCrash.testCaseId} failed to dispatch`,
+                { runId, testCaseId: refundOnCrash.testCaseId, reason: errMsg.slice(0, 200) },
+              );
+              logger.info('[REGRESSION_RUN] Refunded upfront credits after crash', {
+                runId,
+                testCaseId: refundOnCrash.testCaseId,
+                amount: refundOnCrash.amount,
+              });
+            } catch (refundErr) {
+              logger.error('[REGRESSION_RUN] Credit refund failed', {
+                runId,
+                testCaseId: refundOnCrash.testCaseId,
+                amount: refundOnCrash.amount,
+                error: refundErr instanceof Error ? refundErr.message : String(refundErr),
+              });
+            }
+          }
 
           if (execId) {
             try {

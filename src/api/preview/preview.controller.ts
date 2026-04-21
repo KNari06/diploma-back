@@ -348,8 +348,49 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
         kind: kind !== undefined,
         tags: tags !== undefined,
         priority: priority !== undefined,
+        // Included so PATCHes from the Run-as dropdown ("Login" / "No login")
+        // are debuggable from logs alone.
+        resourceBindings: resourceBindings !== undefined,
       },
+      resourceBindingsCount: Array.isArray(resourceBindings) ? resourceBindings.length : undefined,
     });
+
+    // Validate bindings shape upfront with a 400 (instead of letting it leak
+    // as a generic 500 at the DB layer). Empty array is valid — it detaches
+    // all bindings (the "No login" UI flow depends on this).
+    if (resourceBindings !== undefined) {
+      if (!Array.isArray(resourceBindings)) {
+        res.status(400).json({
+          error: 'Invalid resourceBindings (expected array)',
+          code: 'INVALID_RESOURCE_BINDINGS',
+        });
+        return;
+      }
+      for (let i = 0; i < resourceBindings.length; i++) {
+        const b = resourceBindings[i];
+        if (!b || typeof b !== 'object') {
+          res.status(400).json({
+            error: `Invalid resourceBindings[${i}] (expected { kind, resource_id })`,
+            code: 'INVALID_RESOURCE_BINDING_SHAPE',
+          });
+          return;
+        }
+        if (typeof (b as any).kind !== 'string' || !(b as any).kind) {
+          res.status(400).json({
+            error: `resourceBindings[${i}].kind is required (string)`,
+            code: 'INVALID_RESOURCE_BINDING_KIND',
+          });
+          return;
+        }
+        if (typeof (b as any).resource_id !== 'string' || !(b as any).resource_id) {
+          res.status(400).json({
+            error: `resourceBindings[${i}].resource_id is required (string)`,
+            code: 'INVALID_RESOURCE_BINDING_ID',
+          });
+          return;
+        }
+      }
+    }
 
     // Get existing test case to get projectId for validation
     const existingTestCase = await IntentTestCaseService.getById(id, userId);
@@ -464,7 +505,7 @@ export async function updateIntentTestCase(req: Request, res: Response): Promise
     logger.info('[PREVIEW_CONTROLLER] Successfully updated intent test case', {
       intentTestCaseId: id,
       updatedFields: Object.keys({
-        name, description, startUrl, url, steps, flowId, status, kind, tags, priority
+        name, description, startUrl, url, steps, flowId, status, kind, tags, priority, resourceBindings,
       }).filter(k => (req.body as any)[k] !== undefined),
     });
 
