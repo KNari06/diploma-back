@@ -27,6 +27,40 @@ import { Request, Response } from 'express';
 const WARMUP_PREFIX = 'mobile_warmup:';
 const WARMUP_TTL = 900; // 15 minutes
 
+/**
+ * Runner-side Socket.IO handshake auth for the browser to attach.
+ *
+ * The mobile runner has an `io.use()` middleware that rejects connections
+ * without `auth.apiKey` when `API_KEY` is set on its side (runner env). We
+ * return the key in the warmup response so the frontend can pass it via
+ * `io(url, { auth: { apiKey } })`. Empty string when the runner is in open-
+ * auth mode (dev) — the middleware short-circuits on missing config.
+ *
+ * Yes, this value ends up in the browser. It's intentional — the runner is
+ * a per-tenant preview service behind nginx + TLS, not a zero-trust endpoint.
+ * If stronger isolation becomes required we'll proxy WebSocket traffic
+ * through this backend and drop the shared key entirely.
+ */
+function getRunnerAuth(): string {
+  return env.MOBILE_RUNNER_API_KEY ?? '';
+}
+
+/**
+ * Derive the current WebSocket URL for the runner from the **live** env.
+ *
+ * Why not just read `existing.runnerSocketUrl` from Redis? Because warmup
+ * entries live 15 minutes, so if the runner moves (env change, DNS flip,
+ * fresh deploy that repointed `MOBILE_RUNNER_URL`) every cached entry keeps
+ * handing the old URL to the frontend until the TTL elapses. That exact
+ * class of regression ate a prod debugging session on 2026-04-21 — the
+ * only fix was a manual `redis-cli flushdb`. Now we recompute on every
+ * response so cache staleness can never again point browsers at a dead
+ * runner.
+ */
+function currentRunnerSocketUrl(): string {
+  return env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+}
+
 type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
 const VALID_PERMISSION_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
 
@@ -116,6 +150,7 @@ function emitWarmupProgress(
  * Returns: { sessionId, runnerSocketUrl }
  */
 export async function warmupSession(req: Request, res: Response): Promise<void> {
+  const warmupStart = Date.now();
   const userId = req.user?.id;
   if (!userId) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -135,6 +170,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+
+  logger.info('[MOBILE_SESSION] warmup request', {
+    userId,
+    projectId,
+    platform,
+    appPackage: appPackage ?? null,
+    runnerUrl: env.MOBILE_RUNNER_URL,
+    runnerAuthEnabled: !!env.MOBILE_RUNNER_API_KEY,
+  });
 
   try {
     // Feature flag check
@@ -161,10 +205,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         const parsed: WarmupData = JSON.parse(waitResult);
         if (parsed.sessionId && parsed.sessionId !== '_booting') {
           await redisConnection.del(lockKey);
+          const runnerSocketUrl = currentRunnerSocketUrl();
+          logger.info('[MOBILE_SESSION] warmup response (path=concurrent_wait)', {
+            userId, projectId,
+            sessionId: parsed.sessionId,
+            runnerSocketUrl,
+            tookMs: Date.now() - warmupStart,
+          });
           res.json({
             success: true,
             sessionId: parsed.sessionId,
-            runnerSocketUrl: parsed.runnerSocketUrl,
+            runnerSocketUrl,
+            runnerApiKey: getRunnerAuth(),
             platform: parsed.platform,
             reused: true,
           });
@@ -205,11 +257,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         if (bootedSessionId) {
           const refreshRaw = await redisConnection.get(redisKey);
           const refreshed: WarmupData = refreshRaw ? JSON.parse(refreshRaw) : existing;
-          logger.info('[MOBILE_SESSION] Auto-boot completed, reusing session', { projectId, sessionId: bootedSessionId });
+          const runnerSocketUrl = currentRunnerSocketUrl();
+          logger.info('[MOBILE_SESSION] warmup response (path=booting_wait)', {
+            userId, projectId,
+            sessionId: bootedSessionId,
+            runnerSocketUrl,
+            tookMs: Date.now() - warmupStart,
+          });
           res.json({
             success: true,
             sessionId: bootedSessionId,
-            runnerSocketUrl: refreshed.runnerSocketUrl,
+            runnerSocketUrl,
+            runnerApiKey: getRunnerAuth(),
             platform: refreshed.platform,
             reused: true,
           });
@@ -255,10 +314,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           }
           emitWarmupProgress(userId, 'ready', 100);
 
+          const runnerSocketUrl = currentRunnerSocketUrl();
+          logger.info('[MOBILE_SESSION] warmup response (path=cached_reuse)', {
+            userId, projectId,
+            sessionId: existing.sessionId,
+            runnerSocketUrl,
+            tookMs: Date.now() - warmupStart,
+          });
           res.json({
             success: true,
             sessionId: existing.sessionId,
-            runnerSocketUrl: existing.runnerSocketUrl,
+            runnerSocketUrl,
+            runnerApiKey: getRunnerAuth(),
             platform: existing.platform,
             reused: true,
           });
@@ -317,8 +384,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       });
     }
 
-    // Derive socket URL from runner URL
-    const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+    const runnerSocketUrl = currentRunnerSocketUrl();
 
     // Store mapping in Redis
     const warmupData: WarmupData = {
@@ -360,10 +426,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     }
     emitWarmupProgress(userId, 'ready', 100);
 
+    logger.info('[MOBILE_SESSION] warmup response (path=fresh_create)', {
+      userId, projectId,
+      sessionId: session.sessionId,
+      runnerSocketUrl,
+      tookMs: Date.now() - warmupStart,
+    });
+
     res.status(201).json({
       success: true,
       sessionId: session.sessionId,
       runnerSocketUrl,
+      runnerApiKey: getRunnerAuth(),
       platform,
       reused: false,
     });
@@ -1049,7 +1123,7 @@ export async function autoBootAndInstall(
       // Set a "booting" placeholder in Redis BEFORE starting the emulator.
       // This prevents warmupSession from creating a duplicate emulator if
       // the user opens the editor while the boot is still in progress.
-      const runnerSocketUrl = env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
+      const runnerSocketUrl = currentRunnerSocketUrl();
       const bootingData: WarmupData = {
         sessionId: '_booting',
         runnerUrl: env.MOBILE_RUNNER_URL,
