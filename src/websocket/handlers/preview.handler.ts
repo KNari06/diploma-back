@@ -146,6 +146,23 @@ function emitRecordingStep(
     }
   } catch { /* non-critical */ }
 
+  // Coalescing-chain breakers. For each type of `recordingLast*Step`, if the
+  // incoming step is NOT of the matching kind, we clear that chain so the
+  // next occurrence starts a fresh series. Callers emitting the matching
+  // kind are responsible for re-seeding (or reusing) their own chain.
+  try {
+    const kind = payload.step?.type;
+    if (kind !== 'press') {
+      sessionService.setRecordingLastPressStep(previewSessionId, userId, null);
+    }
+    if (kind !== 'click' && kind !== 'dblclick') {
+      sessionService.setRecordingLastClickStep(previewSessionId, userId, null);
+    }
+    if (kind !== 'navigate') {
+      sessionService.setRecordingLastNavigateStep(previewSessionId, userId, null);
+    }
+  } catch { /* non-critical */ }
+
   // Increment the session step counter. We do this in the single emit helper
   // (rather than 20+ call sites) so the number stays accurate. Merge updates
   // go via `preview:recording:step:update` which does NOT route through here.
@@ -2099,8 +2116,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const safeClickCount = (data.clickCount === 2) ? 2 : 1;
               const needsLLM = preClickElement!.resolvedVia === 'directHit' || preClickElement!.resolvedVia === 'cssClass';
 
-              // Helper: build a click step from a ProbedElement (kept local so initial + update are identical)
-              const stepIdForClick = `rec_${Date.now().toString(36)}`;
+              // Helper: build a click step from a ProbedElement (kept local so initial + update are identical).
+              // NOTE: `let` (not const) because the dblclick coalescing path below may rewrite this to the
+              // previous single-click's id so LLM refinement updates the correct row instead of creating
+              // a phantom one that FE would treat as a new step.
+              let stepIdForClick = `rec_${Date.now().toString(36)}`;
               const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
               const initialPageUrl = currentPage?.url();
               const hasModifiers = modifiers && (modifiers.shift || modifiers.ctrl || modifiers.meta || modifiers.alt);
@@ -2145,8 +2165,50 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
-              emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
-              if (cTrace) cTrace.writeStepCaptured(step, needsLLM ? 'click_pending_llm' : 'click');
+              // Double-click coalescing. The browser fires click (detail=1)
+              // followed by click (detail=2) for every double-click. Without
+              // dedup the recording ends up with two steps — a single click
+              // and a dblclick — for one intent. If the previous click step
+              // was on the same element within ~500ms and the current event
+              // is a double-click (clickCount>=2), promote the existing step
+              // in place instead of emitting a new row.
+              const clickElSignature = `${preClickElement?.ref ?? ''}|${preClickElement?.tag ?? ''}|${preClickElement?.boundingBox?.x ?? -1}|${preClickElement?.boundingBox?.y ?? -1}`;
+              const lastClick = sessionService.getRecordingLastClickStep(previewSessionId, ensuredUserId);
+              const dblClickWindow = 500; // ms — matches default OS double-click interval
+              const isDbl = safeClickCount >= 2;
+              if (
+                isDbl
+                && lastClick
+                && lastClick.elementSignature === clickElSignature
+                && Date.now() - lastClick.emittedAt <= dblClickWindow
+              ) {
+                // Upgrade the existing step to dblclick in place. Also rewire
+                // `stepIdForClick` so the LLM refinement closure below targets
+                // the SAME row (otherwise a phantom dblclick step appears
+                // because FE's "idx === -1" branch falls back to append).
+                stepIdForClick = lastClick.id;
+                step.id = lastClick.id;
+                const upgraded: PreviewIntentStep = { ...step };
+                socket.nsp.to(room).emit('preview:recording:step:update', {
+                  previewSessionId,
+                  step: upgraded,
+                  timestamp: new Date().toISOString(),
+                });
+                if (cTrace) cTrace.writeStepUpdated(upgraded, 'click_to_dblclick');
+                sessionService.setRecordingLastClickStep(previewSessionId, ensuredUserId, {
+                  id: lastClick.id,
+                  elementSignature: clickElSignature,
+                  emittedAt: Date.now(),
+                });
+              } else {
+                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
+                if (cTrace) cTrace.writeStepCaptured(step, needsLLM ? 'click_pending_llm' : 'click');
+                sessionService.setRecordingLastClickStep(previewSessionId, ensuredUserId, {
+                  id: step.id,
+                  elementSignature: clickElSignature,
+                  emittedAt: Date.now(),
+                });
+              }
 
               // V19: Background LLM refinement — does NOT block step appearing in the panel.
               // We snapshot the original element for diffing so we only emit an update when LLM
@@ -3028,8 +3090,54 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               if (!mergedEnterIntoType) {
                 const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
                 if (pressStep) {
-                  emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pressStep });
-                  if (pTrace) pTrace.writeStepCaptured(pressStep, 'press');
+                  // Coalesce consecutive identical presses into one step with
+                  // a "× N" suffix. Mashing Backspace on an empty field used
+                  // to produce one standalone step per keystroke — you'd end
+                  // up with 5–6 duplicated "Press Backspace" rows. Now they
+                  // fold into one step that updates its description in place.
+                  //
+                  // Identity = same key AND same modifier combo. Any other
+                  // key breaks the chain (handled by `setRecordingLastPressStep(null)`
+                  // below).
+                  const modifiersKey = Array.isArray(data.modifiers) && data.modifiers.length > 0
+                    ? [...data.modifiers].sort().join('+')
+                    : '';
+                  const lastPress = sessionService.getRecordingLastPressStep(previewSessionId, ensuredUserId);
+                  const isSameKey = !!lastPress
+                    && lastPress.key === data.key
+                    && lastPress.modifiersKey === modifiersKey;
+
+                  if (isSameKey && lastPress) {
+                    // Update in place — bump the count and re-emit as :step:update.
+                    const nextCount = lastPress.count + 1;
+                    const keyLabel = modifiersKey ? `${modifiersKey}+${data.key}` : data.key;
+                    const updatedStep = {
+                      ...pressStep,
+                      id: lastPress.id,
+                      description: `Press ${keyLabel} × ${nextCount}`,
+                    };
+                    socket.nsp.to(room).emit('preview:recording:step:update', {
+                      previewSessionId,
+                      step: updatedStep,
+                      timestamp: new Date().toISOString(),
+                    });
+                    if (pTrace) pTrace.writeStepUpdated(updatedStep, 'press_coalesce');
+                    sessionService.setRecordingLastPressStep(previewSessionId, ensuredUserId, {
+                      id: lastPress.id,
+                      key: data.key,
+                      modifiersKey,
+                      count: nextCount,
+                    });
+                  } else {
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: pressStep });
+                    if (pTrace) pTrace.writeStepCaptured(pressStep, 'press');
+                    sessionService.setRecordingLastPressStep(previewSessionId, ensuredUserId, {
+                      id: pressStep.id,
+                      key: data.key,
+                      modifiersKey,
+                      count: 1,
+                    });
+                  }
                 }
               }
             } catch (e) {
@@ -3188,19 +3296,54 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'refresh');
               flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'refresh');
 
-              // V11: Record a navigate step for refresh
+              // V11: Record a navigate step for refresh.
+              // Coalesce consecutive refreshes on the same URL so mashing F5
+              // doesn't create 3–5 identical "Refresh page" rows.
               const page = sessionService.getPage(previewSessionId, ensuredUserId);
               if (page) {
-                const refreshStep: PreviewIntentStep = {
-                  id: `rec_${Date.now().toString(36)}`,
-                  type: 'navigate',
-                  description: 'Refresh page',
-                  value: page.url(),
-                };
-                emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: refreshStep });
+                const currentUrl = page.url();
+                const lastNav = sessionService.getRecordingLastNavigateStep(previewSessionId, ensuredUserId);
+                const isRepeatRefresh = !!lastNav
+                  && lastNav.kind === 'refresh'
+                  && lastNav.url === currentUrl;
+
+                if (isRepeatRefresh && lastNav) {
+                  const nextCount = lastNav.count + 1;
+                  const updatedStep: PreviewIntentStep = {
+                    id: lastNav.id,
+                    type: 'navigate',
+                    description: `Refresh page × ${nextCount}`,
+                    value: currentUrl,
+                  };
+                  socket.nsp.to(room).emit('preview:recording:step:update', {
+                    previewSessionId,
+                    step: updatedStep,
+                    timestamp: new Date().toISOString(),
+                  });
+                  sessionService.setRecordingLastNavigateStep(previewSessionId, ensuredUserId, {
+                    id: lastNav.id,
+                    url: currentUrl,
+                    kind: 'refresh',
+                    count: nextCount,
+                  });
+                } else {
+                  const refreshStep: PreviewIntentStep = {
+                    id: `rec_${Date.now().toString(36)}`,
+                    type: 'navigate',
+                    description: 'Refresh page',
+                    value: currentUrl,
+                  };
+                  emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: refreshStep });
+                  sessionService.setRecordingLastNavigateStep(previewSessionId, ensuredUserId, {
+                    id: refreshStep.id,
+                    url: currentUrl,
+                    kind: 'refresh',
+                    count: 1,
+                  });
+                }
 
                 // Update URL baseline (URL may change after redirect)
-                sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, page.url());
+                sessionService.setRecordingLastUrl(previewSessionId, ensuredUserId, currentUrl);
               }
             } catch (e) {
               logger.debug('[RECORDING] Refresh hook failed', {

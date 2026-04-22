@@ -389,6 +389,43 @@ interface InternalSession extends PreviewSession {
     elementRef?: string;
     value: string;
   } | null;
+  /**
+   * Last emitted press step — for coalescing consecutive identical key presses
+   * into a single step with a rendered `× N` count. Without this, mashing
+   * Backspace on an empty field produced one standalone "Press Backspace"
+   * step per keystroke (a common complaint — 5-6 duplicates in a row).
+   * Cleared on any non-matching key press OR when a non-press event arrives
+   * (type, click, scroll, etc. — see ensureLastPressCleared in handlers).
+   */
+  recordingLastPressStep: {
+    id: string;
+    key: string;
+    modifiersKey: string; // e.g. "Control+Shift" or "" — used to compare identity
+    count: number;
+  } | null;
+  /**
+   * Last emitted click step — used to upgrade a single-click step into a
+   * dblclick when the browser fires two consecutive clicks on the same
+   * element within the browser's double-click window. Without this, a user
+   * double-clicking a button produced two separate steps: "Click Save"
+   * followed by "Double-click Save". Cleared on any non-click event.
+   */
+  recordingLastClickStep: {
+    id: string;
+    elementSignature: string; // stable id for the clicked element
+    emittedAt: number; // epoch ms — used to bound the dblclick window
+  } | null;
+  /**
+   * Last emitted navigate/refresh step — for coalescing consecutive
+   * navigations to the same URL (e.g. user mashes F5, or clicks Back and
+   * lands on the same page). Cleared on any non-navigate event.
+   */
+  recordingLastNavigateStep: {
+    id: string;
+    url: string;
+    kind: 'navigate' | 'back' | 'forward' | 'refresh';
+    count: number;
+  } | null;
   /** V10: Last emitted scroll step — for merging consecutive scrolls */
   recordingLastScrollStep: {
     id: string;
@@ -794,6 +831,9 @@ export class PreviewSessionService {
           recordingDragState: null,
           recordingStepCount: 0,
           recordingLastTypeStep: null,
+          recordingLastPressStep: null,
+          recordingLastClickStep: null,
+          recordingLastNavigateStep: null,
           recordingLastScrollStep: null,
           recordingLastHover: null,
           dialogMode: 'passive',
@@ -1019,6 +1059,9 @@ export class PreviewSessionService {
       session.recordingLastUrl = startUrl;
       session.recordingDragState = null;
       session.recordingLastTypeStep = null;
+      session.recordingLastPressStep = null;
+      session.recordingLastClickStep = null;
+      session.recordingLastNavigateStep = null;
       session.recordingStepCount = 0;
       session.recordingLastScrollStep = null;
 
@@ -2299,6 +2342,9 @@ export class PreviewSessionService {
       session.recordingTypingBuffer = null;
       session.recordingDragState = null;
       session.recordingLastTypeStep = null;
+      session.recordingLastPressStep = null;
+      session.recordingLastClickStep = null;
+      session.recordingLastNavigateStep = null;
       session.recordingLastScrollStep = null;
       session.recordingLastHover = null;
       session.recordingLastStepEmittedAt = undefined;
@@ -2429,6 +2475,42 @@ export class PreviewSessionService {
   setRecordingLastTypeStep(sessionId: string, userId: string, step: InternalSession['recordingLastTypeStep']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastTypeStep = step;
+  }
+
+  /** Get last emitted press step (for coalescing consecutive identical keys). */
+  getRecordingLastPressStep(sessionId: string, userId?: string): InternalSession['recordingLastPressStep'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastPressStep ?? null;
+  }
+
+  /** Set last emitted press step. Pass null to break the coalescing chain. */
+  setRecordingLastPressStep(sessionId: string, userId: string, step: InternalSession['recordingLastPressStep']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastPressStep = step;
+  }
+
+  /** Get last emitted click step (for upgrading to dblclick on rapid second click). */
+  getRecordingLastClickStep(sessionId: string, userId?: string): InternalSession['recordingLastClickStep'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastClickStep ?? null;
+  }
+
+  /** Set last emitted click step. Pass null to break the coalescing chain. */
+  setRecordingLastClickStep(sessionId: string, userId: string, step: InternalSession['recordingLastClickStep']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastClickStep = step;
+  }
+
+  /** Get last emitted navigate step (for coalescing repeated navigations to same URL). */
+  getRecordingLastNavigateStep(sessionId: string, userId?: string): InternalSession['recordingLastNavigateStep'] {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingLastNavigateStep ?? null;
+  }
+
+  /** Set last emitted navigate step. Pass null to break the coalescing chain. */
+  setRecordingLastNavigateStep(sessionId: string, userId: string, step: InternalSession['recordingLastNavigateStep']): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingLastNavigateStep = step;
   }
 
   /**
