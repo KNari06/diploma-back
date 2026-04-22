@@ -4,6 +4,11 @@ import {
   WorkspaceRole,
 } from '@/services/core/workspace-access.service';
 import { WorkspaceMembersService } from '@/services/core/workspace-members.service';
+import {
+  AUDIT_EVENTS,
+  AuditEventType,
+  WorkspaceAuditService,
+} from '@/services/core/workspace-audit.service';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -833,6 +838,95 @@ export const acceptInvite = async (req: Request, res: Response): Promise<void> =
     res.status(500).json({
       success: false,
       error: 'Failed to accept invite',
+      timestamp: new Date().toISOString(),
+    });
+  }
+};
+
+// ============================================================================
+// AUDIT LOG ENDPOINT
+// ============================================================================
+
+const VALID_AUDIT_EVENTS = new Set<string>(Object.values(AUDIT_EVENTS));
+
+/**
+ * GET /api/v1/workspaces/:id/audit-log
+ * Returns paginated workspace activity for the Settings > Activity page.
+ * Query params: page (1-based), limit (1–100), action (event_type filter).
+ * Only workspace owners may read — matches the RLS policy on workspace_audit_log.
+ */
+export const getAuditLog = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    const workspaceId = req.params.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'Authentication required',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (!workspaceId || !UUID_REGEX.test(workspaceId)) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid workspace ID',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      await WorkspaceAccessService.requireOwner(userId, workspaceId);
+    } catch (error) {
+      if (error instanceof AccessDeniedError) {
+        res.status(403).json({
+          success: false,
+          error: error.message,
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      throw error;
+    }
+
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
+    const limit = Math.min(
+      100,
+      Math.max(1, parseInt(String(req.query.limit ?? '20'), 10) || 20)
+    );
+
+    let eventTypes: AuditEventType[] | undefined;
+    const actionParam = req.query.action;
+    if (actionParam && actionParam !== 'all') {
+      const raw = Array.isArray(actionParam)
+        ? actionParam.map((v) => String(v))
+        : String(actionParam).split(',');
+      const filtered = raw
+        .map((v) => v.trim())
+        .filter((v) => v && VALID_AUDIT_EVENTS.has(v));
+      if (filtered.length > 0) eventTypes = filtered as AuditEventType[];
+    }
+
+    const result = await WorkspaceAuditService.getAuditLogsPaginated(workspaceId, {
+      page,
+      limit,
+      eventTypes,
+    });
+
+    res.json({
+      success: true,
+      data: result,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    logger.error('[WORKSPACE_MEMBERS_API] Error getting audit log', { error });
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get audit log',
       timestamp: new Date().toISOString(),
     });
   }
