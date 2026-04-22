@@ -429,87 +429,235 @@ export async function quickFingerprintCheck(
 }
 
 /**
- * Try a single locator entry
+ * Continuous bbox-closeness score used as a soft tiebreaker between
+ * fingerprint-equal candidates.
+ *
+ * Returns 1.0 when the candidate's bounding box matches the recorded one
+ * exactly, decays smoothly to 0 as distance grows, and stays at 0 beyond
+ * ~400px — by that point the element is clearly not "the same thing moved
+ * slightly" and positional info is no longer trustworthy.
+ *
+ * Why continuous (not just binary 100px): for pages like tutor listings,
+ * every card can match the 100px threshold for its neighbour but only one
+ * candidate is TRULY the recorded element. The continuous score ranks them.
+ *
+ * Returns 0.5 (neutral) when either side has no bbox, so missing data does
+ * not penalize the candidate — we just have no signal.
  */
+function bboxCloseScore(
+  recorded: { x: number; y: number; width: number; height: number } | undefined,
+  candidate: { x: number; y: number; width: number; height: number } | null | undefined,
+): number {
+  if (!recorded || !candidate) return 0.5;
+  const dx = (recorded.x + recorded.width / 2) - (candidate.x + candidate.width / 2);
+  const dy = (recorded.y + recorded.height / 2) - (candidate.y + candidate.height / 2);
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  // Smooth decay: 0px → 1.0, 100px → ~0.6, 200px → ~0.3, 400px+ → ~0.
+  const score = Math.max(0, 1 - dist / 400);
+  return score;
+}
+
+/**
+ * Try a single locator entry.
+ *
+ * When a locator matches multiple elements (`count > 1`) and a `fingerprint`
+ * is provided, we rank each candidate via a COMBINED score:
+ *   - quickFingerprintCheck (structural match: tag/role/label/container)
+ *   - bboxCloseScore (continuous spatial proximity to recorded position)
+ *
+ * Both are computed fail-safely. If scoring throws (detached node, DOM
+ * mutation mid-check, timeout), that candidate is skipped silently and the
+ * remaining candidates are still considered. Worst case: all scores fail →
+ * we fall through to `ambiguous` which routes to the LLM self-heal path
+ * with the original strategy value intact — the user never sees an error,
+ * just a slightly slower step.
+ *
+ * A winner is accepted only when its combined score is clearly above the
+ * runners-up (≥0.55 AND leads by ≥0.12). Anything closer is still reported
+ * as ambiguous so the LLM can make the call on full page context.
+ */
+/**
+ * Build a locator for a strategy entry — optionally scoped inside the
+ * recorded ARIA landmark. Returns the globally-scoped locator when scoping
+ * is not applicable or the scope root itself is missing, so callers never
+ * need to special-case "landmark not found".
+ */
+function buildStrategyLocator(
+  page: PageLike,
+  entry: LocatorEntry,
+  scope: Locator | PageLike = page,
+): Locator | null {
+  switch (entry.strategy) {
+    case 'ref':
+    case 'css':
+      return scope.locator(entry.value);
+    case 'role':
+      return entry.roleName
+        ? scope.getByRole(entry.roleName as any, { name: entry.value })
+        : scope.locator(entry.value);
+    case 'label':
+      return scope.getByLabel(entry.value);
+    case 'testId':
+      return scope.getByTestId(entry.value);
+    case 'placeholder':
+      return scope.getByPlaceholder(entry.value);
+    case 'title':
+      return scope.getByTitle(entry.value);
+    case 'text':
+      return scope.getByText(entry.value, { exact: false });
+    default:
+      return null;
+  }
+}
+
 async function tryLocatorEntry(
   page: PageLike,
   entry: LocatorEntry,
-  timeout: number
+  timeout: number,
+  fingerprint?: TargetFingerprint
 ): Promise<{
   success: boolean;
   locator?: Locator;
   error?: string;
   failureKind?: 'ambiguous' | 'not_found' | 'error';
+  matchCount?: number;
 }> {
   try {
-    let locator: Locator;
-
-    switch (entry.strategy) {
-      case 'ref':
-        // ref is a CSS selector for data-agent-ref
-        locator = page.locator(entry.value);
-        break;
-
-      case 'css':
-        locator = page.locator(entry.value);
-        break;
-
-      case 'role':
-        if (entry.roleName) {
-          // getByRole with name
-          locator = page.getByRole(entry.roleName as any, { name: entry.value });
-        } else {
-          // Fallback to CSS
-          locator = page.locator(entry.value);
+    // ── Landmark scoping (soft prefilter) ───────────────────────────────
+    // When the recorded element had a nearestLandmark (e.g. 'navigation'),
+    // first try resolving INSIDE that landmark. This narrows the search
+    // space to the right section and often eliminates ambiguity caused by
+    // the same label appearing in multiple parts of the page.
+    //
+    // Failure modes are all soft: if the landmark does not exist on the
+    // current page, or scoping finds nothing, or throws — we silently fall
+    // through to the global locator below. The prefilter can never make a
+    // locator fail; it can only make it succeed earlier.
+    if (fingerprint?.nearestLandmark) {
+      try {
+        const landmarkRole = fingerprint.nearestLandmark.toLowerCase();
+        const landmark = page.getByRole(landmarkRole as any);
+        const landmarkCount = await landmark.count().catch(() => 0);
+        if (landmarkCount > 0) {
+          const scopedLocator = buildStrategyLocator(page, entry, landmark.first());
+          if (scopedLocator) {
+            const scopedTotal = await scopedLocator.count().catch(() => 0);
+            if (scopedTotal === 1) {
+              // Perfect — landmark scoping resolved ambiguity.
+              try {
+                await scopedLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 5000) });
+                logger.info('[COMPILED_EXECUTOR] Landmark scoping resolved ambiguity', {
+                  landmark: landmarkRole,
+                  strategy: entry.strategy,
+                  value: entry.value.slice(0, 80),
+                });
+                return { success: true, locator: scopedLocator, matchCount: 1 };
+              } catch {
+                // Candidate disappeared between count and waitFor — fall through to global.
+              }
+            }
+            // 0 matches or >1 inside landmark → fall through; the global
+            // locator below may do better, and the ambiguity path still
+            // has bbox tiebreaker + LLM self-heal as backstops.
+          }
         }
-        break;
+      } catch {
+        // Scoping machinery itself failed — ignore and try global.
+      }
+    }
 
-      case 'label':
-        locator = page.getByLabel(entry.value);
-        break;
-
-      case 'testId':
-        locator = page.getByTestId(entry.value);
-        break;
-
-      case 'placeholder':
-        locator = page.getByPlaceholder(entry.value);
-        break;
-
-      case 'title':
-        locator = page.getByTitle(entry.value);
-        break;
-
-      case 'text':
-        // exact: false allows partial match (whitespace, case variations).
-        // Fingerprint validation downstream prevents false positives.
-        locator = page.getByText(entry.value, { exact: false });
-        break;
-
-      default:
-        return { success: false, error: `Unknown strategy: ${entry.strategy}` };
+    const locator = buildStrategyLocator(page, entry);
+    if (!locator) {
+      return { success: false, error: `Unknown strategy: ${entry.strategy}` };
     }
 
     // Wait for element to be visible (quick check)
     await locator.waitFor({ state: 'visible', timeout: Math.min(timeout, 5000) });
 
-    // Verify exactly one match (avoid ambiguity)
     const count = await locator.count();
     if (count === 0) {
-      return { success: false, error: 'No elements found', failureKind: 'not_found' };
+      return { success: false, error: 'No elements found', failureKind: 'not_found', matchCount: 0 };
     }
-    if (count > 1) {
-      // Multiple matches - treat as ambiguity for CI/background runs
-      // This forces fallback to resolver/self-heal instead of blindly clicking first
-      logger.warn('[COMPILED_EXECUTOR] Multiple elements matched - treating as ambiguous', {
+    if (count === 1) {
+      return { success: true, locator, matchCount: 1 };
+    }
+
+    // Multiple matches — try fingerprint + bbox disambiguation before giving
+    // up. Cap at 8 candidates: beyond that the locator is too broad anyway
+    // and scoring burns time with little payoff.
+    //
+    // All scoring failures are swallowed intentionally: we never want
+    // disambiguation logic to harden into a new source of errors. If
+    // scoring breaks, we report `ambiguous` — the downstream LLM self-heal
+    // path will still run with the original strategy value, so the user
+    // gets an answer, just via the slower path.
+    if (fingerprint) {
+      const maxCandidates = Math.min(count, 8);
+      const scores: Array<{ idx: number; score: number; fp: number; bbox: number }> = [];
+      for (let i = 0; i < maxCandidates; i++) {
+        try {
+          const candidate = locator.nth(i);
+          const fpScore = await quickFingerprintCheck(page, candidate, fingerprint).catch(() => 0);
+          // Probe candidate bbox directly — avoids a second locator.evaluate
+          // roundtrip if quickFingerprintCheck already threw.
+          let candidateBox: { x: number; y: number; width: number; height: number } | null = null;
+          try {
+            candidateBox = await candidate.evaluate((el: any) => {
+              if (!el?.getBoundingClientRect) return null;
+              const r = el.getBoundingClientRect();
+              return { x: r.x, y: r.y, width: r.width, height: r.height };
+            });
+          } catch {
+            // Detached / cross-origin / evaluation timeout — leave null, bboxCloseScore returns neutral.
+          }
+          const bScore = bboxCloseScore(fingerprint.boundingBox, candidateBox);
+          // Combined weight: fingerprint is primary (0.7) since it captures
+          // stable semantics; bbox is secondary (0.3) — pages reflow.
+          const combined = 0.7 * fpScore + 0.3 * bScore;
+          scores.push({ idx: i, score: combined, fp: fpScore, bbox: bScore });
+        } catch {
+          // Absolute last-resort catch — any unexpected error per candidate
+          // just drops it from ranking, never bubbles up.
+        }
+      }
+      scores.sort((a, b) => b.score - a.score);
+      const winner = scores[0];
+      const runnerUp = scores[1];
+      const clearlyBetter =
+        !!winner
+        && winner.score >= 0.55
+        && (!runnerUp || winner.score - runnerUp.score >= 0.12);
+
+      if (clearlyBetter) {
+        logger.info('[COMPILED_EXECUTOR] Fingerprint+bbox disambiguated multi-match', {
+          strategy: entry.strategy,
+          value: entry.value.slice(0, 80),
+          count,
+          winnerIdx: winner.idx,
+          winnerScore: Math.round(winner.score * 100) / 100,
+          winnerFp: Math.round(winner.fp * 100) / 100,
+          winnerBbox: Math.round(winner.bbox * 100) / 100,
+          runnerUpScore: runnerUp ? Math.round(runnerUp.score * 100) / 100 : null,
+        });
+        return { success: true, locator: locator.nth(winner.idx), matchCount: count };
+      }
+
+      logger.warn('[COMPILED_EXECUTOR] Multi-match with no clear winner — deferring to LLM', {
+        strategy: entry.strategy,
+        value: entry.value.slice(0, 80),
+        count,
+        topScore: winner ? Math.round(winner.score * 100) / 100 : null,
+        runnerUpScore: runnerUp ? Math.round(runnerUp.score * 100) / 100 : null,
+      });
+    } else {
+      logger.warn('[COMPILED_EXECUTOR] Multiple elements matched, no fingerprint — deferring to LLM', {
         strategy: entry.strategy,
         value: entry.value,
         count,
       });
-      return { success: false, error: `Ambiguous: ${count} elements matched`, failureKind: 'ambiguous' };
     }
 
-    return { success: true, locator };
+    return { success: false, error: `Ambiguous: ${count} elements matched`, failureKind: 'ambiguous', matchCount: count };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     return { success: false, error: errorMessage, failureKind: 'error' };
@@ -670,7 +818,7 @@ export async function executeCompiledLocatorPlan(
     });
 
     const attemptStart = Date.now();
-    const result = await tryLocatorEntry(page, entry, timeout);
+    const result = await tryLocatorEntry(page, entry, timeout, compiled.targetFingerprint);
     const attemptDur = Date.now() - attemptStart;
 
     if (result.success && result.locator) {

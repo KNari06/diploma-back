@@ -123,6 +123,85 @@ const FLUSH_TRIGGER_KEYS = new Set(['Enter', 'Tab', 'Escape']);
  */
 const DRAG_DISTANCE_THRESHOLD = 10;
 
+/**
+ * Page-context JavaScript source for computing an element's ARIA role.
+ *
+ * Returns the explicit `role` attribute when present, otherwise the W3C-spec
+ * implicit role for the HTML tag (e.g. `<button>` → 'button', `<nav>` →
+ * 'navigation', `<a href>` → 'link'). Mirrors the `getImplicitRole()` logic
+ * in dom-analyzer.service.ts so recording captures and DOM snapshots agree.
+ *
+ * Injected verbatim into every `page.evaluate(...)` that builds a probed
+ * element payload. Each probe runs in its own IIFE page-context scope, so
+ * sharing the helper across probes requires inlining the source — a module-
+ * level JS function is not reachable from page.evaluate callbacks.
+ *
+ * WHY IT MATTERS: without this, native HTML elements had `role: undefined`
+ * in the captured node, which caused locator-plan-builder.service.ts to
+ * skip the `role` strategy and fall through to `getByText(...)` — a weak
+ * primitive that throws strict-mode-violation whenever the same text
+ * recurs anywhere else on the page (e.g. "Видео" label appearing inside
+ * tutor cards alongside the header button).
+ */
+const COMPUTE_ROLE_SRC = `
+  function computeRole(element) {
+    if (!element || !element.tagName) return undefined;
+    if (element.hasAttribute && element.hasAttribute('role')) {
+      return element.getAttribute('role') || undefined;
+    }
+    var t = element.tagName.toLowerCase();
+    switch (t) {
+      case 'button': return 'button';
+      case 'a': return element.hasAttribute('href') ? 'link' : undefined;
+      case 'input': {
+        var inputType = (element.getAttribute('type') || 'text').toLowerCase();
+        switch (inputType) {
+          case 'button': case 'submit': case 'reset': case 'image': return 'button';
+          case 'checkbox': return 'checkbox';
+          case 'radio': return 'radio';
+          case 'range': return 'slider';
+          case 'text': case 'email': case 'tel': case 'url': case 'search':
+          case 'password': case 'number': case 'date': case 'datetime-local':
+          case 'time': case 'week': case 'month': case 'color':
+            return 'textbox';
+          default: return undefined;
+        }
+      }
+      case 'textarea': return 'textbox';
+      case 'select': return element.hasAttribute('multiple') ? 'listbox' : 'combobox';
+      case 'img': return element.hasAttribute('alt') ? 'img' : undefined;
+      case 'nav': return 'navigation';
+      case 'main': return 'main';
+      case 'header': return 'banner';
+      case 'footer': return 'contentinfo';
+      case 'aside': return 'complementary';
+      case 'form': return 'form';
+      case 'dialog': return 'dialog';
+      case 'output': return 'status';
+      case 'meter': return 'meter';
+      case 'progress': return 'progressbar';
+      case 'fieldset': return 'group';
+      case 'menu': return 'menu';
+      case 'menuitem': return 'menuitem';
+      case 'area': return 'link';
+      case 'h1': case 'h2': case 'h3': case 'h4': case 'h5': case 'h6': return 'heading';
+      case 'ul': case 'ol': return 'list';
+      case 'li': return 'listitem';
+      case 'table': return 'table';
+      case 'tr': return 'row';
+      case 'td': return 'cell';
+      case 'th': return 'columnheader';
+      case 'article': return 'article';
+      case 'section': return 'region';
+      case 'search': return 'search';
+      case 'figure': return 'figure';
+      case 'details': return 'group';
+      case 'summary': return 'button';
+      default: return undefined;
+    }
+  }
+`;
+
 /** Generate a recording step ID */
 function recStepId(): string {
   return `rec_${randomUUID().slice(0, 8)}`;
@@ -150,6 +229,8 @@ const PROBE_AT_POINT_FN = `
   ];
   var FRAMEWORK_ATTRS = ['ng-click', 'v-on:click', 'x-on:click', 'on:click'];
   var BTN_CLASS_RE = /\\b(btn|button|clickable|toggle-btn|action-btn)\\b/i;
+
+  ${COMPUTE_ROLE_SRC}
 
   var chain = [];
   var walk = el;
@@ -344,7 +425,12 @@ const PROBE_AT_POINT_FN = `
 
   return {
     tag: tag,
-    role: target.getAttribute('role') || undefined,
+    // computeRole returns the explicit role attribute when present,
+    // otherwise the implicit W3C role for the tag — see the COMPUTE_ROLE_SRC
+    // helper at the top of the file. Previously we only read
+    // getAttribute('role'), which is null for native elements and forced the
+    // locator plan builder to skip role-based strategies entirely.
+    role: computeRole(target),
     type: target.getAttribute('type') || undefined,
     // Use innerText so hidden/script/style children don't leak into the
     // step description or binding hints (hints.text flows to the resolver's
@@ -380,6 +466,8 @@ const PROBE_FOCUSED_FN = `
 (function() {
   var el = document.activeElement;
   if (!el || el === document.body) return null;
+
+  ${COMPUTE_ROLE_SRC}
 
   var target = el;
   var tag = target.tagName.toLowerCase();
@@ -419,7 +507,10 @@ const PROBE_FOCUSED_FN = `
 
   return {
     tag: tag,
-    role: target.getAttribute('role') || undefined,
+    // See PROBE_AT_POINT_FN for rationale: computeRole returns the implicit
+    // W3C role when no explicit role attribute is set, so the locator plan
+    // builder can emit getByRole() strategies for native HTML elements.
+    role: computeRole(target),
     type: target.getAttribute('type') || undefined,
     // innerText over textContent — hides <script>/<style>/<template> and
     // display:none children that would otherwise leak into hints.text.
@@ -752,6 +843,9 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             walk = walk.parentElement;
           }
           if (!walk || walk === document.body) return null;
+
+          ${COMPUTE_ROLE_SRC}
+
           var tag = walk.tagName.toLowerCase();
           var labelText = undefined;
           if (walk.labels && walk.labels.length > 0) {
@@ -773,7 +867,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             || (walk.getAttribute('role') === 'textbox' && walk.getAttribute('aria-multiline') === 'true');
           return {
             tag: tag,
-            role: walk.getAttribute('role') || undefined,
+            role: computeRole(walk),
             type: walk.getAttribute('type') || undefined,
             // innerText skips <script>/<style> and hidden children (see
             // the identical comment on PROBE_CLICK_FN above).
@@ -896,27 +990,24 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
 
     const shortLabel = this.getProbedLabel(element, 60) || 'element';
 
+    // For label-only actions, omit the action-type prefix: the UI already renders
+    // the action type in its own field, so including it in the description would
+    // double up (e.g. "Click 'Foo'" shown next to an action badge that also says "Click").
     switch (actionType) {
       case 'click':
-        return `Click '${shortLabel}'`;
       case 'dblclick':
-        return `Double-click '${shortLabel}'`;
       case 'contextmenu':
-        return `Right-click '${shortLabel}'`;
+      case 'check':
+      case 'uncheck':
+      case 'open':
+      case 'close':
+      case 'toggle':
+      case 'drag_and_drop':
+        return `'${shortLabel}'`;
       case 'type':
         return value
           ? `Type '${value.slice(0, 40)}' in '${shortLabel}'`
           : `Type in '${shortLabel}'`;
-      case 'check':
-        return `Check '${shortLabel}'`;
-      case 'uncheck':
-        return `Uncheck '${shortLabel}'`;
-      case 'open':
-        return `Open '${shortLabel}'`;
-      case 'close':
-        return `Close '${shortLabel}'`;
-      case 'toggle':
-        return `Toggle '${shortLabel}'`;
       case 'select':
         return value
           ? `Select '${value.slice(0, 40)}' in '${shortLabel}'`
@@ -927,12 +1018,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         return value || 'Scroll down';
       case 'navigate':
         return `Navigate to ${value || 'page'}`;
-      case 'drag_and_drop':
-        return `Drag '${shortLabel}'`;
       case 'upload':
         return `Upload file to '${shortLabel}'`;
       default:
-        return `${actionType} '${shortLabel}'`;
+        return `'${shortLabel}'`;
     }
   }
 
@@ -1274,6 +1363,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     try {
       const result = await page.evaluate(`
         (function() {
+          ${COMPUTE_ROLE_SRC}
           var vw = window.innerWidth;
           var vh = window.innerHeight;
           // Sample a point in the upper-center area (where user likely scrolled to see)
@@ -1311,7 +1401,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             // innerText to avoid pulling in hidden/script/style descendants
             // when LLM falls back to a nearby element.
             text: ((best.innerText != null ? best.innerText : best.textContent) || '').trim().slice(0, 80) || undefined,
-            role: best.getAttribute('role') || undefined,
+            role: computeRole(best),
             ariaLabel: best.getAttribute('aria-label') || undefined,
             id: best.getAttribute('id') || undefined
           };

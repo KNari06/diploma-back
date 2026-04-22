@@ -1432,14 +1432,40 @@ async function selectElementWithLLM(params: {
   candidates: Array<{ node: InteractiveNode; candidateText: string }>;
   pageUrl: string;
   pageSignature: string;
+  /**
+   * Optional fingerprint captured at recording time. When present, it is
+   * rendered into the prompt as HINTS from the original interaction — the
+   * stable structural properties (tag/role/containers) should still match,
+   * while surface properties (text, exact position) may have drifted
+   * because of redesign, localization, or A/B tests.
+   */
+  recordedFingerprint?: import('./preview.types').TargetFingerprint;
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint } = params;
   const startTime = Date.now();
 
   // Check cache
   // V15: Include ALL candidate refs in cache key (not just top 5).
   // Truncating to 5 caused stale cache hits when the correct element was 6th+.
-  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${candidates.map(c => c.node.ref).join(',')}`;
+  // Include a fingerprint digest so that prompt-level hints never cause
+  // cross-shape cache hits (e.g. the same intent for a different recorded
+  // element should not reuse a prior selection).
+  const fpDigest = recordedFingerprint
+    ? [
+        recordedFingerprint.tag || '',
+        recordedFingerprint.role || '',
+        recordedFingerprint.ariaLabel || '',
+        recordedFingerprint.labelText || '',
+        recordedFingerprint.testIdAttr || '',
+        recordedFingerprint.placeholder || '',
+        recordedFingerprint.nearestLandmark || '',
+        recordedFingerprint.boundingBox
+          ? `${Math.round(recordedFingerprint.boundingBox.x)},${Math.round(recordedFingerprint.boundingBox.y)}`
+          : '',
+        (recordedFingerprint.containerTitles || []).join('|'),
+      ].join(':')
+    : '';
+  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
     return { ...cached.result, cacheHit: true, latencyMs: Date.now() - startTime };
@@ -1462,10 +1488,36 @@ async function selectElementWithLLM(params: {
     ? `\nIMPORTANT: Multiple elements share the same label. Use the (CONTEXT: ...) text to match the user's intent. Phrases like "on X", "for X", "у X", "на X", "button on Card Name" mean: pick the element whose CONTEXT contains X.`
     : '';
 
+  // Fingerprint hint section — rendered only when the step has recorded
+  // structural properties. The prompt is deliberately soft: the wording
+  // instructs the model to use this as a HINT (not a filter) so a minor
+  // drift (text change, button restyled, moved by 50px) does not force a
+  // null selection when a reasonable match still exists.
+  const fpHintLines: string[] = [];
+  if (recordedFingerprint) {
+    if (recordedFingerprint.tag) fpHintLines.push(`tag=<${recordedFingerprint.tag}>`);
+    if (recordedFingerprint.role) fpHintLines.push(`role="${recordedFingerprint.role}"`);
+    if (recordedFingerprint.ariaLabel) fpHintLines.push(`ariaLabel="${recordedFingerprint.ariaLabel}"`);
+    if (recordedFingerprint.labelText) fpHintLines.push(`labelText="${recordedFingerprint.labelText}"`);
+    if (recordedFingerprint.placeholder) fpHintLines.push(`placeholder="${recordedFingerprint.placeholder}"`);
+    if (recordedFingerprint.testIdAttr) fpHintLines.push(`testId="${recordedFingerprint.testIdAttr}"`);
+    if (recordedFingerprint.nearestLandmark) fpHintLines.push(`inLandmark="${recordedFingerprint.nearestLandmark}"`);
+    if (recordedFingerprint.containerTitles?.length) {
+      fpHintLines.push(`containers=${JSON.stringify(recordedFingerprint.containerTitles.slice(0, 3))}`);
+    }
+    if (recordedFingerprint.boundingBox) {
+      const bb = recordedFingerprint.boundingBox;
+      fpHintLines.push(`recordedAt=(${Math.round(bb.x)},${Math.round(bb.y)},${Math.round(bb.width)}x${Math.round(bb.height)})`);
+    }
+  }
+  const fpHint = fpHintLines.length > 0
+    ? `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${fpHintLines.join('\n')}`
+    : '';
+
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
 PAGE: ${pageUrl}
-VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}
+VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}${fpHint}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
@@ -2230,6 +2282,7 @@ export async function resolveElement(params: {
         candidates: candidatesToProcess,
         pageUrl,
         pageSignature,
+        recordedFingerprint: stepDraft.compiled?.targetFingerprint,
       });
 
       cacheHit = llmResult.cacheHit;
@@ -2439,6 +2492,7 @@ export async function resolveElement(params: {
             candidates: overflowCandidates,
             pageUrl,
             pageSignature: pageSignature + ':overflow',
+            recordedFingerprint: stepDraft.compiled?.targetFingerprint,
           });
 
           if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {
