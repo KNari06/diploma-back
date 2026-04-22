@@ -255,6 +255,7 @@ export async function getTestVisualization(req: Request, res: Response): Promise
             hasTraceFiles: testData.traceFiles.length > 0,
             hasIntelligentSession: !!testData.intelligentSession,
             hasReport: !!testData.report,
+            hasIntentTestCase: !!testData.intentTestCase,
           },
         });
         return;
@@ -296,6 +297,7 @@ export async function getTestVisualization(req: Request, res: Response): Promise
         intelligentSession: !!testData.intelligentSession,
         report: !!testData.report,
         apiConfigs: testData.apiConfigs.length,
+        intentTestCase: !!testData.intentTestCase,
         usedSavedGraph: stepsSource === 'saved_graph', // ✅ NEW: Indicate if we used saved graph
       },
       stepsSource,
@@ -515,6 +517,14 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
   intelligentSession: any;
   report: any;
   apiConfigs: any[];
+  /**
+   * Linked intent test case. Populated when the run was triggered from a
+   * saved intent test case (e.g. recorded via Test Suites, run via
+   * regression). Without this, a saved-but-never-executed case renders as
+   * a useless "Navigate + Perform test interactions" stub because the
+   * handler couldn't see the actual steps_json.
+   */
+  intentTestCase: any | null;
 } | null> {
   try {
     // 1. Get main test data
@@ -662,6 +672,78 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
       delete intelligentSession.session.total_tokens;
     }
 
+    // 7. Linked intent test case.
+    //
+    // Two linkage paths in the schema, both need to be checked:
+    //
+    //   a) Forward link (regression runs): the `tests` row was created by
+    //      `regression-run.service` with `options.metadata.intentTestCaseId`
+    //      pointing at the authored case. Common for "Run test case" /
+    //      regression plan runs.
+    //
+    //   b) Reverse link (saved-from-run): the case was authored LATER by
+    //      saving an ad-hoc test (chat-generated / intelligent). In that
+    //      case the `tests` row has no metadata, but an
+    //      `intent_test_cases` row exists with `source_test_id = tests.id`.
+    //
+    // Saved-but-never-executed cases are a third path — they still produce
+    // a `tests` row via regression runs (that's where this controller is
+    // reached from), so path (a) handles them.
+    let intentTestCase: any = null;
+    try {
+      // Path (a): forward link via options.metadata.
+      const fwdId = test?.options?.metadata?.intentTestCaseId;
+      if (fwdId && UUID_REGEX.test(String(fwdId))) {
+        const { data: itcRow, error: itcError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('id, name, start_url, url, steps_json, status, priority')
+          .eq('id', fwdId)
+          .maybeSingle();
+
+        if (itcError) {
+          logger.warn('[TEST_VISUALIZATION] Error loading linked intent test case (forward)', {
+            testId,
+            fwdId,
+            error: itcError.message,
+          });
+        } else if (itcRow) {
+          intentTestCase = itcRow;
+          logger.info('[TEST_VISUALIZATION] Linked intent test case loaded (forward)', {
+            testId,
+            intentTestCaseId: fwdId,
+            stepsCount: Array.isArray(itcRow.steps_json) ? itcRow.steps_json.length : 0,
+          });
+        }
+      }
+
+      // Path (b): reverse link via source_test_id. Only try if forward
+      // didn't find a row — forward link is authoritative.
+      if (!intentTestCase) {
+        const { data: itcRevRows, error: itcRevError } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('id, name, start_url, url, steps_json, status, priority, updated_at')
+          .eq('source_test_id', testId)
+          .order('updated_at', { ascending: false })
+          .limit(1);
+
+        if (itcRevError) {
+          logger.warn('[TEST_VISUALIZATION] Error loading linked intent test case (reverse)', {
+            testId,
+            error: itcRevError.message,
+          });
+        } else if (itcRevRows && itcRevRows.length > 0) {
+          intentTestCase = itcRevRows[0];
+          logger.info('[TEST_VISUALIZATION] Linked intent test case loaded (reverse via source_test_id)', {
+            testId,
+            intentTestCaseId: itcRevRows[0].id,
+            stepsCount: Array.isArray(itcRevRows[0].steps_json) ? itcRevRows[0].steps_json.length : 0,
+          });
+        }
+      }
+    } catch (error) {
+      logger.warn('[TEST_VISUALIZATION] Error resolving intent test case', { error, testId });
+    }
+
     return {
       test,
       results: results || [],
@@ -669,6 +751,7 @@ async function getComprehensiveTestData(testId: string, userId?: string): Promis
       intelligentSession,
       report,
       apiConfigs,
+      intentTestCase,
     };
 
   } catch (error) {
@@ -687,6 +770,7 @@ async function extractTestSteps(testData: {
   intelligentSession: any;
   report: any;
   apiConfigs: any[];
+  intentTestCase?: any | null;
 }): Promise<PlaywrightStep[]> {
   // const steps: PlaywrightStep[] = [];
 
@@ -705,6 +789,27 @@ async function extractTestSteps(testData: {
     if (reportSteps.length > 0) {
       logger.info('[TEST_VISUALIZATION] Using steps from test report', { count: reportSteps.length });
       return reportSteps;
+    }
+  }
+
+  // Priority 2.5: Linked intent test case.
+  //
+  // This is THE source of truth for cases authored in Test Suites (record /
+  // manual edit). Takes precedence over intelligent session because intent
+  // cases often exist long before (or without) any run, so using them early
+  // avoids rendering a "Navigate + Perform test interactions" stub for a
+  // case that was never executed end-to-end.
+  if (testData.intentTestCase?.steps_json) {
+    const intentSteps = convertIntentTestCaseStepsToPlaywright(
+      testData.intentTestCase.steps_json,
+      testData.intentTestCase,
+    );
+    if (intentSteps.length > 0) {
+      logger.info('[TEST_VISUALIZATION] Using steps from linked intent test case', {
+        count: intentSteps.length,
+        intentTestCaseId: testData.intentTestCase.id,
+      });
+      return intentSteps;
     }
   }
 
@@ -790,6 +895,105 @@ function convertReportStepsToPlaywright(steps: string[], report: any): Playwrigh
       analysis: report.analysis,
     },
   }));
+}
+
+/**
+ * Map an IntentStep `type` (authoring-layer enum from recording/manual edit)
+ * to a PlaywrightStepType the graph parser understands. Keeps the graph
+ * renderer honest without teaching the parser about every UI-layer verb.
+ */
+function mapIntentTypeToPlaywright(intentType: string): PlaywrightStepType {
+  switch (intentType) {
+    case 'navigate':     return 'goto';
+    case 'click':
+    case 'check':
+    case 'uncheck':
+    case 'toggle':
+    case 'open':
+    case 'close':        return 'click';
+    case 'dblclick':     return 'click';
+    case 'contextmenu':  return 'click';
+    case 'type':         return 'type';
+    case 'select':       return 'selectOption';
+    case 'hover':        return 'hover';
+    case 'scroll':       return 'scroll';
+    case 'press':        return 'custom';
+    case 'wait':
+    case 'wait_for':
+    case 'wait_for_email': return 'waitForSelector';
+    case 'assert':
+    case 'ai_check':     return 'assert';
+    case 'upload':       return 'custom';
+    case 'drag_and_drop': return 'custom';
+    case 'dialog':       return 'custom';
+    case 'download':     return 'custom';
+    case 'switch_tab':   return 'custom';
+    default:             return 'custom';
+  }
+}
+
+/**
+ * Convert an intent test case's `steps_json` (IntentStep[]) into the
+ * Playwright-shaped step array the graph parser expects. Produces ONE node
+ * per authored step + a leading `goto` when `start_url` is set — so a
+ * 12-step recording renders as 12 nodes, not the "Navigate + Perform test
+ * interactions" stub.
+ */
+function convertIntentTestCaseStepsToPlaywright(
+  stepsJson: any,
+  intentTestCase: { id: string; start_url?: string | null; url?: string | null; name?: string | null },
+): PlaywrightStep[] {
+  if (!Array.isArray(stepsJson)) return [];
+
+  const out: PlaywrightStep[] = [];
+  const startUrl = intentTestCase.start_url || intentTestCase.url;
+
+  // Lead with an explicit navigate so the graph shows where the case starts.
+  // Skip if the first authored step is already a `navigate` to avoid duplicates.
+  const firstIsNavigate =
+    stepsJson.length > 0 && stepsJson[0]?.type === 'navigate';
+  if (startUrl && !firstIsNavigate) {
+    out.push({
+      id: `intent_nav_0`,
+      type: 'goto',
+      label: `Navigate to ${startUrl}`,
+      value: String(startUrl),
+      meta: {
+        source: 'intent_test_case',
+        intentTestCaseId: intentTestCase.id,
+      },
+    });
+  }
+
+  stepsJson.forEach((s: any, index: number) => {
+    if (!s || typeof s !== 'object') return;
+    const mappedType = mapIntentTypeToPlaywright(String(s.type || ''));
+    const label =
+      (typeof s.description === 'string' && s.description.trim()) ||
+      // Fallback description when the authored step has no description — rare
+      // but possible for auto-injected steps. We still want a readable label.
+      `${s.type || 'step'}${s.value ? `: ${String(s.value).slice(0, 60)}` : ''}`;
+
+    out.push({
+      id: `intent_${s.id || index}`,
+      type: mappedType,
+      label,
+      value: typeof s.value === 'string' ? s.value : undefined,
+      selector: s.bindingHints?.selector,
+      meta: {
+        source: 'intent_test_case',
+        intentTestCaseId: intentTestCase.id,
+        originalType: s.type,
+        stepId: s.id,
+        ...(s.assertionText ? { assertionText: s.assertionText } : {}),
+        ...(s.isAutoInjected ? { autoInjected: true } : {}),
+        ...(s.expectedOutcome ? { expectedOutcome: s.expectedOutcome } : {}),
+        ...(typeof s.tabIndex === 'number' ? { tabIndex: s.tabIndex } : {}),
+      },
+    });
+  });
+
+  return out;
 }
 
 /**
@@ -1114,6 +1318,11 @@ function determineStepsSource(testData: any): string {
   }
   if (testData.report && testData.report.generatedCode?.steps) {
     return 'test_report';
+  }
+  // Matches priority in extractTestSteps — intent_test_case ranks above
+  // intelligent session so saved-but-never-executed cases aren't mislabeled.
+  if (Array.isArray(testData.intentTestCase?.steps_json) && testData.intentTestCase.steps_json.length > 0) {
+    return 'intent_test_case';
   }
   if (testData.intelligentSession) {
     return 'intelligent_session';
