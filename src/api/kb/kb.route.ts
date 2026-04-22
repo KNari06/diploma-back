@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import multer from 'multer';
 import { requireAuth } from '@/middleware/auth.middleware';
 import * as analyticsController from './analytics.controller';
@@ -6,6 +6,53 @@ import * as autoLearnController from './auto-learn.controller';
 import * as kbController from './kb.controller';
 
 const router = Router();
+
+/**
+ * Multer (busboy under the hood) reads the `filename` parameter from
+ * Content-Disposition using latin1 by default. When the browser sends a UTF-8
+ * filename — e.g. "Презентация.pdf" — multer hands us the raw bytes decoded
+ * as latin1, which surfaces downstream as mojibake like "Ð ÐµÐ·Ð°ÐºÑ†Ð¸Ñ".
+ *
+ * Fix: detect the latin1 mis-decoding and re-interpret the bytes as UTF-8.
+ *
+ * Detection heuristic:
+ *   - Every char code in the string is ≤ 0xFF (i.e. it was actually bytes
+ *     masquerading as chars). If any code point is > 0xFF, the string is
+ *     already a proper multi-byte JS string (e.g. RFC 5987 decoded, or
+ *     server was updated) and we MUST NOT touch it.
+ *   - Contains at least one non-ASCII byte (> 0x7F). Pure ASCII filenames
+ *     round-trip unchanged, so skipping them avoids unnecessary work.
+ *   - The UTF-8 reinterpretation must be valid (no replacement chars) —
+ *     otherwise the string was real latin1, not mis-decoded UTF-8, and
+ *     converting would corrupt it.
+ */
+function looksMojibake(raw: string): boolean {
+  let hasHighByte = false;
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i);
+    // Already a proper multi-byte string — nothing to fix.
+    if (code > 0xff) return false;
+    if (code > 0x7f) hasHighByte = true;
+  }
+  return hasHighByte;
+}
+
+function fixOriginalnameEncoding(req: Request, _res: Response, next: NextFunction): void {
+  const file = (req as Request & { file?: Express.Multer.File }).file;
+  if (file?.originalname && looksMojibake(file.originalname)) {
+    try {
+      const decoded = Buffer.from(file.originalname, 'latin1').toString('utf8');
+      // Replacement character = invalid UTF-8 sequence. The bytes were
+      // genuinely latin1, not mis-decoded UTF-8 — don't overwrite.
+      if (!decoded.includes('\ufffd')) {
+        file.originalname = decoded;
+      }
+    } catch {
+      /* keep original — better than crashing the upload */
+    }
+  }
+  next();
+}
 
 // Configure multer for file uploads
 const upload = multer({
@@ -71,7 +118,7 @@ router.use(requireAuth);
  *       403:
  *         description: Admin access required
  */
-router.post('/global/upload', upload.single('file'), kbController.uploadGlobalKB);
+router.post('/global/upload', upload.single('file'), fixOriginalnameEncoding, kbController.uploadGlobalKB);
 
 /**
  * @swagger
@@ -98,7 +145,7 @@ router.post('/global/upload', upload.single('file'), kbController.uploadGlobalKB
  *       200:
  *         description: File uploaded successfully
  */
-router.post('/upload', upload.single('file'), kbController.uploadProjectKB);
+router.post('/upload', upload.single('file'), fixOriginalnameEncoding, kbController.uploadProjectKB);
 
 /**
  * @swagger
