@@ -182,6 +182,20 @@ export interface MobileStepResult {
     environment: Record<string, unknown>;
     detectedAt: number;
   };
+  /**
+   * Non-blocking, advisory messages raised by the runner for this step (e.g.
+   * `install_app` warns when the APK is a release build without WebView
+   * debugging). The editor renders these as amber badges / toasts next to
+   * the step result. Only present when non-empty — never an empty array.
+   */
+  warnings?: Array<{
+    /** Stable machine code (e.g. 'WEBVIEW_DEBUGGABLE_DISABLED'). */
+    code: string;
+    /** Ready-to-display human message (may be multi-sentence). */
+    message: string;
+    /** Optional app identifier the warning refers to. */
+    packageName?: string;
+  }>;
 }
 
 // ── Test Metadata ────────────────────────────────────────────────

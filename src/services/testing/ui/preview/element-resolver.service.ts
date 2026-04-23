@@ -28,6 +28,7 @@ import type {
     LintCandidate,
     LintResult,
     LintStatus,
+    TargetFingerprint,
 } from './preview.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1061,6 +1062,52 @@ function extractFirstJsonObject(text: string): string | null {
   return null;
 }
 
+/**
+ * Tolerant wrapper around JSON.parse that recovers from common LLM
+ * malformations before giving up.
+ *
+ * Why this exists: Gemini 2.5 Flash Lite in JSON mode occasionally emits
+ * malformed escape sequences inside string values — typically when the
+ * model interpolates non-ASCII text (e.g. Russian, emoji) and produces a
+ * stray `\` that is not a valid JSON escape. The result is a valid-looking
+ * JSON that throws "Bad escaped character at position N".
+ *
+ * Repair strategy (in order, each is a no-op when not applicable):
+ *   1. Strict parse (happy path).
+ *   2. Replace any backslash that is NOT followed by a JSON-legal escape
+ *      character with a literal backslash (`\\`). This fixes the
+ *      "Bad escaped character" class without touching legitimate `\n`,
+ *      `\"`, `\\`, `\u0041`, etc.
+ *   3. Strip control characters in string positions (rare).
+ *
+ * If all repairs fail we return null and the caller falls back to its
+ * existing degraded path. We never throw — JSON parsing must not be a
+ * source of unhandled exceptions in the resolution loop.
+ */
+function safeParseJsonResponse(jsonStr: string): unknown | null {
+  try {
+    return JSON.parse(jsonStr);
+  } catch { /* fall through to repair */ }
+
+  // Pass 2: escape stray backslashes. JSON allows: \" \\ \/ \b \f \n \r \t \uXXXX
+  const repaired = jsonStr.replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+  try {
+    const parsed = JSON.parse(repaired);
+    logger.debug('[LLM_SELECT] Recovered from malformed escape via backslash-doubling');
+    return parsed;
+  } catch { /* fall through */ }
+
+  // Pass 3: drop bare control characters that JSON disallows inside strings.
+  const stripped = repaired.replace(/[\u0000-\u001f]/g, '');
+  try {
+    const parsed = JSON.parse(stripped);
+    logger.debug('[LLM_SELECT] Recovered from control char via stripping');
+    return parsed;
+  } catch { /* give up */ }
+
+  return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GEMINI FLASH RESCUE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1198,7 +1245,8 @@ Select the single best matching element. If unsure, return ref: null.`;
     const jsonMatch = extractFirstJsonObject(responseContent);
     if (!jsonMatch) return null;
 
-    const parsed = JSON.parse(jsonMatch);
+    const parsed = safeParseJsonResponse(jsonMatch) as any;
+    if (!parsed) return null;
 
     // ref must be a non-empty string (null or absent = no match) OR have bounding box
     if ((!parsed.ref || typeof parsed.ref !== 'string') && !parsed.boundingBox) return null;
@@ -1439,7 +1487,7 @@ async function selectElementWithLLM(params: {
    * while surface properties (text, exact position) may have drifted
    * because of redesign, localization, or A/B tests.
    */
-  recordedFingerprint?: import('./preview.types').TargetFingerprint;
+  recordedFingerprint?: TargetFingerprint;
 }): Promise<LlmSelectResult> {
   const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint } = params;
   const startTime = Date.now();
@@ -1560,12 +1608,21 @@ Select the single best matching element, or return ref=null if the intent does n
       throw new Error('No JSON in LLM response');
     }
 
-    const parsed = JSON.parse(jsonStr) as {
+    const parsed = safeParseJsonResponse(jsonStr) as {
       ref?: string | null;
       confidence?: number;
       reason?: string;
       alternatives?: string[];
-    };
+    } | null;
+    if (!parsed) {
+      // Repair attempts exhausted — surface as a soft failure so the caller
+      // falls into the rule-based degraded path with full context.
+      logger.warn('[LLM_SELECT] Unrecoverable JSON parse failure', {
+        contentPreview: content.slice(0, 200),
+        jsonPreview: jsonStr.slice(0, 200),
+      });
+      throw new Error('LLM response could not be parsed as JSON');
+    }
 
     // Validate ref against candidate list
     const validRefs = new Set(candidates.map(c => c.node.ref));

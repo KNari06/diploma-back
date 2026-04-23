@@ -1030,6 +1030,14 @@ export class PreviewSessionService {
       // V15: Reset tabs — new context = fresh single tab
       session.pages = [newPage];
       session.activeTabIndex = 0;
+      // Critical: refresh createdAt so evidence-shortcut's session-lifetime
+      // gate treats the new context as a new ref namespace. Without this,
+      // recorded `evidence.lastSuccessRef` values from before the reset
+      // would still be considered valid — but `__agentRefCounter` on the
+      // new browser context starts at 0, so those refs now point at
+      // unrelated elements (fake-pass class bug). See evidenceShortcut
+      // session_newer_than_evidence check.
+      session.createdAt = Date.now();
 
       // Auto-dismiss native dialogs on the new page
       this.attachDialogHandler(newPage, sessionId);
@@ -1488,6 +1496,23 @@ export class PreviewSessionService {
 
     session.lastSeenAt = Date.now();
     return session;
+  }
+
+  /**
+   * Return the `createdAt` (ms-since-epoch) of a session, validated against
+   * `userId` ownership. Returns `null` when the session is gone or the user
+   * does not own it — callers should treat both the same as "no session
+   * info available" and skip session-based invalidation gracefully.
+   *
+   * Exposed so evidence-shortcut callers can compare the session's lifetime
+   * against the step's `evidence.capturedAt` to catch cross-session ref
+   * staleness (same numeric ref, different browser instance → different
+   * element). Not needed in background/regression runs — those mint a
+   * fresh browser per run and have no cross-session concept.
+   */
+  getSessionCreatedAt(sessionId: string, userId: string): number | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session ? session.createdAt : null;
   }
 
   /**

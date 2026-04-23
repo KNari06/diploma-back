@@ -323,6 +323,7 @@ export class TestCompletionHandlerService {
 import type { DOMNode, SelectorCandidate, SelectorResolveRequest, SelectorResolveResponse, SelectorType } from './types';
 import { resolveElement } from '@/services/testing/ui/preview/element-resolver.service';
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
+import { isDynamicId } from '@/services/testing/ui/preview/dynamic-id.util';
 
 export class AISelectorEngine {
   /**
@@ -459,9 +460,11 @@ export class AISelectorEngine {
     // Parse isTopMostAtCenter
     const isTopMostAtCenter = attrs['__isTopMostAtCenter'] === 'true';
 
-    // Detect dynamic IDs (GUIDs, random strings) — should not be used as selectors
+    // Detect dynamic IDs (GUIDs, random strings) — should not be used as selectors.
+    // Shared with dom-analysis-extractor + background-dom-collector via
+    // src/services/testing/ui/preview/dynamic-id.util.ts so all three pipelines
+    // agree on what counts as "unstable id".
     const id = attrs['id'];
-    const isDynamicId = id ? /[0-9a-f]{8,}|[0-9]{4,}|^:r|^:R|^react-|^ember|^ng-/.test(id) : false;
 
     return {
       ref: node.nodeId,
@@ -475,7 +478,7 @@ export class AISelectorEngine {
       name: attrs['name'],
       placeholder: attrs['placeholder'],
       id,
-      isDynamicId,
+      isDynamicId: isDynamicId(id),
       testIdAttr: attrs['data-testid'] || attrs['data-test'],
       autocomplete: attrs['autocomplete'],
       boundingBox: node.boundingBox,

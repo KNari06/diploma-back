@@ -63,6 +63,16 @@ export interface MobileApplyOutput {
     screenshot?: string;
     resolvedVia?: string;
     durationMs?: number;
+    /**
+     * Advisory warnings from the runner (e.g. `install_app` flags release
+     * APKs that lack `WebView.setWebContentsDebuggingEnabled(true)`). Absent
+     * when there are none; callers should truthy-check.
+     */
+    warnings?: Array<{
+      code: string;
+      message: string;
+      packageName?: string;
+    }>;
   };
   appliedStep?: {
     id: string;
@@ -257,6 +267,11 @@ export class MobileStepApplyService {
         screenshot: stepResult?.screenshot,
         resolvedVia: stepResult?.resolvedVia,
         durationMs: stepResult?.durationMs,
+        // Only attach when the runner actually emitted warnings, so the
+        // frontend can do a truthy-check rather than a length-check.
+        ...(stepResult?.warnings && stepResult.warnings.length > 0
+          ? { warnings: stepResult.warnings }
+          : {}),
       },
       appliedStep,
       status: success ? 'passed' : 'failed',
