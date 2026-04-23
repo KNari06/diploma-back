@@ -310,6 +310,14 @@ export class MobileRunnerClient {
     sessionId: string,
     intent: string,
     actionType: string = 'tap',
+    /**
+     * BindingHints from the draft step in the editor. Forwarded so the
+     * runner's lint-evidence + resolver caches key by hints — editing a
+     * `label` / `selector` / `role` in the UI busts the cache and gets a
+     * fresh resolve, instead of silently returning the pre-edit bbox.
+     * Optional: runners older than 2026-04-23 ignore the field.
+     */
+    bindingHints?: Record<string, unknown>,
   ): Promise<{
     status: 'resolved' | 'not_found' | 'low_confidence' | 'error';
     boundingBox?: { x: number; y: number; width: number; height: number };
@@ -324,7 +332,12 @@ export class MobileRunnerClient {
     compiledPlan?: import('./mobile-runner.types').MobileCompiledPlan;
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
-      body: { intent, actionType },
+      // Only attach bindingHints when we actually have some — keeps the wire
+      // payload quiet for steps that carry no hints, and matches how
+      // existing fields (screenshot, compiledPlan) avoid empty emissions.
+      body: bindingHints && Object.keys(bindingHints).length > 0
+        ? { intent, actionType, bindingHints }
+        : { intent, actionType },
       timeoutMs: 15_000, // LLM resolve can take a few seconds
     });
   }

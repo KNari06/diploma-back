@@ -4232,6 +4232,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               screenshot: stepResult.screenshot,
               durationMs: stepResult.durationMs,
               timestamp: new Date().toISOString(),
+              // Advisory warnings from the runner (e.g. WebView debugging
+              // missing on release APK). Only attached when present.
+              ...(stepResult.warnings && stepResult.warnings.length > 0
+                ? { warnings: stepResult.warnings }
+                : {}),
             });
           }
 

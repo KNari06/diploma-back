@@ -339,7 +339,14 @@ const mobileTestRunWorker = new Worker(
   },
   {
     ...workerOptions,
-    concurrency: parseInt(process.env.MOBILE_WORKER_CONCURRENCY || '5', 10),
+    // Mobile tests consume an emulator/simulator each — keep this at or
+    // below the runner's pool size (POOL_ANDROID_SIZE + POOL_IOS_SIZE).
+    // Higher values force cold-starts (~60s each) as the pool drains, which
+    // ends up *slower* than sequential execution. Default 2 matches the
+    // runner's default pool of 2 Android + 1 iOS with headroom for editor
+    // sessions. Override with MOBILE_WORKER_CONCURRENCY only after bumping
+    // the runner's pool size accordingly.
+    concurrency: parseInt(process.env.MOBILE_WORKER_CONCURRENCY || '2', 10),
     lockDuration: 10 * 60 * 1000, // 10 min — mobile tests can be slow
     stalledInterval: 3 * 60 * 1000, // 3 min
     maxStalledCount: 1,

@@ -7,6 +7,8 @@
 import type { LiteElement, LiteSnapshot } from '@/agent/core/lite/lite-types';
 import { logger } from '@/utils/core/logger';
 import type { DomAnalysisData, InteractiveNode } from './preview.types';
+import { computeImplicitRole } from './implicit-role.util';
+import { isDynamicId } from './dynamic-id.util';
 
 // Constants
 // P2 FIX: Increased from 200 to 500 for complex enterprise dashboards
@@ -100,25 +102,10 @@ function borderRadiusToShape(
   return 'rounded'; // Complex values like "8px 16px 8px 16px"
 }
 
-// Dynamic ID patterns (UUIDs, random strings, timestamps)
-const DYNAMIC_ID_PATTERNS = [
-  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i, // UUID
-  /^[a-f0-9]{24,}$/i, // MongoDB ObjectId or similar
-  /^[0-9a-z]{20,}$/i, // Random alphanumeric strings
-  /^\d{10,}$/, // Timestamps
-  /^react-select-\d+-/i, // React Select
-  /^ember\d+$/i, // Ember IDs
-  /^_\w{8,}$/i, // Underscore + random
-  /:r[a-z0-9]+:$/i, // React 18 IDs
-];
-
-/**
- * Check if an ID looks like a dynamic/random value
- */
-function isDynamicId(id: string | undefined): boolean {
-  if (!id) return false;
-  return DYNAMIC_ID_PATTERNS.some(pattern => pattern.test(id));
-}
+// Dynamic-ID detection moved to `./dynamic-id.util.ts` — one source of truth
+// shared with the AI selector engine and mirrored (as inline regex) in the
+// background DOM collector's page.evaluate script. See that module for the
+// full rationale behind pattern selection and MUST-MATCH rules.
 
 /**
  * Truncate text to max length
@@ -145,9 +132,36 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.ref = element.ref;
   }
 
-  // Add role
+  // Add role (explicit or implicit W3C mapping).
+  //
+  // LiteElement.role is `getAttribute('role') || tag.toLowerCase()` (see
+  // snapshot-collector.ts:1522), so for native <button>/<a>/<nav>/etc. the
+  // raw role equals tag. The old code `element.role !== element.tag` dropped
+  // those, leaving `node.role = undefined` → buildLocatorChain skipped the
+  // role strategy → weak `[text]`-only plans → ambiguous matches on pages
+  // with duplicate labels.
+  //
+  // Now we disambiguate via computeImplicitRole:
+  //   • role !== tag → explicit ARIA role set → use it directly.
+  //   • role === tag → we can't tell if the author wrote `role="button"`
+  //     on a <button> or it was the fallback; treat as implicit and let
+  //     the W3C mapping decide. For native interactives (button, input,
+  //     a[href], etc.) this recovers a usable role; for plain <div>/<span>
+  //     it returns undefined, preserving the old skip behaviour.
   if (element.role && element.role !== element.tag) {
     node.role = element.role;
+  } else {
+    const implicit = computeImplicitRole({
+      tag: element.tag,
+      // explicitRole intentionally omitted — if we were here, either it
+      // matched tag (ambiguous fallback) or was empty.
+      inputType: element.type,
+      // hasHref / hasMultiple / hasAlt are not preserved by LiteElement.
+      // computeImplicitRole returns undefined for <a> without hasHref and
+      // <img> without hasAlt, which is correct for now — we'll upgrade
+      // the collector later if we need to distinguish those cases.
+    });
+    if (implicit) node.role = implicit;
   }
 
   // Add type for inputs

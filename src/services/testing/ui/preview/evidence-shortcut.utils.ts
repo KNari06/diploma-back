@@ -74,6 +74,26 @@ export interface EvidenceShortcutInput {
    * own validity semantics (e.g. a readonly input is still valid for hover).
    */
   actionType?: string;
+  /**
+   * Creation timestamp (ms since epoch) of the live preview session. When
+   * passed, and the session was started AFTER the evidence was captured, we
+   * reject the shortcut with `session_newer_than_evidence`.
+   *
+   * Rationale: `data-agent-ref` values are injected per browser context.
+   * Closing and reopening the editor spawns a new Chromium, resetting
+   * `window.__agentRefCounter` to 0, so the same numeric ref from an older
+   * session points at an entirely unrelated element in the new session.
+   * The existing TTL (60 min) catches most of these probabilistically, but
+   * a user reopening in <60 min slips through. This check closes that hole
+   * deterministically — ref validity is bounded by session lifetime, not
+   * wall-clock time.
+   *
+   * Only meaningful for preview callers (browser per user session). Background/
+   * regression callers fire up a fresh browser per run, so the lastSuccessRef
+   * is never from a "previous session" of the same kind — they should leave
+   * this undefined and keep the TTL-only semantics.
+   */
+  sessionCreatedAt?: number;
 }
 
 /** Reason a shortcut was rejected. Exposed for diagnostic logging at call sites. */
@@ -81,6 +101,7 @@ export type EvidenceShortcutSkipReason =
   | 'no_evidence'
   | 'no_cached_ref'
   | 'ttl_expired'
+  | 'session_newer_than_evidence'
   | 'no_recorded_url'
   | 'url_mismatch'
   | 'ref_not_in_dom'
@@ -113,7 +134,7 @@ export type EvidenceShortcutResult =
 export function evaluateEvidenceShortcut(
   input: EvidenceShortcutInput,
 ): EvidenceShortcutResult {
-  const { evidence, domNodes, currentUrl, description, bindingHints, compiledPageUrl, actionType } = input;
+  const { evidence, domNodes, currentUrl, description, bindingHints, compiledPageUrl, actionType, sessionCreatedAt } = input;
 
   if (!evidence) {
     return { ok: false, reason: 'no_evidence' };
@@ -124,10 +145,39 @@ export function evaluateEvidenceShortcut(
     return { ok: false, reason: 'no_cached_ref' };
   }
 
+  // ─── 0. Session-lifetime check (preview-only) ────────────────────────────
+  // If the live session was created AFTER the evidence was captured, the ref
+  // namespace is fresh: window.__agentRefCounter started from 0 in this
+  // browser, so the same numeric ref now points at an unrelated element.
+  // Reject up front — this catches cross-session staleness deterministically
+  // without relying on the 60-min TTL below.
+  if (
+    sessionCreatedAt !== undefined
+    && evidence.capturedAt
+    && Number.isFinite(sessionCreatedAt)
+  ) {
+    const evidenceMs = new Date(evidence.capturedAt).getTime();
+    if (Number.isFinite(evidenceMs) && sessionCreatedAt > evidenceMs) {
+      return {
+        ok: false,
+        reason: 'session_newer_than_evidence',
+        details: {
+          cachedRef,
+          sessionCreatedAt,
+          evidenceCapturedAt: evidenceMs,
+        },
+      };
+    }
+  }
+
   // ─── 1. TTL check ────────────────────────────────────────────────────────
   // Missing capturedAt = legacy record → skip this check (fallback to URL +
   // semantic below). `Number.isFinite` guards against invalid ISO strings
   // producing NaN and silently short-circuiting the comparison.
+  //
+  // Kept as a safety net even though session-lifetime check above covers the
+  // common case: background/CI callers don't pass `sessionCreatedAt`, and
+  // there are legacy records without a session boundary.
   if (evidence.capturedAt) {
     const ageMs = Date.now() - new Date(evidence.capturedAt).getTime();
     if (Number.isFinite(ageMs) && ageMs > EVIDENCE_REF_TTL_MS) {
@@ -199,6 +249,86 @@ export function evaluateEvidenceShortcut(
     .filter(Boolean)
     .map(t => t!.toLowerCase().trim())
     .filter(t => t.length > 0);
+
+  // ─── STRICT GATE: recorded element text must still match ─────────────────
+  // bindingHints.text captures the element's own innerText at record time
+  // (80-char slice). We compare against nodeTexts which is the
+  // accessible-name cascade on the live node (labelText, ariaLabel, name,
+  // placeholder, text). This is asymmetric by construction — recording
+  // gets raw innerText, replay gets computed name — so we use
+  // bidirectional substring matching (either side may be a subset of the
+  // other) rather than equality. Acceptable trade-off: catches the common
+  // "ref shift to unrelated element" class, tolerant of minor text drift
+  // (i18n capitalization, trailing punctuation).
+  //
+  // False-positive surface we intentionally keep: live node with a long
+  // aria-label that happens to contain the recorded text as a substring
+  // (e.g. recorded "Cancel" vs live "Cancel subscription"). We prefer
+  // false-positive-accept here to false-positive-reject — the downstream
+  // action will fail visibly if we picked wrong, but silent rejection of
+  // a legitimate cached ref costs an LLM roundtrip per step.
+  //
+  // Testid gets the same treatment — it's the stablest identifier in the
+  // DOM by design. A changed testId at the same ref means a different
+  // component.
+  //
+  // Strictness:
+  //   • minimum 3 chars: 2-char tokens like "OK"/"Go" substring-match too
+  //     promiscuously (e.g. "OK" is inside "Booking"). 3 is low enough to
+  //     still catch short CTAs like "Yes"/"No"/"Buy" but cuts the most common
+  //     spurious-substring class;
+  //   • falls through to the existing OR-match on partial similarity, so
+  //     "Continue" → "Continue dialog" still matches; "Submit" → "Send" does
+  //     not. Matches the same bidirectional-substring rule used below to
+  //     keep behaviour consistent.
+  const recordedText = bindingHints?.text?.toLowerCase().trim();
+  if (recordedText && recordedText.length >= 3 && nodeTexts.length > 0) {
+    const textMatch = nodeTexts.some(n => n.includes(recordedText) || recordedText.includes(n));
+    if (!textMatch) {
+      return {
+        ok: false,
+        reason: 'semantic_mismatch',
+        details: {
+          cachedRef,
+          semanticSource: 'bindingHints_text_gate',
+          recordedText: recordedText.slice(0, 80),
+          nodeTexts: nodeTexts.slice(0, 3),
+        },
+      };
+    }
+  }
+  // testId gate — only active in the background/CI pipeline today.
+  //
+  // WHY ONLY BACKGROUND: `InteractiveNode.testIdAttr` is populated by
+  // `background-dom-collector.ts:396` but NOT by the preview-side DOM
+  // extractor. Until that pipeline is unified, the check is a no-op for
+  // preview callers — `nodeTestId` will be undefined, falsy check skips.
+  // Removing the gate would lose protection in background; leaving it
+  // costs nothing in preview. Revisit when `dom-analysis-extractor`
+  // starts forwarding `data-testid`/`data-test`/`data-test-id`/`data-cy`.
+  //
+  // PIPELINE MISMATCH: recording reads 4 attrs (data-testid/data-test/
+  // data-test-id/data-cy — recording-capture.service.ts:420-424),
+  // background collector reads 2 (data-testid/data-test only). Projects
+  // using `data-cy` (Cypress) or `data-test-id` will record a hint that
+  // the live node never exposes, and the gate will silently skip. Fix
+  // together with the preview pipeline alignment.
+  const recordedTestId = bindingHints?.testId?.trim();
+  if (recordedTestId && recordedTestId.length >= 2) {
+    const nodeTestId = cachedNode.testIdAttr?.trim();
+    if (nodeTestId && nodeTestId !== recordedTestId) {
+      return {
+        ok: false,
+        reason: 'semantic_mismatch',
+        details: {
+          cachedRef,
+          semanticSource: 'bindingHints_testId_gate',
+          recordedTestId: recordedTestId.slice(0, 80),
+          nodeTestId: nodeTestId.slice(0, 80),
+        },
+      };
+    }
+  }
 
   const hintValues = [bindingHints?.label, bindingHints?.nearText, bindingHints?.autocomplete]
     .filter(Boolean)

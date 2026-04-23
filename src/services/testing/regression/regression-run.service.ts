@@ -1955,11 +1955,57 @@ export class RegressionRunService {
 
     emitProgress('started', `Regression run started: ${totalTests} tests in ${totalLevels} levels`);
 
+    // Mobile regression concurrency cap.
+    //
+    // WHY: BullMQ's mobile worker has its own concurrency (default 2 after
+    // the 2026-04-23 tuning), but that's a GLOBAL cap across ALL runs and
+    // editor sessions on the instance. A single regression plan that
+    // dispatches 15 test-cases as UI queue jobs would try to fan out to the
+    // worker immediately; whoever is first in the queue claims the pool.
+    // This cap keeps one plan from monopolizing the pool: we only dispatch
+    // up to N mobile UI tests in-flight at once, awaiting the first to
+    // complete before dispatching the next.
+    //
+    // The cap is advisory for non-mobile UI tests (web) — they don't
+    // consume the mobile pool, but keeping the same ceiling keeps progress
+    // events ordered and the regression view less chaotic.
+    //
+    // Override via REGRESSION_MOBILE_MAX_CONCURRENCY. Should be ≤ runner's
+    // POOL_ANDROID_SIZE + POOL_IOS_SIZE — otherwise each extra slot forces
+    // a ~60s cold-start that ends up slower than serial execution.
+    const MAX_MOBILE_IN_FLIGHT = Math.max(
+      1,
+      parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '2', 10),
+    );
+
     let creditExhausted = false;
 
     for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted; levelIdx++) {
       const level = levels[levelIdx];
       const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
+
+      // ── Concurrency gate ────────────────────────────────────────────────
+      // Tracks UI waiters that haven't settled yet. We don't want more than
+      // MAX_MOBILE_IN_FLIGHT live mobile tests at a time — each one consumes
+      // a device from the runner's pool, and exceeding pool size forces
+      // expensive cold-starts. The gate also helps fairness across users on
+      // shared infrastructure (one plan can't hog every device).
+      //
+      // We use a set of "in-flight" wrapper promises rather than counting
+      // uiWaiters.length because `executionCompletionEmitter.waitForCompletion`
+      // can resolve at any time while we're still dispatching; a set that
+      // self-removes on resolve gives us an accurate current live count.
+      const inFlight = new Set<Promise<void>>();
+      const trackInFlight = (p: Promise<string>) => {
+        const tracker: Promise<void> = p.then(() => {
+          inFlight.delete(tracker);
+        }, () => {
+          // waitForCompletion only rejects on a timeout / emitter error.
+          // Either way we must free the slot so dispatch can proceed.
+          inFlight.delete(tracker);
+        });
+        inFlight.add(tracker);
+      };
 
       emitProgress('level_started', `Starting level ${levelIdx + 1}/${totalLevels} (${level.length} tests)`, {
         currentLevel: levelIdx + 1,
@@ -2063,6 +2109,28 @@ export class RegressionRunService {
               // Register waiter for dependency-aware ordering
               const waitPromise = executionCompletionEmitter.waitForCompletion(execId);
               uiWaiters.push({ testCaseId: testCase.testCaseId, execId, promise: waitPromise });
+
+              // Only mobile tests consume the runner's emulator pool — gate
+              // those. Web tests go through Playwright's own pool and share
+              // no resources with mobile, so there's no device shortage to
+              // worry about. (When web tests end up slowing mobile due to
+              // shared CPU/memory, cap them via WEB_WORKER_CONCURRENCY, not
+              // here.)
+              if (isMobile) {
+                trackInFlight(waitPromise);
+                if (inFlight.size >= MAX_MOBILE_IN_FLIGHT) {
+                  emitProgress(
+                    'test_started',
+                    `Queued ${totalTests - completedCount - inFlight.size} more — ${inFlight.size} mobile test(s) in flight`,
+                    { currentLevel: levelIdx + 1 },
+                  );
+                  // Wait for any in-flight mobile test to settle. We don't
+                  // care which one — we just need a free slot. Errors are
+                  // absorbed by trackInFlight's .then, so Promise.race won't
+                  // bubble a rejection here.
+                  await Promise.race(inFlight);
+                }
+              }
             }
           } else {
             // Deduct API test credits upfront (flat cost per API test)

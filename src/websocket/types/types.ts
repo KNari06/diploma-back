@@ -574,6 +574,21 @@ export interface TestStepCompletedPayload {
 
     /** Screenshot URL captured at the moment a bug was detected */
     bugScreenshotUrl?: string;
+
+    /**
+     * Non-blocking, advisory warnings raised by the runner for this step.
+     * Currently emitted by the mobile runner's `install_app` command (e.g.
+     * release APK without WebView debugging). Omitted when there are none
+     * — callers should truthy-check before reading `.length`.
+     */
+    warnings?: Array<{
+      /** Stable machine code (e.g. 'WEBVIEW_DEBUGGABLE_DISABLED'). */
+      code: string;
+      /** Ready-to-display human message. */
+      message: string;
+      /** Optional app identifier the warning refers to. */
+      packageName?: string;
+    }>;
   };
 }
 

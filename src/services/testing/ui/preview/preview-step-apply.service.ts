@@ -15,6 +15,7 @@ import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type {
     BindingHints,
+    CompiledStepPlan,
     ConfidenceTier,
     IntentStep,
     InteractiveNode,
@@ -30,6 +31,61 @@ import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
 import { smartStepWait } from '../smart-step-wait.service';
 
 const MAX_ATTEMPTS = STEP_APPLY_CONFIG.maxAttempts;
+
+/**
+ * Decide whether a freshly-built compiled plan is strong enough to replace
+ * the one already stored on the step.
+ *
+ * Called from the compiled fast-path success branch to opportunistically
+ * rebuild weak/legacy plans without regressing strong ones. Returns true
+ * only when the new plan demonstrably adds resolution power — more
+ * distinct strategies OR a higher-priority primary strategy.
+ *
+ * Strategy priority order (highest first) mirrors LocatorPlanBuilder:
+ *   role → testId → label → placeholder → title → text → css → ref
+ *
+ * Deliberately conservative: ties keep the old plan so we never rebuild
+ * for cosmetic reasons. `locator-plan-builder.service.ts` is pure, so the
+ * cost of "try then discard" is a few microseconds.
+ */
+const STRATEGY_RANK: Record<string, number> = {
+  role: 7,
+  testId: 6,
+  label: 5,
+  placeholder: 4,
+  title: 3,
+  text: 2,
+  css: 1,
+  ref: 0,
+};
+
+function shouldUpgradeCompiledPlan(
+  existing: CompiledStepPlan | undefined,
+  candidate: CompiledStepPlan,
+): boolean {
+  // No existing plan → always take the new one.
+  if (!existing || !existing.locatorPlan || existing.locatorPlan.length === 0) {
+    return candidate.locatorPlan.length > 0;
+  }
+
+  // Empty / invalid candidate — never replace.
+  if (!candidate.locatorPlan || candidate.locatorPlan.length === 0) return false;
+
+  const existingStrategies = new Set(existing.locatorPlan.map(e => e.strategy));
+  const candidateStrategies = new Set(candidate.locatorPlan.map(e => e.strategy));
+
+  // Candidate carries a strategy type we didn't have before — real upgrade.
+  for (const s of candidateStrategies) {
+    if (!existingStrategies.has(s)) return true;
+  }
+
+  // Same strategy set, but candidate's primary is stronger (e.g. role vs text).
+  const existingRank = STRATEGY_RANK[existing.locatorPlan[0]?.strategy ?? ''] ?? -1;
+  const candidateRank = STRATEGY_RANK[candidate.locatorPlan[0]?.strategy ?? ''] ?? -1;
+  if (candidateRank > existingRank) return true;
+
+  return false;
+}
 
 /**
  * V2: Build bindingHints from resolved InteractiveNode
@@ -3072,9 +3128,65 @@ export class PreviewStepApplyService {
                   confidenceTier: 'high' as ConfidenceTier,
                 };
 
+                // V22 — Opportunistic plan upgrade on compiled-success path.
+                //
+                // Before: the compiled fast-path returned success and rebuilt
+                // ONLY `evidence.*`, leaving `stepDraft.compiled` untouched.
+                // That meant an old test case whose plan was compiled with
+                // stale builder logic (e.g. pre-`computeImplicitRole`, where
+                // native <button> ended up with `locatorPlan=[text]`) would
+                // run forever on that weak plan — it succeeds, we never fall
+                // into lint, lint was the only place buildCompiledPlan runs.
+                //
+                // Strategy here: after success, look up the live node by the
+                // ref that actually worked and build a FRESH plan from it.
+                // Only commit the rebuild if it is structurally stronger than
+                // the old plan (more strategies, or richer first strategy).
+                // Anything else keeps the old plan untouched — guarantees we
+                // never regress a well-scored plan with a thinner live snapshot
+                // (e.g. page reflowed and the accessible-name disappeared).
+                //
+                // All failures are soft — any throw, missing node, or weaker
+                // rebuild falls through to the old plan, so this path can
+                // NEVER turn a successful step into a failure.
+                let upgradedCompiled = stepDraft.compiled;
+                if (compiledRef) {
+                  try {
+                    const sess = sessionService.getSession(previewSessionId);
+                    const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
+                    if (liveNode) {
+                      const candidatePlan = LocatorPlanBuilder.buildCompiledPlan({
+                        step: stepDraft,
+                        resolvedNode: liveNode,
+                        pageUrl: page.url(),
+                        pageTitle: await page.title().catch(() => undefined),
+                        pageSignature: sess?.lastPageSignature,
+                      });
+                      if (shouldUpgradeCompiledPlan(stepDraft.compiled, candidatePlan)) {
+                        logger.info('[PREVIEW_APPLY] Upgraded compiled plan on fast-path success', {
+                          previewSessionId,
+                          stepId: stepDraft.id,
+                          oldStrategies: stepDraft.compiled?.locatorPlan?.map(e => e.strategy) ?? [],
+                          newStrategies: candidatePlan.locatorPlan.map(e => e.strategy),
+                        });
+                        upgradedCompiled = candidatePlan;
+                      }
+                    }
+                  } catch (upgradeErr) {
+                    // Plan upgrade must never break a successful step —
+                    // fall through with the original plan untouched.
+                    logger.debug('[PREVIEW_APPLY] Compiled plan upgrade skipped', {
+                      previewSessionId,
+                      stepId: stepDraft.id,
+                      error: upgradeErr instanceof Error ? upgradeErr.message : String(upgradeErr),
+                    });
+                  }
+                }
+
                 // Update step with success evidence
                 const updatedStep: IntentStep = {
                   ...stepDraft,
+                  compiled: upgradedCompiled,
                   evidence: {
                     ...stepDraft.evidence,
                     lastSuccessRef: compiledRef || '', // V15: Preserve ref for evidence shortcut

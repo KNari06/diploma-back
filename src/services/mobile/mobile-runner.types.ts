@@ -55,6 +55,7 @@ export type MobileIntentActionType =
   | 'pinch'              // pinch zoom
   | 'go_back'            // Android back / iOS swipe-back
   | 'go_home'            // Home button
+  | 'dismiss'            // Smart close of top modal / sheet / dialog
   // Biometric & auth
   | 'biometric' | 'otp' | 'permission' | 'clipboard'
   // Network simulation
@@ -106,6 +107,10 @@ export interface MobileIntentStepOptions {
   networkLatencyMs?: number;
   networkBandwidthKbps?: number;
   networkPacketLossPercent?: number;
+  // Dismiss
+  /** Free-text hint for `dismiss` steps ("Reading settings sheet"). Advisory
+   *  only — the runner always closes the top-most active layer it sees. */
+  dismissTarget?: string;
 }
 
 export interface MobileIntentStep {
@@ -182,6 +187,20 @@ export interface MobileStepResult {
     environment: Record<string, unknown>;
     detectedAt: number;
   };
+  /**
+   * Non-blocking, advisory messages raised by the runner for this step (e.g.
+   * `install_app` warns when the APK is a release build without WebView
+   * debugging). The editor renders these as amber badges / toasts next to
+   * the step result. Only present when non-empty — never an empty array.
+   */
+  warnings?: Array<{
+    /** Stable machine code (e.g. 'WEBVIEW_DEBUGGABLE_DISABLED'). */
+    code: string;
+    /** Ready-to-display human message (may be multi-sentence). */
+    message: string;
+    /** Optional app identifier the warning refers to. */
+    packageName?: string;
+  }>;
 }
 
 // ── Test Metadata ────────────────────────────────────────────────

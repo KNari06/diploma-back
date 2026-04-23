@@ -44,6 +44,73 @@ function buildExtractScript(maxNodes: number): string {
   const MAX_TEXT_LENGTH = 100;
   const MAX_PARENT_CHAIN = 6;
 
+  // W3C implicit ARIA role mapping. MUST stay in sync with Node-side
+  // src/services/testing/ui/preview/implicit-role.util.ts and the browser-
+  // side COMPUTE_ROLE_SRC in recording-capture.service.ts. This inline copy
+  // exists because this script runs in page.evaluate context and cannot
+  // import from the backend module graph.
+  //
+  // Without this, native <button>/<a href>/<nav> produced node.role =
+  // undefined in background/regression runs, breaking the structural
+  // fingerprint score symmetry with preview (where the recorder already
+  // computes implicit role) and weakening compiled-locator-plan role
+  // strategies during CI replay.
+  function computeRoleFor(el) {
+    if (!el || !el.tagName) return undefined;
+    var explicit = (el.getAttribute('role') || '').trim();
+    if (explicit) return explicit;
+    var t = el.tagName.toLowerCase();
+    switch (t) {
+      case 'button': return 'button';
+      case 'a': return el.hasAttribute('href') ? 'link' : undefined;
+      case 'input': {
+        var it = (el.getAttribute('type') || 'text').toLowerCase();
+        switch (it) {
+          case 'button': case 'submit': case 'reset': case 'image': return 'button';
+          case 'checkbox': return 'checkbox';
+          case 'radio': return 'radio';
+          case 'range': return 'slider';
+          case 'text': case 'email': case 'tel': case 'url': case 'search':
+          case 'password': case 'number': case 'date': case 'datetime-local':
+          case 'time': case 'week': case 'month': case 'color':
+            return 'textbox';
+          default: return undefined;
+        }
+      }
+      case 'textarea': return 'textbox';
+      case 'select': return el.hasAttribute('multiple') ? 'listbox' : 'combobox';
+      case 'img': return el.hasAttribute('alt') ? 'img' : undefined;
+      case 'nav': return 'navigation';
+      case 'main': return 'main';
+      case 'header': return 'banner';
+      case 'footer': return 'contentinfo';
+      case 'aside': return 'complementary';
+      case 'form': return 'form';
+      case 'dialog': return 'dialog';
+      case 'output': return 'status';
+      case 'meter': return 'meter';
+      case 'progress': return 'progressbar';
+      case 'fieldset': return 'group';
+      case 'menu': return 'menu';
+      case 'menuitem': return 'menuitem';
+      case 'area': return 'link';
+      case 'h1': case 'h2': case 'h3': case 'h4': case 'h5': case 'h6': return 'heading';
+      case 'ul': case 'ol': return 'list';
+      case 'li': return 'listitem';
+      case 'table': return 'table';
+      case 'tr': return 'row';
+      case 'td': return 'cell';
+      case 'th': return 'columnheader';
+      case 'article': return 'article';
+      case 'section': return 'region';
+      case 'search': return 'search';
+      case 'figure': return 'figure';
+      case 'details': return 'group';
+      case 'summary': return 'button';
+      default: return undefined;
+    }
+  }
+
   // Interactive element selectors (synced with snapshot-collector.ts)
   const INTERACTIVE_SELECTORS = [
     // ── Core interactive elements ──
@@ -370,18 +437,37 @@ function buildExtractScript(maxNodes: number): string {
     }
 
     // ── Dynamic ID detection ──
-    const elId = el.getAttribute('id') || '';
+    //
+    // MUST MATCH src/services/testing/ui/preview/dynamic-id.util.ts
+    //     DYNAMIC_ID_PATTERNS. This inline copy runs in page.evaluate context
+    //     and cannot import from the backend module graph. Keep these two
+    //     regex lists in sync — drift causes preview and background to
+    //     disagree on "is this id stable?" for the same element, producing
+    //     inconsistent locator plans on identical DOM.
+    const elId = (el.getAttribute('id') || '').trim();
     const isDynamicId = elId.length > 0 && (
-      /[0-9a-f]{8,}/i.test(elId) || // UUID-like
-      /^[a-z]+[-_][a-z0-9]{6,}/i.test(elId) || // prefix-randomstring
-      /:r[0-9]+:/.test(elId) // React :r0:, :r1: etc.
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(elId) || // UUID
+      /^[a-f0-9]{24,}$/i.test(elId) ||                                                // Mongo ObjectId / long hex
+      /^[0-9a-z]{20,}$/i.test(elId) ||                                                 // 20+ char random token
+      /^\d{10,}$/.test(elId) ||                                                        // epoch-like timestamps
+      /^react-select-\d+-/i.test(elId) ||                                              // React Select
+      /^react-[a-z0-9]+/i.test(elId) ||                                                // other React-generated
+      /^ember\d+/i.test(elId) ||                                                       // Ember auto ids
+      /^ng-[a-z0-9-]+/i.test(elId) ||                                                   // AngularJS generated
+      /^_[\w-]{8,}/i.test(elId) ||                                                      // underscore + random
+      /:r[a-z0-9]+:?$/i.test(elId) ||                                                  // React 18 useId (:r0:)
+      /:R[A-Za-z0-9]+:?$/.test(elId)                                                    // React 18 SSR form
     );
 
     // Build node data
     const node = {
       ref,
       tag: el.tagName.toLowerCase(),
-      role: (el.getAttribute('role') || '').replace(/["']/g, '').trim() || undefined,
+      // Explicit OR implicit W3C role (see computeRoleFor comment above).
+      // Was: getAttribute('role') only — which silently dropped the role
+      // on every native <button>, <a href>, <nav>, etc., breaking locator
+      // plan building downstream.
+      role: computeRoleFor(el),
       type: el.getAttribute('type') || undefined,
       inputType: el.getAttribute('type') || undefined,
       text: el.textContent?.trim().substring(0, MAX_TEXT_LENGTH) || undefined,

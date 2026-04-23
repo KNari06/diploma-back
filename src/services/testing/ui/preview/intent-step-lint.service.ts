@@ -6,6 +6,7 @@
 
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
     resolveElement,
@@ -20,6 +21,7 @@ import type {
     LintCandidate,
     LintResult,
     LintStatus,
+    TargetFingerprint,
 } from './preview.types';
 
 
@@ -372,31 +374,89 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
   return { score, reasons, hardReject };
 }
 
+// Note: a local `normalizeUrlForComparison` used to live here with a
+// different (query-sorting) implementation than the one in
+// `auto-wait-for.utils.ts`. It had zero callers in this file — dead code
+// kept from a never-completed P2 work item — and its existence risked
+// silently diverging the URL-equality contract from the rest of the
+// pipeline. Removed; consumers should import from `auto-wait-for.utils`
+// so "same URL?" has one answer across the service.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Degraded-mode fingerprint disambiguation (offline scoring)
+// ─────────────────────────────────────────────────────────────────────────────
+// When the LLM resolver is unavailable, the rule-based fallback often yields
+// several candidates with no clean way to pick. If the step carries a recorded
+// TargetFingerprint, we can rank candidates against it without any extra page
+// roundtrips — the InteractiveNode snapshot is already in memory and exposes
+// every field we need for both structural and spatial comparison.
+//
+// Mirrors the weighting used in compiled-locator-executor.tryLocatorEntry so
+// the two paths agree on what "the recorded element" means.
+
+const DEGRADED_FP_WEIGHT = 0.7;
+const DEGRADED_BBOX_WEIGHT = 0.3;
+
+/** Continuous bbox proximity score (0..1). Identical decay to executor. */
+function bboxProximityScore(
+  recorded: { x: number; y: number; width: number; height: number } | undefined,
+  candidate: { x: number; y: number; width: number; height: number } | null | undefined,
+): number {
+  if (!recorded || !candidate) return 0.5;
+  if (recorded.width <= 0 || recorded.height <= 0) return 0.5;
+  if (candidate.width <= 0 || candidate.height <= 0) return 0.5;
+  const dx = (recorded.x + recorded.width / 2) - (candidate.x + candidate.width / 2);
+  const dy = (recorded.y + recorded.height / 2) - (candidate.y + candidate.height / 2);
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  return Math.max(0, 1 - dist / 400);
+}
+
 /**
- * P2 FIX: Normalize URL for comparison (ignore hash, sort query params)
- * Catches SPA navigations that would otherwise bypass evidence cache invalidation
+ * Score a single candidate against the fingerprint, returning a value in
+ * [0, 1] proportional to how many fingerprint attributes match. Skips
+ * fields the fingerprint did not record (avoids penalising partial data).
  */
-function normalizeUrlForComparison(url: string): string {
-  try {
-    const parsed = new URL(url);
-
-    // Remove hash (SPA navigation)
-    parsed.hash = '';
-
-    // Sort query parameters for consistent comparison
-    const params = Array.from(parsed.searchParams.entries())
-      .sort((a, b) => a[0].localeCompare(b[0]));
-
-    parsed.search = '';
-    for (const [key, value] of params) {
-      parsed.searchParams.append(key, value);
-    }
-
-    return parsed.toString();
-  } catch {
-    // Invalid URL - return as-is
-    return url;
+function structuralFingerprintScore(node: InteractiveNode, fp: TargetFingerprint): number {
+  let total = 0;
+  let matches = 0;
+  if (fp.tag) { total++; if (node.tag?.toLowerCase() === fp.tag.toLowerCase()) matches++; }
+  if (fp.role) { total++; if (node.role === fp.role) matches++; }
+  if (fp.ariaLabel) { total++; if (node.ariaLabel === fp.ariaLabel) matches++; }
+  if (fp.placeholder) { total++; if (node.placeholder === fp.placeholder) matches++; }
+  if (fp.labelText) { total++; if (node.labelText === fp.labelText) matches++; }
+  if (fp.testIdAttr) { total++; if (node.testIdAttr === fp.testIdAttr) matches++; }
+  if (fp.containerTitles && fp.containerTitles.length > 0) {
+    total++;
+    const fpSet = new Set(fp.containerTitles.map((c) => c.toLowerCase()));
+    const nodeContainers = (node.containerTitles || []).map((c: string) => c.toLowerCase());
+    if (nodeContainers.some((c) => fpSet.has(c))) matches++;
   }
+  if (total === 0) return 1;
+  return matches / total;
+}
+
+/**
+ * Rank rule-based LintCandidates against a recorded fingerprint. Used by
+ * the degraded path to recover from "multiple candidates, LLM down" cases
+ * without forcing the user into a clarification dialog when we already
+ * have enough recorded signal to decide.
+ */
+function rankCandidatesByFingerprint(
+  candidates: LintCandidate[],
+  domNodes: InteractiveNode[],
+  fp: TargetFingerprint,
+): Array<{ candidate: LintCandidate; score: number; fp: number; bbox: number }> {
+  const refToNode = new Map(domNodes.map((n) => [n.ref, n]));
+  return candidates
+    .map((c) => {
+      const node = refToNode.get(c.ref);
+      // No matching node in snapshot — score with bbox only and zero structural.
+      const fpScore = node ? structuralFingerprintScore(node, fp) : 0;
+      const bScore = bboxProximityScore(fp.boundingBox, c.boundingBox);
+      const combined = DEGRADED_FP_WEIGHT * fpScore + DEGRADED_BBOX_WEIGHT * bScore;
+      return { candidate: c, score: combined, fp: fpScore, bbox: bScore };
+    })
+    .sort((a, b) => b.score - a.score);
 }
 
 /**
@@ -661,6 +721,10 @@ export class IntentStepLintService {
     const disableCaching = stepDraft.options?.disableCaching === true;
 
     if (!disableCaching && stepDraft.evidence?.lastSuccessRef) {
+      // Best-effort session lookup — null when the session has been torn
+      // down between snapshot and shortcut (race window). When null the
+      // shortcut gracefully degrades to TTL-only behaviour.
+      const sessionCreatedAt = sessionService.getSessionCreatedAt(previewSessionId, params.userId) ?? undefined;
       const shortcut = evaluateEvidenceShortcut({
         evidence: stepDraft.evidence,
         domNodes,
@@ -669,13 +733,15 @@ export class IntentStepLintService {
         bindingHints: stepDraft.bindingHints,
         compiledPageUrl: stepDraft.compiled?.context?.pageUrl,
         actionType: stepDraft.type,
+        sessionCreatedAt,
       });
 
       if (!shortcut.ok) {
         // Reason-specific logging preserved for operator diagnostics.
-        // `ttl_expired`/`url_mismatch`/`semantic_mismatch`/`node_disabled` promoted
-        // to info because they indicate real drift we want to see; the rest stay at debug.
+        // Reasons that indicate real drift we want to see in prod → info;
+        // internal no-op reasons (no_evidence, no_cached_ref) stay at debug.
         const level = (shortcut.reason === 'ttl_expired'
+          || shortcut.reason === 'session_newer_than_evidence'
           || shortcut.reason === 'url_mismatch'
           || shortcut.reason === 'semantic_mismatch'
           || shortcut.reason === 'node_disabled') ? 'info' : 'debug';
@@ -685,6 +751,11 @@ export class IntentStepLintService {
           reason: shortcut.reason,
           ...(shortcut.details || {}),
         });
+        // Per-reason counter so the next CACHE_METRICS dump shows which
+        // reject path is dominant (ttl_expired vs session_newer vs
+        // semantic_mismatch). Helps spot drift after pipeline changes.
+        cacheMetrics.inc('evidence-shortcut', shortcut.reason);
+        cacheMetrics.inc('evidence-shortcut', 'miss');
       } else {
         const { node: cachedNode, ref: cachedRef } = shortcut;
         // Preview-specific: validate the cached node's tag/role against the action
@@ -700,6 +771,7 @@ export class IntentStepLintService {
             nodeRole: cachedNode.role,
             semanticSource: shortcut.semanticSource,
           });
+          cacheMetrics.inc('evidence-shortcut', 'hit');
 
           const evidenceResult: LintResult = {
             status: 'resolved',
@@ -752,6 +824,8 @@ export class IntentStepLintService {
           nodeType: cachedNode.type || cachedNode.inputType,
           reason: compat.reason,
         });
+        cacheMetrics.inc('evidence-shortcut', 'compat_mismatch');
+        cacheMetrics.inc('evidence-shortcut', 'miss');
       }
     }
 
@@ -958,6 +1032,61 @@ export class IntentStepLintService {
         degradedMode: true,
         degradedReason: 'llm_unavailable',
       };
+    }
+
+    // ── Fingerprint-driven recovery in the degraded path ────────────────
+    // When the LLM resolver is down (timeout, JSON parse failure, quota)
+    // and the rule-based fallback returned several candidates, surfacing a
+    // clarification dialog forces the user to babysit a step that we
+    // already have enough recorded data to resolve. If the step carries a
+    // TargetFingerprint from a previous compile, we can rank the rule-based
+    // candidates against it offline (no extra page calls — `LintCandidate`
+    // already exposes boundingBox, and we can read structural fields from
+    // the in-memory `domNodes` snapshot).
+    //
+    // This mirrors the multi-match disambiguation logic in
+    // compiled-locator-executor.tryLocatorEntry but works on
+    // already-resolved DOM data instead of live Playwright locators, so
+    // it also helps when the compiled plan was bypassed (e.g. when the
+    // recorded plan only contained a weak `text` strategy).
+    const recordedFingerprint = stepDraft.compiled?.targetFingerprint;
+    if (recordedFingerprint && validCandidates.length > 1) {
+      const ranked = rankCandidatesByFingerprint(validCandidates, snapshot.domNodes, recordedFingerprint);
+      const winner = ranked[0];
+      const runnerUp = ranked[1];
+      const clearlyBetter =
+        !!winner
+        && winner.score >= 0.55
+        && (!runnerUp || winner.score - runnerUp.score >= 0.12);
+      if (clearlyBetter) {
+        logger.info('[INTENT_LINT_V4] Degraded mode: fingerprint resolved ambiguity', {
+          previewSessionId,
+          stepType: stepDraft.type,
+          winnerRef: winner.candidate.ref,
+          winnerScore: Math.round(winner.score * 100) / 100,
+          winnerFp: Math.round(winner.fp * 100) / 100,
+          winnerBbox: Math.round(winner.bbox * 100) / 100,
+          runnerUpScore: runnerUp ? Math.round(runnerUp.score * 100) / 100 : null,
+        });
+        return {
+          status: 'resolved',
+          message: 'Element resolved via recorded fingerprint (LLM degraded)',
+          confidence: winner.score,
+          candidates: [winner.candidate],
+          highlight: [{
+            ref: winner.candidate.ref,
+            boundingBox: winner.candidate.boundingBox,
+            type: 'success' as const,
+          }],
+          degradedMode: true,
+          degradedReason: 'llm_unavailable',
+        };
+      }
+      logger.debug('[INTENT_LINT_V4] Degraded mode: fingerprint did not yield clear winner', {
+        previewSessionId,
+        topScore: winner ? Math.round(winner.score * 100) / 100 : null,
+        runnerUpScore: runnerUp ? Math.round(runnerUp.score * 100) / 100 : null,
+      });
     }
 
     logger.info('[INTENT_LINT_V4] Degraded mode: asking clarification (rule-based candidates)', {

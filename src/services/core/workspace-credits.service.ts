@@ -1,6 +1,17 @@
 import { supabaseAdmin } from '@/db/supabase';
+import { cache } from '@/utils/core/redis-cache';
 import { logger } from '@/utils/core/logger';
 import { WorkspaceAuditService, AUDIT_EVENTS } from './workspace-audit.service';
+
+/**
+ * Drop the cached /credits response for a workspace.
+ * Called after any mutation that changes balance/plan/usage so the next
+ * read reflects the write immediately instead of waiting for TTL expiry.
+ * Kept in sync with workspaceCreditsCacheKey in workspace-credits.controller.
+ */
+async function invalidateWorkspaceCreditsCache(workspaceId: string): Promise<void> {
+  await cache.del(`qait:cache:workspace-credits:${workspaceId}`);
+}
 
 // ============================================================================
 // WORKSPACE CREDITS INTERFACE
@@ -333,6 +344,7 @@ export class WorkspaceCreditsService {
         );
       }
 
+      await invalidateWorkspaceCreditsCache(workspaceId);
       return updatedCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception deducting credits', {
@@ -512,6 +524,7 @@ export class WorkspaceCreditsService {
         newBalance,
       });
 
+      await invalidateWorkspaceCreditsCache(workspaceId);
       return updatedCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception adding credits', {
@@ -555,6 +568,87 @@ export class WorkspaceCreditsService {
         workspaceId,
       });
       return [];
+    }
+  }
+
+  /**
+   * Paginated credit transactions enriched with the user who triggered each entry.
+   * Response shape matches what the Billing & Usage UI expects:
+   *   { transactions, total, page, total_pages }
+   */
+  static async getTransactionsPaginated(
+    workspaceId: string,
+    options: { page?: number; limit?: number } = {}
+  ): Promise<{
+    transactions: Array<
+      WorkspaceCreditTransaction & { performed_by: string | null }
+    >;
+    total: number;
+    page: number;
+    total_pages: number;
+  }> {
+    const page = Math.max(1, options.page ?? 1);
+    const limit = Math.min(100, Math.max(1, options.limit ?? 10));
+    const offset = (page - 1) * limit;
+
+    try {
+      const { data, error, count } = await supabaseAdmin
+        .from('workspace_credit_transactions')
+        .select('*', { count: 'exact' })
+        .eq('workspace_id', workspaceId)
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1);
+
+      if (error) {
+        logger.error('[WORKSPACE_CREDITS] Error getting paginated transactions', {
+          error: error.message,
+          workspaceId,
+        });
+        return { transactions: [], total: 0, page, total_pages: 0 };
+      }
+
+      const rows = (data || []) as WorkspaceCreditTransaction[];
+      const userIds = Array.from(
+        new Set(rows.map((r) => r.user_id).filter((id): id is string => !!id))
+      );
+
+      const usersById = new Map<string, { email: string | null; name: string | null }>();
+      if (userIds.length > 0) {
+        const { data: users, error: usersError } = await supabaseAdmin
+          .from('users')
+          .select('id, email, name')
+          .in('id', userIds);
+
+        if (usersError) {
+          logger.warn('[WORKSPACE_CREDITS] Failed to enrich transaction actors', {
+            error: usersError.message,
+            workspaceId,
+          });
+        } else {
+          for (const u of users || []) {
+            usersById.set(u.id, { email: u.email ?? null, name: u.name ?? null });
+          }
+        }
+      }
+
+      const transactions = rows.map((row) => {
+        const actor = row.user_id ? usersById.get(row.user_id) : null;
+        return {
+          ...row,
+          performed_by: actor?.name ?? actor?.email ?? null,
+        };
+      });
+
+      const total = count ?? 0;
+      const total_pages = total > 0 ? Math.ceil(total / limit) : 0;
+
+      return { transactions, total, page, total_pages };
+    } catch (error) {
+      logger.error('[WORKSPACE_CREDITS] Exception getting paginated transactions', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+      });
+      return { transactions: [], total: 0, page, total_pages: 0 };
     }
   }
 
@@ -662,6 +756,7 @@ export class WorkspaceCreditsService {
         plan: credits.subscription_plan,
       });
 
+      await invalidateWorkspaceCreditsCache(workspaceId);
       return updatedCredits;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception resetting monthly usage', {
@@ -726,6 +821,7 @@ export class WorkspaceCreditsService {
         newBalance,
       });
 
+      await invalidateWorkspaceCreditsCache(workspaceId);
       return data;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception assigning pilot', {
@@ -806,6 +902,7 @@ export class WorkspaceCreditsService {
         newBalance,
       });
 
+      await invalidateWorkspaceCreditsCache(workspaceId);
       return data;
     } catch (error) {
       logger.error('[WORKSPACE_CREDITS] Exception upgrading plan', {

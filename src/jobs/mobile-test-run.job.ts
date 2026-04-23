@@ -423,6 +423,13 @@ export class MobileTestRunJobHandler {
               executionMs: stepResult.durationMs,
               failedReason: stepResult.error ? 'unknown' : undefined,
               failureExplanation: stepResult.error,
+              // Advisory warnings from the runner (e.g. install_app's
+              // WebView-debuggable probe). Absent when the step had none —
+              // do not emit an empty array, so the frontend can do a
+              // truthy-check instead of length-check.
+              ...(stepResult.warnings && stepResult.warnings.length > 0
+                ? { warnings: stepResult.warnings }
+                : {}),
             },
           });
         } catch { /* non-fatal */ }

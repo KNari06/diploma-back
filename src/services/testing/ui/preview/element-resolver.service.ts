@@ -21,13 +21,16 @@ import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service'
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { cacheMetrics } from '@/utils/core/cache-metrics';
 import type {
+    BindingHints,
     IntentActionType,
     IntentStep,
     InteractiveNode,
     LintCandidate,
     LintResult,
     LintStatus,
+    TargetFingerprint,
 } from './preview.types';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1061,6 +1064,52 @@ function extractFirstJsonObject(text: string): string | null {
   return null;
 }
 
+/**
+ * Tolerant wrapper around JSON.parse that recovers from common LLM
+ * malformations before giving up.
+ *
+ * Why this exists: Gemini 2.5 Flash Lite in JSON mode occasionally emits
+ * malformed escape sequences inside string values — typically when the
+ * model interpolates non-ASCII text (e.g. Russian, emoji) and produces a
+ * stray `\` that is not a valid JSON escape. The result is a valid-looking
+ * JSON that throws "Bad escaped character at position N".
+ *
+ * Repair strategy (in order, each is a no-op when not applicable):
+ *   1. Strict parse (happy path).
+ *   2. Replace any backslash that is NOT followed by a JSON-legal escape
+ *      character with a literal backslash (`\\`). This fixes the
+ *      "Bad escaped character" class without touching legitimate `\n`,
+ *      `\"`, `\\`, `\u0041`, etc.
+ *   3. Strip control characters in string positions (rare).
+ *
+ * If all repairs fail we return null and the caller falls back to its
+ * existing degraded path. We never throw — JSON parsing must not be a
+ * source of unhandled exceptions in the resolution loop.
+ */
+function safeParseJsonResponse(jsonStr: string): unknown | null {
+  try {
+    return JSON.parse(jsonStr);
+  } catch { /* fall through to repair */ }
+
+  // Pass 2: escape stray backslashes. JSON allows: \" \\ \/ \b \f \n \r \t \uXXXX
+  const repaired = jsonStr.replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+  try {
+    const parsed = JSON.parse(repaired);
+    logger.debug('[LLM_SELECT] Recovered from malformed escape via backslash-doubling');
+    return parsed;
+  } catch { /* fall through */ }
+
+  // Pass 3: drop bare control characters that JSON disallows inside strings.
+  const stripped = repaired.replace(/[\u0000-\u001f]/g, '');
+  try {
+    const parsed = JSON.parse(stripped);
+    logger.debug('[LLM_SELECT] Recovered from control char via stripping');
+    return parsed;
+  } catch { /* give up */ }
+
+  return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GEMINI FLASH RESCUE
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1198,7 +1247,8 @@ Select the single best matching element. If unsure, return ref: null.`;
     const jsonMatch = extractFirstJsonObject(responseContent);
     if (!jsonMatch) return null;
 
-    const parsed = JSON.parse(jsonMatch);
+    const parsed = safeParseJsonResponse(jsonMatch) as any;
+    if (!parsed) return null;
 
     // ref must be a non-empty string (null or absent = no match) OR have bounding box
     if ((!parsed.ref || typeof parsed.ref !== 'string') && !parsed.boundingBox) return null;
@@ -1432,18 +1482,46 @@ async function selectElementWithLLM(params: {
   candidates: Array<{ node: InteractiveNode; candidateText: string }>;
   pageUrl: string;
   pageSignature: string;
+  /**
+   * Optional fingerprint captured at recording time. When present, it is
+   * rendered into the prompt as HINTS from the original interaction — the
+   * stable structural properties (tag/role/containers) should still match,
+   * while surface properties (text, exact position) may have drifted
+   * because of redesign, localization, or A/B tests.
+   */
+  recordedFingerprint?: TargetFingerprint;
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint } = params;
   const startTime = Date.now();
 
   // Check cache
   // V15: Include ALL candidate refs in cache key (not just top 5).
   // Truncating to 5 caused stale cache hits when the correct element was 6th+.
-  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${candidates.map(c => c.node.ref).join(',')}`;
+  // Include a fingerprint digest so that prompt-level hints never cause
+  // cross-shape cache hits (e.g. the same intent for a different recorded
+  // element should not reuse a prior selection).
+  const fpDigest = recordedFingerprint
+    ? [
+        recordedFingerprint.tag || '',
+        recordedFingerprint.role || '',
+        recordedFingerprint.ariaLabel || '',
+        recordedFingerprint.labelText || '',
+        recordedFingerprint.testIdAttr || '',
+        recordedFingerprint.placeholder || '',
+        recordedFingerprint.nearestLandmark || '',
+        recordedFingerprint.boundingBox
+          ? `${Math.round(recordedFingerprint.boundingBox.x)},${Math.round(recordedFingerprint.boundingBox.y)}`
+          : '',
+        (recordedFingerprint.containerTitles || []).join('|'),
+      ].join(':')
+    : '';
+  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
+    cacheMetrics.inc('llm-select', 'hit');
     return { ...cached.result, cacheHit: true, latencyMs: Date.now() - startTime };
   }
+  cacheMetrics.inc('llm-select', 'miss');
 
   // Build candidate list for prompt
   const candidateList = candidates
@@ -1462,10 +1540,36 @@ async function selectElementWithLLM(params: {
     ? `\nIMPORTANT: Multiple elements share the same label. Use the (CONTEXT: ...) text to match the user's intent. Phrases like "on X", "for X", "у X", "на X", "button on Card Name" mean: pick the element whose CONTEXT contains X.`
     : '';
 
+  // Fingerprint hint section — rendered only when the step has recorded
+  // structural properties. The prompt is deliberately soft: the wording
+  // instructs the model to use this as a HINT (not a filter) so a minor
+  // drift (text change, button restyled, moved by 50px) does not force a
+  // null selection when a reasonable match still exists.
+  const fpHintLines: string[] = [];
+  if (recordedFingerprint) {
+    if (recordedFingerprint.tag) fpHintLines.push(`tag=<${recordedFingerprint.tag}>`);
+    if (recordedFingerprint.role) fpHintLines.push(`role="${recordedFingerprint.role}"`);
+    if (recordedFingerprint.ariaLabel) fpHintLines.push(`ariaLabel="${recordedFingerprint.ariaLabel}"`);
+    if (recordedFingerprint.labelText) fpHintLines.push(`labelText="${recordedFingerprint.labelText}"`);
+    if (recordedFingerprint.placeholder) fpHintLines.push(`placeholder="${recordedFingerprint.placeholder}"`);
+    if (recordedFingerprint.testIdAttr) fpHintLines.push(`testId="${recordedFingerprint.testIdAttr}"`);
+    if (recordedFingerprint.nearestLandmark) fpHintLines.push(`inLandmark="${recordedFingerprint.nearestLandmark}"`);
+    if (recordedFingerprint.containerTitles?.length) {
+      fpHintLines.push(`containers=${JSON.stringify(recordedFingerprint.containerTitles.slice(0, 3))}`);
+    }
+    if (recordedFingerprint.boundingBox) {
+      const bb = recordedFingerprint.boundingBox;
+      fpHintLines.push(`recordedAt=(${Math.round(bb.x)},${Math.round(bb.y)},${Math.round(bb.width)}x${Math.round(bb.height)})`);
+    }
+  }
+  const fpHint = fpHintLines.length > 0
+    ? `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${fpHintLines.join('\n')}`
+    : '';
+
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
 PAGE: ${pageUrl}
-VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}
+VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}${fpHint}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
@@ -1508,12 +1612,21 @@ Select the single best matching element, or return ref=null if the intent does n
       throw new Error('No JSON in LLM response');
     }
 
-    const parsed = JSON.parse(jsonStr) as {
+    const parsed = safeParseJsonResponse(jsonStr) as {
       ref?: string | null;
       confidence?: number;
       reason?: string;
       alternatives?: string[];
-    };
+    } | null;
+    if (!parsed) {
+      // Repair attempts exhausted — surface as a soft failure so the caller
+      // falls into the rule-based degraded path with full context.
+      logger.warn('[LLM_SELECT] Unrecoverable JSON parse failure', {
+        contentPreview: content.slice(0, 200),
+        jsonPreview: jsonStr.slice(0, 200),
+      });
+      throw new Error('LLM response could not be parsed as JSON');
+    }
 
     // Validate ref against candidate list
     const validRefs = new Set(candidates.map(c => c.node.ref));
@@ -2230,6 +2343,7 @@ export async function resolveElement(params: {
         candidates: candidatesToProcess,
         pageUrl,
         pageSignature,
+        recordedFingerprint: stepDraft.compiled?.targetFingerprint,
       });
 
       cacheHit = llmResult.cacheHit;
@@ -2439,6 +2553,7 @@ export async function resolveElement(params: {
             candidates: overflowCandidates,
             pageUrl,
             pageSignature: pageSignature + ':overflow',
+            recordedFingerprint: stepDraft.compiled?.targetFingerprint,
           });
 
           if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {

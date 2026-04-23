@@ -385,4 +385,102 @@ export class WorkspaceAuditService {
       return [];
     }
   }
+
+  /**
+   * Paginated audit log query enriched with actor name/email.
+   * Response shape matches what the Activity settings UI expects:
+   *   { entries, total, page, total_pages }
+   */
+  static async getAuditLogsPaginated(
+    workspaceId: string,
+    options: {
+      page?: number;
+      limit?: number;
+      eventTypes?: AuditEventType[];
+    } = {}
+  ): Promise<{
+    entries: Array<AuditLogEntry & {
+      actor_name: string | null;
+      actor_email: string | null;
+      action: AuditEventType;
+      timestamp: string;
+    }>;
+    total: number;
+    page: number;
+    total_pages: number;
+  }> {
+    const page = Math.max(1, options.page ?? 1);
+    const limit = Math.min(100, Math.max(1, options.limit ?? 20));
+    const offset = (page - 1) * limit;
+    const { eventTypes } = options;
+
+    try {
+      let query = supabaseAdmin
+        .from('workspace_audit_log')
+        .select('*', { count: 'exact' })
+        .eq('workspace_id', workspaceId)
+        .order('created_at', { ascending: false })
+        .range(offset, offset + limit - 1);
+
+      if (eventTypes && eventTypes.length > 0) {
+        query = query.in('event_type', eventTypes);
+      }
+
+      const { data, error, count } = await query;
+
+      if (error) {
+        logger.error('[WORKSPACE_AUDIT] Error getting paginated audit logs', {
+          error: error.message,
+          workspaceId,
+        });
+        return { entries: [], total: 0, page, total_pages: 0 };
+      }
+
+      const rows = (data || []) as AuditLogEntry[];
+      const actorIds = Array.from(
+        new Set(rows.map((r) => r.actor_user_id).filter((id): id is string => !!id))
+      );
+
+      const actorsById = new Map<string, { email: string | null; name: string | null }>();
+      if (actorIds.length > 0) {
+        const { data: users, error: usersError } = await supabaseAdmin
+          .from('users')
+          .select('id, email, name')
+          .in('id', actorIds);
+
+        if (usersError) {
+          logger.warn('[WORKSPACE_AUDIT] Failed to enrich actors', {
+            error: usersError.message,
+            workspaceId,
+          });
+        } else {
+          for (const u of users || []) {
+            actorsById.set(u.id, { email: u.email ?? null, name: u.name ?? null });
+          }
+        }
+      }
+
+      const entries = rows.map((row) => {
+        const actor = row.actor_user_id ? actorsById.get(row.actor_user_id) : null;
+        return {
+          ...row,
+          action: row.event_type,
+          timestamp: row.created_at,
+          actor_name: actor?.name ?? null,
+          actor_email: actor?.email ?? null,
+        };
+      });
+
+      const total = count ?? 0;
+      const total_pages = total > 0 ? Math.ceil(total / limit) : 0;
+
+      return { entries, total, page, total_pages };
+    } catch (error) {
+      logger.error('[WORKSPACE_AUDIT] Exception getting paginated audit logs', {
+        error: error instanceof Error ? error.message : String(error),
+        workspaceId,
+      });
+      return { entries: [], total: 0, page, total_pages: 0 };
+    }
+  }
 }
