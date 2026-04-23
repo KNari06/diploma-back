@@ -52,6 +52,14 @@ export interface MobileApplyInput {
   sessionId: string;
   stepDraft: any;
   userId: string;
+  /**
+   * Optional abort signal. When it fires (HTTP client disconnected mid-
+   * request), the outgoing fetch to the runner is aborted so the runner's
+   * step loop exits at the next boundary and releases the session mutex.
+   * Without this, a Stop+Run cycle can hit "busy" because the runner is
+   * still executing the previous step long after the client has gone.
+   */
+  signal?: AbortSignal;
 }
 
 export interface MobileApplyOutput {
@@ -104,7 +112,7 @@ export class MobileStepApplyService {
    * trace-session scoping).
    */
   static async apply(input: MobileApplyInput): Promise<MobileApplyOutput> {
-    const { sessionId, stepDraft } = input;
+    const { sessionId, stepDraft, signal } = input;
     const client = getMobileRunnerClient();
 
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
@@ -235,6 +243,7 @@ export class MobileStepApplyService {
     const result = await client.runSteps(sessionId, [intentStep], {
       screenshotEachStep: true,
       stopOnFailure: false,
+      signal,
     });
 
     const stepResult = result.steps?.[0];

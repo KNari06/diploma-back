@@ -1037,13 +1037,29 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     });
     const applyStart = Date.now();
 
+    // Propagate client-disconnect to the runner so its step loop exits
+    // promptly and releases the session mutex. Without this, hitting Stop
+    // during a run followed by a quick Run can race into 'busy' because
+    // the prior step is still executing on the runner.
+    const abortController = new AbortController();
+    const onReqClose = () => {
+      if (!res.writableEnded) abortController.abort();
+    };
+    req.on('close', onReqClose);
+
     // Delegate to shared service — REST and WS both use this path.
     const { MobileStepApplyService } = await import('@/services/mobile/mobile-step-apply.service');
-    const output = await MobileStepApplyService.apply({
-      sessionId,
-      stepDraft,
-      userId: req.user!.id,
-    });
+    let output;
+    try {
+      output = await MobileStepApplyService.apply({
+        sessionId,
+        stepDraft,
+        userId: req.user!.id,
+        signal: abortController.signal,
+      });
+    } finally {
+      req.off('close', onReqClose);
+    }
 
     trace.writeMobileApplyResult({
       stepId: stepDraft.id || `apply_${Date.now()}`,
@@ -1057,13 +1073,23 @@ export async function applySession(req: Request, res: Response): Promise<void> {
       },
     });
 
-    res.json({
-      success: output.success,
-      stepResult: output.stepResult,
-      appliedStep: output.appliedStep,
-      status: output.status,
-    });
+    if (!res.writableEnded) {
+      res.json({
+        success: output.success,
+        stepResult: output.stepResult,
+        appliedStep: output.appliedStep,
+        status: output.status,
+      });
+    }
   } catch (error) {
+    // If the client aborted, there's nothing to respond to — just log.
+    if (res.writableEnded) {
+      logger.info('[MOBILE_SESSION] Apply aborted by client', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
     logger.warn('[MOBILE_SESSION] Apply failed', {
       sessionId,
       error: error instanceof Error ? error.message : String(error),
