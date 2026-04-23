@@ -911,9 +911,27 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
     trace.writeMobileLintRequest({ description, actionType, sessionId });
     const lintStart = Date.now();
 
+    // Pull bindingHints off the draft — the frontend sends either the
+    // authored-from-recording set nested under intentStep, or the
+    // locally-edited flat set if the user has been tweaking. Prefer the
+    // locally-edited one so `label`/`selector` edits in the inspector
+    // immediately bust the runner's lint / resolver caches. Falls back to
+    // the recorded hints when the step is clean.
+    const bindingHints: Record<string, unknown> | undefined = (() => {
+      const edited = stepDraft?.bindingHints;
+      if (edited && typeof edited === 'object' && Object.keys(edited).length > 0) {
+        return edited as Record<string, unknown>;
+      }
+      const recorded = stepDraft?.intentStep?.bindingHints;
+      if (recorded && typeof recorded === 'object' && Object.keys(recorded).length > 0) {
+        return recorded as Record<string, unknown>;
+      }
+      return undefined;
+    })();
+
     // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
     // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
-    const lintResult = await client.lintElement(sessionId, description, actionType);
+    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints);
 
     // Log the result for debugging element resolution issues
     trace.writeMobileLintResult({

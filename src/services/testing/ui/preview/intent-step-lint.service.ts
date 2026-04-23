@@ -6,6 +6,7 @@
 
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
     resolveElement,
@@ -750,6 +751,11 @@ export class IntentStepLintService {
           reason: shortcut.reason,
           ...(shortcut.details || {}),
         });
+        // Per-reason counter so the next CACHE_METRICS dump shows which
+        // reject path is dominant (ttl_expired vs session_newer vs
+        // semantic_mismatch). Helps spot drift after pipeline changes.
+        cacheMetrics.inc('evidence-shortcut', shortcut.reason);
+        cacheMetrics.inc('evidence-shortcut', 'miss');
       } else {
         const { node: cachedNode, ref: cachedRef } = shortcut;
         // Preview-specific: validate the cached node's tag/role against the action
@@ -765,6 +771,7 @@ export class IntentStepLintService {
             nodeRole: cachedNode.role,
             semanticSource: shortcut.semanticSource,
           });
+          cacheMetrics.inc('evidence-shortcut', 'hit');
 
           const evidenceResult: LintResult = {
             status: 'resolved',
@@ -817,6 +824,8 @@ export class IntentStepLintService {
           nodeType: cachedNode.type || cachedNode.inputType,
           reason: compat.reason,
         });
+        cacheMetrics.inc('evidence-shortcut', 'compat_mismatch');
+        cacheMetrics.inc('evidence-shortcut', 'miss');
       }
     }
 

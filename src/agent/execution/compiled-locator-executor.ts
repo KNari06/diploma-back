@@ -21,6 +21,7 @@ import {
   type TargetFingerprint,
 } from '@/services/testing/ui/preview/preview.types';
 import { logger } from '@/utils/core/logger';
+import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { Frame, Locator, Page } from 'playwright';
 
 /**
@@ -1026,6 +1027,13 @@ export async function executeCompiledLocatorPlan(
         confidence: entry.confidence,
       });
 
+      // Track which strategy actually wins so we can see whether locator
+      // plans are paying for themselves (ideally `role`/`testId` carries
+      // most steps; heavy `text`/`css` reliance signals weak compile-time
+      // metadata that we should improve).
+      cacheMetrics.inc('compiled-locator', 'hit');
+      cacheMetrics.inc('compiled-locator-strategy', entry.strategy);
+
       return {
         success: true,
         locator: result.locator,
@@ -1076,6 +1084,8 @@ export async function executeCompiledLocatorPlan(
     sawAmbiguous,
     ambiguityDetails: ambiguityDetails.length > 0 ? ambiguityDetails : undefined,
   });
+  cacheMetrics.inc('compiled-locator', 'miss');
+  cacheMetrics.inc('compiled-locator', sawAmbiguous ? 'miss_ambiguous' : 'miss_not_found');
   return {
     success: false,
     skipReason: sawAmbiguous ? 'ambiguous' : 'locator_failed',

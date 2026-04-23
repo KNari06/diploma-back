@@ -21,7 +21,9 @@ import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service'
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { cacheMetrics } from '@/utils/core/cache-metrics';
 import type {
+    BindingHints,
     IntentActionType,
     IntentStep,
     InteractiveNode,
@@ -1516,8 +1518,10 @@ async function selectElementWithLLM(params: {
   const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
+    cacheMetrics.inc('llm-select', 'hit');
     return { ...cached.result, cacheHit: true, latencyMs: Date.now() - startTime };
   }
+  cacheMetrics.inc('llm-select', 'miss');
 
   // Build candidate list for prompt
   const candidateList = candidates
