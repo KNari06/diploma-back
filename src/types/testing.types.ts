@@ -560,6 +560,22 @@ export interface PlanGitTriggersConfig {
 export interface PlanRuntimeConfig {
   environment?: AutomationEnvironment;
   browser?: AutomationBrowser;
+  /**
+   * When true, the regression run stops dispatching new tests as soon as
+   * the first test case fails or is skipped due to a prerequisite failure.
+   * Tests already in flight within the current dependency level finish
+   * their waiters (we don't abort mid-test); remaining tests are marked
+   * 'skipped' with reason "Stopped early: fail-fast policy".
+   *
+   * Default behaviour (omitted / false): run every test regardless of
+   * earlier failures — useful for nightly regressions where the full
+   * matrix matters. Flip to `true` for CI gates / quick feedback where a
+   * single failure invalidates the rest of the plan (e.g. login smoke
+   * breaks → every test that logs in would fail anyway).
+   *
+   * Credit exhaustion stops the run the same way regardless of this flag.
+   */
+  failOnFirstFailure?: boolean;
 }
 
 /**
