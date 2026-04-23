@@ -891,6 +891,11 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       // Navigation (no element resolution needed, but pass through)
       go_back: 'go_back',
       go_home: 'go_home',
+      // `dismiss` closes the top modal without resolving an element.
+      // The `actionType` here is only used to tell the resolver what the
+      // user intended; for dismiss there's nothing to resolve, but we
+      // still pass it through so the schema validator accepts the step.
+      dismiss: 'dismiss',
       navigate: 'open_url',
       open_app: 'launch_app',
       close_app: 'close_app',

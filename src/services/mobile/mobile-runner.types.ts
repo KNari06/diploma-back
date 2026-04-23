@@ -55,6 +55,7 @@ export type MobileIntentActionType =
   | 'pinch'              // pinch zoom
   | 'go_back'            // Android back / iOS swipe-back
   | 'go_home'            // Home button
+  | 'dismiss'            // Smart close of top modal / sheet / dialog
   // Biometric & auth
   | 'biometric' | 'otp' | 'permission' | 'clipboard'
   // Network simulation
@@ -106,6 +107,10 @@ export interface MobileIntentStepOptions {
   networkLatencyMs?: number;
   networkBandwidthKbps?: number;
   networkPacketLossPercent?: number;
+  // Dismiss
+  /** Free-text hint for `dismiss` steps ("Reading settings sheet"). Advisory
+   *  only — the runner always closes the top-most active layer it sees. */
+  dismissTarget?: string;
 }
 
 export interface MobileIntentStep {
