@@ -1552,6 +1552,13 @@ export interface PreviewRecordingUploadWarningPayload {
     | 'headless_blocked';
   /** Optional human-readable detail (error message, element hint). Safe to show in UI. */
   detail?: string;
+  /**
+   * Correlates the warning with a placeholder step rendered by the inline
+   * upload picker. When present, the UI MUST clear `pendingUploads[stepId]`.
+   * The server additionally emits `preview:recording:step:remove` for the
+   * same stepId so the placeholder row is removed in lockstep.
+   */
+  stepId?: string;
   timestamp: string;
 }
 

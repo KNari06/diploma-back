@@ -4846,6 +4846,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const emitUploadWarning = (
           reason: 'no_file_selected' | 'capture_failed' | 'listener_setup_failed',
           detail?: string,
+          orphanedStepId?: string,
         ) => {
           try {
             const room = createRoomName('preview', previewSessionId);
@@ -4853,8 +4854,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               previewSessionId,
               reason,
               ...(detail ? { detail } : {}),
+              ...(orphanedStepId ? { stepId: orphanedStepId } : {}),
               timestamp: new Date().toISOString(),
             });
+            // When the warning correlates to a placeholder the UI already
+            // rendered, tear that row down too — otherwise the user is left
+            // with a ghost "Choose file…" row that does nothing.
+            if (orphanedStepId) {
+              socket.nsp.to(room).emit('preview:recording:step:remove', {
+                previewSessionId,
+                stepId: orphanedStepId,
+                timestamp: new Date().toISOString(),
+              } as any);
+            }
           } catch { /* non-critical — never let a warn emit break recording */ }
         };
 
@@ -4911,7 +4923,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (!pending) return;
                 pendingUploadPrompts.delete(stepId);
                 pending.fileChooser.setFiles([]).catch(() => { /* page closed */ });
-                emitUploadWarning('no_file_selected', 'Inline picker timed out');
+                // Pass stepId so the UI clears both pendingUploads[stepId]
+                // and the placeholder row (server also emits step:remove).
+                emitUploadWarning('no_file_selected', 'Inline picker timed out', stepId);
                 logger.debug('[RECORDING] Upload prompt timed out', {
                   previewSessionId,
                   stepId,
@@ -5020,15 +5034,30 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       clearTimeout(pending.timeout);
       pendingUploadPrompts.delete(stepId);
 
-      const emitWarn = (reason: 'capture_failed' | 'no_file_selected', detail?: string) => {
+      const emitWarn = (
+        reason: 'capture_failed' | 'no_file_selected',
+        detail?: string,
+        orphanedStepId?: string,
+      ) => {
         try {
           const room = createRoomName('preview', previewSessionId);
           socket.nsp.to(room).emit('preview:recording:upload:warning', {
             previewSessionId,
             reason,
             ...(detail ? { detail } : {}),
+            ...(orphanedStepId ? { stepId: orphanedStepId } : {}),
             timestamp: new Date().toISOString(),
           });
+          // Mirror the cancel handler: when we abort a resolve mid-flight the
+          // UI still shows a "Choose file…" placeholder. Drop it so the user
+          // can re-trigger the upload instead of being stuck.
+          if (orphanedStepId) {
+            socket.nsp.to(room).emit('preview:recording:step:remove', {
+              previewSessionId,
+              stepId: orphanedStepId,
+              timestamp: new Date().toISOString(),
+            } as any);
+          }
         } catch { /* non-critical */ }
       };
 
@@ -5055,7 +5084,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         pending.fileChooser.setFiles([]).catch(() => { /* page closed */ });
         // Clean up any partials.
         await Promise.all(tmpPaths.map((p) => cleanupUploadTempFile(p)));
-        emitWarn('capture_failed', `download_failed: ${msg}`);
+        emitWarn('capture_failed', `download_failed: ${msg}`, stepId);
         return;
       }
 
@@ -5068,7 +5097,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         const msg = sfErr instanceof Error ? sfErr.message : String(sfErr);
         logger.warn('[RECORDING] Upload resolve: setFiles failed', { previewSessionId, stepId, error: msg });
         await Promise.all(tmpPaths.map((p) => cleanupUploadTempFile(p)));
-        emitWarn('capture_failed', `setFiles_failed: ${msg}`);
+        emitWarn('capture_failed', `setFiles_failed: ${msg}`, stepId);
         return;
       }
 
@@ -5082,7 +5111,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const uploadStep = RecCapSvcResolve.captureFileUpload(fileNames, pending.probedEl, pending.pageUrl);
       if (!uploadStep) {
         await Promise.all(tmpPaths.map((p) => cleanupUploadTempFile(p)));
-        emitWarn('capture_failed', 'captureFileUpload returned null');
+        emitWarn('capture_failed', 'captureFileUpload returned null', stepId);
         return;
       }
       // Override the auto-generated id so the frontend can reconcile this
