@@ -578,6 +578,62 @@ const clarificationCleanupInterval = setInterval(() => {
 clarificationCleanupInterval.unref?.();
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Pending inline-upload prompts
+// ───────────────────────────────────────────────────────────────────────────
+// When a `filechooser` event fires during recording we DO NOT wait for the
+// native OS dialog. Instead we park the fileChooser + metadata here, emit
+// `preview:recording:upload:prompt` to the UI, and wait for the user's
+// choice (resolve / cancel) via a matching WS event. Keyed by `stepId` so
+// the frontend's placeholder step maps 1:1 to the held chooser.
+//
+// Old native-dialog flow is still the path that produced this event — we
+// just intercept before `waitForFileSelectionConfirmation`. Native cancel
+// is handled by the `setFiles([])` call on UI cancel/timeout.
+// ═══════════════════════════════════════════════════════════════════════════
+interface PendingUploadPrompt {
+  previewSessionId: string;
+  userId: string;
+  /** Playwright FileChooser object — kept live until resolve/cancel. */
+  fileChooser: { setFiles: (files: string | string[]) => Promise<void>; isMultiple?: () => boolean };
+  /** Probed element hints (for binding on the final captured step). Typed
+   *  as `any` here because `ProbedElement` isn't imported in this handler
+   *  module; values flow straight into RecCapSvc.captureFileUpload. */
+  probedEl: any | null;
+  pageUrl?: string;
+  /** Auto-cancel timer — clears on resolve/cancel/recording-stop. */
+  timeout: ReturnType<typeof setTimeout>;
+  createdAt: number;
+}
+
+// Key: stepId (unique across sessions — generated via randomUUID)
+const pendingUploadPrompts = new Map<string, PendingUploadPrompt>();
+
+/** Server-side timeout for the inline upload picker. After this we drop the
+ *  native dialog and warn the UI. 60s is comfortable for users picking from
+ *  a real file system; shorter windows caused regressions in QA. */
+const UPLOAD_PROMPT_TIMEOUT_MS = 60_000;
+
+/**
+ * Cancel every pending upload prompt attached to a preview session. Called
+ * on recording stop / finalizeRecording so stale FileChooser handles don't
+ * leak and the UI's placeholder steps get cleaned up.
+ */
+function cancelPendingUploadsForSession(
+  previewSessionId: string,
+  emitWarnTo: ((stepId: string, reason: 'no_file_selected') => void) | null,
+): void {
+  for (const [stepId, pending] of pendingUploadPrompts) {
+    if (pending.previewSessionId !== previewSessionId) continue;
+    clearTimeout(pending.timeout);
+    // Best-effort dismiss — Playwright requires setFiles to be called exactly
+    // once; `[]` dismisses the native dialog cleanly.
+    pending.fileChooser.setFiles([]).catch(() => { /* page may be closed */ });
+    pendingUploadPrompts.delete(stepId);
+    if (emitWarnTo) emitWarnTo(stepId, 'no_file_selected');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // V2: Rate limiting
 // ═══════════════════════════════════════════════════════════════════════════
 interface RateLimitEntry {
@@ -4768,65 +4824,137 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
 
         // V10 Fix #5: Listen for filechooser events to record file uploads
+        //
+        // QA-visibility: previously EVERY failure path here was silent (catch +
+        // logger.debug, no WS emit). When a user clicked Upload and the step
+        // didn't appear, there was no way to tell why. We now emit
+        // `preview:recording:upload:warning` with a machine-readable reason
+        // for each failure path so the UI can surface it.
+        const emitUploadWarning = (
+          reason: 'no_file_selected' | 'capture_failed' | 'listener_setup_failed',
+          detail?: string,
+        ) => {
+          try {
+            const room = createRoomName('preview', previewSessionId);
+            socket.nsp.to(room).emit('preview:recording:upload:warning', {
+              previewSessionId,
+              reason,
+              ...(detail ? { detail } : {}),
+              timestamp: new Date().toISOString(),
+            });
+          } catch { /* non-critical — never let a warn emit break recording */ }
+        };
+
         try {
           const { RecordingCaptureService: RecCapSvc } = await import(
             '@/services/testing/ui/preview/recording-capture.service'
           );
 
           const fileChooserHandler = async (fileChooser: any) => {
+            // NEW FLOW (inline-picker): instead of waiting for the OS file
+            // dialog to commit (which silently fails on cancel, headless,
+            // listener races), we IMMEDIATELY park the fileChooser here and
+            // ask the UI to pick a file through its own picker. When the UI
+            // responds with `preview:recording:upload:resolve` we download
+            // the file to tmp and call setFiles() so the real page sees the
+            // upload happen as if the user had used the native dialog.
             try {
               if (!sessionService.isRecording(previewSessionId, ensuredUserId)) return;
 
-              // Probe the file input element for binding hints
-              let probedEl = null;
-              let hasSelectedFiles = false;
+              // Probe the file input element for binding hints. Best-effort
+              // — if it fails we still show the inline picker (the step just
+              // won't carry bindingHints for replay).
+              let probedEl: any = null;
+              let probeError: string | undefined;
               try {
                 const element = fileChooser.element();
                 if (element) {
                   const box = await element.boundingBox().catch(() => null);
                   if (box) {
-                    probedEl = await RecCapSvc.probeForRecording(page, box.x + box.width / 2, box.y + box.height / 2);
+                    probedEl = await RecCapSvc.probeForRecording(
+                      page,
+                      box.x + box.width / 2,
+                      box.y + box.height / 2,
+                    );
                   }
-
-                  // Avoid false positives: record upload only if user actually selected files.
-                  // filechooser event fires when dialog opens, including cancel path.
-                  hasSelectedFiles = await waitForFileSelectionConfirmation(
-                    element,
-                    async (ms) => page.waitForTimeout(ms),
-                  );
                 }
-              } catch { /* non-critical */ }
-
-              if (!hasSelectedFiles) {
-                return;
+              } catch (probeErr) {
+                probeError = probeErr instanceof Error ? probeErr.message : String(probeErr);
+                logger.debug('[RECORDING] File chooser probe failed (non-fatal)', {
+                  previewSessionId,
+                  error: probeError,
+                });
               }
 
-              // Record confirmed upload interaction.
-              // Actual file path will be configured by user in step editor.
-              const uploadStep = RecCapSvc.captureFileUpload(['(file)'], probedEl, page.url());
-              if (uploadStep) {
-                const recordRoom = createRoomName('preview', previewSessionId);
-                emitRecordingStep(socket, recordRoom, sessionService, previewSessionId, ensuredUserId, { step: uploadStep });
-                // Editor trace: log file upload
-                const fuTrace = EditorTraceService.get(previewSessionId);
-                if (fuTrace) {
-                  fuTrace.writeFileUpload({ fileNames: ['(file)'], probedElement: probedEl });
-                  fuTrace.writeStepCaptured(uploadStep, 'file_upload');
-                }
+              // Generate the placeholder step id. Frontend renders a pending
+              // step with this id and echoes it back on resolve/cancel.
+              const stepId = `rec_${require('crypto').randomUUID().slice(0, 8)}`;
+
+              // Park the chooser with an auto-cancel timer. If the user
+              // ignores the prompt we dismiss the native dialog cleanly
+              // instead of leaking the handle.
+              const timeout = setTimeout(() => {
+                const pending = pendingUploadPrompts.get(stepId);
+                if (!pending) return;
+                pendingUploadPrompts.delete(stepId);
+                pending.fileChooser.setFiles([]).catch(() => { /* page closed */ });
+                emitUploadWarning('no_file_selected', 'Inline picker timed out');
+                logger.debug('[RECORDING] Upload prompt timed out', {
+                  previewSessionId,
+                  stepId,
+                });
+              }, UPLOAD_PROMPT_TIMEOUT_MS);
+              timeout.unref?.();
+
+              pendingUploadPrompts.set(stepId, {
+                previewSessionId,
+                userId: ensuredUserId,
+                fileChooser,
+                probedEl,
+                pageUrl: page.url(),
+                timeout,
+                createdAt: Date.now(),
+              });
+
+              // Tell the UI to show its inline picker.
+              const promptRoom = createRoomName('preview', previewSessionId);
+              const bindingHints = probedEl ? RecCapSvc.buildBindingHints(probedEl) : undefined;
+              socket.nsp.to(promptRoom).emit('preview:recording:upload:prompt', {
+                previewSessionId,
+                stepId,
+                multiple: typeof fileChooser.isMultiple === 'function'
+                  ? Boolean(fileChooser.isMultiple())
+                  : false,
+                bindingHints,
+                pageUrl: page.url(),
+                timeoutMs: UPLOAD_PROMPT_TIMEOUT_MS,
+                timestamp: new Date().toISOString(),
+              } as any);
+
+              // Editor trace: note that we prompted the user. The final
+              // captured step is logged in the resolve handler.
+              const fcTrace = EditorTraceService.get(previewSessionId);
+              if (fcTrace) {
+                try {
+                  fcTrace.writeFileUpload({ fileNames: ['(pending)'], probedElement: probedEl });
+                } catch { /* trace is best-effort */ }
               }
             } catch (fcErr) {
-              logger.debug('[RECORDING] File chooser capture failed', {
-                error: fcErr instanceof Error ? fcErr.message : String(fcErr),
-              });
+              const msg = fcErr instanceof Error ? fcErr.message : String(fcErr);
+              logger.debug('[RECORDING] File chooser handler failed', { error: msg });
+              emitUploadWarning('capture_failed', msg);
             }
           };
 
           page.on('filechooser', fileChooserHandler);
           (page as any).__qai_recording_filechooser_handler = fileChooserHandler;
         } catch (e) {
-          logger.debug('[RECORDING] File chooser listener setup failed (non-critical)', {
-            error: e instanceof Error ? e.message : String(e),
-          });
+          // Listener could not be attached at all — Upload will NOT record
+          // anything for this entire session. This is the worst-case silent
+          // failure and the most important one to surface.
+          const msg = e instanceof Error ? e.message : String(e);
+          logger.warn('[RECORDING] File chooser listener setup failed', { error: msg });
+          emitUploadWarning('listener_setup_failed', msg);
         }
       }
 
