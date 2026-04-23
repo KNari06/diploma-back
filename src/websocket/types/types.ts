@@ -1060,6 +1060,35 @@ export interface RegressionRunProgressPayload {
     passed?: number;
     failed?: number;
     skipped?: number;
+    /**
+     * Per-test lifecycle update. Emitted at key transitions so the frontend
+     * can maintain a live per-test card list ("queued", "running",
+     * "completed") without polling REST. Only set on events that describe
+     * a specific test case — aggregate events (`level_started`,
+     * `level_completed`) omit it.
+     *
+     * Works uniformly for web (Playwright) and mobile (runner) tests — the
+     * `platform` field tells the UI which per-test detail view to render.
+     */
+    testExecution?: {
+      /** IntentTestCase id (or api test config id) — stable across runs. */
+      testCaseId: string;
+      /** test_executions.id — use for REST detail fetch / report links. */
+      testExecutionId: string;
+      /** Matches `ExecutableTestCase.testType`. */
+      testType: 'ui' | 'api';
+      /** Null for web UI + all API tests; 'mobile_android' | 'mobile_ios' | 'mobile_flutter' for mobile UI. */
+      platform?: string | null;
+      /** Lifecycle transition. `queued` is emitted when a test is about
+       *  to be dispatched but is held behind the concurrency gate;
+       *  `dispatching` when the job is placed on a queue; `running`
+       *  after the runner acknowledges; `completed` on terminal status. */
+      event: 'queued' | 'dispatching' | 'running' | 'completed';
+      /** Only set when `event === 'completed'`. */
+      status?: 'passed' | 'failed' | 'skipped';
+      /** Short human-readable reason for failed/skipped (≤ 200 chars). */
+      errorMessage?: string;
+    };
   };
   timestamp: string;
 }

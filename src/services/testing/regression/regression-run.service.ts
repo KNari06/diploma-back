@@ -1932,7 +1932,20 @@ export class RegressionRunService {
     const emitProgress = (
       status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed',
       message: string,
-      extra?: { currentLevel?: number; currentTestName?: string; errorCode?: string }
+      extra?: {
+        currentLevel?: number;
+        currentTestName?: string;
+        errorCode?: string;
+        /**
+         * Optional per-test lifecycle update. Populated only when the
+         * event describes a specific test case (queued / dispatching /
+         * running / completed). Let the frontend maintain a live
+         * per-test card list without REST polling.
+         */
+        testExecution?: RegressionRunProgressPayload['details'] extends infer D
+          ? D extends { testExecution?: infer T } ? T : never
+          : never;
+      }
     ) => {
       try {
         const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
@@ -1955,6 +1968,9 @@ export class RegressionRunService {
             passed: apiPassed,
             failed: apiFailed,
             skipped: skippedCount,
+            // Only include when the emitter explicitly passed one — keeps
+            // aggregate-level events (level_started etc) clean.
+            ...(extra?.testExecution ? { testExecution: extra.testExecution } : {}),
           },
           timestamp: new Date().toISOString(),
         };
@@ -2003,7 +2019,15 @@ export class RegressionRunService {
 
     for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted && !failFastTriggered; levelIdx++) {
       const level = levels[levelIdx];
-      const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
+      // `platform` captured at dispatch so we can forward it with the
+      // per-test completion event below (post-level), which is how the
+      // UI discriminates mobile vs web cards.
+      const uiWaiters: Array<{
+        testCaseId: string;
+        execId: string;
+        platform: string | null;
+        promise: Promise<string>;
+      }> = [];
 
       // ── Concurrency gate ────────────────────────────────────────────────
       // Tracks UI waiters that haven't settled yet. We don't want more than
@@ -2058,6 +2082,26 @@ export class RegressionRunService {
             testCaseId: testCase.testCaseId,
             failedPrereqs,
           });
+          // Surface the skip to the per-test dashboard. Same emission
+          // shape as a completed-failed verdict so the FE card renders
+          // consistently.
+          if (execId) {
+            emitProgress(
+              'test_completed',
+              `Skipped (prerequisite failed): ${testCase.testCaseId}`,
+              {
+                currentLevel: levelIdx + 1,
+                testExecution: {
+                  testCaseId: testCase.testCaseId,
+                  testExecutionId: execId,
+                  testType: testCase.testType,
+                  event: 'completed',
+                  status: 'skipped',
+                  errorMessage: `Prerequisite(s) failed: ${failedPrereqs.join(', ')}`.slice(0, 200),
+                },
+              },
+            );
+          }
           continue;
         }
 
@@ -2079,6 +2123,21 @@ export class RegressionRunService {
           emitProgress('test_started', `Running ${testCase.testType.toUpperCase()} test (${completedCount + 1}/${totalTests})`, {
             currentLevel: levelIdx + 1,
             currentTestName: testCase.testCaseId,
+            // Per-test lifecycle marker: we're about to dispatch the job
+            // (UI tests → runner / Playwright queue; API tests → inline).
+            // Platform is filled in after we've fetched the saved case
+            // for UI tests, so we leave it undefined here and let the
+            // `test_completed` event carry the authoritative value.
+            ...(execId
+              ? {
+                  testExecution: {
+                    testCaseId: testCase.testCaseId,
+                    testExecutionId: execId,
+                    testType: testCase.testType,
+                    event: 'dispatching',
+                  },
+                }
+              : {}),
           });
 
           if (testCase.testType === 'ui') {
@@ -2135,7 +2194,12 @@ export class RegressionRunService {
 
               // Register waiter for dependency-aware ordering
               const waitPromise = executionCompletionEmitter.waitForCompletion(execId);
-              uiWaiters.push({ testCaseId: testCase.testCaseId, execId, promise: waitPromise });
+              uiWaiters.push({
+                testCaseId: testCase.testCaseId,
+                execId,
+                platform: savedCase.platform || null,
+                promise: waitPromise,
+              });
 
               // Only mobile tests consume the runner's emulator pool — gate
               // those. Web tests go through Playwright's own pool and share
@@ -2220,6 +2284,22 @@ export class RegressionRunService {
             completedCount++;
             emitProgress('test_completed', `API test ${passed ? 'passed' : 'failed'} (${completedCount}/${totalTests})`, {
               currentLevel: levelIdx + 1,
+              ...(execId
+                ? {
+                    testExecution: {
+                      testCaseId: testCase.testCaseId,
+                      testExecutionId: execId,
+                      testType: 'api',
+                      // API tests have no device platform.
+                      platform: null,
+                      event: 'completed',
+                      status: passed ? 'passed' : 'failed',
+                      errorMessage: passed
+                        ? undefined
+                        : (apiExecution?.error_message || 'API test failed').slice(0, 200),
+                    },
+                  }
+                : {}),
             });
           }
         } catch (error) {
@@ -2285,6 +2365,29 @@ export class RegressionRunService {
                 statusError: statusError instanceof Error ? statusError.message : String(statusError),
               });
             }
+
+            // Surface the catastrophic failure on the per-test card. This
+            // path happens when the dispatch code itself threw (service
+            // crash, network partition, etc.) — the test never entered
+            // the uiWaiters post-level path, so we emit the completed
+            // event here. Credit errors get a dedicated event below.
+            if (!isCreditError) {
+              emitProgress(
+                'test_completed',
+                `${testCase.testType.toUpperCase()} test failed to dispatch: ${errMsg.slice(0, 80)}`,
+                {
+                  currentLevel: levelIdx + 1,
+                  testExecution: {
+                    testCaseId: testCase.testCaseId,
+                    testExecutionId: execId,
+                    testType: testCase.testType,
+                    event: 'completed',
+                    status: 'failed',
+                    errorMessage: errMsg.slice(0, 200),
+                  },
+                },
+              );
+            }
           }
 
           // Emit credit-specific progress event so frontend can show top-up prompt
@@ -2310,7 +2413,12 @@ export class RegressionRunService {
         const results = await Promise.all(
           uiWaiters.map(async (w) => {
             const status = await w.promise;
-            return { testCaseId: w.testCaseId, status };
+            return {
+              testCaseId: w.testCaseId,
+              execId: w.execId,
+              platform: w.platform,
+              status,
+            };
           })
         );
 
@@ -2326,8 +2434,24 @@ export class RegressionRunService {
               failFastTriggerTestCaseId = result.testCaseId;
             }
           }
+          // Narrow the emitter status to the FE's union. `executionCompletionEmitter`
+          // returns strings that may include 'cancelled' / 'pending' — collapse
+          // everything non-pass/non-fail to 'skipped' so the FE state machine stays
+          // three-valued.
+          const mappedStatus: 'passed' | 'failed' | 'skipped' =
+            result.status === 'passed' ? 'passed'
+            : result.status === 'failed' ? 'failed'
+            : 'skipped';
           emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
             currentLevel: levelIdx + 1,
+            testExecution: {
+              testCaseId: result.testCaseId,
+              testExecutionId: result.execId,
+              testType: 'ui',
+              platform: result.platform,
+              event: 'completed',
+              status: mappedStatus,
+            },
           });
         }
       }
@@ -2364,14 +2488,32 @@ export class RegressionRunService {
       for (const tc of testCases) {
         if (!failedOrSkippedIds.has(tc.testCaseId)) {
           const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+          const skipReason = failFastTriggerTestCaseId
+            ? `Skipped: regression stopped early after "${failFastTriggerTestCaseId}" failed (fail-fast policy)`
+            : 'Skipped: regression stopped early (fail-fast policy)';
           if (execId) {
             await ExecutionService.updateStatus({
               id: execId,
               status: 'skipped',
-              errorMessage: failFastTriggerTestCaseId
-                ? `Skipped: regression stopped early after "${failFastTriggerTestCaseId}" failed (fail-fast policy)`
-                : 'Skipped: regression stopped early (fail-fast policy)',
+              errorMessage: skipReason,
             }).catch(() => {});
+
+            // Surface each skipped test on the per-test dashboard so the
+            // UI cards transition from "queued" → "skipped" with a reason.
+            emitProgress(
+              'test_completed',
+              `Skipped (fail-fast): ${tc.testCaseId}`,
+              {
+                testExecution: {
+                  testCaseId: tc.testCaseId,
+                  testExecutionId: execId,
+                  testType: tc.testType,
+                  event: 'completed',
+                  status: 'skipped',
+                  errorMessage: skipReason.slice(0, 200),
+                },
+              },
+            );
           }
           skippedCount++;
         }
