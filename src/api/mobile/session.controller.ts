@@ -1467,6 +1467,7 @@ export async function claimWarmedSession(
  * Returns: { success, totalSteps, passedSteps, failedSteps, skippedSteps, steps, durationMs }
  */
 export async function runTestCaseOnSession(req: Request, res: Response): Promise<void> {
+  logger.info('RUN MOBILE TEST STEPS')
   const userId = req.user?.id;
   if (!userId) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -1503,6 +1504,19 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
       stepCount: steps.length,
       stepTypes: steps.map((s: any) => s.type),
       userId,
+    });
+
+    // Per-step summary of the persisted shape — deterministic oracle for
+    // diagnosing "optional step still halts the run" complaints. On a failed
+    // run, this line tells us whether the DB record actually carries the
+    // optional flag (`options.continueOnError` or legacy top-level).
+    logger.info('[MOBILE_SESSION] Run steps summary', {
+      intentTestCaseId,
+      steps: steps.map((s: any) => ({
+        id: s.id,
+        type: s.type,
+        optional: !!(s.options?.continueOnError ?? s.continueOnError),
+      })),
     });
 
     const client = getMobileRunnerClient();
@@ -1542,17 +1556,26 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
     let passedSteps = 0;
     let failedSteps = 0;
     let skippedSteps = 0;
+    // Optional steps (step.options.continueOnError === true) don't halt the
+    // run when they fail — they're recorded as failed but the loop keeps going.
+    // `hardFailed` tracks whether a *required* step has failed so remaining
+    // steps get short-circuited to 'skipped'.
+    let hardFailed = false;
 
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i] as any;
 
-      // If a previous step failed, skip remaining
-      if (failedSteps > 0) {
+      // If a previous *required* step failed, skip remaining.
+      if (hardFailed) {
         stepResults.push({ stepId: step.id, success: false, error: 'Skipped (previous step failed)', durationMs: 0 });
         skippedSteps++;
         sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'skipped', durationMs: 0 });
         continue;
       }
+
+      // Tolerant of both the canonical shape (options.continueOnError) and a
+      // legacy top-level `continueOnError` some older save paths wrote.
+      const isOptional = !!(step.options?.continueOnError ?? step.continueOnError);
 
       // Notify frontend this step is now running
       sendEvent({ type: 'step_running', stepId: step.id, stepIndex: i });
@@ -1680,9 +1703,10 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           const errorMsg = stepResult?.error || 'Step failed';
           stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
           failedSteps++;
-          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs });
-          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed`, {
-            stepId: step.id, type: rawType, description, error: errorMsg, durationMs,
+          if (!isOptional) hardFailed = true;
+          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
+          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
+            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
           });
         }
       } catch (stepError) {
@@ -1695,9 +1719,10 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           durationMs,
         });
         failedSteps++;
-        sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs });
-        logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} threw error`, {
-          stepId: step.id, error: errorMsg,
+        if (!isOptional) hardFailed = true;
+        sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
+        logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} threw error${isOptional ? ' (optional — continuing)' : ''}`, {
+          stepId: step.id, error: errorMsg, optional: isOptional,
         });
       }
     }
