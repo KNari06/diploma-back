@@ -205,6 +205,9 @@ export class MobileRunnerClient {
       screenshotEachStep?: boolean;
       stopOnFailure?: boolean;
       metadata?: MobileTestMetadata;
+      /** Propagated to the outgoing fetch so client-disconnect aborts
+       *  reach the runner and free its session mutex. */
+      signal?: AbortSignal;
     },
   ): Promise<MobileRunStepsResponse> {
     const body: MobileRunStepsRequest = {
@@ -220,6 +223,7 @@ export class MobileRunnerClient {
       {
         body,
         timeoutMs: CLIENT_CONFIG.runStepsTimeoutMs,
+        signal: opts?.signal,
       },
     );
   }
@@ -361,6 +365,13 @@ export class MobileRunnerClient {
       timeoutMs?: number;
       /** Skip retries — throw immediately on any error (e.g. pool claim 503) */
       noRetry?: boolean;
+      /**
+       * Caller-provided AbortSignal. When it fires (e.g. the originating
+       * HTTP client aborted), we abort the in-flight fetch to the runner so
+       * the runner's `req.on('close')` handler fires and the session mutex
+       * is released at the next step boundary.
+       */
+      signal?: AbortSignal;
     },
   ): Promise<T> {
     if (!env.MOBILE_RUNNER_ENABLED) {
@@ -397,6 +408,14 @@ export class MobileRunnerClient {
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
+      // Propagate caller abort (e.g. client disconnect) to the outgoing
+      // fetch so the runner sees its HTTP request close and can exit its
+      // step loop promptly, freeing the session mutex.
+      const onCallerAbort = () => controller.abort();
+      if (opts?.signal) {
+        if (opts.signal.aborted) controller.abort();
+        else opts.signal.addEventListener('abort', onCallerAbort, { once: true });
+      }
 
       try {
         const response = await fetch(url, {
@@ -407,6 +426,7 @@ export class MobileRunnerClient {
         });
 
         clearTimeout(timer);
+        opts?.signal?.removeEventListener('abort', onCallerAbort);
 
         if (!response.ok) {
           const errorBody = await response.text().catch(() => '');
@@ -436,12 +456,22 @@ export class MobileRunnerClient {
         return (await response.json()) as T;
       } catch (error) {
         clearTimeout(timer);
+        opts?.signal?.removeEventListener('abort', onCallerAbort);
 
         if (error instanceof MobileRunnerError) {
           throw error;
         }
 
         if (error instanceof DOMException && error.name === 'AbortError') {
+          // Caller-initiated abort (HTTP client disconnected). Don't retry —
+          // propagate so upstream knows the operation was cancelled.
+          if (opts?.signal?.aborted) {
+            throw new MobileRunnerError(
+              `Request aborted by caller: ${method} ${path}`,
+              499, // Nginx's "client closed request"
+              'ABORTED',
+            );
+          }
           throw new MobileRunnerError(
             `Request timed out after ${timeoutMs}ms: ${method} ${path}`,
             408,

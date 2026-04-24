@@ -92,6 +92,14 @@ export interface ClientToServerEvents {
   // Preview recording
   'preview:recording:start': (data: PreviewRecordingRequest) => void;
   'preview:recording:stop': (data: PreviewRecordingRequest) => void;
+  // Inline upload picker responses (correlated by stepId with a
+  // `preview:recording:upload:prompt` emitted from the server).
+  'preview:recording:upload:resolve': (
+    data: PreviewRecordingUploadResolveRequest,
+  ) => void;
+  'preview:recording:upload:cancel': (
+    data: PreviewRecordingUploadCancelRequest,
+  ) => void;
 
   // Preview page actions (refresh, reset, back, forward)
   'preview:page:refresh': (data: { previewSessionId: string }) => void;
@@ -374,6 +382,19 @@ export interface ServerToClientEvents {
   'preview:recording:step:update': (data: PreviewRecordingStepPayload) => void;
   'preview:recording:step:remove': (data: { previewSessionId: string; stepId: string; stepCount?: number; timestamp: string }) => void;
   'preview:recording:state': (data: PreviewRecordingStatePayload) => void;
+  /**
+   * Emitted when a file upload could not be captured during recording.
+   * The UI should surface this so the user knows the Upload click did not
+   * turn into a step (previously this path was silent).
+   */
+  'preview:recording:upload:warning': (data: PreviewRecordingUploadWarningPayload) => void;
+  /**
+   * Server -> client: a filechooser event fired on the recording page. UI
+   * should render an inline file picker for this placeholder stepId and
+   * respond with `preview:recording:upload:resolve` or
+   * `preview:recording:upload:cancel`.
+   */
+  'preview:recording:upload:prompt': (data: PreviewRecordingUploadPromptPayload) => void;
 
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
@@ -1060,6 +1081,35 @@ export interface RegressionRunProgressPayload {
     passed?: number;
     failed?: number;
     skipped?: number;
+    /**
+     * Per-test lifecycle update. Emitted at key transitions so the frontend
+     * can maintain a live per-test card list ("queued", "running",
+     * "completed") without polling REST. Only set on events that describe
+     * a specific test case — aggregate events (`level_started`,
+     * `level_completed`) omit it.
+     *
+     * Works uniformly for web (Playwright) and mobile (runner) tests — the
+     * `platform` field tells the UI which per-test detail view to render.
+     */
+    testExecution?: {
+      /** IntentTestCase id (or api test config id) — stable across runs. */
+      testCaseId: string;
+      /** test_executions.id — use for REST detail fetch / report links. */
+      testExecutionId: string;
+      /** Matches `ExecutableTestCase.testType`. */
+      testType: 'ui' | 'api';
+      /** Null for web UI + all API tests; 'mobile_android' | 'mobile_ios' | 'mobile_flutter' for mobile UI. */
+      platform?: string | null;
+      /** Lifecycle transition. `queued` is emitted when a test is about
+       *  to be dispatched but is held behind the concurrency gate;
+       *  `dispatching` when the job is placed on a queue; `running`
+       *  after the runner acknowledges; `completed` on terminal status. */
+      event: 'queued' | 'dispatching' | 'running' | 'completed';
+      /** Only set when `event === 'completed'`. */
+      status?: 'passed' | 'failed' | 'skipped';
+      /** Short human-readable reason for failed/skipped (≤ 200 chars). */
+      errorMessage?: string;
+    };
   };
   timestamp: string;
 }
@@ -1477,6 +1527,104 @@ export interface PreviewRecordingStepPayload {
    */
   stepCount?: number;
   timestamp: string;
+}
+
+/**
+ * Recording upload-warning payload (server -> client).
+ * Emitted when a filechooser event opened during recording but we could NOT
+ * capture a step. Lets the UI tell the user why Upload "did nothing" instead
+ * of silently dropping the interaction.
+ *
+ *   - 'no_file_selected'       — filechooser fired but user never selected a file
+ *                                (cancelled the dialog, or 5s confirmation timeout)
+ *   - 'capture_failed'         — exception inside the handler (probe/evaluate failed)
+ *   - 'listener_setup_failed'  — filechooser listener could not be attached at
+ *                                recording start (Upload will NEVER record this session)
+ *   - 'headless_blocked'       — reserved: headless container has no UI for the native
+ *                                file dialog (to be wired from the handler when detected)
+ */
+export interface PreviewRecordingUploadWarningPayload {
+  previewSessionId: string;
+  reason:
+    | 'no_file_selected'
+    | 'capture_failed'
+    | 'listener_setup_failed'
+    | 'headless_blocked';
+  /** Optional human-readable detail (error message, element hint). Safe to show in UI. */
+  detail?: string;
+  /**
+   * Correlates the warning with a placeholder step rendered by the inline
+   * upload picker. When present, the UI MUST clear `pendingUploads[stepId]`.
+   * The server additionally emits `preview:recording:step:remove` for the
+   * same stepId so the placeholder row is removed in lockstep.
+   */
+  stepId?: string;
+  timestamp: string;
+}
+
+/**
+ * Recording upload-prompt payload (server -> client).
+ *
+ * Emitted the moment a `filechooser` event fires on the recording page. The
+ * OS file dialog has opened (or is about to, in headless). Instead of waiting
+ * for the user to commit a file to the native dialog — which fails for
+ * cancelled dialogs, listener races, and headless browsers — we tell the UI
+ * to show its own inline file picker keyed to this placeholder step.
+ *
+ * The frontend shows a pending "upload" step with an "Attach file" button.
+ * When the user picks a file it POSTs to /api/v1/preview/upload-file, then
+ * emits `preview:recording:upload:resolve` back to the server with the
+ * resulting publicUrl. The server then drives setFiles() on the held
+ * fileChooser so the real page sees the upload happen.
+ */
+export interface PreviewRecordingUploadPromptPayload {
+  previewSessionId: string;
+  /** Placeholder step id — used as correlation key for resolve/cancel. */
+  stepId: string;
+  /**
+   * Multi-file support hint (from filechooser.isMultiple()). Frontend can
+   * let the user pick multiple files when true.
+   */
+  multiple: boolean;
+  /** Best-effort binding hints for the target file input (for replay). */
+  bindingHints?: unknown;
+  /** Page URL at the time of the prompt (for evidence). */
+  pageUrl?: string;
+  /**
+   * Server-side timeout (ms) after which the pending chooser is auto-cancelled
+   * and the placeholder step dropped. UI should render a matching countdown or
+   * at least tolerate the step disappearing if the user ignores the prompt.
+   */
+  timeoutMs: number;
+  timestamp: string;
+}
+
+/**
+ * Client -> server: user picked a file in the inline picker and uploaded it
+ * to /api/v1/preview/upload-file. Server will download it to a tmp path and
+ * call fileChooser.setFiles() so the real page sees the upload.
+ */
+export interface PreviewRecordingUploadResolveRequest {
+  previewSessionId: string;
+  stepId: string;
+  /** Public URL returned from /api/v1/preview/upload-file. */
+  publicUrl: string;
+  /** Original filename (for display in the captured step). */
+  fileName: string;
+  /** Supabase storage path (kept for future teardown / re-download). */
+  storagePath?: string;
+  /** Multi-file: additional files (if filechooser was isMultiple=true). */
+  additionalFiles?: Array<{ publicUrl: string; fileName: string; storagePath?: string }>;
+}
+
+/**
+ * Client -> server: user dismissed the inline picker. Server calls
+ * fileChooser.setFiles([]) to close the native dialog and drops the
+ * placeholder step.
+ */
+export interface PreviewRecordingUploadCancelRequest {
+  previewSessionId: string;
+  stepId: string;
 }
 
 /**

@@ -1265,6 +1265,10 @@ export class RegressionRunService {
 
       // 4. Read runtime config from plan's automation_config
       const browserOverride = plan.automationConfig?.runtime?.browser;
+      // Opt-in fail-fast: stop dispatching new tests after the first
+      // failure / skipped-prereq. Default (undefined / false) preserves
+      // the current "run every test" behaviour.
+      const failOnFirstFailure = plan.automationConfig?.runtime?.failOnFirstFailure === true;
 
       // 5. Start executing tests (async, don't wait)
       this.executeTestCasesAsync(
@@ -1275,6 +1279,7 @@ export class RegressionRunService {
         parameters,
         browserOverride,
         triggerContext,
+        failOnFirstFailure,
       ).catch(async (error) => {
         logger.error('[REGRESSION_RUN] Async execution failed', { error, runId: run.id });
         await supabaseAdmin
@@ -1846,6 +1851,13 @@ export class RegressionRunService {
      * `dispatchMobileTest` is called); web Playwright runs ignore it.
      */
     triggerContext?: { branch?: string; commitSha?: string },
+    /**
+     * When true, the loop sets a `failFastTriggered` flag on the first
+     * failure and stops dispatching further tests. Mirrors the existing
+     * `creditExhausted` early-exit pattern. Defaults to false (continue
+     * running every test) to preserve historic nightly-run semantics.
+     */
+    failOnFirstFailure: boolean = false,
   ): Promise<void> {
     const startedAt = new Date().toISOString();
 
@@ -1920,7 +1932,20 @@ export class RegressionRunService {
     const emitProgress = (
       status: 'started' | 'level_started' | 'test_started' | 'test_completed' | 'level_completed' | 'completed' | 'failed',
       message: string,
-      extra?: { currentLevel?: number; currentTestName?: string; errorCode?: string }
+      extra?: {
+        currentLevel?: number;
+        currentTestName?: string;
+        errorCode?: string;
+        /**
+         * Optional per-test lifecycle update. Populated only when the
+         * event describes a specific test case (queued / dispatching /
+         * running / completed). Let the frontend maintain a live
+         * per-test card list without REST polling.
+         */
+        testExecution?: RegressionRunProgressPayload['details'] extends infer D
+          ? D extends { testExecution?: infer T } ? T : never
+          : never;
+      }
     ) => {
       try {
         const progress = totalTests > 0 ? Math.round((completedCount / totalTests) * 100) : 0;
@@ -1943,6 +1968,9 @@ export class RegressionRunService {
             passed: apiPassed,
             failed: apiFailed,
             skipped: skippedCount,
+            // Only include when the emitter explicitly passed one — keeps
+            // aggregate-level events (level_started etc) clean.
+            ...(extra?.testExecution ? { testExecution: extra.testExecution } : {}),
           },
           timestamp: new Date().toISOString(),
         };
@@ -1979,10 +2007,27 @@ export class RegressionRunService {
     );
 
     let creditExhausted = false;
+    // Fail-fast flag — mirrors `creditExhausted`. Flipped to true the first
+    // time any test case fails or is skipped due to a failed prerequisite
+    // while `failOnFirstFailure` is enabled on the plan. Remaining tests
+    // (both in the current level's dispatch loop and in future levels)
+    // are marked 'skipped' with a clear reason instead of being dispatched.
+    let failFastTriggered = false;
+    // Track the testCaseId that triggered fail-fast so the UI can explain
+    // which test caused the early stop.
+    let failFastTriggerTestCaseId: string | null = null;
 
-    for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted; levelIdx++) {
+    for (let levelIdx = 0; levelIdx < levels.length && !creditExhausted && !failFastTriggered; levelIdx++) {
       const level = levels[levelIdx];
-      const uiWaiters: Array<{ testCaseId: string; execId: string; promise: Promise<string> }> = [];
+      // `platform` captured at dispatch so we can forward it with the
+      // per-test completion event below (post-level), which is how the
+      // UI discriminates mobile vs web cards.
+      const uiWaiters: Array<{
+        testCaseId: string;
+        execId: string;
+        platform: string | null;
+        promise: Promise<string>;
+      }> = [];
 
       // ── Concurrency gate ────────────────────────────────────────────────
       // Tracks UI waiters that haven't settled yet. We don't want more than
@@ -2012,6 +2057,12 @@ export class RegressionRunService {
       });
 
       for (const testCase of level) {
+        // Fail-fast: once a prior test in this level (or earlier) has
+        // failed, stop *dispatching* new ones. The uiWaiters block below
+        // still awaits tests that were dispatched before the trigger, so
+        // we don't lose verdicts from in-flight tests.
+        if (failFastTriggered) break;
+
         const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
 
         // Check if any prerequisite failed or was skipped
@@ -2031,6 +2082,26 @@ export class RegressionRunService {
             testCaseId: testCase.testCaseId,
             failedPrereqs,
           });
+          // Surface the skip to the per-test dashboard. Same emission
+          // shape as a completed-failed verdict so the FE card renders
+          // consistently.
+          if (execId) {
+            emitProgress(
+              'test_completed',
+              `Skipped (prerequisite failed): ${testCase.testCaseId}`,
+              {
+                currentLevel: levelIdx + 1,
+                testExecution: {
+                  testCaseId: testCase.testCaseId,
+                  testExecutionId: execId,
+                  testType: testCase.testType,
+                  event: 'completed',
+                  status: 'skipped',
+                  errorMessage: `Prerequisite(s) failed: ${failedPrereqs.join(', ')}`.slice(0, 200),
+                },
+              },
+            );
+          }
           continue;
         }
 
@@ -2052,6 +2123,21 @@ export class RegressionRunService {
           emitProgress('test_started', `Running ${testCase.testType.toUpperCase()} test (${completedCount + 1}/${totalTests})`, {
             currentLevel: levelIdx + 1,
             currentTestName: testCase.testCaseId,
+            // Per-test lifecycle marker: we're about to dispatch the job
+            // (UI tests → runner / Playwright queue; API tests → inline).
+            // Platform is filled in after we've fetched the saved case
+            // for UI tests, so we leave it undefined here and let the
+            // `test_completed` event carry the authoritative value.
+            ...(execId
+              ? {
+                  testExecution: {
+                    testCaseId: testCase.testCaseId,
+                    testExecutionId: execId,
+                    testType: testCase.testType,
+                    event: 'dispatching',
+                  },
+                }
+              : {}),
           });
 
           if (testCase.testType === 'ui') {
@@ -2108,7 +2194,12 @@ export class RegressionRunService {
 
               // Register waiter for dependency-aware ordering
               const waitPromise = executionCompletionEmitter.waitForCompletion(execId);
-              uiWaiters.push({ testCaseId: testCase.testCaseId, execId, promise: waitPromise });
+              uiWaiters.push({
+                testCaseId: testCase.testCaseId,
+                execId,
+                platform: savedCase.platform || null,
+                promise: waitPromise,
+              });
 
               // Only mobile tests consume the runner's emulator pool — gate
               // those. Web tests go through Playwright's own pool and share
@@ -2166,6 +2257,14 @@ export class RegressionRunService {
             } else {
               apiFailed++;
               failedOrSkippedIds.add(testCase.testCaseId);
+              // Opt-in fail-fast: first failure trips the flag. The outer
+              // level loop checks this after the current level's uiWaiters
+              // finish; we still let already-dispatched tests in this level
+              // complete so their verdicts are recorded.
+              if (failOnFirstFailure && !failFastTriggered) {
+                failFastTriggered = true;
+                failFastTriggerTestCaseId = testCase.testCaseId;
+              }
             }
 
             if (execId) {
@@ -2185,6 +2284,22 @@ export class RegressionRunService {
             completedCount++;
             emitProgress('test_completed', `API test ${passed ? 'passed' : 'failed'} (${completedCount}/${totalTests})`, {
               currentLevel: levelIdx + 1,
+              ...(execId
+                ? {
+                    testExecution: {
+                      testCaseId: testCase.testCaseId,
+                      testExecutionId: execId,
+                      testType: 'api',
+                      // API tests have no device platform.
+                      platform: null,
+                      event: 'completed',
+                      status: passed ? 'passed' : 'failed',
+                      errorMessage: passed
+                        ? undefined
+                        : (apiExecution?.error_message || 'API test failed').slice(0, 200),
+                    },
+                  }
+                : {}),
             });
           }
         } catch (error) {
@@ -2202,6 +2317,11 @@ export class RegressionRunService {
           });
 
           failedOrSkippedIds.add(testCase.testCaseId);
+          // Same fail-fast trip as the normal-failure branch above.
+          if (failOnFirstFailure && !failFastTriggered && !isCreditError) {
+            failFastTriggered = true;
+            failFastTriggerTestCaseId = testCase.testCaseId;
+          }
 
           // Refund upfront-deducted credits on catastrophic dispatch failure.
           // `refundOnCrash` is cleared after normal completion (pass OR fail),
@@ -2245,6 +2365,29 @@ export class RegressionRunService {
                 statusError: statusError instanceof Error ? statusError.message : String(statusError),
               });
             }
+
+            // Surface the catastrophic failure on the per-test card. This
+            // path happens when the dispatch code itself threw (service
+            // crash, network partition, etc.) — the test never entered
+            // the uiWaiters post-level path, so we emit the completed
+            // event here. Credit errors get a dedicated event below.
+            if (!isCreditError) {
+              emitProgress(
+                'test_completed',
+                `${testCase.testType.toUpperCase()} test failed to dispatch: ${errMsg.slice(0, 80)}`,
+                {
+                  currentLevel: levelIdx + 1,
+                  testExecution: {
+                    testCaseId: testCase.testCaseId,
+                    testExecutionId: execId,
+                    testType: testCase.testType,
+                    event: 'completed',
+                    status: 'failed',
+                    errorMessage: errMsg.slice(0, 200),
+                  },
+                },
+              );
+            }
           }
 
           // Emit credit-specific progress event so frontend can show top-up prompt
@@ -2270,7 +2413,12 @@ export class RegressionRunService {
         const results = await Promise.all(
           uiWaiters.map(async (w) => {
             const status = await w.promise;
-            return { testCaseId: w.testCaseId, status };
+            return {
+              testCaseId: w.testCaseId,
+              execId: w.execId,
+              platform: w.platform,
+              status,
+            };
           })
         );
 
@@ -2278,9 +2426,32 @@ export class RegressionRunService {
           completedCount++;
           if (result.status !== 'passed') {
             failedOrSkippedIds.add(result.testCaseId);
+            // UI test verdicts arrive here (async via executionCompletionEmitter)
+            // rather than in the inline API branch — so fail-fast needs to
+            // trip here too, otherwise a UI-only plan would never early-exit.
+            if (failOnFirstFailure && !failFastTriggered) {
+              failFastTriggered = true;
+              failFastTriggerTestCaseId = result.testCaseId;
+            }
           }
+          // Narrow the emitter status to the FE's union. `executionCompletionEmitter`
+          // returns strings that may include 'cancelled' / 'pending' — collapse
+          // everything non-pass/non-fail to 'skipped' so the FE state machine stays
+          // three-valued.
+          const mappedStatus: 'passed' | 'failed' | 'skipped' =
+            result.status === 'passed' ? 'passed'
+            : result.status === 'failed' ? 'failed'
+            : 'skipped';
           emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
             currentLevel: levelIdx + 1,
+            testExecution: {
+              testCaseId: result.testCaseId,
+              testExecutionId: result.execId,
+              testType: 'ui',
+              platform: result.platform,
+              event: 'completed',
+              status: mappedStatus,
+            },
           });
         }
       }
@@ -2288,6 +2459,86 @@ export class RegressionRunService {
       emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {
         currentLevel: levelIdx + 1,
       });
+
+      // If fail-fast fired during this level, emit a dedicated progress
+      // event so the UI can show the reason immediately — before the
+      // remaining-skipped sweep below. We do this AFTER the level
+      // completes (in-flight uiWaiters have returned) so the triggering
+      // test's verdict is already written.
+      if (failFastTriggered && !creditExhausted) {
+        emitProgress(
+          'failed',
+          failFastTriggerTestCaseId
+            ? `Regression stopped early: test "${failFastTriggerTestCaseId}" failed and fail-fast is enabled`
+            : 'Regression stopped early: fail-fast policy',
+          {
+            currentLevel: levelIdx + 1,
+            errorCode: 'FAIL_FAST_TRIGGERED',
+          },
+        );
+      }
+    }
+
+    // If fail-fast stopped the run, mark remaining tests as skipped and
+    // finalize. Mirrors the creditExhausted block below, but with a
+    // distinct status (`completed` not `failed`) and summary flag — the
+    // run finished cleanly per the user's own policy, it wasn't an
+    // infrastructure problem.
+    if (failFastTriggered && !creditExhausted) {
+      for (const tc of testCases) {
+        if (!failedOrSkippedIds.has(tc.testCaseId)) {
+          const execId = execByKey.get(`${tc.testType}:${tc.testCaseId}`);
+          const skipReason = failFastTriggerTestCaseId
+            ? `Skipped: regression stopped early after "${failFastTriggerTestCaseId}" failed (fail-fast policy)`
+            : 'Skipped: regression stopped early (fail-fast policy)';
+          if (execId) {
+            await ExecutionService.updateStatus({
+              id: execId,
+              status: 'skipped',
+              errorMessage: skipReason,
+            }).catch(() => {});
+
+            // Surface each skipped test on the per-test dashboard so the
+            // UI cards transition from "queued" → "skipped" with a reason.
+            emitProgress(
+              'test_completed',
+              `Skipped (fail-fast): ${tc.testCaseId}`,
+              {
+                testExecution: {
+                  testCaseId: tc.testCaseId,
+                  testExecutionId: execId,
+                  testType: tc.testType,
+                  event: 'completed',
+                  status: 'skipped',
+                  errorMessage: skipReason.slice(0, 200),
+                },
+              },
+            );
+          }
+          skippedCount++;
+        }
+      }
+
+      await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          status: 'failed',
+          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+          summary: {
+            total: testCases.length,
+            api_passed: apiPassed,
+            api_failed: apiFailed,
+            skipped: skippedCount,
+            failFastTriggered: true,
+            failFastTriggerTestCaseId,
+            started_at: startedAt,
+            completed_at: new Date().toISOString(),
+          },
+          completed_at: new Date().toISOString(),
+        })
+        .eq('id', runId);
+
+      return;
     }
 
     // If credit exhaustion stopped the run, mark remaining tests as skipped and finalize
