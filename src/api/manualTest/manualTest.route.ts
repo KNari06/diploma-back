@@ -260,7 +260,9 @@ router.post('/run', requireAuth, testRunRateLimiter, asyncHandler(async (req: Re
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
+        code: 'INSUFFICIENT_CREDITS',
         message: 'You need at least 1 credit to start a test. Credits are deducted per step during execution.',
+        details: { required: 1, available: creditCheck.available },
       });
       return;
     }

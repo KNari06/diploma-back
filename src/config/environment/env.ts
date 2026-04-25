@@ -190,6 +190,24 @@ const envSchema = z.object({
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
+
+  // Intent classifier fast-path — set to 'true' to disable the deterministic
+  // whitelist that short-circuits trivial messages (greetings, cancels, yes/no
+  // after pending confirmation). Kill-switch for the rare case the whitelist
+  // misclassifies something.
+  INTENT_FAST_PATH_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // Intent classifier short-TTL cache — guards against double-submit and
+  // instant retries by caching the full (message + context) pair for 60s.
+  // Set to 'true' to disable.
+  INTENT_CACHE_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // Mobile-agent reasoning persistence. When true (default), each turn's
+  // think_aloud entries are written to chat_messages.metadata.reasoningTrace.
+  // Set to 'false' for cost-sensitive deployments where JSONB bloat
+  // matters more than the post-hoc "why did the agent do X" debug surface.
+  // WebSocket streaming is unaffected by this flag.
+  MOBILE_AGENT_PERSIST_REASONING: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
 });
 
 // Parse and validate environment variables

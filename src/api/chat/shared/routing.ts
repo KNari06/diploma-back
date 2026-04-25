@@ -124,6 +124,10 @@ function getRoutingMessage(intent: string): string {
       return 'Executing action...';
     case 'mobile_test':
       return 'Preparing mobile emulator...';
+    case 'mobile_action':
+      return 'Tapping on the device...';
+    case 'mobile_agent':
+      return 'Reading the mobile screen...';
     default:
       return 'Processing your request...';
   }

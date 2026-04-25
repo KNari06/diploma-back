@@ -538,6 +538,30 @@ export class ValidationError extends QAIError {
   }
 }
 
+/**
+ * Thrown when a pre-flight credit check fails (balance < required).
+ *
+ * Carries a stable `code` (`INSUFFICIENT_CREDITS`) so the frontend can
+ * flip the global "credits exhausted" banner instead of just showing a
+ * generic "Validation error" toast, AND structured `details` so the UI
+ * can render an exact "need X, have Y" breakdown when it wants.
+ *
+ * Extends ValidationError so existing `instanceof ValidationError` checks
+ * keep routing these to 422 — we only override the machine-readable code.
+ */
+export class InsufficientCreditsError extends ValidationError {
+  constructor(
+    message: string,
+    details?: { required?: number; available?: number; breakdown?: Record<string, number> },
+  ) {
+    super(message, details);
+    this.name = 'InsufficientCreditsError';
+    // QAIError ctor sets code='VALIDATION_ERROR'; override to the specific
+    // sentinel the frontend keys off.
+    (this as any).code = 'INSUFFICIENT_CREDITS';
+  }
+}
+
 export class NotFoundError extends QAIError {
   constructor(resource: string, id: string) {
     super(`${resource} with id ${id} not found`, 'NOT_FOUND', 404);

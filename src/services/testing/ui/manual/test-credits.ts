@@ -1,5 +1,5 @@
 import { dbService } from '@/db/supabase';
-import { BrowserType, NotFoundError, ValidationError } from '@/types';
+import { BrowserType, NotFoundError, ValidationError, InsufficientCreditsError } from '@/types';
 import { logger } from '@/utils/core/logger';
 
 /**
@@ -101,7 +101,12 @@ export async function checkUserCredits(
   });
 
   if (availableCredits < requiredCredits) {
-    throw new ValidationError(`Insufficient credits. Required: ${requiredCredits}, Available: ${availableCredits}`);
+    // Stable `code: 'INSUFFICIENT_CREDITS'` so the frontend flips the
+    // global "credits exhausted" banner instead of a generic toast.
+    throw new InsufficientCreditsError(
+      `Insufficient credits. Required: ${requiredCredits}, Available: ${availableCredits}`,
+      { required: requiredCredits, available: availableCredits },
+    );
   }
 }
 

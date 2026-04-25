@@ -323,7 +323,11 @@ export async function getPlanBugsSummary(req: AuthenticatedRequest, res: Respons
         success: true,
         data: {
           total: 0,
+          distinct: 0,
+          latestRunBugs: 0,
+          recurringDistinct: 0,
           bySeverity: {},
+          bySeverityDistinct: {},
           byCategory: {},
           topBugs: [],
           recentTrend: [],
@@ -366,7 +370,23 @@ export async function getPlanBugsSummary(req: AuthenticatedRequest, res: Respons
     const validSeverities = new Set(['critical', 'high', 'medium', 'low']);
     const validCategories = new Set(['functional', 'performance', 'accessibility', 'visual', 'security']);
     const allBugs: any[] = [];
-    const bugOccurrences = new Map<string, { bug: any; count: number }>();
+
+    // Deduplicate by normalized title, tracking per-run appearances (not just total count)
+    // so we can report "seen in X/N runs" and distinguish recurring bugs from one-off ones.
+    type BugAgg = {
+      title: string;
+      severity: string;
+      category: string;
+      occurrences: number;      // total count across all executions
+      runIds: Set<string>;      // distinct runs where this bug appeared
+      firstRunIndex: number;    // 0 = latest run (runs are sorted desc)
+      lastRunIndex: number;
+    };
+    const bugOccurrences = new Map<string, BugAgg>();
+
+    // runs are ordered by started_at DESC, so runs[0] is the latest
+    const runIndexById = new Map<string, number>();
+    runs.forEach((r, i) => runIndexById.set(r.id, i));
 
     // Track bugs per run for trend
     const bugsPerRun = new Map<string, number>();
@@ -382,6 +402,7 @@ export async function getPlanBugsSummary(req: AuthenticatedRequest, res: Respons
       const rawBugs: any[] = Array.isArray(rawBugSource) ? rawBugSource : [];
 
       bugsPerRun.set(exec.run_id, (bugsPerRun.get(exec.run_id) || 0) + rawBugs.length);
+      const runIndex = runIndexById.get(exec.run_id) ?? 0;
 
       for (const bug of rawBugs) {
         if (!bug || typeof bug !== 'object') continue;
@@ -389,25 +410,32 @@ export async function getPlanBugsSummary(req: AuthenticatedRequest, res: Respons
         const severity = validSeverities.has(bug.severity) ? bug.severity : 'medium';
         const category = validCategories.has(bug.category) ? bug.category : 'functional';
 
-        allBugs.push({ title, severity, category });
+        allBugs.push({ title, severity, category, runId: exec.run_id });
 
-        // Deduplicate by title for topBugs
         const key = title.toLowerCase().trim();
         if (key) {
           const existing = bugOccurrences.get(key);
           if (existing) {
-            existing.count++;
+            existing.occurrences++;
+            existing.runIds.add(exec.run_id);
+            existing.firstRunIndex = Math.min(existing.firstRunIndex, runIndex);
+            existing.lastRunIndex = Math.max(existing.lastRunIndex, runIndex);
           } else {
             bugOccurrences.set(key, {
-              bug: { title, severity, category },
-              count: 1,
+              title,
+              severity,
+              category,
+              occurrences: 1,
+              runIds: new Set([exec.run_id]),
+              firstRunIndex: runIndex,
+              lastRunIndex: runIndex,
             });
           }
         }
       }
     }
 
-    // Compute bySeverity and byCategory
+    // bySeverity/byCategory: count occurrences (legacy, kept for compatibility)
     const bySeverity: Record<string, number> = {};
     const byCategory: Record<string, number> = {};
     for (const bug of allBugs) {
@@ -415,11 +443,38 @@ export async function getPlanBugsSummary(req: AuthenticatedRequest, res: Respons
       byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
     }
 
-    // Top bugs sorted by occurrence
+    // Distinct counts (what users mean by "how many bugs do I have")
+    const bySeverityDistinct: Record<string, number> = {};
+    for (const agg of bugOccurrences.values()) {
+      bySeverityDistinct[agg.severity] = (bySeverityDistinct[agg.severity] || 0) + 1;
+    }
+
+    // Latest run = runs[0]. Headline numbers reflect freshness.
+    const latestRunId = runs[0].id;
+    const latestRunBugs = bugsPerRun.get(latestRunId) || 0;
+
+    // Recurring = distinct bug titles seen in 2+ runs. Signal for "this isn't a one-off."
+    let recurringDistinct = 0;
+    for (const agg of bugOccurrences.values()) {
+      if (agg.runIds.size >= 2) recurringDistinct++;
+    }
+
+    // Top bugs: surface recurring issues first, then by occurrence count.
+    // Also include per-bug run-visibility data so UI can show "Seen in X/N runs".
     const topBugs = [...bugOccurrences.values()]
-      .sort((a, b) => b.count - a.count)
+      .sort((a, b) => {
+        if (b.runIds.size !== a.runIds.size) return b.runIds.size - a.runIds.size;
+        return b.occurrences - a.occurrences;
+      })
       .slice(0, 10)
-      .map(({ bug, count }) => ({ ...bug, occurrences: count }));
+      .map((agg) => ({
+        title: agg.title,
+        severity: agg.severity,
+        category: agg.category,
+        occurrences: agg.occurrences,
+        runsSeen: agg.runIds.size,
+        inLatestRun: agg.runIds.has(latestRunId),
+      }));
 
     // Recent trend: bugs count per run
     const recentTrend = runs.map(r => ({
@@ -431,8 +486,12 @@ export async function getPlanBugsSummary(req: AuthenticatedRequest, res: Respons
     res.json({
       success: true,
       data: {
-        total: allBugs.length,
-        bySeverity,
+        total: allBugs.length,                    // legacy: occurrences across all runs
+        distinct: bugOccurrences.size,            // distinct bug titles across all runs
+        latestRunBugs,                            // occurrences in most recent run (headline)
+        recurringDistinct,                        // distinct bugs seen in 2+ runs
+        bySeverity,                               // legacy: by occurrence
+        bySeverityDistinct,                       // by distinct bug title
         byCategory,
         topBugs,
         recentTrend,

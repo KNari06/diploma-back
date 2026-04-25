@@ -6,6 +6,8 @@ import { RulesCacheService } from '@/services/kb/rules-cache.service';
 import { IntentResult, IntentType, VALID_SCOPES } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { getSharedOpenAIClient } from '@/services/ai/core/openai.service';
+import { tryIntentFastPath, logFastPathHit } from './intent-fast-path';
+import { buildIntentCacheKey, getCachedIntent, setCachedIntent } from './intent-cache';
 
 const openai = getSharedOpenAIClient();
 
@@ -154,11 +156,35 @@ export async function parseUserIntent(
     const trimmedMessage = validateAndPrepareMessage(message);
     if (!trimmedMessage) return null;
 
-    // Step 2: Check cache for existing results
-    // TODO: Cache temporarily disabled
-    // const cacheKey = buildCacheKey(trimmedMessage, projectId, availableIntents);
-    // const cachedResult = getCachedResult(cacheKey);
-    // if (cachedResult) return cachedResult;
+    // Step 1b: Deterministic fast-path for trivial messages (greetings,
+    // cancels, yes/no after a pending confirmation). Skips the LLM entirely
+    // when a narrow whitelist matches — saves ~800ms + prompt tokens per hit.
+    // Safe by construction: exact-match only, conservative confidence,
+    // bypassable via INTENT_FAST_PATH_DISABLED env var.
+    const fastHit = tryIntentFastPath(trimmedMessage, context);
+    if (fastHit) {
+      logFastPathHit(fastHit, trimmedMessage);
+      return fastHit.result;
+    }
+
+    // Step 2: Short-TTL context-hash cache. Hits only when the SAME user
+    // submits the SAME message with the SAME situational context within
+    // 60 seconds (double-submit, rage-click, network retry). Never merges
+    // across users or across different chat states — see intent-cache.ts.
+    const cacheKey = buildIntentCacheKey(
+      trimmedMessage,
+      context,
+      projectId,
+      availableIntents,
+    );
+    const cached = getCachedIntent(cacheKey);
+    if (cached) {
+      logger.info('[INTENT_CACHE] hit', {
+        intent: cached.intent,
+        messagePreview: trimmedMessage.slice(0, 60),
+      });
+      return cached;
+    }
 
     // Step 3: Get KB rules context (FAST/SLOW path)
     const userLanguage = detectLanguageSimple(trimmedMessage);
@@ -192,7 +218,9 @@ export async function parseUserIntent(
         confidence,
       });
       // Force needs_clarification for incomplete intents
-      return createFallbackResult(intentResult, Math.min(confidence, 0.65), userLanguage);
+      const fallback = createFallbackResult(intentResult, Math.min(confidence, 0.65), userLanguage);
+      setCachedIntent(cacheKey, fallback);
+      return fallback;
     }
 
     // Step 7: Handle high confidence results
@@ -201,7 +229,10 @@ export async function parseUserIntent(
       confidence,
       userLanguage
     );
-    if (highConfidenceResult) return highConfidenceResult;
+    if (highConfidenceResult) {
+      setCachedIntent(cacheKey, highConfidenceResult);
+      return highConfidenceResult;
+    }
 
     // Step 8: Handle low confidence (< 0.7)
     // KB rules are already included in context from Step 3.
@@ -210,7 +241,9 @@ export async function parseUserIntent(
       confidence,
       intent: intentResult.intent,
     });
-    return createFallbackResult(intentResult, confidence, userLanguage);
+    const lowConfFallback = createFallbackResult(intentResult, confidence, userLanguage);
+    setCachedIntent(cacheKey, lowConfFallback);
+    return lowConfFallback;
 
   } catch (error) {
     logger.error('[INTENT_PARSER] Intent parsing failed', { error, message });

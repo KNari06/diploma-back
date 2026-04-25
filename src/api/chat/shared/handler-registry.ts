@@ -15,6 +15,8 @@ import { handleSaveTestIntent } from '../regression/save-test.handler';
 import { handleTestRecommendationsIntent } from '../regression/test-recommendations.handler';
 import { handleEditorAction } from '../editor_action/handler';
 import { handleMobileTest as handleMobileTestOriginal } from '../mobile_test/handler';
+import { handleMobileAgent as handleMobileAgentOriginal } from '../mobile_agent/handler';
+import { handleMobileAction as handleMobileActionOriginal } from '../mobile_action/handler';
 import { handleApiFlowTest as handleApiFlowTestOriginal } from '../api_flow/handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
 
@@ -172,6 +174,42 @@ const handleMobileTest: IntentHandler = async (req, res, params) => {
 };
 
 /**
+ * Wrapper for mobile_agent handler — multi-step AI Agent for the mobile
+ * editor. Parallels the web `general_chat` sub-agent pipeline.
+ */
+const handleMobileAgent: IntentHandler = async (req, res, params) => {
+  return handleMobileAgentOriginal(req, res, {
+    message: params.message,
+    parsedIntent: params.parsedIntent,
+    userId: params.userId,
+    workspace_id: params.workspace_id,
+    chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    context: params.context,
+    abortSignal: params.abortSignal,
+    mode: params.mode,
+  });
+};
+
+/**
+ * Wrapper for mobile_action handler — single atomic action on a live
+ * device. Parallels the web `editor_action` fast-path.
+ */
+const handleMobileAction: IntentHandler = async (req, res, params) => {
+  return handleMobileActionOriginal(req, res, {
+    message: params.message,
+    parsedIntent: params.parsedIntent,
+    userId: params.userId,
+    workspace_id: params.workspace_id,
+    chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    context: params.context,
+    abortSignal: params.abortSignal,
+    mode: params.mode,
+  });
+};
+
+/**
  * Registry of all available intent handlers
  * Single source of truth for intent routing
  */
@@ -201,8 +239,14 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   // Editor mode intent
   editor_action: handleEditorAction,
 
-  // Mobile testing intent
+  // Mobile testing intent (async BullMQ job for recorded steps)
   mobile_test: handleMobileTest,
+
+  // Mobile editor — single atomic action (fast path, parallels editor_action)
+  mobile_action: handleMobileAction,
+
+  // Mobile editor AI agent (multi-step authoring/exploration, parallels general_chat)
+  mobile_agent: handleMobileAgent,
 
   // API flow testing intent (Swagger/OpenAPI/Postman chain execution)
   api_flow_test: handleApiFlowTest,
@@ -265,6 +309,8 @@ export function getIntentDescriptions(): Record<string, string> {
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
     editor_action: 'User wants to perform a direct action on the live page in editor mode',
     mobile_test: 'User wants to run a mobile (Android/iOS) test on recorded steps',
+    mobile_action: 'User is in the mobile editor and wants ONE direct action on the current screen: tap, swipe, type, scroll, press key, back. Executed immediately, no planning.',
+    mobile_agent: 'User is in the mobile editor and wants the agent to handle something multi-step: author a test, explore the app, answer questions about the screen, fill a whole form. Heavier pipeline.',
     api_flow_test: 'User wants to test an API flow from a Swagger/OpenAPI/Postman spec URL or file, or pasted cURL commands',
   };
 }

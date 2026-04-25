@@ -197,9 +197,11 @@ export async function handleMobileTest(
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
+        code: 'INSUFFICIENT_CREDITS',
         message: `❌ Insufficient credits. Mobile tests cost 3 credits, but you have ${creditCheck.available}.`,
         creditsRequired: 3,
         creditsAvailable: creditCheck.available,
+        details: { required: 3, available: creditCheck.available },
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
       });

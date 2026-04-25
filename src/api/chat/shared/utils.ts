@@ -276,10 +276,16 @@ export async function checkChatCredits(
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
+        code: 'INSUFFICIENT_CREDITS',
         message: `You need ${creditCheck.required} credits to send a chat message. You have ${creditCheck.available} credits. Please purchase ${creditCheck.shortage} more credits.`,
         required: creditCheck.required,
         available: creditCheck.available,
         shortage: creditCheck.shortage,
+        details: {
+          required: creditCheck.required,
+          available: creditCheck.available,
+          shortage: creditCheck.shortage,
+        },
         timestamp: new Date().toISOString(),
       });
       return false;

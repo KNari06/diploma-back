@@ -96,10 +96,16 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         res.status(402).json({
           success: false,
           error: 'Insufficient credits',
+          code: 'INSUFFICIENT_CREDITS',
           message: `You need at least ${chatCreditCheck.required} credit(s) to use the chat. You have ${chatCreditCheck.available} credit(s). Please purchase ${chatCreditCheck.shortage} more credit(s) to continue.`,
           required: chatCreditCheck.required,
           available: chatCreditCheck.available,
           shortage: chatCreditCheck.shortage,
+          details: {
+            required: chatCreditCheck.required,
+            available: chatCreditCheck.available,
+            shortage: chatCreditCheck.shortage,
+          },
           timestamp: new Date().toISOString(),
         });
       }

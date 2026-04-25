@@ -417,6 +417,7 @@ export async function parseIntent(
           ...regressionContext,
           mode,
           previewSessionId: contextObj?.previewSessionId,
+          mobileSessionId: contextObj?.mobileSessionId,
         },
         projectId ?? workspace_id, // Use project_id from session if available, fallback to workspace_id
         availableIntents // Pass dynamic intent list
@@ -583,6 +584,12 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
 
     case 'mobile_test':
       return 'Got it! Starting mobile test...';
+
+    case 'mobile_action':
+      return 'Got it! Acting on the device...';
+
+    case 'mobile_agent':
+      return 'Got it! Working on the mobile screen...';
 
     case 'api_flow_test':
       return 'Got it! Building API flow from spec...';

@@ -23,7 +23,7 @@ export interface ChatRequestContext {
   projectId?: string;
   action?: 'run_api_test' | string; // Explicit action keyword for fast path
   apiTest?: ApiTestContext; // API test data when action is 'run_api_test'
-  // Editor mode fields
+  // Editor mode fields (web)
   editorMode?: boolean; // Signals chat is from preview/editor
   previewSessionId?: string; // Active preview session ID
   pageContext?: {
@@ -32,6 +32,9 @@ export interface ChatRequestContext {
     domSummary?: string; // Compact DOM summary (~1500 tokens max)
     testSteps?: Array<{ id: string; type: string; description: string }>;
   };
+  // Mobile editor mode fields — parallels the web editor block
+  mobileEditorMode?: boolean; // Signals chat is from the mobile editor
+  mobileSessionId?: string; // Active runner session ID on :4100
   [key: string]: any;
 }
 
