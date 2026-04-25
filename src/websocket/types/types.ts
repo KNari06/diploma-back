@@ -244,6 +244,13 @@ export interface ServerToClientEvents {
     timestamp: string;
   }) => void;
 
+  // Mobile editor session has expired (idle for IDLE_TTL_MS, or backend
+  // detected the FE↔BE socket has gone away). Frontend should close the
+  // editor modal, clear `intentTestCaseId` from the URL, toast the user,
+  // and bounce back to the Repository view. The runner emulator is
+  // intentionally left alive on idle so re-opening the test case is fast.
+  'mobile:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+
   // Response to `preview:session:inspect`. Contains non-sensitive counts
   // + sameOrigin flag so the frontend can decide whether to prompt the
   // user before a Run. Counts are zero if the context is pristine.
