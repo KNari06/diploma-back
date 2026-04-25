@@ -15,8 +15,76 @@ import {
 import { handleHeartbeat } from './heartbeat.handler';
 import { handlePreviewEvents } from './preview.handler';
 import { handleSubscriptions } from './subscription.handler';
+import {
+  cancelIdle,
+  deleteUserMobileKeys,
+  getUserWarmupSessionIds,
+} from '@/services/mobile/mobile-idle.service';
+import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
+
+/**
+ * Per-user grace timer for "user has gone away — destroy their mobile
+ * emulator soon." Set on disconnect when this is the user's last socket;
+ * cancelled on a fresh connect (refresh / brief reconnect doesn't pay the
+ * cost of a re-warmup). 15s grace tolerates a quick reload.
+ */
+const DISCONNECT_GRACE_MS = 15_000;
+const disconnectGraceTimers = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Run the actual cleanup: destroy each warmed runner session for this
+ * user, then delete the Redis warmup keys, then cancel any pending idle
+ * timer. Best-effort — failures are logged but not surfaced.
+ */
+async function performDisconnectCleanup(userId: string): Promise<void> {
+  try {
+    const sessionIds = await getUserWarmupSessionIds(userId);
+
+    if (sessionIds.length > 0) {
+      const client = getMobileRunnerClient();
+      await Promise.allSettled(
+        sessionIds.map(async (sid) => {
+          try {
+            await client.destroySession(sid);
+          } catch (err) {
+            logger.warn('[WebSocket] Cleanup destroy failed (runner TTL will reclaim)', {
+              sessionId: sid,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }),
+      );
+    }
+
+    const deletedKeys = await deleteUserMobileKeys(userId);
+    cancelIdle(userId);
+
+    logger.info('[WebSocket] Cleanup fired — destroyed sessions + cleared Redis', {
+      userId: userId.substring(0, 8) + '...',
+      destroyedSessions: sessionIds.length,
+      deletedKeys,
+    });
+  } catch (error) {
+    logger.error('[WebSocket] Cleanup error (non-fatal)', {
+      userId: userId.substring(0, 8) + '...',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/** Cancel a pending grace timer (e.g. user reconnects). */
+function cancelDisconnectGrace(userId: string): void {
+  const t = disconnectGraceTimers.get(userId);
+  if (t) {
+    clearTimeout(t);
+    disconnectGraceTimers.delete(userId);
+    logger.debug('[WebSocket] Cancelled scheduled cleanup', {
+      userId: userId.substring(0, 8) + '...',
+    });
+  }
+}
 
 /**
  * Handle new WebSocket connection
@@ -100,6 +168,11 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
       room: userRoom,
     });
 
+    // The user is back — cancel any pending grace-period destroy. This
+    // handles refresh / brief reconnect: the cleanup never fires unless
+    // the user is gone for the full DISCONNECT_GRACE_MS window.
+    cancelDisconnectGrace(userId);
+
     // Setup event handlers
     handleSubscriptions(socket);
     handleHeartbeat(socket);
@@ -113,13 +186,49 @@ export const handleConnection = async (socket: TypedSocket): Promise<void> => {
     // Don't disconnect - let client try to reconnect
   }
 
-  // Handle disconnection
-  socket.on('disconnect', (reason) => {
+  // Handle disconnection — schedule mobile cleanup if this was the last
+  // socket for the user. Refreshes / brief reconnects don't trigger the
+  // destroy because the connect-side `cancelDisconnectGrace()` cancels
+  // the timer.
+  socket.on('disconnect', async (reason) => {
+    const uid = socket.data?.userId;
     logger.info('[WebSocket] Client disconnected', {
       socketId: socket.id,
-      userId: socket.data?.userId || 'unknown',
+      userId: uid || 'unknown',
       reason,
     });
+    if (!uid) return;
+
+    try {
+      const remaining = await socket.nsp.in(`user:${uid}`).fetchSockets();
+      if (remaining.length > 0) {
+        // Other tabs still connected — leave the session alone.
+        return;
+      }
+    } catch (err) {
+      logger.warn('[WebSocket] fetchSockets failed during disconnect', {
+        userId: uid.substring(0, 8) + '...',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Fall through and schedule cleanup defensively.
+    }
+
+    // Last socket gone — schedule cleanup. Replaces any prior pending
+    // timer (shouldn't exist, but defensive).
+    const existing = disconnectGraceTimers.get(uid);
+    if (existing) clearTimeout(existing);
+
+    logger.info('[WebSocket] Last socket for user gone — scheduling cleanup', {
+      userId: uid.substring(0, 8) + '...',
+      graceMs: DISCONNECT_GRACE_MS,
+    });
+
+    const timer = setTimeout(() => {
+      disconnectGraceTimers.delete(uid);
+      void performDisconnectCleanup(uid);
+    }, DISCONNECT_GRACE_MS);
+
+    disconnectGraceTimers.set(uid, timer);
   });
 
   // Handle errors

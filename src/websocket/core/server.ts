@@ -9,11 +9,22 @@ import { Server as HTTPServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import { handleConnection } from '../handlers/connection.handler';
 import { authenticateSocket } from '../middleware/middleware';
+import { refreshIdle } from '@/services/mobile/mobile-idle.service';
 import {
   ClientToServerEvents,
   ServerToClientEvents,
   SocketData,
 } from '../types/types';
+
+/**
+ * Events that are background/heartbeat traffic and should NOT count as
+ * "user activity" for the mobile-editor idle timer. The latency `ping`
+ * fires every 10s from the frontend while a preview session is open;
+ * counting it as activity would prevent the idle timer from ever firing.
+ */
+const IDLE_BACKGROUND_EVENTS = new Set<string>([
+  'ping', // app-level latency probe — see socketClient.startLatencyPing()
+]);
 
 let io: SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData> | null = null;
 
@@ -82,12 +93,13 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
         methods: ['GET', 'POST'],
       },
       // Connection options
-      // ⚠️ CRITICAL: pingInterval affects polling frequency
-      // - Lower value = more frequent HTTP requests when using polling
-      // - Higher value = fewer requests but slower to detect dead connections
-      // - 60s is a good balance: ~1 request/minute with polling, still detects dead connections quickly
-      pingTimeout: 120000, // 120 seconds - time to wait for pong before considering connection dead
-      pingInterval: 60000, // 60 seconds - interval between pings (was 25s, too frequent for polling)
+      // ⚠️ pingInterval affects polling frequency. Lower = more requests
+      // (~6/min/client) but faster dead-connection detection (~10–20s).
+      // We need fast detection so the editor's session-cleanup logic
+      // (Fix A: destroy mobile emulator on browser close, with 15s grace)
+      // and the per-user idle timer reach the user promptly.
+      pingTimeout: 10000, // 10s — disconnect window after a missed pong
+      pingInterval: 10000, // 10s — heartbeat cadence
       connectTimeout: 45000, // 45 seconds
       // Transport options
       // Order matters: first transport is preferred
@@ -143,6 +155,24 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
         from: transport,
         to: upgradedTo,
       });
+    });
+
+    // Per-socket activity middleware: any inbound event from this user
+    // refreshes the mobile-editor idle timer — except for background
+    // heartbeats. The frontend's `startLatencyPing()` sends `ping` every
+    // 10s while a preview session is active, which would otherwise reset
+    // the timer indefinitely and the idle expiry would never fire.
+    // See `services/mobile/mobile-idle.service.ts`.
+    socket.use(([event], next) => {
+      const userId = socket.data?.userId;
+      if (userId && !IDLE_BACKGROUND_EVENTS.has(event)) {
+        refreshIdle(
+          userId,
+          io as SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData>,
+          `socket-event:${event}`,
+        );
+      }
+      next();
     });
 
     // Handle async connection handler
