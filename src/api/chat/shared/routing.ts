@@ -96,7 +96,7 @@ export async function routeToHandler(
 function getRoutingMessage(intent: string): string {
   switch (intent) {
     case 'general_chat':
-      return 'Connecting to assistant...';
+      return 'Thinking...';
     case 'platform_test':
       return 'Preparing test environment...';
     case 'api_test':
