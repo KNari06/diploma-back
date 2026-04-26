@@ -14,7 +14,6 @@
  *   Steps: numbered with optional attachments
  */
 
-import { promises as fs } from 'fs';
 import { PDFParse } from 'pdf-parse';
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
@@ -121,8 +120,7 @@ Extract any Jira issue keys (e.g. MFT-1003, MGOSAPP-4268) and convert to full UR
 // Text extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function extractPdfText(filePath: string): Promise<string> {
-  const buffer = await fs.readFile(filePath);
+async function extractPdfText(buffer: Buffer): Promise<string> {
   const parser = new PDFParse({ data: new Uint8Array(buffer) });
   const result = await parser.getText();
   return result.text ?? '';
@@ -257,11 +255,11 @@ export interface PdfParseResult {
 /**
  * Parse an Allure TestOps PDF export into structured test cases using LLM.
  *
- * @param pdfFilePath - Path to the PDF file on disk
- * @param onProgress  - Optional callback for progress updates
+ * @param pdfBuffer  - PDF file contents as a Buffer
+ * @param onProgress - Optional callback for progress updates
  */
 export async function parseAllurePdf(
-  pdfFilePath: string,
+  pdfBuffer: Buffer,
   onProgress?: (current: number, total: number) => void,
 ): Promise<PdfParseResult> {
   const result: PdfParseResult = { testCases: [], errors: [] };
@@ -269,7 +267,7 @@ export async function parseAllurePdf(
   // 1. Extract text from PDF
   let fullText: string;
   try {
-    fullText = await extractPdfText(pdfFilePath);
+    fullText = await extractPdfText(pdfBuffer);
   } catch (err) {
     const msg = `PDF text extraction failed: ${err instanceof Error ? err.message : String(err)}`;
     logger.error('[AllurePdfParser] ' + msg);
