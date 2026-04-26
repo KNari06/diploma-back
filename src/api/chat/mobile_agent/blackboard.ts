@@ -70,6 +70,14 @@ export class MobileBlackboard {
   // agent can't blow up JSONB row size.
   private readonly reasoningTrace: ReasoningEntry[] = [];
 
+  // ── WebView context (Phase 8) ─────────────────────────────────────
+  // Tracks whether the runner session is currently in NATIVE (default)
+  // or WEB context. Mutated by switch_to_webview / switch_to_native
+  // tools. Read by action tools so they know whether to dispatch a
+  // native command or a web_* command on the runner.
+  private webContext: 'NATIVE' | 'WEB' = 'NATIVE';
+  private webContextUrl: string | undefined;
+
   constructor(init: {
     goal: string;
     mobileSessionId: string;
@@ -143,6 +151,36 @@ export class MobileBlackboard {
 
   getReasoningTrace(): readonly ReasoningEntry[] {
     return this.reasoningTrace;
+  }
+
+  // ── WebView context (Phase 8) ────────────────────────────────────
+
+  getWebContext(): 'NATIVE' | 'WEB' {
+    return this.webContext;
+  }
+
+  /** URL of the active WebView, when known. Set when entering WEB. */
+  getWebContextUrl(): string | undefined {
+    return this.webContextUrl;
+  }
+
+  /**
+   * Move into WEB context. Idempotent: re-calling with the same url
+   * just updates the recorded url.
+   */
+  enterWebContext(url?: string): void {
+    this.webContext = 'WEB';
+    this.webContextUrl = url;
+    // The screen we cached pre-switch is now stale (a11y tree was
+    // native, future observe should hit the DOM). Drop it.
+    this.invalidateSnapshot();
+  }
+
+  /** Move back to NATIVE context. Idempotent. */
+  exitWebContext(): void {
+    this.webContext = 'NATIVE';
+    this.webContextUrl = undefined;
+    this.invalidateSnapshot();
   }
 
   // ── Plan state (phase 5) ──────────────────────────────────────────

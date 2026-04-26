@@ -204,6 +204,28 @@ export async function parseIntent(
       ? context
       : null;
 
+  // Defensive check: if the frontend signals "user is in the mobile editor"
+  // (mobileEditorMode=true) but forgets the mobileSessionId, the classifier
+  // will silently fall through to general_chat and the entire mobile_agent
+  // pipeline never activates. This is the #1 production bug we hit during
+  // the Phase 8 audit. Warn loudly so it's visible in logs and add a
+  // breadcrumb to the eventual chat reply so frontend devs see the cause.
+  // We do NOT throw — backward compat with old frontends that may set the
+  // flag without the id during a transitional rollout.
+  const mobileEditorBug =
+    contextObj?.mobileEditorMode === true && !contextObj?.mobileSessionId;
+  if (mobileEditorBug) {
+    logger.warn(
+      '[CHAT] mobileEditorMode=true but mobileSessionId missing — ' +
+        'mobile_agent classifier will not activate. Frontend bug.',
+      {
+        userId,
+        chatSessionId,
+        contextKeys: Object.keys(contextObj as Record<string, unknown>),
+      },
+    );
+  }
+
   const isExplicitApiTest =
     validMessage.startsWith(FAST_PATH_COMMANDS.API_TEST_PREFIX) ||
     contextObj?.action === FAST_PATH_COMMANDS.ACTIONS.RUN_API_TEST;

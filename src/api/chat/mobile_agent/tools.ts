@@ -250,6 +250,123 @@ const LAUNCH_APP_TOOL: ChatCompletionTool = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
+// WebView tools (Phase 8). For hybrid apps (Capacitor / Cordova / Ionic /
+// React-Native WebView / Flutter InAppWebView) and native apps that
+// embed an OAuth or payment WebView. The runner already has full CDP
+// (Android) and WDA-WebView (iOS) executors; these tools surface that
+// power to the LLM.
+//
+// Workflow:
+//   1. switch_to_webview — runner connects CDP / WDA-WebView, future
+//      observe / tap / type calls target the DOM, not the native a11y
+//      tree. List candidates first via list_webview_contexts when more
+//      than one WebView is on screen.
+//   2. tap_element / type_text continue to work the same way — the runner
+//      auto-routes to dispatchWeb() once the session is in WEB context.
+//   3. switch_to_native — return to UIAutomator / WDA when done with the
+//      web flow. The action tools route back to native automatically.
+//   4. web_evaluate — escape hatch for assertions ("page contains 'Welcome'")
+//      or for grabbing a hidden form value.
+//
+// Requires Android apps to be DEBUG-built (or compiled with
+// `setWebContentsDebuggingEnabled(true)`); iOS Simulator works as-is.
+// Production-signed Android APKs cannot expose the CDP socket and the
+// runner pre-flight check returns a clear error in that case.
+// ─────────────────────────────────────────────────────────────────────────
+
+const LIST_WEBVIEW_CONTEXTS_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'list_webview_contexts',
+    description:
+      'List the WebView contexts currently visible on the device. Returns ' +
+      'each context’s id, url, title, and (best-effort) framework hint ' +
+      '(capacitor / cordova / ionic / rn-webview / flutter-iaw / unknown). ' +
+      'Call before `switch_to_webview` when the screen has more than one ' +
+      'WebView (e.g. parent app + embedded payment iframe). Read-only.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+};
+
+const SWITCH_TO_WEBVIEW_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'switch_to_webview',
+    description:
+      'Switch the session into WebView (DOM) context. After this, ' +
+      '`observe_mobile_page` returns the HTML tree and `tap_element` / ' +
+      '`type_text` operate on DOM elements. Always pair with ' +
+      '`switch_to_native` once the web flow is done so subsequent native ' +
+      'taps work. On Android the app must be a debug build (' +
+      '`setWebContentsDebuggingEnabled(true)`); production APKs return an ' +
+      'error.',
+    parameters: {
+      type: 'object',
+      properties: {
+        contextId: {
+          type: 'string',
+          description:
+            'Optional. The id from `list_webview_contexts`. Omit to let the ' +
+            'runner pick the most-likely-foreground WebView. Useful when ' +
+            'multiple WebViews are visible.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+};
+
+const SWITCH_TO_NATIVE_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'switch_to_native',
+    description:
+      'Switch the session back to the native a11y tree (UIAutomator / WDA). ' +
+      'Idempotent — safe to call when already in native context. Always ' +
+      'call after a WebView flow before returning control to the user, so ' +
+      'the next message defaults to the native screen the user expects.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+};
+
+const WEB_EVALUATE_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'web_evaluate',
+    description:
+      'Run a JavaScript expression in the active WebView and return the ' +
+      'result (must be JSON-serialisable). Use for assertions ("does ' +
+      'document.title contain X?") and for reading hidden form values. ' +
+      'NEVER use to type passwords or other secrets — those go through ' +
+      '`type_text` with isSensitive=true. Requires switch_to_webview first.',
+    parameters: {
+      type: 'object',
+      properties: {
+        expression: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 1000,
+          description:
+            'A JavaScript expression. Examples: "document.title", ' +
+            '"document.querySelectorAll(\'.error\').length", ' +
+            '"!!document.querySelector(\'#welcome-banner\')".',
+        },
+      },
+      required: ['expression'],
+      additionalProperties: false,
+    },
+  },
+};
+
 // Planning tools (Phase 5). `plan_flow` produces a FlowPlan and stores it
 // in the blackboard. `start_plan_step` / `finish_plan_step` let the LLM
 // walk the plan explicitly — the executor knows what's in progress, what
@@ -521,6 +638,14 @@ export const MOBILE_AGENT_TOOLS: ChatCompletionTool[] = [
   THINK_ALOUD_TOOL,
   MOBILE_RUN_DRAFT_STEPS_TOOL,
   MOBILE_CREATE_TEST_CASE_TOOL,
+  // WebView (Phase 8) — only relevant for hybrid apps; native flows
+  // never call them. Listing them at the bottom keeps the prompt cache
+  // stable for native-only sessions while still giving the LLM access
+  // when an `android.webkit.WebView` / `WKWebView` is on the screen.
+  LIST_WEBVIEW_CONTEXTS_TOOL,
+  SWITCH_TO_WEBVIEW_TOOL,
+  SWITCH_TO_NATIVE_TOOL,
+  WEB_EVALUATE_TOOL,
 ];
 
 /**
@@ -589,6 +714,14 @@ export async function executeTool(
         return await runMobileRunDraftSteps(args, bb, opts);
       case 'mobile_create_test_case':
         return await runMobileCreateTestCase(args, bb, opts);
+      case 'list_webview_contexts':
+        return await runListWebviewContexts(args, bb, opts);
+      case 'switch_to_webview':
+        return await runSwitchToWebview(args, bb, opts);
+      case 'switch_to_native':
+        return await runSwitchToNative(args, bb, opts);
+      case 'web_evaluate':
+        return await runWebEvaluate(args, bb, opts);
       default:
         logger.warn('[MOBILE_TOOLS] Unknown tool', { name });
         return {
@@ -1197,6 +1330,10 @@ const ACCEPTED_STEP_TYPES = new Set<string>([
   // runner aliases that toRunnerCommand maps explicitly
   'tap', 'type_text', 'input_text', 'press_key', 'launch_app',
   'assert_visible', 'assert_text', 'permission_dialog',
+  // WebView authoring (Phase 8) — these can appear in saved test cases.
+  'switch_context',
+  'web_navigate', 'web_click', 'web_type', 'web_evaluate',
+  'web_assert_element', 'web_assert_text', 'web_get_url', 'web_screenshot',
 ]);
 
 /**
@@ -1686,6 +1823,87 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
       };
     }
 
+    // ── WebView (Phase 8) ────────────────────────────────────────────
+    // Saved test cases recorded in WebView context store these step
+    // types in steps_json; replay maps them back to runner commands.
+    case 'switch_context': {
+      // The LLM authoring path uses our switch_to_webview / switch_to_native
+      // tools, which never emit a `switch_context` step. But pre-existing
+      // test cases (from explorer / manual recording) might. Honour both.
+      const opts = step.options as { context?: 'NATIVE' | 'WEB'; target?: string } | undefined;
+      const ctx: 'NATIVE' | 'WEB' =
+        opts?.context === 'WEB' || opts?.context === 'NATIVE'
+          ? opts.context
+          : step.value === 'WEB' || step.description?.toLowerCase().includes('web')
+          ? 'WEB'
+          : 'NATIVE';
+      return { type: 'switch_context', params: { context: ctx } };
+    }
+
+    case 'web_navigate':
+      return {
+        type: 'web_navigate',
+        params: { url: step.value ?? step.description },
+      };
+
+    case 'web_click':
+      return {
+        type: 'web_click',
+        // Storage convention: a CSS selector lives in `bindingHints.selector`
+        // when the step was authored, falling back to description as a
+        // selector-shaped string when the LLM emits `web_click` directly.
+        params: {
+          selector:
+            (step.bindingHints as { selector?: string } | undefined)?.selector ??
+            step.description,
+        },
+      };
+
+    case 'web_type':
+      return {
+        type: 'web_type',
+        params: {
+          selector:
+            (step.bindingHints as { selector?: string } | undefined)?.selector ??
+            step.description,
+          text: step.value ?? '',
+          clearFirst: true,
+        },
+      };
+
+    case 'web_evaluate':
+      return {
+        type: 'web_evaluate',
+        params: { expression: step.value ?? step.description },
+      };
+
+    case 'web_assert_element':
+      return {
+        type: 'web_assert_element',
+        params: {
+          selector:
+            (step.bindingHints as { selector?: string } | undefined)?.selector ??
+            step.description,
+        },
+      };
+
+    case 'web_assert_text':
+      return {
+        type: 'web_assert_text',
+        params: {
+          selector:
+            (step.bindingHints as { selector?: string } | undefined)?.selector ??
+            step.description,
+          expectedText: step.assertionText ?? step.value ?? '',
+        },
+      };
+
+    case 'web_get_url':
+      return { type: 'web_get_url', params: {} };
+
+    case 'web_screenshot':
+      return { type: 'web_screenshot', params: {} };
+
     default:
       // Unknown — let the runner reject it. Don't silently drop.
       return { type, params: { intent: step.description } };
@@ -1823,6 +2041,308 @@ async function resolveProjectId(bb: MobileBlackboard): Promise<string | null> {
       error: err instanceof Error ? err.message : String(err),
     });
     return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEBVIEW TOOLS (Phase 8)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Best-effort WebView listing. The runner doesn't expose a dedicated
+ * "list contexts" endpoint yet — discovery happens implicitly when we
+ * call switch_context. So this tool's job is informational: tell the
+ * LLM whether the current screen looks like it has a WebView and which
+ * framework, based on the existing native a11y snapshot.
+ *
+ * Heuristic:
+ *   - If the cached snapshot has `android.webkit.WebView` or
+ *     `WKWebView` in its formatted tree → at least one WebView is
+ *     visible.
+ *   - The runner's `webview-hybrid-hint.ts` already detects framework
+ *     (capacitor / cordova / rn-webview / flutter-iaw / unknown) — but
+ *     it runs server-side during resolve. We don't expose that state
+ *     here; for the LLM, "framework: unknown" is the correct default.
+ *
+ * For multi-WebView screens (parent app + payment iframe) the runner
+ * will pick the foreground WebView when switch_to_webview is called
+ * without contextId. A real list endpoint is a future enhancement.
+ */
+async function runListWebviewContexts(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  _opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const snap = bb.getSnapshot();
+  if (!snap) {
+    return {
+      ok: false,
+      content:
+        'No screen snapshot yet — call observe_mobile_page first, then check for WebViews.',
+    };
+  }
+
+  // Quick textual scan — the runner's full webview-hybrid-hint detection
+  // requires the raw a11y tree (we only have the formatted string here).
+  // This is conservative: false negatives possible if the tree was
+  // truncated, but we never claim a WebView exists when it doesn't.
+  const tree = snap.formattedTree ?? '';
+  const hasAndroidWebView = /android\.webkit\.WebView/i.test(tree);
+  const hasIosWebView = /WKWebView|XCUIElementTypeWebView/i.test(tree);
+  const detected = hasAndroidWebView || hasIosWebView;
+
+  bb.recordToolCall({
+    tool: 'list_webview_contexts',
+    args: {},
+    ok: true,
+    durationMs: 0,
+    at: Date.now(),
+  });
+
+  if (!detected) {
+    return {
+      ok: true,
+      content:
+        'No WebView detected in the current screen. If the user expects ' +
+        'one, observe_mobile_page again — it may have just appeared.',
+      data: { contexts: [] },
+    };
+  }
+
+  // Heuristic: count distinct `android.webkit.WebView` / `WKWebView`
+  // node lines in the formatted tree. Each line is one node, so 2+
+  // matches usually means 2+ WebView containers visible. False
+  // positives possible (a node listed under multiple classnames) but
+  // the signal is good enough to surface "you might have multiple"
+  // hint to the LLM. The runner's authoritative count comes through
+  // when web_click / web_type actually fails (see dispatchWeb in
+  // mobile-runner.ts) — that path attaches the real socket / context
+  // count to the error message.
+  const androidMatches = tree.match(/android\.webkit\.WebView/gi)?.length ?? 0;
+  const iosMatches = tree.match(/WKWebView|XCUIElementTypeWebView/gi)?.length ?? 0;
+  const matchCount = Math.max(androidMatches, iosMatches);
+  const possiblyMultiple = matchCount > 1;
+
+  const platform = snap.platform;
+  return {
+    ok: true,
+    content:
+      `WebView detected on the ${platform} screen` +
+      (possiblyMultiple
+        ? ` (${matchCount} possible candidates — main app plus modal / overlay).`
+        : '.') +
+      ` Call switch_to_webview to enter it; the runner picks the foreground ` +
+      `WebView automatically. Once inside, observe_mobile_page returns the DOM ` +
+      `and tap_element / type_text operate on HTML elements.` +
+      (possiblyMultiple
+        ? '\nIf the auto-picked WebView returns "element not found", the runner ' +
+          'will tell you how many other WebViews are available — at that point ' +
+          'ask the user which one to target (e.g. "main app" vs "payment overlay").'
+        : '') +
+      (platform === 'android'
+        ? '\nNote: Android requires a debug build (setWebContentsDebuggingEnabled(true)) — production APKs cannot be inspected.'
+        : ''),
+    data: {
+      contexts: [
+        {
+          id: 'foreground',
+          platform,
+          framework: 'unknown',
+          possiblyMultiple,
+          treeCandidateCount: matchCount,
+        },
+      ],
+    },
+  };
+}
+
+async function runSwitchToWebview(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const startedAt = Date.now();
+  if (bb.getWebContext() === 'WEB') {
+    return {
+      ok: true,
+      content: 'Already in WebView context. Use observe_mobile_page to read the DOM.',
+    };
+  }
+
+  const client = getMobileRunnerClient();
+  try {
+    // The runner accepts `switch_context({context: 'WEB'})` — pre-Phase-8
+    // it threw "unknown command" because the schema rejected it; the
+    // schema patch in command.schema.ts opens the gate.
+    await client.executeBatchCommands(
+      bb.mobileSessionId,
+      [{ type: 'switch_context', params: { context: 'WEB' } }],
+      { interactive: false, signal: opts?.abortSignal },
+    );
+    bb.enterWebContext();
+
+    // Best-effort URL probe so the LLM has something to anchor on. Failure
+    // here is non-fatal — switch already succeeded.
+    let url: string | undefined;
+    try {
+      const { results } = await client.executeBatchCommands(
+        bb.mobileSessionId,
+        [{ type: 'web_get_url', params: {} }],
+        { interactive: true, signal: opts?.abortSignal },
+      );
+      const first = results?.[0] as { data?: { url?: string } } | undefined;
+      url = first?.data?.url;
+      if (url) bb.enterWebContext(url); // refresh stored url
+    } catch {
+      // ignore
+    }
+
+    bb.recordToolCall({
+      tool: 'switch_to_webview',
+      args: {},
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    return {
+      ok: true,
+      content:
+        `Switched to WebView context.${url ? ` Current URL: ${url}.` : ''} ` +
+        `observe_mobile_page now returns the DOM; tap_element / type_text ` +
+        `operate on HTML elements.`,
+    };
+  } catch (err) {
+    bb.recordToolCall({
+      tool: 'switch_to_webview',
+      args: {},
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    if (err instanceof MobileRunnerError) {
+      // Runner pre-flight returns a specific message when the WebView
+      // exists but isn't debuggable — pass it through verbatim so the
+      // LLM can tell the user to rebuild as debug.
+      return { ok: false, content: `Could not enter WebView: ${err.message}` };
+    }
+    return {
+      ok: false,
+      content: `Could not enter WebView: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+async function runSwitchToNative(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const startedAt = Date.now();
+  if (bb.getWebContext() === 'NATIVE') {
+    return {
+      ok: true,
+      content: 'Already in native context.',
+    };
+  }
+
+  const client = getMobileRunnerClient();
+  try {
+    await client.executeBatchCommands(
+      bb.mobileSessionId,
+      [{ type: 'switch_context', params: { context: 'NATIVE' } }],
+      { interactive: false, signal: opts?.abortSignal },
+    );
+    bb.exitWebContext();
+    bb.recordToolCall({
+      tool: 'switch_to_native',
+      args: {},
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    return {
+      ok: true,
+      content:
+        'Switched back to native context. observe_mobile_page returns the ' +
+        'native a11y tree; tap_element / type_text operate on UI elements.',
+    };
+  } catch (err) {
+    bb.recordToolCall({
+      tool: 'switch_to_native',
+      args: {},
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    return {
+      ok: false,
+      content: `Could not return to native: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+async function runWebEvaluate(
+  args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const expression = requireString(args, 'expression');
+  if (!expression) {
+    return { ok: false, content: 'web_evaluate requires `expression`.' };
+  }
+  if (bb.getWebContext() !== 'WEB') {
+    return {
+      ok: false,
+      content: 'web_evaluate requires WebView context. Call switch_to_webview first.',
+    };
+  }
+
+  const startedAt = Date.now();
+  const client = getMobileRunnerClient();
+  try {
+    const { results } = await client.executeBatchCommands(
+      bb.mobileSessionId,
+      [{ type: 'web_evaluate', params: { expression } }],
+      { interactive: true, signal: opts?.abortSignal },
+    );
+    const first = results?.[0] as
+      | { success?: boolean; data?: { result?: unknown }; error?: string }
+      | undefined;
+    bb.recordToolCall({
+      tool: 'web_evaluate',
+      args: { expressionPreview: expression.slice(0, 80) },
+      ok: !!first?.success,
+      error: first?.success ? undefined : first?.error,
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    if (!first?.success) {
+      return {
+        ok: false,
+        content: `web_evaluate failed: ${first?.error ?? 'unknown error'}`,
+      };
+    }
+    const value = first.data?.result;
+    return {
+      ok: true,
+      content: `Result: ${JSON.stringify(value)}`,
+      data: value,
+    };
+  } catch (err) {
+    bb.recordToolCall({
+      tool: 'web_evaluate',
+      args: { expressionPreview: expression.slice(0, 80) },
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      durationMs: Date.now() - startedAt,
+      at: startedAt,
+    });
+    return {
+      ok: false,
+      content: `web_evaluate threw: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
