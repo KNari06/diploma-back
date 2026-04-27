@@ -30,6 +30,27 @@ const EDITOR_LOGS_DIR = path.join(process.cwd(), 'test_logs', 'editor');
 const EDITOR_MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB per editor session
 const EDITOR_MAX_PAYLOAD_CHARS = 10_000;
 
+/**
+ * String.slice cuts at UTF-16 code unit boundaries, which splits
+ * surrogate pairs when an emoji (🤝, U+1F91D = 🤝) sits
+ * astride the slice index. The resulting JSON contains a lone high
+ * surrogate that breaks every JSON parser downstream (jq, json.loads).
+ * This helper trims one extra code unit when the boundary lands on
+ * a high surrogate so the pair stays intact (or both halves get cut).
+ *
+ * Bug reproduction (2026-04-27): a 14-line trace turned unreadable
+ * because writeElementResolution sliced an LLM prompt containing 🤝
+ * exactly on the surrogate boundary — `\uD83E` survived alone.
+ */
+function safeSlice(s: string, max: number): string {
+  if (typeof s !== 'string' || s.length <= max) return s;
+  let end = max;
+  // If we'd cut between surrogates, drop the orphan high surrogate too.
+  const code = s.charCodeAt(end - 1);
+  if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+  return s.slice(0, end);
+}
+
 /** Active writers indexed by previewSessionId */
 const activeWriters = new Map<string, EditorTraceService>();
 
@@ -55,7 +76,7 @@ function summarizeRuleTrace(trace: RuleTraceEntry[]): Array<{
       grouped.set(key, {
         action: entry.action,
         refs: [...entry.affectedRefs],
-        sample: entry.evidence.slice(0, 120),
+        sample: safeSlice(entry.evidence, 120),
       });
     }
   }
@@ -489,7 +510,7 @@ export class EditorTraceService {
       type: n.type || undefined,
       label: n.labelText || undefined,
       ariaLabel: n.ariaLabel || undefined,
-      text: n.text ? n.text.slice(0, 60) : undefined,
+      text: n.text ? safeSlice(n.text, 60) : undefined,
       placeholder: n.placeholder || undefined,
       isVisible: n.isVisible,
       isDisabled: n.isDisabled || undefined,
@@ -531,8 +552,8 @@ export class EditorTraceService {
           model: data.result._llmTrace.model,
           path: data.result._llmTrace.path,
           latencyMs: data.result._llmTrace.latencyMs,
-          prompt: data.result._llmTrace.prompt.slice(0, 2000),
-          response: data.result._llmTrace.response.slice(0, 500),
+          prompt: safeSlice(data.result._llmTrace.prompt, 2000),
+          response: safeSlice(data.result._llmTrace.response, 500),
         }
       : undefined;
 
@@ -938,7 +959,7 @@ export class EditorTraceService {
       if (data.type === 'type' || data.type === 'fill') {
         safeValue = `[redacted len=${data.value.length}]`;
       } else {
-        safeValue = data.value.slice(0, 200);
+        safeValue = safeSlice(data.value, 200);
       }
     }
     // Same redaction policy for any value that crept into options.
@@ -953,9 +974,9 @@ export class EditorTraceService {
       eventType: 'step_meta',
       payload: {
         ...data,
-        description: typeof data.description === 'string' ? data.description.slice(0, 200) : '',
+        description: typeof data.description === 'string' ? safeSlice(data.description, 200) : '',
         value: safeValue,
-        targetText: typeof data.targetText === 'string' ? data.targetText.slice(0, 200) : data.targetText,
+        targetText: typeof data.targetText === 'string' ? safeSlice(data.targetText, 200) : data.targetText,
         options: safeOptions,
       },
     });
@@ -982,7 +1003,7 @@ export class EditorTraceService {
       payload: {
         ...data,
         activeModalText: typeof data.activeModalText === 'string'
-          ? data.activeModalText.slice(0, 150) : data.activeModalText,
+          ? safeSlice(data.activeModalText, 150) : data.activeModalText,
       },
     });
   }
@@ -1085,7 +1106,7 @@ export class EditorTraceService {
               ref: c.ref,
               score: c.score,
               role: c.role,
-              text: typeof c.text === 'string' ? c.text.slice(0, 80) : c.text,
+              text: typeof c.text === 'string' ? safeSlice(c.text, 80) : c.text,
             }))
           : undefined,
       },
@@ -1148,8 +1169,8 @@ export class EditorTraceService {
       eventType: 'caught_error',
       payload: {
         ...data,
-        message: typeof data.message === 'string' ? data.message.slice(0, 500) : '',
-        stack: typeof data.stack === 'string' ? data.stack.slice(0, 800) : data.stack,
+        message: typeof data.message === 'string' ? safeSlice(data.message, 500) : '',
+        stack: typeof data.stack === 'string' ? safeSlice(data.stack, 800) : data.stack,
       },
     });
   }
