@@ -381,6 +381,60 @@ interface InternalSession extends PreviewSession {
      */
     recordedFingerprint?: TargetFingerprint;
   } | null;
+  /**
+   * V22 Pkg8: Field Session — captures the user's *intent* to fill a form
+   * field as ONE logical step, regardless of how many physical events
+   * (typing, backspace, arrow keys, mid-string edits, copy-paste) the user
+   * generates inside the field.
+   *
+   * Why exist alongside recordingTypingBuffer:
+   *   - The legacy buffer model coalesces letter-by-letter and patches
+   *     edge-cases via per-key absorption (backspace trims last char,
+   *     arrow keys fall through to press-coalesce). This model BREAKS
+   *     whenever the user navigates the cursor into the middle of the
+   *     value and edits there — we end up with 8+ steps in the trace
+   *     and the Type step's value drifts from the real <input>.value.
+   *   - Field Session treats the focus span as a single editing transaction.
+   *     Internal events are absorbed; on close (blur / focus-shift /
+   *     submit / nav) we read the LIVE input.value and emit ONE Type
+   *     step with the canonical final value. Single source of truth.
+   *
+   * Lifecycle:
+   *   open  — focus enters an interactive form control while recording
+   *   live  — internal events (key, arrow, backspace, paste) absorbed
+   *   close — focus shift / blur / submit / nav / recording stop →
+   *           read live value, emit Type step (or remove if value
+   *           reverted to initial), clear session
+   */
+  recordingFieldSession?: {
+    /** data-agent-ref of the focused control (anchors live-value re-read). */
+    elementRef: string;
+    /** Probed label for description ("Phone", "Email", etc). */
+    elementLabel: string;
+    /** Probed tag (input/textarea/select). Used for value-read strategy. */
+    elementTag: string;
+    /** Type attr (text/number/email/password/...) — controls placeholder vs value masking. */
+    elementType?: string;
+    /** True for textarea / contenteditable — value reads via .value vs .textContent. */
+    isMultiline?: boolean;
+    /** initial input.value at session open — diff against final to detect no-op. */
+    initialValue: string;
+    /** monotonic ts of session open — for stale-session timeout safety. */
+    startedAt: number;
+    /** Page URL at open — guards cross-navigation false-merges. */
+    pageUrl: string;
+    /** Iframe selector if the input lives in a child frame. */
+    iframeSelector?: string;
+    /** Full fingerprint of the focused control — flows into recorded step. */
+    recordedFingerprint?: TargetFingerprint;
+    /** Pre-built BindingHints (semantic locator hints). Captured at open time
+     *  via RecordingCaptureService.buildBindingHints so close-time emission
+     *  doesn't need to re-probe. Distinct from recordedFingerprint (raw shape). */
+    bindingHints?: Record<string, unknown>;
+    /** Step ID emitted for THIS session — reused when session value
+     *  re-emits on subsequent updates (`step:update`). Set after first emit. */
+    emittedStepId?: string;
+  } | null;
   recordingLastUrl: string;
   /** V10: Drag state tracked between mouse:down and mouse:up */
   recordingDragState: {
@@ -2410,6 +2464,8 @@ export class PreviewSessionService {
       session.recordingLastHover = null;
       // V22 Pkg5+: clear hover chain on recording stop too.
       session.recordingHoverChain = [];
+      // V22 Pkg8: clear field session on recording stop.
+      session.recordingFieldSession = null;
       session.recordingLastStepEmittedAt = undefined;
       session.recordingStepCount = 0;
     }
@@ -2473,6 +2529,51 @@ export class PreviewSessionService {
   setRecordingBuffer(sessionId: string, userId: string, buffer: InternalSession['recordingTypingBuffer']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingTypingBuffer = buffer;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V22 Pkg8: Field Session — focus-span editing transaction
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Read the active field session (or null when none open). */
+  getRecordingFieldSession(
+    sessionId: string,
+    userId?: string,
+  ): NonNullable<InternalSession['recordingFieldSession']> | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingFieldSession ?? null;
+  }
+
+  /**
+   * Open a new field session. Caller is responsible for closing any
+   * previous session BEFORE calling this (handler does close → emit step
+   * → open new). Idempotent for the same elementRef — overwriting with
+   * identical ref is a no-op (caller should detect & skip).
+   */
+  setRecordingFieldSession(
+    sessionId: string,
+    userId: string,
+    fs: NonNullable<InternalSession['recordingFieldSession']> | null,
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingFieldSession = fs;
+  }
+
+  /**
+   * Update the emittedStepId on the active field session — called after
+   * the first Type step is emitted, so subsequent live-value re-reads
+   * can dispatch `preview:recording:step:update` with the same id and
+   * merge into the existing list entry instead of stacking duplicates.
+   */
+  setRecordingFieldSessionStepId(
+    sessionId: string,
+    userId: string,
+    stepId: string,
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session?.recordingFieldSession) {
+      session.recordingFieldSession.emittedStepId = stepId;
+    }
   }
 
   /**
