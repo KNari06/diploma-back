@@ -1283,6 +1283,14 @@ export class PreviewRunService {
               targetText: (step as unknown as { targetText?: string }).targetText,
               cssSelector: step.options?.cssSelector,
               iframeSelector: step.options?.iframe?.selector,
+              // For ai_check the assertionText is the actual prompt sent to
+              // the model — without it the trace shows "AI check" with no
+              // hint of what was being verified, and a fail reason only
+              // appears in run_summary. Surface it here so the step is
+              // self-explanatory.
+              assertionText: typeof (step as unknown as { assertionText?: string }).assertionText === 'string'
+                ? (step as unknown as { assertionText: string }).assertionText
+                : undefined,
               hasCompiled: !!step.compiled,
               hasEvidence: !!step.evidence?.lastSuccessRef,
               isManual: isManualStep,

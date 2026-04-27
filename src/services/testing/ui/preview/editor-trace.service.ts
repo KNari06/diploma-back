@@ -944,6 +944,8 @@ export class EditorTraceService {
     targetText?: string;
     cssSelector?: string;
     iframeSelector?: string;
+    /** Prompt for ai_check — surfaces "what was the AI asked to verify?" */
+    assertionText?: string;
     hasCompiled: boolean;
     hasEvidence: boolean;
     isManual: boolean; // step added in editor (not from recording) — UUID id, no `rec_` prefix
@@ -977,6 +979,7 @@ export class EditorTraceService {
         description: typeof data.description === 'string' ? safeSlice(data.description, 200) : '',
         value: safeValue,
         targetText: typeof data.targetText === 'string' ? safeSlice(data.targetText, 200) : data.targetText,
+        assertionText: typeof data.assertionText === 'string' ? safeSlice(data.assertionText, 500) : data.assertionText,
         options: safeOptions,
       },
     });

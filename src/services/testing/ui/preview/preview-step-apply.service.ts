@@ -2891,6 +2891,20 @@ export class PreviewStepApplyService {
           // Hoist `assertionText` so TS narrowing isn't lost across the closure.
           const _assertionText = stepDraft.assertionText as string;
           const _pageUrl = page.url();
+
+          // Editor trace: ai_check is a separate code path that bypasses
+          // executeAction, so it never emits action_attempt / action_result /
+          // llm_request_*. Without these events the step is invisible in
+          // the trace (only run_summary records the final pass/fail). Bracket
+          // the call ourselves so reading the JSONL tells the full story.
+          const aiCheckStartedAt = Date.now();
+          try {
+            EditorTraceService.get(previewSessionId)?.writeLlmRequestStart({
+              stepId: stepDraft.id,
+              purpose: 'diagnosis',
+            });
+          } catch { /* non-fatal */ }
+
           const aiCheckResult = await Promise.resolve(
             withAIContext(
               {
@@ -2912,6 +2926,25 @@ export class PreviewStepApplyService {
                 }),
             ),
           );
+
+          try {
+            const aiCheckTrace = EditorTraceService.get(previewSessionId);
+            aiCheckTrace?.writeLlmRequestEnd({
+              stepId: stepDraft.id,
+              purpose: 'diagnosis',
+              durationMs: Date.now() - aiCheckStartedAt,
+              success: aiCheckResult.pass,
+              confidence: aiCheckResult.confidence,
+              ...(aiCheckResult.pass ? {} : { errorReason: (aiCheckResult.explanation || '').slice(0, 200) }),
+            });
+            aiCheckTrace?.writeActionResult({
+              stepId: stepDraft.id,
+              stepType: stepDraft.type,
+              success: aiCheckResult.pass,
+              durationMs: Date.now() - aiCheckStartedAt,
+              ...(aiCheckResult.pass ? {} : { error: (aiCheckResult.explanation || 'ai_check failed').slice(0, 200) }),
+            });
+          } catch { /* non-fatal */ }
 
           logger.info('[PREVIEW_APPLY] ai_check evaluation completed', {
             previewSessionId,
