@@ -12,6 +12,7 @@
  * - Routes events to appropriate WebSocket emit methods
  */
 
+import { aiLogBuffer } from '@/services/ai/logging/ai-log-buffer';
 import { redisWebSocketBridge } from '@/services/websocket/redis-bridge.service';
 import { logger } from '@/utils/core/logger';
 import { webSocketService } from '../core/websocket.service';
@@ -130,6 +131,20 @@ class WebSocketRedisSubscriber {
 
         case 'ai:bug:found':
           wsService.emitAIBugFound(payload.testId, payload);
+          break;
+
+        // AI action log (one row per LLM call) — published from worker processes.
+        // Also ingest into the API process's in-memory buffer so the GET
+        // /api/v1/ai-logs backfill returns worker-emitted entries too.
+        case 'ai:log:new':
+          if (payload && typeof payload === 'object' && payload.id && payload.user_id) {
+            aiLogBuffer.pushExisting(payload);
+          }
+          if (target?.userId) {
+            wsService.emitToUser(target.userId, 'ai:log:new', payload);
+          } else if (payload?.user_id) {
+            wsService.emitToUser(payload.user_id, 'ai:log:new', payload);
+          }
           break;
 
         // Chat events

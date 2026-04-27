@@ -6,6 +6,8 @@ export interface AuthUser {
   role: string;
   status?: string;
   avatar?: string;
+  /** When true, user can see the AI/system logs FAB and modal. */
+  showLogs?: boolean;
 }
 
 export interface AuthTokens {

@@ -13,6 +13,7 @@ import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
 import { getPreviewSessionService } from './preview-session.service';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
     BindingHints,
     CompiledStepPlan,
@@ -2608,14 +2609,32 @@ export class PreviewStepApplyService {
             }
           }
 
-          // Evaluate AI check
-          const aiCheckResult = await evaluateAiCheck({
-            assertionText: stepDraft.assertionText,
-            url: page.url(),
-            html,
-            a11yTree,
-            screenshotBase64,
-          });
+          // Evaluate AI check — wrap in tracking context so the LLM call shows
+          // up in the user's AI activity feed labelled as 'ai-check'.
+          // Hoist `assertionText` so TS narrowing isn't lost across the closure.
+          const _assertionText = stepDraft.assertionText as string;
+          const _pageUrl = page.url();
+          const aiCheckResult = await Promise.resolve(
+            withAIContext(
+              {
+                workspaceId: '',
+                userId,
+                operationType: 'lite-test',
+                logSource: 'ai-check',
+                logActionType: 'assert',
+                logEntityType: 'test_execution',
+                logEntityId: previewSessionId,
+              },
+              () =>
+                evaluateAiCheck({
+                  assertionText: _assertionText,
+                  url: _pageUrl,
+                  html,
+                  a11yTree,
+                  screenshotBase64,
+                }),
+            ),
+          );
 
           logger.info('[PREVIEW_APPLY] ai_check evaluation completed', {
             previewSessionId,

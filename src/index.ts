@@ -7,6 +7,12 @@ import dashboardRoutes from '@/api/dashboard/dashboard.route';
 import apiConfigRoutes from '@/api/apiConfig/apiConfig.routes';
 import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import apiFlowSpecRoutes from '@/api/apiFlowSpec/apiFlowSpec.route';
+import aiLogsRoutes from '@/api/ai-logs/ai-logs.routes';
+import { initLogBridge } from '@/utils/core/log-bridge';
+
+// Start the cross-process log bridge subscriber so worker/scheduler logs
+// land in this process's ring buffer (and thus the System Logs tab).
+initLogBridge();
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
@@ -1304,6 +1310,7 @@ app.use(`/api/${env.API_VERSION}/investor`, investorRoutes); // Investor report 
 app.use(`/api/${env.API_VERSION}/billing`, stripeRoutes); // Stripe billing endpoints
 app.use(`/api/${env.API_VERSION}/stripe`, stripeRoutes); // Stripe webhook endpoint
 app.use(`/api/${env.API_VERSION}/notifications`, notificationsRoutes); // User notifications (needed for pending users)
+app.use(`/api/${env.API_VERSION}/ai-logs`, aiLogsRoutes); // User-viewable AI action logs (auth applied per-route; runner-event uses shared secret)
 app.use(`/api/${env.API_VERSION}/announcements`, announcementsRoutes); // What's New announcements
 app.use(`/api/${env.API_VERSION}/user`, userRoutes); // User profile (needed for pending users)
 app.use(`/api/${env.API_VERSION}/support`, supportRoutes); // User issue reports
@@ -1615,6 +1622,18 @@ const startServer = async () => {
       const { initializeWebSocket } = await import('@/websocket/core/server');
       if (server) {
         initializeWebSocket(server);
+
+        // Start the System Logs broadcaster — emits each Winston ring-buffer
+        // entry to authorized users (`users.show_logs = true`) over WS so the
+        // frontend live-tails instead of polling.
+        try {
+          const { initSystemLogsBroadcaster } = await import('@/services/system-logs/system-logs-broadcaster');
+          initSystemLogsBroadcaster();
+        } catch (broadcastErr) {
+          logger.warn('[SERVER] Failed to start System Logs broadcaster (System Logs UI will fall back to REST polling)', {
+            error: broadcastErr instanceof Error ? broadcastErr.message : String(broadcastErr),
+          });
+        }
 
         // Start Redis subscriber for worker events (bridges worker → WebSocket clients)
         try {

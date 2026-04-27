@@ -2,6 +2,9 @@ import { env } from '@/config/environment/env';
 import * as fs from 'fs';
 import * as path from 'path';
 import winston from 'winston';
+import Transport from 'winston-transport';
+import { logBuffer } from './log-buffer';
+import { PROCESS_KIND, publishLogEntry } from './log-bridge';
 
 // Ensure logs directory exists
 const logsDir = path.join(process.cwd(), 'logs');
@@ -111,8 +114,56 @@ const truncateLargeFields = winston.format((info) => {
   return info;
 });
 
+/**
+ * Ring-buffer transport — captures every log entry into an in-memory buffer
+ * that powers the System Logs tab in the AI activity modal. Cheap (last 1k
+ * entries), bypasses the file system, and works the same in dev and prod.
+ */
+class RingBufferTransport extends Transport {
+  log(info: winston.Logform.TransformableInfo, callback: () => void): void {
+    setImmediate(() => this.emit('logged', info));
+    try {
+      const { level, message, timestamp, stack, ...meta } = info as Record<string, unknown>;
+      const summary =
+        typeof message === 'string'
+          ? message
+          : (() => {
+              try { return JSON.stringify(message); }
+              catch { return String(message); }
+            })();
+      const entry = {
+        timestamp:
+          typeof timestamp === 'string' && timestamp.length > 0
+            ? timestamp
+            : new Date().toISOString(),
+        level: String(level),
+        message: stack ? `${summary}\n${stack}` : summary,
+        meta: Object.keys(meta).length > 0 ? (meta as Record<string, unknown>) : undefined,
+        source: PROCESS_KIND,
+      };
+      // Always push to the local buffer (powers same-process tail).
+      logBuffer.push(entry);
+      // Publish to the cross-process bridge — no-op when this IS the API process,
+      // because the API is the only subscriber and would get its own messages back.
+      publishLogEntry(entry);
+    } catch {
+      // Buffer must never break logging.
+    }
+    callback();
+  }
+}
+
 // Define which transports the logger must use
 const transports: winston.transport[] = [
+  new RingBufferTransport({
+    // Capture everything so the operator can pick what to display in the UI.
+    level: 'debug',
+    format: winston.format.combine(
+      winston.format.timestamp(),
+      winston.format.errors({ stack: true }),
+      truncateLargeFields(),
+    ),
+  }),
   // Console transport
   new winston.transports.Console({
     format: winston.format.combine(

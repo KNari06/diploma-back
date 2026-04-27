@@ -139,10 +139,14 @@ class WebSocketService {
   ): void {
     // Use fallback for worker processes
     if (!this.isReady()) {
-      logger.debug('[WebSocketService] Using Redis Pub/Sub fallback for emitToUser (worker process)', {
-        userId,
-        event,
-      });
+      // Skip the diagnostic for log-stream events — they fire often and the
+      // log line itself would loop back through the ring buffer transport.
+      if (event !== 'system:log:new' && event !== 'ai:log:new') {
+        logger.debug('[WebSocketService] Using Redis Pub/Sub fallback for emitToUser (worker process)', {
+          userId,
+          event,
+        });
+      }
       redisWebSocketBridge.publishEvent(event as string, data, { userId }).catch((error) => {
         logger.error('[WebSocketService] Failed to publish emitToUser to Redis', {
           userId,
@@ -178,6 +182,13 @@ class WebSocketService {
 
       const room = createRoomName('user', userId.trim());
       getIO().to(room).emit(event, data);
+
+      // Suppress logging for log-stream events themselves — otherwise every
+      // emitted system/AI log line triggers another log line (which the ring
+      // buffer transport also captures), creating amplification and noise.
+      if (event === 'system:log:new' || event === 'ai:log:new') {
+        return;
+      }
 
       // Use debug for routine emits, info only for important events
       const logLevel = ['test:started', 'test:completed', 'test:failed', 'chat:message'].includes(event) ? 'info' : 'debug';

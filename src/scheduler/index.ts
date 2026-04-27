@@ -11,6 +11,11 @@ import { env } from '@/config/environment/env';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
+import { initLogBridge } from '@/utils/core/log-bridge';
+
+// Forward this process's Winston log entries to the API process's ring buffer
+// (powers the System Logs tab). No-op if Redis is unavailable.
+initLogBridge();
 
 /**
  * Start scheduler process.

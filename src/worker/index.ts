@@ -15,6 +15,11 @@ import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
 
+// NOTE: worker logs are intentionally NOT bridged into the API ring buffer.
+// The worker is high-volume (queue ticks, RAM guard, job heartbeats, etc.)
+// and would dominate the System Logs tab — operators read worker output via
+// its own console/file transports instead.
+
 // Validate worker configuration
 const getValidatedConcurrency = (): number => {
   if (!connection || typeof connection !== 'object') {
