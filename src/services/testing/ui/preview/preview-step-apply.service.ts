@@ -7,7 +7,7 @@
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
-import type { FrameLocator, Locator, Page } from 'playwright';
+import type { Frame, FrameLocator, Locator, Page } from 'playwright';
 import { sanitizeIntent } from './element-resolver.service';
 import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
@@ -1048,6 +1048,216 @@ function getLocatorContext(page: Page, step: IntentStep): Page | FrameLocator {
     return page.frameLocator(step.options.iframe.selector);
   }
   return page;
+}
+
+/**
+ * Click effect verification — detects whether a click actually changed page state.
+ * Used in editor preview to catch "click in void" cases (clicking through a modal
+ * backdrop, clicking a disabled-but-not-marked element, etc.) where Playwright's
+ * action succeeds but nothing observable happens.
+ *
+ * Strategy: snapshot a few cheap signals before the click, compare after. Any
+ * one positive signal means the click had an effect.
+ */
+type ClickPreState = {
+  url: string;
+  dialogCount: number;
+  // Snapshot of body's *visible* top-level children — text-content hash that is
+  // stable against 3rd-party widget churn (chat/analytics scripts that mutate
+  // body silently). We compare structure, not raw count, so injected
+  // <script>/<iframe> nodes don't trigger false-positive 'dom' signals.
+  bodyVisibleChildSig: string;
+  activeElementSig: string | null;
+  targetAriaPressed: string | null;
+  targetAriaExpanded: string | null;
+  targetAriaChecked: string | null;
+  targetDisabled: boolean;
+  pageCount: number; // browser-context tab count for new-tab detection
+};
+
+type ClickEffectSignal = 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
+
+/**
+ * Resolve the JS-execution context for click verification. When the step
+ * targets an iframe, target/focus/body live inside the frame — not main page.
+ * URL / dialogs / new-tab signals stay on the parent page. Returns null
+ * frame if step doesn't target an iframe (signals all go through `page`).
+ */
+async function resolveTargetFrame(page: Page, step: IntentStep): Promise<Frame | null> {
+  const iframeSelector = step.options?.iframe?.selector;
+  if (!iframeSelector) return null;
+  try {
+    const handle = await page.locator(iframeSelector).first().elementHandle({ timeout: 500 });
+    if (!handle) return null;
+    const frame = await handle.contentFrame();
+    return frame || null;
+  } catch {
+    return null;
+  }
+}
+
+async function captureClickPreState(
+  page: Page,
+  ref: string | undefined,
+  targetFrame: Frame | null,
+): Promise<ClickPreState> {
+  let pageCount = 1;
+  try { pageCount = page.context().pages().length; } catch { /* best-effort */ }
+  const fallback: ClickPreState = {
+    url: page.url(),
+    dialogCount: 0,
+    bodyVisibleChildSig: '',
+    activeElementSig: null,
+    targetAriaPressed: null,
+    targetAriaExpanded: null,
+    targetAriaChecked: null,
+    targetDisabled: false,
+    pageCount,
+  };
+  try {
+    const safeRef = ref ? ref.replace(/[^a-zA-Z0-9_-]/g, '') : '';
+    // Page-level signals (URL, dialogs at top level) — always main frame.
+    let pageSig: { url: string; dialogCount: number; bodyVisibleChildSig: string };
+    try {
+      pageSig = await page.evaluate(() => {
+        // @ts-expect-error - browser context
+        const doc = document;
+        const dialogs = doc.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open],[aria-modal="true"]');
+        const bodyChildren = doc.body ? Array.from(doc.body.children) as any[] : [];
+        const visParts: string[] = [];
+        for (const child of bodyChildren) {
+          const tag = child.tagName ? child.tagName.toLowerCase() : '';
+          if (!tag || tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'link') continue;
+          const rect = child.getBoundingClientRect ? child.getBoundingClientRect() : null;
+          if (rect && (rect.width === 0 && rect.height === 0)) continue;
+          const cls = (child.getAttribute('class') || '').trim().split(/\s+/)[0] || '';
+          const role = child.getAttribute('role') || '';
+          visParts.push(`${tag}.${cls.slice(0, 20)}#${role.slice(0, 10)}`);
+        }
+        return {
+          // @ts-expect-error - browser context
+          url: window.location.href,
+          dialogCount: dialogs.length,
+          bodyVisibleChildSig: visParts.join('|'),
+        };
+      });
+    } catch {
+      pageSig = { url: page.url(), dialogCount: 0, bodyVisibleChildSig: '' };
+    }
+    // Element/focus signals — target frame if iframe step, else main page.
+    const evalCtx = (targetFrame ?? page) as Page | Frame;
+    const elemSig = await evalCtx.evaluate(({ refSel }) => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      const ae = doc.activeElement as any;
+      const aeSig = ae ? `${ae.tagName}#${ae.id || ''}.${(ae.getAttribute('class') || '').slice(0, 30)}` : null;
+      let targetEl: any = null;
+      if (refSel) targetEl = doc.querySelector(`[data-agent-ref="${refSel}"]`);
+      return {
+        activeElementSig: aeSig,
+        targetAriaPressed: targetEl ? targetEl.getAttribute('aria-pressed') : null,
+        targetAriaExpanded: targetEl ? targetEl.getAttribute('aria-expanded') : null,
+        targetAriaChecked: targetEl ? targetEl.getAttribute('aria-checked') : null,
+        targetDisabled: targetEl
+          ? (targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true')
+          : false,
+      };
+    }, { refSel: safeRef });
+    return { ...pageSig, ...elemSig, pageCount };
+  } catch {
+    return fallback;
+  }
+}
+
+async function verifyClickHadEffect(
+  page: Page,
+  pre: ClickPreState,
+  ref: string | undefined,
+  targetFrame: Frame | null,
+): Promise<{ effected: boolean; signal: ClickEffectSignal }> {
+  // Cheap immediate check (0ms wait) catches synchronous handlers; if nothing
+  // changed yet we wait once and re-check for animated/SPA-router effects.
+  // Two checkpoints (0ms + 800ms) instead of three keeps the worst-case slow
+  // path bounded at ~800ms while keeping the fast path effectively free.
+  const safeRef = ref ? ref.replace(/[^a-zA-Z0-9_-]/g, '') : '';
+  const checkpoints = [0, 800];
+  for (const delay of checkpoints) {
+    if (delay > 0) await page.waitForTimeout(delay).catch(() => {});
+
+    // Browser-context check: new tab opened? Cheap, runs against the
+    // BrowserContext (no page.evaluate round-trip needed) so it survives
+    // the case where evaluate would throw because the active page is
+    // mid-navigating.
+    try {
+      const nowPageCount = page.context().pages().length;
+      if (nowPageCount > pre.pageCount) return { effected: true, signal: 'newtab' };
+    } catch { /* best-effort */ }
+
+    // Page-level signals — always main page (URL, top-level dialog, top-level body
+    // structure). Even when the click happened inside an iframe, parent-page
+    // navigation / dialogs are still the most informative top-line signal.
+    let pageResult: { signal: ClickEffectSignal };
+    try {
+      pageResult = await page.evaluate((prev) => {
+        // @ts-expect-error - browser context
+        const doc = document;
+        // @ts-expect-error - browser context
+        if (window.location.href !== prev.url) return { signal: 'url' as const };
+        const dialogCount = doc.querySelectorAll(
+          '[role="dialog"],[role="alertdialog"],dialog[open],[aria-modal="true"]'
+        ).length;
+        if (dialogCount > prev.dialogCount) return { signal: 'dialog' as const };
+        const bodyChildren = doc.body ? Array.from(doc.body.children) as any[] : [];
+        const visParts: string[] = [];
+        for (const child of bodyChildren) {
+          const tag = child.tagName ? child.tagName.toLowerCase() : '';
+          if (!tag || tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'link') continue;
+          const rect = child.getBoundingClientRect ? child.getBoundingClientRect() : null;
+          if (rect && (rect.width === 0 && rect.height === 0)) continue;
+          const cls = (child.getAttribute('class') || '').trim().split(/\s+/)[0] || '';
+          const role = child.getAttribute('role') || '';
+          visParts.push(`${tag}.${cls.slice(0, 20)}#${role.slice(0, 10)}`);
+        }
+        const sig = visParts.join('|');
+        if (sig !== prev.bodyVisibleChildSig) return { signal: 'dom' as const };
+        return { signal: 'none' as const };
+      }, pre);
+    } catch {
+      // Page navigating mid-eval — that itself is an effect.
+      return { effected: true, signal: 'url' };
+    }
+    if (pageResult.signal !== 'none') return { effected: true, signal: pageResult.signal };
+
+    // Element-level signals — inside the targeted iframe (if any), else main page.
+    // If the iframe was destroyed by the click (cross-origin nav, unmount), the
+    // evaluate throws — treat as detached.
+    const evalCtx = (targetFrame ?? page) as Page | Frame;
+    let elemResult: { signal: ClickEffectSignal };
+    try {
+      elemResult = await evalCtx.evaluate(({ refSel, prev }) => {
+        // @ts-expect-error - browser context
+        const doc = document;
+        if (refSel) {
+          const targetEl = doc.querySelector(`[data-agent-ref="${refSel}"]`);
+          if (!targetEl) return { signal: 'detach' as const };
+          if (targetEl.getAttribute('aria-pressed') !== prev.targetAriaPressed) return { signal: 'aria' as const };
+          if (targetEl.getAttribute('aria-expanded') !== prev.targetAriaExpanded) return { signal: 'aria' as const };
+          if (targetEl.getAttribute('aria-checked') !== prev.targetAriaChecked) return { signal: 'aria' as const };
+          const nowDisabled = targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true';
+          if (nowDisabled !== prev.targetDisabled) return { signal: 'aria' as const };
+        }
+        const ae = doc.activeElement as any;
+        const aeSig = ae ? `${ae.tagName}#${ae.id || ''}.${(ae.getAttribute('class') || '').slice(0, 30)}` : null;
+        if (aeSig !== prev.activeElementSig) return { signal: 'focus' as const };
+        return { signal: 'none' as const };
+      }, { refSel: safeRef, prev: pre });
+    } catch {
+      // Frame detached / navigating — count as effect.
+      return { effected: true, signal: 'detach' };
+    }
+    if (elemResult.signal !== 'none') return { effected: true, signal: elemResult.signal };
+  }
+  return { effected: false, signal: 'none' };
 }
 
 /**
@@ -3105,6 +3315,17 @@ export class PreviewStepApplyService {
               }).catch(() => {});
             }
 
+            // Editor click-effect verification: also snapshot pre-state for
+            // non-navigating clicks so we can detect "click in void" cases
+            // (target obstructed by overlay, no-op handler, etc.) on the
+            // compiled fast-path. Mirrors the lint-path check.
+            const compiledTargetFrame = (stepDraft.type === 'click' && !expectedNav)
+              ? await resolveTargetFrame(page, stepDraft)
+              : null;
+            const compiledClickPreState = (stepDraft.type === 'click' && !expectedNav && compiledRef)
+              ? await captureClickPreState(page, compiledRef, compiledTargetFrame)
+              : null;
+
             // Execute action with compiled locator
             const result = await executeAction(page, stepDraft, compiledCandidate, compiledResult.locator, { expectsNavigation });
 
@@ -3170,6 +3391,7 @@ export class PreviewStepApplyService {
                   compiledWasTried = true;
                 }
               }
+
               // If compiledWasTried was set by postcondition failure above, skip success return
               if (!compiledWasTried) {
                 // V16: Post-action settle via smartStepWait (see note above).
@@ -3179,6 +3401,61 @@ export class PreviewStepApplyService {
                     step: stepDraft,
                     phase: 'post',
                   }).catch(() => { /* non-fatal */ });
+                }
+
+                // Editor click-effect verification on compiled fast-path.
+                // Must run AFTER smartStepWait('post') so the DOM has had a
+                // chance to settle (handlers fire, animations run, modals
+                // mount). Earlier and we get false negatives on slow SPAs.
+                //
+                // Important: a compiled click that hits nothing is NOT a
+                // compiled-plan failure (the locator did find the right
+                // element by fingerprint). It's a runtime issue — page
+                // state changed (overlay appeared, etc). So we keep
+                // `compiledWasTried` false and `compiledFailed` false in
+                // the result — that prevents Run loop from disabling
+                // compiled-fast-path for remaining steps.
+                if (
+                  stepDraft.type === 'click'
+                  && !expectedNav
+                  && compiledClickPreState
+                ) {
+                  const effect = await verifyClickHadEffect(page, compiledClickPreState, compiledRef, compiledTargetFrame);
+                  if (!effect.effected) {
+                    logger.info('[PREVIEW_APPLY] Compiled click had no observable effect', {
+                      previewSessionId,
+                      stepId: stepDraft.id,
+                      signal: effect.signal,
+                    });
+                    try {
+                      editorTrace?.writeActionVerify({
+                        stepId: stepDraft.id,
+                        stepType: stepDraft.type,
+                        verificationMethod: 'click-effect',
+                        verified: false,
+                        durationMs: 0,
+                        signal: effect.signal,
+                      });
+                    } catch { /* non-fatal */ }
+                    return {
+                      success: false,
+                      error: '[click-no-effect] Click did not change page state (URL, dialog, ARIA, focus). The element may be obstructed by an overlay, or the click handler did nothing.',
+                      attempts: 1,
+                      // compiledFailed stays falsy — the locator was correct,
+                      // the page just didn't react. Don't disable compiled
+                      // shortcut for remaining steps.
+                    };
+                  }
+                  try {
+                    editorTrace?.writeActionVerify({
+                      stepId: stepDraft.id,
+                      stepType: stepDraft.type,
+                      verificationMethod: 'click-effect',
+                      verified: true,
+                      durationMs: 0,
+                      signal: effect.signal,
+                    });
+                  } catch { /* non-fatal */ }
                 }
 
                 // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -3575,6 +3852,18 @@ export class PreviewStepApplyService {
           }
         } catch { /* non-fatal diagnostic */ }
 
+        // Editor click-effect verification: snapshot page state pre-click so we
+        // can detect whether the click actually changed anything afterwards.
+        // Skip when expectsNavigation — the upstream waitForNavigation race
+        // already proves an effect, and snapshotting during a pending nav
+        // races with the document going away.
+        const clickTargetFrame = (stepDraft.type === 'click' && !expectsNavigation)
+          ? await resolveTargetFrame(page, stepDraft)
+          : null;
+        const clickPreState = (stepDraft.type === 'click' && !expectsNavigation && candidate.ref)
+          ? await captureClickPreState(page, candidate.ref, clickTargetFrame)
+          : null;
+
         let playwrightThrew = false;
         const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
         const actionDur = Date.now() - actionStart;
@@ -3622,15 +3911,6 @@ export class PreviewStepApplyService {
           } else if (POST_ACTION_BUFFER_ACTIONS.has(stepDraft.type)) {
             await page.waitForTimeout(1000);
           }
-          trace?.writeActionResult({
-            stepId: stepDraft.id,
-            stepType: stepDraft.type,
-            success: true,
-            durationMs: actionDur,
-            postActionSettleMs: postSettleMs || undefined,
-            postActionSettleFired: !skipPostActionWait ? postSettleFired : undefined,
-          });
-
           // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
           if (DOM_MUTATING_ACTIONS.has(stepDraft.type)) {
             const sess = sessionService.getSession(previewSessionId);
@@ -3639,12 +3919,33 @@ export class PreviewStepApplyService {
 
           // V2: Post-action verification for state-aware actions
           let verified = false;
+          let clickEffectSignal: ClickEffectSignal | undefined;
           const stateChange: ApplyResult['stateChange'] = undefined;
 
           if (STATE_VERIFIABLE_ACTIONS.has(stepDraft.type) && candidate.ref) {
             const verifyStart = Date.now();
             try {
               verified = await verifyActionEffect(page, stepDraft, candidate.ref);
+
+              // Editor click-effect check: verifyActionEffect for click is
+              // permissive (always true) so the action is "successful" even
+              // when nothing on the page changed. We compare a pre-click
+              // snapshot with the live DOM to catch click-in-void cases
+              // (clicked through a modal backdrop, hit a no-op handler, etc.)
+              // and surface them as honest failures instead of fake green.
+              if (stepDraft.type === 'click' && verified && clickPreState) {
+                const effect = await verifyClickHadEffect(page, clickPreState, candidate.ref, clickTargetFrame);
+                clickEffectSignal = effect.signal;
+                if (!effect.effected) {
+                  verified = false;
+                  logger.info('[PREVIEW_APPLY] Click had no observable effect', {
+                    stepId: stepDraft.id,
+                    candidateRef: candidate.ref,
+                    signal: effect.signal,
+                  });
+                }
+              }
+
               if (verified) {
                 logger.debug('[PREVIEW_APPLY] Action verified', {
                   stepType: stepDraft.type,
@@ -3654,13 +3955,14 @@ export class PreviewStepApplyService {
               trace?.writeActionVerify({
                 stepId: stepDraft.id,
                 stepType: stepDraft.type,
-                verificationMethod: stepDraft.type === 'click' ? 'permissive'
+                verificationMethod: stepDraft.type === 'click' ? 'click-effect'
                   : stepDraft.type === 'check' || stepDraft.type === 'uncheck' ? 'checked'
                   : stepDraft.type === 'open' || stepDraft.type === 'close' ? 'aria-expanded'
                   : stepDraft.type === 'toggle' ? 'aria-pressed'
                   : 'isVisible',
                 verified,
                 durationMs: Date.now() - verifyStart,
+                ...(clickEffectSignal !== undefined ? { signal: clickEffectSignal } : {}),
               });
             } catch (verifyError) {
               logger.warn('[PREVIEW_APPLY] Verification failed', {
@@ -3675,6 +3977,45 @@ export class PreviewStepApplyService {
               });
             }
           }
+
+          // For click in editor preview, treat verify=false as a real failure.
+          // Don't try the next resolver candidate — they typically point at the
+          // same screen region with the same overlay/state issue, so retrying
+          // wastes ~2s per candidate without changing the outcome. Return fail
+          // immediately; the Run loop's step-level retry already gives us a
+          // second attempt with disabled cache + relaxed timeout.
+          if (stepDraft.type === 'click' && !verified && clickEffectSignal === 'none') {
+            const clickNoEffectMsg = '[click-no-effect] Click did not change page state (URL, dialog, ARIA, focus). The element may be obstructed by an overlay, or the click handler did nothing.';
+            trace?.writeActionResult({
+              stepId: stepDraft.id,
+              stepType: stepDraft.type,
+              success: false,
+              durationMs: actionDur,
+              error: 'click-no-effect',
+            });
+            return {
+              success: false,
+              error: clickNoEffectMsg,
+              attempts,
+              highlight: [{
+                ref: candidate.ref,
+                boundingBox: candidate.boundingBox,
+                type: 'error' as const,
+              }],
+            };
+          }
+
+          // Action genuinely succeeded — record the success result now (after
+          // verification), so we don't emit a misleading success-then-fail
+          // pair for click-in-void cases handled above.
+          trace?.writeActionResult({
+            stepId: stepDraft.id,
+            stepType: stepDraft.type,
+            success: true,
+            durationMs: actionDur,
+            postActionSettleMs: postSettleMs || undefined,
+            postActionSettleFired: !skipPostActionWait ? postSettleFired : undefined,
+          });
 
           // V3: Generate compiled plan from resolved node
           // Include pageSignature from session for staleness detection

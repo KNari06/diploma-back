@@ -829,11 +829,12 @@ export class EditorTraceService {
   writeActionVerify(data: {
     stepId: string;
     stepType: string;
-    verificationMethod: 'aria-expanded' | 'aria-pressed' | 'aria-checked' | 'checked' | 'isVisible' | 'permissive' | 'none';
+    verificationMethod: 'aria-expanded' | 'aria-pressed' | 'aria-checked' | 'checked' | 'isVisible' | 'permissive' | 'click-effect' | 'none';
     verified: boolean;
     durationMs: number;
     beforeState?: Record<string, any>;
     afterState?: Record<string, any>;
+    signal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
   }): void {
     this.writer.write({
       stage: 'action',

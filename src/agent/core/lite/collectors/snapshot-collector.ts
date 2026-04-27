@@ -1306,6 +1306,7 @@ export class SnapshotCollector {
 
             const input = el as any;
             const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
+            const tagLower = el.tagName.toLowerCase();
 
             // ✅ FIX: Reuse early modal check (computed before hit test above)
             const isInsideActiveModal = isInsideModal;
