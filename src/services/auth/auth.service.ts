@@ -276,7 +276,7 @@ export async function signInWithEmail(
     // Fetch role and status from public.users
     const { data: userData } = await supabaseAdmin
       .from('users')
-      .select('role, name, status, avatar_url')
+      .select('role, name, status, avatar_url, show_logs')
       .eq('id', data.user.id)
       .maybeSingle();
 
@@ -288,6 +288,7 @@ export async function signInWithEmail(
         role: userData?.role || 'user',
         status: userData?.status || 'pending_approval',
         avatar: userData?.avatar_url || data.user.user_metadata?.avatar_url,
+        showLogs: userData?.show_logs === true,
       },
       tokens: {
         access_token: data.session.access_token,
@@ -1016,6 +1017,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
             credits: creditsBalance,
             subscription: retryUserData.subscription,
             created_at: retryUserData.created_at,
+            showLogs: retryUserData.show_logs === true,
           };
         }
 
@@ -1049,6 +1051,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
         credits: creditsBalance,
         subscription: createdUser.subscription,
         created_at: createdUser.created_at,
+        showLogs: createdUser.show_logs === true,
       };
     }
 
@@ -1067,6 +1070,7 @@ export async function getCurrentUser(accessToken: string): Promise<any> {
       credits: creditsBalance,
       subscription: userData.subscription,
       created_at: userData.created_at,
+      showLogs: userData.show_logs === true,
     };
   } catch (error) {
     logger.error('[AUTH] Get current user error', {

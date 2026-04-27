@@ -171,6 +171,12 @@ export interface ServerToClientEvents {
   'ai:analysis:completed': (data: AIAnalysisCompletedPayload) => void;
   'ai:bug:found': (data: AIBugFoundPayload) => void;
 
+  // AI action log (one row per LLM call) — pushed to the owning user.
+  'ai:log:new': (data: AIActionLogPayload) => void;
+
+  // System (Winston) log entry — pushed only to users with `users.show_logs=true`.
+  'system:log:new': (data: SystemLogPayload) => void;
+
   // Chat events
   'chat:message': (data: ChatMessagePayload) => void;
   'chat:test:update': (data: ChatTestUpdatePayload) => void;
@@ -2053,6 +2059,58 @@ export interface AllureImportFailedWSPayload {
   importId: string;
   error: string;
   timestamp: string;
+}
+
+// ============================================================================
+// SYSTEM LOG PAYLOAD (Winston ring buffer entry, live-tailed over WS)
+// ============================================================================
+
+export interface SystemLogPayload {
+  seq: number;
+  timestamp: string;
+  level: 'error' | 'warn' | 'info' | 'http' | 'debug' | string;
+  message: string;
+  meta?: Record<string, unknown>;
+  source?: 'api' | 'worker' | 'scheduler' | string;
+}
+
+// ============================================================================
+// AI ACTION LOG PAYLOAD (one row per LLM call)
+// ============================================================================
+
+export interface AIActionLogPayload {
+  id: string;
+  created_at: string;
+  user_id: string;
+  workspace_id: string | null;
+  source:
+    | 'chat'
+    | 'analysis'
+    | 'explorer-web'
+    | 'explorer-mobile'
+    | 'ai-selector'
+    | 'ai-check'
+    | 'form-filler';
+  action_type: string;
+  status: 'succeeded' | 'failed';
+  summary: string;
+  detail: Record<string, unknown>;
+  entity_type:
+    | 'regression_run'
+    | 'test_execution'
+    | 'chat_session'
+    | 'exploration_run'
+    | 'mobile_run'
+    | null;
+  entity_id: string | null;
+  iteration: number | null;
+  duration_ms: number | null;
+  model: string | null;
+  provider: 'openai' | 'gemini' | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  cost_usd: number | null;
+  error: string | null;
 }
 
 // ============================================================================

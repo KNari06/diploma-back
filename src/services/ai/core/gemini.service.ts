@@ -2,6 +2,7 @@ import { GoogleGenerativeAI, type Part } from '@google/generative-ai';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { AIUsageTracker, calculateGeminiCost } from '../tracking/ai-usage-tracker';
+import { recordAILog } from '../logging/ai-action-logger';
 
 /**
  * Gemini AI Service
@@ -57,6 +58,7 @@ export async function generateTextWithGemini(params: {
     jsonMode = false,
   } = params;
 
+  const _aiLogStartedAt = Date.now();
   try {
     const client = getGeminiClient();
     const genModel = client.getGenerativeModel({
@@ -98,18 +100,41 @@ export async function generateTextWithGemini(params: {
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: { prompt_excerpt: prompt, response_excerpt: text },
     });
 
     return result;
   } catch (error) {
+    recordAILog({
+      status: 'failed',
+      provider: 'gemini',
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { prompt_excerpt: prompt },
+    });
     logger.error('[GEMINI] Text generation failed', {
       error: error instanceof Error ? error.message : String(error),
       model,
@@ -140,6 +165,7 @@ export async function getChatCompletionWithGemini(params: {
     jsonMode = false,
   } = params;
 
+  const _aiLogStartedAt = Date.now();
   try {
     const client = getGeminiClient();
     // Extract system instruction and chat messages
@@ -228,18 +254,41 @@ export async function getChatCompletionWithGemini(params: {
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: { message_count: messages.length, response_excerpt: text },
     });
 
     return result;
   } catch (error) {
+    recordAILog({
+      status: 'failed',
+      provider: 'gemini',
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { message_count: messages.length },
+    });
     logger.error('[GEMINI] Chat completion failed', {
       error: error instanceof Error ? error.message : String(error),
       model,
@@ -279,6 +328,7 @@ export async function generateTextWithGeminiVision(params: {
     throw new Error('imageBase64 is required for vision requests');
   }
 
+  const _aiLogStartedAt = Date.now();
   try {
     const client = getGeminiClient();
     const genModel = client.getGenerativeModel({
@@ -338,14 +388,26 @@ export async function generateTextWithGeminiVision(params: {
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: { prompt_excerpt: prompt, response_excerpt: text, has_image: true },
     });
 
     logger.info('[GEMINI] Vision generation completed', {
@@ -357,6 +419,17 @@ export async function generateTextWithGeminiVision(params: {
 
     return result;
   } catch (error) {
+    recordAILog({
+      status: 'failed',
+      provider: 'gemini',
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { prompt_excerpt: prompt, has_image: true },
+    });
     logger.error('[GEMINI] Vision generation failed', {
       error: error instanceof Error ? error.message : String(error),
       model,

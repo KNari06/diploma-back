@@ -5,6 +5,7 @@ import { logger } from '@/utils/core/logger';
 import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam, ChatCompletionTool, ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import { AIUsageTracker, calculateOpenAICost } from '../tracking/ai-usage-tracker';
+import { recordAILog } from '../logging/ai-action-logger';
 
 /**
  * ✅ FIX: Configure OpenAI client with timeout and retry settings
@@ -154,6 +155,7 @@ export async function getChatCompletionWithMessages(
     reasoning_effort?: 'low' | 'medium' | 'high';
   }
 ): Promise<OpenAIResponse> {
+  const _aiLogStartedAt = Date.now();
   try {
     // Validate input
     if (!messages || messages.length === 0) {
@@ -323,14 +325,32 @@ export async function getChatCompletionWithMessages(
 
     // Track AI usage for billing/analytics — bill against the model that
     // actually served the request, not the one originally requested.
+    const aiCostUSD = calculateOpenAICost(actualModel, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'openai',
       model: actualModel,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateOpenAICost(actualModel, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'openai',
+      model: actualModel,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: {
+        message_count: messages.length,
+        reply_length: reply.length,
+        tool_call_count: toolCalls?.length ?? 0,
+        requested_model: model !== actualModel ? model : undefined,
+        response_excerpt: reply,
+      },
     });
 
     return result;
@@ -340,6 +360,18 @@ export async function getChatCompletionWithMessages(
     const errorCode = (error as any)?.code;
     const errorStatus = (error as any)?.status;
     const errorType = (error as any)?.type;
+
+    recordAILog({
+      status: 'failed',
+      provider: 'openai',
+      model: options?.model || AI_MODELS.fast,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: errorMessage,
+      detail: { code: errorCode, status: errorStatus, type: errorType, message_count: messages?.length ?? 0 },
+    });
 
     if (errorMessage.includes('aborted') || errorMessage.includes('signal')) {
       logger.warn('[OPENAI] Request aborted', {
@@ -393,6 +425,7 @@ export async function getChatCompletion(
   prompt: string,
   context?: string
 ): Promise<OpenAIResponse> {
+  const _aiLogStartedAt = Date.now();
   try {
     // Use centralized prompt (in English, but AI will respond in user's language)
     const systemPrompt = buildChatSystemPrompt();
@@ -443,18 +476,45 @@ export async function getChatCompletion(
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateOpenAICost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'openai',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateOpenAICost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'openai',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: {
+        prompt_excerpt: prompt,
+        response_excerpt: reply,
+      },
     });
 
     return result;
   } catch (error: any) {
+    recordAILog({
+      status: 'failed',
+      provider: 'openai',
+      model: AI_MODELS.fast,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { prompt_excerpt: prompt },
+    });
+
     // Handle abort signal errors (client closed connection, timeout, etc.)
     if (error?.message?.includes('aborted') || error?.message?.includes('signal')) {
       logger.warn('[OPENAI] Request aborted', {

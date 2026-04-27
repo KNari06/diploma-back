@@ -15,6 +15,7 @@ import {
 import { EditorTraceService } from './editor-trace.service';
 import { evaluateEvidenceShortcut } from './evidence-shortcut.utils';
 import { getPreviewSessionService } from './preview-session.service';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
     IntentStep,
     InteractiveNode,
@@ -467,6 +468,30 @@ export class IntentStepLintService {
    * Lint a step against the current page context
    */
   static async lintStep(params: {
+    previewSessionId: string;
+    stepDraft: IntentStep;
+    pageRef?: string;
+    userId: string;
+  }): Promise<LintResult> {
+    const { previewSessionId, stepDraft, userId } = params;
+
+    // Attribute every LLM call made during this lint to the editor user,
+    // labelled as 'ai-selector' so it shows up in the AI activity feed.
+    return withAIContext(
+      {
+        workspaceId: '',
+        userId,
+        operationType: 'lite-test',
+        logSource: 'ai-selector',
+        logActionType: 'lint-step',
+        logEntityType: 'test_execution',
+        logEntityId: previewSessionId,
+      },
+      () => this._lintStepInner(params),
+    ) as Promise<LintResult>;
+  }
+
+  private static async _lintStepInner(params: {
     previewSessionId: string;
     stepDraft: IntentStep;
     pageRef?: string;
