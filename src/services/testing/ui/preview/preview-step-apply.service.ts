@@ -3398,6 +3398,16 @@ export class PreviewStepApplyService {
                   logger.debug('[PREVIEW_APPLY] Compiled postcondition: URL unchanged but DOM mutated — accepting', {
                     previewSessionId, stepId: stepDraft.id,
                   });
+                  try {
+                    EditorTraceService.get(previewSessionId)?.writeCompiledPostcondition({
+                      stepId: stepDraft.id,
+                      expectsNavigation: true,
+                      urlChanged: false,
+                      domChanged: true,
+                      accepted: true,
+                      reason: 'dom_mutated',
+                    });
+                  } catch { /* non-fatal */ }
                   // Accept as success — fall through to the normal success path below
                 } else {
                   logger.info('[PREVIEW_APPLY] Compiled plan postcondition failed — expected navigation but URL and DOM unchanged', {
@@ -3406,6 +3416,16 @@ export class PreviewStepApplyService {
                     postconditions,
                     url: page.url(),
                   });
+                  try {
+                    EditorTraceService.get(previewSessionId)?.writeCompiledPostcondition({
+                      stepId: stepDraft.id,
+                      expectsNavigation: true,
+                      urlChanged: false,
+                      domChanged: false,
+                      accepted: false,
+                      reason: 'expected_navigation_no_change',
+                    });
+                  } catch { /* non-fatal */ }
                   // Fall through to lint instead of returning success
                   compiledWasTried = true;
                 }
@@ -3454,6 +3474,14 @@ export class PreviewStepApplyService {
                         verified: false,
                         durationMs: 0,
                         signal: effect.signal,
+                      });
+                      editorTrace?.writeCompiledPostcondition({
+                        stepId: stepDraft.id,
+                        expectsNavigation: false,
+                        urlChanged: false,
+                        clickEffectSignal: effect.signal,
+                        accepted: false,
+                        reason: 'click_no_effect',
                       });
                     } catch { /* non-fatal */ }
                     return {
@@ -3592,6 +3620,11 @@ export class PreviewStepApplyService {
       // forceFreshSnapshot: apply is triggered by user clicking Run — the DOM may
       // have changed since the last snapshot tick (e.g. a dropdown opened during
       // typing, or a compiled shortcut just ran and mutated the page).
+      const lintPhaseStart = Date.now();
+      try {
+        const traceForLint = EditorTraceService.get(previewSessionId);
+        traceForLint?.writeApplyPhaseEntry({ stepId: stepDraft.id, phase: 'lint_resolve' });
+      } catch { /* non-fatal */ }
       const lintResult = await IntentStepLintService.lintStepWithAI({
         previewSessionId,
         stepDraft,
@@ -3599,6 +3632,38 @@ export class PreviewStepApplyService {
         userId,
         forceFreshSnapshot: true,
       });
+      try {
+        const traceForLint = EditorTraceService.get(previewSessionId);
+        traceForLint?.writeApplyPhaseExit({
+          stepId: stepDraft.id,
+          phase: 'lint_resolve',
+          durationMs: Date.now() - lintPhaseStart,
+          success: lintResult.status === 'resolved',
+          ...(lintResult.status !== 'resolved' ? { skipReason: lintResult.status } : {}),
+        });
+        // Top-3 candidates so we can spot "weak step" cases — e.g. only 1
+        // candidate at confidence 0.3 means the description doesn't match
+        // anything well even though Playwright might still click it.
+        if (Array.isArray(lintResult.candidates) && lintResult.candidates.length > 0) {
+          const top = lintResult.candidates
+            .slice(0, 3)
+            .filter((c) => typeof c.ref === 'string')
+            .map((c) => ({
+              ref: c.ref as string,
+              score: c.confidence,
+              role: (c as unknown as { node?: { role?: string } }).node?.role,
+              text: c.label,
+            }));
+          traceForLint?.writeResolverCandidates({
+            stepId: stepDraft.id,
+            source: 'lint',
+            totalCount: lintResult.candidates.length,
+            chosenRef: lintResult.candidates[0]?.ref,
+            chosenScore: lintResult.candidates[0]?.confidence,
+            top3: top,
+          });
+        }
+      } catch { /* non-fatal */ }
 
       if (lintResult.status === 'needs_clarification') {
         return {
@@ -3883,10 +3948,23 @@ export class PreviewStepApplyService {
           ? await captureClickPreState(page, candidate.ref, clickTargetFrame)
           : null;
 
+        try {
+          EditorTraceService.get(previewSessionId)?.writeApplyPhaseEntry({
+            stepId: stepDraft.id, phase: 'action_execute',
+          });
+        } catch { /* non-fatal */ }
         let playwrightThrew = false;
         const result = await executeAction(page, stepDraft, candidate, undefined, { expectsNavigation });
         const actionDur = Date.now() - actionStart;
         if (!result.success && result.error) playwrightThrew = true;
+        try {
+          EditorTraceService.get(previewSessionId)?.writeApplyPhaseExit({
+            stepId: stepDraft.id, phase: 'action_execute',
+            durationMs: actionDur,
+            success: result.success,
+            ...(playwrightThrew ? { skipReason: (result.error || '').slice(0, 80) } : {}),
+          });
+        } catch { /* non-fatal */ }
 
         // Emit fine-grained action timing before success/failure branches diverge.
         // `preWaitVisibleMs` is now the probe cost (~0 or ~200ms), not a real wait.
@@ -3920,6 +3998,11 @@ export class PreviewStepApplyService {
           let postSettleFired = false;
           if (!skipPostActionWait) {
             const settleStart = Date.now();
+            try {
+              EditorTraceService.get(previewSessionId)?.writeApplyPhaseEntry({
+                stepId: stepDraft.id, phase: 'post_wait',
+              });
+            } catch { /* non-fatal */ }
             const waitResult = await smartStepWait({
               page,
               step: stepDraft,
@@ -3927,6 +4010,14 @@ export class PreviewStepApplyService {
             }).catch(() => null);
             postSettleMs = Date.now() - settleStart;
             postSettleFired = !!waitResult?.ready;
+            try {
+              EditorTraceService.get(previewSessionId)?.writeApplyPhaseExit({
+                stepId: stepDraft.id, phase: 'post_wait',
+                durationMs: postSettleMs,
+                success: postSettleFired,
+                ...(postSettleFired ? {} : { skipReason: 'timeout_or_unsettled' }),
+              });
+            } catch { /* non-fatal */ }
           } else if (POST_ACTION_BUFFER_ACTIONS.has(stepDraft.type)) {
             await page.waitForTimeout(1000);
           }
@@ -3943,6 +4034,11 @@ export class PreviewStepApplyService {
 
           if (STATE_VERIFIABLE_ACTIONS.has(stepDraft.type) && candidate.ref) {
             const verifyStart = Date.now();
+            try {
+              EditorTraceService.get(previewSessionId)?.writeApplyPhaseEntry({
+                stepId: stepDraft.id, phase: 'verify',
+              });
+            } catch { /* non-fatal */ }
             try {
               verified = await verifyActionEffect(page, stepDraft, candidate.ref);
 
@@ -3995,6 +4091,14 @@ export class PreviewStepApplyService {
                 durationMs: Date.now() - verifyStart,
               });
             }
+            try {
+              EditorTraceService.get(previewSessionId)?.writeApplyPhaseExit({
+                stepId: stepDraft.id, phase: 'verify',
+                durationMs: Date.now() - verifyStart,
+                success: verified,
+                ...(clickEffectSignal !== undefined ? { skipReason: 'click_signal=' + clickEffectSignal } : {}),
+              });
+            } catch { /* non-fatal */ }
           }
 
           // For click in editor preview, treat verify=false as a real failure.

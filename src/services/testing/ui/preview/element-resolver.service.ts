@@ -2892,7 +2892,20 @@ export async function resolveElement(params: {
   // gemini-2.5-flash-lite natively handles multilingual matching, context understanding,
   // and disambiguation in a single call.
   if (!isLlmSelectBreakerOpen()) {
+    const llmStartedAt = Date.now();
     try {
+      // Editor trace: llm_request_start — gives us a clear "we entered LLM
+      // round-trip" marker so a hang vs slow LLM is distinguishable from a
+      // hang in candidate filtering or page evaluation.
+      try {
+        const llmTraceStart = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        llmTraceStart?.writeLlmRequestStart({
+          stepId: stepDraft.id,
+          purpose: 'element_resolve',
+          domNodesCount: domNodes.length,
+          candidatesCount: candidatesToProcess.length,
+        });
+      } catch { /* non-fatal */ }
       const llmResult = await selectElementWithLLM({
         intentText,
         actionType: stepDraft.type,
@@ -2911,6 +2924,21 @@ export async function resolveElement(params: {
       });
 
       cacheHit = llmResult.cacheHit;
+
+      try {
+        const llmTraceEnd = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        llmTraceEnd?.writeLlmRequestEnd({
+          stepId: stepDraft.id,
+          purpose: 'element_resolve',
+          durationMs: Date.now() - llmStartedAt,
+          success: llmResult.status === 'resolved',
+          chosenRef: llmResult.selectedRef || undefined,
+          confidence: llmResult.confidence,
+          cacheHit: llmResult.cacheHit,
+          model: llmResult._model,
+          ...(llmResult.status !== 'resolved' ? { errorReason: llmResult.status } : {}),
+        });
+      } catch { /* non-fatal */ }
 
       // Build LLM trace for diagnostics
       const llmTrace = llmResult._prompt ? {
@@ -3226,6 +3254,21 @@ export async function resolveElement(params: {
         totalLatencyMs,
       });
 
+      // Editor trace: llm_request_end with timedOut/error so a hung resolver
+      // is visible without correlating logger output.
+      try {
+        const llmTraceEnd = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        const isTimeout = /timeout|aborted/i.test(llmErrorMsg);
+        llmTraceEnd?.writeLlmRequestEnd({
+          stepId: stepDraft.id,
+          purpose: 'element_resolve',
+          durationMs: Date.now() - llmStartedAt,
+          success: false,
+          timedOut: isTimeout,
+          errorReason: llmErrorMsg.slice(0, 200),
+        });
+      } catch { /* non-fatal */ }
+
       return {
         status: 'not_found',
         message: 'Element resolution failed (LLM error)',
@@ -3245,6 +3288,20 @@ export async function resolveElement(params: {
       previewSessionId,
       totalLatencyMs,
     });
+
+    // Editor trace: emit llm_request_end with circuitOpen=true so the trace
+    // shows "we skipped LLM because the breaker was open", not "LLM was slow".
+    try {
+      const llmTraceCB = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+      llmTraceCB?.writeLlmRequestEnd({
+        stepId: stepDraft.id,
+        purpose: 'element_resolve',
+        durationMs: 0,
+        success: false,
+        circuitOpen: true,
+        errorReason: 'circuit_breaker_open',
+      });
+    } catch { /* non-fatal */ }
 
     return {
       status: 'not_found',

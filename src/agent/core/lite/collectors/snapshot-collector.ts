@@ -1150,6 +1150,14 @@ export class SnapshotCollector {
         // This set ensures every element gets a unique ref in each collection pass.
         const usedRefsThisPass = new Set<string>();
 
+        // Track per-element exceptions during the forEach pass. Without this,
+        // a regression like the April 2026 `tagLower` ReferenceError silently
+        // drops every element while debugStats shows uniqueCount=300+ but
+        // elementsAfterFilter=0 — looks identical to "page is genuinely empty".
+        // Recording the first ~3 messages lets us tell those cases apart.
+        const __forEachErrors: string[] = [];
+        let __forEachSkipCount = 0;
+
         // Process each unique element (including shadow DOM elements)
         uniqueElements.forEach((el: Element) => {
           try {
@@ -1975,8 +1983,13 @@ export class SnapshotCollector {
               })(),
             });
           } catch (err) {
-            // Skip element if any error
-            // No logging needed here - errors are expected for dynamic elements
+            __forEachSkipCount++;
+            if (__forEachErrors.length < 3) {
+              const msg = err instanceof Error
+                ? err.name + ': ' + err.message
+                : String(err);
+              __forEachErrors.push(msg.slice(0, 200));
+            }
           }
         });
 
@@ -2303,6 +2316,11 @@ export class SnapshotCollector {
           documentBodyChildCount: document.body ? document.body.children.length : -1,
           // @ts-expect-error
           totalDomElements: document.querySelectorAll('*').length,
+          // April 2026: surface silent forEach throws (e.g. ReferenceError
+          // from a missed variable declaration) so 0-element snapshots can
+          // be diagnosed without code spelunking.
+          forEachSkipCount: __forEachSkipCount,
+          forEachErrors: __forEachErrors,
         };
 
         return {

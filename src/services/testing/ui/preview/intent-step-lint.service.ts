@@ -781,6 +781,15 @@ export class IntentStepLintService {
         // semantic_mismatch). Helps spot drift after pipeline changes.
         cacheMetrics.inc('evidence-shortcut', shortcut.reason);
         cacheMetrics.inc('evidence-shortcut', 'miss');
+        try {
+          EditorTraceService.get(previewSessionId)?.writeEvidenceShortcut({
+            stepId: stepDraft.id,
+            hit: false,
+            cachedRef: stepDraft.evidence.lastSuccessRef,
+            reason: shortcut.reason,
+            detail: shortcut.details,
+          });
+        } catch { /* non-fatal */ }
       } else {
         const { node: cachedNode, ref: cachedRef } = shortcut;
         // Preview-specific: validate the cached node's tag/role against the action
@@ -832,6 +841,12 @@ export class IntentStepLintService {
                 evidenceShortcut: true,
                 evidenceRef: cachedRef,
                 latencyMs: 0,
+              });
+              trace.writeEvidenceShortcut({
+                stepId: stepDraft.id,
+                hit: true,
+                cachedRef,
+                reason: 'ok',
               });
             }
           } catch { /* trace logging must never break resolution */ }

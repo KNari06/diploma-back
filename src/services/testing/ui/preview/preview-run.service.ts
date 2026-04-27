@@ -789,6 +789,27 @@ export class PreviewRunService {
       });
       startedEmitted = true;
 
+      // Editor trace: session_context — single-shot snapshot of who/what/where
+      // so a reader doesn't have to correlate events to reconstruct the run.
+      try {
+        const ctxTrace = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        if (ctxTrace) {
+          ctxTrace.writeSessionContext({
+            previewSessionId,
+            userId,
+            intentTestCaseId,
+            isMobile: false,
+            isRecording: sessionService.isRecording(previewSessionId, userId),
+            startUrl,
+            currentUrl: session.page.url(),
+            stepCount: steps.length,
+            hasAuthBinding: false, // populated by runSavedSteps caller via separate writeSessionContext call when known
+            authReset,
+            runMode: persistAppliedSteps ? 'run_all' : 'single_apply',
+          });
+        }
+      } catch { /* non-fatal */ }
+
       // 6. Reset session state for fresh run (prevents stale state from previous run)
       session.lastSnapshotEmit = 0;
       session.lastPageSignature = '';
@@ -1246,6 +1267,30 @@ export class PreviewRunService {
           },
         });
 
+        // Editor trace: step_meta — what THIS step is supposed to do. Without
+        // this, replaying a trace turns into "what was step `f293...` again?".
+        try {
+          const metaTrace = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+          if (metaTrace) {
+            const stepKind = (step as unknown as { kind?: string }).kind;
+            const isManualStep = !/^rec_/.test(step.id || '');
+            metaTrace.writeStepMeta({
+              stepId: step.id,
+              type: step.type,
+              kind: stepKind,
+              description: step.description || '',
+              value: typeof step.value === 'string' ? step.value : undefined,
+              targetText: (step as unknown as { targetText?: string }).targetText,
+              cssSelector: step.options?.cssSelector,
+              iframeSelector: step.options?.iframe?.selector,
+              hasCompiled: !!step.compiled,
+              hasEvidence: !!step.evidence?.lastSuccessRef,
+              isManual: isManualStep,
+              options: step.options as Record<string, unknown> | undefined,
+            });
+          }
+        } catch { /* non-fatal */ }
+
         // V15: Lightweight page state snapshot for the editor trace — answers
         // "what state was the page in when this step started?" without needing
         // to reproduce the session. Fire-and-forget, capped at 200ms hard timeout.
@@ -1294,6 +1339,59 @@ export class PreviewRunService {
               frameworks: stateProbe.frameworks,
               hasServiceWorker: stateProbe.hasServiceWorker,
             });
+
+            // Detect mounted modals/dialogs/overlays so the trace shows
+            // whether the click was happening on a perceived-clean page or
+            // on top of an open dialog/drawer.
+            try {
+              const modalProbe = await Promise.race([
+                session.page.evaluate(() => {
+                  // @ts-expect-error - browser context
+                  const doc = document;
+                  const dialogs = doc.querySelectorAll(
+                    '[role="dialog"],[role="alertdialog"],dialog[open],[aria-modal="true"]'
+                  );
+                  const bodyChildCount = doc.body ? doc.body.children.length : 0;
+                  let topZIndex: number | undefined;
+                  let hasOverlay = false;
+                  let activeModalText: string | undefined;
+                  for (const child of (doc.body ? Array.from(doc.body.children) as any[] : [])) {
+                    try {
+                      const cs = (child.ownerDocument?.defaultView || (globalThis as any).window).getComputedStyle(child);
+                      const z = parseInt(cs.zIndex || '', 10);
+                      if (!isNaN(z) && (topZIndex === undefined || z > topZIndex)) topZIndex = z;
+                      const pos = cs.position;
+                      const rect = child.getBoundingClientRect ? child.getBoundingClientRect() : null;
+                      if ((pos === 'fixed' || pos === 'absolute') && rect && rect.width > 100 && rect.height > 100) {
+                        hasOverlay = true;
+                      }
+                    } catch { /* ignore */ }
+                  }
+                  if (dialogs.length > 0) {
+                    const first = dialogs[0] as any;
+                    activeModalText = (first.innerText || first.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 150);
+                  }
+                  return {
+                    dialogCount: dialogs.length,
+                    bodyChildCount,
+                    topZIndex,
+                    hasOverlay,
+                    activeModalText,
+                  };
+                }),
+                new Promise<null>((resolve) => setTimeout(() => resolve(null), 200)),
+              ]);
+              if (modalProbe) {
+                stateEditorTrace.writePageModalState({
+                  stepId: step.id,
+                  dialogCount: modalProbe.dialogCount,
+                  bodyChildCount: modalProbe.bodyChildCount,
+                  topZIndex: modalProbe.topZIndex,
+                  hasOverlay: modalProbe.hasOverlay,
+                  activeModalText: modalProbe.activeModalText,
+                });
+              }
+            } catch { /* non-fatal */ }
           } catch { /* non-fatal diagnostic */ }
         })();
 
@@ -2313,6 +2411,32 @@ export class PreviewRunService {
       try {
         const { resumeTrap } = await import('./external-nav-trap');
         resumeTrap(previewSessionId);
+      } catch { /* non-fatal */ }
+
+      // Editor trace: run_summary — single event with all the counters, so a
+      // reader doesn't have to grep for passes/fails. failedStepDetails carries
+      // the first 5 errors (truncated at upstream) for quick triage.
+      try {
+        const summaryTrace = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        if (summaryTrace) {
+          // compiledHits / llmCalls counters are NOT emitted — they're aggregated
+          // from individual `compiled_postcondition` and `llm_request_end` events
+          // by the reader. Putting placeholder zeros here would mislead anyone
+          // glancing at the summary.
+          summaryTrace.writeRunSummary({
+            previewSessionId,
+            intentTestCaseId,
+            totalSteps: steps.length,
+            passed: passedSteps,
+            failed: failedSteps,
+            skipped: skippedSteps,
+            cancelled,
+            timedOut,
+            totalDurationMs: duration,
+            failedStepIds: failedStepDetails.map((d) => String(d.stepIndex)),
+            failedStepReasons: failedStepDetails.map((d) => (d.error || '').slice(0, 200)),
+          });
+        }
       } catch { /* non-fatal */ }
 
       webSocketService.emitToUser(userId, 'preview:run:completed', {
