@@ -8,6 +8,7 @@ import type {
   StepOptions,
   BindingHints,
   StepEvidence,
+  TargetFingerprint,
 } from '@/services/testing/ui/preview/preview.types';
 
 // ============================================================================
@@ -1213,6 +1214,13 @@ export interface PreviewIntentStep {
   options?: StepOptions;
   /** Cached evidence from recording or prior execution (used as evidence shortcut during apply/run) */
   evidence?: StepEvidence;
+  /**
+   * V22: Fingerprint of the element captured AT RECORDING TIME (probe snapshot).
+   * Mirror of `IntentStep.recordedFingerprint` — see preview.types.ts for the
+   * full rationale. Travels with the step from recorder → frontend → DB → LLM
+   * resolver, so the FIRST apply already has rich identifying data.
+   */
+  recordedFingerprint?: TargetFingerprint;
   /** V15: Tab index this step targets (0 = initial tab, 1+ = popups) */
   tabIndex?: number;
   /**

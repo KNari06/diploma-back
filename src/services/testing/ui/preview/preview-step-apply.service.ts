@@ -88,12 +88,26 @@ function shouldUpgradeCompiledPlan(
 }
 
 /**
- * V2: Build bindingHints from resolved InteractiveNode
- * Auto-populates hints for better runtime resolution
+ * V2: Build bindingHints from resolved InteractiveNode.
+ * Auto-populates hints for better runtime resolution.
+ *
+ * V22: Extended to mirror all identifying fields the recorder captures via
+ * probe (recording-capture.service.ts buildBindingHints). Without this
+ * symmetry, MANUALLY-AUTHORED steps (created in editor without recording)
+ * had only 6 hints after their first apply, while RECORDED steps had 15+.
+ * That mismatch made manual-step re-resolution and the LLM resolver
+ * disambiguation noticeably worse for icon-only buttons, options, and
+ * Bootstrap triggers.
+ *
+ * Now both code paths produce the same hint set after first successful
+ * apply — manual steps catch up to recorded steps from the second resolve
+ * onwards.
  */
 function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
   const hints: BindingHints = {};
 
+  // Original V2 hints (kept for compatibility with the score-based fallback
+  // path in intent-step-lint.service.ts:scoreCandidate).
   if (node.role) hints.role = node.role;
   if (node.labelText) hints.label = node.labelText;
   if (node.placeholder) hints.placeholder = node.placeholder;
@@ -104,6 +118,50 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
   if (node.containerTitles && node.containerTitles.length > 0) {
     hints.nearText = node.containerTitles[0];
   }
+
+  // V22: identity attributes — surface every stable signal the snapshot
+  // collector extracted (filtered for framework-generated ids).
+  if (node.text) hints.text = node.text;
+  if (node.tag) hints.tag = node.tag;
+  if (node.testIdAttr) hints.testId = node.testIdAttr;
+  if (node.id && !node.isDynamicId) hints.elementId = node.id;
+  if (node.title) hints.nearText = hints.nearText || node.title;
+  if ((node as any).alt) hints.alt = (node as any).alt;
+  if (node.name) hints.name = node.name;
+  if (node.ariaLabel && !hints.nearText) hints.nearText = node.ariaLabel;
+
+  // V22 secondary locator signals.
+  if ((node as any).href) hints.href = (node as any).href;
+  if ((node as any).ariaControls) hints.ariaControls = (node as any).ariaControls;
+  if (node.nearestLandmark) hints.nearestLandmark = node.nearestLandmark;
+  if (node.containerTitles && node.containerTitles.length > 1) {
+    hints.containerTitles = node.containerTitles.slice(0, 2);
+  }
+
+  // V22 Pkg1 — child icon testid lift + select option semantic key.
+  if ((node as any).childTestId) hints.childTestId = (node as any).childTestId;
+  if ((node as any).dataValue) hints.dataValue = (node as any).dataValue;
+
+  // V22 Pkg2 — Bootstrap / aria-haspopup / activedescendant / row-key.
+  if ((node as any).bsToggle) hints.bsToggle = (node as any).bsToggle;
+  if ((node as any).bsTarget) hints.bsTarget = (node as any).bsTarget;
+  if ((node as any).ariaHasPopup) hints.ariaHasPopup = (node as any).ariaHasPopup;
+  if ((node as any).ariaActiveDescendant) hints.ariaActiveDescendant = (node as any).ariaActiveDescendant;
+  if ((node as any).dataRowKey) hints.dataRowKey = (node as any).dataRowKey;
+
+  // V22: ARIA state at resolve-time. Records whether the resolved live
+  // element was expanded/pressed/checked/invalid/current/etc. so the next
+  // resolve treats those state hints as expectations (e.g. "click submit
+  // when invalid" stays meaningful between applies).
+  const ariaState: NonNullable<BindingHints['ariaState']> = {};
+  if (node.ariaExpanded !== undefined) ariaState.expanded = node.ariaExpanded;
+  if (node.ariaPressed !== undefined) ariaState.pressed = node.ariaPressed;
+  if (node.checked !== undefined) ariaState.checked = node.checked;
+  if (node.invalid !== undefined) ariaState.invalid = node.invalid;
+  if ((node as any).ariaCurrent) ariaState.current = (node as any).ariaCurrent;
+  if (typeof (node as any).ariaValueNow === 'number') ariaState.valueNow = (node as any).ariaValueNow;
+  if ((node as any).ariaValueText) ariaState.valueText = (node as any).ariaValueText;
+  if (Object.keys(ariaState).length > 0) hints.ariaState = ariaState;
 
   return hints;
 }

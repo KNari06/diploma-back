@@ -11,7 +11,7 @@ import { randomUUID } from 'crypto';
 import { Browser, BrowserContext, Page, chromium } from 'playwright';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
-import type { InteractiveNode, PreviewSession } from './preview.types';
+import type { InteractiveNode, PreviewSession, TargetFingerprint } from './preview.types';
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { waitForPageInteractive } from './page-interactive.utils';
@@ -373,6 +373,13 @@ interface InternalSession extends PreviewSession {
     pageUrl?: string;
     /** V13: CSS selector of iframe containing the focused element */
     iframeSelector?: string;
+    /**
+     * V22: Probe-time fingerprint of the focused input. Travels with the
+     * buffer through `flushTypingBuffer` into the resulting type-step's
+     * `recordedFingerprint`, giving the LLM resolver full identifying
+     * data on first apply (no need to wait for compiled-plan generation).
+     */
+    recordedFingerprint?: TargetFingerprint;
   } | null;
   recordingLastUrl: string;
   /** V10: Drag state tracked between mouse:down and mouse:up */

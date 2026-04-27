@@ -269,6 +269,31 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.ariaChecked = element.ariaChecked;
   }
 
+  // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state + Select value + IconButton child lift
+  if (element.ariaCurrent) {
+    node.ariaCurrent = element.ariaCurrent;
+  }
+  if (element.ariaValueNow !== undefined) {
+    node.ariaValueNow = element.ariaValueNow;
+  }
+  if (element.ariaValueText) {
+    node.ariaValueText = element.ariaValueText;
+  }
+  if (element.dataValue) {
+    node.dataValue = element.dataValue;
+  }
+  if (element.childTestId) {
+    node.childTestId = element.childTestId;
+  }
+
+  // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
+  if (element.bsToggle) node.bsToggle = element.bsToggle;
+  if (element.bsTarget) node.bsTarget = element.bsTarget;
+  if (element.ariaHasPopup) node.ariaHasPopup = element.ariaHasPopup;
+  if (element.ariaActiveDescendant) node.ariaActiveDescendant = element.ariaActiveDescendant;
+  if (element.dataRowKey) node.dataRowKey = element.dataRowKey;
+  if (element.rowClickable) node.rowClickable = element.rowClickable;
+
   // ═══════════════════════════════════════════════════════════════════════════
   // V2: Validation state
   // ═══════════════════════════════════════════════════════════════════════════

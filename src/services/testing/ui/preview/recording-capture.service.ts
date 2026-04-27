@@ -23,6 +23,7 @@ import type {
   BindingHints,
   ElementBoundingBox,
   IntentActionType,
+  TargetFingerprint,
 } from './preview.types';
 // V15: generateText imported lazily inside resolveInteractiveTarget() to avoid loading AI pipeline on service init
 import type { PreviewIntentStep } from '@/websocket/types/types';
@@ -45,6 +46,79 @@ export interface ProbedElement {
   checked?: boolean;
   ariaExpanded?: boolean;
   ariaPressed?: boolean;
+  /**
+   * V22: aria-invalid — validation state at recording time. Critical for
+   * negative-test recording (user records "submit form with empty email →
+   * red error border"). Without it the resolver can't tell apart a clean
+   * input from an invalid one with the same selector — and replay may
+   * match a *valid* input where the recording targeted the *invalid* one.
+   */
+  ariaInvalid?: boolean;
+  /**
+   * V22 Pkg1: aria-current value (page|step|date|true|location). Pagination
+   * shows it on the active page, Stepper on the active step, Breadcrumbs on
+   * the last crumb. Without it, all pagination buttons look identical to the
+   * resolver — recorded "click page 2" can match any page.
+   */
+  ariaCurrent?: string;
+  /**
+   * V22 Pkg1: aria-valuenow / aria-valuetext — current value of slider /
+   * spinbutton / progressbar. Records "set slider to 50" so replay can
+   * match the same target by its semantic value. valuetext takes priority
+   * (it's a human-readable form) when both are present.
+   */
+  ariaValueNow?: number;
+  ariaValueText?: string;
+  /**
+   * V22 Pkg1: data-value (or `<option value="...">` value). Stable
+   * identifier for select options / list items / chips that have semantic
+   * keys distinct from their display text — e.g. `<option value="kz">Казахстан</option>`,
+   * recording "select Казахстан" stores value="kz" so localized labels still
+   * resolve.
+   */
+  dataValue?: string;
+  /**
+   * V22 Pkg1: data-testid of a single direct child icon (svg/i/img) when
+   * the target itself is descriptor-poor. Closes the most common gap on
+   * MUI IconButton, Element Plus el-tooltip__trigger, Ant Design icon
+   * buttons — the icon's data-testid carries the semantic name
+   * (`VisibilityOffOutlinedIcon`) but lives on the child, not the button.
+   */
+  childTestId?: string;
+  /**
+   * V22 Pkg2: Bootstrap data-bs-toggle / data-bs-target. The de-facto
+   * marker for Bootstrap modals, dropdowns, tabs, accordions, collapses.
+   * `bsToggle` carries the widget kind ("modal" | "dropdown" | "tab" | ...);
+   * `bsTarget` the CSS selector pointing to the controlled element.
+   */
+  bsToggle?: string;
+  bsTarget?: string;
+  /**
+   * V22 Pkg2: aria-haspopup — disambiguation signal for dropdown / menu /
+   * combobox triggers. Even when text or icon is duplicated across the page,
+   * `aria-haspopup="menu"` distinguishes a real trigger from a static button.
+   */
+  ariaHasPopup?: string;
+  /**
+   * V22 Pkg2: aria-activedescendant — id of the currently-active descendant
+   * inside a Combobox / Listbox / Tree. Lets recorder capture "the option
+   * that was hovered when user clicked", crucial for type-ahead flows.
+   */
+  ariaActiveDescendant?: string;
+  /**
+   * V22 Pkg2: data-row-key (AntD), data-rk (RainbowKit), key="..." prop
+   * leaked to DOM by some Vue/React table libs. Stable row identity that
+   * survives re-renders.
+   */
+  dataRowKey?: string;
+  /**
+   * V22 Pkg2: heuristic flag — "this <tr> looks clickable even without
+   * role/onclick". Probe sets it when the row matches at least two
+   * positive signals (cursor:pointer + hover class, or class*="clickable",
+   * or parent table has a click handler). Recorder uses it to elevate
+   * resolvedVia from `directHit` to `behavioral`.
+   */
+  rowClickable?: boolean;
   boundingBox?: ElementBoundingBox;
   /** True if element accepts multi-line text (textarea, contenteditable) */
   isMultiline?: boolean;
@@ -56,16 +130,88 @@ export interface ProbedElement {
   alt?: string;
   /** V18: data-testid/data-test/data-cy — stable test identifier */
   testId?: string;
+  /**
+   * V22: DOM `id` attribute — most stable locator after testId. Critical for
+   * icon-only elements (svg/img/i) where text/aria-label are absent. On Vue
+   * apps from Element Plus / Ant Design icons typically lack labels but carry
+   * a stable `id="layout-header-setting"` — without this field the recorder
+   * falls back to "tag: svg" which collides with every other svg on the page.
+   */
+  elementId?: string;
+  /**
+   * V22: First 1-3 className tokens (filtered to drop utility classes like
+   * Tailwind/UnoCSS shorthand). Useful as a secondary locator when id is
+   * absent but framework-scoped CSS class is stable (e.g. el-button--primary).
+   */
+  cssClass?: string;
+  /**
+   * V22: aria-controls — semantic link to the controlled element. Frequently
+   * stable on dropdowns, tabs, comboboxes. Doubles as a uniqueness signal
+   * even when text is duplicated across the page.
+   */
+  ariaControls?: string;
+  /**
+   * V22: href — for <a> tags. Even when link text is duplicated ("Read more"
+   * × 5), the href differentiates them. Truncated to first 200 chars to
+   * keep the recording payload bounded for sites with very long URLs.
+   */
+  href?: string;
+  /**
+   * V22: Vue scoped style attribute (`data-v-XXXXXXX`). On Vue apps this is
+   * a stable component-instance marker — narrows down to "this exact button
+   * within this exact component" even if class names are utility-only.
+   */
+  vueScopeId?: string;
+  /**
+   * V22: Nearest ARIA landmark (banner / navigation / main / complementary /
+   * search / contentinfo / form). Computed from `target.closest('[role=...]')`
+   * or implicit landmarks (`<header>`, `<nav>`, `<main>`, etc.). Crucial for
+   * disambiguating elements that recur across page sections — e.g. "Settings"
+   * link in nav vs "Settings" link in footer.
+   */
+  nearestLandmark?: string;
+  /**
+   * V22: Up to 2 nearest container titles (first `<h1>..<h6>` or `[role="heading"]`
+   * found by walking ancestors). Used for "this button inside the Login form"
+   * style disambiguation when a page has multiple visually-identical sections.
+   */
+  containerTitles?: string[];
+  /**
+   * V22: Compact one-line summary of `ancestorChain` for inclusion in LLM
+   * prompts. Format: `"<tag>[role|id|class] > <tag> > <tag>"` from outer
+   * to inner. Saves tokens vs sending the full chain object — and survives
+   * the JSON round-trip into bindingHints / DB unlike the chain itself
+   * (which is documented as transient and not persisted).
+   */
+  ancestorSummary?: string;
   /** V13: CSS selector of the iframe containing this element (set when element is inside an iframe) */
   iframeSelector?: string;
   /** V14: Marker — element is inside a cross-origin iframe and cannot be probed/recorded */
   crossOriginIframe?: boolean;
   /** V15: How the interactive target was resolved from the click point */
   resolvedVia?: 'nativeTag' | 'ariaRole' | 'behavioral' | 'cssClass' | 'cursorPointer' | 'directHit' | 'llm';
-  /** V15: Ancestor chain from directHit to body — transient, used for server-side LLM fallback, NOT saved to DB */
+  /**
+   * Ancestor chain from target up to body, capped at 6 levels.
+   *
+   * V15: originally collected only for `directHit` / `cssClass` resolves and
+   *      treated as transient (not persisted).
+   * V22: now collected for ALL resolves — icon targets (cursorPointer) need
+   *      this most, since they have no descriptors of their own. Used by
+   *      `ancestorSummary` builder which IS persisted (bindingHints +
+   *      fingerprint), and by the legacy LLM ancestor-walk in
+   *      `resolveInteractiveTarget`.
+   *
+   * Each segment carries identifying signals in priority order: testId, id,
+   * role, text, ariaLabel, className. The first non-generated, non-empty
+   * field is what the summary builder picks.
+   */
   ancestorChain?: Array<{
     tag: string;
     role?: string;
+    /** V22: stable DOM id (framework-generated ids are filtered at probe time) */
+    id?: string;
+    /** V22: data-testid / data-test / data-cy / data-qa from this ancestor */
+    testId?: string;
     text?: string;
     ariaLabel?: string;
     className?: string;
@@ -80,6 +226,14 @@ export interface RecordingTypingBuffer {
   elementLabel: string;
   lastCharAt: number;
   bindingHints?: Record<string, string>;
+  /**
+   * V22: Fingerprint of the focused input AT FOCUS TIME. Mirror of
+   * `bindingHints` but in TargetFingerprint shape — used to populate the
+   * eventual type-step's `recordedFingerprint` so the resolver can find
+   * the right input on apply (especially when the form has 3 lookalike
+   * `<input type="text">` fields).
+   */
+  recordedFingerprint?: TargetFingerprint;
   /** True if the focused element is multiline (textarea, contenteditable) */
   isMultiline?: boolean;
   /** URL where typing started (guards against cross-page ref collision) */
@@ -275,11 +429,35 @@ const PROBE_AT_POINT_FN = `
       } catch(e) {}
     }
 
+    // V22: Extract id and testId from each ancestor — critical for icon
+    // targets where ancestor's id is the only stable locator (e.g. svg
+    // inside <header id="layout-header"> or <button data-testid="settings">).
+    // Filter happens at chain-projection time (DYNAMIC_ID inline patterns).
+    var wid = (walk.getAttribute('id') || '').slice(0, 80);
+    // V22: same chain as the target-level testId extraction. Keep in sync.
+    var wtestid = walk.getAttribute('data-testid')
+      || walk.getAttribute('data-test')
+      || walk.getAttribute('data-test-id')
+      || walk.getAttribute('data-cy')
+      || walk.getAttribute('data-qa')
+      || walk.getAttribute('data-qa-test-id')
+      || walk.getAttribute('data-qa-id')
+      || walk.getAttribute('data-qaa')
+      || walk.getAttribute('data-automation-id')
+      || walk.getAttribute('data-automationid')
+      || walk.getAttribute('data-pw')
+      || walk.getAttribute('data-e2e')
+      || walk.getAttribute('data-e2e-test')
+      || walk.getAttribute('data-test-element')
+      || walk.getAttribute('data-track')
+      || '';
     chain.push({
       el: walk,
       tag: wtag,
       role: wrole,
       className: wclass,
+      id: wid,
+      testId: wtestid,
       hasTabindex: hasTabindex,
       hasOnclick: hasOnclick,
       hasFrameworkBinding: hasFrameworkClick,
@@ -364,7 +542,74 @@ const PROBE_AT_POINT_FN = `
     } catch(e) {}
   }
 
+  // V22 Pkg2 — Clickable row promotion.
+  // MUI/AntD/Element Plus tables make <tr> kликабельным через CSS hover +
+  // JS handler без role/onclick. If we landed on a <td>/<span> inside a
+  // <tr> that looks clickable (cursor:pointer OR hover-class), promote
+  // the target to the <tr>. Without this, recording grabs random cell text
+  // and replay clicks an unrelated cell instead of the row action.
+  // Constraint: only promote when target is a leaf inside the row, not
+  // when target IS the row already (would dead-loop the chain).
+  if (resolvedVia === 'directHit' || resolvedVia === 'cssClass' || resolvedVia === 'cursorPointer') {
+    try {
+      var rowAncestor = target.closest && target.closest('tr');
+      if (rowAncestor && rowAncestor !== target) {
+        var rowCursor = getComputedStyle(rowAncestor).cursor;
+        var rowClass = rowAncestor.getAttribute('class') || '';
+        var rowHoverish = /\b(hover|clickable|MuiTableRow-hover|ant-table-row|el-table__row|row-clickable)\b/i.test(rowClass);
+        if (rowCursor === 'pointer' || rowHoverish) {
+          target = rowAncestor;
+          resolvedVia = 'behavioral';
+        }
+      }
+    } catch (e) {}
+  }
+
+  // V22 Pkg1 — Fix 6: MUI fieldset rim to input promotion.
+  // Material-UI's OutlinedInput renders an invisible fieldset (class
+  // contains notchedOutline) overlay on top of the input for the border.
+  // A click landing on the fieldset rim (the 1-2px border zone) lands on
+  // the fieldset, not the input. Recording captures fieldset which is
+  // non-interactive and useless for replay. Promote to the actual input
+  // inside the surrounding MuiInputBase-root container.
+  // Same pattern catches Element Plus el-input__inner / Ant Design
+  // ant-input-affix-wrapper variants — any input wrapper with rim overlay.
+  try {
+    var ttag = (target.tagName || '').toLowerCase();
+    var tcls = target.getAttribute && (target.getAttribute('class') || '');
+    var looksLikeInputRim =
+      (ttag === 'fieldset' && /notchedOutline|input.?border|input.?frame/i.test(tcls))
+      || /MuiOutlinedInput-notchedOutline/i.test(tcls)
+      || /el-input__suffix|el-input__prefix|el-input__wrapper/i.test(tcls)
+      || /ant-input-affix-wrapper(?!__)/i.test(tcls);
+    if (looksLikeInputRim) {
+      // Walk up looking for the wrapper container with a real input/textarea/select inside.
+      var rimWalk = target;
+      for (var rwi = 0; rwi < 4 && rimWalk; rwi++) {
+        var rwCls = rimWalk.getAttribute && (rimWalk.getAttribute('class') || '');
+        if (/MuiInputBase-root|MuiInput-root|MuiTextField-root|el-input(?!_)|ant-input-affix-wrapper(?!__)/i.test(rwCls)) {
+          var realInput = rimWalk.querySelector && rimWalk.querySelector('input, textarea, select, [contenteditable="true"]');
+          if (realInput) {
+            target = realInput;
+            resolvedVia = 'nativeTag';
+            break;
+          }
+        }
+        rimWalk = rimWalk.parentElement;
+      }
+    }
+  } catch (e) { /* best-effort, fall through to whatever target probe picked */ }
+
   // ── Collect data from chosen target ──────────────────────────────────
+  // V22 Audit-fix H3: guard against text/comment nodes that may slip in
+  // through fieldset->input promotion when the wrapper has no real input.
+  // Without this guard, a Text node leaks here and target.tagName throws,
+  // killing the entire probe call. Fall back to the original element when
+  // target lost its tagName (Element only has it).
+  if (!target || !target.tagName) {
+    target = el;
+    resolvedVia = 'directHit';
+  }
   var tag = target.tagName.toLowerCase();
   var labelText = undefined;
   if (target.labels && target.labels.length > 0) {
@@ -381,6 +626,15 @@ const PROBE_AT_POINT_FN = `
   var rect = target.getBoundingClientRect();
   var ae = target.getAttribute('aria-expanded');
   var ap = target.getAttribute('aria-pressed');
+  // V22: aria-invalid (or :invalid native pseudo for inputs). Records the
+  // validation state at the moment of capture so negative-flow tests
+  // ("user clicked invalid field → red border") replay against the same
+  // visual state, not a freshly-cleared field.
+  var aiAttr = target.getAttribute('aria-invalid');
+  var ai = aiAttr === 'true' ? true : aiAttr === 'false' ? false : undefined;
+  if (ai === undefined && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
+    try { if (target.matches && target.matches(':invalid')) ai = true; } catch (e) {}
+  }
 
   // Detect multiline: textarea, contenteditable, or role=textbox with aria-multiline
   var isMultiline = tag === 'textarea'
@@ -400,28 +654,426 @@ const PROBE_AT_POINT_FN = `
     walk2 = walk2.parentElement;
   }
 
-  // V15: Build ancestor chain summary for server-side LLM fallback (transient, not saved to DB)
+  // V22: Inline framework-id filter for page-context (cannot import the
+  // shared util into page.evaluate). MUST stay in sync with
+  // dynamic-id.util.ts — drift causes inconsistent locator plans between
+  // recording-time and apply-time. Conservative: only the highest-confidence
+  // shape patterns + the most common UI-library prefixes that are diagnostic.
+  var IS_GENERATED_ID = function (idStr) {
+    if (!idStr || idStr.length === 0 || idStr.length > 80) return true;
+    var s = idStr;
+    if (/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(s)) return true; // UUID
+    if (/^[a-f0-9]{24,}$/i.test(s)) return true;                                                 // Mongo / hex
+    if (/^[0-9a-z]{20,}$/i.test(s)) return true;                                                 // long token
+    if (/^\d{10,}$/.test(s)) return true;                                                        // epoch
+    if (/:r[a-z0-9]+:?$/i.test(s)) return true;                                                  // React useId
+    if (/:R[A-Za-z0-9]+:?$/.test(s)) return true;
+    if (/^react-select-\d+-/i.test(s)) return true;                                              // React Select
+    if (/^react-(?:tabs|router|aria|focus-lock|portal|datepicker)-/i.test(s)) return true;       // narrow react-*
+    if (/^el-id-[\w-]+$/i.test(s)) return true;                                                  // Element Plus
+    if (/^radix-[a-z0-9-]+/i.test(s)) return true;                                               // Radix UI
+    if (/^mui-[\w-]+$/i.test(s)) return true;                                                    // MUI
+    if (/^headlessui-[\w-]+$/i.test(s)) return true;                                             // Headless UI
+    if (/^chakra-[\w-]+$/i.test(s)) return true;                                                 // Chakra
+    if (/^downshift-\d+-/i.test(s)) return true;                                                 // Downshift
+    if (/^cdk-(?:overlay|describedby|focus-trap|live)-/i.test(s)) return true;                   // Angular CDK
+    if (/^mat-(?:input|tab|menu|select|dialog|chip|mdc)-\d/i.test(s)) return true;               // Angular Material
+    if (/^rc-[a-z]+-\d/i.test(s)) return true;                                                   // rc-* (Ant Design)
+    if (/^ant-[a-z-]+-\d/i.test(s)) return true;                                                 // Ant Design
+    if (/^pv_id_\d+$/.test(s)) return true;                                                      // PrimeVue
+    if (/^pn_id_\d+$/.test(s)) return true;                                                      // PrimeNG
+    if (/^__BVID__\d+$/.test(s)) return true;                                                    // BootstrapVue
+    if (/^vs__/.test(s)) return true;                                                            // vue-select
+    if (/^lit-element-\d+$/i.test(s)) return true;                                               // Lit
+    if (/^sc-[a-z0-9-]+-h-/i.test(s)) return true;                                               // Stencil/Ionic
+    if (/^q-[a-z]+-\d+$/i.test(s)) return true;                                                  // Quasar
+    if (/^n-[a-z]+-\d+$/i.test(s)) return true;                                                  // Naive UI
+    if (/^lightning-[a-z]+-\d+/i.test(s)) return true;                                           // Salesforce
+    if (/^slds-[a-z-]+-\d+$/i.test(s)) return true;
+    if (/^aria-id-\d+$/i.test(s)) return true;
+    if (/^descid-\d+$/i.test(s)) return true;
+    if (/^lit\$/.test(s)) return true;
+    if (/^ember\d+/i.test(s)) return true;
+    if (/^ng-[a-z0-9-]+/i.test(s)) return true;                                                  // AngularJS
+    if (/^_[a-zA-Z0-9]{12,}$/.test(s)) return true;                                              // long underscore-prefixed (Emotion)
+    return false;
+  };
+
+  // V22: ancestorChain — now includes id/testId for each segment, with
+  // framework-generated ids filtered out. The chain is no longer a transient
+  // debug artefact — it travels with the step (when persistance enabled below)
+  // so the LLM resolver can reason about "this svg inside the Settings header".
+  // Cap depth at 6 levels to keep payload bounded; that's enough for icon-in-
+  // button-in-toolbar-in-header chains and avoids dragging the whole DOM tree.
   var ancestorChain = [];
-  for (var aci = 0; aci < chain.length; aci++) {
+  for (var aci = 0; aci < Math.min(chain.length, 6); aci++) {
     var ac = chain[aci];
+    var acId = ac.id && !IS_GENERATED_ID(ac.id) ? ac.id : undefined;
+    var acTestId = ac.testId || undefined;
+    var acClassFiltered = undefined;
+    if (ac.className) {
+      // V22 Pkg3 — same css-in-js detection as the target-level extraction.
+      var acHasCssInJs = /(?:^| )(?:css-[a-z0-9]{6,}|sc-[a-zA-Z0-9]{6,})(?: |$)/i.test(ac.className);
+      var acTokens = ac.className.split(/\s+/).filter(function (t) {
+        if (!t || t.length > 50) return false;
+        if (/^(?:[wh]-|p[xytrbl]?-|m[xytrbl]?-|gap-|flex|grid|block|inline|hidden|absolute|relative|fixed|text-|bg-|border|rounded|shadow|opacity|cursor-|select-|items-|justify-|self-|space-|overflow-|min-|max-|top-|left-|right-|bottom-|z-|font-|leading-|tracking-|whitespace-|truncate|line-clamp|transition|duration-|ease-|animate-|hover:|focus:|active:|disabled:|group-)/.test(t)) return false;
+        if (/^data-v-[a-f0-9]{8}$/.test(t)) return false;
+        // V22 Pkg3: Emotion / styled-components scoped classes.
+        if (/^css-[a-z0-9]{6,}$/i.test(t)) return false;
+        if (/^sc-[a-zA-Z0-9]{6,}$/.test(t)) return false;
+        if (acHasCssInJs && /^[a-z][a-zA-Z]{4,7}$/.test(t) && /[A-Z]/.test(t)) return false;
+        return true;
+      });
+      if (acTokens.length > 0) acClassFiltered = acTokens.slice(0, 2).join(' ');
+    }
     ancestorChain.push({
       tag: ac.tag,
       role: ac.role || undefined,
+      id: acId,
+      testId: acTestId,
       text: ac.text ? ac.text.slice(0, 50) : undefined,
       ariaLabel: ac.ariaLabel || undefined,
-      className: ac.className ? ac.className.split(' ').slice(0, 3).join(' ') : undefined
+      className: acClassFiltered
     });
   }
+
+  // V22: Persistent compact ancestor-chain summary. Used by the LLM resolver
+  // at apply time as the primary "where on the page" hint when the target
+  // element itself has no descriptors.
+  //
+  // Format example:
+  //   "header#layout-header > div.icon-group > svg"
+  //   "form[role=form] > [data-testid=email-input]"
+  //
+  // Identifier selection per segment, in priority order:
+  //   1. testId  → "[data-testid=...]"            (gold-standard locator)
+  //   2. id      → "#stable-id"                   (rejected if framework-generated)
+  //   3. role    → "[role=...]"                   (semantic landmark)
+  //   4. text    → "[text='Login']" (≤30 chars)   (label-bearing button/link parent)
+  //   5. class   → ".first-class"                 (last resort)
+  //
+  // Built for ALL probe outcomes (cursorPointer / nativeTag / etc.), not
+  // just directHit/cssClass — that was the original design flaw which left
+  // icon-only targets (where summary is most useful) without it.
+  var ancestorSummary = undefined;
+  if (ancestorChain.length > 0) {
+    var summarySegments = [];
+    for (var asi = 0; asi < Math.min(ancestorChain.length, 5); asi++) {
+      var seg = ancestorChain[asi];
+      var segIdent = '';
+      if (seg.testId) segIdent = '[data-testid=' + seg.testId + ']';
+      else if (seg.id) segIdent = '#' + seg.id;
+      else if (seg.role) segIdent = '[role=' + seg.role + ']';
+      else if (seg.text && seg.text.length <= 30) segIdent = "[text='" + seg.text.replace(/'/g, "") + "']";
+      else if (seg.className) segIdent = '.' + seg.className.split(' ')[0];
+      summarySegments.push(seg.tag + segIdent);
+    }
+    summarySegments.reverse();          // chain is inner→outer; we want outer→inner
+    summarySegments.push(tag);           // target itself at the leaf
+    ancestorSummary = summarySegments.join(' > ').slice(0, 250);
+  }
+
+  // V22: Nearest ARIA landmark (banner|navigation|main|complementary|search|
+  // contentinfo|form). Implicit landmarks via tagName, explicit via role attr.
+  // Walk closest-first, stop at body. Mirrors how snapshot collector tags
+  // InteractiveNode.nearestLandmark so apply-time and recording-time agree.
+  var nearestLandmark = undefined;
+  var landmarkWalk = target.parentElement;
+  var LANDMARK_TAGS = { 'header': 'banner', 'nav': 'navigation', 'main': 'main',
+                        'aside': 'complementary', 'footer': 'contentinfo', 'form': 'form' };
+  var EXPLICIT_LANDMARKS = ['banner', 'navigation', 'main', 'complementary',
+                            'search', 'contentinfo', 'form', 'region'];
+  for (var lwi = 0; lwi < 12 && landmarkWalk; lwi++) {
+    var lwRole = landmarkWalk.getAttribute('role');
+    if (lwRole && EXPLICIT_LANDMARKS.indexOf(lwRole) !== -1) {
+      nearestLandmark = lwRole;
+      break;
+    }
+    var lwTagLower = (landmarkWalk.tagName || '').toLowerCase();
+    if (LANDMARK_TAGS[lwTagLower]) {
+      nearestLandmark = LANDMARK_TAGS[lwTagLower];
+      break;
+    }
+    landmarkWalk = landmarkWalk.parentElement;
+  }
+
+  // V22: Container titles — first 1-2 enclosing headings or dialog/form titles.
+  // Different from containerText (which is also a heading walk but caps at
+  // first hit): we collect up to 2 distinct headings to give the resolver
+  // enough context for nested forms (e.g. Settings > Profile > Save).
+  var containerTitlesArr = [];
+  var titleWalk = target.parentElement;
+  var seenTitles = {};
+  for (var twi = 0; twi < 12 && titleWalk && containerTitlesArr.length < 2; twi++) {
+    var twHeading = titleWalk.querySelector(':scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > [role="heading"]');
+    if (twHeading) {
+      var tt = (twHeading.textContent || '').trim().slice(0, 60);
+      if (tt && !seenTitles[tt]) { seenTitles[tt] = 1; containerTitlesArr.push(tt); }
+    }
+    // Element Plus / Ant Design dialog title pattern
+    var twDialogTitle = titleWalk.getAttribute('aria-labelledby');
+    if (twDialogTitle) {
+      var twTitleEl = document.getElementById(twDialogTitle);
+      if (twTitleEl) {
+        var tt2 = (twTitleEl.textContent || '').trim().slice(0, 60);
+        if (tt2 && !seenTitles[tt2]) { seenTitles[tt2] = 1; containerTitlesArr.push(tt2); }
+      }
+    }
+    titleWalk = titleWalk.parentElement;
+  }
+  var containerTitles = containerTitlesArr.length > 0 ? containerTitlesArr : undefined;
 
   // V18: Collect title and data-testid for behavioral elements with no text/label
   var titleAttr = target.getAttribute('title') || undefined;
   // alt attribute — fallback for <img> targets where textContent is empty
   var altAttr = target.getAttribute('alt') || undefined;
+  // V22: Test-id fallback chain. Ordered by industry adoption (data-testid is
+  // the de-facto standard; the rest cover corporate naming conventions seen
+  // across MUI/Element Plus/Angular/Vue stacks, Cypress/Playwright/Selenium
+  // codebases, and Russian/Kazakhstan SaaS (Documentolog uses data-qa-test-id).
+  // Order matters only for which value lands in testId when multiple are
+  // present — adding more patterns is safe (we just look up first non-empty).
   var testId = target.getAttribute('data-testid')
     || target.getAttribute('data-test')
     || target.getAttribute('data-test-id')
     || target.getAttribute('data-cy')
+    || target.getAttribute('data-qa')
+    || target.getAttribute('data-qa-test-id')      // Documentolog / MUI corporate
+    || target.getAttribute('data-qa-id')           // alt naming
+    || target.getAttribute('data-qaa')             // Angular HostBinding convention
+    || target.getAttribute('data-automation-id')   // Cypress / Selenium corp
+    || target.getAttribute('data-automationid')    // Microsoft / FluentUI variant
+    || target.getAttribute('data-pw')              // Playwright community
+    || target.getAttribute('data-e2e')             // generic e2e
+    || target.getAttribute('data-e2e-test')        // generic e2e (full)
+    || target.getAttribute('data-test-element')    // long-form variant
+    || target.getAttribute('data-track')           // analytics-friendly testing hook
     || undefined;
+
+  // V22: id — most stable locator after testId. Skip framework-generated IDs
+  // (Element Plus "el-id-XXXX-N" pattern, Radix UI "radix-:rXX:" pattern,
+  // Vue UUID-like ids) since those rotate between sessions / SSR vs CSR.
+  var rawId = target.id || target.getAttribute('id') || '';
+  var elementId = undefined;
+  if (rawId && rawId.length > 0 && rawId.length < 80) {
+    var looksGenerated =
+      /^el-id-/i.test(rawId)               // Element Plus
+      || /^radix-/.test(rawId)             // Radix UI
+      || /^:r[0-9a-z]+:$/i.test(rawId)     // React useId()
+      || /^mui-/i.test(rawId)              // MUI auto-generated
+      || /^headlessui-/i.test(rawId)       // Headless UI
+      || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(rawId); // UUID
+    if (!looksGenerated) elementId = rawId;
+  }
+
+  // V22: cssClass — first stable class token (drops Tailwind/UnoCSS utility
+  // prefixes). For SVGElement target.className is SVGAnimatedString, not a
+  // string, so always read via getAttribute for cross-tag safety.
+  var rawClass = target.getAttribute('class') || '';
+  var cssClass = undefined;
+  // V22 Pkg3 — flag when ANY css-in-js generated class is on this element
+  // (Emotion css-XXX, styled-components sc-XXX). When present, the
+  // OTHER tokens on the same element are likely also generated companions
+  // (kAtEng, hpEYiQ — display-name hashes that can't be regex-detected
+  // without false positives on legitimate camelCase ids). In that case we
+  // are extra strict on what we treat as "stable className".
+  var hasCssInJs = /(?:^| )(?:css-[a-z0-9]{6,}|sc-[a-zA-Z0-9]{6,})(?: |$)/i.test(rawClass);
+  if (rawClass) {
+    var tokens = rawClass.split(/\s+/).filter(function (t) {
+      if (!t || t.length > 50) return false;
+      // Drop common utility/state classes that don't differentiate semantics.
+      if (/^(?:[wh]-|p[xytrbl]?-|m[xytrbl]?-|gap-|flex|grid|block|inline|hidden|absolute|relative|fixed|text-|bg-|border|rounded|shadow|opacity|cursor-|select-|items-|justify-|self-|space-|overflow-|min-|max-|top-|left-|right-|bottom-|z-|font-|leading-|tracking-|whitespace-|truncate|line-clamp|transition|duration-|ease-|animate-|hover:|focus:|active:|disabled:|group-)/.test(t)) return false;
+      // Drop dynamic Vue/CSS scoped hashes
+      if (/^data-v-[a-f0-9]{8}$/.test(t)) return false;
+      // V22 Pkg3: drop Emotion / styled-components scoped classes.
+      if (/^css-[a-z0-9]{6,}$/i.test(t)) return false;
+      if (/^sc-[a-zA-Z0-9]{6,}$/.test(t)) return false;
+      // V22 Pkg3: when ANY css-in-js class is present on this element,
+      // also drop bare 5-8-char mixed-case tokens — they're almost
+      // certainly styled-components display-name hashes (kAtEng/hpEYiQ).
+      // We do NOT drop them when there's no css-in-js sibling, to avoid
+      // dropping legitimate ids like "userName" or "submitBtn".
+      if (hasCssInJs && /^[a-z][a-zA-Z]{4,7}$/.test(t) && /[A-Z]/.test(t)) return false;
+      return true;
+    });
+    if (tokens.length > 0) cssClass = tokens.slice(0, 3).join(' ');
+  }
+
+  // V22: Vue scoped marker (data-v-XXXXXXX). All children of one component
+  // share it, so it narrows + survives className refactors.
+  var vueScopeId = undefined;
+  for (var ai = 0; ai < target.attributes.length; ai++) {
+    var attr = target.attributes[ai];
+    if (attr.name && attr.name.indexOf('data-v-') === 0) {
+      vueScopeId = attr.name; // we want the attribute *name* (the hash itself is the value=='')
+      break;
+    }
+  }
+
+  // V22: aria-controls — uniqueness signal for dropdowns/tabs/menus.
+  var ariaControls = target.getAttribute('aria-controls') || undefined;
+
+  // V22: href — link target. Truncate to keep payload small.
+  var hrefAttr = undefined;
+  if (tag === 'a') {
+    var rawHref = target.getAttribute('href') || '';
+    if (rawHref && rawHref.length > 0 && rawHref.length < 500) {
+      hrefAttr = rawHref.slice(0, 200);
+    }
+  }
+
+  // V22 Pkg1 — Fix 5: aria-current (page|step|date|true|location|time).
+  // Pagination/Stepper/Breadcrumbs disambiguation: lets resolver tell apart
+  // "click current page" from neighbouring page buttons that share text/role.
+  var ariaCurrentAttr = target.getAttribute('aria-current') || undefined;
+  // The attribute is boolean-like but stored as string — keep raw value
+  // ('page' | 'step' | 'true' | ...) so resolver can do exact compare.
+
+  // V22 Pkg1 — Fix 2: aria-valuenow / aria-valuetext. Slider, SpinButton,
+  // ProgressBar carry their current value via these ARIA attrs (or via
+  // <input type="number/range">.value). Without them, "set slider to 50%"
+  // recordings replay against an unrelated slider in the same shape.
+  var ariaValueNowAttr = target.getAttribute('aria-valuenow');
+  var ariaValueNum = undefined;
+  if (ariaValueNowAttr !== null && ariaValueNowAttr !== '') {
+    var parsedVN = parseFloat(ariaValueNowAttr);
+    if (!isNaN(parsedVN)) ariaValueNum = parsedVN;
+  } else if ((tag === 'input' && (target.type === 'range' || target.type === 'number')) || tag === 'progress' || tag === 'meter') {
+    var nativeVal = parseFloat(target.value);
+    if (!isNaN(nativeVal)) ariaValueNum = nativeVal;
+  }
+  var ariaValueTextAttr = target.getAttribute('aria-valuetext') || undefined;
+
+  // V22 Pkg1 — Fix 3: data-value / value attribute for option-like elements.
+  // <option value="kz">Казахстан</option>, <li role="option" data-value="kz">,
+  // <MuiMenuItem value="kz" />. Records the semantic key alongside the
+  // localized display text — so re-recording in another language still
+  // resolves the same logical option.
+  var dataValueAttr = undefined;
+  var rawDataValue = target.getAttribute('data-value') || '';
+  if (rawDataValue && rawDataValue.length > 0 && rawDataValue.length < 200) {
+    dataValueAttr = rawDataValue;
+  } else if (tag === 'option' || target.getAttribute('role') === 'option' || target.getAttribute('role') === 'menuitem') {
+    var rawVal = target.getAttribute('value') || '';
+    if (rawVal && rawVal.length > 0 && rawVal.length < 200) {
+      dataValueAttr = rawVal;
+    }
+  }
+
+  // V22 Pkg1 — Fix 1: child icon testid promotion.
+  // When the target is descriptor-poor (no text, ariaLabel, labelText, title,
+  // alt, testId, elementId) AND has a single direct icon child (svg/i/img)
+  // that DOES carry a data-testid, lift the icon's testid up. This closes
+  // the most common gap on MUI IconButton / Element Plus el-tooltip__trigger
+  // / Ant Design icon buttons where the semantic name lives on the child.
+  // Constraint: only ONE qualifying child, walked 1-2 levels deep — multiple
+  // candidates make the lift ambiguous, so we abstain.
+  var childTestIdAttr = undefined;
+  var hasOwnDescriptor =
+    (target.innerText && target.innerText.trim().length > 0)
+    || (target.textContent && target.textContent.trim().length > 0 && tag !== 'svg')
+    || target.getAttribute('aria-label')
+    || target.getAttribute('title')
+    || target.getAttribute('alt')
+    || testId
+    || elementId
+    || (target.labels && target.labels.length > 0);
+  if (!hasOwnDescriptor) {
+    var childCandidates = [];
+    var directChildren = target.children || [];
+    for (var dci = 0; dci < directChildren.length && childCandidates.length < 3; dci++) {
+      var dc = directChildren[dci];
+      var dcTag = (dc.tagName || '').toLowerCase();
+      if (dcTag === 'svg' || dcTag === 'i' || dcTag === 'img' || dcTag === 'span') {
+        var dcTestId = dc.getAttribute('data-testid')
+          || dc.getAttribute('data-test')
+          || dc.getAttribute('data-cy')
+          || dc.getAttribute('data-qa-test-id')
+          || '';
+        if (dcTestId) childCandidates.push(dcTestId);
+        // One level deeper for span > svg pattern (MUI's startIcon wrapper).
+        if (!dcTestId && dcTag === 'span' && dc.children && dc.children.length === 1) {
+          var dcc = dc.children[0];
+          var dccTag = (dcc.tagName || '').toLowerCase();
+          if (dccTag === 'svg' || dccTag === 'i' || dccTag === 'img') {
+            var dccTestId = dcc.getAttribute('data-testid')
+              || dcc.getAttribute('data-test')
+              || dcc.getAttribute('data-cy')
+              || dcc.getAttribute('data-qa-test-id')
+              || '';
+            if (dccTestId) childCandidates.push(dccTestId);
+          }
+        }
+      }
+    }
+    // Only lift when EXACTLY one candidate found — multiple icons mean we
+    // can't tell which carries the semantic name without ambiguity.
+    if (childCandidates.length === 1) {
+      childTestIdAttr = childCandidates[0];
+    }
+  }
+
+  // V22 Pkg2 — Bootstrap markers (data-bs-toggle / data-bs-target).
+  // Walk the target itself + up to 3 parents — Bootstrap puts these on
+  // either the trigger button OR an ancestor wrapper depending on the
+  // helper used (data-bs-toggle="modal" vs collapse, etc).
+  var bsToggleAttr = undefined;
+  var bsTargetAttr = undefined;
+  var bsWalk = target;
+  for (var bsi = 0; bsi < 3 && bsWalk; bsi++) {
+    if (!bsToggleAttr) {
+      var t = bsWalk.getAttribute('data-bs-toggle') || bsWalk.getAttribute('data-toggle') || '';
+      if (t && t.length > 0 && t.length < 30) bsToggleAttr = t;
+    }
+    if (!bsTargetAttr) {
+      var tt = bsWalk.getAttribute('data-bs-target') || bsWalk.getAttribute('data-target') || '';
+      if (tt && tt.length > 0 && tt.length < 200) bsTargetAttr = tt;
+    }
+    if (bsToggleAttr && bsTargetAttr) break;
+    bsWalk = bsWalk.parentElement;
+  }
+
+  // V22 Pkg2 — aria-haspopup. W3C spec values: menu | listbox | tree |
+  // grid | dialog | true | false. We keep the raw string so the resolver
+  // can match recorded "open menu" to live aria-haspopup=menu triggers.
+  var ariaHasPopupAttr = target.getAttribute('aria-haspopup') || undefined;
+
+  // V22 Pkg2 — aria-activedescendant. Combobox/Listbox/Tree typeahead
+  // points to the focused descendant via this attribute; capturing it lets
+  // replay distinguish "press Enter on the highlighted suggestion" from
+  // "press Enter on the input itself".
+  var ariaActiveDescendantAttr = target.getAttribute('aria-activedescendant') || undefined;
+
+  // V22 Pkg2 — data-row-key (Ant Design Table) / data-rk (RainbowKit).
+  // Stable identity for table rows that survives re-render and pagination.
+  // Walk up to 3 parents — usually placed on <tr> while click lands on <td>.
+  var dataRowKeyAttr = undefined;
+  var rkWalk = target;
+  for (var rki = 0; rki < 4 && rkWalk; rki++) {
+    var rk = rkWalk.getAttribute('data-row-key') || rkWalk.getAttribute('data-rk') || '';
+    if (rk && rk.length > 0 && rk.length < 100) {
+      dataRowKeyAttr = rk;
+      break;
+    }
+    rkWalk = rkWalk.parentElement;
+  }
+
+  // V22 Pkg2 — clickable-row heuristic. MUI / AntD / Element Plus tables
+  // render rows clickable via CSS hover + JS handler without role/onclick.
+  // Probe detects this via two signals: (a) tag is tr, (b) cursor:pointer
+  // OR class contains hover/clickable token. Sets rowClickable flag so
+  // resolver can elevate the row from a passive container to a candidate.
+  var rowClickableFlag = undefined;
+  if (tag === 'tr') {
+    try {
+      var trCursor = getComputedStyle(target).cursor;
+      var trClass = target.getAttribute('class') || '';
+      var hoverishClass = /\b(hover|clickable|MuiTableRow-hover|ant-table-row|el-table__row|row-clickable)\b/i.test(trClass);
+      if (trCursor === 'pointer' || hoverishClass) {
+        rowClickableFlag = true;
+      }
+    } catch (e) {}
+  }
 
   return {
     tag: tag,
@@ -445,9 +1097,32 @@ const PROBE_AT_POINT_FN = `
     title: titleAttr,
     alt: altAttr,
     testId: testId,
+    elementId: elementId,
+    cssClass: cssClass,
+    ariaControls: ariaControls,
+    href: hrefAttr,
+    vueScopeId: vueScopeId,
+    nearestLandmark: nearestLandmark,
+    containerTitles: containerTitles,
+    ancestorSummary: ancestorSummary,
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
+    ariaInvalid: ai,
+    // V22 Pkg1 — extracted above. Each is undefined when not applicable so
+    // bindingHints/fingerprint stay sparse (no zero-value noise).
+    ariaCurrent: ariaCurrentAttr,
+    ariaValueNow: ariaValueNum,
+    ariaValueText: ariaValueTextAttr,
+    dataValue: dataValueAttr,
+    childTestId: childTestIdAttr,
+    // V22 Pkg2 — Bootstrap / aria-haspopup / activedescendant / row-key / clickable-row.
+    bsToggle: bsToggleAttr,
+    bsTarget: bsTargetAttr,
+    ariaHasPopup: ariaHasPopupAttr,
+    ariaActiveDescendant: ariaActiveDescendantAttr,
+    dataRowKey: dataRowKeyAttr,
+    rowClickable: rowClickableFlag,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -457,7 +1132,11 @@ const PROBE_AT_POINT_FN = `
       height: Math.round(rect.height)
     },
     resolvedVia: resolvedVia,
-    ancestorChain: resolvedVia === 'directHit' || resolvedVia === 'cssClass' ? ancestorChain : undefined
+    // V22: Always return chain — ancestorSummary uses it for persistence,
+    // and the resolver can lean on it for any resolvedVia. Earlier gating
+    // to directHit/cssClass left icon targets (cursorPointer/nativeTag)
+    // without ancestor context exactly when they needed it most.
+    ancestorChain: ancestorChain
   };
 })
 `;
@@ -486,6 +1165,15 @@ const PROBE_FOCUSED_FN = `
   var rect = target.getBoundingClientRect();
   var ae = target.getAttribute('aria-expanded');
   var ap = target.getAttribute('aria-pressed');
+  // V22: aria-invalid (or :invalid native pseudo for inputs). Records the
+  // validation state at the moment of capture so negative-flow tests
+  // ("user clicked invalid field → red border") replay against the same
+  // visual state, not a freshly-cleared field.
+  var aiAttr = target.getAttribute('aria-invalid');
+  var ai = aiAttr === 'true' ? true : aiAttr === 'false' ? false : undefined;
+  if (ai === undefined && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
+    try { if (target.matches && target.matches(':invalid')) ai = true; } catch (e) {}
+  }
 
   // Detect multiline: textarea, contenteditable, or role=textbox with aria-multiline
   var isMultiline = tag === 'textarea'
@@ -525,6 +1213,7 @@ const PROBE_FOCUSED_FN = `
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
+    ariaInvalid: ai,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -769,8 +1458,16 @@ export class RecordingCaptureService {
 
     // 2. LLM call
     try {
+      // V22: include id/testId so LLM can prefer ancestors with stable
+      // identifiers ("button#login-submit" beats "div.flex" any day).
       const chainDescription = chain.map((n, i) =>
-        `[${i}] <${n.tag}>${n.role ? ` role="${n.role}"` : ''}${n.ariaLabel ? ` aria-label="${n.ariaLabel}"` : ''}${n.className ? ` class="${n.className}"` : ''}${n.text ? ` text="${n.text.slice(0, 30)}"` : ''}`,
+        `[${i}] <${n.tag}>`
+        + (n.testId ? ` data-testid="${n.testId}"` : '')
+        + (n.id ? ` id="${n.id}"` : '')
+        + (n.role ? ` role="${n.role}"` : '')
+        + (n.ariaLabel ? ` aria-label="${n.ariaLabel}"` : '')
+        + (n.className ? ` class="${n.className}"` : '')
+        + (n.text ? ` text="${n.text.slice(0, 30)}"` : '')
       ).join('\n');
 
       const prompt = `Given this DOM ancestor chain from a click point (index 0 = element under cursor, higher indices = parents), which element is the interactive control the user intended to click?
@@ -861,6 +1558,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
           var rect = walk.getBoundingClientRect();
           var ae = walk.getAttribute('aria-expanded');
           var ap = walk.getAttribute('aria-pressed');
+          // V22: aria-invalid for re-probe path (see PROBE_AT_POINT for rationale).
+          var aiAttr = walk.getAttribute('aria-invalid');
+          var ai = aiAttr === 'true' ? true : aiAttr === 'false' ? false : undefined;
+          if (ai === undefined && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
+            try { if (walk.matches && walk.matches(':invalid')) ai = true; } catch (e) {}
+          }
           var isMultiline = tag === 'textarea'
             || walk.getAttribute('contenteditable') === 'true'
             || walk.getAttribute('contenteditable') === ''
@@ -880,6 +1583,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             checked: (tag === 'input' && (walk.type === 'checkbox' || walk.type === 'radio')) ? walk.checked : undefined,
             ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
             ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
+            ariaInvalid: ai,
             isMultiline: isMultiline || undefined,
             boundingBox: {
               x: Math.round(rect.x),
@@ -946,6 +1650,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     ]);
     const elTagLc = (element.tag || '').toLowerCase();
     // Tuples of (value, isFreeText) — only free-text fields get the noise filter.
+    // V22: elementId added below testId (also intentional, framework-filtered).
+    // For Element Plus / Ant Design icon-only elements (svg/i with no text/aria),
+    // a stable id like `layout-header-setting` is the only meaningful label —
+    // without it the user sees `'element'` and can't tell what was clicked.
+    // The probe already strips framework-generated ids (el-id-*, radix-*, useId,
+    // UUIDs, MUI/Headless UI prefixes), so what reaches us here is human-named.
     const candidates: Array<[string | undefined, boolean]> = [
       [element.ariaLabel, false],
       [element.labelText, true],
@@ -955,6 +1665,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       [element.placeholder, true],
       [element.name, true],
       [element.testId, false],
+      [element.elementId, false],  // V22: stable id (e.g. "layout-header-setting")
+      // V22 Pkg1: child icon testid for IconButton-shaped targets where the
+      // semantic name lives on the descendant svg/i/img (e.g. MUI's
+      // `VisibilityOffOutlinedIcon`). Promoted only when the target itself
+      // had no descriptor — see probe-side hasOwnDescriptor gate.
+      [element.childTestId, false],
       [element.role, false],
     ];
     for (const [c, isFreeText] of candidates) {
@@ -1039,13 +1755,123 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     // V18: Use title as nearText fallback for icon-only buttons (e.g. <div title="Attach file">📎</div>)
     if (element.title && !hints.nearText) hints.nearText = element.title;
     if (element.type) hints.type = element.type;
-    if (element.name) hints.autocomplete = element.name;
+    // V22: keep `name` separate from `autocomplete` — they had been collapsed
+    // for legacy reasons but the resolver wants both (autocomplete is a
+    // semantic hint, name is a stable identifier on form fields).
+    if (element.name) {
+      hints.name = element.name;
+      if (!hints.autocomplete) hints.autocomplete = element.name;
+    }
     // V15: Add text content and tag for better LLM resolution at replay time
     if (element.text) hints.text = element.text;
     if (element.tag) hints.tag = element.tag;
+    // V22: alt — fallback identifier for <img> targets.
+    if (element.alt) hints.alt = element.alt;
     // V18: data-testid as stable identifier — highest confidence for element matching at replay
     if (element.testId) hints.testId = element.testId;
+    // V22: id / className / aria-controls / href / vueScopeId — additional
+    // locator signals for icon-only elements (svg/img/i) where text-based
+    // strategies fail. id alone resolves Element Plus / Ant Design icons
+    // that ship without aria-label (`#layout-header-setting` etc.).
+    if (element.elementId) hints.elementId = element.elementId;
+    if (element.cssClass) hints.cssClass = element.cssClass;
+    if (element.ariaControls) hints.ariaControls = element.ariaControls;
+    if (element.href) hints.href = element.href;
+    if (element.vueScopeId) hints.vueScopeId = element.vueScopeId;
+    // V22: ancestorSummary, nearestLandmark, containerTitles — provide
+    // disambiguation context when the same label recurs across page
+    // sections. Resolver weights these as soft hints, not hard filters.
+    if (element.nearestLandmark) hints.nearestLandmark = element.nearestLandmark;
+    if (element.containerTitles && element.containerTitles.length > 0) {
+      hints.containerTitles = element.containerTitles.slice(0, 2);
+    }
+    if (element.ancestorSummary) hints.ancestorSummary = element.ancestorSummary;
+    // V22: ARIA state at recording time. Differentiates "click toggle when
+    // expanded" from "click toggle when collapsed" — same locator but
+    // different intent. Skipped when no relevant state was set on the target.
+    const ariaState: BindingHints['ariaState'] = {};
+    if (element.ariaExpanded !== undefined) ariaState.expanded = element.ariaExpanded;
+    if (element.ariaPressed !== undefined) ariaState.pressed = element.ariaPressed;
+    if (element.checked !== undefined) ariaState.checked = element.checked;
+    if (element.ariaInvalid !== undefined) ariaState.invalid = element.ariaInvalid;
+    // V22 Pkg1: aria-current / aria-valuenow / aria-valuetext.
+    if (element.ariaCurrent) ariaState.current = element.ariaCurrent;
+    if (element.ariaValueNow !== undefined) ariaState.valueNow = element.ariaValueNow;
+    if (element.ariaValueText) ariaState.valueText = element.ariaValueText;
+    if (Object.keys(ariaState).length > 0) hints.ariaState = ariaState;
+    // V22 Pkg1: data-value / child icon testid.
+    if (element.dataValue) hints.dataValue = element.dataValue;
+    if (element.childTestId) hints.childTestId = element.childTestId;
+    // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
+    if (element.bsToggle) hints.bsToggle = element.bsToggle;
+    if (element.bsTarget) hints.bsTarget = element.bsTarget;
+    if (element.ariaHasPopup) hints.ariaHasPopup = element.ariaHasPopup;
+    if (element.ariaActiveDescendant) hints.ariaActiveDescendant = element.ariaActiveDescendant;
+    if (element.dataRowKey) hints.dataRowKey = element.dataRowKey;
     return hints;
+  }
+
+  /**
+   * V22: Build a `TargetFingerprint` snapshot from a probed element AT
+   * RECORDING TIME. Distinct from `buildTargetFingerprint` in
+   * locator-plan-builder.service.ts (which builds the fingerprint from a
+   * resolved live DOM node at apply time).
+   *
+   * Why both exist:
+   *   - Recorded fingerprint travels with the step from the moment of
+   *     capture, so the LLM resolver has identifying data even on the
+   *     FIRST apply (before any compiled plan exists).
+   *   - Live-DOM fingerprint reflects what was actually executed and is
+   *     used by the heal-time comparator to detect drift.
+   *
+   * The two should agree on shape (same TargetFingerprint type) so the
+   * resolver and comparator can read either one transparently.
+   */
+  static buildRecordedFingerprint(element: ProbedElement): TargetFingerprint {
+    const fp: TargetFingerprint = {};
+    if (element.tag) fp.tag = element.tag;
+    if (element.role) fp.role = element.role;
+    if (element.labelText) fp.labelText = element.labelText;
+    if (element.ariaLabel) fp.ariaLabel = element.ariaLabel;
+    if (element.testId) fp.testIdAttr = element.testId;
+    if (element.placeholder) fp.placeholder = element.placeholder;
+    if (element.boundingBox) fp.boundingBox = element.boundingBox;
+    if (element.containerTitles && element.containerTitles.length > 0) {
+      fp.containerTitles = element.containerTitles.slice(0, 3);
+    }
+    if (element.nearestLandmark) fp.nearestLandmark = element.nearestLandmark;
+    // V22: extra identifiers (id / classes / framework markers).
+    if (element.title) fp.title = element.title;
+    if (element.alt) fp.alt = element.alt;
+    if (element.text) fp.text = element.text;
+    if (element.elementId) fp.elementId = element.elementId;
+    if (element.cssClass) fp.cssClass = element.cssClass;
+    if (element.ariaControls) fp.ariaControls = element.ariaControls;
+    if (element.href) fp.href = element.href;
+    if (element.vueScopeId) fp.vueScopeId = element.vueScopeId;
+    if (element.name) fp.name = element.name;
+    if (element.type) fp.type = element.type;
+    if (element.ancestorSummary) fp.ancestorSummary = element.ancestorSummary;
+    const ariaState: NonNullable<TargetFingerprint['ariaState']> = {};
+    if (element.ariaExpanded !== undefined) ariaState.expanded = element.ariaExpanded;
+    if (element.ariaPressed !== undefined) ariaState.pressed = element.ariaPressed;
+    if (element.checked !== undefined) ariaState.checked = element.checked;
+    if (element.ariaInvalid !== undefined) ariaState.invalid = element.ariaInvalid;
+    // V22 Pkg1: aria-current / valueNow / valueText.
+    if (element.ariaCurrent) ariaState.current = element.ariaCurrent;
+    if (element.ariaValueNow !== undefined) ariaState.valueNow = element.ariaValueNow;
+    if (element.ariaValueText) ariaState.valueText = element.ariaValueText;
+    if (Object.keys(ariaState).length > 0) fp.ariaState = ariaState;
+    // V22 Pkg1: data-value / child icon testid.
+    if (element.dataValue) fp.dataValue = element.dataValue;
+    if (element.childTestId) fp.childTestId = element.childTestId;
+    // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
+    if (element.bsToggle) fp.bsToggle = element.bsToggle;
+    if (element.bsTarget) fp.bsTarget = element.bsTarget;
+    if (element.ariaHasPopup) fp.ariaHasPopup = element.ariaHasPopup;
+    if (element.ariaActiveDescendant) fp.ariaActiveDescendant = element.ariaActiveDescendant;
+    if (element.dataRowKey) fp.dataRowKey = element.dataRowKey;
+    return fp;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1485,11 +2311,15 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
    */
   static captureHover(element: ProbedElement, pageUrl?: string): PreviewIntentStep {
     const label = this.getElementLabel(element);
+    // V22: Include recordedFingerprint so resolver has identifying data on
+    // first apply (mirrors the click-step path in preview.handler.ts).
+    const recFp = this.buildRecordedFingerprint(element);
     return {
       id: recStepId(),
       type: 'hover',
       description: `Hover '${label}'`,
       bindingHints: this.buildBindingHints(element) as BindingHints | undefined,
+      recordedFingerprint: Object.keys(recFp).length > 0 ? recFp : undefined,
       evidence: {
         ...(element.ref && { lastSuccessRef: element.ref }),
         confidence: 1.0,
@@ -1604,6 +2434,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       description,
       value: buffer.text,
       bindingHints: buffer.bindingHints as BindingHints | undefined,
+      // V22: travel the fingerprint through buffer → step. Buffer was
+      // populated with the focused input's probe snapshot at focus time
+      // (preview.handler.ts focus path), so on flush we hand it to the step.
+      recordedFingerprint: buffer.recordedFingerprint,
       ...(Object.keys(opts).length > 0 && { options: opts }),
       evidence: {
         ...(buffer.elementRef && { lastSuccessRef: buffer.elementRef }),

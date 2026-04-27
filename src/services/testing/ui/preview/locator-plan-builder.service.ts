@@ -15,10 +15,22 @@ import type {
 
 /**
  * Escape value for CSS attribute selector.
- * Keeps selector valid even if value contains quotes/backslashes.
+ * Keeps selector valid even if value contains quotes/backslashes/brackets/
+ * newlines. V22 Audit-fix H2: previous version only handled `\` and `"`,
+ * which broke when bsTarget contained CSS metacharacters like `]`
+ * (closing the attribute selector) or `[` (re-opening). Newlines also
+ * break selector parsing in Playwright.
+ *
+ * Order matters: `\` MUST be escaped first, otherwise we double-escape
+ * the backslashes we just added.
  */
 function escapeCssAttrValue(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\]/g, '\\]')
+    .replace(/\[/g, '\\[')
+    .replace(/[\n\r]/g, ' ');
 }
 
 /**
@@ -70,6 +82,86 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
       strategy: 'testId',
       value: node.testIdAttr,
       confidence: 0.8,
+    });
+  }
+
+  // V22: getById via attribute selector — high-priority, before placeholder.
+  // The id attribute is the most stable locator for icon-only elements
+  // (svg/i/img with no text/aria-label) — e.g. `#layout-header-setting` on
+  // Element Plus pages. Already filtered for framework-generated ids via
+  // `isDynamicId` (see dynamic-id.util.ts), so what reaches here is human-
+  // named and survives reloads.
+  // Confidence sits between testId (0.8) and placeholder (0.75) — id is
+  // strong but testId remains gold standard when both exist.
+  if (node.id && !node.isDynamicId) {
+    const safeId = escapeCssAttrValue(node.id);
+    locators.push({
+      strategy: 'css',
+      value: `[id="${safeId}"]`,
+      confidence: 0.78,
+    });
+  }
+
+  // V22 Pkg1: childTestId — lifts the icon's data-testid up to its parent
+  // button/anchor for replay. CSS `:has()` is supported in all modern
+  // browsers (Playwright Chromium ≥ 105). Confidence between testId and id
+  // because the lift is parent-of-icon, not the element itself.
+  if ((node as any).childTestId) {
+    const safeChildId = escapeCssAttrValue((node as any).childTestId);
+    locators.push({
+      strategy: 'css',
+      value: `${node.tag || '*'}:has([data-testid="${safeChildId}"])`,
+      confidence: 0.77,
+    });
+  }
+
+  // V22 Pkg1: data-value — semantic key for select options / list items /
+  // chips. Localized labels drift (Login → Войти → 登录) but the value attr
+  // stays stable. Confidence below testId because data-value is product
+  // semantics, not a test-only marker.
+  if ((node as any).dataValue) {
+    const safeVal = escapeCssAttrValue((node as any).dataValue);
+    locators.push({
+      strategy: 'css',
+      value: `${node.tag || '*'}[data-value="${safeVal}"]`,
+      confidence: 0.74,
+    });
+  }
+
+  // V22 Pkg2: data-row-key — Ant Design Table / RainbowKit row identity.
+  // Survives pagination, sorting, filtering — strong row locator.
+  // V22 Audit M2: confidence dropped from 0.82 → 0.78 so testId (0.80)
+  // remains the gold-standard primary strategy. data-row-key still beats
+  // placeholder (0.75) and id-css (0.78) which is correct: it's product
+  // semantics, but only relevant for table rows.
+  if ((node as any).dataRowKey) {
+    const safeKey = escapeCssAttrValue((node as any).dataRowKey);
+    // AntD writes data-row-key on <tr>, others on the row container.
+    locators.push({
+      strategy: 'css',
+      value: `[data-row-key="${safeKey}"]`,
+      confidence: 0.78,
+    });
+  }
+
+  // V22 Pkg2: Bootstrap data-bs-toggle + data-bs-target combo. Either
+  // alone is weakish (multiple modals share toggle="modal"), but together
+  // they uniquely identify a real Bootstrap trigger.
+  if ((node as any).bsToggle && (node as any).bsTarget) {
+    const safeToggle = escapeCssAttrValue((node as any).bsToggle);
+    const safeTarget = escapeCssAttrValue((node as any).bsTarget);
+    locators.push({
+      strategy: 'css',
+      value: `[data-bs-toggle="${safeToggle}"][data-bs-target="${safeTarget}"]`,
+      confidence: 0.76,
+    });
+  } else if ((node as any).bsTarget) {
+    // Target alone is usually unique (CSS selector pointing to specific element).
+    const safeTarget = escapeCssAttrValue((node as any).bsTarget);
+    locators.push({
+      strategy: 'css',
+      value: `[data-bs-target="${safeTarget}"]`,
+      confidence: 0.72,
     });
   }
 
@@ -135,18 +227,12 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
     }
   }
 
-  // 7. CSS selector (last resort, only if id is not dynamic)
-  if (node.id && !node.isDynamicId) {
-    const safeId = escapeCssAttrValue(node.id);
-    locators.push({
-      strategy: 'css',
-      // Use attribute selector instead of #id to avoid CSS escaping edge cases.
-      value: `[id="${safeId}"]`,
-      confidence: 0.6,
-    });
-  } else if (node.tag && node.testIdAttr) {
+  // 7. CSS fallback: tag + data-testid combo (last resort, only when id strategy
+  // wasn't already added above). The high-priority id-css strategy at step 4.5
+  // covers the `[id="..."]` case; this branch only adds tag+testId when both
+  // are present — a slightly more specific shape than testId alone.
+  if (node.tag && node.testIdAttr) {
     const safeTestId = escapeCssAttrValue(node.testIdAttr);
-    // Fallback: tag + data attribute
     locators.push({
       strategy: 'css',
       value: `${node.tag}[data-testid="${safeTestId}"]`,
@@ -161,6 +247,18 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
  * Build target fingerprint from InteractiveNode
  */
 function buildTargetFingerprint(node: InteractiveNode): TargetFingerprint {
+  // V22 Pkg1: ariaState compaction — only include states that were actually
+  // present on the node so quickFingerprintCheck doesn't artificially deflate
+  // the score on missing fields.
+  const ariaState: NonNullable<TargetFingerprint['ariaState']> = {};
+  if (node.ariaExpanded !== undefined) ariaState.expanded = node.ariaExpanded;
+  if (node.ariaPressed !== undefined) ariaState.pressed = node.ariaPressed;
+  if (node.checked !== undefined) ariaState.checked = node.checked;
+  if (node.invalid !== undefined) ariaState.invalid = node.invalid;
+  if ((node as any).ariaCurrent) ariaState.current = (node as any).ariaCurrent;
+  if (typeof (node as any).ariaValueNow === 'number') ariaState.valueNow = (node as any).ariaValueNow;
+  if ((node as any).ariaValueText) ariaState.valueText = (node as any).ariaValueText;
+
   return {
     tag: node.tag,
     role: node.role,
@@ -171,6 +269,25 @@ function buildTargetFingerprint(node: InteractiveNode): TargetFingerprint {
     boundingBox: node.boundingBox,
     containerTitles: node.containerTitles,
     nearestLandmark: node.nearestLandmark,
+    // V22 Pkg1: extended identity / semantic / state fields. Sparse — only
+    // populated when the underlying InteractiveNode had a value, so legacy
+    // recordings without these don't get noisy fingerprints.
+    elementId: node.id && !node.isDynamicId ? node.id : undefined,
+    name: node.name,
+    type: node.type,
+    title: node.title,
+    text: node.text,
+    href: (node as any).href,
+    ariaControls: (node as any).ariaControls,
+    dataValue: (node as any).dataValue,
+    childTestId: (node as any).childTestId,
+    // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
+    bsToggle: (node as any).bsToggle,
+    bsTarget: (node as any).bsTarget,
+    ariaHasPopup: (node as any).ariaHasPopup,
+    ariaActiveDescendant: (node as any).ariaActiveDescendant,
+    dataRowKey: (node as any).dataRowKey,
+    ariaState: Object.keys(ariaState).length > 0 ? ariaState : undefined,
   };
 }
 

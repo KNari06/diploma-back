@@ -1356,6 +1356,135 @@ export class SnapshotCollector {
               ariaCheckedRaw === 'false' ? false :
                 ariaCheckedRaw === 'mixed' ? 'mixed' : undefined;
 
+            // V22 Pkg1: aria-current (page|step|true|location|date|time)
+            const ariaCurrentRaw = getCleanAttr(el, 'aria-current');
+            const ariaCurrent = ariaCurrentRaw && ariaCurrentRaw.length > 0 && ariaCurrentRaw.length < 30
+              ? ariaCurrentRaw
+              : undefined;
+
+            // V22 Pkg1: aria-valuenow / aria-valuetext (slider/spinbutton/progress)
+            const ariaValueNowRaw = getCleanAttr(el, 'aria-valuenow');
+            let ariaValueNow: number | undefined;
+            if (ariaValueNowRaw) {
+              const parsed = parseFloat(ariaValueNowRaw);
+              if (!isNaN(parsed)) ariaValueNow = parsed;
+            } else if (
+              (tagLower === 'input' && (input.type === 'range' || input.type === 'number'))
+              || tagLower === 'progress' || tagLower === 'meter'
+            ) {
+              const nativeVal = parseFloat(input.value || '');
+              if (!isNaN(nativeVal)) ariaValueNow = nativeVal;
+            }
+            const ariaValueTextRaw = getCleanAttr(el, 'aria-valuetext');
+            const ariaValueText = ariaValueTextRaw && ariaValueTextRaw.length > 0 && ariaValueTextRaw.length < 100
+              ? ariaValueTextRaw
+              : undefined;
+
+            // V22 Pkg1: data-value / option value — semantic key for options
+            let dataValue: string | undefined;
+            const dvRaw = getCleanAttr(el, 'data-value');
+            if (dvRaw && dvRaw.length > 0 && dvRaw.length < 200) {
+              dataValue = dvRaw;
+            } else if (tagLower === 'option' || el.getAttribute('role') === 'option' || el.getAttribute('role') === 'menuitem') {
+              const ovRaw = el.getAttribute('value') || '';
+              if (ovRaw && ovRaw.length > 0 && ovRaw.length < 200) dataValue = ovRaw;
+            }
+
+            // V22 Pkg1: child icon testid promotion. Extract data-testid from
+            // a single direct icon child (svg/i/img/span>svg) when the node
+            // has no own descriptor (no text, aria-label, title, alt, testid).
+            let childTestId: string | undefined;
+            const ownLabelLikeText = (el.innerText || el.textContent || '').trim();
+            const ownAriaLabel = el.getAttribute('aria-label');
+            const ownTitle = el.getAttribute('title');
+            const ownAlt = el.getAttribute('alt');
+            const ownTestIdAttr = el.getAttribute('data-testid')
+              || el.getAttribute('data-test')
+              || el.getAttribute('data-cy')
+              || el.getAttribute('data-qa-test-id');
+            const elIsDescriptorPoor = !ownLabelLikeText && !ownAriaLabel && !ownTitle && !ownAlt && !ownTestIdAttr;
+            if (elIsDescriptorPoor) {
+              const directKids = el.children || [];
+              const childCands: string[] = [];
+              for (let dki = 0; dki < directKids.length && childCands.length < 3; dki++) {
+                const dk = directKids[dki] as Element;
+                const dkTag = (dk.tagName || '').toLowerCase();
+                if (dkTag === 'svg' || dkTag === 'i' || dkTag === 'img' || dkTag === 'span') {
+                  const dkTestId = dk.getAttribute('data-testid')
+                    || dk.getAttribute('data-test')
+                    || dk.getAttribute('data-cy')
+                    || dk.getAttribute('data-qa-test-id')
+                    || '';
+                  if (dkTestId) childCands.push(dkTestId);
+                  if (!dkTestId && dkTag === 'span' && dk.children && dk.children.length === 1) {
+                    const dkc = dk.children[0] as Element;
+                    const dkcTag = (dkc.tagName || '').toLowerCase();
+                    if (dkcTag === 'svg' || dkcTag === 'i' || dkcTag === 'img') {
+                      const dkcTestId = dkc.getAttribute('data-testid')
+                        || dkc.getAttribute('data-test')
+                        || dkc.getAttribute('data-cy')
+                        || dkc.getAttribute('data-qa-test-id')
+                        || '';
+                      if (dkcTestId) childCands.push(dkcTestId);
+                    }
+                  }
+                }
+              }
+              if (childCands.length === 1) childTestId = childCands[0];
+            }
+
+            // V22 Pkg2: Bootstrap markers walked up to 3 ancestors —
+            // toggle/target may sit on a wrapper, not on the trigger itself.
+            let bsToggle: string | undefined;
+            let bsTarget: string | undefined;
+            {
+              let bsW: Element | null = el;
+              for (let bi = 0; bi < 3 && bsW; bi++) {
+                if (!bsToggle) {
+                  const t = bsW.getAttribute('data-bs-toggle') || bsW.getAttribute('data-toggle') || '';
+                  if (t && t.length < 30) bsToggle = t;
+                }
+                if (!bsTarget) {
+                  const tt = bsW.getAttribute('data-bs-target') || bsW.getAttribute('data-target') || '';
+                  if (tt && tt.length < 200) bsTarget = tt;
+                }
+                if (bsToggle && bsTarget) break;
+                bsW = bsW.parentElement;
+              }
+            }
+
+            // V22 Pkg2: aria-haspopup / aria-activedescendant — direct attrs.
+            const ariaHasPopup = el.getAttribute('aria-haspopup') || undefined;
+            const ariaActiveDescendant = el.getAttribute('aria-activedescendant') || undefined;
+
+            // V22 Pkg2: data-row-key (Ant Design Table) / data-rk (RainbowKit).
+            // Walk up to 4 ancestors — usually on <tr>, click lands on cell.
+            let dataRowKey: string | undefined;
+            {
+              let rkW: Element | null = el;
+              for (let ri = 0; ri < 4 && rkW; ri++) {
+                const rk = rkW.getAttribute('data-row-key') || rkW.getAttribute('data-rk') || '';
+                if (rk && rk.length < 100) { dataRowKey = rk; break; }
+                rkW = rkW.parentElement;
+              }
+            }
+
+            // V22 Pkg2: clickable-row heuristic. Live-DOM mirror of recorder.
+            let rowClickable: boolean | undefined;
+            if (tagLower === 'tr') {
+              try {
+                // V22 Audit-fix H1: must use `window.getComputedStyle` in
+                // browser context. The earlier `globalThis.getComputedStyle`
+                // works in Node-with-jsdom test envs but is undefined in
+                // some embedded Chromium contexts (Playwright headed mode).
+                // @ts-expect-error - window available in page.evaluate scope
+                const trCursor = window.getComputedStyle(el).cursor;
+                const trClass = el.getAttribute('class') || '';
+                const hoverishClass = /\b(hover|clickable|MuiTableRow-hover|ant-table-row|el-table__row|row-clickable)\b/i.test(trClass);
+                if (trCursor === 'pointer' || hoverishClass) rowClickable = true;
+              } catch { /* best-effort */ }
+            }
+
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract validation state
             // ═══════════════════════════════════════════════════════════════
@@ -1565,6 +1694,20 @@ export class SnapshotCollector {
               ariaPressed,
               ariaSelected,
               ariaChecked,
+              // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state
+              ariaCurrent,
+              ariaValueNow,
+              ariaValueText,
+              // V22 Pkg1: Select option semantic key + IconButton child testid lift
+              dataValue,
+              childTestId,
+              // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
+              bsToggle,
+              bsTarget,
+              ariaHasPopup,
+              ariaActiveDescendant,
+              dataRowKey,
+              rowClickable,
               // Validation state
               required: required || undefined,
               readOnly: readOnly || undefined,

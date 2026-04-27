@@ -716,6 +716,74 @@ export function buildCandidateText(node: InteractiveNode): string {
     parts.push(`testid: ${node.testIdAttr}`);
   }
 
+  // V22: Stable id (after isDynamicId filter — framework-generated ids are
+  // already stripped at snapshot collection). Critical for icon-only elements
+  // (svg/img/i) where description-style matching fails — without `id` in the
+  // candidate text, LLM can't bridge a recorded `'layout-header-setting'`
+  // intent to the live svg that bears that exact id.
+  if (node.id && !node.isDynamicId) {
+    parts.push(`id: ${node.id}`);
+  }
+
+  // V22: href for <a> tags. Differentiates duplicate link text by destination
+  // (5 "Read more" links → distinct hrefs disambiguate).
+  if (node.tag === 'a' && (node as any).href) {
+    const hrefShort = String((node as any).href).slice(0, 80);
+    parts.push(`href: ${hrefShort}`);
+  }
+
+  // V22 Pkg1: child icon testid. For descriptor-poor IconButton-shaped
+  // targets the lifted child testid (`VisibilityOffOutlinedIcon`) is what
+  // makes the candidate identifiable to the resolver.
+  if ((node as any).childTestId) {
+    parts.push(`icon: ${(node as any).childTestId}`);
+  }
+
+  // V22 Pkg1: data-value for Select option / MenuItem / chip semantic key.
+  // Same logical option matches across i18n re-localization.
+  if ((node as any).dataValue) {
+    parts.push(`value: ${(node as any).dataValue}`);
+  }
+
+  // V22 Pkg1: aria-valuenow / aria-valuetext for slider / spinbutton /
+  // progressbar. Lets LLM pick the right control by its semantic value
+  // even when multiple identical-shape sliders coexist on a page.
+  const liveValueText = (node as any).ariaValueText;
+  const liveValueNow = (node as any).ariaValueNow;
+  if (liveValueText) {
+    parts.push(`value: ${liveValueText}`);
+  } else if (typeof liveValueNow === 'number') {
+    parts.push(`value: ${liveValueNow}`);
+  }
+
+  // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row-key.
+  // These are present on a small subset of elements so the candidateText
+  // stays compact when absent. Each surfaces a different disambiguator:
+  //   - bsToggle="modal" / bsTarget="#editForm" → real Bootstrap trigger
+  //   - aria-haspopup="menu" → genuine popup-button vs styled lookalike
+  //   - data-row-key → table row identity even after re-paginate
+  //   - aria-activedescendant → which Combobox option is currently focused
+  if ((node as any).bsToggle) {
+    parts.push(`bsToggle: ${(node as any).bsToggle}`);
+  }
+  if ((node as any).bsTarget) {
+    parts.push(`bsTarget: ${String((node as any).bsTarget).slice(0, 60)}`);
+  }
+  if ((node as any).ariaHasPopup) {
+    parts.push(`hasPopup: ${(node as any).ariaHasPopup}`);
+  }
+  if ((node as any).dataRowKey) {
+    parts.push(`rowKey: ${(node as any).dataRowKey}`);
+  }
+  if ((node as any).ariaActiveDescendant) {
+    parts.push(`activeDescendant: ${(node as any).ariaActiveDescendant}`);
+  }
+  if ((node as any).rowClickable) {
+    // Soft hint that this <tr> is interactive — helps LLM treat it as a
+    // candidate for "click row" intents that lack an explicit role/onclick.
+    parts.push('clickable-row');
+  }
+
   // ARIA state hints (helps LLM match "selected tab", "expanded menu", "pressed toggle")
   const stateHints: string[] = [];
   if (node.isDisabled) stateHints.push('disabled');
@@ -726,6 +794,13 @@ export function buildCandidateText(node: InteractiveNode): string {
   else if (node.ariaExpanded === false) stateHints.push('collapsed');
   if (node.ariaChecked === true || node.checked === true) stateHints.push('checked');
   else if (node.ariaChecked === 'mixed') stateHints.push('indeterminate');
+  // V22: invalid state — recorded "click on invalid email field with red border"
+  // must match a live invalid input, not a freshly-cleared valid one.
+  if ((node as any).invalid === true) stateHints.push('invalid');
+  // V22 Pkg1: aria-current — "click current page" disambiguator for
+  // Pagination / Stepper / Breadcrumbs.
+  const liveAriaCurrent = (node as any).ariaCurrent;
+  if (liveAriaCurrent) stateHints.push(`current=${liveAriaCurrent}`);
   if (stateHints.length > 0) {
     parts.push(`[${stateHints.join(', ')}]`);
   }
@@ -1345,131 +1420,404 @@ interface LlmSelectResult {
   _model?: string;
 }
 
-const LLM_SELECT_SYSTEM_PROMPT = `You are an AI element selector for a browser testing tool.
+// ═══════════════════════════════════════════════════════════════════════════
+// V22 — Prompts split into shared base + Apply variant + Heal variant.
+//
+// Why two prompts:
+//   - Apply (preview:step:lint, preview:step:apply, preview:run:start)
+//     happens when the user is AUTHORING a step. The intent text may be
+//     vague/exploratory ("the gear icon"). We accept null when nothing
+//     matches — user will refine the description.
+//   - Heal (command-executor.ts on regression run, when compiled-shortcut
+//     fails) happens when an EXISTING step that worked before suddenly
+//     can't find its element. The element almost certainly still exists
+//     in some form — null is the worst-case answer because it breaks the
+//     regression. Heal prompt biases toward "find the closest match" and
+//     leans HARD on `recordedFingerprint` data (id, testId, ancestorPath,
+//     boundingBox) which is always present at heal time.
+//
+// V22 GAP CLOSURE — both prompts now explicitly explain:
+//   - Identity priority hierarchy (id/testId/dataRowKey/childIconTestId
+//     beat text/role beat coordinates)
+//   - State-at-record semantics (expanded/invalid/current/valueNow)
+//   - data-value as i18n-stable key for select options
+//   - Bootstrap data-bs-toggle/data-bs-target combos
+//   - aria-haspopup as popup-trigger marker
+//   - ancestorPath as structural filter
+// ═══════════════════════════════════════════════════════════════════════════
 
-TASK: Given a user's intent (ANY language) and a list of candidate UI elements with their positions, select the SINGLE best matching element.
-
-RULES:
-1. Match semantically, not literally. Cross-language matching is critical:
-   - "войти" = "sign in" = "登录" = "iniciar sesión"
+/**
+ * Shared rules used by both Apply and Heal prompts. Covers the
+ * stable-across-all-modes logic: i18n, action-type semantics, icon button
+ * vocabulary, spatial layout, page state, disambiguation, ordinals, tables,
+ * confidence scale, gibberish rejection.
+ */
+const LLM_SHARED_RULES = `RULES:
+1. CROSS-LANGUAGE SEMANTIC MATCHING (intent and candidates can be in any language):
+   - "войти" = "sign in" = "登录" = "iniciar sesión" = "kirish"
    - "поиск" = "search" = "搜索" = "buscar"
    - "корзина" = "cart" = "购物车" = "carrito"
-2. Use action-type semantics:
+   Match by meaning, not by literal characters.
+
+2. ACTION-TYPE SEMANTICS:
    - click: prefer buttons, links, interactive elements
-   - type: prefer inputs, textareas, editable fields
-   - select: prefer dropdowns, select elements, listboxes
-   - check/uncheck/toggle: prefer checkboxes, radios, switches
+   - type: prefer inputs, textareas, [contenteditable=true]
+   - select: prefer dropdowns (role=combobox / role=listbox), <select>, MenuItem
+   - check/uncheck/toggle: prefer checkboxes, radios, switches (role=switch)
    - hover: prefer any interactive element
-3. Consider: label text, aria-label, placeholder, visible text, title attribute, container context
-4. ICON BUTTONS: Elements marked "icon-button" have no visible text — only an icon (SVG/image).
-   Match the user's VISUAL description of the icon to the element's semantic aria-label or title:
-   - "eye button" / "show/hide password" = "toggle password visibility"
-   - "X button" / "close" = "dismiss" / "close dialog"
-   - "hamburger menu" / "three lines" = "open navigation" / "menu"
-   - "arrow" / "back" = "go back" / "navigate back"
-   - "trash" / "delete icon" = "remove" / "delete item"
-   - "pencil" / "edit icon" = "edit" / "modify"
-5. VISUAL PROPERTIES: Elements may include [color, shape, icon: class] hints in square brackets.
-   - "серая кнопка" / "grey button" → match [grey] or [light-grey] color
-   - "круглая иконка" / "round icon" → match [circle] or [rounded] shape
-   - "иконка шестерёнки" / "gear icon" → match [icon: fa-gear] or [icon: settings]
-   - If no visual hints are present, rely on text/semantic matching only
-6. SPATIAL LAYOUT AWARENESS: Each element has position @(x,y,widthxheight).
-   Use positions to understand the page layout and detect overlay layers:
-   - MODAL/DIALOG: group of elements clustered in the CENTER of the viewport
-   - DRAWER/SIDEBAR: group of elements clustered on the RIGHT or LEFT edge
-   - DROPDOWN/MENU: small group of elements appearing BELOW a trigger
+   - press: prefer focusable element (input is fine)
+
+3. V22 IDENTITY SIGNAL PRIORITY (MOST → LEAST stable):
+   When candidate carries any of these identity hints, weigh them in this order:
+   ┌─ TIER 1 (almost always wins; treat as proof-of-identity):
+   │   • testid: <value>            ← test-only attribute, never changes
+   │   • id: <value>                ← DOM id (framework-generated ones are pre-filtered)
+   │   • dataRowKey: <value>        ← stable table-row identity (AntD Table)
+   │   • icon: <name>               ← lifted child icon testid (e.g. VisibilityOffOutlinedIcon)
+   ├─ TIER 2 (strong signals):
+   │   • value: <value>             ← <option value> — semantic key, survives i18n
+   │   • bsToggle / bsTarget        ← Bootstrap trigger combo
+   │   • activeDescendant: <ref>    ← currently-focused descendant of combobox
+   │   • hasPopup: <kind>           ← popup-trigger marker (menu|listbox|dialog)
+   ├─ TIER 3 (good signals — but locale-sensitive or layout-dependent):
+   │   • text / labelText / ariaLabel / placeholder / title / alt
+   │   • role + accessibleName combination
+   ├─ TIER 4 (weak / shape-only — use only as tie-breakers):
+   │   • cssClass / position @(x,y,wxh) / containerTitles / nearestLandmark
+   When recorded fingerprint has a TIER 1 signal AND a candidate carries the
+   exact same value, prefer that candidate even if its visible text differs.
+   Conversely: if recorded fingerprint says id="login-submit" but no candidate
+   has that id, the recorded element may have been renamed — fall back to TIER 2/3.
+
+4. STATE-AT-RECORD AWARENESS:
+   The fingerprint may include "stateAtRecord=[...]" reflecting how the
+   element looked when the user recorded it:
+   - expanded/collapsed → only relevant for togglable containers
+   - pressed/not-pressed → for toggle buttons (aria-pressed)
+   - checked/unchecked → for checkboxes/radios/switches
+   - invalid → element had a validation error showing (red border)
+   - current=page|step → Pagination/Stepper active marker
+   - valueNow=<num> / valueText="<str>" → Slider/SpinButton/ProgressBar value
+   When live candidates have explicit state markers ([expanded], [invalid],
+   [current=page], value:<X>), prefer the candidate whose live state matches
+   the recorded state. Different state usually means a different intent.
+
+5. ICON BUTTONS without visible text:
+   Match user's VISUAL description to the element's aria-label/title/icon hint:
+   - "eye button" / "show/hide password" → "toggle password visibility" / VisibilityOffIcon
+   - "X button" / "close" → "dismiss" / "close dialog" / CloseIcon
+   - "hamburger menu" / "three lines" → "open navigation" / MenuIcon
+   - "arrow back" → "go back" / ArrowBackIcon
+   - "trash" / "delete icon" → "remove" / "delete item" / DeleteIcon
+   - "pencil" / "edit icon" → "edit" / "modify" / EditIcon
+   - "gear" / "cog" / "шестерёнка" → "settings" / SettingsIcon
+   When candidate has "icon: SettingsIcon" in its hints, treat that as
+   semantic name even though it's a class identifier.
+
+6. VISUAL PROPERTIES (color, shape, icon-class):
+   Elements may include [color] [shape] [icon: class] hints in square brackets.
+   - "серая кнопка" / "grey button" → match [grey] or [light-grey]
+   - "круглая иконка" / "round icon" → match [circle] or [rounded]
+   - If user provides no visual hint, ignore these and rely on text/semantics.
+
+7. SPATIAL LAYOUT AWARENESS:
+   Position @(x,y,widthxheight). Use to detect overlay layers:
+   - MODAL/DIALOG: cluster centered horizontally and vertically
+   - DRAWER/SIDEBAR: cluster on RIGHT or LEFT edge
+   - DROPDOWN/MENU: small group BELOW a trigger
    - TOOLTIP/POPOVER: small cluster near a specific element
    - TOAST/SNACKBAR: small element at TOP or BOTTOM edge
-   When an overlay is present, ALWAYS prefer elements INSIDE the overlay over background elements.
-   Overlay elements cluster together spatially and appear ON TOP of the main content.
-   Background elements are spread across the full page and are NOT the user's target.
-7. PAGE STATE AWARENESS: Use the PAGE STATE line and element state hints to understand the live page:
-   - [expanded] = container/dropdown/menu is currently OPEN — its children are visible targets
-   - [collapsed] = container is CLOSED — its children are NOT the target
-   - [selected] = tab/option is currently active — content within is visible
-   - [active-layer] = element is inside the foreground modal/popup/overlay (if detected)
-   When the user says "inside dropdown/menu/popup/dialog":
-   - Find elements that are CHILDREN of an expanded/open container (check [container] prefixes)
-   - Prefer [active-layer] elements over background elements
-   - The trigger element (the one with [expanded]) is NOT the target — the content INSIDE is
-8. PARTIAL / ABBREVIATED DESCRIPTIONS: Users often shorten element descriptions:
-   - Match the MOST SPECIFIC candidate, not the broadest
-   - If a keyword appears in both a parent section/tab AND a child element, prefer the CHILD —
-     users describe what they want to interact with, using the parent as scope
-   - [Section > Subsection] prefixes are LOCATION context: "X inside Y" = find X within Y container
-9. DISAMBIGUATION when 2+ candidates share a keyword:
-   - Prefer candidates with more context overlap with the intent
-   - Prefer deeper-nested [A > B > C] elements over shallow [A] — more specific
-   - Prefer action-oriented text ("Create", "Add", "Delete", "Edit") for click/hover actions
-   - Prefer elements inside overlays or [active-layer] over background elements
-   - Use spatial position to disambiguate: if the intent mentions an element visible in an overlay, pick the overlay element
-10. RELATIVE POSITIONING — when the user describes an element by its spatial relationship to another:
-   COORDINATE SYSTEM: @(x,y,wxh) where x=pixels from LEFT, y=pixels from TOP.
-   Negative x or y means the element is partially scrolled off-screen — deprioritize these.
-   DIRECTIONAL:
-   - "above/over/сверху/上面" = SMALLER y value
-   - "below/under/снизу/下面" = LARGER y value
-   - "left of/слева от/左边" = SMALLER x value
-   - "right of/справа от/右边" = LARGER x value
-   - "top-left corner" / "верхний левый" = x < 200 AND y < 100
-   - "top-right corner" / "верхний правый" = x > viewportWidth - 200 AND y < 100
-   - "bottom" / "внизу" = y > viewportHeight - 200
-   PROXIMITY:
-   - "next to/beside/near/рядом с/около" = find the REFERENCE element first by name, then pick the closest candidate by Euclidean distance between bounding box centers
-   - "between X and Y" = find both reference elements, pick candidate whose center is between them
-   CONTAINMENT:
-   - "inside/within/in/внутри/в" = check [Section > Container] prefix — candidate must be a CHILD of named container
-   - "outside/вне" = candidate must NOT have the named container in its prefix
-   ORDINAL:
-   - "first/second/third/nth" / "первый/второй/третий" = sort matching candidates by DOM order (top-to-bottom, left-to-right by position), pick the Nth one
-   - "last/последний" = pick the one with highest index
-   TABLE/GRID (works for <table>, role="grid", and CSS grid/flex layouts):
-   - "row N column M" / "строка N столбец M" / "第N行第M列" = group elements by Y coordinate (same Y ±5px = same row), then by X (left-to-right = column order), pick [row N][col M]
-   - "cell in the Status column for row John" = find element whose near: text contains "John" AND whose X aligns with the "Status" column header
-   - Column headers: elements at the smallest Y value with header-like tags (<th>, role="columnheader") or styling define column positions — match candidate X to header X to determine column
-   - For CSS grid/flex tables (no <td>/<th>): treat elements with identical height, aligned Y as rows, aligned X as columns — same grouping logic applies
-   MULTI-SIGNAL: Combine signals when the user provides multiple hints:
-   - "grey button on the right side" → match [grey] color AND x > viewportWidth/2
-   - "small icon above the search bar" → match [small] size AND y < search_bar.y
-   - "delete button in the third row" → match "delete" text AND near: context of third row
-11. DUPLICATE ELEMENTS: When multiple elements have the same label, they are marked [N of M].
-   Each duplicate has "(CONTEXT: ...)" showing its card/row/container content — the KEY disambiguation signal.
-   - If the intent says "X button on Y" / "X for Y" / "X у Y" / "X на Y" / "X in Y row/card":
-     → Find the element whose CONTEXT contains "Y" and pick THAT one. This is the STRONGEST signal.
-   - If the intent mentions ANY name/text that matches ONE element's CONTEXT → pick THAT one confidently
-   - Example: intent "Забронировать button on Мирас А." + candidates have CONTEXT "Мирас А..." and CONTEXT "Кэтрин Ш..." → pick the one with "Мирас А."
-   - "second delete" / "2nd remove" / "второй удалить" → pick [2 of M]
-   - "first/last" → pick [1 of M] / [M of M]
-   - If intent has NO context to distinguish duplicates → MUST return alternatives, NEVER guess
-12. HONEST CONFIDENCE — be accurate, not optimistic:
-   - 0.9-1.0: exact or near-exact text/semantic match, no ambiguity
-   - 0.7-0.9: strong semantic match but indirect (cross-language, abbreviation, partial match)
-   - 0.5-0.7: plausible match but uncertain (multiple candidates could fit)
-   - below 0.5: weak guess — return alternatives instead
-   NEVER return confidence > 0.8 when guessing between duplicates without distinguishing context
-13. If 2+ elements are equally valid, return alternatives (not a single pick)
-14. ONLY use refs from the provided list — never invent refs
-15. Respond ONLY with valid JSON, no markdown
-16. CRITICAL — REJECT NON-MATCHING DESCRIPTIONS:
-   You MUST return ref=null when the intent does NOT semantically describe any candidate element.
-   This includes:
-   - Random/gibberish characters: "asdfgh", "ываыва", "xyzabc", "ывавыаывавыаывавыа"
-   - Text that is NOT an element description (copied content, random sentences, test data)
-   - Intent that has no semantic relationship to ANY candidate's label, text, placeholder, role, or appearance
-   You are NOT required to always pick an element. Returning null is the CORRECT answer when nothing matches.
-   Forcing a match on irrelevant input is WORSE than returning null.
+   When an overlay is present, ALWAYS prefer elements INSIDE it over background.
+
+8. PAGE-STATE-DRIVEN selection:
+   - [expanded] = container is OPEN; its children are visible candidates
+   - [collapsed] = container is CLOSED; its children are NOT the target
+   - [selected] = tab/option is active; content within is visible
+   - [active-layer] = element is inside the foreground overlay
+   - "clickable-row" = <tr> wired up as interactive without explicit role
+   When user says "inside dropdown/menu/popup/dialog":
+   - Find children of an [expanded]/[active-layer] container
+   - The trigger (the [expanded] element itself) is NOT the target
+
+9. ANCESTOR PATH HINT (V22):
+   The fingerprint may include "ancestorPath=...header#layout-header > div.icon-group > svg"
+   This is the DOM hierarchy of the recorded element from outer to inner.
+   Use it as a SOFT structural filter — candidates whose container chain
+   resembles this path (same outer landmark, same role progression) are
+   stronger matches. Do NOT require exact equality (DOM evolves).
+
+10. DUPLICATE ELEMENTS marked "[N of M]":
+    Each duplicate carries "(CONTEXT: ...)" showing card/row/container content.
+    - "X button on Y" / "X for Y" / "X у Y" / "X на Y" → match the duplicate
+      whose CONTEXT contains "Y". This is the STRONGEST disambiguator.
+    - "second delete" / "2nd" → pick [2 of M]
+    - "first" / "last" → pick [1 of M] / [M of M]
+    - If intent has NO context to distinguish duplicates → return alternatives.
+
+11. PARTIAL / ABBREVIATED DESCRIPTIONS:
+    Users shorten descriptions ("login" instead of "Login button").
+    - Match the MOST SPECIFIC candidate, not the broadest.
+    - When a keyword appears in BOTH a parent section AND a child element,
+      prefer the CHILD — users name what they want to interact with.
+    - [Section > Subsection] prefixes are LOCATION scope.
+
+12. RELATIVE POSITIONING (directional, proximity, ordinal, table/grid):
+    COORDINATE SYSTEM: @(x,y,wxh), x=left-to-right, y=top-to-bottom.
+    DIRECTIONAL: "above/over/сверху" → smaller y; "below/снизу" → larger y;
+    "left of/слева" → smaller x; "right of/справа" → larger x.
+    PROXIMITY: "next to / near / рядом" → smallest Euclidean distance to
+    the named reference element's bounding-box center.
+    ORDINAL: "first/second/N-th/последний" → sort by DOM order, pick N-th.
+    TABLE/GRID: "row N column M" → group by aligned Y for rows, aligned X
+    for columns; "cell in Status column for John" → match near-text "John"
+    AND X-aligned with Status header.
+    MULTI-SIGNAL: combine ("grey button on the right" → [grey] AND x > vw/2).
+
+13. CONFIDENCE SCALE (be honest, not optimistic):
+    - 0.95-1.0: exact TIER 1 identity match (id/testId/dataRowKey/icon equal)
+    - 0.85-0.95: TIER 2 match (value/bsToggle) OR exact text + role match
+    - 0.7-0.85: TIER 3 match — strong text/aria but indirect
+    - 0.5-0.7: plausible but uncertain (multiple candidates could fit)
+    - below 0.5: weak guess — return alternatives, not a single pick
+    NEVER return >0.8 when guessing between duplicates without context.
+
+14. ONLY use refs from the provided list — never invent refs.
+15. Respond ONLY with valid JSON, no markdown.
 
 OUTPUT FORMAT:
+- One match: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief"}
+- Ambiguous: {"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}`;
 
-If nothing matches or intent is nonsense/irrelevant (ALWAYS prefer this over a forced low-quality match):
-{"ref":null,"confidence":0,"reason":"description does not match any element"}
+/**
+ * Apply-mode prompt: user is AUTHORING a new step or refining one.
+ * The intent text comes from the editor; user might be exploratory.
+ * Returning null is the CORRECT answer when nothing matches — the user
+ * will refine the description.
+ */
+const LLM_SELECT_APPLY_PROMPT = `You are an AI element selector for a browser testing tool.
 
-If one element clearly matches:
-{"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
+MODE: APPLY — the user is authoring a test step. Pick the SINGLE element
+that best matches their description, OR return null if nothing fits.
 
-If ambiguous (2+ equally valid):
-{"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}`;
+TASK: Given a user's intent (any language) and a list of candidate UI
+elements, select the one that best matches OR null if no candidate
+semantically describes any element.
+
+${LLM_SHARED_RULES}
+
+16. REJECT GIBBERISH / IRRELEVANT TEXT (Apply-mode safety):
+    Return ref=null when the intent is:
+    - Random/gibberish: "asdfgh", "ываыва", "xyzabc"
+    - Copied content / random sentences (not element descriptions)
+    - Has no semantic relationship to ANY candidate's label/text/role/icon
+    Forcing a match on irrelevant input is WORSE than returning null —
+    the user will see no-match feedback and refine their intent.
+
+EXAMPLES (Apply-mode — diverse domains, calibrated confidence):
+
+— TIER 1 dataValue exact match (high confidence 0.95) —
+INTENT: "Казахстан"
+CANDIDATES:
+  1. ref="e10" <li> Kazakhstan [role: option] value: kz
+  2. ref="e11" <li> Kyrgyzstan [role: option] value: kg
+RECORDED HINTS: dataValue="kz"
+EXPECTED: {"ref":"e10","confidence":0.95,"reason":"dataValue=kz exact match; UI text localized but key stable"}
+
+— TIER 1 childTestId for icon-only button (high confidence 0.92) —
+INTENT: "show password"
+CANDIDATES:
+  1. ref="e2" <input> placeholder: Email [type: email]
+  2. ref="e3" <button> [role: button] icon: VisibilityOffOutlinedIcon
+EXPECTED: {"ref":"e3","confidence":0.92,"reason":"icon: VisibilityOffIcon semantically matches \"show password\""}
+
+— TIER 3 cross-language text-only match (medium confidence 0.78) —
+INTENT: "Добавить в корзину"
+CANDIDATES:
+  1. ref="e15" <button> Add to cart [role: button]
+  2. ref="e16" <button> Buy now [role: button]
+  3. ref="e17" <a> View details [role: link]
+EXPECTED: {"ref":"e15","confidence":0.78,"reason":"\"Добавить в корзину\"=\"Add to cart\" cross-language; no recorded id/testId, so confidence is medium not high"}
+
+— Partial / ambiguous text — medium confidence (0.65) when uncertain —
+INTENT: "submit"
+CANDIDATES:
+  1. ref="e1" <button> Submit form [role: button]
+  2. ref="e2" <button> Submit & Continue [role: button]
+  3. ref="e3" <input> [role: button] type: submit
+EXPECTED: {"ref":"e1","confidence":0.65,"reason":"three plausible matches; pick shortest exact-prefix match but confidence is honest about ambiguity"}
+
+— File upload trigger via aria-label (mixed signals, 0.82) —
+INTENT: "upload avatar"
+CANDIDATES:
+  1. ref="e8" <button> [role: button] ariaLabel: "Upload profile picture" [icon: CloudUploadIcon]
+  2. ref="e9" <input> type: file accept: image/*
+EXPECTED: {"ref":"e8","confidence":0.82,"reason":"button with ariaLabel \"Upload profile picture\" semantically matches \"upload avatar\"; the hidden input is the actual <input type=file> but users click the styled button"}
+
+— Reject gibberish —
+INTENT: "ываыва asdfgh"
+CANDIDATES: any list
+EXPECTED: {"ref":null,"confidence":0,"reason":"intent is gibberish, no semantic relationship to any candidate"}
+
+— Ambiguous duplicates — return alternatives, not guess —
+INTENT: "Delete"
+CANDIDATES:
+  1. ref="e30" <button> Delete [1 of 3] (CONTEXT: Anna Lee, anna@x.com)
+  2. ref="e31" <button> Delete [2 of 3] (CONTEXT: Bob Smith, bob@x.com)
+  3. ref="e32" <button> Delete [3 of 3] (CONTEXT: Cara Jones, cara@x.com)
+EXPECTED: {"ref":null,"confidence":0,"alternatives":["e30","e31","e32"],"reason":"3 identical Delete buttons; intent has no row context — refuse to guess"}
+
+CONFIDENCE CALIBRATION REMINDER:
+TIER 1 exact (id/testId/dataRowKey/childTestId) → 0.92-0.97
+TIER 2 exact (dataValue/bsToggle combo) → 0.85-0.92
+TIER 3 strong (exact text + role) → 0.80-0.88
+TIER 3 indirect (cross-language / abbreviation) → 0.70-0.80
+Medium uncertainty (multiple plausible) → 0.55-0.70 — return alternatives if ≥2 equally good
+Weak guess → return alternatives, NOT a single low-confidence pick
+
+OUTPUT (Apply-mode):
+- No match: {"ref":null,"confidence":0,"reason":"description does not match any element"}
+- One match: {"ref":"eXX","confidence":0.0-1.0,"reason":"..."}
+- Ambiguous (2+ equally valid): {"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}`;
+
+/**
+ * Heal-mode prompt: an EXISTING step that worked before is failing now,
+ * usually because the page changed (redesign, A/B test, locale switch).
+ * The element almost always still exists in SOME form — the recorded
+ * fingerprint is the strongest evidence. We bias HARD toward finding the
+ * closest match rather than returning null.
+ */
+const LLM_SELECT_HEAL_PROMPT = `You are an AI element selector for a browser testing tool, in HEAL mode.
+
+MODE: HEAL — an existing recorded test step that worked before is failing
+now because the page changed. The same element almost certainly still
+exists in some form. Use the RECORDED ELEMENT HINTS as the primary
+evidence — those captured the element BEFORE it drifted.
+
+CRITICAL HEAL DIRECTIVES (override the shared rules where they conflict):
+
+A. PREFER ANY REASONABLE MATCH OVER NULL.
+   The element existed once. Returning null breaks the regression test —
+   that's strictly worse than picking a candidate with confidence 0.6.
+   Only return null when ZERO candidates share even a TIER 3 signal with
+   the recorded fingerprint.
+
+B. RECORDED FINGERPRINT IS THE PRIMARY EVIDENCE.
+   The user's intent text may now be misleading (e.g. recorded button
+   said "Submit" but UI changed to "Continue"). Trust the fingerprint
+   over the intent text when they conflict.
+
+C. MATCH ON IDENTITY FIRST, SHAPE SECOND, TEXT LAST.
+   Walk the TIER 1 → TIER 4 hierarchy from the shared rules:
+     - Same testid in fingerprint and a live candidate? Pick that one.
+     - Same id in fingerprint? Pick that candidate.
+     - Same dataRowKey, childIconTestId, value? Pick.
+     - Same role + same containerTitle (e.g. both inside form#login)? Pick.
+     - Same recordedAt position (boundingBox roughly matches)? Pick.
+     - Same TIER 3 text/aria-label match? Pick.
+   Only fall through to "best-effort semantic match" when no signal aligns.
+
+D. STATE DRIFT IS NORMAL.
+   The recorded state (expanded/invalid/current=page) may not match the
+   live state — that's fine. The state is a HINT for disambiguation, not
+   a hard filter. Pick the right element by identity even if its state
+   has changed.
+
+E. POSITIONAL DRIFT IS NORMAL.
+   recordedAt=(x,y,w,h) may be off by 200+ pixels after a redesign. Use
+   it only as a tie-breaker among same-identity candidates, not as a
+   filter.
+
+${LLM_SHARED_RULES}
+
+EXAMPLES (Heal-mode — element existed before, find closest match):
+
+— TIER 1 id wins over text drift (high confidence 0.95) —
+INTENT: "Submit"
+RECORDED HINTS: id="login-submit-btn", role="button", labelText="Submit"
+CANDIDATES:
+  1. ref="e5" <button> Continue [role: button] id: login-submit-btn
+  2. ref="e9" <button> Cancel [role: button]
+EXPECTED: {"ref":"e5","confidence":0.95,"reason":"id=login-submit-btn matches recorded; text drifted Submit→Continue (UI redesign)"}
+
+— Localization drift, id stays stable (high confidence 0.93) —
+INTENT: "Login"
+RECORDED HINTS: id="auth-login", labelText="Login"
+CANDIDATES:
+  1. ref="e1" <button> Войти [role: button] id: auth-login
+  2. ref="e2" <a> Регистрация [role: link]
+EXPECTED: {"ref":"e1","confidence":0.93,"reason":"id=auth-login matches; text drifted Login→Войти (locale switch)"}
+
+— Position drifted, childTestId identifies (high confidence 0.90) —
+INTENT: "settings gear"
+RECORDED HINTS: childTestId="SettingsIcon", recordedAt=(1240,14,20x20)
+CANDIDATES:
+  1. ref="e7" <button> [role: button] icon: SettingsIcon @(310,800,32x32)
+  2. ref="e8" <button> [role: button] icon: HomeIcon @(1240,14,20x20)
+EXPECTED: {"ref":"e7","confidence":0.90,"reason":"childTestId=SettingsIcon matches; layout moved header→sidebar but icon identity stable"}
+
+— ancestorPath disambiguates duplicates (medium-high 0.85) —
+INTENT: "Save"
+RECORDED HINTS: ariaLabel="Save changes", ancestorPath="form#profile > div.actions > button"
+CANDIDATES:
+  1. ref="e2" <button> Save [role: button] [ancestor: form#profile]
+  2. ref="e3" <button> Save [role: button] [ancestor: dialog#confirm]
+EXPECTED: {"ref":"e2","confidence":0.85,"reason":"two Save buttons; recorded ancestorPath has form#profile — pick that one"}
+
+— Slider value drift within tolerance (medium 0.75) —
+INTENT: "volume slider"
+RECORDED HINTS: role="slider", stateAtRecord=[valueText="50%",valueNow=50]
+CANDIDATES:
+  1. ref="e3" <input> [role: slider] value: 48
+  2. ref="e4" <input> [role: slider] value: 100
+EXPECTED: {"ref":"e3","confidence":0.75,"reason":"valueNow=48 close to recorded 50; only one slider in similar value range"}
+
+— Text-only heal, no identity signals — medium confidence (0.65) —
+INTENT: "Continue"
+RECORDED HINTS: text="Continue", role="button"
+CANDIDATES:
+  1. ref="e1" <button> Continue [role: button]
+  2. ref="e2" <button> Cancel [role: button]
+EXPECTED: {"ref":"e1","confidence":0.65,"reason":"only text+role to match; recorded had no id/testId so heal confidence is honest medium"}
+
+— Honest null: live page lacks element entirely (rare but real) —
+INTENT: "Apply discount code"
+RECORDED HINTS: id="discount-apply", testId="discount-btn", text="Apply", role="button"
+CANDIDATES (live page after redesign — discount feature was removed):
+  1. ref="e1" <input> placeholder: "Search products" [role: textbox]
+  2. ref="e2" <a> Cart [role: link]
+  3. ref="e3" <button> Sign in [role: button]
+EXPECTED: {"ref":null,"confidence":0,"reason":"zero candidates share recorded id/testId/text/aria; feature appears removed — heal cannot fabricate match"}
+
+— Honest null: ambiguous heal (multiple equally-strong matches) —
+INTENT: "Edit row"
+RECORDED HINTS: childTestId="EditIcon", role="button"
+CANDIDATES:
+  1. ref="e1" <button> [role: button] icon: EditIcon (CONTEXT: row 1)
+  2. ref="e2" <button> [role: button] icon: EditIcon (CONTEXT: row 2)
+  3. ref="e3" <button> [role: button] icon: EditIcon (CONTEXT: row 3)
+EXPECTED: {"ref":null,"confidence":0,"alternatives":["e1","e2","e3"],"reason":"three buttons with same recorded childTestId; recorded fingerprint has no row-distinguishing context"}
+
+CONFIDENCE CALIBRATION REMINDER (Heal):
+TIER 1 exact match → 0.90-0.97 (rare to hit ceiling — page changed for a reason)
+TIER 2 / 1+structural match → 0.80-0.90
+ancestorPath disambiguator → 0.80-0.88
+state/value drift within tolerance → 0.70-0.80
+text-only heal (no id/testId in recorded) → 0.60-0.75
+Below 0.60 → STOP, return alternatives or null instead of low-confidence pick.
+
+PREFERENCE ORDER when multiple options seem viable:
+1. Pick the candidate with strongest TIER 1 match (id/testId/dataRowKey/childTestId).
+2. If no TIER 1, prefer the one whose ancestorPath / containerTitles align with recorded.
+3. If still tied — return alternatives (DO NOT guess silently).
+4. Return null ONLY when zero candidates share any TIER 1-3 signal — the
+   element genuinely seems removed, not just drifted.
+
+OUTPUT (Heal-mode — bias toward picking when identity signals match):
+- One match: {"ref":"eXX","confidence":0.0-1.0,"reason":"..."}
+- No reasonable match (RARE — only when zero TIER 1-3 signals align):
+  {"ref":null,"confidence":0,"reason":"no candidate shares any identity/shape/text signal with recorded fingerprint"}
+- Ambiguous between equally-strong matches:
+  {"ref":null,"confidence":0,"alternatives":["e1","e5"],"reason":"..."}`;
 
 /**
  * LLM-based element selection: uses Gemini Flash Lite to pick the best candidate.
@@ -1490,8 +1838,16 @@ async function selectElementWithLLM(params: {
    * because of redesign, localization, or A/B tests.
    */
   recordedFingerprint?: TargetFingerprint;
+  /**
+   * V22: which prompt to use.
+   *   - 'apply' (default): user is authoring a step. Returning null on a
+   *     no-match is correct — the user will refine the description.
+   *   - 'heal': existing step is failing during regression. Bias toward
+   *     finding the closest match using recordedFingerprint identity.
+   */
+  mode?: 'apply' | 'heal';
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, mode = 'apply' } = params;
   const startTime = Date.now();
 
   // Check cache
@@ -1500,22 +1856,62 @@ async function selectElementWithLLM(params: {
   // Include a fingerprint digest so that prompt-level hints never cause
   // cross-shape cache hits (e.g. the same intent for a different recorded
   // element should not reuse a prior selection).
+  // V22: digest now includes all V22 identity attributes (id/name/href/etc.)
+  // so a step recorded against a *different* element with same description
+  // gets its own cache slot. Without this, two recordings with identical
+  // intentText but distinct recordedFingerprints could share a stale cache entry.
+  //
+  // V22 Audit-fix C1: each value is escaped so embedded `:` (e.g. CSS
+  // selectors in bsTarget like "#modal:not(.hidden)") cannot collide with
+  // the `:` separator. We replace `:` and `\` in each segment before join.
+  const dEsc = (v: unknown): string => {
+    if (v === undefined || v === null) return '';
+    return String(v).replace(/\\/g, '\\\\').replace(/:/g, '\\c');
+  };
   const fpDigest = recordedFingerprint
     ? [
-        recordedFingerprint.tag || '',
-        recordedFingerprint.role || '',
-        recordedFingerprint.ariaLabel || '',
-        recordedFingerprint.labelText || '',
-        recordedFingerprint.testIdAttr || '',
-        recordedFingerprint.placeholder || '',
-        recordedFingerprint.nearestLandmark || '',
+        dEsc(recordedFingerprint.tag),
+        dEsc(recordedFingerprint.role),
+        dEsc(recordedFingerprint.ariaLabel),
+        dEsc(recordedFingerprint.labelText),
+        dEsc(recordedFingerprint.testIdAttr),
+        dEsc(recordedFingerprint.placeholder),
+        dEsc(recordedFingerprint.nearestLandmark),
+        dEsc(recordedFingerprint.elementId),
+        dEsc(recordedFingerprint.name),
+        dEsc(recordedFingerprint.href),
+        dEsc(recordedFingerprint.ariaControls),
+        dEsc(recordedFingerprint.cssClass),
+        dEsc(recordedFingerprint.ancestorSummary),
+        // V22 Pkg1 — childTestId + dataValue + current/valueNow/valueText
+        // are all distinct identifiers, must contribute to cache key so a
+        // re-recorded step with same description but different selected
+        // option / slider value doesn't reuse a stale answer.
+        dEsc((recordedFingerprint as any).childTestId),
+        dEsc((recordedFingerprint as any).dataValue),
+        // V22 Pkg2 — Bootstrap / activedescendant / row-key disambiguators.
+        dEsc((recordedFingerprint as any).bsToggle),
+        dEsc((recordedFingerprint as any).bsTarget),
+        dEsc((recordedFingerprint as any).ariaHasPopup),
+        dEsc((recordedFingerprint as any).ariaActiveDescendant),
+        dEsc((recordedFingerprint as any).dataRowKey),
+        // ariaState compact form: e/p/c/i flags + (V22 Pkg1) current/valueNow/valueText.
+        // Sub-fields joined with `|` (also escaped for safety).
+        recordedFingerprint.ariaState
+          ? `${recordedFingerprint.ariaState.expanded ?? '_'}${recordedFingerprint.ariaState.pressed ?? '_'}${recordedFingerprint.ariaState.checked ?? '_'}${recordedFingerprint.ariaState.invalid ?? '_'}|${dEsc((recordedFingerprint.ariaState as any).current)}|${dEsc((recordedFingerprint.ariaState as any).valueNow)}|${dEsc((recordedFingerprint.ariaState as any).valueText)}`
+          : '',
         recordedFingerprint.boundingBox
           ? `${Math.round(recordedFingerprint.boundingBox.x)},${Math.round(recordedFingerprint.boundingBox.y)}`
           : '',
         (recordedFingerprint.containerTitles || []).join('|'),
       ].join(':')
     : '';
-  const cacheKey = `${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
+  // V22: include mode in cache key — apply-mode and heal-mode use different
+  // prompts and may return different answers for the same inputs (heal
+  // biases toward picking, apply allows null). Sharing cache slots between
+  // them would leak heal's "always-pick" answers into apply (where null is
+  // the right answer for gibberish) and vice versa.
+  const cacheKey = `${mode}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
     cacheMetrics.inc('llm-select', 'hit');
@@ -1545,21 +1941,101 @@ async function selectElementWithLLM(params: {
   // instructs the model to use this as a HINT (not a filter) so a minor
   // drift (text change, button restyled, moved by 50px) does not force a
   // null selection when a reasonable match still exists.
+  // V22 Audit-fix M1: escape values that flow into LLM prompt text.
+  // Newlines or unescaped quotes in recorded fp values (e.g. id with `\n`,
+  // text with `"`) can break the prompt's hint structure or smuggle an
+  // unintended directive. Cap at 200 chars per value to prevent token
+  // bloat from a single oversized field.
+  const fpEsc = (v: unknown): string => {
+    if (v === undefined || v === null) return '';
+    let s = String(v);
+    if (s.length > 200) s = s.slice(0, 200);
+    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]+/g, ' ');
+  };
   const fpHintLines: string[] = [];
   if (recordedFingerprint) {
-    if (recordedFingerprint.tag) fpHintLines.push(`tag=<${recordedFingerprint.tag}>`);
-    if (recordedFingerprint.role) fpHintLines.push(`role="${recordedFingerprint.role}"`);
-    if (recordedFingerprint.ariaLabel) fpHintLines.push(`ariaLabel="${recordedFingerprint.ariaLabel}"`);
-    if (recordedFingerprint.labelText) fpHintLines.push(`labelText="${recordedFingerprint.labelText}"`);
-    if (recordedFingerprint.placeholder) fpHintLines.push(`placeholder="${recordedFingerprint.placeholder}"`);
-    if (recordedFingerprint.testIdAttr) fpHintLines.push(`testId="${recordedFingerprint.testIdAttr}"`);
-    if (recordedFingerprint.nearestLandmark) fpHintLines.push(`inLandmark="${recordedFingerprint.nearestLandmark}"`);
+    // V22 Audit M1: every value flowing into a `key="${value}"` line gets
+    // run through fpEsc to neutralize embedded quotes/newlines/backslashes.
+    // ── Identity attributes (most stable; use as primary disambiguators) ──
+    if (recordedFingerprint.tag) fpHintLines.push(`tag=<${fpEsc(recordedFingerprint.tag)}>`);
+    if (recordedFingerprint.role) fpHintLines.push(`role="${fpEsc(recordedFingerprint.role)}"`);
+    // V22: id is the strongest identity signal after testId — emit it FIRST
+    // among the "stable identifiers" group so the LLM weighs it accordingly.
+    if (recordedFingerprint.elementId) fpHintLines.push(`id="${fpEsc(recordedFingerprint.elementId)}"`);
+    if (recordedFingerprint.testIdAttr) fpHintLines.push(`testId="${fpEsc(recordedFingerprint.testIdAttr)}"`);
+    if (recordedFingerprint.name) fpHintLines.push(`name="${fpEsc(recordedFingerprint.name)}"`);
+
+    // ── Descriptive attributes ──
+    if (recordedFingerprint.ariaLabel) fpHintLines.push(`ariaLabel="${fpEsc(recordedFingerprint.ariaLabel)}"`);
+    if (recordedFingerprint.labelText) fpHintLines.push(`labelText="${fpEsc(recordedFingerprint.labelText)}"`);
+    if (recordedFingerprint.text) fpHintLines.push(`text="${fpEsc(recordedFingerprint.text)}"`);
+    if (recordedFingerprint.placeholder) fpHintLines.push(`placeholder="${fpEsc(recordedFingerprint.placeholder)}"`);
+    if (recordedFingerprint.title) fpHintLines.push(`title="${fpEsc(recordedFingerprint.title)}"`);
+    if (recordedFingerprint.alt) fpHintLines.push(`alt="${fpEsc(recordedFingerprint.alt)}"`);
+    if (recordedFingerprint.type) fpHintLines.push(`inputType="${fpEsc(recordedFingerprint.type)}"`);
+
+    // ── Secondary locator signals (V22) ──
+    if (recordedFingerprint.cssClass) fpHintLines.push(`cssClass="${fpEsc(recordedFingerprint.cssClass)}"`);
+    if (recordedFingerprint.href) fpHintLines.push(`href="${fpEsc(recordedFingerprint.href)}"`);
+    if (recordedFingerprint.ariaControls) fpHintLines.push(`ariaControls="${fpEsc(recordedFingerprint.ariaControls)}"`);
+
+    // ── Spatial / structural context ──
+    if (recordedFingerprint.nearestLandmark) fpHintLines.push(`inLandmark="${fpEsc(recordedFingerprint.nearestLandmark)}"`);
     if (recordedFingerprint.containerTitles?.length) {
+      // JSON.stringify already escapes quotes; no fpEsc needed here.
       fpHintLines.push(`containers=${JSON.stringify(recordedFingerprint.containerTitles.slice(0, 3))}`);
+    }
+    if (recordedFingerprint.ancestorSummary) {
+      fpHintLines.push(`ancestorPath="${fpEsc(recordedFingerprint.ancestorSummary)}"`);
     }
     if (recordedFingerprint.boundingBox) {
       const bb = recordedFingerprint.boundingBox;
       fpHintLines.push(`recordedAt=(${Math.round(bb.x)},${Math.round(bb.y)},${Math.round(bb.width)}x${Math.round(bb.height)})`);
+    }
+
+    // ── V22 Pkg1: child icon testid + data-value ──
+    if ((recordedFingerprint as any).childTestId) {
+      fpHintLines.push(`childIconTestId="${fpEsc((recordedFingerprint as any).childTestId)}"`);
+    }
+    if ((recordedFingerprint as any).dataValue) {
+      fpHintLines.push(`dataValue="${fpEsc((recordedFingerprint as any).dataValue)}"`);
+    }
+
+    // ── V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key ──
+    if ((recordedFingerprint as any).bsToggle) {
+      fpHintLines.push(`bsToggle="${fpEsc((recordedFingerprint as any).bsToggle)}"`);
+    }
+    if ((recordedFingerprint as any).bsTarget) {
+      fpHintLines.push(`bsTarget="${fpEsc((recordedFingerprint as any).bsTarget)}"`);
+    }
+    if ((recordedFingerprint as any).ariaHasPopup) {
+      fpHintLines.push(`ariaHasPopup="${fpEsc((recordedFingerprint as any).ariaHasPopup)}"`);
+    }
+    if ((recordedFingerprint as any).ariaActiveDescendant) {
+      fpHintLines.push(`activeDescendant="${fpEsc((recordedFingerprint as any).ariaActiveDescendant)}"`);
+    }
+    if ((recordedFingerprint as any).dataRowKey) {
+      fpHintLines.push(`dataRowKey="${fpEsc((recordedFingerprint as any).dataRowKey)}"`);
+    }
+
+    // ── ARIA state at recording time (V22) ──
+    // Distinguishes "click toggle when expanded" vs "when collapsed",
+    // and "click invalid input with red border" vs "click freshly-cleared one".
+    if (recordedFingerprint.ariaState) {
+      const stateBits: string[] = [];
+      const st = recordedFingerprint.ariaState;
+      if (st.expanded === true) stateBits.push('expanded');
+      else if (st.expanded === false) stateBits.push('collapsed');
+      if (st.pressed === true) stateBits.push('pressed');
+      else if (st.pressed === false) stateBits.push('not-pressed');
+      if (st.checked === true) stateBits.push('checked');
+      else if (st.checked === false) stateBits.push('unchecked');
+      if (st.invalid === true) stateBits.push('invalid');
+      // V22 Pkg1: current/valueNow/valueText state — Pagination/Slider fidelity
+      if ((st as any).current) stateBits.push(`current=${(st as any).current}`);
+      if (typeof (st as any).valueNow === 'number') stateBits.push(`valueNow=${(st as any).valueNow}`);
+      if ((st as any).valueText) stateBits.push(`valueText="${(st as any).valueText}"`);
+      if (stateBits.length > 0) fpHintLines.push(`stateAtRecord=[${stateBits.join(',')}]`);
     }
   }
   const fpHint = fpHintLines.length > 0
@@ -1580,10 +2056,15 @@ Select the single best matching element, or return ref=null if the intent does n
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), LLM_SELECT_TIMEOUT_MS);
 
+  // V22: pick prompt by mode. Heal-mode biases toward "find any reasonable
+  // match" using recordedFingerprint as primary evidence; apply-mode allows
+  // null when the description is gibberish or doesn't fit any candidate.
+  const systemPrompt = mode === 'heal' ? LLM_SELECT_HEAL_PROMPT : LLM_SELECT_APPLY_PROMPT;
+
   try {
     const response = await getChatCompletionWithMessages(
       [
-        { role: 'system', content: LLM_SELECT_SYSTEM_PROMPT },
+        { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
       {
@@ -1848,6 +2329,14 @@ export async function resolveElement(params: {
   includeAlternatives?: boolean;
   /** Phase 6: Screenshot for vision-enhanced rescue (base64 JPEG/PNG or lazy callback) */
   screenshot?: ScreenshotResult | (() => Promise<ScreenshotResult | null>);
+  /**
+   * V22: caller mode. 'apply' (default) for editor authoring + preview run;
+   * 'heal' for command-executor.ts auto-heal during regression. Routes to
+   * the appropriate LLM prompt and cache slot. The legacy convention of
+   * `previewSessionId === 'background'` indicating heal-mode is honored
+   * automatically when this flag isn't set.
+   */
+  mode?: 'apply' | 'heal';
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -1857,6 +2346,10 @@ export async function resolveElement(params: {
     includeAlternatives = false,
     screenshot: screenshotOrFnRaw,
   } = params;
+  // V22: derive heal-mode from explicit param OR the legacy
+  // `previewSessionId === 'background'` convention used by command-executor.
+  const resolveMode: 'apply' | 'heal' =
+    params.mode ?? (previewSessionId === 'background' ? 'heal' : 'apply');
   const startTime = Date.now();
 
   // V15: Memoize screenshot capture within this resolveElement call.
@@ -2343,7 +2836,15 @@ export async function resolveElement(params: {
         candidates: candidatesToProcess,
         pageUrl,
         pageSignature,
-        recordedFingerprint: stepDraft.compiled?.targetFingerprint,
+        // V22: prefer the recording-time fingerprint (set by recorder at
+        // capture). Falls back to the apply-time fingerprint embedded in
+        // the compiled plan (only present after the FIRST successful apply).
+        // Without this fallback, the very first apply ran fingerprint-blind
+        // even though the recorder had already gathered all the data.
+        recordedFingerprint: stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint,
+        // V22: route to apply / heal prompt — derived from previewSessionId
+        // legacy convention or explicit caller flag, see resolveMode above.
+        mode: resolveMode,
       });
 
       cacheHit = llmResult.cacheHit;
@@ -2553,7 +3054,14 @@ export async function resolveElement(params: {
             candidates: overflowCandidates,
             pageUrl,
             pageSignature: pageSignature + ':overflow',
-            recordedFingerprint: stepDraft.compiled?.targetFingerprint,
+            // V22: prefer the recording-time fingerprint (set by recorder at
+            // capture). Falls back to the apply-time fingerprint embedded in
+            // the compiled plan (only present after the FIRST successful apply).
+            // Without this fallback, the very first apply ran fingerprint-blind
+            // even though the recorder had already gathered all the data.
+            recordedFingerprint: stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint,
+            // V22: route to apply / heal prompt (overflow path inherits parent mode).
+            mode: resolveMode,
           });
 
           if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {

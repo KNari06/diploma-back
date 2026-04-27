@@ -2198,12 +2198,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const aType = RecordingCaptureService.inferClickActionType(el, safeClickCount, safeButton);
                 const desc = RecordingCaptureService.buildDescription(aType, el);
                 const bHints = RecordingCaptureService.buildBindingHints(el);
+                // V22: Fingerprint set NOW so LLM resolver has identifying
+                // data on the first apply (before compiled plan exists).
+                const recFp = RecordingCaptureService.buildRecordedFingerprint(el);
                 const iSel = el.iframeSelector;
                 const built: PreviewIntentStep = {
                   id: stepIdForClick,
                   type: aType,
                   description: desc,
                   bindingHints: Object.keys(bHints).length > 0 ? bHints : undefined,
+                  recordedFingerprint: Object.keys(recFp).length > 0 ? recFp : undefined,
                   options: {
                     ...(hasModifiers && {
                       modifiers: {
@@ -2789,12 +2793,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 // First character — probe focused element for label
                 const page = sessionService.getPage(previewSessionId, ensuredUserId);
                 const focusedEl = page ? await RecordingCaptureService.probeFocusedElement(page) : null;
+                // V22: capture fingerprint at focus time so the eventual
+                // type-step has identifying data on first apply.
+                const focusedFp = focusedEl
+                  ? RecordingCaptureService.buildRecordedFingerprint(focusedEl)
+                  : undefined;
                 buffer = {
                   text: data.text,
                   elementRef: focusedEl?.ref,
                   elementLabel: RecordingCaptureService.getElementLabel(focusedEl),
                   lastCharAt: Date.now(),
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
+                  recordedFingerprint: focusedFp && Object.keys(focusedFp).length > 0 ? focusedFp : undefined,
                   isMultiline: focusedEl?.isMultiline,
                   pageUrl: page?.url(),
                   iframeSelector: focusedEl?.iframeSelector, // V13: iframe context for replay

@@ -439,13 +439,170 @@ export async function quickFingerprintCheck(
         depth++;
       }
 
+      // V22: extended testId fallback chain — must match the recorder
+      // (recording-capture.service.ts probe). Without parity, a recording
+      // that picked up `data-qa-test-id` won't validate against the live
+      // node and fp score silently degrades.
+      const liveTestId =
+        el?.getAttribute?.('data-testid')
+        || el?.getAttribute?.('data-test')
+        || el?.getAttribute?.('data-test-id')
+        || el?.getAttribute?.('data-cy')
+        || el?.getAttribute?.('data-qa')
+        || el?.getAttribute?.('data-qa-test-id')
+        || el?.getAttribute?.('data-qa-id')
+        || el?.getAttribute?.('data-qaa')
+        || el?.getAttribute?.('data-automation-id')
+        || el?.getAttribute?.('data-automationid')
+        || el?.getAttribute?.('data-pw')
+        || el?.getAttribute?.('data-e2e')
+        || el?.getAttribute?.('data-e2e-test')
+        || el?.getAttribute?.('data-test-element')
+        || el?.getAttribute?.('data-track')
+        || null;
+
+      // V22: extended attributes for fingerprint comparison.
+      const liveId = el?.id || el?.getAttribute?.('id') || null;
+      const liveName = el?.getAttribute?.('name') || null;
+      const liveType = el?.getAttribute?.('type') || null;
+      const liveTitle = el?.getAttribute?.('title') || null;
+      const liveAlt = el?.getAttribute?.('alt') || null;
+      const liveText = ((el?.innerText != null ? el.innerText : el?.textContent) || '').trim().slice(0, 80) || null;
+      const liveAriaControls = el?.getAttribute?.('aria-control') || el?.getAttribute?.('aria-controls') || null;
+      const liveHref = el?.tagName?.toLowerCase() === 'a' ? (el?.getAttribute?.('href') || null) : null;
+      // ARIA state — for "click toggle while expanded" style fingerprints.
+      const ae2 = el?.getAttribute?.('aria-expanded');
+      const ap2 = el?.getAttribute?.('aria-pressed');
+      const ai2 = el?.getAttribute?.('aria-invalid');
+      // V22 Pkg1: aria-current / aria-valuenow / aria-valuetext for
+      // pagination / slider / spinbutton fidelity at heal time.
+      const acu2 = el?.getAttribute?.('aria-current') || undefined;
+      const avnRaw = el?.getAttribute?.('aria-valuenow');
+      let avn: number | undefined;
+      if (avnRaw !== null && avnRaw !== '' && avnRaw !== undefined) {
+        const parsed = parseFloat(avnRaw);
+        if (!isNaN(parsed)) avn = parsed;
+      } else if (
+        (el?.tagName?.toLowerCase() === 'input' && (el.type === 'range' || el.type === 'number'))
+        || el?.tagName?.toLowerCase() === 'progress'
+        || el?.tagName?.toLowerCase() === 'meter'
+      ) {
+        const nativeVal = parseFloat(el.value || '');
+        if (!isNaN(nativeVal)) avn = nativeVal;
+      }
+      const avt = el?.getAttribute?.('aria-valuetext') || undefined;
+      const liveAriaState = {
+        expanded: ae2 === 'true' ? true : ae2 === 'false' ? false : undefined,
+        pressed: ap2 === 'true' ? true : ap2 === 'false' ? false : undefined,
+        invalid: ai2 === 'true' ? true : ai2 === 'false' ? false : undefined,
+        checked: el?.tagName?.toLowerCase() === 'input' && (el.type === 'checkbox' || el.type === 'radio') ? !!el.checked : undefined,
+        current: acu2,
+        valueNow: avn,
+        valueText: avt,
+      };
+
+      // V22 Pkg1: data-value / option value for select option matching.
+      let liveDataValue: string | undefined =
+        el?.getAttribute?.('data-value') || undefined;
+      const ttagLower = el?.tagName?.toLowerCase();
+      const tRole = el?.getAttribute?.('role');
+      if (!liveDataValue && (ttagLower === 'option' || tRole === 'option' || tRole === 'menuitem')) {
+        liveDataValue = el?.getAttribute?.('value') || undefined;
+      }
+
+      // V22 Pkg1: child icon testid promotion at live side, mirrors recorder.
+      let liveChildTestId: string | undefined;
+      const ownDescriptive =
+        (el?.innerText && el.innerText.trim().length > 0)
+        || el?.getAttribute?.('aria-label')
+        || el?.getAttribute?.('title')
+        || el?.getAttribute?.('alt')
+        || el?.getAttribute?.('data-testid')
+        || el?.getAttribute?.('id');
+      if (!ownDescriptive && el?.children) {
+        const cands: string[] = [];
+        for (let i = 0; i < el.children.length && cands.length < 3; i++) {
+          const c = el.children[i];
+          const cTag = (c.tagName || '').toLowerCase();
+          if (cTag === 'svg' || cTag === 'i' || cTag === 'img' || cTag === 'span') {
+            const cTid = c.getAttribute('data-testid')
+              || c.getAttribute('data-test')
+              || c.getAttribute('data-cy')
+              || c.getAttribute('data-qa-test-id')
+              || '';
+            if (cTid) cands.push(cTid);
+            if (!cTid && cTag === 'span' && c.children && c.children.length === 1) {
+              const cc = c.children[0];
+              const ccTag = (cc.tagName || '').toLowerCase();
+              if (ccTag === 'svg' || ccTag === 'i' || ccTag === 'img') {
+                const ccTid = cc.getAttribute('data-testid')
+                  || cc.getAttribute('data-test')
+                  || cc.getAttribute('data-cy')
+                  || cc.getAttribute('data-qa-test-id')
+                  || '';
+                if (ccTid) cands.push(ccTid);
+              }
+            }
+          }
+        }
+        if (cands.length === 1) liveChildTestId = cands[0];
+      }
+
+      // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key — live extraction.
+      let liveBsToggle: string | undefined;
+      let liveBsTarget: string | undefined;
+      {
+        let bsW: any = el;
+        for (let bi = 0; bi < 3 && bsW; bi++) {
+          if (!liveBsToggle) {
+            const t = bsW.getAttribute?.('data-bs-toggle') || bsW.getAttribute?.('data-toggle');
+            if (t) liveBsToggle = t;
+          }
+          if (!liveBsTarget) {
+            const tt = bsW.getAttribute?.('data-bs-target') || bsW.getAttribute?.('data-target');
+            if (tt) liveBsTarget = tt;
+          }
+          if (liveBsToggle && liveBsTarget) break;
+          bsW = bsW.parentElement;
+        }
+      }
+      const liveAriaHasPopup = el?.getAttribute?.('aria-haspopup') || undefined;
+      const liveAriaActiveDescendant = el?.getAttribute?.('aria-activedescendant') || undefined;
+      let liveDataRowKey: string | undefined;
+      {
+        let rkW: any = el;
+        for (let ri = 0; ri < 4 && rkW; ri++) {
+          const rk = rkW.getAttribute?.('data-row-key') || rkW.getAttribute?.('data-rk');
+          if (rk) { liveDataRowKey = rk; break; }
+          rkW = rkW.parentElement;
+        }
+      }
+
       return {
         tag: el?.tagName?.toLowerCase(),
         role: computeRole(el),
         ariaLabel: el?.getAttribute?.('aria-label'),
         placeholder: el?.getAttribute?.('placeholder'),
         labelText,
-        testIdAttr: el?.getAttribute?.('data-testid'),
+        testIdAttr: liveTestId,
+        elementId: liveId,
+        name: liveName,
+        type: liveType,
+        title: liveTitle,
+        alt: liveAlt,
+        text: liveText,
+        ariaControls: liveAriaControls,
+        href: liveHref,
+        ariaState: liveAriaState,
+        // V22 Pkg1: select option value + child icon testid lift.
+        dataValue: liveDataValue,
+        childTestId: liveChildTestId,
+        // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
+        bsToggle: liveBsToggle,
+        bsTarget: liveBsTarget,
+        ariaHasPopup: liveAriaHasPopup,
+        ariaActiveDescendant: liveAriaActiveDescendant,
+        dataRowKey: liveDataRowKey,
         containerTitles,
         boundingBox: el?.getBoundingClientRect ? (() => {
           const r = el.getBoundingClientRect();
@@ -504,6 +661,128 @@ export async function quickFingerprintCheck(
       const elContainers = (element.containerTitles || []).map((c: string) => c.toLowerCase());
       const hasCommon = elContainers.some((c: string) => fpContainers.has(c));
       if (hasCommon) matches++;
+    }
+
+    // ── V22: extended identity attributes (each weighted as 1) ──
+    // Each only counted when present in the recorded fingerprint (sparse fingerprints
+    // shouldn't get artificial 0-of-15 score; only what we recorded counts).
+    if (fingerprint.elementId) {
+      total++;
+      if (element.elementId === fingerprint.elementId) matches++;
+    }
+    if (fingerprint.name) {
+      total++;
+      if (element.name === fingerprint.name) matches++;
+    }
+    if (fingerprint.type) {
+      total++;
+      if (element.type === fingerprint.type) matches++;
+    }
+    if (fingerprint.title) {
+      total++;
+      if (element.title === fingerprint.title) matches++;
+    }
+    if (fingerprint.alt) {
+      total++;
+      if (element.alt === fingerprint.alt) matches++;
+    }
+    if (fingerprint.text) {
+      total++;
+      // Loose text compare — exact match preferred, but partial inclusion
+      // counts as half-credit (text often re-flows during i18n / restyling).
+      if (element.text === fingerprint.text) matches++;
+      else if (element.text && fingerprint.text && (
+        element.text.includes(fingerprint.text) || fingerprint.text.includes(element.text)
+      )) matches += 0.5;
+    }
+    if (fingerprint.ariaControls) {
+      total++;
+      if (element.ariaControls === fingerprint.ariaControls) matches++;
+    }
+    if (fingerprint.href) {
+      total++;
+      if (element.href === fingerprint.href) matches++;
+    }
+
+    // ── V22: ARIA state comparison (each present-state counts as 1) ──
+    // Important for negative-test fidelity: recorded "click invalid email
+    // field" must not match a live freshly-cleared valid one.
+    if (fingerprint.ariaState) {
+      const fpSt = fingerprint.ariaState;
+      const liveSt = element.ariaState || {};
+      if (fpSt.expanded !== undefined) {
+        total++;
+        if (liveSt.expanded === fpSt.expanded) matches++;
+      }
+      if (fpSt.pressed !== undefined) {
+        total++;
+        if (liveSt.pressed === fpSt.pressed) matches++;
+      }
+      if (fpSt.checked !== undefined) {
+        total++;
+        if (liveSt.checked === fpSt.checked) matches++;
+      }
+      if (fpSt.invalid !== undefined) {
+        total++;
+        if (liveSt.invalid === fpSt.invalid) matches++;
+      }
+      // V22 Pkg1: aria-current — for Pagination current page disambiguation.
+      if ((fpSt as any).current) {
+        total++;
+        if ((liveSt as any).current === (fpSt as any).current) matches++;
+      }
+      // V22 Pkg1: slider/spinbutton/progressbar value matching.
+      // valueText takes priority (human-readable, exact-match), valueNow uses
+      // tolerance window since live values may continuously drift.
+      if ((fpSt as any).valueText) {
+        total++;
+        if ((liveSt as any).valueText === (fpSt as any).valueText) matches++;
+      } else if (typeof (fpSt as any).valueNow === 'number') {
+        total++;
+        const fpVN = (fpSt as any).valueNow as number;
+        const liveVN = (liveSt as any).valueNow;
+        if (typeof liveVN === 'number') {
+          // Exact match → 1; within 5% of recorded value → 0.5 (slider drift tolerance).
+          if (liveVN === fpVN) matches++;
+          else if (Math.abs(liveVN - fpVN) / Math.max(Math.abs(fpVN), 1) < 0.05) matches += 0.5;
+        }
+      }
+    }
+
+    // ── V22 Pkg1: data-value (semantic key for options) ──
+    if ((fingerprint as any).dataValue) {
+      total++;
+      if ((element as any).dataValue === (fingerprint as any).dataValue) matches++;
+    }
+
+    // ── V22 Pkg1: childTestId (lifted from icon child) ──
+    if ((fingerprint as any).childTestId) {
+      total++;
+      if ((element as any).childTestId === (fingerprint as any).childTestId) matches++;
+    }
+
+    // ── V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key ──
+    // Each only counted when present in the recorded fingerprint (sparse
+    // recordings shouldn't get artificially low scores on missing fields).
+    if ((fingerprint as any).bsToggle) {
+      total++;
+      if ((element as any).bsToggle === (fingerprint as any).bsToggle) matches++;
+    }
+    if ((fingerprint as any).bsTarget) {
+      total++;
+      if ((element as any).bsTarget === (fingerprint as any).bsTarget) matches++;
+    }
+    if ((fingerprint as any).ariaHasPopup) {
+      total++;
+      if ((element as any).ariaHasPopup === (fingerprint as any).ariaHasPopup) matches++;
+    }
+    if ((fingerprint as any).ariaActiveDescendant) {
+      total++;
+      if ((element as any).ariaActiveDescendant === (fingerprint as any).ariaActiveDescendant) matches++;
+    }
+    if ((fingerprint as any).dataRowKey) {
+      total++;
+      if ((element as any).dataRowKey === (fingerprint as any).dataRowKey) matches++;
     }
 
     // NOTE: bbox comparison intentionally omitted here. Spatial proximity is

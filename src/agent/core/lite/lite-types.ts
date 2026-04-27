@@ -71,6 +71,41 @@ export interface LiteElement {
   ariaSelected?: boolean;
   /** aria-checked for custom checkboxes/switches (native `checked` takes priority) */
   ariaChecked?: boolean | 'mixed';
+  /**
+   * V22 Pkg1: aria-current value — Pagination current page, Stepper active
+   * step, Breadcrumbs last crumb. Raw string ('page' | 'step' | 'true' | ...).
+   */
+  ariaCurrent?: string;
+  /**
+   * V22 Pkg1: aria-valuenow / aria-valuetext — Slider, SpinButton,
+   * ProgressBar current value. Number for valuenow (parsed); valuetext is
+   * the human-readable form when present.
+   */
+  ariaValueNow?: number;
+  ariaValueText?: string;
+  /**
+   * V22 Pkg1: data-value or `<option value>` — semantic key distinct from
+   * display text. Localized labels come and go; the value attribute stays.
+   */
+  dataValue?: string;
+  /**
+   * V22 Pkg1: data-testid lifted from a single direct icon child
+   * (svg/i/img/span>svg) when the node itself is descriptor-poor. Closes
+   * the IconButton-with-child-icon-name gap on MUI/AntD/Element Plus.
+   */
+  childTestId?: string;
+  /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
+  bsToggle?: string;
+  /** V22 Pkg2: Bootstrap data-bs-target selector. */
+  bsTarget?: string;
+  /** V22 Pkg2: aria-haspopup popup-trigger marker. */
+  ariaHasPopup?: string;
+  /** V22 Pkg2: aria-activedescendant — id of currently-active descendant. */
+  ariaActiveDescendant?: string;
+  /** V22 Pkg2: data-row-key / data-rk — stable row identity. */
+  dataRowKey?: string;
+  /** V22 Pkg2: heuristic flag — row clickable without role/onclick. */
+  rowClickable?: boolean;
 
   // Validation state
   /** HTML required attribute */
