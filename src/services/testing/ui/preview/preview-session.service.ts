@@ -451,6 +451,22 @@ interface InternalSession extends PreviewSession {
     /** V18: Full probe result from hover — reused by click to avoid double-probe divergence */
     probedElement?: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement | null;
   } | null;
+  /**
+   * V22 Pkg5+: Hover CHAIN — all distinct hover-targets dwelt on between
+   * consecutive clicks. Replaces "single last hover" semantics so multi-
+   * level menus (Menu → Submenu → click leaf) survive replay deterministically
+   * — each menu trigger gets its own hover-step in trace order.
+   *
+   * Distinctness is by boundingBox (same x/y/w/h = same element). Capped
+   * at 4 entries to bound memory; oldest dropped when full. Cleared after
+   * each click flush in preview.handler.ts.
+   */
+  recordingHoverChain?: Array<{
+    x: number;
+    y: number;
+    timestamp: number;
+    probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement;
+  }>;
 
   /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
   recordingStartUrl?: string;
@@ -2027,6 +2043,19 @@ export class PreviewSessionService {
       if (probed.resolvedVia === 'directHit') return null;
       if (!probed.boundingBox) return null;
 
+      // V22 Pkg5+ Patch C: append to hover chain — distinct hover-targets
+      // accumulated between two consecutive clicks. Skips noise via:
+      //   - directHit / crossOriginIframe / no-bbox already filtered above
+      //   - de-dupe vs last entry by boundingBox in appendRecordingHoverChain
+      // Recording-only — no overhead when not recording.
+      if (session.recording) {
+        try {
+          this.appendRecordingHoverChain(sessionId, userId, {
+            x, y, timestamp: Date.now(), probedElement: probed,
+          });
+        } catch { /* chain append best-effort */ }
+      }
+
       // Hover caps label at 40 chars to fit the floating tooltip; record/DB path uses 60.
       // `getProbedLabel` returns null for literal tag-only fallbacks so we can surface a
       // 'element' placeholder instead of "div"/"svg".
@@ -2379,6 +2408,8 @@ export class PreviewSessionService {
       session.recordingLastNavigateStep = null;
       session.recordingLastScrollStep = null;
       session.recordingLastHover = null;
+      // V22 Pkg5+: clear hover chain on recording stop too.
+      session.recordingHoverChain = [];
       session.recordingLastStepEmittedAt = undefined;
       session.recordingStepCount = 0;
     }
@@ -2591,6 +2622,59 @@ export class PreviewSessionService {
   setRecordingLastHover(sessionId: string, userId: string, state: InternalSession['recordingLastHover']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastHover = state;
+  }
+
+  /**
+   * V22 Pkg5+: Append a distinct hover-target to the chain. Distinctness
+   * is checked by boundingBox (same x/y/w/h = same element). Caps at 4
+   * entries to bound memory — oldest dropped when full.
+   *
+   * Called from preview.handler.ts after each successful hover-probe so
+   * the chain reflects the user's mouse-movement history between two
+   * consecutive clicks. Cleared on click-flush so next click starts fresh.
+   */
+  appendRecordingHoverChain(
+    sessionId: string,
+    userId: string,
+    entry: { x: number; y: number; timestamp: number; probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement },
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return;
+    if (!session.recordingHoverChain) session.recordingHoverChain = [];
+    const chain = session.recordingHoverChain;
+    // De-dupe vs the LAST entry — if same boundingBox, just refresh timestamp.
+    const newBB = entry.probedElement.boundingBox;
+    const last = chain.length > 0 ? chain[chain.length - 1] : null;
+    if (last && newBB && last.probedElement.boundingBox) {
+      const lbb = last.probedElement.boundingBox;
+      if (lbb.x === newBB.x && lbb.y === newBB.y
+        && lbb.width === newBB.width && lbb.height === newBB.height) {
+        last.timestamp = entry.timestamp; // freshen, but don't add duplicate
+        return;
+      }
+    }
+    chain.push(entry);
+    // Cap at 4 — multi-level menus rarely exceed 3 (root → submenu → leaf).
+    while (chain.length > 4) chain.shift();
+  }
+
+  /**
+   * V22 Pkg5+: Read the hover chain (read-only snapshot).
+   */
+  getRecordingHoverChain(
+    sessionId: string,
+    userId?: string,
+  ): NonNullable<InternalSession['recordingHoverChain']> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingHoverChain ?? [];
+  }
+
+  /**
+   * V22 Pkg5+: Clear the hover chain after a click is flushed.
+   */
+  clearRecordingHoverChain(sessionId: string, userId: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingHoverChain = [];
   }
 
   /**

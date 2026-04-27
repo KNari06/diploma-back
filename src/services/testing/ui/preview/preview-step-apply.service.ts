@@ -149,6 +149,15 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
   if ((node as any).ariaActiveDescendant) hints.ariaActiveDescendant = (node as any).ariaActiveDescendant;
   if ((node as any).dataRowKey) hints.dataRowKey = (node as any).dataRowKey;
 
+  // V22 Pkg4 — semantic icon label (svg <title>/data-lucide/FA class).
+  if ((node as any).iconLabel) (hints as any).iconLabel = (node as any).iconLabel;
+
+  // V22 Pkg5 — row text + sibling pos + disabled + arrow direction.
+  if ((node as any).nearestRowText) (hints as any).nearestRowText = (node as any).nearestRowText;
+  if (typeof (node as any).siblingIndex === 'number') (hints as any).siblingIndex = (node as any).siblingIndex;
+  if ((node as any).disabled !== undefined) (hints as any).disabled = (node as any).disabled;
+  if ((node as any).arrowDir) (hints as any).arrowDir = (node as any).arrowDir;
+
   // V22: ARIA state at resolve-time. Records whether the resolved live
   // element was expanded/pressed/checked/invalid/current/etc. so the next
   // resolve treats those state hints as expectations (e.g. "click submit

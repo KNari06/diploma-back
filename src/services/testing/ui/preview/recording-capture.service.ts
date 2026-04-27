@@ -86,6 +86,16 @@ export interface ProbedElement {
    */
   childTestId?: string;
   /**
+   * V22 Pkg4: Semantic icon name extracted from svg-internal accessibility
+   * (`<title>`, `<desc>`), sprite reference (`<use href="#icon-menu">`), or
+   * icon-library data-attrs (`data-lucide`, `data-feather`, `data-icon`,
+   * `data-iconify-name`). Closes the gap for icon-only buttons WITHOUT
+   * `data-testid` (`<div role="button"><svg><title>Menu</title></svg></div>`).
+   * Mirrors the snapshot-collector iconChildLabel logic so record-time and
+   * apply-time agree on what the icon "means".
+   */
+  iconLabel?: string;
+  /**
    * V22 Pkg2: Bootstrap data-bs-toggle / data-bs-target. The de-facto
    * marker for Bootstrap modals, dropdowns, tabs, accordions, collapses.
    * `bsToggle` carries the widget kind ("modal" | "dropdown" | "tab" | ...);
@@ -119,6 +129,40 @@ export interface ProbedElement {
    * resolvedVia from `directHit` to `behavioral`.
    */
   rowClickable?: boolean;
+  /**
+   * V22 Pkg5: Concatenated text of sibling cells inside the nearest
+   * row container (`<tr>` / `[role="row"]` / `li[role="option"]` /
+   * `li.list-row`). Cells containing the target itself are excluded.
+   * Format: "<cell1> | <cell2> | <cell3>" capped at 200 chars / 4 cells.
+   * Critical for descriptor-poor row checkboxes & action buttons that
+   * are identical-looking at the DOM level — only sibling text gives
+   * uniqueness. Works on AntD/MUI/Bootstrap/plain HTML tables alike.
+   */
+  nearestRowText?: string;
+  /**
+   * V22 Pkg5: Index among same-class siblings of the same parent.
+   * Only set when sibling count is 2..10 (avoid catching huge lists)
+   * and target shares its first className token with siblings. Enables
+   * stable `parent > .cls:nth-of-type(N)` selectors for pagination
+   * arrows, tab strips, button groups where attribute identity is missing.
+   */
+  siblingIndex?: number;
+  /**
+   * V22 Pkg5: Boolean disabled state captured from `disabled` attribute,
+   * `aria-disabled="true"`, or `.Mui-disabled` / `.is-disabled` class
+   * tokens. Recorded fingerprint contains the *recorded* disabled state;
+   * heal-time scoring boosts match when live disabled state agrees.
+   * Distinguishes "prev (disabled)" from "next (enabled)" pagination twins.
+   */
+  disabled?: boolean;
+  /**
+   * V22 Pkg5: Cardinal direction inferred from svg path geometry.
+   * Cheap heuristic — compares first M (move) and L (line) X/Y coords.
+   * Values: "left" | "right" | "up" | "down". Only set when target is
+   * an svg-only button without other identifiers. Fed to LLM resolver
+   * as candidateText hint ("arrow: left") and used as iconLabel fallback.
+   */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
   boundingBox?: ElementBoundingBox;
   /** True if element accepts multi-line text (textarea, contenteditable) */
   isMultiline?: boolean;
@@ -370,8 +414,49 @@ function recStepId(): string {
  */
 const PROBE_AT_POINT_FN = `
 (function(px, py) {
+  // V22 Pkg7: Shadow DOM piercing entry. Recursively descend into open
+  // shadow roots so the captured target is the real inner element (e.g.
+  // <a> inside Documentolog Market shadow), not the host wrapper. Closed
+  // shadow remains impenetrable per spec — el.shadowRoot is null for
+  // outside callers, the loop simply breaks (graceful fallback to host).
+  //
+  // Safety guards:
+  //   - depth cap 5 prevents runaway recursion in exotic web components
+  //   - inner === el break protects against self-referential shadow points
+  //   - try/catch (implicit via JS truthy short-circuit) — if shadowRoot
+  //     access throws (very rare CSP edge), loop exits cleanly
   var el = document.elementFromPoint(px, py);
+  var shadowDepth = 0;
+  while (el && el.shadowRoot && shadowDepth < 5) {
+    var inner = el.shadowRoot.elementFromPoint(px, py);
+    if (!inner || inner === el) break;
+    el = inner;
+    shadowDepth++;
+  }
   if (!el) return null;
+
+  // V22 Pkg7+: in-probe text normalizer. NFC + invisible-char strip +
+  // whitespace collapse. Mirrors normalizeText() in text-normalizer.util.ts
+  // — symmetry contract: the same canonicalization runs at probe-time
+  // (here) and heal-time / locator generation. Diverging implementations
+  // would silently break fingerprint matching across BMP scripts (Cyrillic
+  // NFC vs NFD, RTL with bidi marks, ZWJ in copied text).
+  var INVISIBLE_CHARS_RE_PROBE = /[​-‏‪-‮⁠-⁩﻿]/g;
+  function normProbeText(s) {
+    if (s === undefined || s === null) return undefined;
+    if (s.length === 0) return '';
+    var out = s;
+    try { out = out.normalize('NFC'); } catch (e) { /* ancient browsers */ }
+    // \\s in this regex is intentionally double-escaped: the surrounding
+    // const PROBE_AT_POINT_FN is a JS template literal, so a single \\s
+    // would be interpreted by the TS compiler as escape-of-s before the
+    // resulting JS code reaches page.evaluate. Without the double escape,
+    // the runtime regex would not match whitespace.
+    return out
+      .replace(INVISIBLE_CHARS_RE_PROBE, '')
+      .replace(/\\s+/g, ' ')
+      .trim();
+  }
 
   // ── Pass 1: Collect ancestor chain (up to 12 ancestors) ──────────────
   var INTERACTIVE_TAGS = ['button', 'a', 'input', 'select', 'textarea', 'summary'];
@@ -467,9 +552,22 @@ const PROBE_AT_POINT_FN = `
       // innerText skips script/style/template and display:none children;
       // textContent would leak JSON-LD, inline CSS, offscreen microcopy.
       // Non-HTML nodes (SVG etc.) lack innerText — fall back.
-      text: ((walk.innerText != null ? walk.innerText : walk.textContent) || '').trim().slice(0, 80),
-      ariaLabel: walk.getAttribute('aria-label') || ''
+      text: (normProbeText((walk.innerText != null ? walk.innerText : walk.textContent) || '') || '').slice(0, 80),
+      ariaLabel: normProbeText(walk.getAttribute('aria-label')) || ''
     });
+    // V22 Pkg7: Cross shadow boundary on ancestor walk. When parentElement
+    // is null but the node sits inside a ShadowRoot, jump to the host
+    // element so we can collect attributes / classes from ancestors above
+    // the shadow (e.g. wrapper testIds set in the outer document).
+    if (!walk.parentElement) {
+      try {
+        var rootNode = walk.getRootNode && walk.getRootNode();
+        if (rootNode && rootNode !== document && rootNode.host) {
+          walk = rootNode.host;
+          continue;
+        }
+      } catch (e) { /* ignore — fall through to normal exit */ }
+    }
     walk = walk.parentElement;
   }
 
@@ -600,6 +698,55 @@ const PROBE_AT_POINT_FN = `
     }
   } catch (e) { /* best-effort, fall through to whatever target probe picked */ }
 
+  // V22 Pkg5+: <label>-child to <input>/<select>/<textarea> elevation.
+  // Mirrors browser native click-on-label semantics: clicking the visible
+  // text/icon inside a <label> activates the associated control. Without
+  // this promotion, clicks on Documentolog-style radio rows (where text
+  // and svg circle live as <div> siblings of an invisible <input>) record
+  // a useless <div data-qa-test-id="typography"> as target. After elevation
+  // we capture data-value, the actual input testId, and proper labels —
+  // robust across i18n re-localization.
+  //
+  // Safety guards:
+  //   1. Skip when target IS already a form control (don't dead-loop).
+  //   2. Skip when label contains MULTIPLE form controls (ambiguous —
+  //      we cannot know which one user meant). Native browser behaviour
+  //      also skips activation in that case.
+  //   3. Prefer for=-association (explicit) before descendant search.
+  try {
+    var ttagForLabel = (target.tagName || '').toLowerCase();
+    var alreadyFormControl = /^(input|select|textarea|button)$/.test(ttagForLabel);
+    if (!alreadyFormControl) {
+      var labelAnc = target.closest && target.closest('label');
+      if (labelAnc && labelAnc !== target) {
+        var labelInput = null;
+        var forAttr = labelAnc.getAttribute && labelAnc.getAttribute('for');
+        if (forAttr) {
+          // Explicit for= link — trust it. CSS.escape guards against
+          // React 18 useId values like :r0: that contain colons.
+          var safeForId = (typeof CSS !== 'undefined' && CSS.escape)
+            ? CSS.escape(forAttr)
+            : forAttr.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+          try { labelInput = document.querySelector('#' + safeForId); } catch (e2) {}
+        }
+        if (!labelInput) {
+          // Implicit association via DOM nesting. Only elevate when label
+          // has EXACTLY one form control to avoid ambiguous matches.
+          var labelControls = labelAnc.querySelectorAll('input, select, textarea');
+          if (labelControls.length === 1) {
+            labelInput = labelControls[0];
+          }
+        }
+        if (labelInput && labelInput !== target && labelInput.tagName) {
+          target = labelInput;
+          // Use directHit since the label association IS the intended
+          // interaction (matches native browser semantics).
+          resolvedVia = 'directHit';
+        }
+      }
+    }
+  } catch (e) { /* best-effort */ }
+
   // ── Collect data from chosen target ──────────────────────────────────
   // V22 Audit-fix H3: guard against text/comment nodes that may slip in
   // through fieldset->input promotion when the wrapper has no real input.
@@ -613,13 +760,13 @@ const PROBE_AT_POINT_FN = `
   var tag = target.tagName.toLowerCase();
   var labelText = undefined;
   if (target.labels && target.labels.length > 0) {
-    labelText = (target.labels[0].textContent || '').trim().slice(0, 100) || undefined;
+    labelText = (normProbeText(target.labels[0].textContent || '') || '').slice(0, 100) || undefined;
   }
   if (!labelText) {
     var lby = target.getAttribute('aria-labelledby');
     if (lby) {
       var lel = document.getElementById(lby);
-      if (lel) labelText = (lel.textContent || '').trim().slice(0, 100) || undefined;
+      if (lel) labelText = (normProbeText(lel.textContent || '') || '').slice(0, 100) || undefined;
     }
   }
 
@@ -824,7 +971,7 @@ const PROBE_AT_POINT_FN = `
   var containerTitles = containerTitlesArr.length > 0 ? containerTitlesArr : undefined;
 
   // V18: Collect title and data-testid for behavioral elements with no text/label
-  var titleAttr = target.getAttribute('title') || undefined;
+  var titleAttr = normProbeText(target.getAttribute('title')) || undefined;
   // alt attribute — fallback for <img> targets where textContent is empty
   var altAttr = target.getAttribute('alt') || undefined;
   // V22: Test-id fallback chain. Ordered by industry adoption (data-testid is
@@ -1013,6 +1160,114 @@ const PROBE_AT_POINT_FN = `
     }
   }
 
+  // V22 Pkg4 — Icon-library / SVG-internal label extraction.
+  // Closes the "<div role=button><svg/></div> without attributes" gap by
+  // mining the svg itself for accessibility children, sprite hrefs, and
+  // popular icon-library data-attributes (Lucide / Feather / Iconify / FA Pro).
+  // Only runs when the target is descriptor-poor (same gate as childTestId)
+  // AND childTestId did NOT already lift a name. MUST mirror the same
+  // extraction order used by background-dom-collector so record-time and
+  // apply-time agree on what an icon "means".
+  var iconLabelAttr = undefined;
+  if (!hasOwnDescriptor && !childTestIdAttr) {
+    try {
+      // Search inside target FIRST (icon as direct or nested child),
+      // fall back to target itself if it IS the svg (clicked svg directly).
+      var svgRoot = (tag === 'svg') ? target : target.querySelector('svg');
+      var iconHolder = (tag === 'i' || tag === 'svg') ? target : target.querySelector('i, svg');
+
+      // ① <svg><title>X</title></svg>  — WCAG-recommended SVG accessibility
+      if (svgRoot && !iconLabelAttr) {
+        var svgTitle = svgRoot.querySelector('title');
+        if (svgTitle) {
+          var svgText = (svgTitle.textContent || '').trim();
+          if (svgText.length > 0 && svgText.length <= 100) iconLabelAttr = svgText;
+        }
+      }
+      // ② <svg><desc>X</desc></svg>  — fallback when title absent
+      if (svgRoot && !iconLabelAttr) {
+        var svgDesc = svgRoot.querySelector('desc');
+        if (svgDesc) {
+          var descText = (svgDesc.textContent || '').trim();
+          if (descText.length > 0 && descText.length <= 100) iconLabelAttr = descText;
+        }
+      }
+      // ③ <svg><use href="#icon-menu"/></svg>  — sprite reference
+      if (svgRoot && !iconLabelAttr) {
+        var useEl = svgRoot.querySelector('use');
+        if (useEl) {
+          var href = useEl.getAttribute('href') || useEl.getAttribute('xlink:href') || '';
+          // "#icon-menu" / "/sprites.svg#icon-menu" / "#menu" — keep tail after last #
+          var refTail = href.indexOf('#') >= 0 ? href.slice(href.lastIndexOf('#') + 1) : href;
+          // Normalize: strip "icon-" / "icon_" prefix, replace separators with space.
+          var iconRef = refTail.replace(/^icon[-_]/i, '').replace(/[-_]/g, ' ').trim();
+          if (iconRef.length > 0 && iconRef.length <= 50) iconLabelAttr = iconRef;
+        }
+      }
+      // ④ data-lucide / data-feather / data-icon / data-iconify-name
+      // Check the target itself AND any inner svg/i (Lucide attaches to svg,
+      // Iconify often to a wrapper div, FA Pro to <i>).
+      if (!iconLabelAttr) {
+        var iconAttrCands = [];
+        if (target && (target.matches && target.matches('[data-lucide], [data-feather], [data-icon], [data-iconify-name]'))) {
+          iconAttrCands.push(target);
+        }
+        if (iconHolder && iconHolder !== target) iconAttrCands.push(iconHolder);
+        if (svgRoot && svgRoot !== target && svgRoot !== iconHolder) iconAttrCands.push(svgRoot);
+        for (var iac = 0; iac < iconAttrCands.length && !iconLabelAttr; iac++) {
+          var ih = iconAttrCands[iac];
+          var raw =
+            ih.getAttribute('data-lucide')
+            || ih.getAttribute('data-feather')
+            || ih.getAttribute('data-icon')
+            || ih.getAttribute('data-iconify-name')
+            || '';
+          if (raw && raw.length > 0 && raw.length <= 50) {
+            // Strip namespace prefix like "mdi:menu" -> "menu", "fa-bars" -> "bars".
+            var cleaned = raw.replace(/^[a-z0-9]+[:-]/i, '').replace(/[-_]/g, ' ').trim();
+            if (cleaned.length > 0) iconLabelAttr = cleaned;
+          }
+        }
+      }
+      // ⑤ <i class="fa-solid fa-bars">  — FontAwesome class-based icons.
+      // Pull the FA name token (fa-bars, fa-trash, fa-pencil) which is the
+      // closest thing to a semantic name FA exposes for old class-based usage.
+      if (!iconLabelAttr) {
+        var iElem = (tag === 'i') ? target : target.querySelector('i[class]');
+        if (iElem) {
+          var iCls = iElem.getAttribute('class') || '';
+          var faMatch = iCls.match(/\bfa[-]([a-z][a-z0-9-]+)\b/i);
+          if (faMatch && faMatch[1]) {
+            var faName = faMatch[1].replace(/-/g, ' ').trim();
+            if (faName.length > 0 && faName.length <= 30
+                // Skip FA size/style modifiers ("solid", "regular", "lg", "2x")
+                && !/^(solid|regular|brands|light|thin|duotone|fw|sm|lg|xl|2x|3x|4x|5x|spin|pulse|inverse|stack)$/i.test(faName)) {
+              iconLabelAttr = faName;
+            }
+          }
+        }
+      }
+      // ⑥ background-image: url(/icons/hamburger.svg)  — last resort.
+      // Cheap heuristic: parse the URL filename. Skip data:URIs (encoded svgs
+      // have no semantic name) and svg-sprite hashes (data-v-XXX pattern).
+      if (!iconLabelAttr) {
+        try {
+          var bgImage = window.getComputedStyle(target).backgroundImage;
+          if (bgImage && bgImage !== 'none' && bgImage.indexOf('url(') === 0) {
+            var bgUrl = bgImage.slice(4, -1).replace(/^["']|["']$/g, '');
+            if (bgUrl.indexOf('data:') !== 0) {
+              var bgFile = bgUrl.split('/').pop() || '';
+              var bgName = bgFile.replace(/\.(svg|png|jpe?g|webp|gif)(\?.*)?$/i, '').replace(/[-_]/g, ' ').trim();
+              if (bgName.length > 1 && bgName.length <= 40 && !/^[a-f0-9]{8,}$/i.test(bgName)) {
+                iconLabelAttr = bgName;
+              }
+            }
+          }
+        } catch (e) { /* CSS parsing best-effort */ }
+      }
+    } catch (e) { /* svg/icon mining failed — skip silently */ }
+  }
+
   // V22 Pkg2 — Bootstrap markers (data-bs-toggle / data-bs-target).
   // Walk the target itself + up to 3 parents — Bootstrap puts these on
   // either the trigger button OR an ancestor wrapper depending on the
@@ -1075,6 +1330,127 @@ const PROBE_AT_POINT_FN = `
     } catch (e) {}
   }
 
+  // V22 Pkg5 — nearestRowText. Concatenates sibling-cell text inside the
+  // closest row container so descriptor-poor row checkboxes/buttons get
+  // unique identity from the row's payload (name / id / amount / etc).
+  // Cells containing the target itself are excluded so we don't echo back
+  // the empty checkbox we're trying to identify.
+  var nearestRowTextAttr = undefined;
+  try {
+    var rowContainer = target.closest('tr, [role="row"], li[role="option"], li.list-row, li.list-item');
+    if (rowContainer && rowContainer !== target) {
+      var cellNodes = rowContainer.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
+      // Some layouts (li-based grids) don't have td/th — fall back to direct
+      // children of the row. Cap at 8 to keep extraction cheap.
+      var cellList = cellNodes.length > 0
+        ? Array.prototype.slice.call(cellNodes, 0, 8)
+        : Array.prototype.slice.call(rowContainer.children, 0, 8);
+      var cellTexts = [];
+      for (var ci = 0; ci < cellList.length && cellTexts.length < 4; ci++) {
+        var cellEl = cellList[ci];
+        if (cellEl.contains(target)) continue; // skip the cell holding the target
+        // V22 Pkg7+: normalize each cell text symmetrically with probe+heal.
+        var cellText = normProbeText(cellEl.innerText != null ? cellEl.innerText : cellEl.textContent) || '';
+        // Min 2 chars filters checkbox-only cells; max 80 trims long blurbs.
+        if (cellText.length >= 2 && cellText.length <= 80) {
+          cellTexts.push(cellText);
+        }
+      }
+      if (cellTexts.length > 0) {
+        // V22 Pkg7+: U+241F (Information Separator One) — never appears in
+        // real DOM text, so cell-separator collisions are impossible even
+        // when cells contain literal " | ". Symmetric with snapshot+heal.
+        nearestRowTextAttr = cellTexts.join('␟').slice(0, 200);
+      }
+    }
+  } catch (e) { /* row-text extraction best-effort */ }
+
+  // V22 Pkg5 — siblingIndex. nth-of-type-style index among same-class
+  // siblings of the same parent. Critical for pagination prev/next twins,
+  // tab strips, and identical button groups where attribute identity is
+  // missing. Bounded to 2..10 siblings: <2 means no ambiguity, >10 means
+  // we're in a huge list where positional locators are too brittle.
+  var siblingIndexAttr = undefined;
+  try {
+    var firstClassToken = (target.getAttribute('class') || '').trim().split(/\s+/)[0] || '';
+    // Skip dynamic/utility classes — anchoring on jss123 / sc-XXX is brittle.
+    var skipClassRx = /^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/;
+    if (firstClassToken && firstClassToken.length >= 2 && !skipClassRx.test(firstClassToken)) {
+      var sibParent = target.parentElement;
+      if (sibParent) {
+        // Querying with escaped class lets us include CSS Modules names
+        // like dg_uikit_root_xxx — they're stable per-build and the index
+        // (0..N) is what we use, the class itself isn't stored.
+        var safeCls = (typeof CSS !== 'undefined' && CSS.escape)
+          ? CSS.escape(firstClassToken)
+          : firstClassToken.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+        var sibs = sibParent.querySelectorAll(':scope > .' + safeCls);
+        if (sibs.length >= 2 && sibs.length <= 10) {
+          for (var sii = 0; sii < sibs.length; sii++) {
+            if (sibs[sii] === target) { siblingIndexAttr = sii; break; }
+          }
+        }
+      }
+    }
+  } catch (e) { /* sibling index extraction best-effort */ }
+
+  // V22 Pkg5 — disabled boolean. Combined signal from disabled attribute,
+  // aria-disabled, and well-known disabled class tokens. Recorded as the
+  // captured state so heal-time can boost match when live state agrees
+  // (distinguishes pagination prev/next when only one is enabled).
+  var disabledAttr = undefined;
+  try {
+    // Audit fix: emit boolean (true OR false) for ANY form-ish element so
+    // pagination prev=disabled vs next=enabled can be distinguished. The
+    // earlier rawDisabled-only gate was too tight — it skipped emission
+    // for enabled buttons, breaking the very twin disambiguation Pkg5
+    // was meant to fix.
+    var isFormish = /^(button|input|select|textarea|fieldset|optgroup|option|a)$/.test(tag)
+      || target.getAttribute('role') === 'button'
+      || target.getAttribute('role') === 'link';
+    if (isFormish) {
+      var rawDisabled = target.hasAttribute('disabled')
+        || target.getAttribute('aria-disabled') === 'true';
+      if (!rawDisabled) {
+        var clsForDis = ' ' + (target.getAttribute('class') || '') + ' ';
+        if (/\s(?:Mui-disabled|is-disabled|el-button--disabled|ant-btn-disabled|disabled)\s/.test(clsForDis)) {
+          rawDisabled = true;
+        }
+      }
+      disabledAttr = !!rawDisabled;
+    }
+  } catch (e) { /* disabled detection best-effort */ }
+
+  // V22 Pkg5 — arrowDir. Cheap heuristic that infers cardinal direction
+  // from the first svg <path d=...> by comparing the M (move) and L (line)
+  // anchor coords. Only set for descriptor-poor svg-only buttons (no
+  // testId / aria-label / text / iconLabel) — same gate as Pkg4 iconLabel.
+  // Used as candidateText hint for the LLM resolver and as iconLabel
+  // fallback in fingerprint scoring.
+  var arrowDirAttr = undefined;
+  if (!hasOwnDescriptor && !iconLabelAttr) {
+    try {
+      var pathSvg = (tag === 'svg') ? target : target.querySelector('svg');
+      var firstPath = pathSvg ? pathSvg.querySelector('path[d]') : null;
+      var d = firstPath ? (firstPath.getAttribute('d') || '') : '';
+      if (d.length > 0 && d.length < 500) {
+        var mMatch = d.match(/M\s*([-\d.]+)[\s,]+([-\d.]+)/);
+        var lMatch = d.match(/L\s*([-\d.]+)[\s,]+([-\d.]+)/);
+        if (mMatch && lMatch) {
+          var mx = parseFloat(mMatch[1]), my = parseFloat(mMatch[2]);
+          var lx = parseFloat(lMatch[1]), ly = parseFloat(lMatch[2]);
+          var dx = lx - mx, dy = ly - my;
+          // Pick the dominant axis; require ≥3 unit delta to avoid noise.
+          if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= 3) {
+            arrowDirAttr = dx < 0 ? 'left' : 'right';
+          } else if (Math.abs(dy) >= 3) {
+            arrowDirAttr = dy < 0 ? 'up' : 'down';
+          }
+        }
+      }
+    } catch (e) { /* svg path parsing best-effort */ }
+  }
+
   return {
     tag: tag,
     // computeRole returns the explicit role attribute when present,
@@ -1088,10 +1464,12 @@ const PROBE_AT_POINT_FN = `
     // step description or binding hints (hints.text flows to the resolver's
     // LLM prompt at replay time). Fall back to textContent for SVG and
     // other non-HTMLElement nodes where innerText is undefined.
-    text: ((target.innerText != null ? target.innerText : target.textContent) || '').trim().slice(0, 80) || undefined,
-    ariaLabel: target.getAttribute('aria-label') || undefined,
+    // V22 Pkg7+: normalize so re-renders with NFD-encoded characters or
+    // copied-text zero-width contamination still produce equal fingerprints.
+    text: ((normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80) || undefined),
+    ariaLabel: normProbeText(target.getAttribute('aria-label')) || undefined,
     labelText: labelText,
-    placeholder: target.getAttribute('placeholder') || undefined,
+    placeholder: normProbeText(target.getAttribute('placeholder')) || undefined,
     name: target.getAttribute('name') || undefined,
     ref: target.getAttribute('data-agent-ref') || undefined,
     title: titleAttr,
@@ -1116,6 +1494,7 @@ const PROBE_AT_POINT_FN = `
     ariaValueText: ariaValueTextAttr,
     dataValue: dataValueAttr,
     childTestId: childTestIdAttr,
+    iconLabel: iconLabelAttr,
     // V22 Pkg2 — Bootstrap / aria-haspopup / activedescendant / row-key / clickable-row.
     bsToggle: bsToggleAttr,
     bsTarget: bsTargetAttr,
@@ -1123,6 +1502,11 @@ const PROBE_AT_POINT_FN = `
     ariaActiveDescendant: ariaActiveDescendantAttr,
     dataRowKey: dataRowKeyAttr,
     rowClickable: rowClickableFlag,
+    // V22 Pkg5 — row text + sibling index + disabled state + svg arrow direction.
+    nearestRowText: nearestRowTextAttr,
+    siblingIndex: siblingIndexAttr,
+    disabled: disabledAttr,
+    arrowDir: arrowDirAttr,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -1148,17 +1532,31 @@ const PROBE_FOCUSED_FN = `
 
   ${COMPUTE_ROLE_SRC}
 
+  // V22 Pkg7+: same in-probe text normalizer as PROBE_AT_POINT_FN.
+  // NFC + invisible-char strip + whitespace collapse — symmetry contract.
+  var INVISIBLE_CHARS_RE_PROBE = /[​-‏‪-‮⁠-⁩﻿]/g;
+  function normProbeText(s) {
+    if (s === undefined || s === null) return undefined;
+    if (s.length === 0) return '';
+    var out = s;
+    try { out = out.normalize('NFC'); } catch (e) { /* ancient browsers */ }
+    return out
+      .replace(INVISIBLE_CHARS_RE_PROBE, '')
+      .replace(/\\s+/g, ' ')
+      .trim();
+  }
+
   var target = el;
   var tag = target.tagName.toLowerCase();
   var labelText = undefined;
   if (target.labels && target.labels.length > 0) {
-    labelText = (target.labels[0].textContent || '').trim().slice(0, 100) || undefined;
+    labelText = (normProbeText(target.labels[0].textContent || '') || '').slice(0, 100) || undefined;
   }
   if (!labelText) {
     var lby = target.getAttribute('aria-labelledby');
     if (lby) {
       var lel = document.getElementById(lby);
-      if (lel) labelText = (lel.textContent || '').trim().slice(0, 100) || undefined;
+      if (lel) labelText = (normProbeText(lel.textContent || '') || '').slice(0, 100) || undefined;
     }
   }
 
@@ -1202,13 +1600,14 @@ const PROBE_FOCUSED_FN = `
     type: target.getAttribute('type') || undefined,
     // innerText over textContent — hides <script>/<style>/<template> and
     // display:none children that would otherwise leak into hints.text.
-    text: ((target.innerText != null ? target.innerText : target.textContent) || '').trim().slice(0, 80) || undefined,
-    ariaLabel: target.getAttribute('aria-label') || undefined,
+    // V22 Pkg7+: normProbeText normalizes for fingerprint stability.
+    text: ((normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80) || undefined),
+    ariaLabel: normProbeText(target.getAttribute('aria-label')) || undefined,
     labelText: labelText,
-    placeholder: target.getAttribute('placeholder') || undefined,
+    placeholder: normProbeText(target.getAttribute('placeholder')) || undefined,
     name: target.getAttribute('name') || undefined,
     ref: target.getAttribute('data-agent-ref') || undefined,
-    title: target.getAttribute('title') || undefined,
+    title: normProbeText(target.getAttribute('title')) || undefined,
     alt: target.getAttribute('alt') || undefined,
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
@@ -1671,6 +2070,11 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       // `VisibilityOffOutlinedIcon`). Promoted only when the target itself
       // had no descriptor — see probe-side hasOwnDescriptor gate.
       [element.childTestId, false],
+      // V22 Pkg4: icon-library / svg-internal label (Lucide / Feather /
+      // FA / SVG <title>). Last identifier-style fallback before role —
+      // for icon-only buttons WITHOUT data-testid (FA class buttons,
+      // sprite-based icons, accessible <svg><title> patterns).
+      [element.iconLabel, false],
       [element.role, false],
     ];
     for (const [c, isFreeText] of candidates) {
@@ -1802,12 +2206,19 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     // V22 Pkg1: data-value / child icon testid.
     if (element.dataValue) hints.dataValue = element.dataValue;
     if (element.childTestId) hints.childTestId = element.childTestId;
+    // V22 Pkg4: semantic icon name (Lucide/Feather/FA/SVG title).
+    if (element.iconLabel) hints.iconLabel = element.iconLabel;
     // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
     if (element.bsToggle) hints.bsToggle = element.bsToggle;
     if (element.bsTarget) hints.bsTarget = element.bsTarget;
     if (element.ariaHasPopup) hints.ariaHasPopup = element.ariaHasPopup;
     if (element.ariaActiveDescendant) hints.ariaActiveDescendant = element.ariaActiveDescendant;
     if (element.dataRowKey) hints.dataRowKey = element.dataRowKey;
+    // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+    if (element.nearestRowText) hints.nearestRowText = element.nearestRowText;
+    if (element.siblingIndex !== undefined) hints.siblingIndex = element.siblingIndex;
+    if (element.disabled !== undefined) hints.disabled = element.disabled;
+    if (element.arrowDir) hints.arrowDir = element.arrowDir;
     return hints;
   }
 
@@ -1865,12 +2276,19 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     // V22 Pkg1: data-value / child icon testid.
     if (element.dataValue) fp.dataValue = element.dataValue;
     if (element.childTestId) fp.childTestId = element.childTestId;
+    // V22 Pkg4: semantic icon name for heal-time identity match.
+    if (element.iconLabel) fp.iconLabel = element.iconLabel;
     // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
     if (element.bsToggle) fp.bsToggle = element.bsToggle;
     if (element.bsTarget) fp.bsTarget = element.bsTarget;
     if (element.ariaHasPopup) fp.ariaHasPopup = element.ariaHasPopup;
     if (element.ariaActiveDescendant) fp.ariaActiveDescendant = element.ariaActiveDescendant;
     if (element.dataRowKey) fp.dataRowKey = element.dataRowKey;
+    // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+    if (element.nearestRowText) fp.nearestRowText = element.nearestRowText;
+    if (element.siblingIndex !== undefined) fp.siblingIndex = element.siblingIndex;
+    if (element.disabled !== undefined) fp.disabled = element.disabled;
+    if (element.arrowDir) fp.arrowDir = element.arrowDir;
     return fp;
   }
 

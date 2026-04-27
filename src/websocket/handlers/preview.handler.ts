@@ -2135,40 +2135,79 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'click');
               flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'click');
 
-              // V15: Emit hover step before click only if user dwelled on a genuinely different interactive element.
-              // Fixes: V11 had hoverOnDifferentElement always true (ref never stored) → mass false positives.
-              // Now: 400ms minimum dwell + structural comparison (tag + boundingBox) of resolved targets.
-              const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
-              if (lastHover && preClickElement) {
-                const timeSinceHover = Date.now() - lastHover.timestamp;
-                // V15: Raised minimum dwell from 200ms to 400ms — real dropdown hovers require intentional pause
-                if (timeSinceHover > 400 && timeSinceHover < 5000) {
-                  try {
-                    const page = sessionService.getPage(previewSessionId, ensuredUserId);
-                    if (page) {
-                      const hoverElement = await RecordingCaptureService.probeForRecording(page, lastHover.x, lastHover.y);
-                      if (hoverElement) {
-                        // V15: Compare resolved interactive targets structurally.
-                        // data-agent-ref is NOT injected during recording, so we compare by
-                        // boundingBox (position+size) which uniquely identifies elements on page.
-                        const hBB = hoverElement.boundingBox;
-                        const cBB = preClickElement.boundingBox;
-                        const isSameElement = hBB && cBB
-                          && hBB.x === cBB.x && hBB.y === cBB.y
-                          && hBB.width === cBB.width && hBB.height === cBB.height;
-                        if (!isSameElement) {
-                          const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
-                          emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
-                          if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
-                        }
-                      }
+              // V22 Pkg5+ Patch A & C: Emit hover-steps before click using
+              //   (A) Adaptive dwell threshold — 80ms for popup-trigger
+              //       elements (aria-haspopup, dropdown classes, bsToggle),
+              //       400ms for everything else. Quick hover on a real
+              //       trigger (Documentolog Market hover-menu) now records
+              //       a hover-step even if the user moves fast.
+              //   (B) Hover CHAIN — multi-level menus (Menu → Submenu →
+              //       Click leaf) emit a hover-step per distinct ancestor
+              //       trigger, preserving order. Replays deterministically
+              //       even when CSS :hover-only menus drive the UI.
+              //
+              // Old behaviour (single 400ms dwell on lastHover) is fully
+              // subsumed — chain falls back to lastHover when empty.
+              try {
+                const page = sessionService.getPage(previewSessionId, ensuredUserId);
+                const chain = sessionService.getRecordingHoverChain(previewSessionId, ensuredUserId);
+                if (page && preClickElement) {
+                  // Build the candidate list. Prefer chain (multi-level);
+                  // fall back to lastHover (single-step legacy path).
+                  const candidates: Array<{ x: number; y: number; timestamp: number; probedElement?: any }> = [];
+                  if (chain.length > 0) {
+                    for (const c of chain) candidates.push(c);
+                  } else {
+                    const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
+                    if (lastHover) candidates.push(lastHover);
+                  }
+                  const cBB = preClickElement.boundingBox;
+                  const seenBBoxKeys = new Set<string>();
+                  for (let ci = 0; ci < candidates.length; ci++) {
+                    const cand = candidates[ci];
+                    const timeSinceHover = Date.now() - cand.timestamp;
+                    if (timeSinceHover >= 5000) continue; // too stale
+                    // Re-probe if no cached probedElement (legacy lastHover path)
+                    let hoverElement = cand.probedElement || null;
+                    if (!hoverElement) {
+                      hoverElement = await RecordingCaptureService.probeForRecording(page, cand.x, cand.y);
                     }
-                  } catch {
-                    // Non-critical — hover step is best-effort
+                    if (!hoverElement || !hoverElement.boundingBox) continue;
+                    // Skip if this hover-target equals the click-target (same element).
+                    const hBB = hoverElement.boundingBox;
+                    const isSameElement = hBB && cBB
+                      && hBB.x === cBB.x && hBB.y === cBB.y
+                      && hBB.width === cBB.width && hBB.height === cBB.height;
+                    if (isSameElement) continue;
+                    // De-dupe within the chain itself (rare but possible
+                    // when chain entries probed the same element from
+                    // slightly-different coords).
+                    const bboxKey = `${hBB.x}|${hBB.y}|${hBB.width}|${hBB.height}`;
+                    if (seenBBoxKeys.has(bboxKey)) continue;
+                    seenBBoxKeys.add(bboxKey);
+                    // Patch A: adaptive dwell threshold.
+                    // Popup-trigger signals (aria-haspopup, bsToggle="dropdown",
+                    // class*="dropdown|menu-trigger|has-submenu", or any
+                    // ancestor-summary that hints at a menu container) → 80ms.
+                    // Everything else → 400ms (legacy threshold).
+                    const cls = (hoverElement.cssClass || '') + ' ' + (hoverElement.ancestorSummary || '');
+                    const isLikelyPopupTrigger =
+                      !!hoverElement.ariaHasPopup
+                      || hoverElement.bsToggle === 'dropdown'
+                      || hoverElement.bsToggle === 'menu'
+                      || /\b(dropdown|menu-trigger|has-submenu|popper-trigger|has-dropdown|nav-item|MuiMenuItem|MuiMenu-)\b/i.test(cls);
+                    const minDwell = isLikelyPopupTrigger ? 80 : 400;
+                    if (timeSinceHover < minDwell) continue;
+                    const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
+                    if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
                   }
                 }
+              } catch {
+                // Non-critical — hover step is best-effort
               }
               sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
+              sessionService.clearRecordingHoverChain(previewSessionId, ensuredUserId);
 
               // V19: Non-blocking click step emission.
               // Old flow: await LLM (up to 2s) → emit step → user sees step ~2s after click.

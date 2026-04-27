@@ -72,6 +72,21 @@ export class SnapshotCollector {
           win.__agentRefCounter = 0;
         }
 
+        // V22 Pkg7+: heal-side text normalizer. Mirrors normProbeText() in
+        // recording-capture.service.ts and normalizeText() in
+        // text-normalizer.util.ts. Symmetry contract — same canonicalization
+        // at probe / live-DOM / locator-builder ensures fingerprint matching
+        // works across i18n re-renders, NFC/NFD differences, and copied
+        // text contaminated with zero-width chars.
+        const INVISIBLE_RE = /[​-‏‪-‮⁠-⁩﻿]/g;
+        const normLiveText = (s: string | undefined | null): string | undefined => {
+          if (s === undefined || s === null) return undefined;
+          if (s.length === 0) return '';
+          let out = s;
+          try { out = out.normalize('NFC'); } catch { /* best-effort */ }
+          return out.replace(INVISIBLE_RE, '').replace(/\s+/g, ' ').trim();
+        };
+
         // ✅ TASK 10: Fingerprint-based ref stability for React re-renders
         // Persist refs across DOM rebuilds using element fingerprints
         if (!win.__agentFingerprintMap) {
@@ -1485,6 +1500,92 @@ export class SnapshotCollector {
               } catch { /* best-effort */ }
             }
 
+            // V22 Pkg5: nearestRowText — concatenate sibling-cell text.
+            // Mirrors probe extractor; tolerates <td>/<th>/[role=cell]/[role=gridcell]
+            // and falls back to direct row children for li-based grids.
+            let nearestRowText: string | undefined;
+            try {
+              const rowAnc = el.closest('tr, [role="row"], li[role="option"], li.list-row, li.list-item');
+              if (rowAnc && rowAnc !== el) {
+                const cellNodes = rowAnc.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
+                const cellList: Element[] = cellNodes.length > 0
+                  ? Array.prototype.slice.call(cellNodes, 0, 8)
+                  : Array.prototype.slice.call(rowAnc.children, 0, 8);
+                const cellTexts: string[] = [];
+                for (let ci = 0; ci < cellList.length && cellTexts.length < 4; ci++) {
+                  const cellEl = cellList[ci] as HTMLElement;
+                  if (cellEl.contains(el)) continue;
+                  // V22 Pkg7+: NFC-normalize each cell so fingerprint matches
+                  // across recordings done on different OS / keyboard layouts.
+                  const t = normLiveText(cellEl.innerText != null ? cellEl.innerText : cellEl.textContent) || '';
+                  if (t.length >= 2 && t.length <= 80) cellTexts.push(t);
+                }
+                // V22 Pkg7+: cell separator is U+241F (Information Separator
+                // One) — a control char never present in real DOM text, so
+                // .split(CELL_SEP) is collision-free even when cells contain
+                // literal " | ". Symmetric with probe + heal extractors.
+                if (cellTexts.length > 0) nearestRowText = cellTexts.join('␟').slice(0, 200);
+              }
+            } catch { /* best-effort */ }
+
+            // V22 Pkg5: siblingIndex among same-class siblings (2..10).
+            let siblingIndex: number | undefined;
+            try {
+              const firstCls = (el.getAttribute('class') || '').trim().split(/\s+/)[0] || '';
+              const skipRx = /^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/;
+              if (firstCls && firstCls.length >= 2 && !skipRx.test(firstCls)) {
+                const sibParent = el.parentElement;
+                if (sibParent) {
+                  // @ts-expect-error - CSS available in page.evaluate scope
+                  const safeCls = (typeof CSS !== 'undefined' && CSS.escape)
+                    // @ts-expect-error - CSS available in page.evaluate scope
+                    ? CSS.escape(firstCls)
+                    : firstCls.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+                  const sibs = sibParent.querySelectorAll(':scope > .' + safeCls);
+                  if (sibs.length >= 2 && sibs.length <= 10) {
+                    for (let sii = 0; sii < sibs.length; sii++) {
+                      if (sibs[sii] === el) { siblingIndex = sii; break; }
+                    }
+                  }
+                }
+              }
+            } catch { /* best-effort */ }
+
+            // V22 Pkg5: disabled boolean (attr / aria / class tokens).
+            let disabledLive: boolean | undefined;
+            try {
+              const isFormish = /^(button|input|select|textarea|fieldset|optgroup|option|a)$/.test(tagLower)
+                || el.getAttribute('role') === 'button'
+                || el.getAttribute('role') === 'link';
+              if (isFormish) {
+                let d = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+                if (!d) {
+                  const c = ' ' + (el.getAttribute('class') || '') + ' ';
+                  if (/\s(?:Mui-disabled|is-disabled|el-button--disabled|ant-btn-disabled|disabled)\s/.test(c)) d = true;
+                }
+                disabledLive = !!d;
+              }
+            } catch { /* best-effort */ }
+
+            // V22 Pkg5: arrowDir from svg path geometry.
+            let arrowDirLive: 'left' | 'right' | 'up' | 'down' | undefined;
+            try {
+              const svgRootArrow = (tagLower === 'svg') ? el : el.querySelector('svg');
+              const firstP = svgRootArrow ? svgRootArrow.querySelector('path[d]') : null;
+              const dAttr = firstP ? (firstP.getAttribute('d') || '') : '';
+              if (dAttr.length > 0 && dAttr.length < 500) {
+                const mM = dAttr.match(/M\s*([-\d.]+)[\s,]+([-\d.]+)/);
+                const lM = dAttr.match(/L\s*([-\d.]+)[\s,]+([-\d.]+)/);
+                if (mM && lM) {
+                  const mx = parseFloat(mM[1]), my = parseFloat(mM[2]);
+                  const lx = parseFloat(lM[1]), ly = parseFloat(lM[2]);
+                  const dx = lx - mx, dy = ly - my;
+                  if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= 3) arrowDirLive = dx < 0 ? 'left' : 'right';
+                  else if (Math.abs(dy) >= 3) arrowDirLive = dy < 0 ? 'up' : 'down';
+                }
+              }
+            } catch { /* best-effort */ }
+
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract validation state
             // ═══════════════════════════════════════════════════════════════
@@ -1708,6 +1809,11 @@ export class SnapshotCollector {
               ariaActiveDescendant,
               dataRowKey,
               rowClickable,
+              // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+              nearestRowText,
+              siblingIndex,
+              disabled: disabledLive,
+              arrowDir: arrowDirLive,
               // Validation state
               required: required || undefined,
               readOnly: readOnly || undefined,
@@ -1716,6 +1822,11 @@ export class SnapshotCollector {
               // Labels
               ariaLabel,
               title: titleAttr || iconChildLabel,
+              // V22 Pkg4: dedicated semantic icon label field (alongside title
+              // for backward compat). Used by candidateText / fpHintLines /
+              // heal-time score so icon-only buttons get a stable "name" even
+              // when title was already taken by a real tooltip.
+              iconLabel: iconChildLabel,
               isIconButton: isIconButton || undefined,
               labelText,
               // Hierarchy

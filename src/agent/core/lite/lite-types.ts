@@ -94,6 +94,11 @@ export interface LiteElement {
    * the IconButton-with-child-icon-name gap on MUI/AntD/Element Plus.
    */
   childTestId?: string;
+  /**
+   * V22 Pkg4: semantic icon name from svg-internal accessibility / sprite
+   * href / icon-library data-attrs. See ProbedElement.iconLabel.
+   */
+  iconLabel?: string;
   /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap data-bs-target selector. */
@@ -106,6 +111,14 @@ export interface LiteElement {
   dataRowKey?: string;
   /** V22 Pkg2: heuristic flag — row clickable without role/onclick. */
   rowClickable?: boolean;
+  /** V22 Pkg5: sibling-cell text inside nearest row container. */
+  nearestRowText?: string;
+  /** V22 Pkg5: nth-of-type index among same-class siblings (2..10). */
+  siblingIndex?: number;
+  // NOTE: `disabled` boolean is already declared on LiteElement above
+  // (line ~32). V22 Pkg5 reuses that field rather than redefining it.
+  /** V22 Pkg5: cardinal direction inferred from svg path geometry. */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
 
   // Validation state
   /** HTML required attribute */

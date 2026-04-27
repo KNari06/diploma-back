@@ -285,6 +285,10 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if (element.childTestId) {
     node.childTestId = element.childTestId;
   }
+  // V22 Pkg4: semantic icon label from svg/icon-library extraction.
+  if ((element as any).iconLabel) {
+    (node as any).iconLabel = (element as any).iconLabel;
+  }
 
   // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
   if (element.bsToggle) node.bsToggle = element.bsToggle;
@@ -293,6 +297,12 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if (element.ariaActiveDescendant) node.ariaActiveDescendant = element.ariaActiveDescendant;
   if (element.dataRowKey) node.dataRowKey = element.dataRowKey;
   if (element.rowClickable) node.rowClickable = element.rowClickable;
+
+  // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+  if ((element as any).nearestRowText) (node as any).nearestRowText = (element as any).nearestRowText;
+  if ((element as any).siblingIndex !== undefined) (node as any).siblingIndex = (element as any).siblingIndex;
+  if ((element as any).disabled !== undefined) (node as any).disabled = (element as any).disabled;
+  if ((element as any).arrowDir) (node as any).arrowDir = (element as any).arrowDir;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // V2: Validation state

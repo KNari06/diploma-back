@@ -22,6 +22,7 @@ import {
 } from '@/services/testing/ui/preview/preview.types';
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
+import { CELL_SEP, normalizeText } from '@/services/testing/ui/preview/text-normalizer.util';
 import { Frame, Locator, Page } from 'playwright';
 
 /**
@@ -346,6 +347,21 @@ export async function quickFingerprintCheck(
 ): Promise<number> {
   try {
     const element = await locator.evaluate((el: any) => {
+      // V22 Pkg7+: heal-side text normalizer (NFC + invisible-char strip).
+      // MUST MATCH normProbeText() in recording-capture.service.ts and
+      // normLiveText() in snapshot-collector.ts. Without this, recorded
+      // fingerprints in NFC fail to match live elements rendered in NFD
+      // after a fresh React render, causing silent fp-score degradation.
+      const __INVISIBLE_RE = /[​-‏‪-‮⁠-⁩﻿]/g;
+      const __norm = (s: any): string | undefined => {
+        if (s === undefined || s === null) return undefined;
+        if (typeof s !== 'string') return s;
+        if (s.length === 0) return '';
+        let out = s;
+        try { out = out.normalize('NFC'); } catch { /* best-effort */ }
+        return out.replace(__INVISIBLE_RE, '').replace(/\s+/g, ' ').trim();
+      };
+
       // Symmetry with recorder: `TargetFingerprint.role` was written as the
       // explicit-or-implicit role via computeRole() at record time, so the
       // comparison target must be computed the same way. Reading raw
@@ -409,15 +425,17 @@ export async function quickFingerprintCheck(
       }
 
       // Extract associated label text
+      // V22 Pkg7+: NFC + invisible-strip via __norm so RU/KZ/AR labels
+      // compare equal across NFD-normalized re-renders.
       let labelText: string | null = null;
       const doc = el.ownerDocument;
       if (el.id && doc) {
         // @ts-expect-error - CSS.escape is available in browser context
         const label = doc.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-        if (label) labelText = label.textContent?.trim() || null;
+        if (label) labelText = __norm(label.textContent) || null;
       }
       if (!labelText && el.closest?.('label')) {
-        labelText = el.closest('label').textContent?.trim() || null;
+        labelText = __norm(el.closest('label').textContent) || null;
       }
 
       // Extract container titles (nearest semantic containers)
@@ -462,12 +480,14 @@ export async function quickFingerprintCheck(
         || null;
 
       // V22: extended attributes for fingerprint comparison.
+      // V22 Pkg7+: text-bearing attrs are NFC-normalized to match the
+      // recorded fingerprint regardless of OS/keyboard composition state.
       const liveId = el?.id || el?.getAttribute?.('id') || null;
       const liveName = el?.getAttribute?.('name') || null;
       const liveType = el?.getAttribute?.('type') || null;
-      const liveTitle = el?.getAttribute?.('title') || null;
-      const liveAlt = el?.getAttribute?.('alt') || null;
-      const liveText = ((el?.innerText != null ? el.innerText : el?.textContent) || '').trim().slice(0, 80) || null;
+      const liveTitle = __norm(el?.getAttribute?.('title')) || null;
+      const liveAlt = __norm(el?.getAttribute?.('alt')) || null;
+      const liveText = (__norm(el?.innerText != null ? el.innerText : el?.textContent) || '').slice(0, 80) || null;
       const liveAriaControls = el?.getAttribute?.('aria-control') || el?.getAttribute?.('aria-controls') || null;
       const liveHref = el?.tagName?.toLowerCase() === 'a' ? (el?.getAttribute?.('href') || null) : null;
       // ARIA state — for "click toggle while expanded" style fingerprints.
@@ -548,6 +568,87 @@ export async function quickFingerprintCheck(
         if (cands.length === 1) liveChildTestId = cands[0];
       }
 
+      // V22 Pkg4: live iconLabel extraction (mirror of recording-capture probe).
+      // Only computed when childTestId fallback failed AND target is descriptor-poor.
+      let liveIconLabel: string | undefined;
+      if (!liveChildTestId && !ownDescriptive) {
+        try {
+          const tgTag = (el?.tagName || '').toLowerCase();
+          const svgRoot: any = (tgTag === 'svg') ? el : el?.querySelector?.('svg');
+          if (svgRoot) {
+            const svgTitle = svgRoot.querySelector('title');
+            if (svgTitle) {
+              const tt = (svgTitle.textContent || '').trim();
+              if (tt.length > 0 && tt.length <= 100) liveIconLabel = tt;
+            }
+            if (!liveIconLabel) {
+              const svgDesc = svgRoot.querySelector('desc');
+              if (svgDesc) {
+                const dt = (svgDesc.textContent || '').trim();
+                if (dt.length > 0 && dt.length <= 100) liveIconLabel = dt;
+              }
+            }
+            if (!liveIconLabel) {
+              const useEl = svgRoot.querySelector('use');
+              if (useEl) {
+                const href = useEl.getAttribute('href') || useEl.getAttribute('xlink:href') || '';
+                const tail = href.indexOf('#') >= 0 ? href.slice(href.lastIndexOf('#') + 1) : href;
+                const ref = tail.replace(/^icon[-_]/i, '').replace(/[-_]/g, ' ').trim();
+                if (ref.length > 0 && ref.length <= 50) liveIconLabel = ref;
+              }
+            }
+          }
+          if (!liveIconLabel) {
+            const ihCands: any[] = [];
+            if (el?.matches?.('[data-lucide], [data-feather], [data-icon], [data-iconify-name]')) ihCands.push(el);
+            const inner = el?.querySelector?.('[data-lucide], [data-feather], [data-icon], [data-iconify-name]');
+            if (inner && inner !== el) ihCands.push(inner);
+            for (let i = 0; i < ihCands.length && !liveIconLabel; i++) {
+              const ih = ihCands[i];
+              const raw = ih.getAttribute('data-lucide') || ih.getAttribute('data-feather')
+                || ih.getAttribute('data-icon') || ih.getAttribute('data-iconify-name') || '';
+              if (raw && raw.length <= 50) {
+                const cleaned = raw.replace(/^[a-z0-9]+[:-]/i, '').replace(/[-_]/g, ' ').trim();
+                if (cleaned) liveIconLabel = cleaned;
+              }
+            }
+          }
+          if (!liveIconLabel) {
+            const iElem: any = (tgTag === 'i') ? el : el?.querySelector?.('i[class]');
+            if (iElem) {
+              const cls = iElem.getAttribute('class') || '';
+              const m = cls.match(/\bfa[-]([a-z][a-z0-9-]+)\b/i);
+              if (m && m[1]) {
+                const fn = m[1].replace(/-/g, ' ').trim();
+                if (fn.length > 0 && fn.length <= 30
+                    && !/^(solid|regular|brands|light|thin|duotone|fw|sm|lg|xl|2x|3x|4x|5x|spin|pulse|inverse|stack)$/i.test(fn)) {
+                  liveIconLabel = fn;
+                }
+              }
+            }
+          }
+          // ⑥ background-image: url(/icons/hamburger.svg) — last-resort.
+          // Mirrors recording-capture probe step ⑥ so heal-time scoring
+          // doesn't lose a fingerprint match when the recorded label came
+          // from a CSS-painted icon (no DOM <svg>, no class tokens).
+          if (!liveIconLabel && el) {
+            try {
+              const bgImage = (globalThis as any).window?.getComputedStyle?.(el)?.backgroundImage;
+              if (bgImage && bgImage !== 'none' && bgImage.indexOf('url(') === 0) {
+                const bgUrl = bgImage.slice(4, -1).replace(/^["']|["']$/g, '');
+                if (bgUrl.indexOf('data:') !== 0) {
+                  const bgFile = bgUrl.split('/').pop() || '';
+                  const bgName = bgFile.replace(/\.(svg|png|jpe?g|webp|gif)(\?.*)?$/i, '').replace(/[-_]/g, ' ').trim();
+                  if (bgName.length > 1 && bgName.length <= 40 && !/^[a-f0-9]{8,}$/i.test(bgName)) {
+                    liveIconLabel = bgName;
+                  }
+                }
+              }
+            } catch { /* CSS parsing best-effort */ }
+          }
+        } catch { /* best-effort */ }
+      }
+
       // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key — live extraction.
       let liveBsToggle: string | undefined;
       let liveBsTarget: string | undefined;
@@ -578,10 +679,87 @@ export async function quickFingerprintCheck(
         }
       }
 
+      // V22 Pkg5: nearestRowText — concatenate sibling-cell text.
+      let liveRowText: string | undefined;
+      try {
+        const rowAnc = el?.closest?.('tr, [role="row"], li[role="option"], li.list-row, li.list-item');
+        if (rowAnc && rowAnc !== el) {
+          const cellNodes = rowAnc.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
+          const cellList: any[] = cellNodes.length > 0
+            ? Array.prototype.slice.call(cellNodes, 0, 8)
+            : Array.prototype.slice.call(rowAnc.children, 0, 8);
+          const cellTexts: string[] = [];
+          for (let ci = 0; ci < cellList.length && cellTexts.length < 4; ci++) {
+            const cellEl = cellList[ci];
+            if (cellEl.contains?.(el)) continue;
+            // V22 Pkg7+: NFC + invisible-char strip — symmetric with probe.
+            const t = __norm(cellEl.innerText != null ? cellEl.innerText : cellEl.textContent) || '';
+            if (t.length >= 2 && t.length <= 80) cellTexts.push(t);
+          }
+          // V22 Pkg7+: U+241F separator — collision-free vs literal " | ".
+          if (cellTexts.length > 0) liveRowText = cellTexts.join('␟').slice(0, 200);
+        }
+      } catch { /* best-effort */ }
+
+      // V22 Pkg5: siblingIndex among same-class siblings.
+      let liveSibIdx: number | undefined;
+      try {
+        const firstCls = (el?.getAttribute?.('class') || '').trim().split(/\s+/)[0] || '';
+        const skipRx = /^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/;
+        if (firstCls && firstCls.length >= 2 && !skipRx.test(firstCls) && el?.parentElement) {
+          const safeCls = (typeof (globalThis as any).CSS !== 'undefined' && (globalThis as any).CSS.escape)
+            ? (globalThis as any).CSS.escape(firstCls)
+            : firstCls.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+          const sibs = el.parentElement.querySelectorAll(':scope > .' + safeCls);
+          if (sibs.length >= 2 && sibs.length <= 10) {
+            for (let sii = 0; sii < sibs.length; sii++) {
+              if (sibs[sii] === el) { liveSibIdx = sii; break; }
+            }
+          }
+        }
+      } catch { /* best-effort */ }
+
+      // V22 Pkg5: disabled boolean.
+      let liveDisabled: boolean | undefined;
+      try {
+        const tgL = (el?.tagName || '').toLowerCase();
+        const isFormish = /^(button|input|select|textarea|fieldset|optgroup|option|a)$/.test(tgL)
+          || el?.getAttribute?.('role') === 'button'
+          || el?.getAttribute?.('role') === 'link';
+        if (isFormish) {
+          let d = el.hasAttribute?.('disabled') || el.getAttribute?.('aria-disabled') === 'true';
+          if (!d) {
+            const c = ' ' + (el.getAttribute?.('class') || '') + ' ';
+            if (/\s(?:Mui-disabled|is-disabled|el-button--disabled|ant-btn-disabled|disabled)\s/.test(c)) d = true;
+          }
+          liveDisabled = !!d;
+        }
+      } catch { /* best-effort */ }
+
+      // V22 Pkg5: arrowDir from svg path geometry.
+      let liveArrowDir: 'left' | 'right' | 'up' | 'down' | undefined;
+      try {
+        const tgL = (el?.tagName || '').toLowerCase();
+        const svgArrow = (tgL === 'svg') ? el : el?.querySelector?.('svg');
+        const firstP = svgArrow ? svgArrow.querySelector('path[d]') : null;
+        const dAttr = firstP ? (firstP.getAttribute('d') || '') : '';
+        if (dAttr.length > 0 && dAttr.length < 500) {
+          const mM = dAttr.match(/M\s*([-\d.]+)[\s,]+([-\d.]+)/);
+          const lM = dAttr.match(/L\s*([-\d.]+)[\s,]+([-\d.]+)/);
+          if (mM && lM) {
+            const mx = parseFloat(mM[1]), my = parseFloat(mM[2]);
+            const lx = parseFloat(lM[1]), ly = parseFloat(lM[2]);
+            const dx = lx - mx, dy = ly - my;
+            if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= 3) liveArrowDir = dx < 0 ? 'left' : 'right';
+            else if (Math.abs(dy) >= 3) liveArrowDir = dy < 0 ? 'up' : 'down';
+          }
+        }
+      } catch { /* best-effort */ }
+
       return {
         tag: el?.tagName?.toLowerCase(),
         role: computeRole(el),
-        ariaLabel: el?.getAttribute?.('aria-label'),
+        ariaLabel: __norm(el?.getAttribute?.('aria-label')),
         placeholder: el?.getAttribute?.('placeholder'),
         labelText,
         testIdAttr: liveTestId,
@@ -597,12 +775,18 @@ export async function quickFingerprintCheck(
         // V22 Pkg1: select option value + child icon testid lift.
         dataValue: liveDataValue,
         childTestId: liveChildTestId,
+        iconLabel: liveIconLabel,
         // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
         bsToggle: liveBsToggle,
         bsTarget: liveBsTarget,
         ariaHasPopup: liveAriaHasPopup,
         ariaActiveDescendant: liveAriaActiveDescendant,
         dataRowKey: liveDataRowKey,
+        // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+        nearestRowText: liveRowText,
+        siblingIndex: liveSibIdx,
+        disabled: liveDisabled,
+        arrowDir: liveArrowDir,
         containerTitles,
         boundingBox: el?.getBoundingClientRect ? (() => {
           const r = el.getBoundingClientRect();
@@ -761,6 +945,17 @@ export async function quickFingerprintCheck(
       if ((element as any).childTestId === (fingerprint as any).childTestId) matches++;
     }
 
+    // ── V22 Pkg4: iconLabel (svg <title>/data-lucide/FA class, etc.) ──
+    // Fuzzy match: exact = 1, partial substring = 0.5 (icon library renames
+    // "menu" → "burger-menu" or vice versa happen during redesigns).
+    if ((fingerprint as any).iconLabel) {
+      total++;
+      const fpIcon = String((fingerprint as any).iconLabel).toLowerCase();
+      const liveIcon = String((element as any).iconLabel || '').toLowerCase();
+      if (liveIcon === fpIcon) matches++;
+      else if (liveIcon && fpIcon && (liveIcon.includes(fpIcon) || fpIcon.includes(liveIcon))) matches += 0.5;
+    }
+
     // ── V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key ──
     // Each only counted when present in the recorded fingerprint (sparse
     // recordings shouldn't get artificially low scores on missing fields).
@@ -783,6 +978,54 @@ export async function quickFingerprintCheck(
     if ((fingerprint as any).dataRowKey) {
       total++;
       if ((element as any).dataRowKey === (fingerprint as any).dataRowKey) matches++;
+    }
+
+    // ── V22 Pkg5: nearestRowText (Jaccard token similarity) ──
+    // Tokenize on word boundaries; row text drifts across re-fetches
+    // (status badges flip "Active"→"Disabled"), so partial overlap still
+    // counts as match. ≥50% Jaccard = full match (1), ≥25% = half (0.5).
+    // V22 Pkg7+: normalize both sides (NFC + invisible-strip) AND replace
+    // CELL_SEP with whitespace so split(\\W) tokenizes cleanly. Without
+    // normalize, Cyrillic Қ in NFC vs NFD form would tokenize as different
+    // strings even though they render identically.
+    if ((fingerprint as any).nearestRowText) {
+      total++;
+      const fpRaw = String((fingerprint as any).nearestRowText);
+      const liveRaw = String((element as any).nearestRowText || '');
+      const fpNorm = (normalizeText(fpRaw.split(CELL_SEP).join(' ')) || '').toLowerCase();
+      const liveNorm = (normalizeText(liveRaw.split(CELL_SEP).join(' ')) || '').toLowerCase();
+      const fpToks = new Set(fpNorm.split(/\W+/).filter(t => t.length >= 2));
+      const liveToks = new Set(liveNorm.split(/\W+/).filter(t => t.length >= 2));
+      if (fpToks.size > 0 && liveToks.size > 0) {
+        let inter = 0;
+        for (const t of fpToks) if (liveToks.has(t)) inter++;
+        const jaccard = inter / (fpToks.size + liveToks.size - inter);
+        if (jaccard >= 0.5) matches++;
+        else if (jaccard >= 0.25) matches += 0.5;
+      }
+    }
+
+    // ── V22 Pkg5: siblingIndex (exact match only) ──
+    // Position-based identity is fragile — we only count it when both
+    // sides actually have a value. No partial credit (sibling 2 vs 3 is
+    // a different button, not a similar one).
+    if (typeof (fingerprint as any).siblingIndex === 'number') {
+      total++;
+      if ((element as any).siblingIndex === (fingerprint as any).siblingIndex) matches++;
+    }
+
+    // ── V22 Pkg5: disabled state (boolean exact) ──
+    // Distinguishes pagination prev/next twins. Not weighted heavily but
+    // tips the scale when other signals are equal.
+    if ((fingerprint as any).disabled !== undefined) {
+      total++;
+      if ((element as any).disabled === (fingerprint as any).disabled) matches++;
+    }
+
+    // ── V22 Pkg5: arrowDir (exact direction match) ──
+    if ((fingerprint as any).arrowDir) {
+      total++;
+      if ((element as any).arrowDir === (fingerprint as any).arrowDir) matches++;
     }
 
     // NOTE: bbox comparison intentionally omitted here. Spatial proximity is

@@ -737,6 +737,12 @@ export function buildCandidateText(node: InteractiveNode): string {
   // makes the candidate identifiable to the resolver.
   if ((node as any).childTestId) {
     parts.push(`icon: ${(node as any).childTestId}`);
+  } else if ((node as any).iconLabel) {
+    // V22 Pkg4: semantic icon label from svg <title> / data-lucide /
+    // sprite href / FA class. Fallback for `<div role="button"><svg/></div>`
+    // patterns where childTestId is unavailable. Same `icon:` key so the
+    // LLM-prompt rules apply uniformly.
+    parts.push(`icon: ${(node as any).iconLabel}`);
   }
 
   // V22 Pkg1: data-value for Select option / MenuItem / chip semantic key.
@@ -782,6 +788,31 @@ export function buildCandidateText(node: InteractiveNode): string {
     // Soft hint that this <tr> is interactive — helps LLM treat it as a
     // candidate for "click row" intents that lack an explicit role/onclick.
     parts.push('clickable-row');
+  }
+
+  // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+  // nearestRowText is THE big disambiguator for descriptor-poor row
+  // checkboxes — surfaces the row's payload (name/id/etc) directly to
+  // the LLM. Truncated to 100 chars to keep candidateText compact.
+  if ((node as any).nearestRowText) {
+    const rt = String((node as any).nearestRowText).slice(0, 100);
+    parts.push(`row: ${rt}`);
+  }
+  // siblingIndex helps LLM pick "the second of two pagination buttons"
+  // when both look identical at the DOM level. 0-indexed in fingerprint
+  // but emitted 1-indexed in candidateText (more natural for prompting).
+  if (typeof (node as any).siblingIndex === 'number') {
+    parts.push(`pos: ${((node as any).siblingIndex as number) + 1}`);
+  }
+  // disabled state — distinguishes prev (disabled) from next (enabled).
+  if ((node as any).disabled === true) {
+    parts.push('disabled');
+  } else if ((node as any).disabled === false) {
+    parts.push('enabled');
+  }
+  // arrowDir — last-resort hint when a button has no name and only an svg.
+  if ((node as any).arrowDir) {
+    parts.push(`arrow: ${(node as any).arrowDir}`);
   }
 
   // ARIA state hints (helps LLM match "selected tab", "expanded menu", "pressed toggle")
@@ -1888,6 +1919,7 @@ async function selectElementWithLLM(params: {
         // re-recorded step with same description but different selected
         // option / slider value doesn't reuse a stale answer.
         dEsc((recordedFingerprint as any).childTestId),
+        dEsc((recordedFingerprint as any).iconLabel),
         dEsc((recordedFingerprint as any).dataValue),
         // V22 Pkg2 — Bootstrap / activedescendant / row-key disambiguators.
         dEsc((recordedFingerprint as any).bsToggle),
@@ -1895,6 +1927,13 @@ async function selectElementWithLLM(params: {
         dEsc((recordedFingerprint as any).ariaHasPopup),
         dEsc((recordedFingerprint as any).ariaActiveDescendant),
         dEsc((recordedFingerprint as any).dataRowKey),
+        // V22 Pkg5 — row text / sibling pos / disabled / arrow direction.
+        // Each one shifts the right answer for descriptor-poor candidates,
+        // so they all participate in the cache key.
+        dEsc((recordedFingerprint as any).nearestRowText),
+        dEsc((recordedFingerprint as any).siblingIndex),
+        dEsc((recordedFingerprint as any).disabled),
+        dEsc((recordedFingerprint as any).arrowDir),
         // ariaState compact form: e/p/c/i flags + (V22 Pkg1) current/valueNow/valueText.
         // Sub-fields joined with `|` (also escaped for safety).
         recordedFingerprint.ariaState
@@ -1997,6 +2036,10 @@ async function selectElementWithLLM(params: {
     if ((recordedFingerprint as any).childTestId) {
       fpHintLines.push(`childIconTestId="${fpEsc((recordedFingerprint as any).childTestId)}"`);
     }
+    // V22 Pkg4: semantic icon label (svg title / data-lucide / FA class).
+    if ((recordedFingerprint as any).iconLabel) {
+      fpHintLines.push(`iconLabel="${fpEsc((recordedFingerprint as any).iconLabel)}"`);
+    }
     if ((recordedFingerprint as any).dataValue) {
       fpHintLines.push(`dataValue="${fpEsc((recordedFingerprint as any).dataValue)}"`);
     }
@@ -2016,6 +2059,26 @@ async function selectElementWithLLM(params: {
     }
     if ((recordedFingerprint as any).dataRowKey) {
       fpHintLines.push(`dataRowKey="${fpEsc((recordedFingerprint as any).dataRowKey)}"`);
+    }
+
+    // ── V22 Pkg5: row text + sibling pos + disabled state + arrow direction ──
+    // nearestRowText is the headline disambiguator for table-row clicks
+    // (the recorded checkbox/button gets "AO HABAR khabar 980640..." as
+    // its row context). siblingIndex is 0-indexed in storage but emitted
+    // 1-indexed in the prompt (more natural for the LLM).
+    if ((recordedFingerprint as any).nearestRowText) {
+      fpHintLines.push(`rowText="${fpEsc((recordedFingerprint as any).nearestRowText)}"`);
+    }
+    if (typeof (recordedFingerprint as any).siblingIndex === 'number') {
+      fpHintLines.push(`siblingPos=${((recordedFingerprint as any).siblingIndex as number) + 1}`);
+    }
+    if ((recordedFingerprint as any).disabled === true) {
+      fpHintLines.push('disabled=true');
+    } else if ((recordedFingerprint as any).disabled === false) {
+      fpHintLines.push('disabled=false');
+    }
+    if ((recordedFingerprint as any).arrowDir) {
+      fpHintLines.push(`arrowDir="${fpEsc((recordedFingerprint as any).arrowDir)}"`);
     }
 
     // ── ARIA state at recording time (V22) ──

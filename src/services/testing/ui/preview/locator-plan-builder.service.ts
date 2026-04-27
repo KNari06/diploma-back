@@ -12,6 +12,7 @@ import type {
   LocatorEntry,
   TargetFingerprint,
 } from './preview.types';
+import { CELL_SEP, escapeHasText, normalizeText } from './text-normalizer.util';
 
 /**
  * Escape value for CSS attribute selector.
@@ -115,6 +116,51 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
     });
   }
 
+  // V22 Pkg4: iconLabel (svg <title>/data-lucide/FA class) — for
+  // descriptor-poor icon-only buttons WITHOUT data-testid. Emit *scoped*
+  // CSS selectors that constrain matching to actual icon ancestors, so we
+  // don't accidentally click a navbar link that happens to contain the
+  // same word as the icon name (a flat getByText("menu") would). Order:
+  //   1. :has(svg title="X")     — most precise (matches probe step ①)
+  //   2. :has([data-lucide="X"]) — icon-library attr (probe step ④)
+  // Both stay below testId/childTestId. The plain `text` fallback was
+  // intentionally dropped — too lossy without scope. The label still
+  // travels to the LLM resolver via candidateText / fpHints for cases
+  // these selectors miss (FA class, bg-image, etc).
+  if ((node as any).iconLabel && !(node as any).childTestId
+      // Skip when there's already a text/aria/testId hint that would compete.
+      && !node.text && !node.ariaLabel && !node.labelText) {
+    const iconLabel = String((node as any).iconLabel).slice(0, 60);
+    if (iconLabel.length >= 2) {
+      const safeIcon = escapeCssAttrValue(iconLabel);
+      const tagPrefix = node.tag || '*';
+      // Probe step ① — svg <title> is the WCAG-recommended icon name.
+      // :has(svg title) traverses into the svg subtree. Playwright supports
+      // `:text-is()` for exact-match text on the title element.
+      locators.push({
+        strategy: 'css',
+        value: `${tagPrefix}:has(svg title:text-is("${safeIcon.replace(/"/g, '\\"')}"))`,
+        confidence: 0.62,
+      });
+      // Probe step ④ — icon-library data attrs. Skip when the recorded
+      // value contains spaces (we normalize "menu-icon" → "menu icon"
+      // during probe, but DOM attrs hold the original hyphenated form).
+      // Trying both forms costs little and dramatically widens coverage.
+      const attrCandidates = [iconLabel, iconLabel.replace(/\s+/g, '-')];
+      const tried = new Set<string>();
+      for (const v of attrCandidates) {
+        if (tried.has(v)) continue;
+        tried.add(v);
+        const safe = escapeCssAttrValue(v);
+        locators.push({
+          strategy: 'css',
+          value: `${tagPrefix}:has([data-lucide="${safe}"], [data-feather="${safe}"], [data-icon="${safe}"], [data-iconify-name="${safe}"])`,
+          confidence: 0.60,
+        });
+      }
+    }
+  }
+
   // V22 Pkg1: data-value — semantic key for select options / list items /
   // chips. Localized labels drift (Login → Войти → 登录) but the value attr
   // stays stable. Confidence below testId because data-value is product
@@ -143,6 +189,87 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
       confidence: 0.78,
     });
   }
+
+  // V22 Pkg5: nearestRowText — descriptor-poor row checkboxes/buttons.
+  // Strategy: `tr:has-text("FIRST_CELL") <tag>` — Playwright's `:has-text()`
+  // pseudo searches the entire row subtree, anchoring our otherwise
+  // identical-looking checkbox to the row's payload (name/id/amount).
+  // Confidence 0.73 — just below testId/dataRowKey but above name (0.70)
+  // because text identity is robust on Documentolog/AntD/MUI alike.
+  if ((node as any).nearestRowText && !node.testIdAttr && !(node as any).dataRowKey) {
+    const rowText = String((node as any).nearestRowText);
+    // V22 Pkg7+: split on the canonical Pkg5 cell separator (U+241F).
+    // Falls back to legacy " | " for fingerprints persisted before the
+    // separator change so old-recordings replay still works.
+    const firstCellRaw = rowText.includes(CELL_SEP)
+      ? rowText.split(CELL_SEP)[0]
+      : rowText.split(' | ')[0];
+    // V22 Pkg7+: normalize so RU/KZ/UZ rows still match across NFD-encoded
+    // re-renders or zero-width contamination from CMS sources.
+    const firstCell = (normalizeText(firstCellRaw) || '').trim();
+    // Audit fix: skip strategy when tag is missing — `tr:has-text("X") *`
+    // matches every descendant of the row, completely defeating the point.
+    // Pair the strategy to a concrete tag so we only emit when we know
+    // what we're locating (input/button/a/svg/etc).
+    if (firstCell.length >= 3 && firstCell.length <= 60 && node.tag) {
+      // V22 Pkg7+: escapeHasText handles backslash + double-quote per
+      // Playwright :has-text() syntax. Unicode passes through unmodified.
+      const safeText = escapeHasText(firstCell);
+      // For checkboxes specifically, narrow further with [type="checkbox"]
+      // so we don't pick a hidden input that came from a different control.
+      const tagPart = (node.tag === 'input' && node.type)
+        ? `input[type="${escapeCssAttrValue(node.type)}"]`
+        : node.tag;
+      locators.push({
+        strategy: 'css',
+        value: `tr:has-text("${safeText}") ${tagPart}`,
+        confidence: 0.73,
+      });
+      // Same idea for li-based grids (no <tr>).
+      locators.push({
+        strategy: 'css',
+        value: `li:has-text("${safeText}") ${tagPart}`,
+        confidence: 0.68,
+      });
+    }
+  }
+
+  // V22 Pkg5: siblingIndex — nth-of-type within same-class sibling group.
+  // Anchors pagination prev/next, tab strips, button groups when the
+  // first className token is stable (not jss/sc-/css-/makeStyles).
+  // Confidence 0.62 — below text/title because position is fragile to
+  // structural refactors, but above pure cssClass.
+  if (typeof (node as any).siblingIndex === 'number'
+      && !node.testIdAttr
+      && !node.text
+      && !node.ariaLabel) {
+    const idx = (node as any).siblingIndex as number;
+    // cssClass arrives via the dom-analysis pass-through (see
+    // dom-analysis-extractor.service.ts) and isn't declared on
+    // InteractiveNode itself — cast through `any` keeps the field
+    // optional without polluting the type with a fingerprint-only field.
+    const rawCls = (node as any).cssClass;
+    const cls = typeof rawCls === 'string' && rawCls.length > 0 ? rawCls.split(/\s+/)[0] : '';
+    // Reuse the same skip-rx as probe — keep selectors symmetric.
+    const skipRx = /^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/;
+    if (cls && cls.length >= 2 && !skipRx.test(cls)) {
+      const safeCls = escapeCssAttrValue(cls);
+      // CSS :nth-of-type is 1-indexed; siblingIndex is 0-indexed → +1.
+      locators.push({
+        strategy: 'css',
+        value: `.${safeCls}:nth-of-type(${idx + 1})`,
+        confidence: 0.62,
+      });
+    }
+  }
+
+  // V22 Pkg5: arrowDir — soft hint for svg-only pagination buttons.
+  // No direct CSS strategy possible (we can't query "svg pointing left"),
+  // but emit a synthetic locator that the LLM resolver can use as a hint
+  // alongside `boundingBox.x` ranking. The actual click resolution still
+  // happens via positional + sibling text in the LLM prompt; this just
+  // makes sure arrowDir survives into compiled plan as candidateText.
+  // (Strategy: skipped here — purely informational, fed via fingerprint.)
 
   // V22 Pkg2: Bootstrap data-bs-toggle + data-bs-target combo. Either
   // alone is weakish (multiple modals share toggle="modal"), but together
@@ -287,6 +414,13 @@ function buildTargetFingerprint(node: InteractiveNode): TargetFingerprint {
     ariaHasPopup: (node as any).ariaHasPopup,
     ariaActiveDescendant: (node as any).ariaActiveDescendant,
     dataRowKey: (node as any).dataRowKey,
+    // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+    nearestRowText: (node as any).nearestRowText,
+    siblingIndex: (node as any).siblingIndex,
+    disabled: (node as any).disabled,
+    arrowDir: (node as any).arrowDir,
+    // V22 Pkg4: iconLabel pass-through.
+    iconLabel: (node as any).iconLabel,
     ariaState: Object.keys(ariaState).length > 0 ? ariaState : undefined,
   };
 }

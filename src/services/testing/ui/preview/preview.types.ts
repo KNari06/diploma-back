@@ -108,6 +108,15 @@ export interface InteractiveNode {
    * surface a meaningful name in candidateText for IconButton-shaped targets.
    */
   childTestId?: string;
+  /**
+   * V22 Pkg4: Semantic icon name from svg-internal accessibility (`<title>`,
+   * `<desc>`), sprite reference (`<use href="#icon-X">`), icon-library
+   * data-attrs (`data-lucide`, `data-feather`, `data-icon`, `data-iconify-name`),
+   * FontAwesome class tokens, or background-image URL filename. Used for
+   * `<div role="button"><svg/></div>` patterns where neither testId nor
+   * childTestId is available — closes the "fully bare icon button" gap.
+   */
+  iconLabel?: string;
   /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap data-bs-target selector. */
@@ -124,6 +133,29 @@ export interface InteractiveNode {
    * this when ranking candidates inside a table context.
    */
   rowClickable?: boolean;
+  /**
+   * V22 Pkg5: Concatenated text of sibling cells inside the nearest
+   * row container — uniqueness signal for descriptor-poor row checkboxes
+   * and action buttons. Format: "<cell1> | <cell2> | <cell3>".
+   */
+  nearestRowText?: string;
+  /**
+   * V22 Pkg5: nth-of-type index among same-class siblings. Bounded to
+   * 2..10 siblings. Anchors pagination prev/next, tabs, button groups
+   * where attribute identity is missing.
+   */
+  siblingIndex?: number;
+  /**
+   * V22 Pkg5: Recorded disabled state (combines `disabled` attr,
+   * `aria-disabled`, and disabled CSS class tokens). Distinguishes
+   * pagination prev (disabled at start) from next (enabled).
+   */
+  disabled?: boolean;
+  /**
+   * V22 Pkg5: Cardinal direction inferred from svg path geometry.
+   * Last-resort hint for svg-only buttons (prev/next, expand/collapse).
+   */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
 
   // ═══════════════════════════════════════════════════════════════════════════
   // V2: Validation state
@@ -346,6 +378,15 @@ export interface BindingHints {
    */
   childTestId?: string;
   /**
+   * V22 Pkg4: Semantic icon name extracted from svg-internal accessibility
+   * (`<title>`, `<desc>`, `<use href="#icon-X">`), icon-library data-attrs
+   * (`data-lucide`, `data-feather`, `data-icon`, `data-iconify-name`),
+   * FontAwesome class tokens, or background-image URL filename. Last-line
+   * defense for fully-bare icon buttons (`<div role="button"><svg/></div>`
+   * with no testId / aria-label / title).
+   */
+  iconLabel?: string;
+  /**
    * V22 Pkg2: Bootstrap toggle marker (data-bs-toggle). Distinguishes
    * "real Bootstrap dropdown trigger" from a static button with similar
    * styling. Values: 'modal' | 'dropdown' | 'tab' | 'collapse' | 'tooltip' | etc.
@@ -372,6 +413,26 @@ export interface BindingHints {
    * table re-renders (Ant Design Table, RainbowKit).
    */
   dataRowKey?: string;
+  /**
+   * V22 Pkg5: Concatenated text of sibling cells in nearest row container.
+   * Identity for descriptor-poor row checkboxes / action buttons.
+   */
+  nearestRowText?: string;
+  /**
+   * V22 Pkg5: nth-of-type index among same-class siblings (2..10).
+   * Anchors pagination prev/next, tab strips, button groups.
+   */
+  siblingIndex?: number;
+  /**
+   * V22 Pkg5: Recorded disabled state (boolean). Distinguishes pagination
+   * prev (disabled) from next (enabled) when both share class & geometry.
+   */
+  disabled?: boolean;
+  /**
+   * V22 Pkg5: Cardinal direction inferred from svg path geometry.
+   * Last-resort hint for svg-only pagination/expand buttons.
+   */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
   /**
    * V22: Nearest ARIA landmark (banner / navigation / main / footer / etc.).
    * Disambiguates "Settings" in nav from "Settings" in footer.
@@ -542,6 +603,8 @@ export interface TargetFingerprint {
   dataValue?: string;
   /** V22 Pkg1: data-testid of the single direct icon child (svg/i/img). */
   childTestId?: string;
+  /** V22 Pkg4: semantic icon name (svg <title>/<desc>/<use href>/data-lucide/etc). */
+  iconLabel?: string;
   /** V22 Pkg2: Bootstrap toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap target selector. */
@@ -552,6 +615,14 @@ export interface TargetFingerprint {
   ariaActiveDescendant?: string;
   /** V22 Pkg2: data-row-key / data-rk — stable row identity. */
   dataRowKey?: string;
+  /** V22 Pkg5: sibling-cell text inside nearest row (uniqueness signal). */
+  nearestRowText?: string;
+  /** V22 Pkg5: nth-of-type index among same-class siblings (2..10). */
+  siblingIndex?: number;
+  /** V22 Pkg5: recorded disabled state (combines disabled attr / aria / class). */
+  disabled?: boolean;
+  /** V22 Pkg5: cardinal direction inferred from svg path geometry. */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
   /** V22: Compact ancestor chain summary (see BindingHints.ancestorSummary). */
   ancestorSummary?: string;
 }
