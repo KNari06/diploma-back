@@ -1020,6 +1020,39 @@ interface ApplyResult {
   attempts?: number;
   /** V2: Whether action was verified post-execution */
   verified?: boolean;
+  /**
+   * Click-effect verification signal that proved the click did something.
+   * Surfaced so callers (preview_run trace, regression replay) can audit
+   * whether `verified: true` is backed by a strong signal (url/dialog/aria/
+   * detach/dom/newtab) or a weak one (focus). Without this, "passed" is
+   * indistinguishable from "fake-passed" — focus-only successes look the
+   * same as real navigations in run summaries.
+   */
+  clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
+  /**
+   * Identity of the element the resolver actually clicked. Without this we
+   * can't tell whether "passed" landed on the recorded target or on a
+   * neighbour with similar bounding box. A passed step with chosenRef
+   * pointing at a different element than the recorded fingerprint is the
+   * canonical fake-success signature.
+   */
+  chosenRef?: string;
+  chosenLabel?: string;
+  chosenBoundingBox?: { x: number; y: number; width: number; height: number };
+  /**
+   * Did the chosen element match the recorded fingerprint? A best-effort
+   * heuristic comparing `id` (strong), `bbox` overlap (medium) and `tag`
+   * (weak). 'mismatch' on a passed step is a strong fake-success signal
+   * — replay clicked something, but not what was recorded.
+   */
+  fingerprintMatch?: 'id' | 'bbox' | 'tag' | 'no_recorded' | 'mismatch';
+  /**
+   * Which resolver path produced the candidate. Lets preview_run trace
+   * distinguish between an identity fast-path hit (recorded id matched live
+   * DOM) and an LLM/vision pick (semantic match), which is the difference
+   * between "right element" and "model picked something nearby".
+   */
+  resolverPath?: import('./preview.types').LintResult['resolverPath'];
   /** V2: State change detected */
   stateChange?: {
     before?: Partial<InteractiveNode>;
@@ -1259,6 +1292,44 @@ async function verifyClickHadEffect(
     if (elemResult.signal !== 'none') return { effected: true, signal: elemResult.signal };
   }
   return { effected: false, signal: 'none' };
+}
+
+/**
+ * Compare what the resolver clicked against the recorded fingerprint to
+ * detect "passed but on the wrong element" cases. Returns the strongest
+ * piece of identity that matched — `id` (definitely the right element),
+ * `bbox` (same screen region, may be a neighbour), `tag` (only generic
+ * shape match), `no_recorded` (no fingerprint to compare against), or
+ * `mismatch` (different element entirely — fake-success).
+ */
+function compareToRecordedFingerprint(
+  chosen: { tag?: string; id?: string | null; boundingBox?: { x: number; y: number; width: number; height: number } | null } | null,
+  recorded?: { tag?: string; elementId?: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null,
+): 'id' | 'bbox' | 'tag' | 'no_recorded' | 'mismatch' {
+  if (!recorded) return 'no_recorded';
+  if (!chosen) return 'mismatch';
+  // Strongest signal: stable id match. The probe filters generated ids
+  // upstream so what reaches `recorded.elementId` is human-named.
+  if (recorded.elementId && chosen.id === recorded.elementId) return 'id';
+  // Medium signal: bbox overlap (same screen region). Used when neither
+  // element has an id — accepts a small position drift (responsive layouts
+  // shift things by a few pixels). Threshold 25% Intersection-over-Union.
+  if (recorded.boundingBox && chosen.boundingBox) {
+    const r = recorded.boundingBox;
+    const c = chosen.boundingBox;
+    const ix = Math.max(0, Math.min(r.x + r.width, c.x + c.width) - Math.max(r.x, c.x));
+    const iy = Math.max(0, Math.min(r.y + r.height, c.y + c.height) - Math.max(r.y, c.y));
+    const inter = ix * iy;
+    const union = r.width * r.height + c.width * c.height - inter;
+    const iou = union > 0 ? inter / union : 0;
+    if (iou >= 0.25) return 'bbox';
+  }
+  // Weak signal: same tag. <button> recorded → <button> clicked is at
+  // least the right shape, even if the wrong instance.
+  if (recorded.tag && chosen.tag && recorded.tag.toLowerCase() === chosen.tag.toLowerCase()) {
+    return 'tag';
+  }
+  return 'mismatch';
 }
 
 /**
@@ -4236,6 +4307,98 @@ export class PreviewStepApplyService {
             compiled, // NEW: compiled execution plan
           };
 
+          // Audit: which element did the resolver actually click? Compare
+          // against the recorded fingerprint so a 'pass' on the wrong target
+          // (fake-success) becomes diagnosable from logs alone.
+          let chosenLabel: string | undefined;
+          let chosenTagLive: string | undefined;
+          let chosenIdLive: string | null | undefined;
+          try {
+            if (candidate.node) {
+              chosenLabel = candidate.node.labelText
+                || candidate.node.ariaLabel
+                || candidate.node.text
+                || candidate.node.placeholder
+                || `<${candidate.node.tag}>`;
+              chosenTagLive = candidate.node.tag;
+              chosenIdLive = candidate.node.id;
+            }
+          } catch { /* best-effort */ }
+          const fingerprintMatch = compareToRecordedFingerprint(
+            {
+              tag: chosenTagLive,
+              id: chosenIdLive,
+              boundingBox: candidate.boundingBox || null,
+            },
+            stepDraft.recordedFingerprint
+              ? {
+                  tag: stepDraft.recordedFingerprint.tag,
+                  elementId: stepDraft.recordedFingerprint.elementId,
+                  boundingBox: stepDraft.recordedFingerprint.boundingBox,
+                }
+              : null,
+          );
+
+          // Fake-success guard. The resolver landed on an element whose
+          // identity does not line up with what the recorder captured, AND
+          // the only thing that "verified" the click was a focus shift or
+          // 'none'. Almost every fake-success bug we hunted on hub.atk.pro
+          // matches this pattern: LLM picked the loudest CTA next to the
+          // real target, the click navigated *somewhere*, focus moved, and
+          // the verifier rubber-stamped it green. With the recorded id
+          // present we have ground truth — if it doesn't match, this is
+          // not a pass. Strong signals (url / dialog / aria expansion /
+          // dom mutation / detach / newtab) are still allowed through:
+          // mismatch under those is suspicious but the click did clearly
+          // do something the test cared about, so we let trace audit catch
+          // it post-hoc rather than block.
+          const hasGroundTruth =
+            stepDraft.type === 'click' &&
+            !!stepDraft.recordedFingerprint &&
+            (!!stepDraft.recordedFingerprint.elementId ||
+             !!stepDraft.recordedFingerprint.testIdAttr ||
+             !!stepDraft.recordedFingerprint.name);
+          // 'newtab' is treated as weak under mismatch — opening an unrelated
+          // tab is the canonical fake-success symptom (recorder captured a
+          // settings cog with id="layout-header-setting", LLM clicked a
+          // neighbouring "click me!" banner, popup→yuque.com docs, verifier
+          // saw newtab and stamped pass). Real navigations land on the same
+          // page (url change without popup), which is signal 'url'.
+          const weakSignal = clickEffectSignal === 'focus' || clickEffectSignal === 'none' || clickEffectSignal === 'newtab' || clickEffectSignal === undefined;
+          if (hasGroundTruth && fingerprintMatch === 'mismatch' && weakSignal) {
+            logger.warn('[PREVIEW_APPLY] Rejecting fake-success: fingerprint mismatch with weak click signal', {
+              stepId: stepDraft.id,
+              candidateRef: candidate.ref,
+              chosenLabel,
+              chosenIdLive,
+              recordedId: stepDraft.recordedFingerprint?.elementId,
+              recordedTestId: stepDraft.recordedFingerprint?.testIdAttr,
+              clickEffectSignal,
+            });
+            trace?.writeActionResult({
+              stepId: stepDraft.id,
+              stepType: stepDraft.type,
+              success: false,
+              durationMs: actionDur,
+              error: 'fingerprint-mismatch-weak-signal',
+            });
+            return {
+              success: false,
+              error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the recorded target had id="${stepDraft.recordedFingerprint?.elementId || stepDraft.recordedFingerprint?.testIdAttr}". The click only triggered a ${clickEffectSignal || 'no'} change, not a real navigation/dialog/state update — almost certainly a fake-success. Refine the step description or check that the recorded id still exists on the page.`,
+              attempts,
+              highlight: [{
+                ref: candidate.ref,
+                boundingBox: candidate.boundingBox,
+                type: 'error' as const,
+              }],
+              clickEffectSignal,
+              chosenRef: candidate.ref,
+              chosenLabel,
+              chosenBoundingBox: candidate.boundingBox,
+              fingerprintMatch,
+              resolverPath: lintResult.resolverPath,
+            };
+          }
           return {
             success: true,
             appliedStep: updatedStep,
@@ -4248,6 +4411,16 @@ export class PreviewStepApplyService {
             }],
             attempts,
             verified,
+            // Surface the verify signal so preview_run trace can audit
+            // whether passed clicks were backed by url/dialog/aria/etc
+            // (strong) or only focus (weak — often fake-success when the
+            // page is in a different state than recording).
+            clickEffectSignal,
+            chosenRef: candidate.ref,
+            chosenLabel,
+            chosenBoundingBox: candidate.boundingBox,
+            fingerprintMatch,
+            resolverPath: lintResult.resolverPath,
             stateChange,
             compiledFailed: compiledWasTried,
           };

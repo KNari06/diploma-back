@@ -2146,11 +2146,22 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const probeX = hStateRef.latestX;
               const probeY = hStateRef.latestY;
 
-              const el = await sessionService.probeInteractiveElementAt({
+              // V23: ask probe for the precise reject reason. Without this
+              // every null result trace-encodes as 'no_interactive_element'
+              // — so 53× identical rows during a stuck recording look
+              // identical regardless of whether the page is empty, the
+              // hit-test landed in a cross-origin iframe, or a non-
+              // interactive <div> covered the area.
+              const probeResult = await sessionService.probeInteractiveElementAt({
                 sessionId: previewSessionId,
                 userId: ensuredUserId,
                 x: probeX, y: probeY,
+                withRejectReason: true,
               });
+              // Narrow: a "real" element has tag/label; rejection has only rejectReason.
+              const el = probeResult && 'tag' in probeResult ? probeResult : null;
+              const rejectReason = probeResult && 'rejectReason' in probeResult
+                ? probeResult.rejectReason : undefined;
 
               const probeLatencyMs = Date.now() - probeStartMs;
 
@@ -2167,7 +2178,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 originalX: x, originalY: y,
                 latencyMs: probeLatencyMs,
                 result: el ? { tag: el.tag, label: el.label, resolvedVia: el.resolvedVia } : null,
-                skipped: el ? undefined : 'no_interactive_element',
+                skipped: el ? undefined : (rejectReason || 'no_interactive_element'),
               });
 
               const elKey = el
@@ -2284,6 +2295,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
             return; // Don't try to create a step from cross-origin element
           }
+          // V23: <webview> / <object> / <embed> host a separate browsing
+          // context Playwright cannot reach — recording silently captures
+          // nothing. Surface a clear message instead of "no element here".
+          if (preClickElement.unsupportedHost) {
+            const room = createRoomName('preview', previewSessionId);
+            const hostKind = preClickElement.unsupportedHost;
+            const hostMsg = hostKind === 'webview'
+              ? 'This site renders its content inside an Electron <webview> element. Playwright runs vanilla Chromium, so the inner content is not reachable. Recording will not capture clicks or typing here.'
+              : `This site renders content inside a <${hostKind}> element whose internals are not accessible to recording.`;
+            socket.nsp.to(room).emit('preview:recording:warning' as any, {
+              previewSessionId,
+              type: 'unsupported_host',
+              hostKind,
+              message: hostMsg,
+              timestamp: new Date().toISOString(),
+            });
+            return; // No usable target — skip step creation
+          }
           setImmediate(async () => {
             try {
               const { RecordingCaptureService } = await import(
@@ -2366,6 +2395,18 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       || /\b(dropdown|menu-trigger|has-submenu|popper-trigger|has-dropdown|nav-item|MuiMenuItem|MuiMenu-)\b/i.test(cls);
                     const minDwell = isLikelyPopupTrigger ? 80 : 400;
                     if (timeSinceHover < minDwell) continue;
+                    // Skip generic-label hovers. If the probe couldn't find any
+                    // descriptive name for the target (no aria-label, no text,
+                    // no title, no id, no testId), the recorded step ends up as
+                    // "Hover 'element'" which is useless for replay — the
+                    // resolver has nothing semantic to match against. Most of
+                    // these come from cursor sweeps between meaningful targets
+                    // (e.g. mouse passing over a wrapper div on the way to the
+                    // language flag). Exception: keep the step when the probe
+                    // indicates a popup-trigger (aria-haspopup / dropdown class)
+                    // — there the hover IS the action even without a label.
+                    const probedLabel = RecordingCaptureService.getProbedLabel(hoverElement, 60);
+                    if (!probedLabel && !isLikelyPopupTrigger) continue;
                     const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
                     if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');

@@ -232,6 +232,15 @@ export interface ProbedElement {
   iframeSelector?: string;
   /** V14: Marker — element is inside a cross-origin iframe and cannot be probed/recorded */
   crossOriginIframe?: boolean;
+  /**
+   * V23: Marker — click landed inside an unsupported host element whose
+   * content lives in a separate browsing context Playwright cannot reach.
+   * 'webview' — Electron / Chrome Apps `<webview>` (browse via Chrome IPC).
+   * 'object' / 'embed' — legacy plugin hosts.
+   * Distinct from `crossOriginIframe` because the failure mode is permanent
+   * (the host element type is unsupported) rather than per-origin.
+   */
+  unsupportedHost?: 'webview' | 'object' | 'embed';
   /** V15: How the interactive target was resolved from the click point */
   resolvedVia?: 'nativeTag' | 'ariaRole' | 'behavioral' | 'cssClass' | 'cursorPointer' | 'directHit' | 'llm';
   /**
@@ -747,6 +756,57 @@ const PROBE_AT_POINT_FN = `
     }
   } catch (e) { /* best-effort */ }
 
+  // Wrapper-to-icon descent. Click coordinate at the edge of an icon
+  // (Element Plus shesterёnka, MUI IconButton chevrons) often lands on
+  // the wrapping <div class="el-tooltip__trigger"> / <span class="MuiIcon">
+  // because elementFromPoint snaps to the wrapper at sub-pixel borders.
+  // The wrapper has no id, but the visual icon inside DOES (e.g.
+  // <svg id="layout-header-setting">). Without descent the recorder saves
+  // a generic div and replay falls back to LLM, which grabs the loudest
+  // neighbouring CTA — the canonical fake-success path.
+  //
+  // Constraints: only descend when (a) target is currently the wrapper-
+  // level resolve (directHit / cssClass / cursorPointer — anything stronger
+  // already picked a semantic element on purpose), (b) the wrapper contains
+  // EXACTLY one svg/img/i child carrying a stable, non-framework id, and
+  // (c) that child is geometrically inside the click point. The single-
+  // child gate plus stable-id gate make this match symmetric with the
+  // identity fast-path on the resolver side: recorder writes the id, live
+  // collector reads the id, fast-path matches without LLM.
+  if (target && target.tagName && (resolvedVia === 'directHit' || resolvedVia === 'cssClass' || resolvedVia === 'cursorPointer')) {
+    try {
+      var ttagLc = target.tagName.toLowerCase();
+      var isWrapperish = ttagLc === 'div' || ttagLc === 'span' || ttagLc === 'button';
+      if (isWrapperish) {
+        var iconChildren = target.querySelectorAll('svg[id], img[id], i[id]');
+        if (iconChildren && iconChildren.length === 1) {
+          var iconChild = iconChildren[0];
+          var iconId = iconChild.getAttribute('id') || '';
+          var iconLooksGenerated =
+            /^el-id-/i.test(iconId)
+            || /^radix-/.test(iconId)
+            || /^:r[0-9a-z]+:$/i.test(iconId)
+            || /^mui-/i.test(iconId)
+            || /^headlessui-/i.test(iconId)
+            || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(iconId);
+          if (iconId && !iconLooksGenerated && iconId.length < 80) {
+            var iconRect = iconChild.getBoundingClientRect && iconChild.getBoundingClientRect();
+            // Slightly inflated containment — sub-pixel rounding can put the
+            // click 1-2px outside the icon's exact rect even when the user
+            // clearly aimed at it.
+            var iconHit = iconRect &&
+              x >= iconRect.left - 2 && x <= iconRect.right + 2 &&
+              y >= iconRect.top - 2 && y <= iconRect.bottom + 2;
+            if (iconHit) {
+              target = iconChild;
+              resolvedVia = 'cursorPointer';
+            }
+          }
+        }
+      }
+    } catch (e) { /* best-effort */ }
+  }
+
   // ── Collect data from chosen target ──────────────────────────────────
   // V22 Audit-fix H3: guard against text/comment nodes that may slip in
   // through fieldset->input promotion when the wrapper has no real input.
@@ -1257,7 +1317,13 @@ const PROBE_AT_POINT_FN = `
             var bgUrl = bgImage.slice(4, -1).replace(/^["']|["']$/g, '');
             if (bgUrl.indexOf('data:') !== 0) {
               var bgFile = bgUrl.split('/').pop() || '';
-              var bgName = bgFile.replace(/\.(svg|png|jpe?g|webp|gif)(\?.*)?$/i, '').replace(/[-_]/g, ' ').trim();
+              // Double-escape \\. and \\? — this regex lives inside a TS
+              // template literal that gets serialised into the page.evaluate
+              // string. Single \. would arrive as a bare . at runtime and
+              // \?  as a bare ? (which then opens an invalid lookahead group).
+              // Reproduced in production 2026-04-28: every probe call
+              // SyntaxError'd, recording silently captured nothing.
+              var bgName = bgFile.replace(/\\.(svg|png|jpe?g|webp|gif)(\\?.*)?$/i, '').replace(/[-_]/g, ' ').trim();
               if (bgName.length > 1 && bgName.length <= 40 && !/^[a-f0-9]{8,}$/i.test(bgName)) {
                 iconLabelAttr = bgName;
               }
@@ -1646,10 +1712,109 @@ export class RecordingCaptureService {
     try {
       // Try main frame first (fast path)
       const result = await page.evaluate(`${PROBE_AT_POINT_FN}(${x}, ${y})`) as ProbedElement | null;
-      if (result) return result;
+      // April 2026 deep diagnostic: when probe returns null, capture the raw
+      // elementFromPoint truth + viewport size + whether body is the topmost
+      // hit. Lets us tell apart "click in transparent overlay" from
+      // "click outside viewport" from "Playwright sees a different DOM than
+      // user's regular Chrome". Logged at debug level — zero overhead in prod.
+      if (!result) {
+        try {
+          const diag = await page.evaluate(({ px, py }) => {
+            // @ts-expect-error - browser context
+            const doc = document;
+            // @ts-expect-error - browser context
+            const win = window;
+            const el = doc.elementFromPoint(px, py);
+            const rawTag = el ? (el.tagName || '').toLowerCase() : null;
+            const cs = el ? win.getComputedStyle(el) : null;
+            const bodyTag = doc.body ? doc.body.tagName : null;
+            return {
+              hasEl: !!el,
+              tag: rawTag,
+              cls: el ? (el.getAttribute('class') || '').slice(0, 80) : null,
+              role: el ? el.getAttribute('role') : null,
+              pointerEvents: cs ? cs.pointerEvents : null,
+              opacity: cs ? cs.opacity : null,
+              visibility: cs ? cs.visibility : null,
+              display: cs ? cs.display : null,
+              isBody: rawTag === 'body' || rawTag === 'html',
+              bodyTag,
+              vw: win.innerWidth,
+              vh: win.innerHeight,
+              docReady: doc.readyState,
+              url: win.location.href,
+            };
+          }, { px: x, py: y });
+          logger.info('[RECORDING] probe-null diagnostic', { x, y, ...diag });
+        } catch { /* diagnostic failure is fine */ }
+      }
+      if (result) {
+        // April 2026 regression: when the click lands on an <iframe> element,
+        // the main-frame probe returns the iframe itself (resolvedVia=
+        // 'directHit', tag='iframe'), and `probeInChildFrames` was therefore
+        // never called. Downstream the WS handler rejects directHit results,
+        // so every click on an iframe-hosted dashboard (e.g. hub.atk.pro,
+        // any embedded SPA) ended up as `no_probe_result` — recording state
+        // looked active but no steps were captured.
+        //
+        // Detect that exact shape and descend into the iframe instead. If
+        // the iframe is cross-origin, probeInChildFrames still returns the
+        // crossOriginIframe marker so the user gets a clear warning.
+        if (result.tag === 'iframe' && result.resolvedVia === 'directHit') {
+          const inside = await this.probeInChildFrames(page, x, y);
+          if (inside) return inside;
+        }
+        // April 2026: <webview> is an Electron / Chrome Apps custom element.
+        // It hosts a separate browsing context that isn't part of the DOM
+        // tree and isn't reachable via page.frames() in regular Chromium —
+        // Playwright runs vanilla Chromium, not Electron, so the <webview>
+        // child renderer never loads and its content is invisible to us.
+        // hub.atk.pro and any other Electron-shell SPA hits this — recording
+        // looks broken (no probe target found at any coord inside the
+        // webview rect) when in fact the substrate doesn't support it.
+        // Surface a distinct marker so the WS handler can emit a clear
+        // warning instead of the generic "no element here".
+        if (result.tag === 'webview' && result.resolvedVia === 'directHit') {
+          return { tag: 'webview', unsupportedHost: 'webview', crossOriginIframe: false };
+        }
+        return result;
+      }
 
       // Main frame returned null — check if click landed on an iframe
-      return await this.probeInChildFrames(page, x, y);
+      const inIframe = await this.probeInChildFrames(page, x, y);
+      if (inIframe) return inIframe;
+
+      // April 2026: still null. Look around the point — maybe a <webview> /
+      // <object> / <embed> sits there but Chrome's hit-test ignores it
+      // because the host element isn't backed by a real renderer in plain
+      // Chromium. We CAN find it via getBoundingClientRect intersection.
+      // This turns a silent "nothing here" into an actionable warning
+      // ("this site uses Electron <webview>") even when the host element
+      // is invisible to elementFromPoint.
+      try {
+        const unsupported = await page.evaluate(({ px, py }) => {
+          // @ts-expect-error - browser context
+          const doc = document;
+          const candidates = doc.querySelectorAll('webview, object, embed');
+          for (const node of Array.from(candidates) as any[]) {
+            const r = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+            if (!r) continue;
+            if (px >= r.left && px <= r.right && py >= r.top && py <= r.bottom) {
+              return { tag: (node.tagName || '').toLowerCase() };
+            }
+          }
+          return null;
+        }, { px: x, py: y });
+        if (unsupported && (unsupported.tag === 'webview' || unsupported.tag === 'object' || unsupported.tag === 'embed')) {
+          return {
+            tag: unsupported.tag,
+            unsupportedHost: unsupported.tag as 'webview' | 'object' | 'embed',
+            crossOriginIframe: false,
+          };
+        }
+      } catch { /* best-effort fallback */ }
+
+      return null;
     } catch (error) {
       logger.debug('[RECORDING] Probe at point failed', {
         x, y,
@@ -2085,6 +2250,31 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
       if (lc === elTagLc) continue; // always skip self-referential noise
       if (isFreeText && TAG_LIKE_NOISE.has(lc)) continue;
       return trimmed.slice(0, maxLen);
+    }
+
+    // April 2026: last-resort — extract a stable parent id from the
+    // ancestor chain. Icon-only targets (svg without id/aria-label) often
+    // sit inside a wrapper with a stable id (e.g. <div id="layout-header-user">
+    // > svg.icon). Without this, the recorded description collapses to
+    // 'element' and the resolver can't pick the right target during replay.
+    if (element.ancestorSummary) {
+      // Match #ID tokens, prefer the closest one to the target. Skip
+      // generated ids that the probe didn't already filter (defensive —
+      // probe-side filter is the primary line).
+      const idMatches = element.ancestorSummary.match(/#[a-zA-Z][\w-]*/g);
+      if (idMatches && idMatches.length > 0) {
+        // The chain is rendered target-last, so the LAST #id is the
+        // closest ancestor to the target.
+        for (let i = idMatches.length - 1; i >= 0; i--) {
+          const candidateId = idMatches[i].slice(1);
+          // Reject framework-generated ids the probe missed
+          // (kept conservative — the probe regex is the source of truth).
+          if (/^(?:el-id-|radix-|mui-|headlessui-|:r[0-9a-z]+:?$)/i.test(candidateId)) continue;
+          if (candidateId.length > 1 && candidateId.length <= 60) {
+            return candidateId.slice(0, maxLen);
+          }
+        }
+      }
     }
     return null;
   }

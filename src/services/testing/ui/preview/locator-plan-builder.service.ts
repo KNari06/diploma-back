@@ -103,6 +103,42 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
     });
   }
 
+  // Hash-anchor href for <a href="#..."> intra-page links. ATK Hub's
+  // `<a href="#AboutATKHUB">About ATK HUB</a>`-style anchor menu fell
+  // through to the LLM every replay because the compiled plan only had
+  // `text=` (0.7 conf). LLM sometimes takes 5+ seconds → 7-second step.
+  //
+  // Why scoped to hash anchors only (not all hrefs):
+  //   - External urls (`/login`) get rebranded; matching by absolute path
+  //     breaks when the site reorganises routes.
+  //   - Hash anchors are intra-page only, stable across redesigns by
+  //     definition (the hash IS the section identifier).
+  //
+  // Guards mirror what we apply to ids:
+  //   - Skip when fragment looks generated (`#section-1700123456789`).
+  //   - Require ≥3 chars so we don't anchor to `#` or `#x`.
+  //   - Filter through escapeCssAttrValue for quote / bracket safety.
+  const hrefAttr = (node as any).href;
+  if (typeof hrefAttr === 'string' && hrefAttr.startsWith('#')) {
+    const fragment = hrefAttr.slice(1);
+    const looksGenerated =
+      /^\d{6,}$/.test(fragment)                      // pure long digits
+      || /^[a-f0-9]{8,}-/i.test(fragment)            // UUID-prefix
+      || /^[0-9a-f]{16,}$/i.test(fragment)           // long hex blob
+      || /^section-\d+$/.test(fragment)              // numeric section-N
+      || /^tab-\d{4,}$/.test(fragment);              // numeric tab-NNNN
+    if (fragment.length >= 3 && !looksGenerated) {
+      const safeHref = escapeCssAttrValue(hrefAttr);
+      locators.push({
+        strategy: 'css',
+        value: `a[href="${safeHref}"]`,
+        // Below id (0.78) — anchor menus can have multiple <a href="#top">
+        // duplicates in long pages; waterfall keeps text-locator as backup.
+        confidence: 0.72,
+      });
+    }
+  }
+
   // V22 Pkg1: childTestId — lifts the icon's data-testid up to its parent
   // button/anchor for replay. CSS `:has()` is supported in all modern
   // browsers (Playwright Chromium ≥ 105). Confidence between testId and id

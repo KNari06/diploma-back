@@ -1264,6 +1264,10 @@ export class PreviewRunService {
             description: step.description,
             hasCompiled: !!step.compiled,
             hasEvidence: !!step.evidence?.lastSuccessRef,
+            hasRecordedFingerprint: !!step.recordedFingerprint,
+            recordedId: step.recordedFingerprint?.elementId,
+            recordedTestId: step.recordedFingerprint?.testIdAttr,
+            recordedTag: step.recordedFingerprint?.tag,
           },
         });
 
@@ -1625,6 +1629,14 @@ export class PreviewRunService {
             });
 
             // Trace step_result (pass)
+            // April 2026: include clickEffectSignal so audits can tell
+            // strong-signal passes (url / dialog / aria / dom / detach /
+            // newtab) from weak ones (focus only — likely fake-success
+            // when the page isn't in the recorded state). Also include
+            // chosenRef/chosenLabel/chosenBbox + fingerprintMatch so a
+            // 'pass on the wrong element' is diagnosable from a single
+            // log line — fingerprintMatch:'mismatch' on a passed step
+            // is the canonical fake-success signature.
             traceWriter.write({
               iteration: i,
               stage: 'step_execution',
@@ -1639,6 +1651,12 @@ export class PreviewRunService {
                 url: result.url,
                 attempts: result.attempts,
                 verified: result.verified,
+                ...(result.clickEffectSignal !== undefined ? { clickEffectSignal: result.clickEffectSignal } : {}),
+                ...(result.chosenRef !== undefined ? { chosenRef: result.chosenRef } : {}),
+                ...(result.chosenLabel !== undefined ? { chosenLabel: result.chosenLabel.slice(0, 80) } : {}),
+                ...(result.chosenBoundingBox !== undefined ? { chosenBbox: result.chosenBoundingBox } : {}),
+                ...(result.fingerprintMatch !== undefined ? { fingerprintMatch: result.fingerprintMatch } : {}),
+                ...(result.resolverPath !== undefined ? { resolverPath: result.resolverPath } : {}),
                 retried,
               },
             });
@@ -1913,6 +1931,12 @@ export class PreviewRunService {
                 attempts: result.attempts,
                 retried,
                 pageContext: failPageSummary || undefined,
+                ...(result.clickEffectSignal !== undefined ? { clickEffectSignal: result.clickEffectSignal } : {}),
+                ...(result.chosenRef !== undefined ? { chosenRef: result.chosenRef } : {}),
+                ...(result.chosenLabel !== undefined ? { chosenLabel: result.chosenLabel.slice(0, 80) } : {}),
+                ...(result.chosenBoundingBox !== undefined ? { chosenBbox: result.chosenBoundingBox } : {}),
+                ...(result.fingerprintMatch !== undefined ? { fingerprintMatch: result.fingerprintMatch } : {}),
+                ...(result.resolverPath !== undefined ? { resolverPath: result.resolverPath } : {}),
               },
             });
 

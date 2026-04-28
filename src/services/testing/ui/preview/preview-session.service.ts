@@ -2057,21 +2057,34 @@ export class PreviewSessionService {
     userId: string;
     x: number;
     y: number;
+    /**
+     * When set, populates `rejectReason` on the result instead of just
+     * returning null. Lets the WS handler write a precise reason into the
+     * hover_probe trace ('cross_origin_iframe' vs 'direct_hit' vs
+     * 'no_bounding_box' vs 'no_probe_result') so a stuck recording doesn't
+     * look like 53× identical 'no_interactive_element' rows.
+     */
+    withRejectReason?: boolean;
   }): Promise<{
     tag: string;
     label: string;
     boundingBox: { x: number; y: number; width: number; height: number };
     resolvedVia: string;
+    rejectReason?: undefined;
+  } | {
+    rejectReason: 'no_session' | 'invalid_coords' | 'no_viewport' | 'no_probe_result' | 'cross_origin_iframe' | 'direct_hit_non_interactive' | 'no_bounding_box' | 'error';
   } | null> {
-    const { sessionId, userId, x, y } = params;
+    const { sessionId, userId, x, y, withRejectReason } = params;
     const session = this.getAuthorizedSession(sessionId, userId);
-    if (!session) return null;
+    if (!session) return withRejectReason ? { rejectReason: 'no_session' } : null;
 
     try {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return withRejectReason ? { rejectReason: 'invalid_coords' } : null;
+      }
 
       const viewport = session.page.viewportSize();
-      if (!viewport) return null;
+      if (!viewport) return withRejectReason ? { rejectReason: 'no_viewport' } : null;
 
       const clampedX = Math.max(0, Math.min(x, viewport.width - 1));
       const clampedY = Math.max(0, Math.min(y, viewport.height - 1));
@@ -2091,11 +2104,11 @@ export class PreviewSessionService {
         session.recordingLastHover.probedElement = probed;
       }
 
-      if (!probed) return null;
-      if (probed.crossOriginIframe) return null;
+      if (!probed) return withRejectReason ? { rejectReason: 'no_probe_result' } : null;
+      if (probed.crossOriginIframe) return withRejectReason ? { rejectReason: 'cross_origin_iframe' } : null;
       // directHit = no interactive element found — don't highlight plain divs
-      if (probed.resolvedVia === 'directHit') return null;
-      if (!probed.boundingBox) return null;
+      if (probed.resolvedVia === 'directHit') return withRejectReason ? { rejectReason: 'direct_hit_non_interactive' } : null;
+      if (!probed.boundingBox) return withRejectReason ? { rejectReason: 'no_bounding_box' } : null;
 
       // V22 Pkg5+ Patch C: append to hover chain — distinct hover-targets
       // accumulated between two consecutive clicks. Skips noise via:
@@ -2126,7 +2139,7 @@ export class PreviewSessionService {
         sessionId, x, y,
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
+      return withRejectReason ? { rejectReason: 'error' } : null;
     }
   }
 

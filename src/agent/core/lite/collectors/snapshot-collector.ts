@@ -1020,15 +1020,53 @@ export class SnapshotCollector {
             // cursor:pointer + has text (≤200 chars) + not a large layout container
             if (!hasFrameworkBinding && style.cursor === 'pointer') {
               const totalText = (el.textContent || '').trim();
-              if (totalText.length > 0 && totalText.length < 200) {
-                // Reject large layout containers (nav, main, body, full-width sections)
-                const tag = el.tagName.toLowerCase();
-                const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
-                const rect = el.getBoundingClientRect();
-                const isFullWidth = rect.width > (window.innerWidth * 0.9);
-                if (!isLayoutContainer && !isFullWidth) {
-                  hasFrameworkBinding = true;
-                }
+              const tag = el.tagName.toLowerCase();
+              const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
+              const rect = el.getBoundingClientRect();
+              const isFullWidth = rect.width > (window.innerWidth * 0.9);
+
+              // Icon-only interactive: <svg id="...">, <i id="...">, <img id="...">,
+              // <button><svg/></button>-style wrappers. They have no text but ARE
+              // clickable (recorder's probe captures them via cursor:pointer
+              // walk-up). Without surfacing them here the resolver's identity
+              // fast-path can never match the recorded id, so id-as-description
+              // steps fall through to the LLM and the LLM grabs the loudest
+              // neighbouring CTA — the canonical fake-success path on
+              // hub.atk.pro / Element Plus icon toolbars.
+              //
+              // Symmetric with the recorder: same stable-id filter, same
+              // testId attr list, same exclusion of full-width layout
+              // containers. We additionally accept text-bearing elements
+              // (the original branch) so this only widens the set, never
+              // narrows it.
+              const rawId = el.getAttribute('id') || '';
+              const idLooksGenerated = !!rawId && (
+                /^el-id-/i.test(rawId)
+                || /^radix-/.test(rawId)
+                || /^:r[0-9a-z]+:$/i.test(rawId)
+                || /^mui-/i.test(rawId)
+                || /^headlessui-/i.test(rawId)
+                || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(rawId)
+              );
+              const hasStableId = !!rawId && !idLooksGenerated && rawId.length < 80;
+              const hasTestIdAttr = !!(el.getAttribute('data-testid')
+                || el.getAttribute('data-test-id')
+                || el.getAttribute('data-test')
+                || el.getAttribute('data-cy')
+                || el.getAttribute('data-qa'));
+              const hasText = totalText.length > 0 && totalText.length < 200;
+              const isIconish = tag === 'svg' || tag === 'i' || tag === 'img' || tag === 'path';
+              // Min-size gate: 5×5 enough to filter out invisible 0-size cursor-pointer
+              // wrappers, but small enough to keep typical 16-32px icons.
+              const hasSize = rect.width >= 5 && rect.height >= 5;
+
+              if (!isLayoutContainer && !isFullWidth && hasSize && (
+                hasText
+                || hasStableId
+                || hasTestIdAttr
+                || isIconish
+              )) {
+                hasFrameworkBinding = true;
               }
             }
 
@@ -1622,6 +1660,36 @@ export class SnapshotCollector {
             const titleAttr = el.getAttribute('title') || undefined;
             const labelText = getLabelText(el);
 
+            // Identity fast-path requires the live DOM id / testId / name on
+            // every InteractiveNode so the resolver can match against the
+            // recorder's TargetFingerprint without an LLM call. Without this,
+            // a step like click '<svg id="layout-header-setting">' falls
+            // through to the LLM, which has no idea what the slug means and
+            // grabs the loudest neighbouring CTA — the canonical
+            // fake-success path. We mirror the same framework-id filter the
+            // recorder uses so generated ids (Element Plus el-id-XXXX,
+            // Radix radix-:rXX:, useId :r1:) don't poison the fast-path.
+            const liveRawId = el.getAttribute('id') || '';
+            const liveLooksGenerated = !!liveRawId && (
+              /^el-id-/i.test(liveRawId) ||
+              /^radix-/.test(liveRawId) ||
+              /^:r[0-9a-z]+:$/i.test(liveRawId) ||
+              /^mui-/i.test(liveRawId) ||
+              /^headlessui-/i.test(liveRawId) ||
+              /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(liveRawId)
+            );
+            const liveStableId = (liveRawId && !liveLooksGenerated && liveRawId.length < 80)
+              ? liveRawId
+              : undefined;
+            const liveTestId = el.getAttribute('data-testid')
+              || el.getAttribute('data-test-id')
+              || el.getAttribute('data-test')
+              || el.getAttribute('data-cy')
+              || el.getAttribute('data-qa')
+              || el.getAttribute('data-test-element')
+              || el.getAttribute('data-track')
+              || undefined;
+
             // Detect icon-only buttons/links: element has child SVG/img but no visible text.
             // Covers: <button>, <a>, any element with role="button", and clickable
             // div/span wrappers common in React/Vue/Angular component libraries.
@@ -1763,6 +1831,12 @@ export class SnapshotCollector {
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
                 getReadableElementText(el).slice(0, 50) || '',
+              // Identity fields — populated for the resolver's identity
+              // fast-path. Read from the live DOM, NOT computed from labels,
+              // so they line up byte-for-byte with TargetFingerprint values
+              // captured at recording time.
+              id: liveStableId,
+              testIdAttr: liveTestId,
               tag: el.tagName.toLowerCase(),
               type: isInput ? input.type : undefined,
               // SECURITY: Never include raw input values in snapshots.

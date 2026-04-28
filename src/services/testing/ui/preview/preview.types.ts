@@ -934,6 +934,21 @@ export interface LintResult {
   message: string;
   /** Overall confidence (0-1) */
   confidence: number;
+  /**
+   * Which path actually selected the chosen candidate. Surfaced into
+   * preview_run trace so a fake-success / wrong-element pass can be
+   * traced to the exact step in the resolver pipeline that picked it.
+   *   identity_id     — recordedFingerprint.elementId match (uniqueness gate passed)
+   *   identity_testid — recordedFingerprint.testIdAttr match
+   *   identity_name   — recordedFingerprint.name match
+   *   evidence_shortcut — TTL/URL-valid lastSuccessRef hit
+   *   compiled        — compiled plan locator hit
+   *   llm             — LLM picked from candidates
+   *   vision          — gemini-flash vision rescue picked it
+   *   rule_fallback   — degraded mode, rule-based score
+   *   user_confirmed  — user picked from clarification UI
+   */
+  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_name' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
   /** Candidate elements (for ambiguous cases) */
   candidates: LintCandidate[];
   /** Elements to highlight on UI */

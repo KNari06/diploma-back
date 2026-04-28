@@ -1299,7 +1299,9 @@ RULES:
 5. If multiple elements could match, pick the one whose label/text is semantically closest.
 6. Only use refs from the provided list — never invent refs.
 7. If no element is a confident match, return ref as null. NEVER return the first candidate as a default guess.
-8. Respond ONLY with valid JSON, no markdown or extra text.
+8. ADJACENCY ≠ SAME FUNCTION. Two controls sitting next to each other in a header / toolbar / row are SEPARATE elements with SEPARATE behaviour. A settings cog and a neighbouring "Click me!" banner are not interchangeable just because they share a row. Spatial / visual prominence is a TIE-BREAKER between candidates whose semantics already match the intent — never a reason to OVERRIDE semantics.
+9. NO "FALLBACK TO LOUDEST CTA". When no candidate semantically matches the intent, the correct answer is ref=null. Picking the most action-y looking element ("Submit", "Get started", "Click me!", "Try it") because something must be clicked is the #1 source of fake-success. Refuse the guess; return null.
+10. Respond ONLY with valid JSON, no markdown or extra text.
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
@@ -1636,7 +1638,48 @@ semantically describes any element.
 
 ${LLM_SHARED_RULES}
 
-16. REJECT GIBBERISH / IRRELEVANT TEXT (Apply-mode safety):
+16. ID-AS-DESCRIPTION (CRITICAL — fake-success prevention):
+    When the INTENT is wrapped in apostrophes and looks like a slug —
+    'layout-header-setting', 'btn-submit-form', 'nav_user_menu',
+    kebab-case / snake_case strings with no spaces or with internal
+    dashes/underscores — it is the recorded element's HTML id, NOT a
+    label users would see on screen. The recorder writes the id as the
+    description ONLY when the target had no visible text (icon-only
+    button, <svg>, etc).
+
+    For id-like intents:
+    - The ONLY correct match is a candidate whose own id, testId, name
+      or data-* attribute carries that exact value.
+    - If RECORDED IDENTITY supplies id/testId and a candidate matches —
+      pick it, confidence 0.95+ (this case should normally be caught by
+      the deterministic identity fast-path; you only see it if that
+      path missed for a fingerprint reason).
+    - If NO candidate has that id/testId/name → return ref=null with
+      confidence 0. NEVER pick the nearest visually-prominent button
+      ("Click me!", "Get started", "Learn more") just because the user
+      has to click something. A wrong click that opens an unrelated
+      page is far worse than a not_found that the user can refine.
+
+17. ADJACENCY ≠ SAME FUNCTION:
+    Two elements next to each other in a header / toolbar / row are
+    SEPARATE controls with SEPARATE functions. A settings cog and a
+    "Mouse sleeps abnormally, click me!" banner sitting in the same
+    header strip are not interchangeable — clicking the cog opens
+    settings, clicking the banner opens a help article. Spatial
+    proximity is a TIE-BREAKER between candidates whose semantics
+    already match the intent, never a reason to OVERRIDE semantics.
+
+18. NO "FALLBACK TO LOUDEST CTA":
+    When no candidate semantically matches the intent, the correct
+    answer is ref=null. Picking the most action-y looking element
+    ("Submit", "Get started", "Click me!", "Try it") because something
+    must be clicked is the #1 source of fake-success in this system.
+    Verifier will see the click had effect (URL changed, popup opened)
+    and mark the step pass — but the test is now driving a completely
+    different flow than what was recorded. Refuse the guess; return
+    null.
+
+19. REJECT GIBBERISH / IRRELEVANT TEXT (Apply-mode safety):
     Return ref=null when the intent is:
     - Random/gibberish: "asdfgh", "ываыва", "xyzabc"
     - Copied content / random sentences (not element descriptions)
@@ -1653,6 +1696,21 @@ CANDIDATES:
   2. ref="e11" <li> Kyrgyzstan [role: option] value: kg
 RECORDED HINTS: dataValue="kz"
 EXPECTED: {"ref":"e10","confidence":0.95,"reason":"dataValue=kz exact match; UI text localized but key stable"}
+
+— TIER 1 id match where INTENT is the id itself (icon-only target, high confidence 0.97) —
+The recorder uses the DOM id as the step description when the target is an
+icon/svg with no visible text — e.g. <svg id="layout-header-setting">. The
+INTENT will look like a slug ('layout-header-setting'). Do NOT treat it as
+free text and do NOT pick something just because its label contains a
+similar word. If RECORDED IDENTITY supplies an id="..." and one candidate
+carries that exact id, that candidate IS the target.
+INTENT: "'layout-header-setting'"
+CANDIDATES:
+  1. ref="e3" <button> "Learn more" [role: button]
+  2. ref="e7" <svg> id="layout-header-setting" [role: button]
+  3. ref="e9" <span> "Settings" [role: link]
+RECORDED IDENTITY: id="layout-header-setting"
+EXPECTED: {"ref":"e7","confidence":0.97,"reason":"recorded id=layout-header-setting matches the live svg exactly; intent text is the id itself, not a label"}
 
 — TIER 1 childTestId for icon-only button (high confidence 0.92) —
 INTENT: "show password"
@@ -1757,6 +1815,29 @@ E. POSITIONAL DRIFT IS NORMAL.
    recordedAt=(x,y,w,h) may be off by 200+ pixels after a redesign. Use
    it only as a tie-breaker among same-identity candidates, not as a
    filter.
+
+F. ADJACENCY ≠ SAME FUNCTION (fake-success prevention).
+   Two controls sitting next to each other in a header / toolbar / row
+   are SEPARATE elements with SEPARATE behaviour. A settings cog and a
+   neighbouring "Click me!" banner are not interchangeable just because
+   they share a row. When the recorded fingerprint clearly points at
+   one (id, testId, childTestId, icon name) but no live candidate
+   carries that identity, do NOT substitute the loudest visible CTA
+   ("Click me!", "Get started", "Submit", "Try it") in the same area —
+   that's the canonical fake-success path. Spatial / visual prominence
+   is a TIE-BREAKER between identity-matched candidates, never a
+   reason to override identity. If no live candidate matches the
+   recorded identity AND no candidate matches by text/role/icon, return
+   ref=null with confidence 0 — the regression has truly broken and
+   the user needs to know.
+
+G. ID-AS-INTENT (recorder's icon-only fallback).
+   When the INTENT looks like a slug ('layout-header-setting',
+   'btn-submit-form'), the recorder used the DOM id as the description
+   because the target had no visible text. The ONLY correct match is a
+   candidate carrying that exact id / testId / name / data-* value.
+   Picking a nearby element whose label happens to share a word with
+   the slug is the same fake-success class as F.
 
 ${LLM_SHARED_RULES}
 
@@ -2101,9 +2182,31 @@ async function selectElementWithLLM(params: {
       if (stateBits.length > 0) fpHintLines.push(`stateAtRecord=[${stateBits.join(',')}]`);
     }
   }
-  const fpHint = fpHintLines.length > 0
-    ? `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${fpHintLines.join('\n')}`
-    : '';
+  // April 2026: split fingerprint hints into "must-match" identity and
+  // "soft" descriptive lines. Identity attributes (id, testId, name) are
+  // STRONG evidence: when present, the corresponding live element on the
+  // page IS the recorded target. Treating them as soft hints (the old
+  // "use as a guide" wording) made the model freely ignore them and pick
+  // candidates by text similarity instead — for id-as-description steps
+  // (e.g. INTENT="'layout-header-setting'" on an icon-only svg) the LLM
+  // had no visible text "layout-header-setting" anywhere and substituted
+  // an unrelated word match (a "Learn more" / `了解更多` ad button), which
+  // verifier then accepted because the click opened a new tab.
+  const identityHintKeys = new Set(['id', 'testId', 'name']);
+  const identityHintLines = fpHintLines.filter((l) => identityHintKeys.has(l.split('=')[0]));
+  const softHintLines = fpHintLines.filter((l) => !identityHintKeys.has(l.split('=')[0]));
+  const fpHintParts: string[] = [];
+  if (identityHintLines.length > 0) {
+    fpHintParts.push(
+      `\nRECORDED IDENTITY (MUST MATCH — these are stable HTML attributes on the recorded element; if a live candidate has the same id / testId / name value, it IS the target — pick it even if its visible text differs from the intent, even if the intent looks like an id-as-text string):\n${identityHintLines.join('\n')}`
+    );
+  }
+  if (softHintLines.length > 0) {
+    fpHintParts.push(
+      `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${softHintLines.join('\n')}`
+    );
+  }
+  const fpHint = fpHintParts.join('');
 
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
@@ -2508,6 +2611,155 @@ export async function resolveElement(params: {
     totalAllowed: allowedCount,
   });
 
+  // Step 2.5 (April 2026): identity-by-id fast-path. When the recorder
+  // captured a stable DOM id or test-id and that exact id still exists on
+  // the page, return immediately — no LLM call needed. Without this, an
+  // id-as-description step ('layout-header-setting' on an icon-only svg)
+  // forces the LLM to interpret the id as free text. The model sees no
+  // visible "layout-header-setting" string anywhere, picks the closest
+  // word match (e.g. an unrelated 'Learn more' / `了解更多` ad button) and
+  // verifier records `pass` because the click opened a new tab. Result:
+  // hard fake-success that audit fields (fingerprintMatch=mismatch) catch
+  // post-hoc but the resolver itself missed.
+  //
+  // Both `recordedFingerprint` (canonical) and `compiled?.targetFingerprint`
+  // (legacy fallback) are checked. We require the live element to be in
+  // the allowed set so disabled / off-screen / aria-hidden matches still
+  // get filtered out.
+  const identityFp = stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint;
+  if (identityFp && allAllowed.length > 0) {
+    // Diagnostic: log id/testId distribution among live allAllowed candidates
+    // so a "fast-path didn't fire even though recordedId exists" run can be
+    // diagnosed from the log alone (vs guessing whether snapshot-collector
+    // populates id at all). Includes the recorded identity values for
+    // direct comparison.
+    try {
+      const liveIds = allAllowed.map((n) => n.id).filter(Boolean) as string[];
+      const liveTestIds = allAllowed.map((n) => n.testIdAttr).filter(Boolean) as string[];
+      logger.info('[ELEMENT_RESOLVER] identity fast-path diag', {
+        previewSessionId,
+        stepType: stepDraft.type,
+        recordedId: identityFp.elementId,
+        recordedTestId: identityFp.testIdAttr,
+        recordedTag: identityFp.tag,
+        allAllowedCount: allAllowed.length,
+        liveIdsSample: liveIds.slice(0, 8),
+        liveIdsCount: liveIds.length,
+        liveTestIdsSample: liveTestIds.slice(0, 8),
+        liveTestIdsCount: liveTestIds.length,
+        idMatch: identityFp.elementId ? liveIds.includes(identityFp.elementId) : null,
+      });
+    } catch { /* non-fatal */ }
+    // Identity-by-attribute fast-path. For each attribute the recorder
+    // captured (id / testId / name / href / aria-controls), look for ONE
+    // and only ONE live candidate carrying the same value. Non-unique
+    // matches fall through to the LLM so it can disambiguate by context
+    // (e.g. two <input name="password"> forms — login vs reset).
+    //
+    // Layout: each entry is a (attr, recordedValue, nodeValue) triple
+    // sourced from the existing TargetFingerprint / InteractiveNode types.
+    // Reading by accessor function keeps the loop body type-safe and free
+    // of `as any` while making the attribute list trivial to extend — add
+    // one row, no other code touched.
+    // Only attributes that BOTH the recorder (TargetFingerprint) AND the
+    // live DOM probe (InteractiveNode) carry can power a fast-path. id /
+    // testId / name satisfy that. `href` and `ariaControls` exist on the
+    // recorded fingerprint but the live snapshot collector doesn't surface
+    // them on InteractiveNode yet — adding them here would be a hardcoded
+    // assumption that breaks at runtime. When the snapshot collector is
+    // extended to emit these fields we can append a row here, no other
+    // code touched.
+    const identityChecks: Array<{
+      attr: string;
+      want: string | undefined;
+      readNode: (n: InteractiveNode) => string | undefined;
+    }> = [
+      { attr: 'id',     want: identityFp.elementId,  readNode: (n) => n.id },
+      { attr: 'testId', want: identityFp.testIdAttr, readNode: (n) => n.testIdAttr },
+      // NOTE: `n.name` in InteractiveNode is the *computed label* string
+      // (ariaLabel || title || placeholder || text), not the live HTML
+      // `name` attribute. Comparing it to `recordedFingerprint.name`
+      // (which IS the HTML name attribute) is a category error and would
+      // never match. The snapshot-collector doesn't expose the raw HTML
+      // name attribute today, so we skip this row until it does. Adding
+      // it back is a one-line change in snapshot-collector — see comment
+      // there about identity fields.
+    ];
+
+    const wantTagLc = identityFp.tag?.toLowerCase();
+
+    for (const check of identityChecks) {
+      if (!check.want) continue;
+      const wantValue = check.want;
+
+      // Step A: collect all candidates whose value matches.
+      const valueMatches = allAllowed.filter((n) => check.readNode(n) === wantValue);
+
+      // Step B: apply uniqueness gate. Three outcomes:
+      //   1 match  → fast-path: clear single target.
+      //   0 match  → try next attribute.
+      //   ≥2 match → try narrowing by recorded tag. If exactly one of the
+      //              value-matches also shares the recorded tag, that
+      //              candidate is the disambiguated target. Otherwise let
+      //              the LLM decide by surrounding context — context is
+      //              exactly what fast-paths cannot reproduce.
+      let chosen: InteractiveNode | null = null;
+      let mode: 'value' | 'value+tag' | null = null;
+      if (valueMatches.length === 1) {
+        chosen = valueMatches[0];
+        mode = 'value';
+      } else if (valueMatches.length > 1 && wantTagLc) {
+        const tagMatches = valueMatches.filter((n) => (n.tag || '').toLowerCase() === wantTagLc);
+        if (tagMatches.length === 1) {
+          chosen = tagMatches[0];
+          mode = 'value+tag';
+        }
+      }
+
+      if (chosen) {
+        logger.info('[ELEMENT_RESOLVER] identity fast-path hit', {
+          previewSessionId,
+          stepType: stepDraft.type,
+          matchedBy: check.attr,
+          mode,
+          ref: chosen.ref,
+          tag: chosen.tag,
+        });
+        const lintCandidate: LintCandidate = {
+          ref: chosen.ref,
+          label: chosen.labelText || chosen.ariaLabel || chosen.text || chosen.placeholder || `<${chosen.tag}>`,
+          reason: `identity match (${check.attr}${mode === 'value+tag' ? '+tag' : ''})`,
+          confidence: 1.0,
+          boundingBox: chosen.boundingBox,
+          node: chosen,
+        };
+        const resolverPath: LintResult['resolverPath'] =
+          check.attr === 'id' ? 'identity_id' :
+          check.attr === 'testId' ? 'identity_testid' : 'identity_name';
+        return {
+          status: 'resolved',
+          message: `Element resolved by recorded ${check.attr}`,
+          confidence: 1.0,
+          candidates: [lintCandidate],
+          highlight: [{ ref: chosen.ref, boundingBox: chosen.boundingBox, type: 'success' }],
+          cacheHit: false,
+          resolverPath,
+          ..._diag,
+        };
+      }
+      if (valueMatches.length > 1) {
+        logger.info('[ELEMENT_RESOLVER] identity fast-path skipped — ambiguous', {
+          previewSessionId,
+          stepType: stepDraft.type,
+          attr: check.attr,
+          matchCount: valueMatches.length,
+        });
+        // Don't break — a different attribute (later in the list) may
+        // still resolve uniquely on this same page.
+      }
+    }
+  }
+
   // Step 3: Handle case of 0 allowed elements
   // V5: Before giving up, try Gemini Flash rescue on excluded-but-visible nodes
   if (allowedCount === 0) {
@@ -2556,6 +2808,7 @@ export async function resolveElement(params: {
           highlight: [{ ref: rescuedNode.ref, boundingBox: rescuedNode.boundingBox, type: 'success' }],
           cacheHit: false,
           degradedMode: false,
+          resolverPath: 'vision',
           ..._diag,
         };
       }
@@ -2642,6 +2895,7 @@ export async function resolveElement(params: {
               highlight: [{ ref: bestNode.ref, boundingBox: bestNode.boundingBox, type: status === 'resolved' ? 'success' : 'warning' }],
               cacheHit: false,
               degradedMode: false,
+              resolverPath: 'vision',
               ...(status === 'needs_clarification' ? { alternativesIncluded: true } : {}),
               ..._diag,
             };
@@ -2691,6 +2945,7 @@ export async function resolveElement(params: {
       highlight: [],
       needsAiFallback: true,
       degradedMode: false,
+      resolverPath: 'rule_fallback',
       // V8: Signal to frontend to show suggestions as "Did you mean?" list
       ...(suggestions.length > 0 ? { alternativesIncluded: true } : {}),
       ..._diag,
@@ -2800,6 +3055,7 @@ export async function resolveElement(params: {
             }],
             cacheHit: false,
             degradedMode: false,
+            resolverPath: 'vision',
             ..._diag,
           };
         }
@@ -2848,6 +3104,7 @@ export async function resolveElement(params: {
             highlight: [{ ref: best.ref, boundingBox: best.boundingBox, type: confidence >= 0.5 ? 'success' : 'warning' }],
             cacheHit: false,
             degradedMode: false,
+            resolverPath: 'vision',
             ..._diag,
           };
         }
@@ -2877,6 +3134,7 @@ export async function resolveElement(params: {
           : [],
         cacheHit: false,
         degradedMode: false,
+        resolverPath: 'vision',
         ...(altCandidates.length > 0 ? { alternativesIncluded: true } : {}),
         ..._diag,
       };
@@ -2988,6 +3246,7 @@ export async function resolveElement(params: {
             }],
             cacheHit,
             degradedMode: false,
+            resolverPath: 'llm',
             ..._diag,
             _llmTrace: llmTrace,
           };
@@ -3037,6 +3296,7 @@ export async function resolveElement(params: {
             highlight,
             cacheHit,
             degradedMode: false,
+            resolverPath: 'llm',
             ..._diag,
             _llmTrace: llmTrace,
           };
@@ -3113,6 +3373,7 @@ export async function resolveElement(params: {
                   }],
                   cacheHit: false,
                   degradedMode: false,
+                  resolverPath: 'vision',
                   ..._diag,
                 };
               }
@@ -3184,6 +3445,7 @@ export async function resolveElement(params: {
                 highlight: [{ ref: selectedNode.node.ref, boundingBox: selectedNode.node.boundingBox, type: 'success' }],
                 cacheHit: false,
                 degradedMode: false,
+                resolverPath: 'llm',
                 ..._diag,
                 _llmTrace: overflowResult._prompt ? {
                   model: overflowResult._model || 'unknown',
