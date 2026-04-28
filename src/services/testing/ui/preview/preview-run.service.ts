@@ -497,6 +497,13 @@ export class PreviewRunService {
       startUrl?: string;
       /** Optional per-run authReset override (see `runStepsOnPreview` docs). */
       authReset?: 'always' | 'never';
+      /**
+       * "Apply New Only" — start at this step index instead of 0. The
+       * preview is left where it currently is (no goto, no auth wipe).
+       * Steps 0..startFromIndex-1 are persisted to DB but not executed.
+       * Validated upstream (handler) to be a positive finite integer.
+       */
+      startFromIndex?: number;
     },
   ): Promise<PreviewRunSummary> {
     // ─── Early guards (fail-fast before any DB work) ───────────────────
@@ -566,6 +573,27 @@ export class PreviewRunService {
       throw new Error('Test case has no startUrl or url');
     }
 
+    // "Apply New Only": clamp index to valid range and force authReset
+    // off. The whole point of this mode is to run against the live
+    // preview state — wiping cookies would defeat it. Invalid indices
+    // (>= step count) collapse to undefined so the run still works as
+    // a normal Apply All instead of failing silently.
+    let effectiveStartFromIndex: number | undefined;
+    let effectiveAuthReset = options?.authReset;
+    if (typeof options?.startFromIndex === 'number'
+        && options.startFromIndex > 0
+        && options.startFromIndex < savedSteps.length) {
+      effectiveStartFromIndex = options.startFromIndex;
+      effectiveAuthReset = 'never';
+      logger.info('[PreviewRun] Apply New Only mode', {
+        previewSessionId,
+        intentTestCaseId,
+        startFromIndex: effectiveStartFromIndex,
+        totalSteps: savedSteps.length,
+        stepsToExecute: savedSteps.length - effectiveStartFromIndex,
+      });
+    }
+
     // ─── Delegate to core execution loop with persistence enabled ────────
     return PreviewRunService.runStepsOnPreview(
       previewSessionId,
@@ -576,7 +604,8 @@ export class PreviewRunService {
         intentTestCaseId,
         persistAppliedSteps: true,
         _skipOwnershipCheck: true, // Already verified above
-        authReset: options?.authReset,
+        authReset: effectiveAuthReset,
+        startFromIndex: effectiveStartFromIndex,
       },
     );
   }
@@ -632,11 +661,25 @@ export class PreviewRunService {
       authReset?: 'always' | 'never';
       /** @internal Skip ownership check when caller (runSavedSteps) already verified */
       _skipOwnershipCheck?: boolean;
+      /**
+       * "Apply New Only" — skip steps before this index (don't execute,
+       * don't goto, don't auth-reset). Caller must enforce authReset='never'
+       * when this is set; we don't double-check here.
+       */
+      startFromIndex?: number;
     },
   ): Promise<PreviewRunSummary> {
     const intentTestCaseId = options?.intentTestCaseId;
     const persistAppliedSteps = options?.persistAppliedSteps ?? false;
     const authReset: 'always' | 'never' = options?.authReset ?? 'never';
+    // Validated by callers. Default 0 = run from start (full Apply All).
+    const startFromIndex: number =
+      typeof options?.startFromIndex === 'number'
+      && options.startFromIndex > 0
+      && options.startFromIndex < steps.length
+        ? options.startFromIndex
+        : 0;
+    const skipNavigationAndAuthReset = startFromIndex > 0;
 
     // 1. Check if already running
     if (activeRuns.has(previewSessionId)) {
@@ -780,9 +823,16 @@ export class PreviewRunService {
       });
 
       // 5. Emit started event
+      // Apply New Only: report only the count of steps actually being
+      // executed so the progress bar reads "1/20" instead of "16/35"
+      // (the prior 15 are skipped on the wire — the user explicitly
+      // chose this mode to avoid re-running them).
+      const visibleTotalSteps = startFromIndex > 0
+        ? Math.max(0, steps.length - startFromIndex)
+        : steps.length;
       webSocketService.emitToUser(userId, 'preview:run:started', {
         previewSessionId,
-        totalSteps: steps.length,
+        totalSteps: visibleTotalSteps,
         startUrl,
         ephemeral: !persistAppliedSteps, // true for draft runs (from chat), false for saved test runs
         timestamp: new Date().toISOString(),
@@ -832,20 +882,48 @@ export class PreviewRunService {
       const currentUrl = session.page.url();
       const needsReload = normalizeUrlForComparison(currentUrl) === normalizeUrlForComparison(startUrl);
 
+      // "Apply New Only" — skip the whole goto+auth-reset+readiness block.
+      // The whole point is that the live preview is ALREADY in the state we
+      // want to test (right where the user just finished recording). A
+      // wipe-then-goto here would defeat the mode entirely. The user must
+      // have triggered this from the new "Apply New Only" dropdown, which
+      // pre-checks current preview URL against the recorded URL of the
+      // first-to-execute step — so we trust the input here.
+      if (skipNavigationAndAuthReset) {
+        logger.info('[PreviewRun] Apply New Only — skipping goto + auth-reset', {
+          previewSessionId,
+          startFromIndex,
+          currentUrl,
+        });
+      }
+
       logger.info('[PreviewRun] Navigating to startUrl', {
         previewSessionId,
         startUrl,
         needsReload,
+        skipNavigation: skipNavigationAndAuthReset,
       });
 
       // Test-run pre-navigation is user-intent. Tell the external-nav trap
       // to accept the new landing origin as the fresh baseline so a
       // test that starts from a cross-origin URL isn't reverted on load.
-      try {
-        const { markIntentionalGoto } = await import('./external-nav-trap');
-        markIntentionalGoto(previewSessionId, startUrl);
-      } catch { /* non-fatal */ }
+      // (Skipped in Apply New Only — preview already where the user
+      // wants it, no navigation happening from us.)
+      if (!skipNavigationAndAuthReset) {
+        try {
+          const { markIntentionalGoto } = await import('./external-nav-trap');
+          markIntentionalGoto(previewSessionId, startUrl);
+        } catch { /* non-fatal */ }
+      }
 
+      // Apply New Only branch: skip the whole "auth reset → goto → wait
+      // for interactive → URL mismatch detect" block. The preview is
+      // already where the user wants it (where they finished recording),
+      // and we already declined to register markIntentionalGoto above.
+      // We do NOT throw if anything looks weird — the per-step URL
+      // mismatch check will surface a yellow badge if step N+1 finds
+      // itself on the wrong page, which is the right granularity here.
+      if (!skipNavigationAndAuthReset) {
       // Auth reset (Phase 0).
       //
       // Rationale: without this, a prior run that logged the user in leaves cookies +
@@ -1145,6 +1223,7 @@ export class PreviewRunService {
         });
         throw new Error(`Failed to navigate to startUrl: ${navError instanceof Error ? navError.message : String(navError)}`);
       }
+      } // end of `if (!skipNavigationAndAuthReset)` — Apply New Only branches around the goto/auth block
 
       // Allow other events (cancel/isRunning) to observe activeRuns state.
       await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1188,13 +1267,23 @@ export class PreviewRunService {
       // On second+ runs these are already in the DB from batchUpdateStepsFromRun().
       // The injection is idempotent — it skips if the next step is already wait_for.
       // Uses evidence.pageUrl (captured during recording) as fallback when compiled plans are missing.
-      const stepsToExecute = injectAutoWaitForSteps(steps);
-      if (stepsToExecute.length !== steps.length) {
+      //
+      // Apply New Only: slice off the already-applied prefix BEFORE the
+      // auto-wait injection. We intentionally do this on `steps` (original
+      // array) rather than after injection — wait_for is only useful as a
+      // pre-step warm-up before the actual interaction. The user's first
+      // un-applied step IS the first interaction we're running, so prefacing
+      // it with a wait_for derived from earlier steps would just block on
+      // state we already trust (the live preview is exactly where the user
+      // recorded from).
+      const stepsAfterSlice = startFromIndex > 0 ? steps.slice(startFromIndex) : steps;
+      const stepsToExecute = injectAutoWaitForSteps(stepsAfterSlice);
+      if (stepsToExecute.length !== stepsAfterSlice.length) {
         logger.info('[PreviewRun] Pre-injected auto-wait steps for first-run stability', {
           previewSessionId,
-          originalSteps: steps.length,
+          originalSteps: stepsAfterSlice.length,
           withAutoWaits: stepsToExecute.length,
-          injectedCount: stepsToExecute.length - steps.length,
+          injectedCount: stepsToExecute.length - stepsAfterSlice.length,
         });
       }
 
@@ -1212,6 +1301,19 @@ export class PreviewRunService {
 
       // ─── Step execution loop ───────────────────────────────────────────
       for (let i = 0; i < stepsToExecute.length; i++) {
+        // Apply New Only: when steps are sliced (startFromIndex > 0), `i`
+        // is the slice-local index (0..N-1) but downstream consumers
+        // (frontend step rows keyed by stepIndex, telemetry, run summary)
+        // expect the ORIGINAL index from the editor (e.g. 16..35). Use
+        // this whenever we emit stepIndex outside the loop body — i alone
+        // would lie about which step in the editor's list is currently
+        // executing. injectAutoWaitForSteps may also have inserted
+        // synthetic wait_for steps which don't have a recorded position;
+        // for those we still report the ORIGINAL position of the next
+        // real step the wait is preceding (i.e. just clamp to the slice's
+        // start offset — UI keys steps by id anyway, the index is for
+        // ordering / progress display).
+        const originalStepIndex = startFromIndex + i;
         // Check cancellation
         const currentRunState = activeRuns.get(previewSessionId);
         if (!currentRunState || runState.cancelled || currentRunState.cancelled) {
@@ -1243,7 +1345,7 @@ export class PreviewRunService {
 
         logger.info('[PreviewRun] Executing step', {
           previewSessionId,
-          stepIndex: i,
+          stepIndex: originalStepIndex,
           stepId: step.id,
           stepType: step.type,
           description: step.description?.slice(0, 80),
@@ -1258,7 +1360,7 @@ export class PreviewRunService {
           spanId: stepSpanId,
           parentSpanId: rootSpanId,
           payload: {
-            stepIndex: i,
+            stepIndex: originalStepIndex,
             stepId: step.id,
             stepType: step.type,
             description: step.description,
@@ -1270,6 +1372,83 @@ export class PreviewRunService {
             recordedTag: step.recordedFingerprint?.tag,
           },
         });
+
+        // Per-step URL mismatch detection.
+        // Catches the "user clicked around the preview between Apply All and
+        // recording the next batch" case. If step 16 was recorded on /admin/x
+        // but the test currently sits on / (because authReset cleared session
+        // and steps 1-15 ended elsewhere), the click is doomed before it
+        // starts — but the failure looks like a generic "element not found"
+        // and the user has no way to know why.
+        //
+        // We compare normalized URLs (origin + pathname, ignoring query/hash
+        // to allow benign navigation like ?tab=2 or #section). Only emitted
+        // when the step has a recorded URL — manual steps without recording
+        // history are skipped (nothing to compare against).
+        //
+        // i=0 is normally skipped because the run-wide `urlMismatchInfo`
+        // already covers the initial-landing case. But in Apply New Only
+        // mode we never run the goto/auth-reset block, so urlMismatchInfo
+        // is always null and the first step IS the user's first new step
+        // — exactly the one most at risk. So we DO check i=0 in that mode.
+        let perStepUrlMismatch: { recorded: string; actual: string } | null = null;
+        if (i > 0 || skipNavigationAndAuthReset) {
+          try {
+            const recordedUrl =
+              (step.compiled?.context?.pageUrl && typeof step.compiled.context.pageUrl === 'string'
+                ? step.compiled.context.pageUrl
+                : undefined)
+              || (typeof step.evidence?.pageUrl === 'string' ? step.evidence.pageUrl : undefined);
+            if (recordedUrl) {
+              const actualUrl = session.page.url();
+              const normRecorded = normalizeUrlForComparison(recordedUrl);
+              const normActual = normalizeUrlForComparison(actualUrl);
+              if (normRecorded && normActual && normRecorded !== normActual) {
+                perStepUrlMismatch = { recorded: recordedUrl, actual: actualUrl };
+                logger.warn('[PreviewRun] Per-step URL mismatch detected', {
+                  previewSessionId,
+                  stepIndex: originalStepIndex,
+                  stepId: step.id,
+                  recordedUrl,
+                  actualUrl,
+                });
+                // Trace event so post-hoc analysis can correlate with fail
+                // type. Non-fatal — we still execute the step so that legit
+                // redirects (login flow, OAuth) don't get false-flagged.
+                traceWriter.write({
+                  iteration: i,
+                  stage: 'step_execution',
+                  eventType: 'url_mismatch',
+                  spanId: traceWriter.generateSpanId(),
+                  parentSpanId: stepSpanId,
+                  payload: {
+                    stepIndex: originalStepIndex,
+                    stepId: step.id,
+                    recordedUrl,
+                    actualUrl,
+                  },
+                });
+                // WS event for the frontend yellow badge. Frontend renders
+                // a non-blocking hint on this step row; user can re-record
+                // the step or click Reset to recreate the recorded context.
+                webSocketService.emitToUser(userId, 'preview:run:url-mismatch', {
+                  previewSessionId,
+                  stepIndex: originalStepIndex,
+                  stepId: step.id,
+                  recordedUrl,
+                  actualUrl,
+                });
+              }
+            }
+          } catch (e) {
+            // Best-effort — never let URL diagnostic crash the run.
+            logger.debug('[PreviewRun] Per-step URL mismatch check failed', {
+              previewSessionId,
+              stepIndex: originalStepIndex,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
 
         // Editor trace: step_meta — what THIS step is supposed to do. Without
         // this, replaying a trace turns into "what was step `f293...` again?".
@@ -1410,7 +1589,7 @@ export class PreviewRunService {
         // Emit step running
         webSocketService.emitToUser(userId, 'preview:run:step', {
           previewSessionId,
-          stepIndex: i,
+          stepIndex: originalStepIndex,
           stepId: step.id,
           status: 'running',
           action: step.type,
@@ -1436,7 +1615,7 @@ export class PreviewRunService {
           // Current step already received 'running' — emit it as cancelled, then skip the rest
           webSocketService.emitToUser(userId, 'preview:run:step', {
             previewSessionId,
-            stepIndex: i,
+            stepIndex: originalStepIndex,
             stepId: step.id,
             status: 'skipped',
             action: step.type,
@@ -1469,7 +1648,7 @@ export class PreviewRunService {
 
         logger.debug('[PreviewRun] Evidence policy check', {
           previewSessionId,
-          stepIndex: i,
+          stepIndex: originalStepIndex,
           stepId: step.id,
           urlChanged,
           disableCaching,
@@ -1528,7 +1707,7 @@ export class PreviewRunService {
           if (result.compiledFailed && !skipCompiledForRemaining) {
             skipCompiledForRemaining = true;
             logger.info('[PreviewRun] Compiled plan failed — skipping compiled for remaining steps', {
-              previewSessionId, stepIndex: i, stepId: step.id,
+              previewSessionId, stepIndex: originalStepIndex, stepId: step.id,
             });
           }
           let retried = false;
@@ -1545,7 +1724,7 @@ export class PreviewRunService {
           ) {
             logger.info('[PreviewRun] Attempting retry after failure', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               stepType: step.type,
               originalError: result.error,
@@ -1571,7 +1750,7 @@ export class PreviewRunService {
               if (result.success) {
                 logger.info('[PreviewRun] Retry succeeded', {
                   previewSessionId,
-                  stepIndex: i,
+                  stepIndex: originalStepIndex,
                   stepId: step.id,
                 });
               } else if (runState.cancelled) {
@@ -1599,7 +1778,7 @@ export class PreviewRunService {
               retried = true;
               logger.warn('[PreviewRun] Retry threw exception, using original failure', {
                 previewSessionId,
-                stepIndex: i,
+                stepIndex: originalStepIndex,
                 error: retryError instanceof Error ? retryError.message : String(retryError),
               });
             }
@@ -1611,7 +1790,7 @@ export class PreviewRunService {
           if (stepDurationMs > 3000) {
             logger.warn('[PreviewRun] Slow step execution', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               stepType: step.type,
               durationMs: stepDurationMs,
@@ -1624,7 +1803,7 @@ export class PreviewRunService {
           if (result.success) {
             logger.info('[PreviewRun] Step passed', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
             });
 
@@ -1644,7 +1823,7 @@ export class PreviewRunService {
               spanId: traceWriter.generateSpanId(),
               parentSpanId: stepSpanId,
               payload: {
-                stepIndex: i,
+                stepIndex: originalStepIndex,
                 stepId: step.id,
                 status: 'pass',
                 urlChanged: result.urlChanged,
@@ -1664,7 +1843,7 @@ export class PreviewRunService {
             // Emit pass (include appliedStep so frontend can enrich the UI step)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               status: 'pass',
               action: step.type,
@@ -1907,7 +2086,7 @@ export class PreviewRunService {
 
             logger.warn('[PreviewRun] Step failed', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               error: result.error,
               retried,
@@ -1924,7 +2103,7 @@ export class PreviewRunService {
               spanId: traceWriter.generateSpanId(),
               parentSpanId: stepSpanId,
               payload: {
-                stepIndex: i,
+                stepIndex: originalStepIndex,
                 stepId: step.id,
                 status: 'fail',
                 error: result.error,
@@ -1943,7 +2122,7 @@ export class PreviewRunService {
             // Emit fail (with augmented error + screenshot for better UX)
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               status: 'fail',
               action: step.type,
@@ -1957,7 +2136,7 @@ export class PreviewRunService {
             // Capture for summary (truncate to first 5 to bound payload size)
             if (failedStepDetails.length < 5) {
               failedStepDetails.push({
-                stepIndex: i,
+                stepIndex: originalStepIndex,
                 description: step.description || '',
                 action: step.type,
                 error: errorWithContext,
@@ -1998,13 +2177,13 @@ export class PreviewRunService {
           if (stepError instanceof DOMException && stepError.name === 'AbortError') {
             logger.info('[PreviewRun] Step aborted by cancel signal', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
             });
             // Current step already emitted 'running' — mark as skipped
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               status: 'skipped',
               action: step.type,
@@ -2042,7 +2221,7 @@ export class PreviewRunService {
           ) {
             logger.info('[PreviewRun] Exception during step, attempting retry', {
               previewSessionId,
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               error: originalError,
             });
@@ -2067,7 +2246,7 @@ export class PreviewRunService {
               if (retryResult.success) {
                 logger.info('[PreviewRun] Exception retry succeeded', {
                   previewSessionId,
-                  stepIndex: i,
+                  stepIndex: originalStepIndex,
                   stepId: step.id,
                 });
 
@@ -2079,7 +2258,7 @@ export class PreviewRunService {
                   spanId: traceWriter.generateSpanId(),
                   parentSpanId: stepSpanId,
                   payload: {
-                    stepIndex: i,
+                    stepIndex: originalStepIndex,
                     stepId: step.id,
                     status: 'pass',
                     urlChanged: retryResult.urlChanged,
@@ -2090,7 +2269,7 @@ export class PreviewRunService {
 
                 webSocketService.emitToUser(userId, 'preview:run:step', {
                   previewSessionId,
-                  stepIndex: i,
+                  stepIndex: originalStepIndex,
                   stepId: step.id,
                   status: 'pass',
                   action: step.type,
@@ -2152,12 +2331,12 @@ export class PreviewRunService {
                   traceWriter.write({
                     iteration: i, stage: 'step_execution', eventType: 'step_result',
                     spanId: traceWriter.generateSpanId(), parentSpanId: stepSpanId,
-                    payload: { stepIndex: i, stepId: step.id, status: 'pass',
+                    payload: { stepIndex: originalStepIndex, stepId: step.id, status: 'pass',
                       urlChanged: finalResult.urlChanged, url: finalResult.url, retried: true },
                   });
 
                   webSocketService.emitToUser(userId, 'preview:run:step', {
-                    previewSessionId, stepIndex: i, stepId: step.id, status: 'pass',
+                    previewSessionId, stepIndex: originalStepIndex, stepId: step.id, status: 'pass',
                     action: step.type, description: step.description,
                     timestamp: new Date().toISOString(),
                     ...(finalResult.appliedStep ? { appliedStep: finalResult.appliedStep } : {}),
@@ -2221,7 +2400,7 @@ export class PreviewRunService {
 
           logger.error('[PreviewRun] Step exception', {
             previewSessionId,
-            stepIndex: i,
+            stepIndex: originalStepIndex,
             stepId: step.id,
             error: originalError,
             retried: exceptionRetried,
@@ -2238,7 +2417,7 @@ export class PreviewRunService {
             spanId: traceWriter.generateSpanId(),
             parentSpanId: stepSpanId,
             payload: {
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               stepId: step.id,
               status: 'exception',
               error: originalError,
@@ -2250,7 +2429,7 @@ export class PreviewRunService {
           // Emit fail (with screenshot for visual debugging)
           webSocketService.emitToUser(userId, 'preview:run:step', {
             previewSessionId,
-            stepIndex: i,
+            stepIndex: originalStepIndex,
             stepId: step.id,
             status: 'fail',
             action: step.type,
@@ -2264,7 +2443,7 @@ export class PreviewRunService {
           // Capture for summary (truncate to first 5)
           if (failedStepDetails.length < 5) {
             failedStepDetails.push({
-              stepIndex: i,
+              stepIndex: originalStepIndex,
               description: step.description || '',
               action: step.type,
               error: errorWithContext,

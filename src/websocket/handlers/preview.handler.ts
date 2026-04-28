@@ -4522,7 +4522,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:run:start', async (data) => {
     try {
       const userId = getUserId(socket);
-      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset } = data;
+      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset, startFromIndex: clientStartFromIndex } = data;
 
       // Validate input
       if (!previewSessionId || !intentTestCaseId) {
@@ -4771,10 +4771,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           ? clientAuthReset
           : undefined;
       const hasInline = Array.isArray(inlineSteps) && inlineSteps.length > 0;
+      // Sanitize startFromIndex: must be a non-negative finite integer.
+      // Anything else (NaN, negative, undefined, string, etc.) collapses to
+      // the default "run from step 0" behaviour. This is the safe fallback
+      // — a malformed value never accidentally skips steps.
+      const safeStartFromIndex =
+        typeof clientStartFromIndex === 'number'
+        && Number.isFinite(clientStartFromIndex)
+        && clientStartFromIndex > 0
+        && Math.floor(clientStartFromIndex) === clientStartFromIndex
+          ? clientStartFromIndex
+          : undefined;
       const runOptions = hasInline
-        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset }
-        : safeAuthReset
-          ? { authReset: safeAuthReset }
+        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
+        : (safeAuthReset || safeStartFromIndex !== undefined)
+          ? { authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
           : undefined;
       PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
         logger.error('[WebSocket] Preview run failed', {

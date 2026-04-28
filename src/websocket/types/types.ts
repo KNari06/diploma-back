@@ -251,6 +251,22 @@ export interface ServerToClientEvents {
     timestamp: string;
   }) => void;
 
+  // Per-step URL mismatch warning. Fires when the live preview URL differs
+  // (after origin+path normalization) from the URL captured at recording
+  // time for that step. Non-fatal — the run continues. Frontend uses this
+  // to show a yellow badge on the step row so the user can spot why a fail
+  // happened: "step recorded on /admin/users, ran on /". The most common
+  // cause is the user clicking around the preview between Apply All and
+  // recording the next batch, leaving step N+1's recorded fingerprint
+  // pointing at a page state that no longer exists at run time.
+  'preview:run:url-mismatch': (data: {
+    previewSessionId: string;
+    stepIndex: number;
+    stepId: string;
+    recordedUrl: string;
+    actualUrl: string;
+  }) => void;
+
   // Mobile editor session has expired (idle for IDLE_TTL_MS, or backend
   // detected the FE↔BE socket has gone away). Frontend should close the
   // editor modal, clear `intentTestCaseId` from the URL, toast the user,
@@ -1289,6 +1305,25 @@ export interface PreviewRunStartRequest {
    * explicitly chooses when an active session is detected before Run.
    */
   authReset?: 'always' | 'never';
+  /**
+   * "Apply New Only" (April 2026): start execution at this step index
+   * instead of step 0, preserving the live preview state. Used when the
+   * user already ran Apply All on steps 0..N-1 and now wants to apply
+   * only the freshly-recorded steps N..end without re-running everything
+   * (faster, no auth wipe, runs against current preview state).
+   *
+   * When set:
+   *   - Backend skips goto(startUrl) — preview stays where it is
+   *   - Backend ignores authReset='always' (forced to 'never')
+   *   - Steps before the index are not executed but ARE saved to DB
+   *     alongside the new ones (single source of truth)
+   *
+   * The frontend pre-flight checks that current preview URL matches the
+   * recorded `pageUrl` of step at this index before sending. Backend
+   * trusts that check — unsafe values still won't crash the run, but
+   * step N may fail with a "page mismatch" badge from per-step URL diag.
+   */
+  startFromIndex?: number;
 }
 
 /**
