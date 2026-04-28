@@ -1433,6 +1433,25 @@ export class PreviewSessionService {
     try {
       logger.info('[PREVIEW_SESSION] Stopping session', { sessionId });
 
+      // Force-cancel any in-flight preview run BEFORE we close the
+      // browser context. Without this, the run loop keeps trying to
+      // page.evaluate against a closed page → throws → unwind path may
+      // leave `activeRuns` populated, blocking every future run for
+      // this session id with "Run already in progress" until process
+      // restart. forceCancelOnSessionStop is a no-op when nothing is
+      // active. Lazy-import to dodge a circular dependency between
+      // session and run services (each pulls the other's API surface
+      // at module-eval time).
+      try {
+        const { PreviewRunService } = await import('./preview-run.service');
+        PreviewRunService.forceCancelOnSessionStop(sessionId);
+      } catch (e) {
+        logger.warn('[PREVIEW_SESSION] forceCancelOnSessionStop threw (non-fatal)', {
+          sessionId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
       // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
       try {
         const { EditorTraceService } = await import('./editor-trace.service');

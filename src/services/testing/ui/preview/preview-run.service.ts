@@ -1328,7 +1328,7 @@ export class PreviewRunService {
             const step = stepsToExecute[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
-              stepIndex: j,
+              stepIndex: startFromIndex + j,
               stepId: step.id,
               status: 'skipped',
               action: step.type,
@@ -1627,7 +1627,7 @@ export class PreviewRunService {
             const remaining = stepsToExecute[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
-              stepIndex: j,
+              stepIndex: startFromIndex + j,
               stepId: remaining.id,
               status: 'skipped',
               action: remaining.type,
@@ -2034,7 +2034,7 @@ export class PreviewRunService {
                 const remainingStep = stepsToExecute[j];
                 webSocketService.emitToUser(userId, 'preview:run:step', {
                   previewSessionId,
-                  stepIndex: j,
+                  stepIndex: startFromIndex + j,
                   stepId: remainingStep.id,
                   status: 'skipped',
                   action: remainingStep.type,
@@ -2161,7 +2161,7 @@ export class PreviewRunService {
               const remainingStep = stepsToExecute[j];
               webSocketService.emitToUser(userId, 'preview:run:step', {
                 previewSessionId,
-                stepIndex: j,
+                stepIndex: startFromIndex + j,
                 stepId: remainingStep.id,
                 status: 'skipped',
                 action: remainingStep.type,
@@ -2195,7 +2195,7 @@ export class PreviewRunService {
               const remaining = stepsToExecute[j];
               webSocketService.emitToUser(userId, 'preview:run:step', {
                 previewSessionId,
-                stepIndex: j,
+                stepIndex: startFromIndex + j,
                 stepId: remaining.id,
                 status: 'skipped',
                 action: remaining.type,
@@ -2463,7 +2463,7 @@ export class PreviewRunService {
             const remainingStep = stepsToExecute[j];
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
-              stepIndex: j,
+              stepIndex: startFromIndex + j,
               stepId: remainingStep.id,
               status: 'skipped',
               action: remainingStep.type,
@@ -2779,6 +2779,47 @@ export class PreviewRunService {
       userId,
       currentStepIndex: runState.currentStepIndex,
     });
+  }
+
+  /**
+   * Force-cancel any active run for this session WITHOUT owner check.
+   * Called by `PreviewSessionService.stopSession` when the underlying
+   * preview is being torn down (browser close, idle timeout, user clicked
+   * "End preview"). Without this, an in-flight run kept executing against
+   * a stale Playwright context — the loop's next `page.evaluate` would
+   * throw "Target page closed" but the surrounding promise might never
+   * settle, leaving `activeRuns` permanently locked and rejecting all
+   * subsequent runs with "Run already in progress" until server restart.
+   *
+   * Safe to call when no run is active — silent no-op. Does NOT remove
+   * the activeRuns entry itself (the loop's finally block does that
+   * after emitting `preview:run:completed`); we only signal cancellation
+   * so the loop can unwind cleanly.
+   */
+  static forceCancelOnSessionStop(previewSessionId: string): void {
+    const runState = activeRuns.get(previewSessionId);
+    if (!runState) return;
+    runState.cancelled = true;
+    try { runState.abortController.abort(); } catch { /* aborted twice = noop */ }
+    logger.info('[PreviewRun] Run force-cancelled (session stopping)', {
+      previewSessionId,
+      currentStepIndex: runState.currentStepIndex,
+    });
+
+    // Safety net: if the loop's finally block fails to fire (e.g. page
+    // was already closed and a sync throw bubbled past every catch), the
+    // entry would stay in activeRuns forever. After a generous timeout
+    // we hard-purge so the next run isn't blocked. The 30s window is
+    // long enough that any healthy unwind has finished by then.
+    setTimeout(() => {
+      const stillThere = activeRuns.get(previewSessionId);
+      if (stillThere === runState) {
+        activeRuns.delete(previewSessionId);
+        logger.warn('[PreviewRun] Force-purged activeRuns entry that did not unwind in time', {
+          previewSessionId,
+        });
+      }
+    }, 30000).unref();
   }
 
   /**
