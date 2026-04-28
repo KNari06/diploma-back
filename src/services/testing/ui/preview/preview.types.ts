@@ -117,6 +117,29 @@ export interface InteractiveNode {
    * childTestId is available — closes the "fully bare icon button" gap.
    */
   iconLabel?: string;
+  /**
+   * Angular Material icon registry name. Read from `svgicon` attribute on
+   * `<mat-icon>` (or `data-mat-icon-name` mirror). Survives across builds
+   * and re-renders — Material registers each icon once globally and the
+   * attribute is the lookup key. Strong identity signal for Material apps
+   * where the SVG itself has no `<title>`/aria-label/text.
+   *
+   *   <mat-icon svgicon="chevron-left-outline"><svg>...</svg></mat-icon>
+   *
+   * Distinct from `iconLabel` (which sources from svg <title>, data-lucide,
+   * FA classes). When both are present we prefer svgIcon as the identity —
+   * iconLabel can be derived from generic CSS class tokens that overlap
+   * across icons; svgIcon comes from the explicit registration name.
+   */
+  svgIcon?: string;
+  /**
+   * Closest semantic custom-element ancestor (`<app-foo-bar>` /
+   * `<my-button>` / etc.). See TargetFingerprint.customElementTag for
+   * the rationale and filter rules. Used by the resolver's identity
+   * fast-path so an Angular icon-only button wrapped in a meaningful
+   * `<app-X>` tag still gets a deterministic match.
+   */
+  customElementTag?: string;
   /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap data-bs-target selector. */
@@ -387,6 +410,16 @@ export interface BindingHints {
    */
   iconLabel?: string;
   /**
+   * Angular Material icon registry name (`svgicon` attribute on `<mat-icon>`).
+   * Mirror of `TargetFingerprint.svgIcon` — see that field for rationale.
+   */
+  svgIcon?: string;
+  /**
+   * Closest semantic custom-element ancestor's tag name. Mirror of
+   * `TargetFingerprint.customElementTag` — see that field for rationale.
+   */
+  customElementTag?: string;
+  /**
    * V22 Pkg2: Bootstrap toggle marker (data-bs-toggle). Distinguishes
    * "real Bootstrap dropdown trigger" from a static button with similar
    * styling. Values: 'modal' | 'dropdown' | 'tab' | 'collapse' | 'tooltip' | etc.
@@ -605,6 +638,25 @@ export interface TargetFingerprint {
   childTestId?: string;
   /** V22 Pkg4: semantic icon name (svg <title>/<desc>/<use href>/data-lucide/etc). */
   iconLabel?: string;
+  /**
+   * Angular Material icon registry name (`svgicon` / `data-mat-icon-name`
+   * attribute on `<mat-icon>`). Strong identity signal for Material apps —
+   * survives rebuilds because the value is the registration key, not a
+   * generated hash. Distinct from `iconLabel` which sources from
+   * `<title>`/`data-lucide`/FA classes.
+   */
+  svgIcon?: string;
+  /**
+   * Closest meaningful custom-element ancestor's tag name. Captures the
+   * Angular component / Vue 3 SFC / Lit / Stencil semantic name that
+   * wraps an otherwise-bare button (`<app-notifications-button>` →
+   * `<button class="btn"><svg/></button>`). On Angular Material apps
+   * this is often the ONLY identity available for icon-only header
+   * actions where there's no id, testid, aria-label, title, or text.
+   * Filtered to "semantic" tags only (≥3 dash-segments, no counter
+   * suffix) so `<app-c134>` doesn't pass.
+   */
+  customElementTag?: string;
   /** V22 Pkg2: Bootstrap toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap target selector. */
@@ -948,7 +1000,7 @@ export interface LintResult {
    *   rule_fallback   — degraded mode, rule-based score
    *   user_confirmed  — user picked from clarification UI
    */
-  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_name' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
+  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
   /** Candidate elements (for ambiguous cases) */
   candidates: LintCandidate[];
   /** Elements to highlight on UI */

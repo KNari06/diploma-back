@@ -96,6 +96,28 @@ export interface ProbedElement {
    */
   iconLabel?: string;
   /**
+   * Angular Material icon registry name from `<mat-icon svgicon="..."`.
+   * Strong identity signal — value is the registration key, stable
+   * across rebuilds. Read from the target if it is `<mat-icon>`, else
+   * the closest `<mat-icon>` ancestor (probe may have landed on the
+   * inner svg/path).
+   */
+  svgIcon?: string;
+  /**
+   * Tag name of the closest meaningful custom-element ancestor walking
+   * up from the target. Filter: tag must contain a dash AND be semantic
+   * (>= 3 dash-segments, no `-c\d+` counter tail). Examples that pass:
+   * `app-notifications-button`, `app-user-menu`, `juz40-search-bar`.
+   * Examples that fail: `app-c134`, `ng-component`, `mat-menu` (only 1
+   * dash-segment), `ion-tab-bar` (counted but lib-generic — actually we
+   * accept this; library tags are stable identity too).
+   *
+   * Catches notification-button-style cases on Angular: `<button>` has
+   * no id/testid/aria, but ancestor `<app-notifications-button>` is a
+   * stable component name that makes identity match deterministic.
+   */
+  customElementTag?: string;
+  /**
    * V22 Pkg2: Bootstrap data-bs-toggle / data-bs-target. The de-facto
    * marker for Bootstrap modals, dropdowns, tabs, accordions, collapses.
    * `bsToggle` carries the widget kind ("modal" | "dropdown" | "tab" | ...);
@@ -964,15 +986,60 @@ const PROBE_AT_POINT_FN = `
   // icon-only targets (where summary is most useful) without it.
   var ancestorSummary = undefined;
   if (ancestorChain.length > 0) {
+    // First-stable-class picker for ancestor segments. Mirrors the target-
+    // level cssClass strip filter — without it, an ancestor with class
+    // "ng-star-inserted ng-tns-c50-11 mat-mdc-foo" would land in the
+    // summary as ".ng-star-inserted" and a tomorrow-build would fail to
+    // match. Order: first non-state, non-encapsulation token.
+    var firstStableAncestorClass = function (raw) {
+      if (!raw) return undefined;
+      var parts = raw.split(/\s+/);
+      for (var pi = 0; pi < parts.length; pi++) {
+        var p = parts[pi];
+        if (!p || p.length > 50) continue;
+        // Same blacklist as cssClass filter — keep in sync.
+        if (p === 'ng-star-inserted') continue;
+        if (/^ng-tns-c\d+-\d+$/.test(p)) continue;
+        if (/^ng-(?:un)?touched$|^ng-pristine$|^ng-dirty$|^ng-valid$|^ng-invalid$|^ng-pending$|^ng-submitted$/.test(p)) continue;
+        if (/^data-v-[a-f0-9]{8}$/.test(p)) continue;
+        if (/^css-[a-z0-9]{6,}$/i.test(p)) continue;
+        if (/^sc-[a-zA-Z0-9]{6,}$/.test(p)) continue;
+        // BEM state modifier — see target-level cssClass filter for the
+        // same regex. Same identity rationale: the parent's modifier
+        // flips with state (e.g. nav-item--active), the base block is
+        // the real identity. Skip the modifier so ancestor summary
+        // anchors on the parent's stable identity.
+        if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled)$/.test(p)) continue;
+        return p;
+      }
+      return undefined;
+    };
+    // Same DYNAMIC_ID set we use for target.id — Angular Material counter
+    // ids (mat-select-4, cdk-overlay-1) are unstable across renders so we
+    // shouldn't anchor an ancestor selector on them either.
+    var isDynamicAncestorId = function (id) {
+      if (!id) return true;
+      return /^el-id-/i.test(id)
+        || /^radix-/.test(id)
+        || /^:r[0-9a-z]+:$/i.test(id)
+        || /^mui-/i.test(id)
+        || /^headlessui-/i.test(id)
+        || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)
+        || /^mat-(?:input|tab|menu|select|dialog|chip|mdc)-\d/i.test(id)
+        || /^cdk-(?:overlay|describedby|focus-trap|live)-/i.test(id);
+    };
     var summarySegments = [];
     for (var asi = 0; asi < Math.min(ancestorChain.length, 5); asi++) {
       var seg = ancestorChain[asi];
       var segIdent = '';
       if (seg.testId) segIdent = '[data-testid=' + seg.testId + ']';
-      else if (seg.id) segIdent = '#' + seg.id;
+      else if (seg.id && !isDynamicAncestorId(seg.id)) segIdent = '#' + seg.id;
       else if (seg.role) segIdent = '[role=' + seg.role + ']';
       else if (seg.text && seg.text.length <= 30) segIdent = "[text='" + seg.text.replace(/'/g, "") + "']";
-      else if (seg.className) segIdent = '.' + seg.className.split(' ')[0];
+      else {
+        var stableCls = firstStableAncestorClass(seg.className);
+        if (stableCls) segIdent = '.' + stableCls;
+      }
       summarySegments.push(seg.tag + segIdent);
     }
     summarySegments.reverse();          // chain is inner→outer; we want outer→inner
@@ -1095,6 +1162,34 @@ const PROBE_AT_POINT_FN = `
       // V22 Pkg3: drop Emotion / styled-components scoped classes.
       if (/^css-[a-z0-9]{6,}$/i.test(t)) return false;
       if (/^sc-[a-zA-Z0-9]{6,}$/.test(t)) return false;
+      // Angular-specific runtime markers — must NOT survive into cssClass
+      // because they signal STATE (form validity, structural directive
+      // attached) or BUILD (ViewEncapsulation salt), not identity. A
+      // tomorrow-build of the same Angular app gets a different ng-tns
+      // suffix; an element rendered into a different *ngIf branch has
+      // ng-star-inserted while the original didn't. Either way the
+      // captured locator dies on replay.
+      //   ng-star-inserted     — *ngIf / *ngFor structural directive
+      //   ng-tns-cNN-MM        — ViewEncapsulation per-component salt
+      //   ng-(un)?touched|pristine|dirty|valid|invalid|pending|submitted
+      //                        — Angular form-control state (changes
+      //                          the moment the user types or blurs)
+      // Material's mat-mdc-* classes are intentionally KEPT — they are
+      // stable across builds and provide useful semantic hints.
+      if (t === 'ng-star-inserted') return false;
+      if (/^ng-tns-c\d+-\d+$/.test(t)) return false;
+      if (/^ng-(?:un)?touched$|^ng-pristine$|^ng-dirty$|^ng-valid$|^ng-invalid$|^ng-pending$|^ng-submitted$/.test(t)) return false;
+      // BEM-style state modifier suffix: block--active, tab--selected,
+      // nav-item--current. The base block class precedes it and is the
+      // real identity; the modifier flips on/off when the page state
+      // changes (which week is active, which row is selected). If the
+      // modifier survives into the recorded cssClass, replay against an
+      // inactive instance fails to match. Whitelist of states is narrow
+      // (only the ones that are obviously transient) so we don't drop
+      // legitimate domain modifiers like card--premium or
+      // button--primary. CSS class case-sensitive, regex ASCII-only
+      // (Cyrillic / mixed-case identifiers don't end in these tokens).
+      if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled)$/.test(t)) return false;
       // V22 Pkg3: when ANY css-in-js class is present on this element,
       // also drop bare 5-8-char mixed-case tokens — they're almost
       // certainly styled-components display-name hashes (kAtEng/hpEYiQ).
@@ -1334,6 +1429,86 @@ const PROBE_AT_POINT_FN = `
     } catch (e) { /* svg/icon mining failed — skip silently */ }
   }
 
+  // Angular Material mat-icon[svgicon] extraction. This is its own probe
+  // pass (NOT part of the iconLabel chain above) because the value is a
+  // stable identity — Materials icon registry binds a name to an SVG
+  // asset at app boot, the name survives every rebuild, and its strong
+  // enough to be the primary identifier even when the target has
+  // otherwise-rich descriptors. So we always populate it when present,
+  // regardless of hasOwnDescriptor.
+  //
+  // Sources, in order:
+  //   1. Target itself is <mat-icon> (most common — clicked the icon)
+  //   2. Closest <mat-icon> ancestor (clicked a child <svg>/<path>
+  //      inside the icon — common when probe lands on inner geometry)
+  //
+  // We mirror the attribute name across svgicon and the
+  // data-mat-icon-name data-mirror that Angular Material stamps for
+  // its CSS hooks. Either is fine — both come from the same registry
+  // call at runtime.
+  var svgIconAttr = undefined;
+  try {
+    var matIconHost = null;
+    if (tag === 'mat-icon') {
+      matIconHost = target;
+    } else if (target.closest) {
+      matIconHost = target.closest('mat-icon');
+    }
+    if (matIconHost) {
+      var rawSvgIcon =
+        matIconHost.getAttribute('svgicon')
+        || matIconHost.getAttribute('data-mat-icon-name')
+        || '';
+      // Length cap mirrors iconLabel — semantic icon names are short.
+      // Skip empty / suspiciously long values (defensive: a custom
+      // <mat-icon>-named component might stuff something else here).
+      if (rawSvgIcon && rawSvgIcon.length > 0 && rawSvgIcon.length <= 60) {
+        svgIconAttr = rawSvgIcon;
+      }
+    }
+  } catch (e) { /* mat-icon mining best-effort */ }
+
+  // Closest semantic custom-element ancestor (Angular component / Vue 3
+  // SFC tag / Lit / Stencil web component). Last-resort identity for
+  // icon-only buttons that lack id/testid/aria/title/text but are
+  // wrapped in a meaningful component tag, e.g.:
+  //   <app-notifications-button>
+  //     <button class="btn"><svg/></button>
+  //   </app-notifications-button>
+  // Filter: tag must (a) contain a dash, (b) NOT be a generic
+  // counter (app-c134 / ion-c2), (c) NOT be a known leaf-level
+  // primitive that wraps everything (router-outlet, ng-component,
+  // mat-icon — already covered or non-semantic).
+  var customElementTagAttr = undefined;
+  try {
+    var ceWalk = target;
+    for (var cwi = 0; cwi < 6 && ceWalk && ceWalk !== document.body; cwi++) {
+      var ceTag = (ceWalk.tagName || '').toLowerCase();
+      if (ceTag.indexOf('-') >= 0
+        && ceTag.length >= 5
+        && ceTag.length <= 60
+        // Reject generic Angular auto-generated component selectors.
+        && !/^(?:app|ng|ion|sl|stencil)-c\d+$/.test(ceTag)
+        // Reject known non-semantic / framework primitives. mat-icon
+        // already feeds svgIcon; router-outlet is a routing slot, not
+        // a button container; ng-component is a fallback selector.
+        && ceTag !== 'router-outlet'
+        && ceTag !== 'ng-component'
+        && ceTag !== 'mat-icon'
+        && ceTag !== 'mat-menu'
+        && ceTag !== 'mat-select'
+        && ceTag !== 'mat-form-field'
+        // Reject targets where the tag IS the target (we want a
+        // WRAPPER identity, not the leaf — leaf is already in tag).
+        && ceWalk !== target
+      ) {
+        customElementTagAttr = ceTag;
+        break;
+      }
+      ceWalk = ceWalk.parentElement;
+    }
+  } catch (e) { /* custom-element walk best-effort */ }
+
   // V22 Pkg2 — Bootstrap markers (data-bs-toggle / data-bs-target).
   // Walk the target itself + up to 3 parents — Bootstrap puts these on
   // either the trigger button OR an ancestor wrapper depending on the
@@ -1561,6 +1736,8 @@ const PROBE_AT_POINT_FN = `
     dataValue: dataValueAttr,
     childTestId: childTestIdAttr,
     iconLabel: iconLabelAttr,
+    svgIcon: svgIconAttr,
+    customElementTag: customElementTagAttr,
     // V22 Pkg2 — Bootstrap / aria-haspopup / activedescendant / row-key / clickable-row.
     bsToggle: bsToggleAttr,
     bsTarget: bsTargetAttr,
@@ -2398,6 +2575,11 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.childTestId) hints.childTestId = element.childTestId;
     // V22 Pkg4: semantic icon name (Lucide/Feather/FA/SVG title).
     if (element.iconLabel) hints.iconLabel = element.iconLabel;
+    // Angular Material `<mat-icon svgicon="...">` registry name.
+    if (element.svgIcon) hints.svgIcon = element.svgIcon;
+    // Closest semantic custom-element ancestor — last-resort identity
+    // for icon-only buttons.
+    if (element.customElementTag) hints.customElementTag = element.customElementTag;
     // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
     if (element.bsToggle) hints.bsToggle = element.bsToggle;
     if (element.bsTarget) hints.bsTarget = element.bsTarget;
@@ -2468,6 +2650,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.childTestId) fp.childTestId = element.childTestId;
     // V22 Pkg4: semantic icon name for heal-time identity match.
     if (element.iconLabel) fp.iconLabel = element.iconLabel;
+    // Angular Material registry name — top-tier identity for Material apps.
+    if (element.svgIcon) fp.svgIcon = element.svgIcon;
+    // Custom-element ancestor identity (Angular component / Vue 3 SFC).
+    if (element.customElementTag) fp.customElementTag = element.customElementTag;
     // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key.
     if (element.bsToggle) fp.bsToggle = element.bsToggle;
     if (element.bsTarget) fp.bsTarget = element.bsTarget;

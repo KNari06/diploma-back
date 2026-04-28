@@ -1690,6 +1690,59 @@ export class SnapshotCollector {
               || el.getAttribute('data-track')
               || undefined;
 
+            // Angular Material icon registry name. Mirrors the recorder
+            // probe: read from target if it IS <mat-icon>, else closest
+            // <mat-icon> ancestor. Cap at 60 chars (defensive — values
+            // are short identifier strings like "chevron-left-outline").
+            // Symmetric with recorder so identity fast-path on svgIcon
+            // can match recorded ↔ live without normalization drift.
+            let liveSvgIcon: string | undefined;
+            try {
+              const matIconHost = el.tagName.toLowerCase() === 'mat-icon'
+                ? el
+                : (el.closest ? el.closest('mat-icon') : null);
+              if (matIconHost) {
+                const rawSvgIcon = matIconHost.getAttribute('svgicon')
+                  || matIconHost.getAttribute('data-mat-icon-name')
+                  || '';
+                if (rawSvgIcon && rawSvgIcon.length > 0 && rawSvgIcon.length <= 60) {
+                  liveSvgIcon = rawSvgIcon;
+                }
+              }
+            } catch { /* best-effort — non-Material apps will simply leave it undefined */ }
+
+            // Closest semantic custom-element ancestor. Mirrors recorder
+            // probe — same filter rules, same depth (6 levels) so the
+            // recorded fingerprint and the live snapshot agree on which
+            // wrapper "owns" the button. Without this symmetry an Angular
+            // app's `<app-notifications-button>` would land in the
+            // recorded fingerprint but the live node wouldn't carry it,
+            // identity fast-path would miss, and we'd fall to LLM (which
+            // is the bug this whole feature is closing).
+            let liveCustomElementTag: string | undefined;
+            try {
+              let ceWalk: Element | null = el;
+              for (let cwi = 0; cwi < 6 && ceWalk && ceWalk !== document.body; cwi++) {
+                const ceTag = (ceWalk.tagName || '').toLowerCase();
+                if (ceTag.indexOf('-') >= 0
+                  && ceTag.length >= 5
+                  && ceTag.length <= 60
+                  && !/^(?:app|ng|ion|sl|stencil)-c\d+$/.test(ceTag)
+                  && ceTag !== 'router-outlet'
+                  && ceTag !== 'ng-component'
+                  && ceTag !== 'mat-icon'
+                  && ceTag !== 'mat-menu'
+                  && ceTag !== 'mat-select'
+                  && ceTag !== 'mat-form-field'
+                  && ceWalk !== el
+                ) {
+                  liveCustomElementTag = ceTag;
+                  break;
+                }
+                ceWalk = ceWalk.parentElement;
+              }
+            } catch { /* best-effort */ }
+
             // Detect icon-only buttons/links: element has child SVG/img but no visible text.
             // Covers: <button>, <a>, any element with role="button", and clickable
             // div/span wrappers common in React/Vue/Angular component libraries.
@@ -1910,6 +1963,8 @@ export class SnapshotCollector {
               // heal-time score so icon-only buttons get a stable "name" even
               // when title was already taken by a real tooltip.
               iconLabel: iconChildLabel,
+              svgIcon: liveSvgIcon,
+              customElementTag: liveCustomElementTag,
               isIconButton: isIconButton || undefined,
               labelText,
               // Hierarchy

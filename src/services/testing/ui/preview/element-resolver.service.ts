@@ -737,12 +737,26 @@ export function buildCandidateText(node: InteractiveNode): string {
   // makes the candidate identifiable to the resolver.
   if ((node as any).childTestId) {
     parts.push(`icon: ${(node as any).childTestId}`);
+  } else if ((node as any).svgIcon) {
+    // Angular Material `<mat-icon svgicon="...">` — preferred over
+    // iconLabel when present because it's an explicit registry name,
+    // not a derived guess. LLM still gets the same `icon:` key so the
+    // prompt rules apply uniformly across libraries.
+    parts.push(`icon: ${(node as any).svgIcon}`);
   } else if ((node as any).iconLabel) {
     // V22 Pkg4: semantic icon label from svg <title> / data-lucide /
     // sprite href / FA class. Fallback for `<div role="button"><svg/></div>`
     // patterns where childTestId is unavailable. Same `icon:` key so the
     // LLM-prompt rules apply uniformly.
     parts.push(`icon: ${(node as any).iconLabel}`);
+  }
+  // Custom-element wrapper tag — emitted as a separate semantic hint,
+  // NOT under `icon:` because it's not the icon's name but the
+  // component's name (e.g. "wrappedBy: app-notifications-button"). The
+  // LLM treats it as context: the button is officially a "notifications
+  // button" component, even though its `<button>` is otherwise bare.
+  if ((node as any).customElementTag) {
+    parts.push(`wrappedBy: ${(node as any).customElementTag}`);
   }
 
   // V22 Pkg1: data-value for Select option / MenuItem / chip semantic key.
@@ -2121,6 +2135,15 @@ async function selectElementWithLLM(params: {
     if ((recordedFingerprint as any).iconLabel) {
       fpHintLines.push(`iconLabel="${fpEsc((recordedFingerprint as any).iconLabel)}"`);
     }
+    // Angular Material registry name — strong identity hint.
+    if ((recordedFingerprint as any).svgIcon) {
+      fpHintLines.push(`svgIcon="${fpEsc((recordedFingerprint as any).svgIcon)}"`);
+    }
+    // Custom-element wrapper tag — semantic hint for Angular apps where
+    // the button's only stable identity is its component ancestor.
+    if ((recordedFingerprint as any).customElementTag) {
+      fpHintLines.push(`customElementTag="${fpEsc((recordedFingerprint as any).customElementTag)}"`);
+    }
     if ((recordedFingerprint as any).dataValue) {
       fpHintLines.push(`dataValue="${fpEsc((recordedFingerprint as any).dataValue)}"`);
     }
@@ -2676,6 +2699,19 @@ export async function resolveElement(params: {
     }> = [
       { attr: 'id',     want: identityFp.elementId,  readNode: (n) => n.id },
       { attr: 'testId', want: identityFp.testIdAttr, readNode: (n) => n.testIdAttr },
+      // Angular Material icon registry name. Read symmetrically by
+      // recorder probe and snapshot-collector from <mat-icon svgicon>.
+      // Stable across builds — Material apps register icons by name
+      // once at boot and the value is the lookup key, not a hash.
+      // Listed AFTER id/testId so explicit data-testid still wins on
+      // mixed-tag pages (test author can override).
+      { attr: 'svgIcon', want: identityFp.svgIcon,    readNode: (n) => n.svgIcon },
+      // Closest semantic custom-element ancestor (Angular component /
+      // Vue 3 SFC tag). Last in the identity chain — only fires when
+      // there's no id/testid/svgicon. Catches the icon-only-button-
+      // wrapped-in-`<app-notifications-button>` pattern that's common
+      // on Angular apps and otherwise has zero stable identifiers.
+      { attr: 'customElementTag', want: identityFp.customElementTag, readNode: (n) => n.customElementTag },
       // NOTE: `n.name` in InteractiveNode is the *computed label* string
       // (ariaLabel || title || placeholder || text), not the live HTML
       // `name` attribute. Comparing it to `recordedFingerprint.name`
@@ -2735,7 +2771,9 @@ export async function resolveElement(params: {
         };
         const resolverPath: LintResult['resolverPath'] =
           check.attr === 'id' ? 'identity_id' :
-          check.attr === 'testId' ? 'identity_testid' : 'identity_name';
+          check.attr === 'testId' ? 'identity_testid' :
+          check.attr === 'svgIcon' ? 'identity_svgicon' :
+          check.attr === 'customElementTag' ? 'identity_custom_element' : 'identity_name';
         return {
           status: 'resolved',
           message: `Element resolved by recorded ${check.attr}`,
