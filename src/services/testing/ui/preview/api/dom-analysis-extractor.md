@@ -7,7 +7,7 @@
 
 Transforms a `LiteSnapshot` (raw page collection from `agent/core/lite/collectors/snapshot-collector.ts`) into a normalized `InteractiveNode[]` for the resolver/lint candidate set, and into `DomAnalysisData` for persistent storage in `intelligent_page_visits.dom_analysis`. Strips sensitive data (no values, only `hasValue` flags), truncates long text, populates ARIA state, validation flags, hierarchy hints and visual properties.
 
-**Symmetry contract:** `extractInteractiveNodes()` and `recording-capture.service.ts`'s `PROBE_AT_POINT_FN` MUST use the same Tier-1/Tier-2 selection rules, the same dynamic-id regex, and the same text normalization. Breaking this symmetry causes silent wrong-element bugs (recording sees X, resolver doesn't). See [.claude/rules/wrong-element-debugging.md](../../../../../.claude/rules/wrong-element-debugging.md).
+**Symmetry contract:** `extractInteractiveNodes()` and `recording-capture.service.ts`'s `PROBE_AT_POINT_FN` MUST use the same Tier-1/Tier-2 selection rules, the same dynamic-id regex, and the same text normalization. Breaking this symmetry causes silent wrong-element bugs (recording sees X, resolver doesn't). See [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md).
 
 ## Exports
 
@@ -266,4 +266,4 @@ Delegated to [dynamic-id.util.ts](../dynamic-id.util.ts). Patterns include:
 - `dynamic-id.util.ts`, `implicit-role.util.ts`, `text-normalizer.util.ts` — shared utilities.
 - [element-resolver.md](element-resolver.md) — consumes `InteractiveNode[]`.
 - [intent-step-lint.md](intent-step-lint.md) — scores candidates from this set.
-- [.claude/rules/wrong-element-debugging.md](../../../../../.claude/rules/wrong-element-debugging.md) — diagnostic order for symmetry breaks.
+- [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md) — diagnostic order for symmetry breaks.

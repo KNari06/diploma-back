@@ -68,7 +68,7 @@ Internal — use the exported `getPreviewSessionService()`. Initializes the 2 mi
 
 ### `startSession({ userId, projectId, startUrl, viewport? }): Promise<{ previewSessionId, url, domNodes, screenshot? }>`
 
-- **Callers:** `POST /api/v1/preview` ([preview.controller.ts](../../../../api/preview/preview.controller.ts)); WS `preview:recording:start`.
+- **Callers:** `POST /api/v1/preview` ([preview.controller.ts](../../../../../api/preview/preview.controller.ts)); WS `preview:recording:start`.
 - **Side-effects:**
   - Launches Chromium headless.
   - Creates `BrowserContext` with stealth, third-party blocker, auto-dismiss-overlays.

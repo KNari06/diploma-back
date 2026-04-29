@@ -281,4 +281,4 @@ Common pitfalls: optimism bias (0.85 when evidence is 0.6); using adjacency to o
 ## Related
 
 - [preview-step-apply.md](preview-step-apply.md), [intent-step-lint.md](intent-step-lint.md), [dom-analysis-extractor.md](dom-analysis-extractor.md), [locator-plan-builder.md](locator-plan-builder.md).
-- [.claude/rules/wrong-element-debugging.md](../../../../../.claude/rules/wrong-element-debugging.md).
+- [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md).

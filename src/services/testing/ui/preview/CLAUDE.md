@@ -3,7 +3,7 @@
 > Hot zone of the project. Live browser sessions, step recording, replay execution, element resolution, auto-healing.
 > Most production bugs land here. Read this whole file before changing anything in this folder.
 
-**Parent map:** [project root CLAUDE.md](../../../../CLAUDE.md)
+**Parent map:** [project root CLAUDE.md](../../../../../CLAUDE.md)
 
 ---
 
@@ -36,7 +36,7 @@ Element resolution and auto-healing serve all three.
 | [locator-plan-builder.service.ts](locator-plan-builder.service.ts) | [api/locator-plan-builder.md](api/locator-plan-builder.md) | Compiled fallback chain (role → testId → label → placeholder → text → css). `ref` excluded for replay. |
 | [step-readiness.service.ts](step-readiness.service.ts) | [api/step-readiness.md](api/step-readiness.md) | 7-layer pre-action readiness — challenge, nav race, loaders, API idle, animation, overlay, element state. |
 | [dom-analysis-extractor.service.ts](dom-analysis-extractor.service.ts) | [api/dom-analysis-extractor.md](api/dom-analysis-extractor.md) | Page → `InteractiveNode[]`. Symmetry partner of `PROBE_AT_POINT_FN`. |
-| [../../../websocket/handlers/preview.handler.ts](../../../websocket/handlers/preview.handler.ts) | [api/preview-handler.md](api/preview-handler.md) | All `preview:*` WS events — recording, mouse/keyboard, navigation, apply, devtools, video. |
+| [../../../../websocket/handlers/preview.handler.ts](../../../../websocket/handlers/preview.handler.ts) | [api/preview-handler.md](api/preview-handler.md) | All `preview:*` WS events — recording, mouse/keyboard, navigation, apply, devtools, video. |
 | [intent-test-case.service.ts](intent-test-case.service.ts) | — | CRUD for intent test cases (steps + metadata). Import/export. |
 | [intent-step-converter.service.ts](intent-step-converter.service.ts) | — | `IntentStep` ↔ Playwright commands (used by background replay). |
 

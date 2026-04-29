@@ -105,7 +105,7 @@ A field session is a single-shot open/close lifecycle for typing in a focused in
 ### `probeForRecording(page, x, y): Promise<ProbedElement | null>`
 
 - **Visibility:** `public static`.
-- **Caller:** [preview.handler.ts](../../../../websocket/handlers/preview.handler.ts) click path.
+- **Caller:** [preview.handler.ts](../../../../../websocket/handlers/preview.handler.ts) click path.
 - **Returns:** `ProbedElement` or `null`.
 - **Side-effects:** debug logs on null result; iframe descent attempts; `<webview>` detection.
 - **Throws:** never (errors caught, logged, null returned).
@@ -287,7 +287,7 @@ write editor trace
 3. **Scroll merge window.** Scrolls within 3000ms of last emit are merged; 500ms inactivity flushes.
 4. **Dynamic-id filtering.** Inline regex must mirror [dynamic-id.util.ts](../dynamic-id.util.ts). Drift causes wrong-element bugs.
 5. **Wrapper → icon descent.** Generic wrapper with single icon child + click inside icon's bbox (±2px) → descend.
-6. **Symmetry contract.** `PROBE_AT_POINT_FN` and `dom-analysis-extractor` MUST use the same selection criteria + same dynamic-id regex. Divergence = "wrong element clicked" class of bugs (see [.claude/rules/wrong-element-debugging.md](../../../../../.claude/rules/wrong-element-debugging.md)).
+6. **Symmetry contract.** `PROBE_AT_POINT_FN` and `dom-analysis-extractor` MUST use the same selection criteria + same dynamic-id regex. Divergence = "wrong element clicked" class of bugs (see [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md)).
 7. **Iframe descent.** Coordinates translated to child-frame viewport. Cross-origin → `crossOriginIframe: true`.
 8. **Debounce + throttle interaction.** Typing 1500 / scroll 500 / scroll-merge 3000 / hover 200 — different on purpose to avoid cross-event stutter.
 9. **Auto-stop.** `RECORDING_MAX_STEPS=50` and `RECORDING_MAX_TIME_MS=30min`. Apply or commit before re-recording.

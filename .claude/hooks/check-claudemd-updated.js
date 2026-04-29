@@ -1,40 +1,25 @@
 #!/usr/bin/env node
 /**
  * Stop hook: after the assistant finishes a turn, scan the transcript for
- * Edit/Write tool calls in hot folders or hot service files. If a hot file
- * was edited but its sibling doc was NOT, print a reminder to stderr.
+ * Edit/Write/MultiEdit tool calls in hot folders or hot service files. If a
+ * hot file was edited but its sibling doc was NOT, print a reminder to
+ * stderr.
  *
- * Two layers:
- *   1. Folder-level — touched <folder>/<file> but not <folder>/CLAUDE.md.
- *   2. Service-level — touched <folder>/<service>.ts but not <folder>/api/<service>.md.
+ * Two layers, in order of specificity:
+ *   1. Service-level — touched <service>.ts but not api/<service>.md.
+ *   2. Folder-level  — touched a file in a hot folder but not CLAUDE.md.
  *
- * Hook contract: receives JSON on stdin with { transcript_path, ... }.
- * Writing to stderr surfaces the message to the assistant. Always exit 0.
+ * If a service-level reminder fires (or its api doc was touched), the
+ * folder-level reminder is suppressed for that folder — the user is plainly
+ * already aware they're working on documented code.
  *
- * Add a hot folder by appending to FOLDER_MAP.
- * Add a hot service file by appending to SERVICE_MAP.
+ * Always exits 0 — never blocks the assistant.
+ *
+ * Maps live in ./doc-map.js (single source of truth).
  */
 
 const fs = require("fs");
-
-// Folder-level: editing anywhere in the folder triggers a reminder for CLAUDE.md.
-const FOLDER_MAP = [
-  ["src/services/testing/ui/preview/", "src/services/testing/ui/preview/CLAUDE.md"],
-];
-
-// Service-level: editing the .ts file triggers a reminder for api/<service>.md.
-const SERVICE_MAP = [
-  ["src/services/testing/ui/preview/preview-step-apply.service.ts", "src/services/testing/ui/preview/api/preview-step-apply.md"],
-  ["src/services/testing/ui/preview/preview-run.service.ts", "src/services/testing/ui/preview/api/preview-run.md"],
-  ["src/services/testing/ui/preview/recording-capture.service.ts", "src/services/testing/ui/preview/api/recording-capture.md"],
-  ["src/services/testing/ui/preview/element-resolver.service.ts", "src/services/testing/ui/preview/api/element-resolver.md"],
-  ["src/services/testing/ui/preview/intent-step-lint.service.ts", "src/services/testing/ui/preview/api/intent-step-lint.md"],
-  ["src/services/testing/ui/preview/locator-plan-builder.service.ts", "src/services/testing/ui/preview/api/locator-plan-builder.md"],
-  ["src/services/testing/ui/preview/step-readiness.service.ts", "src/services/testing/ui/preview/api/step-readiness.md"],
-  ["src/services/testing/ui/preview/dom-analysis-extractor.service.ts", "src/services/testing/ui/preview/api/dom-analysis-extractor.md"],
-  ["src/services/testing/ui/preview/preview-session.service.ts", "src/services/testing/ui/preview/api/preview-session.md"],
-  ["src/websocket/handlers/preview.handler.ts", "src/services/testing/ui/preview/api/preview-handler.md"],
-];
+const { SERVICE_MAP, FOLDER_MAP } = require("./doc-map.js");
 
 function readStdin() {
   try {
@@ -99,24 +84,16 @@ function main() {
   if (editedPaths.length === 0) return;
 
   const reminders = [];
-
-  // Track which folders had at least one mapped service that was satisfied
-  // (touched both .ts and api/<service>.md OR only the api doc), so the
-  // folder-level reminder can be suppressed for those — the user is plainly
-  // already aware they're working on documented code.
   const foldersWithSatisfiedService = new Set();
 
-  // Service-level checks (most specific)
+  // Service-level checks
   for (const [tsFile, apiDoc] of SERVICE_MAP) {
     const touchedTs = editedPaths.some((p) => p.endsWith(tsFile));
     if (!touchedTs) continue;
     const touchedDoc = editedPaths.some((p) => p.endsWith(apiDoc));
-
-    // Find the folder this service belongs to (if any in FOLDER_MAP)
     const owningFolder = FOLDER_MAP.find(([folder]) => tsFile.includes(folder));
 
     if (touchedDoc) {
-      // Doc was updated — suppress folder reminder for this folder
       if (owningFolder) foldersWithSatisfiedService.add(owningFolder[0]);
       continue;
     }
@@ -125,18 +102,15 @@ function main() {
       `[structure] You edited ${tsFile} this turn but did not update ${apiDoc}. ` +
         `If a public method was added/renamed/changed signature, side-effect changed, new invariant, or constant value changed — update the API doc in this same turn.`
     );
-    // Service reminder counts as covering the folder concern too
     if (owningFolder) foldersWithSatisfiedService.add(owningFolder[0]);
   }
 
-  // Folder-level checks (only fire when no mapped service for the folder was touched)
+  // Folder-level checks
   for (const [folder, doc] of FOLDER_MAP) {
     const touchedFolder = editedPaths.some((p) => p.includes(folder));
     if (!touchedFolder) continue;
     const touchedDoc = editedPaths.some((p) => p.includes(doc));
     if (touchedDoc) continue;
-    // Suppress if a service in this folder already produced a reminder OR
-    // its service-level api doc was touched (intent signal).
     if (foldersWithSatisfiedService.has(folder)) continue;
     reminders.push(
       `[structure] You edited files in ${folder} this turn but did not update ${doc}. ` +

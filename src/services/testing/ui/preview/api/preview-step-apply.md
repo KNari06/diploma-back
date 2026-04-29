@@ -220,7 +220,7 @@ Service is stateless. Persistent state lives in:
 
 ## See also
 
-- [.claude/rules/wrong-element-debugging.md](../../../../../.claude/rules/wrong-element-debugging.md)
+- [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md)
 - [element-resolver.md](element-resolver.md)
 - [intent-step-lint.md](intent-step-lint.md)
 - [step-readiness.md](step-readiness.md)

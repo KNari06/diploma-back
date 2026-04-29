@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-commit hook for qai-backend.
+# Currently runs the preview/ doc-drift detector — warning only, never blocks.
+# To enable in your local clone:  git config core.hooksPath .githooks
+#
+# Add new checks here (lint, type-check, etc.) when needed.
+
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+if command -v node >/dev/null 2>&1; then
+  # Self-check first: warn if doc-map.js references non-existent files
+  # (catches renames/deletions before the drift check runs against stale paths).
+  node "$ROOT/.claude/hooks/validate-doc-maps.js" >/dev/null || true
+  node "$ROOT/.githooks/preview-doc-drift.js" || true
+else
+  # Node missing — skip the doc-drift checks rather than block the commit.
+  echo "[githooks] node not found; skipping preview-doc-drift check" >&2
+fi
+
+exit 0
