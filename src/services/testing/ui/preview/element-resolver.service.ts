@@ -38,6 +38,7 @@ import type {
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
+import { normalizeUrlForComparison } from './auto-wait-for.utils';
 
 const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
 const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
@@ -1451,12 +1452,51 @@ const llmSelectCache = new Map<string, { result: LlmSelectResult; createdAt: num
 const LLM_SELECT_CACHE_TTL_MS = ELEMENT_RESOLVER_CONFIG.llmCache.ttlMs;
 const LLM_SELECT_CACHE_MAX_SIZE = ELEMENT_RESOLVER_CONFIG.llmCache.maxSize;
 
+/**
+ * Coaching payload surfaced to the editor when the resolver couldn't
+ * confidently match. Two callers use this:
+ *   - Apply-mode no-match → frontend renders a red "no match — try X / Y"
+ *     hint near the description input
+ *   - Apply-mode partial match (confidence < 0.85) → frontend shows a soft
+ *     warning so the user knows the description could be tightened
+ *
+ * Designed to be fully advisory: callers that don't read this field
+ * keep their existing behaviour. All values are bounded and validated
+ * in backend before being added — the LLM cannot smuggle an arbitrarily
+ * long string or a hallucinated example label here.
+ */
+interface ResolverSuggestion {
+  /**
+   * Why we couldn't confidently pick. Drives the icon / wording on the
+   * frontend without forcing it to parse free text.
+   */
+  issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+  /**
+   * One-line user-facing explanation, in the SAME language as the user's
+   * INTENT. Capped at 200 chars in the post-processor.
+   */
+  hint: string;
+  /**
+   * Up to 3 candidate descriptions the user might have meant — pulled
+   * from candidates' visible labels. Each is validated against the
+   * candidate list (no hallucinations) and trimmed to 80 chars.
+   */
+  examples?: string[];
+}
+
 interface LlmSelectResult {
   status: 'resolved' | 'needs_clarification' | 'not_found';
   selectedRef: string | null;
   confidence: number;
   reason: string;
   alternativeRefs?: string[];
+  /**
+   * Optional coaching for the editor UI — present when the resolver
+   * either rejected a low-confidence pick or genuinely found no match.
+   * Always omitted on confident `resolved` results so a successful pick
+   * isn't muddied with warning chrome.
+   */
+  suggestion?: ResolverSuggestion;
   latencyMs: number;
   cacheHit: boolean;
   /** @internal LLM prompt sent (for trace) */
@@ -1700,6 +1740,62 @@ ${LLM_SHARED_RULES}
     - Has no semantic relationship to ANY candidate's label/text/role/icon
     Forcing a match on irrelevant input is WORSE than returning null —
     the user will see no-match feedback and refine their intent.
+
+21. INTENT QUALITY ASSESSMENT (informs confidence + suggestion):
+    Before picking, classify the user's INTENT into one of three buckets.
+    The classification is internal — you don't emit a label, but it
+    governs your confidence and whether you emit a "suggestion".
+
+    - SPECIFIC: contains a unique anchor — exact label/text fragment,
+      icon name, role + position together, identifier-shaped value, or
+      a phrase that can only describe one element on the page.
+      Examples: "кнопка Сохранить", "settings cog in header",
+      "carousel next arrow", "MAT-SMART курс карточка".
+      → Confident pick allowed (≥0.75 if a candidate matches).
+
+    - GENERIC: refers to an element class without a specifier.
+      Examples: "кнопка", "ссылка", "icon", "input field", "button".
+      Multiple candidates plausibly match.
+      → Cap confidence at 0.6. Emit suggestion (issue=GENERIC_INTENT)
+        listing the 3 most likely interpretations.
+
+    - VAGUE: positional or quantitative without a visual anchor.
+      Examples: "четвертая иконка", "first link", "the third button",
+      "последняя кнопка".
+      → Cap confidence at 0.7 even with a strong positional candidate.
+        Emit suggestion (issue=VAGUE_INTENT) recommending the user add
+        a label/role/section so the locator survives layout changes.
+
+    Action-words at the start ("нажать на", "click", "press", "выбрать")
+    are stripped mentally — focus on what's being acted upon.
+
+22. SUGGESTION OUTPUT (UX assistance for ambiguous / no-match):
+    When the result would be:
+      • ref=null (no candidate matches the intent), OR
+      • a low-confidence pick (<0.7), OR
+      • intent classified as GENERIC / VAGUE,
+    ALSO emit a "suggestion" object alongside the usual fields.
+
+    Format:
+      "suggestion": {
+        "issue": "NO_MATCH" | "AMBIGUOUS" | "GENERIC_INTENT" | "VAGUE_INTENT",
+        "hint": "<one short sentence in INTENT's language>",
+        "examples": ["<label1>", "<label2>", "<label3>"]
+      }
+
+    Rules for the fields:
+      • hint: matches the language/script of INTENT. RU → RU, KZ → KZ,
+        EN → EN, ZH → ZH. ≤140 chars. No prose, no apology, just the
+        actionable advice ("Уточни описание: укажи текст карточки или
+        раздел").
+      • examples: 1–3 STRINGS that already appear as visible text on a
+        candidate (label / text / ariaLabel / placeholder). Never
+        invent — if no candidate visibly looks like what the user
+        described, emit examples=[] (empty list is fine).
+      • Reflect actual candidates, not idealized possibilities.
+
+    On confident matches (≥0.75 with a clear winner), DO NOT emit
+    suggestion — a successful pick should not carry a warning.
 
 20. CONFIDENCE CALIBRATION (Apply-mode — strict scoring):
     Anchor your number to the evidence, not your prose certainty:
@@ -2122,7 +2218,17 @@ async function selectElementWithLLM(params: {
   // biases toward picking, apply allows null). Sharing cache slots between
   // them would leak heal's "always-pick" answers into apply (where null is
   // the right answer for gibberish) and vice versa.
-  const cacheKey = `${mode}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${bhDigest}|${candidates.map(c => c.node.ref).join(',')}`;
+  //
+  // V23 (April 2026): include normalized URL (origin + pathname, no query /
+  // hash / trailing slash) so two different pages with structurally similar
+  // candidate sets can't collide on the same cache slot. pageSignature is
+  // a strong DOM fingerprint already, but in SPAs that share component
+  // chrome (header / nav / footer) the visible refs and content hash can
+  // align by accident — adding URL eliminates that whole class of cross-page
+  // cache leaks at zero performance cost (same URL → same key, hit rate
+  // unchanged for typical Editor + Apply All flows).
+  const urlKey = (() => { try { return normalizeUrlForComparison(pageUrl); } catch { return pageUrl || ''; } })();
+  const cacheKey = `${mode}|${urlKey}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${bhDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
     cacheMetrics.inc('llm-select', 'hit');
@@ -2417,6 +2523,14 @@ Select the single best matching element, or return ref=null if the intent does n
       confidence?: number;
       reason?: string;
       alternatives?: string[];
+      // V23: optional coaching payload — see LLM prompt rule 22.
+      // Validated below (issue allow-list, hint length cap, examples
+      // each substring-validated against a candidate's visible text).
+      suggestion?: {
+        issue?: string;
+        hint?: string;
+        examples?: string[];
+      };
     } | null;
     if (!parsed) {
       // Repair attempts exhausted — surface as a soft failure so the caller
@@ -2427,6 +2541,124 @@ Select the single best matching element, or return ref=null if the intent does n
       });
       throw new Error('LLM response could not be parsed as JSON');
     }
+
+    // Sanitizer / validator for the LLM-emitted suggestion. The LLM is
+    // strongly instructed (rule 22) but not guaranteed — it can:
+    //   • emit hallucinated example labels that don't appear on any
+    //     candidate ("попробуй 'Save changes'" when the page has none);
+    //   • return arbitrarily long strings;
+    //   • emit issue codes outside our enum.
+    // We accept only validated values; the caller can also synthesize a
+    // suggestion from scratch when LLM omitted it (see the resolved /
+    // not_found branches below).
+    const ALLOWED_ISSUES: ReadonlySet<ResolverSuggestion['issue']> = new Set<ResolverSuggestion['issue']>(
+      ['NO_MATCH', 'AMBIGUOUS', 'GENERIC_INTENT', 'VAGUE_INTENT', 'LOW_CONFIDENCE'],
+    );
+    const candidateLabels: string[] = candidates
+      .map((c) => (
+        c.node.labelText
+        || c.node.ariaLabel
+        || c.node.text
+        || c.node.placeholder
+        || c.node.title
+        || ''
+      ).trim())
+      .filter((l) => l.length > 0);
+    const validateExamples = (raw: unknown): string[] => {
+      if (!Array.isArray(raw)) return [];
+      const out: string[] = [];
+      for (const item of raw) {
+        if (typeof item !== 'string') continue;
+        const trimmed = item.trim().slice(0, 80);
+        if (trimmed.length < 2) continue;
+        // Anti-hallucination: the example MUST appear (case-insensitive,
+        // partial) in some candidate's visible text. Otherwise the LLM
+        // invented a label and we drop it. Substring-either-way to allow
+        // either side to be the longer one (LLM may shorten "МАТ-SMART
+        // ЖЕЛТОҚСАН Т. Бекнұр" → "МАТ-SMART").
+        const trimmedLc = trimmed.toLowerCase();
+        const grounded = candidateLabels.some((l) => {
+          const lc = l.toLowerCase();
+          return lc.includes(trimmedLc) || trimmedLc.includes(lc);
+        });
+        if (grounded) out.push(trimmed);
+        if (out.length >= 3) break;
+      }
+      return out;
+    };
+    const sanitizeLlmSuggestion = (
+      raw: typeof parsed.suggestion,
+    ): ResolverSuggestion | undefined => {
+      if (!raw || typeof raw !== 'object') return undefined;
+      const issueRaw = typeof raw.issue === 'string' ? raw.issue.toUpperCase() : '';
+      const issue = (ALLOWED_ISSUES.has(issueRaw as ResolverSuggestion['issue'])
+        ? issueRaw
+        : 'NO_MATCH') as ResolverSuggestion['issue'];
+      const hint = typeof raw.hint === 'string'
+        ? raw.hint.replace(/\s+/g, ' ').trim().slice(0, 200)
+        : '';
+      const examples = validateExamples(raw.examples);
+      // No usable content → drop the suggestion entirely; let the caller
+      // synthesize a backend-side fallback if it still wants to coach.
+      if (!hint && examples.length === 0) return undefined;
+      return { issue, hint, examples: examples.length > 0 ? examples : undefined };
+    };
+
+    // Backend-side suggestion synthesizer for cases where the LLM omitted
+    // the field but we still want to help the user. Picks the top-3
+    // candidate labels by visible text length (longer = more specific
+    // anchor) and emits a generic-language hint. Never invents text —
+    // every example is a real candidate label.
+    const synthesizeFallbackSuggestion = (
+      issue: ResolverSuggestion['issue'],
+    ): ResolverSuggestion | undefined => {
+      const ranked = [...candidateLabels]
+        .filter((l) => l.length >= 2 && l.length <= 80)
+        // Prefer mid-length labels (8–60 chars) over very short generic
+        // ones ("OK", "Cancel") and over walls of text. Mid range tends
+        // to be the most useful for "you might have meant..." prompts.
+        .sort((a, b) => {
+          const score = (s: string) => {
+            const len = s.length;
+            if (len >= 8 && len <= 60) return 0;     // best
+            if (len < 8) return 1;
+            return 2;                                 // very long
+          };
+          return score(a) - score(b);
+        })
+        .slice(0, 3);
+      if (ranked.length === 0) return undefined;
+      // Detect dominant script of INTENT to produce a same-language hint.
+      // Heuristic: any Cyrillic char → Russian/Kazakh wording; otherwise
+      // English. We don't try to detect Kazakh vs Russian — Russian
+      // wording reads correctly to KZ users and avoids picking the
+      // wrong letter set on mixed pages.
+      const hasCyrillic = /[\p{Script=Cyrillic}]/u.test(intentText);
+      const issueHints: Record<ResolverSuggestion['issue'], { ru: string; en: string }> = {
+        NO_MATCH: {
+          ru: 'Не нашёл такой элемент. Уточни описание — приведи видимый текст или раздел.',
+          en: 'No element matched. Refine: include visible text or section.',
+        },
+        AMBIGUOUS: {
+          ru: 'Несколько подходящих элементов. Добавь раздел или уникальный текст.',
+          en: 'Several candidates fit. Add a section or a unique label.',
+        },
+        GENERIC_INTENT: {
+          ru: 'Описание слишком общее. Укажи текст или роль (кнопка / ссылка / иконка с подписью).',
+          en: 'Description is too generic. Add visible text or specify role.',
+        },
+        VAGUE_INTENT: {
+          ru: 'Положение без якоря ненадёжно при изменении вёрстки. Назови элемент по тексту/роли.',
+          en: 'Positional descriptions break when layout shifts. Reference text/role instead.',
+        },
+        LOW_CONFIDENCE: {
+          ru: 'Нашёл, но не уверен. Уточни описание для надёжного матча.',
+          en: 'Match was weak. Tighten the description for a stable locator.',
+        },
+      };
+      const hint = (hasCyrillic ? issueHints[issue].ru : issueHints[issue].en);
+      return { issue, hint, examples: ranked };
+    };
 
     // Validate ref against candidate list
     const validRefs = new Set(candidates.map(c => c.node.ref));
@@ -2561,6 +2793,72 @@ Select the single best matching element, or return ref=null if the intent does n
         latencyMs: Date.now() - startTime,
         cacheHit: false,
       };
+    }
+
+    // V23 — attach an advisory suggestion when the resolver couldn't
+    // confidently pick. Three branches feed into this:
+    //   1. Apply-mode rejection (low confidence OR off-semantic): we
+    //      know what the LLM tried to pick — surface that label as one
+    //      example, plus 2 more from candidates so the user has options.
+    //   2. needs_clarification: LLM gave alternatives — those go straight
+    //      into examples. No need to invent.
+    //   3. Bare not_found: LLM said "nothing fits" — synthesize from
+    //      candidate labels so the editor still has something to show.
+    // Heal-mode never gets a suggestion: there the resolver is bidding
+    // hard to keep a regression alive, and a "you might have meant..."
+    // chip in the run logs would be noise.
+    //
+    // The LLM-emitted suggestion (if any) takes precedence after
+    // sanitization; we only synthesize when LLM omitted or its payload
+    // failed validation. Resolver consumers that ignore this field
+    // continue to work — the result type only adds it as optional.
+    if (mode !== 'heal') {
+      const llmSuggestion = sanitizeLlmSuggestion(parsed.suggestion);
+      if (result.status === 'not_found') {
+        const synthesized = llmSuggestion
+          ?? synthesizeFallbackSuggestion(
+            // The semantic-floor branch already established why; we tag
+            // it `LOW_CONFIDENCE` so the UI can render a softer warning
+            // ("found something but uncertain") vs the harder NO_MATCH.
+            (parsed.ref && validRefs.has(parsed.ref)) ? 'LOW_CONFIDENCE' : 'NO_MATCH',
+          );
+        if (synthesized) result = { ...result, suggestion: synthesized };
+      } else if (result.status === 'needs_clarification') {
+        // For ambiguous, prefer LLM-supplied examples; if missing, use
+        // the alternativeRefs' labels — those ARE candidates so they're
+        // automatically grounded.
+        const altLabels: string[] = (result.alternativeRefs || [])
+          .slice(0, 3)
+          .map((ref) => {
+            const c = candidates.find((cc) => cc.node.ref === ref);
+            return (
+              c?.node.labelText
+              || c?.node.ariaLabel
+              || c?.node.text
+              || c?.node.placeholder
+              || c?.node.title
+              || ''
+            ).trim().slice(0, 80);
+          })
+          .filter((l) => l.length > 0);
+        const synthesized: ResolverSuggestion | undefined = llmSuggestion
+          ?? (altLabels.length > 0
+            ? {
+                issue: 'AMBIGUOUS',
+                hint: /[\p{Script=Cyrillic}]/u.test(intentText)
+                  ? 'Несколько подходящих — выбери из вариантов или уточни описание.'
+                  : 'Several candidates fit — pick one or refine the description.',
+                examples: altLabels,
+              }
+            : undefined);
+        if (synthesized) result = { ...result, suggestion: synthesized };
+      } else if (result.status === 'resolved' && result.confidence < 0.85) {
+        // Soft warning for "weak resolved" — the user got a pick but the
+        // resolver wasn't sure. Surface only if the LLM volunteered a
+        // suggestion (per rule 22) — don't synthesize for these because
+        // a successful pick shouldn't be drowned in coaching noise.
+        if (llmSuggestion) result = { ...result, suggestion: llmSuggestion };
+      }
     }
 
     // Cache result
@@ -3494,6 +3792,11 @@ export async function resolveElement(params: {
             cacheHit,
             degradedMode: false,
             resolverPath: 'llm',
+            // V23: surface advisory coaching when LLM volunteered it on
+            // a low-confidence pick. selectElementWithLLM only attaches
+            // suggestion to resolved when confidence < 0.85, so this is
+            // already gated correctly upstream.
+            ...(llmResult.suggestion ? { suggestion: llmResult.suggestion } : {}),
             ..._diag,
             _llmTrace: llmTrace,
           };
@@ -3544,6 +3847,10 @@ export async function resolveElement(params: {
             cacheHit,
             degradedMode: false,
             resolverPath: 'llm',
+            // V23: forward AMBIGUOUS coaching so the editor can show the
+            // "Several candidates fit — pick one or refine" hint with
+            // grounded examples derived from alternativeRefs.
+            ...(llmResult.suggestion ? { suggestion: llmResult.suggestion } : {}),
             ..._diag,
             _llmTrace: llmTrace,
           };
@@ -3779,6 +4086,11 @@ export async function resolveElement(params: {
           degradedMode: false,
           needsAiFallback: true,
           ...(llmNotFoundSuggestions.length > 0 ? { alternativesIncluded: true } : {}),
+          // V23: forward NO_MATCH coaching (LLM-supplied or backend-synthesized)
+          // so the editor can render "Try refining: <example1>, <example2>...".
+          // selectElementWithLLM always attaches a suggestion to not_found
+          // results, so this propagates the user's actionable next step.
+          ...(llmResult.suggestion ? { suggestion: llmResult.suggestion } : {}),
           ..._diag,
           _llmTrace: llmTrace,
         };

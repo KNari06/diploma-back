@@ -62,8 +62,21 @@ export const AI_TASK_MODELS = {
    * prompts, causing Find-by-description to time out on first click.
    */
   disambiguation: 'gemini-2.5-flash-lite' as const,
-  /** Intent step linting (element resolution) */
-  intentLint: AI_MODELS.fast,
+  /**
+   * Intent step linting — clarification messages (NOT element selection).
+   *
+   * V23 (April 2026): switched from gpt-5.4-mini to gemini-2.5-flash-lite for
+   * the same reason as `disambiguation`: gpt's hidden chain-of-thought made
+   * lint latency unpredictable (1.5-14s observed in production logs on the
+   * "Find using desc." button), causing the LLM circuit breaker to open and
+   * masking real errors. gemini-flash-lite gives predictable 300-800ms,
+   * native JSON mode, and equal-or-better multilingual handling for the
+   * RU/KZ/EN clarification copy this prompt produces. Element SELECTION
+   * (where reasoning matters) stays on the smarter model via the
+   * disambiguation path; this slot is only ever asked to translate a
+   * scenario classification into a localized one-sentence message.
+   */
+  intentLint: 'gemini-2.5-flash-lite' as const,
   /** AI check assertion evaluation */
   aiCheck: AI_MODELS.fast,
   /** AI check with screenshot (needs vision) */

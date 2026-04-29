@@ -19,6 +19,12 @@ import type { Page } from 'playwright';
 import type { LiteElement, LiteSnapshot, ObstacleFact } from '../lite-types';
 import { VisualStability } from './visual-stability';
 
+// April 2026: Module-level throttle map for [SNAPSHOT_REJECTS] logging.
+// Snapshot is collected every 500ms by recorder/preview, so per-tick logging
+// would be overwhelming. Logging once per ~30s per URL keeps the signal
+// useful for offline analysis without flooding app.log.
+const SNAPSHOT_REJECT_LOG_LAST = new Map<string, number>();
+
 export class SnapshotCollector {
   /**
    * Collect page snapshot with parent context
@@ -836,6 +842,33 @@ export class SnapshotCollector {
          */
         const MAX_SECONDARY_ELEMENTS = 300; // Cap to prevent flooding from global scan (raised from 120 for large SPAs)
 
+        // April 2026: Tier-2 (framework + cursor:pointer walk) rejection counters.
+        // Most subtle losses happen here — wrappers without text, oversized
+        // containers, custom elements without size. We need data to know which
+        // condition is fired most often before relaxing it.
+        const __tier2Rejects = {
+          alreadyCollected: 0, // duplicate of primary pass
+          hidden: 0,           // display:none / visibility:hidden / opacity<0.1
+          tooSmall: 0,         // < 5×5
+          tooLarge: 0,         // > 600×600 (likely layout wrapper)
+          noFwBinding: 0,      // exhausted all framework checks + no cursor:pointer signal
+          capReached: 0,       // hit MAX_SECONDARY_ELEMENTS
+        };
+        const __tier2RejectSamples: Record<string, string[]> = {
+          alreadyCollected: [], hidden: [], tooSmall: [], tooLarge: [], noFwBinding: [], capReached: [],
+        };
+        const __pushTier2Sample = (bucket: string, el: Element) => {
+          const arr = __tier2RejectSamples[bucket];
+          if (!arr || arr.length >= 3) return;
+          try {
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            const id = el.getAttribute('id') || '';
+            const cls = (el.getAttribute('class') || '').slice(0, 40);
+            arr.push(`${tag}${role ? `[role=${role}]` : ''}${id ? `#${id.slice(0, 30)}` : ''}${cls ? `.${cls}` : ''}`);
+          } catch { /* ignore */ }
+        };
+
         const collectFrameworkInteractiveElements = (
           container: Element,
           alreadyCollected: Set<Element>,
@@ -846,25 +879,47 @@ export class SnapshotCollector {
           let added = 0;
           for (const el of candidates) {
             // Q2 FIX: Hard cap on secondary pass elements
-            if (added >= MAX_SECONDARY_ELEMENTS) break;
+            if (added >= MAX_SECONDARY_ELEMENTS) {
+              __tier2Rejects.capReached++;
+              break;
+            }
 
             // Q3 FIX: Skip the container element itself — it's a wrapper, not a clickable target
             if (el === container) continue;
 
             // Skip if already collected by primary pass
-            if (alreadyCollected.has(el)) continue;
+            if (alreadyCollected.has(el)) {
+              __tier2Rejects.alreadyCollected++;
+              continue;
+            }
 
             // Skip non-visible elements early
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-            if (parseFloat(style.opacity) < 0.1) continue;
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              __tier2Rejects.hidden++;
+              __pushTier2Sample('hidden', el);
+              continue;
+            }
+            if (parseFloat(style.opacity) < 0.1) {
+              __tier2Rejects.hidden++;
+              __pushTier2Sample('hidden', el);
+              continue;
+            }
 
             // Skip elements too small to be interactive (lowered from 10 to catch icon buttons)
             const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) continue;
+            if (rect.width < 5 || rect.height < 5) {
+              __tier2Rejects.tooSmall++;
+              __pushTier2Sample('tooSmall', el);
+              continue;
+            }
 
             // Skip structural/container elements that are too large (likely wrappers, not clickables)
-            if (rect.width > 600 && rect.height > 600) continue;
+            if (rect.width > 600 && rect.height > 600) {
+              __tier2Rejects.tooLarge++;
+              __pushTier2Sample('tooLarge', el);
+              continue;
+            }
 
             // ── Tier 1: Framework event bindings (high confidence) ──
             let hasFrameworkBinding = false;
@@ -1087,6 +1142,15 @@ export class SnapshotCollector {
               addedElements.add(el);
               elementShadowDepth.set(el, 0);
               added++;
+            } else {
+              // Element passed visibility/size but exhausted every framework
+              // signal (no React/Vue/Angular/Alpine/HTMX/Stimulus/jQuery
+              // hooks, no cursor:pointer with text/id/icon, no custom-tag
+              // shape). This is the bucket to watch: real losses live here
+              // (Web Components without text, role-less divs with delegated
+              // listeners on document, etc.).
+              __tier2Rejects.noFwBinding++;
+              __pushTier2Sample('noFwBinding', el);
             }
           }
           return addedElements;
@@ -1196,13 +1260,50 @@ export class SnapshotCollector {
         const __forEachErrors: string[] = [];
         let __forEachSkipCount = 0;
 
+        // April 2026: Per-rule rejection counters for the main forEach pass.
+        // Lets us answer "what's getting filtered out and why" without re-running
+        // with custom logging. Counters are cheap (just integers); sample rejects
+        // are tag/role snippets to spot patterns (e.g. all Web Components dropped
+        // by aria-hidden, or all svg dropped by min-size). Capped at 3 each to
+        // avoid bloating debugStats payload.
+        const __mainRejects = {
+          hidden: 0,         // display:none / visibility:hidden
+          opacity: 0,        // opacity < 0.01
+          ariaHidden: 0,     // inside non-root aria-hidden subtree
+          pointerEvents: 0,  // pointer-events:none
+          tooSmall: 0,       // < 5×5
+          offViewport: 0,    // outside visible viewport
+        };
+        const __mainRejectSamples: Record<string, string[]> = {
+          hidden: [], opacity: [], ariaHidden: [], pointerEvents: [], tooSmall: [], offViewport: [],
+        };
+        const __pushRejectSample = (bucket: string, el: Element) => {
+          const arr = __mainRejectSamples[bucket];
+          if (!arr || arr.length >= 3) return;
+          try {
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            const id = el.getAttribute('id') || '';
+            const cls = (el.getAttribute('class') || '').slice(0, 40);
+            arr.push(`${tag}${role ? `[role=${role}]` : ''}${id ? `#${id.slice(0, 30)}` : ''}${cls ? `.${cls}` : ''}`);
+          } catch { /* ignore */ }
+        };
+
         // Process each unique element (including shadow DOM elements)
         uniqueElements.forEach((el: Element) => {
           try {
             // Skip hidden elements
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return;
-            if (parseFloat(style.opacity) < 0.01) return; // 0.01 instead of 0.1: catch fade-in animations
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              __mainRejects.hidden++;
+              __pushRejectSample('hidden', el);
+              return;
+            }
+            if (parseFloat(style.opacity) < 0.01) { // 0.01 instead of 0.1: catch fade-in animations
+              __mainRejects.opacity++;
+              __pushRejectSample('opacity', el);
+              return;
+            }
             // Skip elements inside aria-hidden containers (not accessible to users).
             // ✅ FIX: Many React/Vue apps set aria-hidden="true" on #root when a modal opens.
             // Elements inside active modal, visible dialog, or fallback modal are always kept.
@@ -1225,15 +1326,25 @@ export class SnapshotCollector {
                    Element passed visibility checks above (not display:none, not visibility:hidden).
                    Let it through — downstream buildAllowedSets soft-penalty + LLM will handle. */
               } else {
+                __mainRejects.ariaHidden++;
+                __pushRejectSample('ariaHidden', el);
                 return; // Lower-level aria-hidden — genuinely hidden block
               }
             }
             // Skip non-interactive elements (pointer-events:none = can't be clicked)
-            if (style.pointerEvents === 'none') return;
+            if (style.pointerEvents === 'none') {
+              __mainRejects.pointerEvents++;
+              __pushRejectSample('pointerEvents', el);
+              return;
+            }
 
             // Skip if too small
             const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) return;
+            if (rect.width < 5 || rect.height < 5) {
+              __mainRejects.tooSmall++;
+              __pushRejectSample('tooSmall', el);
+              return;
+            }
 
             // Skip elements that are fully outside the visible viewport
             // @ts-expect-error - window available in browser context
@@ -1242,10 +1353,18 @@ export class SnapshotCollector {
             const vh = window.innerHeight;
             if (__mc.fullPage) {
               // fullPage: skip only horizontally off-screen elements
-              if (rect.right < 0 || rect.left > vw) return;
+              if (rect.right < 0 || rect.left > vw) {
+                __mainRejects.offViewport++;
+                __pushRejectSample('offViewport', el);
+                return;
+              }
             } else {
               // default: skip everything outside viewport
-              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+                __mainRejects.offViewport++;
+                __pushRejectSample('offViewport', el);
+                return;
+              }
             }
 
             // ═══════════════════════════════════════════════════════════════
@@ -2490,6 +2609,17 @@ export class SnapshotCollector {
           // be diagnosed without code spelunking.
           forEachSkipCount: __forEachSkipCount,
           forEachErrors: __forEachErrors,
+          // April 2026: per-rule rejection counters for the main forEach pass
+          // and the Tier-2 (framework + cursor:pointer) walk. Lets us answer
+          // "what's getting filtered out and why" data-driven, instead of
+          // guessing which rule to relax. Sample arrays carry up to 3
+          // tag/role/id snippets per bucket to spot patterns.
+          rejects: {
+            main: __mainRejects,
+            mainSamples: __mainRejectSamples,
+            tier2: __tier2Rejects,
+            tier2Samples: __tier2RejectSamples,
+          },
         };
 
         return {
@@ -2528,6 +2658,40 @@ export class SnapshotCollector {
         });
       }
 
+      // April 2026: Periodic rejection summary at debug level. Throttled to
+      // once per ~30s per page so 500ms-tick recordings don't flood logs.
+      // Goal: collect data on which filter rule is firing most often, so
+      // future relaxation of snapshot-collector heuristics is data-driven.
+      // Read with: `grep '[SNAPSHOT_REJECTS]' app.log | jq` over a few days.
+      try {
+        const debugStats = (snapshot as any).__debugStats;
+        const rejects = debugStats?.rejects;
+        if (rejects && snapshot.elements.length > 0) {
+          const pageKey = (snapshot.url || '').split('?')[0].slice(0, 200);
+          const now = Date.now();
+          const last = SNAPSHOT_REJECT_LOG_LAST.get(pageKey) || 0;
+          if (now - last > 30_000) {
+            SNAPSHOT_REJECT_LOG_LAST.set(pageKey, now);
+            // Cap the map so a long-running session doesn't leak unbounded URLs.
+            if (SNAPSHOT_REJECT_LOG_LAST.size > 200) {
+              const oldestKey = SNAPSHOT_REJECT_LOG_LAST.keys().next().value;
+              if (oldestKey !== undefined) SNAPSHOT_REJECT_LOG_LAST.delete(oldestKey);
+            }
+            logger.debug('[SNAPSHOT_REJECTS] filter rejection summary', {
+              url: pageKey,
+              kept: snapshot.elements.length,
+              totalDom: debugStats.totalDomElements,
+              uniqueScanned: debugStats.uniqueElementsCount,
+              main: rejects.main,
+              mainSamples: rejects.mainSamples,
+              tier2: rejects.tier2,
+              tier2Samples: rejects.tier2Samples,
+              iframes: debugStats.iframeRejects,
+            });
+          }
+        }
+      } catch { /* logging is best-effort */ }
+
       // ═══════════════════════════════════════════════════════════════════════
       // IFRAME ELEMENT COLLECTION (same-origin only)
       // ═══════════════════════════════════════════════════════════════════════
@@ -2542,19 +2706,33 @@ export class SnapshotCollector {
               frameName = frame.name() || 'iframe';
             }
 
-            const iframeElements = await frame.evaluate((fName: string) => {
+            const iframeResult = await frame.evaluate((fName: string) => {
               const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="option"], [role="combobox"], [role="switch"], [role="menuitem"], [role="slider"], [role="searchbox"], [role="textbox"], [role="gridcell"], [role="rowheader"], [role="columnheader"], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
               const els: any[] = [];
               let idx = 0;
               const MAX_IFRAME_ELEMENTS = 50;
+              // April 2026: minimal iframe rejection counters. iframes are
+              // already a fallback path; we just want to know if a lot of
+              // matches got filtered before MAX_IFRAME_ELEMENTS could even
+              // bite — that signals the cap is wrong, not the filter.
+              const rejects = { hidden: 0, tooSmall: 0, capReached: 0 };
 
               document.querySelectorAll(selectors).forEach((el) => {
-                if (idx >= MAX_IFRAME_ELEMENTS) return;
+                if (idx >= MAX_IFRAME_ELEMENTS) {
+                  rejects.capReached++;
+                  return;
+                }
                 const htmlEl = el as HTMLElement;
                 const rect = htmlEl.getBoundingClientRect();
                 const style = window.getComputedStyle(htmlEl);
-                if (style.display === 'none' || style.visibility === 'hidden') return;
-                if (rect.width < 5 || rect.height < 5) return;
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  rejects.hidden++;
+                  return;
+                }
+                if (rect.width < 5 || rect.height < 5) {
+                  rejects.tooSmall++;
+                  return;
+                }
 
                 const tag = htmlEl.tagName.toLowerCase();
                 const role = (htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button')).replace(/["']/g, '').trim();
@@ -2575,11 +2753,22 @@ export class SnapshotCollector {
                 });
                 idx++;
               });
-              return els;
+              return { els, rejects, frameName: fName };
             }, frameName);
 
+            const iframeElements = iframeResult.els;
             if (iframeElements.length > 0) {
               (snapshot as any).elements.push(...iframeElements);
+            }
+            // Attach iframe rejection stats so the debug logger can see them.
+            const stats = (snapshot as any).__debugStats;
+            if (stats) {
+              if (!stats.iframeRejects) stats.iframeRejects = [];
+              stats.iframeRejects.push({
+                frame: iframeResult.frameName,
+                collected: iframeElements.length,
+                rejects: iframeResult.rejects,
+              });
             }
           } catch {
             // Cross-origin or detached iframe — skip silently

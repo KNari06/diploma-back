@@ -1017,6 +1017,20 @@ export interface LintResult {
   interpretation?: string;
   /** V3: Clarification question for user (in user's language) */
   clarificationQuestion?: string;
+  /**
+   * V23: Resolver coaching for the editor — present when the LLM
+   * couldn't confidently pick (no_match / ambiguous / weak resolved).
+   * The frontend renders it as a hint near the description input
+   * (red on no_match, yellow on ambiguous, soft warning on weak).
+   * Always omitted on confident `resolved` results so a green badge
+   * stays clean. Examples are validated against actual candidate
+   * labels — no hallucinations are allowed through.
+   */
+  suggestion?: {
+    issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+    hint: string;
+    examples?: string[];
+  };
 
   // ═══════════════════════════════════════════════════════════════════════════
   // LLM-based resolver fields

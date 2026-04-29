@@ -5,6 +5,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
+import { logIntentResolveApply } from './intent-resolve-audit';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Frame, FrameLocator, Locator, Page } from 'playwright';
@@ -261,6 +262,9 @@ function buildSyntheticFingerprintFromNode(node: InteractiveNode): TargetFingerp
   if (Object.keys(ariaState).length > 0) fp.ariaState = ariaState;
   return fp;
 }
+
+// Apply-time intent→element audit lives in ./intent-resolve-audit.ts so the
+// lint service can write through the same sink without circular imports.
 
 const ACTION_TIMEOUT = STEP_APPLY_CONFIG.actionTimeoutMs;
 const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
@@ -3969,6 +3973,7 @@ export class PreviewStepApplyService {
         pageRef: params.pageRef,
         userId,
         forceFreshSnapshot: true,
+        auditTrigger: 'apply_prelint',
       });
       try {
         const traceForLint = EditorTraceService.get(previewSessionId);
@@ -4368,6 +4373,10 @@ export class PreviewStepApplyService {
           // V2: Post-action verification for state-aware actions
           let verified = false;
           let clickEffectSignal: ClickEffectSignal | undefined;
+          // V23: marks a manual-add no-effect click that passed via soft
+          // validation. Used downstream to skip compiled plan write (we
+          // don't want next run's strict path to fail on the same legit no-op).
+          let softPassedOnNoEffect = false;
           const stateChange: ApplyResult['stateChange'] = undefined;
 
           if (STATE_VERIFIABLE_ACTIONS.has(stepDraft.type) && candidate.ref) {
@@ -4446,24 +4455,94 @@ export class PreviewStepApplyService {
           // immediately; the Run loop's step-level retry already gives us a
           // second attempt with disabled cache + relaxed timeout.
           if (stepDraft.type === 'click' && !verified && clickEffectSignal === 'none') {
-            const clickNoEffectMsg = '[click-no-effect] Click did not change page state (URL, dialog, ARIA, focus). The element may be obstructed by an overlay, or the click handler did nothing.';
-            trace?.writeActionResult({
-              stepId: stepDraft.id,
-              stepType: stepDraft.type,
-              success: false,
-              durationMs: actionDur,
-              error: 'click-no-effect',
-            });
-            return {
-              success: false,
-              error: clickNoEffectMsg,
-              attempts,
-              highlight: [{
-                ref: candidate.ref,
-                boundingBox: candidate.boundingBox,
-                type: 'error' as const,
-              }],
-            };
+            // V23 (April 2026): SOFT validation for manual-add steps.
+            //
+            // Class of legit no-effect clicks that this strict guard breaks:
+            //   - Self-link ("Главная" / "Explore" pointing to current page)
+            //   - Idempotent toggle (already-subscribed "Subscribe" button)
+            //   - Already-open accordion clicked again
+            //   - Anchor link to a section already scrolled into view
+            //
+            // For RECORDED steps we have ground truth (recordedFingerprint +
+            // future recordedClickEffect), so strict failure is correct: the
+            // recorded interaction DID change something, and live "none"
+            // means regression.
+            //
+            // For MANUAL-ADD steps (no recordedFingerprint, no compiled),
+            // we have no ground truth. The user authored the step by typing
+            // a description and the LLM picked a candidate. If the candidate:
+            //   • is a legitimate interactive element (button / a / role=button|link), AND
+            //   • LLM was confident (≥0.75), AND
+            //   • fingerprint comparison didn't say "mismatch" (i.e. nothing
+            //     suggests we hit the wrong element),
+            // then "none" is most likely a legitimate no-op. Pass with a
+            // warning surfaced via trace + lint; the user can inspect.
+            //
+            // This intentionally accepts a small false-negative rate (LLM
+            // picked the wrong but interactive element with high confidence
+            // by accident). The alternative — failing every Главная-style
+            // self-link — produces a much worse UX.
+            const isManualAdd = !stepDraft.recordedFingerprint && !stepDraft.compiled;
+            const candidateNode = candidate.node;
+            const isInteractiveTarget = !!candidateNode && (
+              candidateNode.tag === 'button'
+              || candidateNode.tag === 'a'
+              || candidateNode.role === 'button'
+              || candidateNode.role === 'link'
+              || candidateNode.role === 'menuitem'
+              || candidateNode.role === 'tab'
+              || candidateNode.tag === 'input'
+              || candidateNode.tag === 'summary'
+            );
+            const llmConfident = candidate.confidence >= 0.75;
+            // For manual-add we already gated on `!stepDraft.recordedFingerprint`
+            // via isManualAdd, so identity-audit signals (fingerprintMatch) don't
+            // exist on this code path. When the step has neither recorded
+            // fingerprint nor compiled plan, there's nothing to compare against —
+            // the only signals we have are interactivity + confidence.
+
+            if (isManualAdd && isInteractiveTarget && llmConfident) {
+              logger.info('[PREVIEW_APPLY] Manual-add no-effect click — soft pass', {
+                stepId: stepDraft.id,
+                candidateRef: candidate.ref,
+                candidateTag: candidateNode?.tag,
+                candidateRole: candidateNode?.role,
+                confidence: candidate.confidence,
+              });
+              trace?.writeActionResult({
+                stepId: stepDraft.id,
+                stepType: stepDraft.type,
+                success: true,
+                durationMs: actionDur,
+                ...(clickEffectSignal !== undefined ? { signal: clickEffectSignal + ' (soft pass)' } as any : {}),
+              });
+              // Mark verified so the rest of the pipeline proceeds normally.
+              // BUT: set `softPassedOnNoEffect` so we DON'T write a compiled
+              // plan / promote the step out of manual-add. Otherwise the next
+              // run would carry `compiled` and bypass this guard, falling back
+              // into the strict path and failing again on the same legit no-op.
+              verified = true;
+              softPassedOnNoEffect = true;
+            } else {
+              const clickNoEffectMsg = '[click-no-effect] Click did not change page state (URL, dialog, ARIA, focus). The element may be obstructed by an overlay, or the click handler did nothing.';
+              trace?.writeActionResult({
+                stepId: stepDraft.id,
+                stepType: stepDraft.type,
+                success: false,
+                durationMs: actionDur,
+                error: 'click-no-effect',
+              });
+              return {
+                success: false,
+                error: clickNoEffectMsg,
+                attempts,
+                highlight: [{
+                  ref: candidate.ref,
+                  boundingBox: candidate.boundingBox,
+                  type: 'error' as const,
+                }],
+              };
+            }
           }
 
           // Action genuinely succeeded — record the success result now (after
@@ -4483,7 +4562,13 @@ export class PreviewStepApplyService {
           // Use urlBeforeAction to record the context where element was found
           let compiled;
           let pageSignature: string | undefined;
-          if (candidate.node) {
+          // V23: skip compiled plan write when this run was a soft-pass on
+          // no-effect click. We're not confident the click did the right thing
+          // (we just trusted "interactive target + high LLM confidence"), so
+          // pinning a compiled plan would lock the step onto a possibly-wrong
+          // element AND promote it out of manual-add status, which would
+          // bypass this same soft-validation guard on the next run.
+          if (candidate.node && !softPassedOnNoEffect) {
             try {
               // Get pageSignature from session if available
               const session = sessionService.getSession(previewSessionId);
@@ -4506,6 +4591,10 @@ export class PreviewStepApplyService {
                 error: compileError instanceof Error ? compileError.message : String(compileError),
               });
             }
+          } else if (softPassedOnNoEffect) {
+            logger.debug('[PREVIEW_APPLY] Skipping compiled plan — soft pass on no-effect', {
+              stepId: stepDraft.id,
+            });
           }
 
           // Build resolution meta from lint result
@@ -4573,6 +4662,27 @@ export class PreviewStepApplyService {
               : null,
           );
 
+          // Diagnostic: capture user intent → resolved element pair so
+          // bisecting wrong-element regressions doesn't require a re-run.
+          // Written BEFORE the fake-success guard so we see what the resolver
+          // actually picked, even if we then reject it.
+          try {
+            logIntentResolveApply({
+              stepDraft,
+              candidate,
+              resolverPath: lintResult.resolverPath,
+              fingerprintMatch,
+              clickEffectSignal,
+              outcome: 'pass', // tentative; reject branches log again with their own outcome
+              url: urlBeforeAction,
+              attempts,
+              durationMs: actionDur,
+              resolverDegraded: lintResult.degradedMode,
+              topSimilarity: lintResult.topSimilarity,
+              candidatesCount: lintResult.candidates?.length,
+            });
+          } catch { /* never break apply on diagnostics */ }
+
           // Fake-success guard. The resolver landed on an element whose
           // identity does not line up with what the recorder captured, AND
           // the only thing that "verified" the click was a focus shift or
@@ -4609,6 +4719,23 @@ export class PreviewStepApplyService {
               recordedTestId: stepDraft.recordedFingerprint?.testIdAttr,
               clickEffectSignal,
             });
+            try {
+              logIntentResolveApply({
+                stepDraft,
+                candidate,
+                resolverPath: lintResult.resolverPath,
+                fingerprintMatch,
+                clickEffectSignal,
+                outcome: 'reject',
+                rejectReason: 'fingerprint-mismatch-weak-signal',
+                url: urlBeforeAction,
+                attempts,
+                durationMs: actionDur,
+                resolverDegraded: lintResult.degradedMode,
+                topSimilarity: lintResult.topSimilarity,
+                candidatesCount: lintResult.candidates?.length,
+              });
+            } catch { /* never break apply on diagnostics */ }
             trace?.writeActionResult({
               stepId: stepDraft.id,
               stepType: stepDraft.type,
@@ -4806,6 +4933,23 @@ export class PreviewStepApplyService {
               chosenTokens: Array.from(chosenTokens).slice(0, 5),
               tokenOverlap: overlap(recordedTokens, chosenTokens),
             });
+            try {
+              logIntentResolveApply({
+                stepDraft,
+                candidate,
+                resolverPath: lintResult.resolverPath,
+                fingerprintMatch,
+                clickEffectSignal,
+                outcome: 'reject',
+                rejectReason: `label-mismatch-weak-signal recorded=[${Array.from(recordedTokens).slice(0, 5).join(',')}] chosen=[${Array.from(chosenTokens).slice(0, 5).join(',')}]`,
+                url: urlBeforeAction,
+                attempts,
+                durationMs: actionDur,
+                resolverDegraded: lintResult.degradedMode,
+                topSimilarity: lintResult.topSimilarity,
+                candidatesCount: lintResult.candidates?.length,
+              });
+            } catch { /* never break apply on diagnostics */ }
             trace?.writeActionResult({
               stepId: stepDraft.id,
               stepType: stepDraft.type,
@@ -4902,6 +5046,7 @@ export class PreviewStepApplyService {
           if (
             stepDraft.type === 'click'
             && !stepDraft.recordedFingerprint
+            && !softPassedOnNoEffect  // V23: same rationale as compiled-plan guard above
             && candidate.node
           ) {
             const synthetic = buildSyntheticFingerprintFromNode(candidate.node);

@@ -1492,6 +1492,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         userId: ensuredUserId,
         includeAlternatives: !!includeAlternatives,
         forceFreshSnapshot: true,
+        // Editor-side lint: Find button + debounced auto-lint after typing.
+        // We can't tell them apart from this socket event alone, so use the
+        // generic 'find_button' label (covers both user-triggered moments).
+        auditTrigger: 'find_button',
       });
 
       // V5: Handle needs_clarification status
@@ -1554,6 +1558,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           clarificationQuestion: result.clarificationQuestion,
           alternativesIncluded: !!includeAlternatives,
           applyDisabled: true, // V5: Apply should be disabled for needs_clarification
+          // V23: forward AMBIGUOUS coaching so the editor renders an
+          // actionable hint alongside the alternatives picker.
+          ...(result.suggestion ? { suggestion: result.suggestion } : {}),
           timestamp: new Date().toISOString(),
         });
 

@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e 'const i=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\"));const p=(i.tool_input&&i.tool_input.file_path)||\"\";const map=[[\"src/services/testing/ui/preview/\",\"src/services/testing/ui/preview/CLAUDE.md\"]];for(const[prefix,doc]of map){if(p.includes(prefix)&&!p.endsWith(\"CLAUDE.md\")){console.error(`[structure] Editing ${prefix} — check ${doc} and update it in the same change if your edit qualifies (see .claude/rules/structure.md).`);process.exit(0)}}'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $CLAUDE_PROJECT_DIR/.claude/hooks/check-claudemd-updated.js"
+          }
+        ]
+      }
+    ]
+  }
+}
