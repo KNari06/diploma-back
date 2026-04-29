@@ -1369,6 +1369,10 @@ async function installAppOnSession(
         reinstall: true, // use -r as safety net — if uninstall failed silently, install still works
         clearData: true, // always wipe app data for clean state after install
         autoLaunch: false, // always launch via an explicit launch_app command below for determinism
+        // Hint runner with the known packageName so it can fall back to it
+        // if `pm list packages -3` diff fails to surface the new package
+        // (rare, but happens with side-loaded splits).
+        ...(explicitPackage ? { packageName: explicitPackage } : {}),
         ...(shouldUninstallOld ? { uninstallOldPackage: oldPackage } : {}),
       },
     },
