@@ -1848,6 +1848,46 @@ export class SnapshotCollector {
                     }
                   }
                 }
+                // Last-resort: <img src=".../filename.svg"> filename. Catches
+                // file-type icons (pdf.svg, doc.svg, image.svg) on LMS /
+                // file managers and arrow/chevron icons on legacy sites
+                // where the only identity left is the asset filename. Two
+                // hard guards so we don't poison candidates with garbage:
+                //   1. Filename must be a slug-shaped word (lowercase
+                //      letters, digits, dashes/underscores) — rejects
+                //      hash names like "a8f3b2c1d4e5.svg".
+                //   2. Length 2..30 — rejects empty stems and UUID-ish.
+                // Looks at the host element first (case where <img> itself
+                // IS the candidate via cursor:pointer) and falls back to a
+                // direct <img> child. Mirrors recorder probe to keep
+                // recorded fingerprint and live snapshot in sync.
+                if (!iconChildLabel) {
+                  try {
+                    const imgEl = (el.tagName.toLowerCase() === 'img'
+                      ? (el as HTMLImageElement)
+                      : el.querySelector('img[src]') as HTMLImageElement | null);
+                    if (imgEl) {
+                      const src = (imgEl.getAttribute('src') || '').trim();
+                      if (src && src.indexOf('data:') !== 0) {
+                        // Strip query/hash, take last path segment, drop extension.
+                        const cleanPath = src.split('?')[0].split('#')[0];
+                        const file = (cleanPath.split('/').pop() || '').toLowerCase();
+                        const m = file.match(/^([a-z][a-z0-9_-]{1,29})\.(?:svg|png|jpe?g|webp|gif|ico)$/);
+                        if (m && m[1]) {
+                          const stem = m[1];
+                          // Reject hex / digit-heavy stems (asset hashes,
+                          // upload UUIDs that snuck past the slug shape).
+                          // Threshold: >=4 digits OR >=8 hex-only chars.
+                          const digitCount = (stem.match(/\d/g) || []).length;
+                          const looksHashed = digitCount >= 4 || /^[a-f0-9]{8,}$/.test(stem);
+                          if (!looksHashed) {
+                            iconChildLabel = stem.replace(/[-_]/g, ' ').trim();
+                          }
+                        }
+                      }
+                    }
+                  } catch { /* best-effort */ }
+                }
               } catch { /* ignore */ }
             }
 

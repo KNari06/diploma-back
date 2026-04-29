@@ -22,6 +22,7 @@ import type {
     InteractiveNode,
     LintCandidate,
     ResolutionMeta,
+    TargetFingerprint,
     UrlMatcher,
 } from './preview.types';
 
@@ -175,6 +176,92 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
 
   return hints;
 }
+
+/**
+ * Build a synthetic `recordedFingerprint` from a live LLM-resolved node.
+ *
+ * MOTIVATION
+ * ──────────
+ * Manually-added steps (created via "+ Add new step" in the editor instead
+ * of via Recording) start life with **only a description**. They have no
+ * `recordedFingerprint` because no recorder probe ran for them. After the
+ * first successful apply the LLM picks a candidate and we know — at that
+ * moment — exactly which DOM element the user's description meant. Without
+ * this synthesis, that knowledge is lost: only `evidence.lastSuccessRef`
+ * (a transient DOM counter, ≤60 min TTL) and `bindingHints` (semantic
+ * label/role only) survive into the next run. Identity fast-path and the
+ * fake-success guard both gate on `recordedFingerprint`, so manual steps
+ * permanently miss those layers — every replay is description-driven LLM
+ * roulette.
+ *
+ * This helper closes the gap by snapshotting the structural identity of
+ * the resolved node and writing it into `step.recordedFingerprint` after
+ * the first successful apply. From the second run onward, manual steps
+ * benefit from the same identity-based shortcuts and guards as recorded
+ * steps.
+ *
+ * Field shape mirrors `RecordingCaptureService.buildRecordedFingerprint`
+ * so resolver and comparator code can read either origin transparently —
+ * the synthetic and recorded variants share `TargetFingerprint`.
+ *
+ * Caller must only invoke this AFTER verifying the click had real effect
+ * (url / dialog / aria / dom signal). Calling on a fake-success would
+ * permanently anchor the step on the wrong element.
+ */
+function buildSyntheticFingerprintFromNode(node: InteractiveNode): TargetFingerprint {
+  const fp: TargetFingerprint = {};
+  if (node.tag) fp.tag = node.tag;
+  if (node.role) fp.role = node.role;
+  if (node.labelText) fp.labelText = node.labelText;
+  if (node.ariaLabel) fp.ariaLabel = node.ariaLabel;
+  if (node.testIdAttr) fp.testIdAttr = node.testIdAttr;
+  if (node.placeholder) fp.placeholder = node.placeholder;
+  if (node.boundingBox) fp.boundingBox = node.boundingBox;
+  if (node.title) fp.title = node.title;
+  if ((node as any).alt) fp.alt = (node as any).alt;
+  if (node.text) fp.text = node.text;
+  // node.id is the live DOM id; only persist when it isn't a framework-
+  // generated counter (mat-radio-3, mui-12, :r0:, etc.) so identity match
+  // doesn't lock onto an unstable token. The probe path applies the same
+  // filter via isDynamicId.
+  if (node.id && !node.isDynamicId) fp.elementId = node.id;
+  if (node.name) fp.name = node.name;
+  if (node.inputType || node.type) fp.type = node.inputType || node.type;
+  if ((node as any).cssClass) fp.cssClass = (node as any).cssClass;
+  if ((node as any).href) fp.href = (node as any).href;
+  if ((node as any).ariaControls) fp.ariaControls = (node as any).ariaControls;
+  if ((node as any).vueScopeId) fp.vueScopeId = (node as any).vueScopeId;
+  if (node.containerTitles && node.containerTitles.length > 0) {
+    fp.containerTitles = node.containerTitles.slice(0, 3);
+  }
+  if (node.nearestLandmark) fp.nearestLandmark = node.nearestLandmark;
+  if ((node as any).childTestId) fp.childTestId = (node as any).childTestId;
+  if ((node as any).dataValue) fp.dataValue = (node as any).dataValue;
+  if ((node as any).iconLabel) fp.iconLabel = (node as any).iconLabel;
+  if ((node as any).svgIcon) fp.svgIcon = (node as any).svgIcon;
+  if ((node as any).customElementTag) fp.customElementTag = (node as any).customElementTag;
+  if ((node as any).bsToggle) fp.bsToggle = (node as any).bsToggle;
+  if ((node as any).bsTarget) fp.bsTarget = (node as any).bsTarget;
+  if ((node as any).ariaHasPopup) fp.ariaHasPopup = (node as any).ariaHasPopup;
+  if ((node as any).ariaActiveDescendant) fp.ariaActiveDescendant = (node as any).ariaActiveDescendant;
+  if ((node as any).dataRowKey) fp.dataRowKey = (node as any).dataRowKey;
+  if ((node as any).nearestRowText) fp.nearestRowText = (node as any).nearestRowText;
+  if (typeof (node as any).siblingIndex === 'number') fp.siblingIndex = (node as any).siblingIndex;
+  if ((node as any).disabled !== undefined) fp.disabled = (node as any).disabled;
+  if ((node as any).arrowDir) fp.arrowDir = (node as any).arrowDir;
+  if ((node as any).ancestorSummary) fp.ancestorSummary = (node as any).ancestorSummary;
+  const ariaState: NonNullable<TargetFingerprint['ariaState']> = {};
+  if (node.ariaExpanded !== undefined) ariaState.expanded = node.ariaExpanded;
+  if (node.ariaPressed !== undefined) ariaState.pressed = node.ariaPressed;
+  if (node.checked !== undefined) ariaState.checked = node.checked;
+  if (node.invalid !== undefined) ariaState.invalid = node.invalid;
+  if ((node as any).ariaCurrent) ariaState.current = (node as any).ariaCurrent;
+  if (typeof (node as any).ariaValueNow === 'number') ariaState.valueNow = (node as any).ariaValueNow;
+  if ((node as any).ariaValueText) ariaState.valueText = (node as any).ariaValueText;
+  if (Object.keys(ariaState).length > 0) fp.ariaState = ariaState;
+  return fp;
+}
+
 const ACTION_TIMEOUT = STEP_APPLY_CONFIG.actionTimeoutMs;
 const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 
@@ -807,6 +894,42 @@ async function executeWaitFor(
       return { success: true };
     }
 
+    // Recover from misconfigured / legacy steps where the recorder created a
+    // wait_for with `urlMatcher` but no predicate (no changedFrom / regex /
+    // glob / substring / domain). Without this, line 993 below would return
+    // success in microseconds and the next step would race the actual SPA
+    // redirect — which is exactly the 1ms wait_for + 41s click hang we saw on
+    // hub.atk.pro and juz40-edu.kz logs (April 2026). Promote the empty
+    // matcher to a `changedFrom: <current URL>` so the slow path actually
+    // waits for the URL to change.
+    //
+    // Budget treatment: a legacy/empty matcher carries NO user intent about
+    // URL change (the user just dropped a "Wait for URL" placeholder between
+    // clicks for safety). Treat it as auto-injected for budget purposes —
+    // 2s URL wait + 3s settle fallback (up to 5s total) instead of the
+    // manual budget (≈timeoutMs - 1.5s URL wait + 1.5s settle, capping near
+    // the full timeout). This caps the worst-case impact to 2s on legacy
+    // tests where the URL genuinely never changes, while still giving a
+    // fair shot at catching an actual SPA redirect.
+    const hasPredicate = !!(
+      matcher.changedFrom
+      || matcher.regex
+      || matcher.glob
+      || matcher.substring
+      || matcher.domain
+    );
+    let recoveredFromEmptyMatcher = false;
+    if (!hasPredicate) {
+      const currentUrl = page.url();
+      logger.warn('[WAIT_FOR] urlMatcher has no predicate — recovering with changedFrom=currentUrl', {
+        currentUrl,
+        timeoutMs,
+        isAutoInjected,
+      });
+      matcher = { ...matcher, changedFrom: currentUrl };
+      recoveredFromEmptyMatcher = true;
+    }
+
     const negate = matcher.negate ?? false;
     const caseSensitive = matcher.caseSensitive ?? false;
 
@@ -840,8 +963,16 @@ async function executeWaitFor(
       // is a contract; hiding a broken auth/redirect/nav behind "page settled" is
       // far worse than surfacing it. We still keep a tiny safety net for tests
       // recorded before this code existed (historical steps without isAutoInjected).
-      const SETTLE_MAX_MS = isAutoInjected ? 3000 : 1500;
-      const urlWaitBudget = isAutoInjected
+      // `recoveredFromEmptyMatcher` shares the auto-injected budget profile:
+      // both are "we synthesised this matcher because the user/recorder
+      // didn't tell us what to wait for" — fast-degrade is the right
+      // policy. Without this, a manual "Wait for URL" placeholder on a
+      // page where URL genuinely never changes would burn (timeoutMs - 1.5s)
+      // before degrading; bumping to the auto-injected profile caps that
+      // to 2s URL wait, then up to 3s page-settle fallback.
+      const fastDegrade = isAutoInjected || recoveredFromEmptyMatcher;
+      const SETTLE_MAX_MS = fastDegrade ? 3000 : 1500;
+      const urlWaitBudget = fastDegrade
         ? Math.min(2000, timeoutMs)
         : Math.max(500, timeoutMs - SETTLE_MAX_MS);
 
@@ -904,12 +1035,18 @@ async function executeWaitFor(
           // Manual wait_for degraded → loud error log. A user-written URL-change
           // contract silently succeeded via the fallback, which likely masks a
           // broken redirect/auth/nav. Auto-injected → info (expected path).
-          const exitFn = isAutoInjected ? logger.info : logger.error;
+          // Recovered-from-empty matcher → info too: there was no contract
+          // because the matcher had no predicate; we synthesised one so the
+          // step doesn't return success in 1ms, but degrading to page-settle
+          // is the expected outcome on stable pages.
+          const isSoftFallback = isAutoInjected || recoveredFromEmptyMatcher;
+          const exitFn = isSoftFallback ? logger.info : logger.error;
           exitFn('[WAIT_FOR_URL] wait_for resolved via page-settle fallback (URL unchanged but page quiet)', {
             prevUrl,
             currentUrl: page.url(),
             isAutoInjected,
-            hint: isAutoInjected
+            recoveredFromEmptyMatcher,
+            hint: isSoftFallback
               ? undefined
               : 'Manual wait_for expected URL change but page settled without navigating. This may mask a broken redirect or auth flow — verify the action under test.',
           });
@@ -1068,6 +1205,20 @@ interface ApplyResult {
   compiledFailed?: boolean;
   /** V15: wait_for resolved via fast-path (URL already changed) and settled DOM before returning */
   fastPathSettled?: boolean;
+  /**
+   * Diagnostic only — wait_for decision branch, recorded so trace audits can
+   * tell which path the step took and why it returned that fast.
+   * - `fast_path`: changedFrom !== current → success without waiting
+   * - `runtime_changed`: matcher had no changedFrom or current === changedFrom →
+   *   slow path entered, returned via executeWaitFor URL change
+   * - `runtime_settle`: slow path degraded to page-settle (auto-injected)
+   * - `slow_path`: slow path executed normally
+   */
+  waitForBranch?: 'fast_path' | 'runtime_changed' | 'runtime_settle' | 'slow_path' | 'no_matcher';
+  /** Diagnostic only — `matcher.changedFrom` value at apply time (recorded). */
+  waitForChangedFrom?: string;
+  /** Diagnostic only — `page.url()` value at the moment the wait_for branch was decided. */
+  waitForUrlBefore?: string;
 }
 
 /**
@@ -2443,14 +2594,31 @@ async function executeAction(
     const urlAfter = page.url();
     return { success: true, urlChanged: urlBefore !== urlAfter };
   } catch (error) {
+    const rawMsg = error instanceof Error ? error.message : String(error);
     logger.warn('[PREVIEW_APPLY] Action execution failed', {
       stepType: step.type,
       candidateRef: candidate.ref,
-      error: error instanceof Error ? error.message : String(error),
+      error: rawMsg,
     });
+    // Translate Playwright actionability failures into a hint that points
+    // at the previous step. Recorded tests that submit a form often pair a
+    // "fill last field" + "click Submit" pair where Submit is gated until
+    // the form validates — if validation needs more than ACTION_TIMEOUT_MS
+    // (e.g. server-side validation roundtrip), Playwright will throw with
+    // generic "element is not enabled" / "not stable" / "intercepts pointer
+    // events" messages. Wrapping with a clearer hint saves users a long
+    // debugging trip.
+    let augmentedMsg = rawMsg;
+    if (/element is not enabled|not enabled|disabled/i.test(rawMsg)) {
+      augmentedMsg = `${rawMsg}\n\n[hint] The target was still disabled at click time. The previous step may not have brought the form into a valid/enabled state. Check that the prior fill/select step actually applied (it might have failed silently, or the app does async validation that exceeds the action timeout).`;
+    } else if (/element is not visible|hidden/i.test(rawMsg) && !/timeout/i.test(rawMsg)) {
+      augmentedMsg = `${rawMsg}\n\n[hint] The target wasn't visible. Possible causes: the previous step closed/navigated away, the element is inside a collapsed accordion, or a modal moved it off-screen.`;
+    } else if (/intercepts pointer events|element is outside of the viewport/i.test(rawMsg)) {
+      augmentedMsg = `${rawMsg}\n\n[hint] Another element is on top of the target (sticky header, modal backdrop) or the element is offscreen. A scroll-into-view or close-modal step before this one may be missing.`;
+    }
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Action failed',
+      error: augmentedMsg,
       urlChanged: page.url() !== urlBefore,
     };
   }
@@ -2721,6 +2889,9 @@ export class PreviewStepApplyService {
               url: page.url(),
               attempts: 1,
               fastPathSettled: true,
+              waitForBranch: 'fast_path',
+              waitForChangedFrom: matcher.changedFrom,
+              waitForUrlBefore: urlBefore,
             };
           }
           // URL hasn't changed yet — replace changedFrom with current URL for runtime
@@ -2733,6 +2904,17 @@ export class PreviewStepApplyService {
           timeoutMs,
           changedFromOverride: matcher?.changedFrom ? `${matcher.changedFrom} → ${page.url()}` : undefined,
         });
+
+        // Pick a diagnostic branch label for the slow path. `runtime_changed`
+        // means matcher had a changedFrom but current URL still matched it, so
+        // we rewrote changedFrom to the current URL before handing off to
+        // executeWaitFor. `slow_path` means no changedFrom (substring/regex/etc).
+        // `no_matcher` means the step had no urlMatcher at all (timeout-only).
+        const slowPathBranch: 'runtime_changed' | 'slow_path' | 'no_matcher' = !matcher
+          ? 'no_matcher'
+          : matcher.changedFrom
+            ? 'runtime_changed'
+            : 'slow_path';
 
         try {
           const result = await executeWaitFor(page, runtimeMatcher, timeoutMs, stepDraft.isAutoInjected === true);
@@ -2767,6 +2949,9 @@ export class PreviewStepApplyService {
             urlChanged: urlBefore !== page.url(),
             url: page.url(),
             attempts: 1,
+            waitForBranch: result.degraded === 'page_settled' ? 'runtime_settle' : slowPathBranch,
+            waitForChangedFrom: matcher?.changedFrom,
+            waitForUrlBefore: urlBefore,
           };
         } catch (error) {
           return {
@@ -2775,6 +2960,9 @@ export class PreviewStepApplyService {
             urlChanged: urlBefore !== page.url(),
             url: page.url(),
             attempts: 1,
+            waitForBranch: slowPathBranch,
+            waitForChangedFrom: matcher?.changedFrom,
+            waitForUrlBefore: urlBefore,
           };
         }
       }
@@ -3558,6 +3746,7 @@ export class PreviewStepApplyService {
                 // `compiledWasTried` false and `compiledFailed` false in
                 // the result — that prevents Run loop from disabling
                 // compiled-fast-path for remaining steps.
+                let compiledClickEffected = true;
                 if (
                   stepDraft.type === 'click'
                   && !expectedNav
@@ -3565,7 +3754,20 @@ export class PreviewStepApplyService {
                 ) {
                   const effect = await verifyClickHadEffect(page, compiledClickPreState, compiledRef, compiledTargetFrame);
                   if (!effect.effected) {
-                    logger.info('[PREVIEW_APPLY] Compiled click had no observable effect', {
+                    // Compiled hit a stale target — page didn't react. Common
+                    // root causes for manual-add steps (no `recordedFingerprint`):
+                    //   • The plan was generated against an element the LLM picked
+                    //     last run; that ref/text now resolves to a different
+                    //     element (off-screen card, archived item, hidden duplicate).
+                    //   • Page now has an overlay (modal backdrop) intercepting
+                    //     pointer events on the target.
+                    //
+                    // Old behaviour: hard-return failure → next step skipped.
+                    // New behaviour: mark `compiledWasTried` so we fall through
+                    // to lint+LLM resolve below. The LLM resolver can re-pick
+                    // a fresh candidate from the live DOM, which is exactly
+                    // what manual steps with stale `compiled` need to recover.
+                    logger.info('[PREVIEW_APPLY] Compiled click had no effect — falling back to lint', {
                       previewSessionId,
                       stepId: stepDraft.id,
                       signal: effect.signal,
@@ -3588,25 +3790,28 @@ export class PreviewStepApplyService {
                         reason: 'click_no_effect',
                       });
                     } catch { /* non-fatal */ }
-                    return {
-                      success: false,
-                      error: '[click-no-effect] Click did not change page state (URL, dialog, ARIA, focus). The element may be obstructed by an overlay, or the click handler did nothing.',
-                      attempts: 1,
-                      // compiledFailed stays falsy — the locator was correct,
-                      // the page just didn't react. Don't disable compiled
-                      // shortcut for remaining steps.
-                    };
+                    compiledWasTried = true;
+                    compiledClickEffected = false;
+                  } else {
+                    try {
+                      editorTrace?.writeActionVerify({
+                        stepId: stepDraft.id,
+                        stepType: stepDraft.type,
+                        verificationMethod: 'click-effect',
+                        verified: true,
+                        durationMs: 0,
+                        signal: effect.signal,
+                      });
+                    } catch { /* non-fatal */ }
                   }
-                  try {
-                    editorTrace?.writeActionVerify({
-                      stepId: stepDraft.id,
-                      stepType: stepDraft.type,
-                      verificationMethod: 'click-effect',
-                      verified: true,
-                      durationMs: 0,
-                      signal: effect.signal,
-                    });
-                  } catch { /* non-fatal */ }
+                }
+                // If the click had no effect, skip the success-return path and
+                // let execution fall through to lint+LLM further down.
+                if (!compiledClickEffected) {
+                  // throw to break out of the success path; the surrounding
+                  // try/catch turns it into a `compiledWasTried = true`
+                  // fallthrough to lint just like any other compiled error.
+                  throw new Error('compiled-click-no-effect');
                 }
 
                 // Invalidate snapshot cache for DOM-mutating actions so next step's lint gets fresh nodes
@@ -3679,7 +3884,7 @@ export class PreviewStepApplyService {
                 }
 
                 // Update step with success evidence
-                const updatedStep: IntentStep = {
+                let updatedStep: IntentStep = {
                   ...stepDraft,
                   compiled: upgradedCompiled,
                   evidence: {
@@ -3690,6 +3895,35 @@ export class PreviewStepApplyService {
                     capturedAt: new Date().toISOString(), // V15.6: staleness guard
                   },
                 };
+
+                // Synthesize `recordedFingerprint` for manually-added click
+                // steps on the compiled fast-path. Mirrors the lint-path
+                // synthesis at the bottom of the resolver loop. Click only,
+                // and only if the field is missing — never overwrites a
+                // genuine recorder-provided fingerprint. Uses the live DOM
+                // node looked up by `compiledRef` so the identity reflects
+                // what the click actually hit, not what was in the plan.
+                if (
+                  stepDraft.type === 'click'
+                  && !stepDraft.recordedFingerprint
+                  && compiledRef
+                ) {
+                  try {
+                    const sess = sessionService.getSession(previewSessionId);
+                    const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
+                    if (liveNode) {
+                      const synthetic = buildSyntheticFingerprintFromNode(liveNode);
+                      if (Object.keys(synthetic).length > 0) {
+                        updatedStep = { ...updatedStep, recordedFingerprint: synthetic };
+                        logger.info('[PREVIEW_APPLY] Synthesized recordedFingerprint on compiled fast-path', {
+                          previewSessionId,
+                          stepId: stepDraft.id,
+                          fpKeys: Object.keys(synthetic).slice(0, 10),
+                        });
+                      }
+                    }
+                  } catch { /* synthesis is non-fatal */ }
+                }
 
                 return {
                   success: true,
@@ -4399,9 +4633,294 @@ export class PreviewStepApplyService {
               resolverPath: lintResult.resolverPath,
             };
           }
+
+          // Label-based fallback guard for steps recorded BEFORE
+          // `recordedFingerprint` was added (April 27 2026). Identity gate
+          // above can't fire for those — the field is just not in the DB row.
+          // Without this fallback, on weak-signal clicks (focus / none / newtab),
+          // the LLM is free to pick any visually loud element on the page and
+          // the verifier rubber-stamps it. Real-world example: step
+          // description "МАТ-smart желтоқсан", chosenLabel "Б" (profile avatar
+          // in the header), signal `focus` → fake pass.
+          //
+          // Ground truth comes from whatever the recorder DID capture for the
+          // step: bindingHints.{label,text,nearText} (preferred — recording
+          // time, exact element) and the step description (fallback, may be
+          // user-edited but still authoritative). chosenLabel is the live
+          // accessible name of the element the resolver picked. If the two
+          // share zero meaningful tokens AND the click signal is weak, treat
+          // it the same as a fingerprint mismatch.
+          //
+          // Strong signals (url / dialog / aria / dom / detach) still pass —
+          // those mean the click DID move the test forward, even if onto a
+          // different element than the recording. That's a different class of
+          // bug (recording drift) and gets caught by post-hoc trace audit.
+          // Cyrillic letters that share a glyph with a Latin letter — same
+          // visual shape, different Unicode codepoint (М U+041C vs M U+004D).
+          // Recorders see the typed-in description ("MAT-SMART раздел") with
+          // Latin M/A/T while the live page often renders the same brand in
+          // Cyrillic ("МАТ-SMART"). Without folding, identical visible
+          // strings hash to disjoint token sets and the guard mis-fires.
+          // Single-direction Cyrillic→Latin is enough — both halves go
+          // through the same fold so the comparison is symmetric.
+          const cyrillicToLatin = (s: string): string => {
+            let out = '';
+            for (const ch of s) {
+              const code = ch.charCodeAt(0);
+              switch (code) {
+                case 0x0410: out += 'a'; break;     // А
+                case 0x0412: out += 'b'; break;     // В
+                case 0x0415: out += 'e'; break;     // Е
+                case 0x041A: out += 'k'; break;     // К
+                case 0x041C: out += 'm'; break;     // М
+                case 0x041D: out += 'h'; break;     // Н
+                case 0x041E: out += 'o'; break;     // О
+                case 0x0420: out += 'p'; break;     // Р
+                case 0x0421: out += 'c'; break;     // С
+                case 0x0422: out += 't'; break;     // Т
+                case 0x0425: out += 'x'; break;     // Х
+                case 0x0423: out += 'y'; break;     // У
+                case 0x0430: out += 'a'; break;     // а
+                case 0x0432: out += 'b'; break;     // в
+                case 0x0435: out += 'e'; break;     // е
+                case 0x043A: out += 'k'; break;     // к
+                case 0x043C: out += 'm'; break;     // м
+                case 0x043D: out += 'h'; break;     // н
+                case 0x043E: out += 'o'; break;     // о
+                case 0x0440: out += 'p'; break;     // р
+                case 0x0441: out += 'c'; break;     // с
+                case 0x0442: out += 't'; break;     // т
+                case 0x0445: out += 'x'; break;     // х
+                case 0x0443: out += 'y'; break;     // у
+                default: out += ch;
+              }
+            }
+            return out;
+          };
+          const tokenize = (s: string | undefined | null): Set<string> => {
+            if (!s) return new Set();
+            return new Set(
+              cyrillicToLatin(s.toLowerCase())
+                // Cyrillic + Latin word chars; keep digits.
+                .split(/[^\p{L}\p{N}]+/u)
+                .filter(t => t.length >= 3),
+            );
+          };
+          // Damerau-Levenshtein ≤ 2 captures common single-typo / inflection
+          // pairs (раздел vs разделах, save vs saved). Cap on shorter token
+          // length so a 3-char "Yes" vs "No" doesn't collapse just because
+          // the budget is forgiving in absolute terms.
+          const fuzzyMatches = (a: string, b: string): boolean => {
+            if (a === b) return true;
+            const la = a.length, lb = b.length;
+            if (Math.abs(la - lb) > 2) return false;
+            // Substring catch (handles inflection: "разделах".includes("раздел")).
+            if (la >= 4 && lb >= 4 && (a.includes(b) || b.includes(a))) return true;
+            // Limit fuzzy edit-distance to medium-length tokens — short
+            // tokens collide too easily under Damerau-Levenshtein ≤ 2.
+            if (Math.min(la, lb) < 5) return false;
+            // Inline DL distance, capped at 2 for early bail.
+            const dp: number[][] = Array.from({ length: la + 1 }, () => new Array(lb + 1).fill(0));
+            for (let i = 0; i <= la; i++) dp[i][0] = i;
+            for (let j = 0; j <= lb; j++) dp[0][j] = j;
+            for (let i = 1; i <= la; i++) {
+              let rowMin = Infinity;
+              for (let j = 1; j <= lb; j++) {
+                const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+                dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+                if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+                  dp[i][j] = Math.min(dp[i][j], dp[i - 2][j - 2] + 1);
+                }
+                if (dp[i][j] < rowMin) rowMin = dp[i][j];
+              }
+              if (rowMin > 2) return false; // early exit when whole row exceeds threshold
+            }
+            return dp[la][lb] <= 2;
+          };
+          const overlap = (a: Set<string>, b: Set<string>): number => {
+            if (a.size === 0 || b.size === 0) return 0;
+            let n = 0;
+            for (const t of a) {
+              if (b.has(t)) { n++; continue; }
+              // Fuzzy fallback — only when exact match fails. Iterate the
+              // smaller-cardinality side (here `b`) so worst-case stays
+              // O(|a|·|b|·max-token-len²) which is a few hundred ops per
+              // check at our typical scales.
+              for (const u of b) {
+                if (fuzzyMatches(t, u)) { n++; break; }
+              }
+            }
+            return n;
+          };
+          const recordedLabel =
+            stepDraft.bindingHints?.label
+            || stepDraft.bindingHints?.text
+            || stepDraft.bindingHints?.nearText
+            || stepDraft.description
+            || '';
+          const recordedTokens = tokenize(recordedLabel);
+          const chosenTokens = tokenize(chosenLabel);
+          // chosenLabel sometimes degrades to `<tag>` form when the live node
+          // has no accessible name (icon button, single-char avatar, generic
+          // <li>/<button>). Treat that as "no usable chosen label" → guard
+          // fires whenever recorded labels are meaningful, because no overlap
+          // is possible. Same effect when the live label is a single char
+          // (e.g. profile avatar "Б" — 1-letter tokens are dropped by
+          // tokenize()'s 3-char minimum).
+          const chosenLabelIsGeneric =
+            !chosenLabel
+            || /^<[^>]+>$/.test(chosenLabel.trim())
+            || chosenTokens.size === 0;
+          // Eligibility: don't double-fire when the identity guard above
+          // already had ground truth, and require a meaningful recorded
+          // anchor (≥1 token after the 3-char filter).
+          //
+          // For label-based gating, `dom` is upgraded from "strong" to
+          // "checkable" — a wrong click can still mutate the DOM (open a
+          // profile menu, expand an unrelated panel) and the existing
+          // identity guard's "strong = always pass" assumption stops
+          // holding when there's no fingerprint to corroborate. Url /
+          // dialog / aria / detach remain strong: those move the test
+          // forward toward something testable.
+          const labelGuardWeakSignal =
+            weakSignal || clickEffectSignal === 'dom';
+          const labelGuardEligible =
+            !hasGroundTruth
+            && stepDraft.type === 'click'
+            && labelGuardWeakSignal
+            && recordedTokens.size >= 1;
+          // Reject when recorded and chosen labels share zero tokens, OR
+          // when the chosen label is too generic to validate at all.
+          const labelMismatch =
+            chosenLabelIsGeneric
+            || overlap(recordedTokens, chosenTokens) === 0;
+          if (labelGuardEligible && labelMismatch) {
+            logger.warn('[PREVIEW_APPLY] Rejecting fake-success: label mismatch (no recorded fingerprint)', {
+              stepId: stepDraft.id,
+              candidateRef: candidate.ref,
+              chosenLabel,
+              chosenLabelIsGeneric,
+              recordedLabel: recordedLabel.slice(0, 80),
+              clickEffectSignal,
+              recordedTokens: Array.from(recordedTokens).slice(0, 5),
+              chosenTokens: Array.from(chosenTokens).slice(0, 5),
+              tokenOverlap: overlap(recordedTokens, chosenTokens),
+            });
+            trace?.writeActionResult({
+              stepId: stepDraft.id,
+              stepType: stepDraft.type,
+              success: false,
+              durationMs: actionDur,
+              error: 'label-mismatch-weak-signal',
+            });
+            // Clean up the side-effect of the rejected click. When LLM
+            // misclicked the profile avatar / nav-icon and the page
+            // reacted with `clickEffectSignal: 'dom'` (popup menu, modal
+            // backdrop, overlay drawer), THAT overlay now intercepts
+            // pointer events for the step's RETRY — so the retry's
+            // correctly-targeted click gets blocked, the runner waits
+            // 15s for the locator to become clickable, then fails with
+            // an "overlay intercepts pointer events" error even though
+            // we already know the right element.
+            //
+            // Sequence on hub.atk.pro / juz40-edu.kz:
+            //   1. attempt 1 → wrong target (e.g. profile "Б") → opens
+            //      cdk-overlay-pane (Angular Material profile menu)
+            //   2. guard rejects → returns failure
+            //   3. retry → correct target found by compiled/lint → click
+            //   4. cdk-overlay-backdrop intercepts → 15s timeout → fail
+            //
+            // Closing strategy is best-effort — Escape covers most menus
+            // (Angular Material, Bootstrap, Headless UI), backdrop click
+            // covers CDK overlays where Escape doesn't bind. Both fail
+            // silently if there's nothing to close. We bound the wait so
+            // a stuck overlay can't extend the step timeout indefinitely.
+            try {
+              await page.keyboard.press('Escape', { delay: 0 }).catch(() => {});
+              // Click on the overlay backdrop directly. CDK + most modal
+              // libraries listen on `[role=presentation]` / `[aria-modal]`
+              // backdrops. force:true skips actionability checks (the
+              // backdrop IS the dismissal target; we don't care if it's
+              // also covered by something — we just want one click event).
+              await page.evaluate(() => {
+                /* eslint-disable @typescript-eslint/no-explicit-any */
+                const doc = (globalThis as any).document;
+                const sels = [
+                  '.cdk-overlay-backdrop.cdk-overlay-backdrop-showing',
+                  '.cdk-overlay-backdrop',
+                  '.modal-backdrop.show',
+                  '.modal-backdrop',
+                ];
+                for (const sel of sels) {
+                  const el = doc.querySelector(sel);
+                  if (el) {
+                    el.click?.();
+                    break;
+                  }
+                }
+              }).catch(() => {});
+              // Settle window — let close animation play out so the
+              // backdrop is actually removed from the hit-test stack
+              // before the next attempt resolves its locator.
+              await page.waitForTimeout(250).catch(() => {});
+              logger.info('[PREVIEW_APPLY] Cleared side-effect overlay before retry', {
+                previewSessionId,
+                stepId: stepDraft.id,
+                clickEffectSignal,
+              });
+            } catch { /* non-fatal — best-effort cleanup */ }
+            return {
+              success: false,
+              error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the step targets "${recordedLabel.slice(0, 60)}". The click only triggered a ${clickEffectSignal || 'no'} change, and the labels share no meaningful words — almost certainly a fake-success. Re-record the step so a structural fingerprint is captured, or refine the step description.`,
+              attempts,
+              highlight: [{
+                ref: candidate.ref,
+                boundingBox: candidate.boundingBox,
+                type: 'error' as const,
+              }],
+              clickEffectSignal,
+              chosenRef: candidate.ref,
+              chosenLabel,
+              chosenBoundingBox: candidate.boundingBox,
+              fingerprintMatch,
+              resolverPath: lintResult.resolverPath,
+            };
+          }
+          // Synthesize a `recordedFingerprint` for manually-added click
+          // steps. By this point both guards (identity-mismatch + weak,
+          // label-mismatch + weak) have already let the click through, so
+          // the resolved node is the trusted ground truth. Anchor the step
+          // structurally so subsequent runs can use the identity fast-path
+          // and the fake-success guard — exactly the protections recorded
+          // steps get for free. Only writes when the field is missing, so
+          // it never overwrites a real recorder fingerprint.
+          //
+          // Click-only on purpose: type / select / hover have their own
+          // post-action verification semantics and don't need this anchor.
+          // Click is also the action class where wrong-element bugs show up.
+          let appliedStep = updatedStep;
+          if (
+            stepDraft.type === 'click'
+            && !stepDraft.recordedFingerprint
+            && candidate.node
+          ) {
+            const synthetic = buildSyntheticFingerprintFromNode(candidate.node);
+            // Reject empty synthesis — without at least tag/role/labelText
+            // there is no identity worth persisting.
+            if (Object.keys(synthetic).length > 0) {
+              appliedStep = { ...updatedStep, recordedFingerprint: synthetic };
+              logger.info('[PREVIEW_APPLY] Synthesized recordedFingerprint for manual step', {
+                previewSessionId,
+                stepId: stepDraft.id,
+                fpKeys: Object.keys(synthetic).slice(0, 10),
+                signal: clickEffectSignal,
+              });
+            }
+          }
+
           return {
             success: true,
-            appliedStep: updatedStep,
+            appliedStep,
             urlChanged: result.urlChanged,
             url: page.url(),
             highlight: [{

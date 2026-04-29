@@ -1009,7 +1009,10 @@ const PROBE_AT_POINT_FN = `
         // flips with state (e.g. nav-item--active), the base block is
         // the real identity. Skip the modifier so ancestor summary
         // anchors on the parent's stable identity.
-        if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled)$/.test(p)) continue;
+        if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled|first|last|initial|terminal|empty|filled|valid|invalid|dirty|touched|pristine|untouched|pending|error|success|warning)$/.test(p)) continue;
+        // Standalone state classes (Bootstrap-style: ".active", ".selected").
+        // Same drop list as cssClass filter above — keep in sync.
+        if (/^(?:active|selected|current|checked|open|opened|expanded|focused|hovered|loading|busy|highlighted|chosen|disabled|enabled|valid|invalid|dirty|touched|pristine|untouched|pending|error|success|warning|empty|filled|readonly|required|focused|hidden|visible|collapsed|expanded)$/.test(p)) continue;
         return p;
       }
       return undefined;
@@ -1091,6 +1094,39 @@ const PROBE_AT_POINT_FN = `
       if (twTitleEl) {
         var tt2 = (twTitleEl.textContent || '').trim().slice(0, 60);
         if (tt2 && !seenTitles[tt2]) { seenTitles[tt2] = 1; containerTitlesArr.push(tt2); }
+      }
+    }
+    // Card-style heading fallback: capture <div class="*title*"> /
+    // <div class="*heading*"> / <p class="*caption*"> when no native h1-h4
+    // is present. Modern card-based UIs (catalog grids, dashboards,
+    // landing pages) frequently render titles as bare divs to avoid the
+    // semantic h-tag bumping document outline order. Without this hook
+    // a 40-card grid where every card has the same "Add" button stays
+    // ambiguous in the resolver — the only differentiator IS the card's
+    // visual title text. Gated on (a) no h-tag found at this level so we
+    // don't double-count, (b) class contains an explicit "title-y" word
+    // (not generic "btn" / "wrapper"), (c) direct child only via :scope
+    // so a sidebar's "Recent activity" heading doesn't pollute every
+    // card's containerTitles. Length cap mirrors h-tag path.
+    if (!twHeading) {
+      var twCardTitle = titleWalk.querySelector(
+        ':scope > [class*="title"], :scope > [class*="heading"], :scope > [class*="caption"]'
+      );
+      if (twCardTitle) {
+        var twCls = (twCardTitle.getAttribute('class') || '').toLowerCase();
+        // Reject titles that obviously belong to chrome/UI affordances —
+        // dialog title bars, sidebar section headers, nav titles. Those
+        // describe a region the click happens IN, not an item the click
+        // is FOR. h-tag heuristic above already covers them via aria
+        // pattern; here we want item-scoped titles only.
+        var isChromeTitle = /(?:dialog-title|sidebar-title|nav-title|panel-title|menu-title|toolbar-title|form-title|page-title|app-title|window-title)/.test(twCls);
+        if (!isChromeTitle) {
+          var tt3 = (twCardTitle.textContent || '').trim().slice(0, 60);
+          if (tt3 && tt3.length >= 2 && !seenTitles[tt3]) {
+            seenTitles[tt3] = 1;
+            containerTitlesArr.push(tt3);
+          }
+        }
       }
     }
     titleWalk = titleWalk.parentElement;
@@ -1189,7 +1225,15 @@ const PROBE_AT_POINT_FN = `
       // legitimate domain modifiers like card--premium or
       // button--primary. CSS class case-sensitive, regex ASCII-only
       // (Cyrillic / mixed-case identifiers don't end in these tokens).
-      if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled)$/.test(t)) return false;
+      if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled|first|last|initial|terminal|empty|filled|valid|invalid|dirty|touched|pristine|untouched|pending|error|success|warning)$/.test(t)) return false;
+      // Standalone state classes (Bootstrap/legacy CSS pattern, NOT BEM):
+      // <button class="tabs__item active">  vs the BEM form
+      // <button class="tabs__item tabs__item--active">. Same semantic —
+      // class flips on/off with state — same replay risk: recorded with
+      // "active" but live element doesn't have it (different tab is
+      // selected) → cssClass hint mismatch confuses the LLM resolver.
+      // Whitelist mirrors the BEM-suffix list above.
+      if (/^(?:active|selected|current|checked|open|opened|expanded|focused|hovered|loading|busy|highlighted|chosen|disabled|enabled|valid|invalid|dirty|touched|pristine|untouched|pending|error|success|warning|empty|filled|readonly|required|focused|hidden|visible|collapsed|expanded)$/.test(t)) return false;
       // V22 Pkg3: when ANY css-in-js class is present on this element,
       // also drop bare 5-8-char mixed-case tokens — they're almost
       // certainly styled-components display-name hashes (kAtEng/hpEYiQ).
@@ -1401,6 +1445,36 @@ const PROBE_AT_POINT_FN = `
             }
           }
         }
+      }
+      // <img src=".../filename.svg"> filename. Catches file-type icons
+      // (pdf.svg, doc.svg, image.svg) on LMS and arrow/chevron icons on
+      // legacy sites where alt is missing and there's no svg <title> /
+      // data-lucide / FA class. Considers the target itself if it IS an
+      // <img>, else any direct <img> child of the icon-host.
+      // Filter rules mirror snapshot-collector — keep them in sync so the
+      // same identity reaches recorder and live snapshot.
+      if (!iconLabelAttr) {
+        try {
+          var imgCandidate = (tag === 'img') ? target : target.querySelector('img[src]');
+          if (imgCandidate) {
+            var imgSrc = (imgCandidate.getAttribute('src') || '').trim();
+            if (imgSrc && imgSrc.indexOf('data:') !== 0) {
+              // Strip query/hash, take last path segment.
+              var imgPath = imgSrc.split('?')[0].split('#')[0];
+              var imgFile = (imgPath.split('/').pop() || '').toLowerCase();
+              var imgMatch = imgFile.match(/^([a-z][a-z0-9_-]{1,29})\\.(?:svg|png|jpe?g|webp|gif|ico)$/);
+              if (imgMatch && imgMatch[1]) {
+                var imgStem = imgMatch[1];
+                // Reject hash-shaped names: 4+ digits or 8+ hex-only chars.
+                var imgDigits = (imgStem.match(/\d/g) || []).length;
+                var imgLooksHashed = imgDigits >= 4 || /^[a-f0-9]{8,}$/.test(imgStem);
+                if (!imgLooksHashed) {
+                  iconLabelAttr = imgStem.replace(/[-_]/g, ' ').trim();
+                }
+              }
+            }
+          }
+        } catch (e) { /* best-effort */ }
       }
       // ⑥ background-image: url(/icons/hamburger.svg)  — last resort.
       // Cheap heuristic: parse the URL filename. Skip data:URIs (encoded svgs

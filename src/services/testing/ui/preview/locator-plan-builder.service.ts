@@ -376,6 +376,7 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
   // Always included as a fallback (lower confidence than role/label/testId/placeholder),
   // but essential for elements that lack those attributes.
   // Skip if text is too short (single char) or duplicates the role strategy's accessible name.
+  let textStrategyAdded = false;
   if (node.text && node.text.length >= 2) {
     // Avoid duplicate: if role strategy already uses the same text as accessible name, skip
     const roleAlreadyUsesText = locators.some(
@@ -387,6 +388,85 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
         value: node.text,
         confidence: 0.7,
       });
+      textStrategyAdded = true;
+    }
+  }
+
+  // 7b. SCOPED text fallbacks — pin a `getByText` match to a structural
+  // ancestor so re-renders that introduce a duplicate copy of the same
+  // visible text elsewhere on the page (sidebar item that mirrors a card
+  // title, hidden tab pane carrying the same heading, etc.) don't pull
+  // the click to the wrong copy.
+  //
+  // These run AFTER the bare text strategy so legacy single-match pages
+  // keep their fast path; multi-match pages get a scoped follow-up
+  // before falling back to LLM. Confidence is bumped slightly above the
+  // bare text (0.7) because adding scope removes ambiguity, but below
+  // role (0.9) because we still rely on text equality at the leaf.
+  //
+  // Playwright chaining syntax: `<scope-selector> >> text="..."`. The
+  // `>>` operator narrows successive locators within the previous match.
+  // Both halves are escaped so values containing `"` / `\` / `]` /
+  // newlines can't break selector parsing — same rule as
+  // escapeCssAttrValue at the top of this file.
+  //
+  // Manual-add steps benefit the most: their compiled chain is often a
+  // SINGLE bare-text locator (no role/label/testId/href). On replay
+  // ambiguity made them flap to the wrong element + LLM-fallthrough,
+  // which is the canonical "Run picks differently than Apply" symptom
+  // we hunt with manual steps. Recorded steps usually have stronger
+  // primary strategies, but the scoped fallbacks help them too on
+  // pages where text drifts (i18n, SSR vs CSR mounts, etc.).
+  if (textStrategyAdded) {
+    const escText = escapeCssAttrValue(node.text!);
+    // Landmark scope (header / main / nav / footer / aside / form / search).
+    // `nearestLandmark` already filters to known ARIA landmarks at probe time,
+    // so we trust its value. Picks role-attr selector first (`[role="main"]`)
+    // and falls back to the implicit-role tag (`main`) — same Playwright
+    // resolves either form, but role-attr is more specific when sites
+    // duplicate landmark elements (e.g. nested `<nav>`s).
+    if (node.nearestLandmark) {
+      const escLandmark = escapeCssAttrValue(node.nearestLandmark);
+      locators.push({
+        strategy: 'css',
+        value: `[role="${escLandmark}"] >> text="${escText}"`,
+        confidence: 0.78,
+      });
+      // Tag-form fallback when the page uses semantic HTML elements
+      // without an explicit role attr (`<main>` instead of `<div role="main">`).
+      // Skip when the landmark string would produce an invalid tag selector
+      // (only ASCII letters survive after the regex below, mirrors how
+      // browsers validate custom element names).
+      if (/^[a-z]+$/i.test(node.nearestLandmark)) {
+        locators.push({
+          strategy: 'css',
+          value: `${node.nearestLandmark.toLowerCase()} >> text="${escText}"`,
+          confidence: 0.76,
+        });
+      }
+    }
+    // Container-title scope — emitted when the recorder/probe captured
+    // titled section ancestors (e.g. card heading, panel title, expansion
+    // label). We use `:has-text()` to anchor on the title's literal text
+    // and then chain into the leaf's text. Useful for pages with multiple
+    // sections sharing the same item names (e.g. "Архив" tab + "Активные"
+    // tab both showing "Курс A") — title disambiguates which section's
+    // copy we mean. Cap at top 2 titles to keep the plan compact; the
+    // recorder already orders containerTitles by proximity.
+    if (node.containerTitles && node.containerTitles.length > 0) {
+      for (const title of node.containerTitles.slice(0, 2)) {
+        if (!title || title.length < 2) continue;
+        const escTitle = escapeHasText(title);
+        locators.push({
+          strategy: 'css',
+          value: `:has-text("${escTitle}") >> text="${escText}"`,
+          // Slightly above bare text (0.7) but below landmark (0.78)
+          // because container titles drift faster than landmarks (the
+          // section heading may be edited, while landmark roles are
+          // structural).
+          confidence: 0.74,
+        });
+      }
     }
   }
 

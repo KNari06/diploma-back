@@ -1807,6 +1807,62 @@ export class PreviewRunService {
               stepId: step.id,
             });
 
+            // Diagnostic — dump visible overlay/menu/dialog elements after
+            // EVERY successful step so we can pinpoint which step opens the
+            // profile menu / cdk-overlay that later blocks step 8/9. Probes
+            // common Angular Material / CDK / generic dropdown markers.
+            // Output goes to logs/fp_audit.log so it can be grep'd post-run.
+            try {
+              const overlays = await session.page.evaluate(() => {
+                const sels = [
+                  '.cdk-overlay-pane',
+                  '.cdk-overlay-backdrop-showing',
+                  '[role="menu"]',
+                  '[role="dialog"]',
+                  '[role="listbox"]',
+                  '.mat-mdc-menu-panel',
+                  '.mat-menu-panel',
+                  '.mat-mdc-select-panel',
+                  '[aria-modal="true"]',
+                  '[data-state="open"]',
+                ];
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const doc = (globalThis as any).document;
+                const found: Array<{sel: string; visible: boolean; text: string; bbox: {x:number;y:number;w:number;h:number} | null}> = [];
+                for (const sel of sels) {
+                  const els = doc.querySelectorAll(sel);
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  for (const el of Array.from(els) as any[]) {
+                    const r = el.getBoundingClientRect();
+                    const visible = r.width > 0 && r.height > 0;
+                    found.push({
+                      sel,
+                      visible,
+                      text: (el.innerText || '').slice(0, 100),
+                      bbox: visible ? { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } : null,
+                    });
+                  }
+                }
+                return found;
+              }).catch(() => null);
+              if (overlays && overlays.length > 0) {
+                const fs = await import('fs');
+                const path = await import('path');
+                const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+                fs.appendFileSync(auditPath, JSON.stringify({
+                  ts: new Date().toISOString(),
+                  scope: 'overlay_probe_after_step',
+                  intentTestCaseId,
+                  stepIndex: originalStepIndex,
+                  stepId: step.id?.slice(0, 8),
+                  stepDesc: typeof step.description === 'string' ? step.description.slice(0, 60) : '',
+                  url: session.page.url(),
+                  overlayCount: overlays.filter(o => o.visible).length,
+                  overlays: overlays.filter(o => o.visible).slice(0, 10),
+                }) + '\n');
+              }
+            } catch { /* non-fatal */ }
+
             // Trace step_result (pass)
             // April 2026: include clickEffectSignal so audits can tell
             // strong-signal passes (url / dialog / aria / dom / detach /
@@ -1836,11 +1892,23 @@ export class PreviewRunService {
                 ...(result.chosenBoundingBox !== undefined ? { chosenBbox: result.chosenBoundingBox } : {}),
                 ...(result.fingerprintMatch !== undefined ? { fingerprintMatch: result.fingerprintMatch } : {}),
                 ...(result.resolverPath !== undefined ? { resolverPath: result.resolverPath } : {}),
+                // Diagnostic — wait_for branch + the URLs it compared. Lets the
+                // audit log explain why a `wait_for` step returned in 1ms vs
+                // really waited for the URL change.
+                ...(result.waitForBranch !== undefined ? { waitForBranch: result.waitForBranch } : {}),
+                ...(result.waitForChangedFrom !== undefined ? { waitForChangedFrom: result.waitForChangedFrom } : {}),
+                ...(result.waitForUrlBefore !== undefined ? { waitForUrlBefore: result.waitForUrlBefore } : {}),
+                ...(result.fastPathSettled !== undefined ? { fastPathSettled: result.fastPathSettled } : {}),
                 retried,
               },
             });
 
-            // Emit pass (include appliedStep so frontend can enrich the UI step)
+            // Emit pass (include appliedStep so frontend can enrich the UI step).
+            // `url` is included so the editor's preview URL bar tracks the live
+            // page during a run — the regular `preview:page` snapshot pipeline
+            // is gated off while a run is in flight (see preview.handler.ts —
+            // skipped to avoid page.evaluate() contention with readiness/apply),
+            // so without this field the URL bar stays frozen on the pre-run URL.
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: originalStepIndex,
@@ -1849,6 +1917,7 @@ export class PreviewRunService {
               action: step.type,
               description: step.description,
               timestamp: new Date().toISOString(),
+              ...(result.url ? { url: result.url } : {}),
               ...(result.appliedStep ? { appliedStep: result.appliedStep } : {}),
               ...(retried ? { retried: true } : {}),
             });

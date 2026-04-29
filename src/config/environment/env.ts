@@ -186,6 +186,26 @@ const envSchema = z.object({
   FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
+  // ──────────────────────────────────────────────────────────────────
+  // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
+  //
+  // When false (default), POST /chat with `testCaseId` returns 404
+  // and the per-test-case routes / WS subscribe channel are
+  // unreachable. The legacy global chat path is unaffected. This lets
+  // us merge backend changes ahead of frontend without exposing the
+  // half-wired surface to clients.
+  //
+  // Migration `20260429_test_case_chat.sql` is independent of this
+  // flag — it can be applied first; tables stay empty until the flag
+  // flips on.
+  //
+  // To enable: set ENABLE_TEST_CASE_CHAT=true in the deployment env.
+  //   - Per-test-case REST endpoints become live
+  //   - POST /chat accepts testCaseId
+  //   - WS subscribe:chat:testcase begins responding
+  // ──────────────────────────────────────────────────────────────────
+  ENABLE_TEST_CASE_CHAT: z.string().transform(v => v === 'true').default('false'),
+
   // Mobile Runner (qait-mobile-runner microservice)
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),

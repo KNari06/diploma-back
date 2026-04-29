@@ -27,6 +27,12 @@ interface WebSocketEventMessage {
     testId?: string;
     userId?: string;
     sessionId?: string;
+    // Per-test-case chat surface. When set, the main-process subscriber
+    // dual-broadcasts the event to BOTH `chat:<sessionId>` AND
+    // `chat:tc:<testCaseId>` rooms, so a frontend that subscribed
+    // before the session was created (lazy-create model) still gets
+    // the event. Optional — legacy call sites omit it.
+    testCaseId?: string;
   };
   timestamp: number;
 }
@@ -90,12 +96,12 @@ class RedisWebSocketBridge {
    *
    * @param event - Event name (e.g., 'test:progress', 'test:started')
    * @param payload - Event payload data
-   * @param target - Optional target identifiers (testId, userId, sessionId)
+   * @param target - Optional target identifiers (testId, userId, sessionId, testCaseId)
    */
   async publishEvent(
     event: string,
     payload: any,
-    target?: { testId?: string; userId?: string; sessionId?: string }
+    target?: { testId?: string; userId?: string; sessionId?: string; testCaseId?: string }
   ): Promise<void> {
     try {
       const publisher = this.getPublisher();

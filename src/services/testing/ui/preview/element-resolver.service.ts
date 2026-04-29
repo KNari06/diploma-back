@@ -1701,6 +1701,44 @@ ${LLM_SHARED_RULES}
     Forcing a match on irrelevant input is WORSE than returning null —
     the user will see no-match feedback and refine their intent.
 
+20. CONFIDENCE CALIBRATION (Apply-mode — strict scoring):
+    Anchor your number to the evidence, not your prose certainty:
+
+    - 0.90–1.00: identity match. id/testId/name/dataValue exact (case-
+      insensitive); OR a candidate's label IS the intent (after Cyrillic↔
+      Latin glyph folding for visually identical scripts: М↔M, А↔A, Т↔T,
+      etc.). Use this band ONLY when one candidate clearly outranks
+      every alternative.
+
+    - 0.75–0.89: strong semantic match. Candidate's label or text
+      contains every meaningful word in the intent (or vice versa) AND
+      the role/landmark fits the intent's intent (button vs link vs
+      input). E.g. INTENT "Save changes" → label "Save changes". Only
+      enter this band if no other candidate also satisfies the same
+      conditions; if two do, return alternatives instead.
+
+    - 0.55–0.74: partial match. Several intent words found in the
+      candidate's text but NOT all, OR fits role/landmark but text
+      diverges. Use sparingly — this band exists for legitimate drift
+      (i18n change, button restyle), NOT to label "the element kind of
+      relates to the intent topic."
+
+    - <0.55: do NOT pick. Return ref=null. Examples that BELONG here:
+        • INTENT "Save" with no label-similar candidate ("OK", "Cancel"
+          present but not "Save").
+        • INTENT mentions a feature name ("MAT-SMART раздел", "checkout")
+          on a page that doesn't visually show that feature.
+        • Intent is a hint about a DIFFERENT page than the one in
+          ELEMENTS (e.g. recorded against archive page; live page is the
+          landing hero with promo content). Returning the loudest
+          available CTA here is a fake-success.
+
+    Picking 0.85 to feel decisive when the evidence is 0.6 is a bug.
+    The downstream verifier will catch the bad click on a strong-signal
+    page, but the same wrong pick on a weak-signal page (focus-only,
+    DOM-only) becomes a fake pass that breaks the test silently. Better
+    to undershoot.
+
 EXAMPLES (Apply-mode — diverse domains, calibrated confidence):
 
 — TIER 1 dataValue exact match (high confidence 0.95) —
@@ -1965,6 +2003,22 @@ async function selectElementWithLLM(params: {
    */
   recordedFingerprint?: TargetFingerprint;
   /**
+   * Hints captured from the LAST successful apply (not from recorder).
+   * Manual-add steps (no `recordedFingerprint`) accumulate `bindingHints`
+   * once they resolve correctly the first time. Re-feeding those hints
+   * to the LLM on subsequent runs anchors the choice to "the element we
+   * matched last time", dramatically reducing the LLM-stochastic flip
+   * across runs that ship without recording-time identity.
+   *
+   * Treated as soft hints (advisory): drift in any single field doesn't
+   * disqualify a candidate, but a candidate matching multiple fields is
+   * preferred over a description-only match. Distinct from
+   * `recordedFingerprint` so the prompt can render both groups separately
+   * — recorded identity is "must match where present", apply hints are
+   * "preferred where they line up".
+   */
+  priorApplyHints?: BindingHints;
+  /**
    * V22: which prompt to use.
    *   - 'apply' (default): user is authoring a step. Returning null on a
    *     no-match is correct — the user will refine the description.
@@ -1973,7 +2027,7 @@ async function selectElementWithLLM(params: {
    */
   mode?: 'apply' | 'heal';
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, mode = 'apply' } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, mode = 'apply' } = params;
   const startTime = Date.now();
 
   // Check cache
@@ -2040,12 +2094,35 @@ async function selectElementWithLLM(params: {
         (recordedFingerprint.containerTitles || []).join('|'),
       ].join(':')
     : '';
+  // Cache key participation for prior-apply hints. Without this, two manual
+  // steps with identical description but different past resolutions would
+  // collide on the cache and reuse a stale answer. The digest covers the
+  // same identity-leaning fields the prompt renders below — drift in any
+  // of them invalidates the cache entry, forcing a fresh LLM call.
+  const bhDigest = priorApplyHints
+    ? [
+        dEsc(priorApplyHints.tag),
+        dEsc(priorApplyHints.role),
+        dEsc(priorApplyHints.label),
+        dEsc(priorApplyHints.text),
+        dEsc(priorApplyHints.testId),
+        dEsc(priorApplyHints.elementId),
+        dEsc(priorApplyHints.name),
+        dEsc(priorApplyHints.href),
+        dEsc(priorApplyHints.placeholder),
+        dEsc(priorApplyHints.type),
+        dEsc(priorApplyHints.nearText),
+        dEsc((priorApplyHints as any).childTestId),
+        dEsc((priorApplyHints as any).iconLabel),
+        dEsc((priorApplyHints as any).dataValue),
+      ].join(':')
+    : '';
   // V22: include mode in cache key — apply-mode and heal-mode use different
   // prompts and may return different answers for the same inputs (heal
   // biases toward picking, apply allows null). Sharing cache slots between
   // them would leak heal's "always-pick" answers into apply (where null is
   // the right answer for gibberish) and vice versa.
-  const cacheKey = `${mode}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
+  const cacheKey = `${mode}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${bhDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
     cacheMetrics.inc('llm-select', 'hit');
@@ -2229,6 +2306,59 @@ async function selectElementWithLLM(params: {
       `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${softHintLines.join('\n')}`
     );
   }
+
+  // PRIOR APPLY HINTS — for manual-add steps without a recorder fingerprint,
+  // bindingHints persist across runs and capture "what we resolved to last
+  // time". Treat as soft preference: a candidate matching multiple of these
+  // fields is more likely the same element the user verified during Apply.
+  // Rendered AFTER recorded hints so the model sees identity (must-match)
+  // first and apply hints (preference) second; if both are present, they
+  // reinforce each other.
+  //
+  // Skip fields already covered by recordedFingerprint blocks above to keep
+  // the prompt compact and avoid contradictory duplicate signals when the
+  // recorder fp captured an earlier value than the last apply.
+  const recordedFieldsRendered = new Set<string>();
+  for (const line of fpHintLines) {
+    const key = line.split('=')[0];
+    if (key) recordedFieldsRendered.add(key);
+  }
+  const bhHintLines: string[] = [];
+  if (priorApplyHints) {
+    const pushIfNew = (key: string, value: unknown) => {
+      if (recordedFieldsRendered.has(key)) return;
+      if (value === undefined || value === null || value === '') return;
+      bhHintLines.push(`${key}="${fpEsc(value)}"`);
+    };
+    // Same field order / naming as recorded fp block so the model treats
+    // both groups consistently.
+    if (priorApplyHints.tag) pushIfNew('tag', `<${priorApplyHints.tag}>`);
+    pushIfNew('role', priorApplyHints.role);
+    pushIfNew('id', priorApplyHints.elementId);
+    pushIfNew('testId', priorApplyHints.testId);
+    pushIfNew('name', priorApplyHints.name);
+    pushIfNew('label', priorApplyHints.label);
+    pushIfNew('text', priorApplyHints.text);
+    pushIfNew('placeholder', priorApplyHints.placeholder);
+    pushIfNew('inputType', priorApplyHints.type);
+    pushIfNew('href', priorApplyHints.href);
+    pushIfNew('ariaControls', priorApplyHints.ariaControls);
+    pushIfNew('nearText', priorApplyHints.nearText);
+    pushIfNew('inLandmark', priorApplyHints.nearestLandmark);
+    pushIfNew('childIconTestId', (priorApplyHints as any).childTestId);
+    pushIfNew('iconLabel', (priorApplyHints as any).iconLabel);
+    pushIfNew('dataValue', (priorApplyHints as any).dataValue);
+    pushIfNew('rowText', (priorApplyHints as any).nearestRowText);
+    if (priorApplyHints.containerTitles?.length && !recordedFieldsRendered.has('containers')) {
+      bhHintLines.push(`containers=${JSON.stringify(priorApplyHints.containerTitles.slice(0, 3))}`);
+    }
+  }
+  if (bhHintLines.length > 0) {
+    fpHintParts.push(
+      `\nPRIOR APPLY HINTS (the element previously verified by Apply for this step — strong preference signal, but candidates may have drifted; if a candidate matches several of these fields, prefer it over a description-only match):\n${bhHintLines.join('\n')}`
+    );
+  }
+
   const fpHint = fpHintParts.join('');
 
   const userPrompt = `INTENT: "${intentText}"
@@ -2305,13 +2435,85 @@ Select the single best matching element, or return ref=null if the intent does n
 
     if (parsed.ref && validRefs.has(parsed.ref)) {
       const confidence = Math.min(1, Math.max(0, parsed.confidence ?? 0.8));
-      // Reject low-confidence matches — likely nonsense/irrelevant descriptions
-      if (confidence < 0.4) {
+      // Apply-mode threshold lifted from 0.4 → 0.55: in real-world manual-add
+      // flows the LLM tends to return 0.5–0.85 on "I think this looks
+      // related" matches even when the page genuinely lacks the target.
+      // 0.4 is too generous — those mid-tier guesses are exactly the
+      // false-positive class we hunt with the label/identity guards
+      // downstream. Heal-mode keeps the looser threshold (`mode==='heal'`
+      // below) because there we already have a recorded fingerprint and
+      // we WANT the LLM to bias toward "find something close".
+      const minConfidence = mode === 'heal' ? 0.4 : 0.55;
+      // Semantic floor — when confidence is in the "good but not great"
+      // band (≥minConfidence but <0.85) AND the chosen candidate's text
+      // shares zero meaningful tokens with the user's description, treat
+      // it as a soft mismatch and return not_found. This catches the
+      // canonical "step is for a different page; LLM reaches for the
+      // loudest CTA" case (e.g. INTENT="MAT-SMART раздел" on a homepage,
+      // chosen "Артықшылықтарымыз" — strictly no overlap).
+      let semanticFloorRejected = false;
+      if (mode !== 'heal' && confidence < 0.85) {
+        const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
+        const chosenText = (
+          chosenCandidate?.node.labelText
+          || chosenCandidate?.node.ariaLabel
+          || chosenCandidate?.node.text
+          || chosenCandidate?.node.placeholder
+          || ''
+        ).toLowerCase();
+        // Same Cyrillic↔Latin glyph fold the apply-time guard uses (M↔М,
+        // A↔А, T↔Т, …) so "MAT-SMART" and "МАТ-SMART" agree on tokens.
+        // Cheap inline copy — pulling the helper out of preview-step-apply
+        // would create a circular import; the duplication is fine for two
+        // sites and lets each guard stay self-contained.
+        const cyrFold = (s: string): string => {
+          let out = '';
+          for (const ch of s) {
+            const code = ch.charCodeAt(0);
+            switch (code) {
+              case 0x0410: case 0x0430: out += 'a'; break;
+              case 0x0412: case 0x0432: out += 'b'; break;
+              case 0x0415: case 0x0435: out += 'e'; break;
+              case 0x041A: case 0x043A: out += 'k'; break;
+              case 0x041C: case 0x043C: out += 'm'; break;
+              case 0x041D: case 0x043D: out += 'h'; break;
+              case 0x041E: case 0x043E: out += 'o'; break;
+              case 0x0420: case 0x0440: out += 'p'; break;
+              case 0x0421: case 0x0441: out += 'c'; break;
+              case 0x0422: case 0x0442: out += 't'; break;
+              case 0x0425: case 0x0445: out += 'x'; break;
+              case 0x0423: case 0x0443: out += 'y'; break;
+              default: out += ch;
+            }
+          }
+          return out;
+        };
+        const tok = (s: string): Set<string> =>
+          new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
+        const intentTokens = tok(intentText.toLowerCase());
+        const chosenTokens = tok(chosenText);
+        if (intentTokens.size > 0 && chosenTokens.size > 0) {
+          let shared = 0;
+          for (const t of intentTokens) if (chosenTokens.has(t)) { shared++; break; }
+          if (shared === 0) semanticFloorRejected = true;
+        }
+      }
+      if (confidence < minConfidence || semanticFloorRejected) {
+        const reason = semanticFloorRejected
+          ? `chosen "${(parsed.reason || '').slice(0, 50)}" shares no tokens with intent — likely no real match on this page`
+          : (parsed.reason || 'description does not match any element');
+        logger.info('[LLM_SELECT] Rejecting low-confidence / off-semantic pick', {
+          intentText: intentText.slice(0, 80),
+          chosenRef: parsed.ref,
+          confidence,
+          minConfidence,
+          semanticFloorRejected,
+        });
         result = {
           status: 'not_found',
           selectedRef: null,
           confidence: 0,
-          reason: (parsed.reason || 'description does not match any element').slice(0, 200),
+          reason: reason.slice(0, 200),
           latencyMs: Date.now() - startTime,
           cacheHit: false,
         };
@@ -3214,6 +3416,13 @@ export async function resolveElement(params: {
         // Without this fallback, the very first apply ran fingerprint-blind
         // even though the recorder had already gathered all the data.
         recordedFingerprint: stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint,
+        // Manual-add steps lack `recordedFingerprint`. Their ground truth
+        // builds up across runs in `bindingHints` (written by every
+        // successful apply). Pass it through so the LLM gets the same
+        // identity-leaning anchors the Apply UI flow used last time —
+        // closes the gap where Apply found the right element but the next
+        // Run picks a different one because the prompt forgot.
+        priorApplyHints: stepDraft.bindingHints,
         // V22: route to apply / heal prompt — derived from previewSessionId
         // legacy convention or explicit caller flag, see resolveMode above.
         mode: resolveMode,
@@ -3347,8 +3556,29 @@ export async function resolveElement(params: {
       if (llmResult.status === 'not_found' || (llmResult.status === 'resolved' && llmResult.confidence < 0.5)) {
         // Check if candidates include visual elements that might need screenshot analysis
         const VISUAL_TAGS = new Set(['img', 'canvas', 'svg', 'video', 'picture']);
+        // Also treat as "visual" the anonymous-anchor-with-image pattern that
+        // dominates poster/banner carousels: <a target="_blank" href="..."><img/></a>
+        // with no text/aria/title. recorder probe walks up to <a> via nativeTag,
+        // so the candidate.tag is "a" — VISUAL_TAGS check above misses this
+        // case completely. The heuristic: if the anchor has none of the usual
+        // textual descriptors (text/labelText/ariaLabel/title) AND no childTestId,
+        // it's almost certainly an image-only link the user identifies by what
+        // they SEE, not what's in the DOM. Vision is the only way to match
+        // "poster about exam X" to a specific carousel slot.
+        // Conservative: gated on the SAME LLM-confidence-low precondition above
+        // so this only fires after the text path failed — never on the happy path.
+        const isImageOnlyAnchor = (n: InteractiveNode): boolean => {
+          if (n.tag !== 'a' && n.tag !== 'button' && n.tag !== 'div') return false;
+          const noText = !n.text && !n.labelText && !n.ariaLabel && !n.title;
+          if (!noText) return false;
+          const noChildIcon = !(n as any).childTestId
+            && !(n as any).iconLabel
+            && !(n as any).svgIcon;
+          if (!noChildIcon) return false;
+          return true;
+        };
         const hasVisualCandidates = candidatesToProcess.some(
-          c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton
+          c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton || isImageOnlyAnchor(c.node)
         );
 
         if (hasVisualCandidates && screenshotOrFn) {
@@ -3356,16 +3586,21 @@ export async function resolveElement(params: {
             previewSessionId,
             llmStatus: llmResult.status,
             llmConfidence: llmResult.confidence,
-            visualCandidateCount: candidatesToProcess.filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton).length,
+            visualCandidateCount: candidatesToProcess.filter(
+              c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton || isImageOnlyAnchor(c.node),
+            ).length,
           });
 
           // Capture screenshot for vision analysis (normalized with clipPageTop/scrollY)
           const visionShot = await resolveScreenshot(screenshotOrFn);
 
           if (visionShot) {
-            // Pass visual candidates as the node list for vision to match against
+            // Pass visual candidates as the node list for vision to match against.
+            // Includes image-only anchors (poster/banner pattern) so vision can
+            // match "click poster about X" against carousel slots that probe
+            // captured as bare <a> wrappers.
             const visualNodes = candidatesToProcess
-              .filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton)
+              .filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton || isImageOnlyAnchor(c.node))
               .map(c => c.node);
 
             const visionResult = await rescueWithGeminiFlash({
@@ -3450,6 +3685,10 @@ export async function resolveElement(params: {
             // Without this fallback, the very first apply ran fingerprint-blind
             // even though the recorder had already gathered all the data.
             recordedFingerprint: stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint,
+            // Mirror primary call: feed prior apply hints so manual-add
+            // steps stay anchored to their last-verified element across
+            // overflow batches as well.
+            priorApplyHints: stepDraft.bindingHints,
             // V22: route to apply / heal prompt (overflow path inherits parent mode).
             mode: resolveMode,
           });

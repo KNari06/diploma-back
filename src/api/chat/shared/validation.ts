@@ -20,6 +20,15 @@ export interface Step0Result {
   mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
   executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
   attachments?: ChatAttachment[]; // Processed file attachments (images + documents)
+  /**
+   * Test-case scoping. When set, the controller routes this request to the
+   * per-test-case chat surface (separate tables, separate cancellation
+   * registry namespace, restricted intent set). When unset, the request
+   * follows the legacy workspace-chat path — behavior is byte-for-byte
+   * unchanged. Validated as a non-empty string here; ownership check
+   * happens later in the controller via `assertCanAccessTestCase`.
+   */
+  testCaseId?: string;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -64,7 +73,7 @@ export async function validateInput(
   // Check connection after validation
   checkConnection();
 
-  const { message, context, sessionId, conversationId, answers, mode, executionStrategy } = req.body as ChatRequest;
+  const { message, context, sessionId, conversationId, answers, mode, executionStrategy, testCaseId } = req.body as ChatRequest;
 
   // Validate message (FIX #1) — allow empty message when files are attached
   const files = req.files as Express.Multer.File[] | undefined;
@@ -92,6 +101,14 @@ export async function validateInput(
   // Process uploaded files (if any)
   const attachments = await processUploadedFiles(req);
 
+  // Surface-validate testCaseId only — existence and access are checked
+  // later in the controller (assertCanAccessTestCase). Empty string is
+  // treated as "not provided" so the legacy path stays default.
+  const safeTestCaseId =
+    typeof testCaseId === 'string' && testCaseId.trim().length > 0
+      ? testCaseId.trim()
+      : undefined;
+
   return {
     userId,
     message,
@@ -102,6 +119,7 @@ export async function validateInput(
     mode: (mode as 'lite' | 'pro' | 'editor') || 'lite', // Default to 'lite' mode
     executionStrategy: executionStrategy === 'exploration' ? 'exploration' : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
+    testCaseId: safeTestCaseId,
   };
 }
 

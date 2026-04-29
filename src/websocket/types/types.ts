@@ -25,6 +25,21 @@ export interface ClientToServerEvents {
   ) => void;
   'unsubscribe:chat': (data: { sessionId: string }) => void;
 
+  // Per-test-case chat subscription. Keyed by `testCaseId`, NOT a session
+  // id — the per-test-case session is lazy-created on first POST /chat,
+  // so the frontend has no session id to subscribe to when the editor
+  // opens. Server resolves the existing session (if any) at subscribe
+  // time and joins both `chat:tc:<testCaseId>` (always) and
+  // `chat:<sessionId>` (when the session already exists). New emits
+  // from the chat handlers always go to BOTH rooms when `testCaseId` is
+  // known, so the frontend doesn't need to re-subscribe after the first
+  // message creates the session row.
+  'subscribe:chat:testcase': (
+    data: { testCaseId: string },
+    callback?: (response: { ok: boolean; error?: string; sessionId?: string }) => void,
+  ) => void;
+  'unsubscribe:chat:testcase': (data: { testCaseId: string }) => void;
+
   // Preview subscriptions
   'subscribe:preview': (data: { previewSessionId: string }) => void;
   'unsubscribe:preview': (data: { previewSessionId: string }) => void;
@@ -2171,6 +2186,24 @@ export const createRoomName = (type: RoomType, id: string): string => {
   }
 
   return `${type}:${id.trim()}`;
+};
+
+/**
+ * Per-test-case chat room.
+ *
+ * Format: `chat:tc:<testCaseId>` — a `chat:` room with a `tc:` prefixed
+ * id. We deliberately do NOT add 'test-case-chat' to RoomType: that
+ * would change the public surface of `createRoomName` and ripple into
+ * many call sites in the test/preview/user code paths that have no
+ * relationship with test-case chat. Keeping the room as a `chat`-typed
+ * room with a sub-prefix means `emitToRoom('chat', ...)` patterns still
+ * work and Socket.IO room semantics are unchanged.
+ */
+export const createTestCaseChatRoomName = (testCaseId: string): string => {
+  if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
+    throw new Error('Test case room id must be a non-empty string');
+  }
+  return `chat:tc:${testCaseId.trim()}`;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

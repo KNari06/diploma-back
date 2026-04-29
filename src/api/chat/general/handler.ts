@@ -8,6 +8,8 @@ import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summ
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
 import { searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
+import { ChatPersistence } from '@/services/utils/chat-persistence';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
 import { convertRoleForOpenAI, injectTemporalMarkers } from '@/utils/helpers/chat-helpers';
@@ -197,9 +199,24 @@ export async function handleGeneralChat(
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
     attachments?: ChatAttachment[]; // File attachments (images + documents)
     needsTools?: boolean; // Signal from Intent Parser: false = skip Router in pipeline (~600ms saved)
+    /**
+     * Persistence backend (set by controller). When `kind === 'testcase'`,
+     * history reads, message saves and auto-title all route to the per-
+     * test-case tables. Default GLOBAL_STORE preserves the legacy workspace
+     * chat path byte-for-byte. The actual table swap happens inside
+     * ChatPersistence — handlers stay backend-agnostic.
+     */
+    chatStore?: ChatStore;
+    /** Test-case scope marker; passed through for downstream loggers / WS rooms. */
+    testCaseId?: string;
   }
 ): Promise<void> {
-  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools } = params;
+  const { message, userId, chatSessionId, context: rawContext, workspace_id: paramWorkspaceId, abortSignal, logger: functionLogger, mode, attachments, needsTools, testCaseId } = params;
+  // Resolve persistence backend with safe default. Done at the top so
+  // every read/write below uses the same store value, preventing a
+  // mid-handler refactor mistake from sending some messages to one table
+  // and some to the other.
+  const store: ChatStore = params.chatStore ?? GLOBAL_STORE;
 
   // Normalize context: parse JSON string into object if needed (frontend may send stringified JSON)
   let context: any = rawContext;
@@ -231,11 +248,24 @@ export async function handleGeneralChat(
   let oldContextSummary = '';
 
   if (chatSessionId) {
-    // Get recent messages (last 20) - always needed for conversationHistory
+    // Get recent messages (last 20) - always needed for conversationHistory.
+    // Routed through ChatPersistence: legacy global path keeps the
+    // userId-based session-access check; test-case path skips that check
+    // because ownership has already been verified by requireTestCaseAccess
+    // in the controller (single source of truth, no double round-trip).
     const getRecentMessagesWithLogging = functionLogger
-      ? withFunctionLogging(ChatService.getRecentMessages.bind(ChatService), 'ChatService.getRecentMessages', functionLogger)
-      : ChatService.getRecentMessages.bind(ChatService);
-    const recentMessages = await getRecentMessagesWithLogging(chatSessionId, userId, CONSTANTS.RECENT_MESSAGES_LIMIT); // SECURITY: Pass userId for verification
+      ? withFunctionLogging(
+          ChatPersistence.getRecentMessages.bind(ChatPersistence),
+          'ChatPersistence.getRecentMessages',
+          functionLogger,
+        )
+      : ChatPersistence.getRecentMessages.bind(ChatPersistence);
+    const recentMessages = await getRecentMessagesWithLogging(
+      store,
+      chatSessionId,
+      userId,
+      CONSTANTS.RECENT_MESSAGES_LIMIT,
+    );
     if (abortSignal) {
       const checkRequestAbortedWithLogging = functionLogger
         ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
@@ -256,8 +286,14 @@ export async function handleGeneralChat(
     // ═══════════════════════════════════════════════════════════════════════
 
     // Check if we need vector search (only if we have old messages beyond the recent window)
-    // If recentMessages returned exactly LIMIT messages, there are likely more old messages
-    if (recentMessages.length >= CONSTANTS.RECENT_MESSAGES_LIMIT && chatSessionId) {
+    // If recentMessages returned exactly LIMIT messages, there are likely more old messages.
+    //
+    // Test-case scope guard: vector search reads chat_message_embeddings
+    // (global table). For test-case sessions there are no embeddings yet
+    // (Phase 11 wires them into test_case_chat_message_embeddings). Skip
+    // the whole block — the test-case AI sees only the recent window,
+    // which is acceptable for now and avoids any cross-table read.
+    if (recentMessages.length >= CONSTANTS.RECENT_MESSAGES_LIMIT && chatSessionId && store.kind === 'global') {
       logger.info('[GENERAL_CHAT] Recent messages at limit, using vector search for old context', {
         sessionId: chatSessionId,
         recentCount: recentMessages.length
@@ -518,8 +554,12 @@ export async function handleGeneralChat(
           return { chunks: [], citations: [], sources: { global: [], project: [] } };
         }),
 
-      // 2. Agent memory — summaries from old conversations
-      chatSessionId
+      // 2. Agent memory — summaries from old conversations.
+      // Test-case scope: getSummariesForContext reads chat_summaries
+      // (global table). Test-case summaries land in test_case_chat_summaries
+      // and aren't wired up yet (Phase 11). Skip cleanly, return empty
+      // string so the prompt builder treats this as "no agent memory".
+      chatSessionId && store.kind === 'global'
         ? getSummariesForContext(chatSessionId).catch((err: Error) => {
             logger.warn('[GENERAL_CHAT] Failed to load agent memory', { error: err.message });
             return '';
@@ -886,7 +926,17 @@ You can still help with general questions, saved test cases, and test management
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
   const thinkingMessage = mode === 'editor' ? 'Analyzing the page...' : 'Thinking...';
-  emitProcessingStepWithLogging(chatSessionId, 'generating_response', thinkingMessage, PROGRESS.ROUTING);
+  // Pass testCaseId so progress events also reach `chat:tc:<tcid>` room —
+  // critical for the lazy-create window where the frontend subscribed
+  // by testCaseId before the session existed.
+  emitProcessingStepWithLogging(
+    chatSessionId,
+    'generating_response',
+    thinkingMessage,
+    PROGRESS.ROUTING,
+    undefined,
+    testCaseId,
+  );
 
   let gptResponse: { content: string; usage?: any };
   let shouldDeductCredits = false;
@@ -932,6 +982,10 @@ You can still help with general questions, saved test cases, and test management
             projectName,
             previewSessionId: resolvedPreviewSessionId,
             mode: mode as 'lite' | 'pro' | 'editor' | undefined,
+            // Pass testCaseId so the pipeline's emitStep dual-broadcasts
+            // to `chat:tc:<tcid>` — without this, the test-case chat
+            // sees zero progress events while sub-agents work.
+            testCaseId,
           });
 
           // Extract the user content from the last message (may be multimodal array with images)
@@ -1309,9 +1363,18 @@ You can still help with general questions, saved test cases, and test management
   }
 
   if (chatSessionId) {
+    // Save through the persistence façade — backend selected by `store`
+    // (set at the top of this function from params.chatStore || GLOBAL_STORE).
+    // This is the line that prevents test-case writes from leaking into
+    // the global chat_messages table. Do not replace with a direct
+    // ChatService call.
     const saveChatMessagesWithLogging = functionLogger
-      ? withFunctionLogging(ChatService.saveChatMessages.bind(ChatService), 'ChatService.saveChatMessages', functionLogger)
-      : ChatService.saveChatMessages.bind(ChatService);
+      ? withFunctionLogging(
+          ChatPersistence.saveMessages.bind(ChatPersistence),
+          'ChatPersistence.saveMessages',
+          functionLogger,
+        )
+      : ChatPersistence.saveMessages.bind(ChatPersistence);
 
     // Build user message metadata (include file info if attachments present)
     const modeTag = mode || 'lite';
@@ -1330,7 +1393,7 @@ You can still help with general questions, saved test cases, and test management
       } catch { /* non-critical */ }
     }
 
-    const timestamps = await saveChatMessagesWithLogging(chatSessionId, [
+    const timestamps = await saveChatMessagesWithLogging(store, chatSessionId, [
       { role: 'user', content: message, metadata: userMessageMetadata },
       {
         role: 'ai',
@@ -1354,23 +1417,41 @@ You can still help with general questions, saved test cases, and test management
       }
     }
 
-    // Auto-generate title for new chats (after first user message)
-    // This runs in background, doesn't block response
-    ChatService.autoGenerateTitle(chatSessionId).catch(error => {
-      logger.warn('[GENERAL_CHAT] Failed to auto-generate title', { error, chatSessionId });
+    // Auto-generate title for new chats (after first user message).
+    // Routed through ChatPersistence so test-case sessions update their
+    // own row, not the global one. Fire-and-forget — title gen must
+    // never block the response.
+    ChatPersistence.autoGenerateTitle(store, chatSessionId).catch(error => {
+      logger.warn('[GENERAL_CHAT] Failed to auto-generate title', {
+        error,
+        chatSessionId,
+        chatStore: store.kind,
+      });
     });
 
     // ═══════════════════════════════════════════════════════════════════════
     // AUTO-EMBED OLD MESSAGES (AFTER SAVING - for NEXT request)
     // ═══════════════════════════════════════════════════════════════════════
-    // Now that we saved new messages, check if we need to create embeddings
-    // This runs in background and prepares embeddings for the NEXT request
-    const { count: totalMessageCountAfterSave } = await supabaseAdmin
-      .from('chat_messages')
-      .select('id', { count: 'exact', head: true })
-      .eq('session_id', chatSessionId);
-
-    const totalMessagesNow = totalMessageCountAfterSave || 0;
+    // Skip the embed/summary path entirely for test-case scope.
+    //
+    // The downstream services (autoEmbedOldMessages, summarizeOldMessages)
+    // are hard-coded to read from `chat_messages` / write to
+    // `chat_message_embeddings` / `chat_summaries`. If we fed them a
+    // test-case session id they would either silently no-op (count = 0,
+    // session not found in chat_messages) or — worse — risk inserting
+    // ghost rows into the global tables. Wiring them up properly for
+    // test-case storage is a separate phase; until then, we just don't
+    // call them for test-case sessions. Acceptable cost: per-test-case
+    // chats lose long-context recall after 20 messages until embeddings
+    // are wired in. Tracked as TODO (Phase 11).
+    let totalMessagesNow = 0;
+    if (store.kind === 'global') {
+      const { count: totalMessageCountAfterSave } = await supabaseAdmin
+        .from('chat_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('session_id', chatSessionId);
+      totalMessagesNow = totalMessageCountAfterSave || 0;
+    }
 
     // If we now have more than 20 messages, create embeddings for old ones
     if (totalMessagesNow > CONSTANTS.RECENT_MESSAGES_LIMIT) {

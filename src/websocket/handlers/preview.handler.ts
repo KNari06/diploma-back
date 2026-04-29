@@ -2483,6 +2483,38 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // Build & emit the initial step IMMEDIATELY using pre-click probe data
               const step = buildClickStep(preClickElement!);
 
+              // Diagnostic — audit what the recorder actually built. If
+              // `hasRecordedFingerprint: false` here, the loss is upstream
+              // (probe didn't capture identity); if it's true here but
+              // false in fp_audit.log on the next Run, the loss is in
+              // frontend serialize / DB persist.
+              try {
+                const fs = await import('fs');
+                const path = await import('path');
+                const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+                const fpKeys = step.recordedFingerprint && typeof step.recordedFingerprint === 'object'
+                  ? Object.keys(step.recordedFingerprint).slice(0, 15)
+                  : undefined;
+                const probeKeys = preClickElement
+                  ? Object.keys(preClickElement).filter(k => preClickElement![k as keyof typeof preClickElement] != null).slice(0, 20)
+                  : undefined;
+                fs.appendFileSync(auditPath, JSON.stringify({
+                  ts: new Date().toISOString(),
+                  scope: 'recorder_emit',
+                  stepId: step.id?.slice(0, 8),
+                  type: step.type,
+                  hasRecordedFingerprint: !!step.recordedFingerprint,
+                  hasBindingHints: !!step.bindingHints,
+                  hasEvidence: !!step.evidence,
+                  fpKeys,
+                  probeKeys,
+                  probeTag: preClickElement?.tag,
+                  probeId: preClickElement?.elementId,
+                  probeTestId: preClickElement?.testId,
+                  probeRef: preClickElement?.ref,
+                }) + '\n');
+              } catch { /* non-fatal */ }
+
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
@@ -4551,6 +4583,61 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         userId,
       });
 
+      // Diagnostic — write to a dedicated file (winston dev config drops
+      // info/warn to stdout-only, which we can't read from outside the
+      // process). Bypassing winston with direct fs.appendFile gives us a
+      // disk artifact we can grep regardless of log level config.
+      try {
+        const fs = await import('fs');
+        const path = await import('path');
+        const dbSteps = ((testCase?.stepsJson || []) as unknown as Array<Record<string, unknown>>);
+        const fpAudit = dbSteps.map((s, idx) => {
+          const compiled = s?.compiled as Record<string, unknown> | undefined;
+          const evidence = s?.evidence as Record<string, unknown> | undefined;
+          const bindingHints = s?.bindingHints as Record<string, unknown> | undefined;
+          const compiledContext = compiled?.context as Record<string, unknown> | undefined;
+          const locatorPlan = compiled?.locatorPlan as Array<Record<string, unknown>> | undefined;
+          return {
+            locatorStrategies: locatorPlan?.map(l => `${l.strategy}=${typeof l.value === 'string' ? l.value.slice(0, 40) : ''}@${l.confidence}`).slice(0, 5),
+            idx,
+            id: typeof s?.id === 'string' ? s.id.slice(0, 8) : undefined,
+            type: s?.type,
+            description: typeof s?.description === 'string' ? (s.description as string).slice(0, 80) : undefined,
+            // Where the step was applied (compiled plan stamps the URL it
+            // was generated for). Run-time URL mismatch with this is the
+            // canonical "compiled stale" signal.
+            compiledPageUrl: typeof compiledContext?.pageUrl === 'string' ? compiledContext.pageUrl : undefined,
+            // What evidence ref was cached + what URL it was captured on.
+            evidencePageUrl: typeof evidence?.pageUrl === 'string' ? evidence.pageUrl : undefined,
+            evidenceLastSuccessRef: typeof evidence?.lastSuccessRef === 'string' ? evidence.lastSuccessRef : undefined,
+            evidenceCapturedAt: typeof evidence?.capturedAt === 'string' ? evidence.capturedAt : undefined,
+            // bindingHints captured at apply time — primary semantic anchor.
+            bhLabel: typeof bindingHints?.label === 'string' ? (bindingHints.label as string).slice(0, 80) : undefined,
+            bhText: typeof bindingHints?.text === 'string' ? (bindingHints.text as string).slice(0, 80) : undefined,
+            bhRole: typeof bindingHints?.role === 'string' ? bindingHints.role : undefined,
+            bhTag: typeof bindingHints?.tag === 'string' ? bindingHints.tag : undefined,
+            bhTestId: typeof bindingHints?.testId === 'string' ? bindingHints.testId : undefined,
+            bhElementId: typeof bindingHints?.elementId === 'string' ? bindingHints.elementId : undefined,
+            // Flags + fingerprint key list (compact summary for grep).
+            hasRecordedFingerprint: !!s?.recordedFingerprint,
+            hasBindingHints: !!bindingHints,
+            hasCompiled: !!compiled,
+            hasEvidence: !!evidence,
+            fpKeys: s?.recordedFingerprint && typeof s.recordedFingerprint === 'object'
+              ? Object.keys(s.recordedFingerprint as object).slice(0, 10)
+              : undefined,
+          };
+        });
+        const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+        const line = JSON.stringify({
+          ts: new Date().toISOString(),
+          intentTestCaseId,
+          stepCount: dbSteps.length,
+          steps: fpAudit,
+        }) + '\n';
+        fs.appendFileSync(auditPath, line);
+      } catch { /* non-fatal — diagnostic only */ }
+
       if (isMobile && testCase) {
         // Mobile path: delegate to mobile runner via HTTP
         logger.info('[WebSocket] Starting mobile preview run', {
@@ -4575,6 +4662,29 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // If inline steps provided, save them to DB first (Apply All flow)
         if (Array.isArray(inlineSteps) && inlineSteps.length > 0) {
+          // Diagnostic — answers "did the frontend ship `recordedFingerprint`
+          // for click/type steps, or did toIntentStepForSave drop it?". When
+          // the value is false here, the cause is upstream of this handler
+          // (frontend serialization, recorder emit, or initial DB load).
+          try {
+            const fpAudit = (inlineSteps as unknown as Array<Record<string, unknown>>).map((s, idx) => ({
+              idx,
+              id: typeof s?.id === 'string' ? s.id.slice(0, 8) : undefined,
+              type: s?.type,
+              hasRecordedFingerprint: !!s?.recordedFingerprint,
+              hasBindingHints: !!s?.bindingHints,
+              hasCompiled: !!s?.compiled,
+              hasEvidence: !!s?.evidence,
+              fpKeys: s?.recordedFingerprint && typeof s.recordedFingerprint === 'object'
+                ? Object.keys(s.recordedFingerprint as object).slice(0, 10)
+                : undefined,
+            }));
+            logger.info('[APPLY_ALL_FP_AUDIT] inline steps received', {
+              intentTestCaseId,
+              stepCount: inlineSteps.length,
+              steps: fpAudit,
+            });
+          } catch { /* non-fatal — diagnostic only */ }
           const patch: Record<string, unknown> = { steps: inlineSteps };
           if (inlineStartUrl) {
             patch.url = inlineStartUrl;

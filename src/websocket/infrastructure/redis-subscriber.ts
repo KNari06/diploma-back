@@ -148,21 +148,38 @@ class WebSocketRedisSubscriber {
           break;
 
         // Chat events
+        // `target.testCaseId` is forwarded into the third arg of each
+        // emit method. When non-empty, the emit method dual-broadcasts
+        // to both `chat:<sessionId>` and `chat:tc:<testCaseId>` rooms,
+        // covering the lazy-create window where the frontend has
+        // subscribed by testCaseId but no session row exists yet.
         case 'chat:message':
           if (target?.sessionId || payload.sessionId) {
-            wsService.emitChatMessage(target?.sessionId || payload.sessionId, payload);
+            wsService.emitChatMessage(
+              target?.sessionId || payload.sessionId,
+              payload,
+              target?.testCaseId,
+            );
           }
           break;
 
         case 'chat:test:update':
           if (target?.sessionId || payload.sessionId) {
-            wsService.emitChatTestUpdate(target?.sessionId || payload.sessionId, payload);
+            wsService.emitChatTestUpdate(
+              target?.sessionId || payload.sessionId,
+              payload,
+              target?.testCaseId,
+            );
           }
           break;
 
         case 'chat:processing:step':
           if (target?.sessionId || payload.sessionId) {
-            wsService.emitChatProcessingStep(target?.sessionId || payload.sessionId, payload);
+            wsService.emitChatProcessingStep(
+              target?.sessionId || payload.sessionId,
+              payload,
+              target?.testCaseId,
+            );
           }
           break;
 
