@@ -9,7 +9,7 @@ import { logIntentResolveApply } from './intent-resolve-audit';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Frame, FrameLocator, Locator, Page } from 'playwright';
-import { getEffectiveLabel, sanitizeIntent } from './element-resolver.service';
+import { getEffectiveLabel, invalidateLlmSelectionsForRef, sanitizeIntent } from './element-resolver.service';
 import { tokenizeLabel, tokenOverlap, hasAnyOverlap } from './text-similarity.util';
 import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
@@ -4887,6 +4887,24 @@ export class PreviewStepApplyService {
             preClickAborted = true;
             // Cleanup the click-effect listener since we're not clicking.
             try { clickPreState?.cleanupDownloadListener?.(); } catch { /* non-fatal */ }
+            // V24: invalidate cache so retry / next run doesn't get the same
+            // wrong ref back in 200ms. Cache poisoning is the canonical cause
+            // of "fixed once, broken forever" regressions on Angular Material
+            // sites — guard rejected the pick, but cache still served it.
+            try {
+              const removed = invalidateLlmSelectionsForRef({
+                rejectedRef: candidate.ref,
+                pageUrl: page.url(),
+                intentText: stepDraft.description || '',
+              });
+              if (removed > 0) {
+                logger.info('[PREVIEW_APPLY] LLM cache invalidated after pre-click rejection', {
+                  stepId: stepDraft.id,
+                  rejectedRef: candidate.ref,
+                  entriesRemoved: removed,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
             return {
               success: false,
               error: `[wrong-element] Resolver wanted to click "${chosenLabelForGuard.slice(0, 60)}" for step targeting "${recordedLabelForGuard.slice(0, 60)}" — labels share no meaningful words. Click aborted to avoid side-effects. Refine the step description, or re-record so a structural fingerprint anchors the target.`,
@@ -5491,6 +5509,23 @@ export class PreviewStepApplyService {
               stepId: stepDraft.id,
               reason: 'identity-fingerprint-mismatch-rejection',
             });
+            // V24: invalidate LLM cache so retry doesn't get the same wrong
+            // ref. Without this, run #2 cacheHit returns the stale wrong pick
+            // in 200ms and we re-fail on the same false answer.
+            try {
+              const removed = invalidateLlmSelectionsForRef({
+                rejectedRef: candidate.ref,
+                pageUrl: page.url(),
+                intentText: stepDraft.description || '',
+              });
+              if (removed > 0) {
+                logger.info('[PREVIEW_APPLY] LLM cache invalidated after identity-mismatch rejection', {
+                  stepId: stepDraft.id,
+                  rejectedRef: candidate.ref,
+                  entriesRemoved: removed,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
             return {
               success: false,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the recorded target had id="${stepDraft.recordedFingerprint?.elementId || stepDraft.recordedFingerprint?.testIdAttr}". The click only triggered a ${clickEffectSignal || 'no'} change, not a real navigation/dialog/state update — almost certainly a fake-success. Refine the step description or check that the recorded id still exists on the page.`,
@@ -5770,6 +5805,22 @@ export class PreviewStepApplyService {
               stepId: stepDraft.id,
               reason: 'label-mismatch-rejection',
             });
+            // V24: invalidate LLM cache so retry doesn't get the same wrong
+            // ref. Same rationale as identity guard above.
+            try {
+              const removed = invalidateLlmSelectionsForRef({
+                rejectedRef: candidate.ref,
+                pageUrl: page.url(),
+                intentText: stepDraft.description || '',
+              });
+              if (removed > 0) {
+                logger.info('[PREVIEW_APPLY] LLM cache invalidated after label-mismatch rejection', {
+                  stepId: stepDraft.id,
+                  rejectedRef: candidate.ref,
+                  entriesRemoved: removed,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
             return {
               success: false,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the step targets "${recordedLabel.slice(0, 60)}". The click only triggered a ${clickEffectSignal || 'no'} change, and the labels share no meaningful words — almost certainly a fake-success. Re-record the step so a structural fingerprint is captured, or refine the step description.`,

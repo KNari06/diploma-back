@@ -1534,6 +1534,52 @@ const LLM_SELECT_CACHE_TTL_MS = ELEMENT_RESOLVER_CONFIG.llmCache.ttlMs;
 const LLM_SELECT_CACHE_MAX_SIZE = ELEMENT_RESOLVER_CONFIG.llmCache.maxSize;
 
 /**
+ * V24 — Invalidate cached LLM selections that returned a now-rejected ref.
+ *
+ * Why: when a guard (pre-click / identity / label) rejects a click as
+ * wrong-element, the LLM cache may still hold the same wrong pick for the
+ * same `(intent text, URL)` combo. Next retry / next run hits cache, gets
+ * the same wrong ref in 200ms, fails again. Cache poisoning is the canonical
+ * symptom: cacheHit=true + fingerprintMatch=mismatch in trace.
+ *
+ * Strategy: walk the cache and drop any entry whose CACHED result returned
+ * the rejected ref AND whose key encodes the same normalized URL + intent
+ * text hash. Other entries (different intents, different URLs) untouched.
+ *
+ * Conservative — we don't invalidate by URL alone or by ref alone, only by
+ * the intersection. This avoids wiping legitimate entries for unrelated
+ * steps on the same page.
+ *
+ * Returns the number of entries removed for diagnostics.
+ */
+export function invalidateLlmSelectionsForRef(args: {
+  rejectedRef: string | undefined;
+  pageUrl: string;
+  intentText: string;
+}): number {
+  if (!args.rejectedRef) return 0;
+  const urlKey = (() => {
+    try { return normalizeUrlForComparison(args.pageUrl); } catch { return args.pageUrl || ''; }
+  })();
+  const intentHash = computeTextHash(args.intentText || '');
+  let removed = 0;
+  for (const [key, entry] of llmSelectCache) {
+    // Cache key shape: ${mode}|${urlKey}|${pageSignature}|${actionType}|${textHash}|${fpDigest}|${bhDigest}|${refsList}
+    // Match on URL key + intent text hash via substring — both segments are
+    // pipe-delimited, the textHash is unique enough that false-positive
+    // matches across keys are statistically negligible.
+    const keyMatchesContext =
+      key.includes(`|${urlKey}|`) && key.includes(`|${intentHash}|`);
+    if (!keyMatchesContext) continue;
+    if (entry.result?.selectedRef === args.rejectedRef) {
+      llmSelectCache.delete(key);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
  * Coaching payload surfaced to the editor when the resolver couldn't
  * confidently match. Two callers use this:
  *   - Apply-mode no-match → frontend renders a red "no match — try X / Y"
