@@ -76,7 +76,11 @@ const INTENT_PROMPT_CAP = 500;
 // Bumped on prompt edits to invalidate caches across deploys.
 // v2: action-aware preferences, ref format spec, candidate-notation key,
 //     href in identity, bbox dropped, TOP_K reminder in user prompt.
-const PROMPT_VERSION = 'v2';
+// v3: cross-script semantic match elevated above token overlap in ranking
+//     order — fixes regression where Russian intent ("иконка папка") with
+//     0 token overlap to Kazakh target ("Папкалар") got demoted out of
+//     pruner top-K, then semantic-floor reject killed the resolver.
+const PROMPT_VERSION = 'v3';
 
 // ───────────────────────────────────────────────────────────────────────
 // Types
@@ -271,7 +275,7 @@ CANDIDATE NOTATION (already added by upstream; respect when ranking):
 OUTPUT (JSON only): {"refs":["e1","e7",...]}
 - Refs MUST be copied verbatim from the CANDIDATES list (e.g. "e7", never "7" or "candidate-7" — use the exact value inside ref="...")
 - Up to {TOP_K} refs total
-- Order by descending confidence: identity match > token overlap > container/context match > action-tag fit
+- Order by descending confidence: identity match > cross-script semantic match > token overlap > container/context match > action-tag fit
 - No reasoning, no scores, no explanations`;
 
 function buildPrompt(args: {
