@@ -77,6 +77,15 @@ export const AI_TASK_MODELS = {
    * scenario classification into a localized one-sentence message.
    */
   intentLint: 'gemini-2.5-flash-lite' as const,
+  /**
+   * Stable-token extraction from UI labels for LocatorPlanBuilder.
+   * Same reasoning as `disambiguation` / `intentLint`: predictable sub-second
+   * latency + native JSON mode + multilingual (RU/KZ/EN/CN) matter more than
+   * raw quality for this deterministic text-in/text-out preprocessing step.
+   * temp=0 → same input must produce same tokens, otherwise compiled plans
+   * drift between recordings of the same step.
+   */
+  stableTokens: 'gemini-2.5-flash-lite' as const,
   /** AI check assertion evaluation */
   aiCheck: AI_MODELS.fast,
   /** AI check with screenshot (needs vision) */
@@ -91,6 +100,11 @@ export const AI_TASK_MODELS = {
   selectorResolution: AI_MODELS.fast,
   /** Intent parsing (NL → structured command) */
   intentParsing: AI_MODELS.fast,
+  /**
+   * Yes/no/other confirmation classification (e.g. "do you want to start
+   * exploration?"). Gemini Flash for speed, native JSON, multilingual.
+   */
+  confirmationClassification: 'gemini-2.5-flash' as const,
   // ── API Flow Testing ───────────────────────────────────────────────
   /** API Flow Analyst — domain analysis from spec (needs large context for 1000+ endpoints) */
   apiFlowAnalyst: 'gemini-2.5-flash' as const,

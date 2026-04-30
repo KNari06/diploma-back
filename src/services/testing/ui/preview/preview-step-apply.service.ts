@@ -10,6 +10,8 @@ import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Frame, FrameLocator, Locator, Page } from 'playwright';
 import { getEffectiveLabel, invalidateLlmSelectionsForRef, sanitizeIntent } from './element-resolver.service';
+import { invalidateTokensForText } from './stable-tokens-llm.service';
+import { invalidatePrunerForRef } from './candidate-pruner-llm.service';
 import { tokenizeLabel, tokenOverlap, hasAnyOverlap } from './text-similarity.util';
 import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
@@ -3788,7 +3790,7 @@ export class PreviewStepApplyService {
           let compiled;
           if (resolvedNode) {
             try {
-              compiled = LocatorPlanBuilder.buildCompiledPlan({
+              compiled = await LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode,
                 pageUrl: urlBeforeAction,
@@ -4219,7 +4221,7 @@ export class PreviewStepApplyService {
                     const sess = sessionService.getSession(previewSessionId);
                     const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
                     if (liveNode) {
-                      const candidatePlan = LocatorPlanBuilder.buildCompiledPlan({
+                      const candidatePlan = await LocatorPlanBuilder.buildCompiledPlan({
                         step: stepDraft,
                         resolvedNode: liveNode,
                         pageUrl: page.url(),
@@ -4905,6 +4907,35 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
+            // V25: invalidate stable-tokens cache too. If the rejected pick
+            // was driven by a token-chain locator built from cached LLM
+            // tokens, those tokens are now suspect — re-derive on next run.
+            try {
+              const recordedText = stepDraft.recordedFingerprint?.text || stepDraft.description || '';
+              if (invalidateTokensForText(recordedText)) {
+                logger.info('[PREVIEW_APPLY] Token cache invalidated after pre-click rejection', {
+                  stepId: stepDraft.id,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
+            // V25 Phase 4: invalidate the pruner cache for the same
+            // (pageUrl, intentText) so the next resolver call doesn't
+            // serve a cached top-15 that included the rejected ref.
+            // Mirrors `invalidateLlmSelectionsForRef` semantics.
+            try {
+              const removed = invalidatePrunerForRef({
+                rejectedRef: candidate.ref,
+                pageUrl: page.url(),
+                intentText: stepDraft.description || '',
+              });
+              if (removed > 0) {
+                logger.info('[PREVIEW_APPLY] Pruner cache invalidated after pre-click rejection', {
+                  stepId: stepDraft.id,
+                  rejectedRef: candidate.ref,
+                  entriesRemoved: removed,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
             return {
               success: false,
               error: `[wrong-element] Resolver wanted to click "${chosenLabelForGuard.slice(0, 60)}" for step targeting "${recordedLabelForGuard.slice(0, 60)}" — labels share no meaningful words. Click aborted to avoid side-effects. Refine the step description, or re-record so a structural fingerprint anchors the target.`,
@@ -5209,7 +5240,7 @@ export class PreviewStepApplyService {
               const session = sessionService.getSession(previewSessionId);
               pageSignature = session?.lastPageSignature;
 
-              compiled = LocatorPlanBuilder.buildCompiledPlan({
+              compiled = await LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode: candidate.node,
                 pageUrl: urlBeforeAction,
@@ -5526,6 +5557,32 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
+            // V25: invalidate stable-tokens cache too — see pre-click guard
+            // for rationale. Token-chain locators that drove this click may
+            // be built from suspect cached tokens.
+            try {
+              const recordedText = stepDraft.recordedFingerprint?.text || stepDraft.description || '';
+              if (invalidateTokensForText(recordedText)) {
+                logger.info('[PREVIEW_APPLY] Token cache invalidated after identity-mismatch rejection', {
+                  stepId: stepDraft.id,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
+            // V25 Phase 4: invalidate pruner cache — see pre-click guard.
+            try {
+              const removed = invalidatePrunerForRef({
+                rejectedRef: candidate.ref,
+                pageUrl: page.url(),
+                intentText: stepDraft.description || '',
+              });
+              if (removed > 0) {
+                logger.info('[PREVIEW_APPLY] Pruner cache invalidated after identity-mismatch rejection', {
+                  stepId: stepDraft.id,
+                  rejectedRef: candidate.ref,
+                  entriesRemoved: removed,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
             return {
               success: false,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the recorded target had id="${stepDraft.recordedFingerprint?.elementId || stepDraft.recordedFingerprint?.testIdAttr}". The click only triggered a ${clickEffectSignal || 'no'} change, not a real navigation/dialog/state update — almost certainly a fake-success. Refine the step description or check that the recorded id still exists on the page.`,
@@ -5815,6 +5872,31 @@ export class PreviewStepApplyService {
               });
               if (removed > 0) {
                 logger.info('[PREVIEW_APPLY] LLM cache invalidated after label-mismatch rejection', {
+                  stepId: stepDraft.id,
+                  rejectedRef: candidate.ref,
+                  entriesRemoved: removed,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
+            // V25: invalidate stable-tokens cache too — see pre-click guard
+            // for rationale.
+            try {
+              const recordedText = stepDraft.recordedFingerprint?.text || stepDraft.description || '';
+              if (invalidateTokensForText(recordedText)) {
+                logger.info('[PREVIEW_APPLY] Token cache invalidated after label-mismatch rejection', {
+                  stepId: stepDraft.id,
+                });
+              }
+            } catch { /* never break apply on cache cleanup */ }
+            // V25 Phase 4: invalidate pruner cache — see pre-click guard.
+            try {
+              const removed = invalidatePrunerForRef({
+                rejectedRef: candidate.ref,
+                pageUrl: page.url(),
+                intentText: stepDraft.description || '',
+              });
+              if (removed > 0) {
+                logger.info('[PREVIEW_APPLY] Pruner cache invalidated after label-mismatch rejection', {
                   stepId: stepDraft.id,
                   rejectedRef: candidate.ref,
                   entriesRemoved: removed,

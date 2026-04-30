@@ -164,9 +164,42 @@ const transports: winston.transport[] = [
       truncateLargeFields(),
     ),
   }),
-  // Console transport
+  // V25 — Console transport with debug-level noise filter.
+  // Each suppressed tag below fires every 1-10s during a session and
+  // crowds out the lines we actually care about. They still land in
+  // v25-debug.log if matched there; here we only filter terminal output.
   new winston.transports.Console({
     format: winston.format.combine(
+      winston.format((info) => {
+        // Suppress only at debug level — info/warn/error always pass.
+        if (info.level !== 'debug') return info;
+        const msg = typeof info.message === 'string' ? info.message : String(info.message);
+        const NOISY_DEBUG_TAGS = [
+          '[PREVIEW_VIDEO] Stats',
+          '[PREVIEW_VIDEO] Injected manual frame',
+          '[PREVIEW_VIDEO] First frame guaranteed',
+          '[WebSocketService] Emitted to user',
+          '[STEP_READINESS] Skipped',
+          '[STEP_READINESS] Starting lookahead',
+          '[STEP_READINESS] Element ready',
+          '[STEP_READINESS] Unknown locator',
+          '[PreviewRun] Lookahead skipped',
+          '[PreviewRun] Evidence policy check',
+          '[SNAPSHOT_REJECTS] filter rejection summary',
+          '[ELEMENT_RESOLVER] Starting resolution',
+          '[ELEMENT_RESOLVER] Built allowed sets',
+          '[ELEMENT_RESOLVER] Allowed sets built',
+          '[COMPILED_EXECUTOR] Compiled signature is base64',
+          '[INTENT_LINT] Linting step',
+          '[AI_USAGE] Untracked AI call',
+          '[AI_PROVIDER] Generating text',
+          '[BLOCKER_DIAGNOSIS] Requesting LLM diagnosis',
+          '[BLOCKER_DIAGNOSIS] Wait timed out',
+          '[INTENT_LINT_V23] Clarification LLM resolved',
+          '[INTENT_LINT_V4] Degraded mode: fingerprint',
+        ];
+        return NOISY_DEBUG_TAGS.some(t => msg.includes(t)) ? false : info;
+      })(),
       winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss:ms' }),
       winston.format.errors({ stack: true }), // ← FIX: Extract error.stack
       truncateLargeFields(), // V21: cap individual fields before colorize/printf
@@ -218,6 +251,67 @@ try {
 } catch (error) {
   console.error('Failed to create error.log transport:', error);
   console.warn('Error logging to file will be disabled. Errors will only go to console.');
+}
+
+// V25 — dedicated debug log for resolver + builder + token-extraction events.
+//
+// Why a separate file instead of using the console transport: in dev mode
+// info-level lines go ONLY to stdout, so we can't post-mortem them without
+// piping the entire dev session through `tee`. This transport always writes
+// to disk regardless of NODE_ENV, but filters to ONLY our V25 tags so the
+// file stays small and grep-friendly. Kill switch: rm logs/v25-debug.log.
+try {
+  // Tags whose log lines we want preserved on disk for post-mortem. Each
+  // entry is matched as a substring against the message string (winston
+  // passes message + meta separately, so we lift `[TAG]` from message).
+  const V25_TAGS = [
+    '[STABLE_TOKENS_LLM]',
+    '[LOCATOR_PLAN_BUILDER]',
+    '[LLM_SELECT]',
+    '[ELEMENT_RESOLVER]',
+    '[CANDIDATE_PRUNER]',
+    '[PREVIEW_APPLY] Rejecting',
+    '[PREVIEW_APPLY] Cleared parasitic',
+    '[PREVIEW_APPLY] LLM cache invalidated',
+    '[PREVIEW_APPLY] Token cache invalidated',
+    '[PREVIEW_APPLY] Pre-click guard',
+    '[INTENT_LINT_TIMING]',
+    '[COMPILED_EXECUTOR]',
+  ];
+  const v25Filter = winston.format((info) => {
+    const msg = typeof info.message === 'string' ? info.message : String(info.message);
+    return V25_TAGS.some(tag => msg.includes(tag)) ? info : false;
+  });
+
+  // Custom format that bypasses truncateLargeFields — we WANT the full
+  // candidate dump / token list / fingerprint object preserved, otherwise
+  // post-mortem becomes guesswork. Tag-filter ensures we only catch our
+  // diagnostic lines so the file stays small even without truncation.
+  const v25LogTransport = new winston.transports.File({
+    filename: path.join(logsDir, 'v25-debug.log'),
+    // debug grabs `[COMPILED_EXECUTOR] Trying locator` and `[ELEMENT_RESOLVER]
+    // Starting resolution` which are key for understanding plan execution.
+    // The tag filter still narrows volume so we don't drown in PREVIEW_VIDEO
+    // / SNAPSHOT_REJECTS / WebSocketService chatter at debug level.
+    level: 'debug',
+    maxsize: 20 * 1024 * 1024, // 20MB — enough for several full test runs
+    maxFiles: 3,                // rotate, keep last 3
+    format: winston.format.combine(
+      v25Filter(),
+      winston.format.timestamp(),
+      // INTENTIONALLY SKIP truncateLargeFields — diagnostic dumps need
+      // full fidelity. The tag filter already keeps total volume bounded.
+      winston.format.json()
+    ),
+  });
+
+  v25LogTransport.on('error', (error) => {
+    console.error('Error writing to v25-debug.log:', error);
+  });
+
+  transports.push(v25LogTransport);
+} catch (error) {
+  console.error('Failed to create v25-debug.log transport:', error);
 }
 
 // Add additional file transports in production

@@ -14,6 +14,7 @@ import type {
   TargetFingerprint,
 } from './preview.types';
 import { CELL_SEP, escapeHasText, normalizeText } from './text-normalizer.util';
+import { extractStableTokensViaLLM } from './stable-tokens-llm.service';
 
 /**
  * Escape value for CSS attribute selector.
@@ -44,8 +45,87 @@ const GENERIC_ROLES = new Set(['generic', 'none', 'presentation', 'group']);
 /**
  * Build ordered list of locators (primary + fallbacks)
  */
-function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
+async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]> {
   const locators: LocatorEntry[] = [];
+
+  // V25 — Stable-token enrichment for long-text labels.
+  //
+  // Class of element this targets: Angular Material card / Vue tile /
+  // dashboard widget where the recorder captured ONLY a long visible text
+  // (e.g. "МАТ-SMART ЖЕЛТОҚСАН Т. Бекнұр • Курс аяқталды") plus bbox.
+  // No id, testId, name, href, svgIcon — nothing structural to grip.
+  //
+  // For these elements we ask an LLM to pick 2-3 stable identifying
+  // tokens (brand + author surname). Three places below use the tokens:
+  //   1. NEW first-priority CSS chain `<tag>:has-text("X"):has-text("Y")`
+  //   2. Augmented role strategy with token as accessible-name partial
+  //   3. Scoped chain inside landmark / containerTitles
+  //
+  // Existing full-text strategies remain as fallbacks — we ADD, never
+  // REPLACE. On testId-rich sites (`hasStructuralAnchor === true`) we
+  // skip the LLM call entirely → no latency penalty.
+  //
+  // The LLM call is short (~150-300ms) and cached by text-hash, so
+  // subsequent plan builds for the same recorded label are 0ms.
+  const hasStructuralAnchor =
+    !!node.id
+    || !!node.testIdAttr
+    || !!(node as any).childTestId
+    || !!(node as any).href
+    || !!node.svgIcon
+    || !!(node as any).iconLabel
+    || !!(node as any).customElementTag
+    || !!(node as any).dataValue
+    || !!(node as any).dataRowKey;
+  const isLongText = !!node.text && node.text.length >= 30;
+  const shouldEnrichWithTokens = !hasStructuralAnchor && isLongText;
+  const enrichStartedAt = shouldEnrichWithTokens ? Date.now() : 0;
+  const stableTokens: string[] = shouldEnrichWithTokens
+    ? await extractStableTokensViaLLM(node.text!)
+    : [];
+  if (shouldEnrichWithTokens) {
+    // Diagnostic: lets post-mortem trace whether the V25 enrichment fired
+    // for a given step, what tokens (if any) made it into the plan, and
+    // whether the extractor was a cache hit (~0ms) or a fresh LLM call
+    // (~150-300ms). Logged once per buildLocatorChain call.
+    const enrichDurationMs = Date.now() - enrichStartedAt;
+    logger.info('[LOCATOR_PLAN_BUILDER] Token enrichment', {
+      tokenCount: stableTokens.length,
+      tokens: stableTokens,
+      textPreview: node.text!.slice(0, 60),
+      tagPrefix: node.tag || '(none)',
+      latencyMs: enrichDurationMs,
+      cacheHit: enrichDurationMs < 20, // heuristic — LLM cold call ~150ms+
+    });
+  }
+
+  // V25 — Enhancement #1: token-chain CSS as first-priority strategy.
+  // Inserted BEFORE role/testId/etc. so a successful token chain match
+  // (cheap, ~50ms) beats waiting on full-text role/getByText timeouts
+  // when the recorded full string drifted. Tag prefix narrows by element
+  // type — `a:has-text("X"):has-text("Y")` won't match a parent <div>
+  // that incidentally contains both tokens.
+  //
+  // Skip when tag is missing/empty: a wildcard prefix `*:has-text(X)` would
+  // match every ancestor that contains the token in its descendant tree
+  // (including <body>), which produces cheap-but-useless plans. Better to
+  // emit no chain than a globally-matching one — falls through to scoped
+  // chains (landmark / containerTitles) below where the scope itself
+  // restricts matches.
+  const hasUsableTag = !!(node.tag && node.tag.length > 0);
+  if (stableTokens.length >= 2 && hasUsableTag) {
+    const tagPrefix = node.tag!;
+    const chain = stableTokens
+      .map(tok => `:has-text("${escapeHasText(tok)}")`)
+      .join('');
+    locators.push({
+      strategy: 'css',
+      value: `${tagPrefix}${chain}`,
+      // Above bare text (0.7) and below testId (0.8). Chained :has-text
+      // is strong identity but not as durable as an explicit attribute.
+      confidence: 0.82,
+    });
+  }
 
   // ── BUG FIX: Removed 'ref' (data-agent-ref) strategy ──
   // data-agent-ref attributes are injected ONLY during preview sessions and are
@@ -79,6 +159,38 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
         roleName: node.role,
         confidence: 0.9,
       });
+      // V25 — Enhancement #2: role with stable token as accessible-name
+      // partial. Playwright's `getByRole(role, {name})` does substring
+      // matching by default — so `name: "МАТ-SMART"` matches any element
+      // whose accessible name CONTAINS that substring.
+      //
+      // ⚠ Ambiguity caveat: substring match cuts both ways. The same
+      // partial name will also match OTHER cards / nav links / breadcrumbs
+      // that mention the brand. On a multi-card page this entry is more
+      // a "rescue if full-name fails" than a precise locator. Confidence
+      // is intentionally low (0.65) so it sits AFTER label / testId / id /
+      // role-full-name / token-chain — only used when those drift.
+      //
+      // Gating widened (vs. earlier draft): we extract tokens from
+      // `node.text` regardless of which source provided `accessibleName`
+      // (text might be the descendant's text content while accessibleName
+      // came from a short ariaLabel like "card"). Any time we have ≥1
+      // token AND a long node.text, the partial role rescue is worth
+      // adding.
+      if (stableTokens.length >= 1 && node.text && node.text.length >= 30) {
+        const partialName = stableTokens[0];
+        if (partialName !== accessibleName && partialName.length >= 2) {
+          locators.push({
+            strategy: 'role',
+            value: partialName,
+            roleName: node.role,
+            // Below role-full-name (0.9), text (0.7), and the token-chain
+            // CSS (0.82). Last-resort "did the full name change but the
+            // brand survives?" probe.
+            confidence: 0.65,
+          });
+        }
+      }
     }
   }
 
@@ -365,6 +477,120 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
   // makes sure arrowDir survives into compiled plan as candidateText.
   // (Strategy: skipped here — purely informational, fed via fingerprint.)
 
+  // V25 — Strategies that read fields the extractor was already populating
+  // but the builder ignored. Extractor fills `alt`, `href`, `customElementTag`,
+  // `nearText` from the live snapshot; without dedicated strategies they
+  // were only flowing into LLM prompts and fingerprints, never into the
+  // compiled plan as actionable locators. Each one is gated to avoid
+  // duplicating stronger anchors (id / testId) that already won.
+
+  // <img alt="..."> direct attribute. The accessibleName chain in the role
+  // strategy already considers `alt` for image roles, but a bare image link
+  // (`<img alt="JUZ40 Logo">` inside a clickable wrapper) often loses that
+  // path because the role lookup hits the wrapper, not the img. Direct
+  // attr selector recovers it. Skipped when stronger anchors exist so we
+  // don't bloat plans on testId-rich pages.
+  if (node.tag === 'img'
+      && node.alt
+      && node.alt.length >= 2
+      && !node.testIdAttr
+      && !(node.id && !node.isDynamicId)) {
+    const safeAlt = escapeCssAttrValue(node.alt);
+    locators.push({
+      strategy: 'css',
+      value: `img[alt="${safeAlt}"]`,
+      // Below testId (0.8) and id (0.78) — alt drifts when designers
+      // rename, but it's stable enough for nav/brand images.
+      confidence: 0.74,
+    });
+  }
+
+  // <a href="..."> for full paths (not only fragment-anchors which the
+  // existing block above already handles). Substring match `[href*="..."]`
+  // survives origin/protocol changes and querystring noise — `/curator/archive`
+  // matches `https://juz40-edu.kz/curator/archive?tab=active`.
+  // Skipped when a stronger anchor already won.
+  if (node.href
+      && typeof node.href === 'string'
+      && !node.href.startsWith('#')
+      && !node.href.startsWith('javascript:')
+      && !node.href.startsWith('mailto:')
+      && node.href.length >= 4
+      && !node.testIdAttr
+      && !(node.id && !node.isDynamicId)) {
+    // Strip query / hash so the substring stays focused on the route path.
+    // Avoid `URL` parse so we don't choke on relative hrefs (`./foo`,
+    // `?modal=login`); split-on-? is enough for our substring use.
+    const hrefForMatch = node.href.split('?')[0].split('#')[0];
+    if (hrefForMatch.length >= 4) {
+      const safeHref = escapeCssAttrValue(hrefForMatch);
+      locators.push({
+        strategy: 'css',
+        value: `a[href*="${safeHref}"]`,
+        // Below testId (0.8) — paths get reorganised more often than
+        // testIds, but they survive copy-edits to the visible label.
+        confidence: 0.72,
+      });
+    }
+  }
+
+  // Custom element wrapper as semantic anchor. Angular / Vue / Web Components
+  // often render branded leaf elements like `<app-course-card>`, `<v-btn>`,
+  // `<sl-button>`. Combine the wrapper tag with the leaf text (or a stable
+  // token from V25) to disambiguate two cards in the same list. Without
+  // this, descriptor-poor cards fell back to `getByText("...")` only.
+  if (node.customElementTag
+      && node.customElementTag.length >= 3
+      && (node.text || stableTokens.length > 0)) {
+    // Prefer the most stable token if V25 LLM extraction returned one;
+    // otherwise the full text. Skip empty/whitespace anchors.
+    const anchorText = stableTokens[0] || node.text || '';
+    const trimmedAnchor = anchorText.trim();
+    if (trimmedAnchor.length >= 2) {
+      const safeTag = escapeCssAttrValue(node.customElementTag);
+      const safeAnchor = escapeHasText(trimmedAnchor);
+      locators.push({
+        strategy: 'css',
+        value: `${safeTag}:has-text("${safeAnchor}")`,
+        // Above bare text (0.7) because the tag prefix narrows by
+        // component type; below testId (0.8) since custom-element names
+        // can be renamed during refactors.
+        confidence: 0.75,
+      });
+    }
+  }
+
+  // nearText-scoped chain to disambiguate duplicate-label leaves. The probe
+  // captures a sibling/row text snippet that uniquely sits next to the
+  // target element on busy pages (e.g. table action buttons that all say
+  // "Edit" — nearText is the row's first cell text).
+  // Why scoped: a flat `getByText("Edit")` would pick the first match;
+  // anchoring to nearText forces "the Edit button NEAR <row label>".
+  if (node.nearText
+      && node.nearText.length >= 3
+      && node.nearText.length <= 80
+      && node.text
+      && node.tag
+      && !node.testIdAttr) {
+    const leafAnchor = stableTokens[0] || node.text;
+    const trimmedLeaf = leafAnchor.trim();
+    if (trimmedLeaf.length >= 2) {
+      const safeNear = escapeHasText(node.nearText);
+      const safeLeaf = escapeHasText(trimmedLeaf);
+      locators.push({
+        strategy: 'css',
+        // Two-stage chain: outer container that contains the nearText anchor,
+        // then the leaf with our target text. `>>` narrows successive
+        // locators within the previous match.
+        value: `:has-text("${safeNear}") >> ${node.tag}:has-text("${safeLeaf}")`,
+        // Below containerTitles scope (0.74) because nearText is more
+        // brittle than a section heading — sibling text re-orders more
+        // often than container titles do.
+        confidence: 0.73,
+      });
+    }
+  }
+
   // V22 Pkg2: Bootstrap data-bs-toggle + data-bs-target combo. Either
   // alone is weakish (multiple modals share toggle="modal"), but together
   // they uniquely identify a real Bootstrap trigger.
@@ -491,6 +717,15 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
   // pages where text drifts (i18n, SSR vs CSR mounts, etc.).
   if (textStrategyAdded) {
     const escText = escapeCssAttrValue(node.text!);
+    // V25 — Enhancement #3: token-based scoped chain. Inserted BEFORE
+    // the full-text scoped variants below so a successful match on the
+    // resilient form is preferred. Confidence is bumped above the full-
+    // text scoped (0.78) but stays below role-with-name (0.9) — chained
+    // tokens inside a landmark are more durable than full text but not
+    // as deterministic as an aria-named role.
+    const tokenChainInner = stableTokens.length >= 2
+      ? stableTokens.map(tok => `:has-text("${escapeHasText(tok)}")`).join('')
+      : '';
     // Landmark scope (header / main / nav / footer / aside / form / search).
     // `nearestLandmark` already filters to known ARIA landmarks at probe time,
     // so we trust its value. Picks role-attr selector first (`[role="main"]`)
@@ -499,6 +734,14 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
     // duplicate landmark elements (e.g. nested `<nav>`s).
     if (node.nearestLandmark) {
       const escLandmark = escapeCssAttrValue(node.nearestLandmark);
+      // V25: token-chain variant FIRST when tokens available.
+      if (tokenChainInner) {
+        locators.push({
+          strategy: 'css',
+          value: `[role="${escLandmark}"] >> ${tokenChainInner}`,
+          confidence: 0.80,
+        });
+      }
       locators.push({
         strategy: 'css',
         value: `[role="${escLandmark}"] >> text="${escText}"`,
@@ -529,6 +772,14 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
       for (const title of node.containerTitles.slice(0, 2)) {
         if (!title || title.length < 2) continue;
         const escTitle = escapeHasText(title);
+        // V25: token-chain variant FIRST when tokens available.
+        if (tokenChainInner) {
+          locators.push({
+            strategy: 'css',
+            value: `:has-text("${escTitle}") >> ${tokenChainInner}`,
+            confidence: 0.76,
+          });
+        }
         locators.push({
           strategy: 'css',
           value: `:has-text("${escTitle}") >> text="${escText}"`,
@@ -678,11 +929,19 @@ const RESOLVER_VERSION = '3.0.0';
  */
 export class LocatorPlanBuilder {
   /**
-   * Build compiled execution plan from resolved node and step
-   * 
+   * Build compiled execution plan from resolved node and step.
+   *
+   * V25: now async — `buildLocatorChain` may consult an LLM-backed token
+   * extractor for long-text labels without structural anchors. The chain
+   * itself is still computed synchronously; the only async surface is
+   * the optional token enrichment for `:has-text()` chains. All existing
+   * deterministic strategies (id / testId / role / ...) run unchanged
+   * before any LLM call is even considered, so on testId-rich sites this
+   * function returns synchronously fast (no LLM latency).
+   *
    * @param params.pageSignature Optional page signature for staleness detection
    */
-  static buildCompiledPlan(params: {
+  static async buildCompiledPlan(params: {
     step: IntentStep;
     resolvedNode: InteractiveNode;
     pageUrl: string;
@@ -690,7 +949,7 @@ export class LocatorPlanBuilder {
     snapshotRef?: string;
     screenshotRef?: string;
     pageSignature?: string;
-  }): CompiledStepPlan {
+  }): Promise<CompiledStepPlan> {
     const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef, pageSignature } = params;
 
     logger.debug('[LOCATOR_PLAN_BUILDER] Building compiled plan', {
@@ -702,8 +961,11 @@ export class LocatorPlanBuilder {
       hasPageSignature: !!pageSignature,
     });
 
-    // Build locator chain (primary + fallbacks)
-    const locatorPlan = buildLocatorChain(resolvedNode);
+    // Build locator chain (primary + fallbacks). Async since V25: the
+    // chain may consult the LLM-backed token extractor for long-text
+    // labels without structural anchors. On testId-rich elements the
+    // function returns synchronously fast (no LLM call).
+    const locatorPlan = await buildLocatorChain(resolvedNode);
 
     if (locatorPlan.length === 0) {
       logger.warn('[LOCATOR_PLAN_BUILDER] Empty locator plan — element has no durable selectors', {
@@ -752,11 +1014,21 @@ export class LocatorPlanBuilder {
       targetFingerprint,
     };
 
+    // V25: count locators that were produced by token enrichment so we can
+    // see at-a-glance whether long-text steps got chain coverage. Token
+    // entries are recognised by the canonical `:has-text("X"):has-text(`
+    // shape — single-token-only entries (regex partial role / single
+    // text) intentionally aren't counted here because they aren't
+    // chain-form.
+    const tokenChainCount = locatorPlan.filter(
+      l => l.strategy === 'css' && /:has-text\([^)]*\):has-text\(/.test(l.value),
+    ).length;
     logger.info('[LOCATOR_PLAN_BUILDER] Compiled plan generated', {
       stepId: step.id,
       locatorCount: locatorPlan.length,
       primaryStrategy: locatorPlan[0]?.strategy,
       primaryConfidence: locatorPlan[0]?.confidence,
+      tokenChainCount,
       compiledVersion: COMPILED_VERSION,
       resolverVersion: RESOLVER_VERSION,
     });

@@ -19,7 +19,7 @@
 import { generateText } from '@/services/ai/core/ai-provider.service';
 import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
+import { AI_MODELS, AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import type {
@@ -39,6 +39,7 @@ import type {
 
 import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { pruneCandidatesViaLLM } from './candidate-pruner-llm.service';
 
 const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
 const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
@@ -212,6 +213,15 @@ function isFillCompatibleTextField(node: InteractiveNode): boolean {
 export function buildAllowedSets(
   nodes: InteractiveNode[],
   actionType: IntentActionType,
+  // V26: real viewport dimensions. When provided, used for modal coverage
+  // ratio calculation. Without it we fall back to the high-water-mark
+  // bounding box of all visible nodes — which UNDERESTIMATES coverage on
+  // long scrollable pages (a 1280×720 modal on a 1280×8000 page reads as
+  // 9% coverage instead of 100%, so the modal isn't treated as blocking
+  // and background elements aren't hard-excluded). Caller passes
+  // `{ width: window.innerWidth, height: window.innerHeight }` from the
+  // snapshot collector.
+  viewport?: { width: number; height: number },
 ): AllowedSetResult {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
@@ -245,17 +255,29 @@ export function buildAllowedSets(
   if (modalNode) {
     const bb = modalNode.boundingBox;
     if (bb && bb.width > 0 && bb.height > 0) {
-      // Estimate viewport as max bounding box across all visible nodes
-      let maxRight = 0;
-      let maxBottom = 0;
-      for (const n of nodes) {
-        if (n.boundingBox && n.isVisible) {
-          maxRight = Math.max(maxRight, n.boundingBox.x + n.boundingBox.width);
-          maxBottom = Math.max(maxBottom, n.boundingBox.y + n.boundingBox.height);
+      // V26: prefer real viewport when caller provides it. Fall back to
+      // high-water-mark bbox across visible nodes only when viewport is
+      // unknown — that fallback underestimates coverage on long pages.
+      let viewportArea = 0;
+      if (viewport && viewport.width > 0 && viewport.height > 0) {
+        viewportArea = viewport.width * viewport.height;
+      } else {
+        let maxRight = 0;
+        let maxBottom = 0;
+        for (const n of nodes) {
+          if (n.boundingBox && n.isVisible) {
+            maxRight = Math.max(maxRight, n.boundingBox.x + n.boundingBox.width);
+            maxBottom = Math.max(maxBottom, n.boundingBox.y + n.boundingBox.height);
+          }
         }
+        viewportArea = maxRight * maxBottom;
       }
-      const viewportArea = maxRight * maxBottom;
-      const modalArea = bb.width * bb.height;
+      // Modal area is also clamped to viewport — a modal taller than the
+      // viewport (very rare; usually scrollable internally) shouldn't
+      // produce coverage > 1 and be treated as "extra blocking".
+      const clampedModalW = viewport ? Math.min(bb.width, viewport.width) : bb.width;
+      const clampedModalH = viewport ? Math.min(bb.height, viewport.height) : bb.height;
+      const modalArea = clampedModalW * clampedModalH;
       // Modal must cover at least 30% of visible area to be considered blocking
       // This filters out cookie banners, notification bars, etc.
       const coverageRatio = viewportArea > 0 ? modalArea / viewportArea : 0;
@@ -1011,145 +1033,6 @@ function buildSceneSummary(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PRE-SCORE: Rank elements by text overlap with intent
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Tokenize text into lowercase words (3+ chars). No stop-word lists — no hardcode.
- * Short tokens (<3 chars) are noise in any language and excluded.
- */
-function tokenizeForPrescore(text: string): string[] {
-  if (!text) return [];
-  return text
-    .toLowerCase()
-    .split(/[\s|,;:.()\[\]{}'"!?/\\<>@#$%^&*+=~`\-_]+/)
-    .filter(w => w.length >= 3);
-}
-
-/**
- * Build searchable text blob for an InteractiveNode.
- * Combines all text fields that a user might reference when describing an element.
- */
-function buildNodeSearchText(node: InteractiveNode): string {
-  const parts: string[] = [];
-  if (node.labelText) parts.push(node.labelText);
-  if (node.text) parts.push(node.text);
-  if (node.ariaLabel) parts.push(node.ariaLabel);
-  if (node.placeholder) parts.push(node.placeholder);
-  if (node.title) parts.push(node.title);
-  if (node.nearText) parts.push(node.nearText);
-  if (node.testIdAttr) parts.push(node.testIdAttr);
-  if (node.name && !node.isDynamicId) parts.push(node.name);
-  if (node.containerTitles?.length) parts.push(node.containerTitles.join(' '));
-  if (node.autocomplete) parts.push(node.autocomplete);
-  if (node.nearestLandmark) parts.push(node.nearestLandmark);
-  // V15: Icon semantic signals — critical for icon-only buttons where no text/aria-label exists.
-  // Splits "lucide-folder" / "icon-folder" / "mdi:folder" into scannable tokens so
-  // intent "folder icon" matches the right element instead of falling back to DOM order.
-  if (node.iconClasses) parts.push(node.iconClasses.replace(/[-_:]/g, ' '));
-  // V23: additional identity sources for searchable text — gives preScoreAndSort
-  // a chance on icon-only / Angular-Material / Vue / Bootstrap targets where
-  // identity lives on derived fields. Each is split on hyphen/underscore so
-  // a multi-word value like "folder-outline" matches an intent like "folder".
-  const alt = (node as any).alt as string | undefined;
-  if (alt) parts.push(alt);
-  const iconLabel = (node as any).iconLabel as string | undefined;
-  if (iconLabel) parts.push(iconLabel.replace(/[-_]/g, ' '));
-  const svgIcon = (node as any).svgIcon as string | undefined;
-  if (svgIcon) parts.push(svgIcon.replace(/[-_]/g, ' '));
-  const childTestId = (node as any).childTestId as string | undefined;
-  if (childTestId) parts.push(childTestId.replace(/[-_]/g, ' '));
-  const customElementTag = (node as any).customElementTag as string | undefined;
-  if (customElementTag) parts.push(customElementTag.replace(/[-_]/g, ' '));
-  return parts.join(' ').toLowerCase();
-}
-
-/** Proportion of LLM slots reserved for scored elements (rest go to DOM-order) */
-const SCORED_SLOT_RATIO = 0.6; // 60% scored, 40% DOM-order
-
-/**
- * Pre-score elements and build a merged batch that GUARANTEES both:
- * 1. Elements with text overlap are prioritized (covers 65% of intents)
- * 2. DOM-order elements always get slots (covers cross-language, visual, synonym intents)
- *
- * CRITICAL: No element is ever filtered out by score. Score only determines
- * which RESERVED SLOTS an element fills. Zero-score elements fill DOM slots.
- *
- * Layout for limit=70:
- *   [up to 42 scored elements (desc)] + [up to 28 DOM-order elements not already included]
- *   = always 70 (or fewer if total < 70)
- *
- * If scored < 42, remaining slots go to DOM-order (total still 70).
- * If scored >= 42, overflow scored elements go to DOM-order slots if space permits.
- *
- * This means: even if pre-score has 42 false positives, 28 DOM-order elements
- * still get through — covering cross-language, synonym, and visual description cases.
- */
-function preScoreAndSort(nodes: InteractiveNode[], intentText: string, limit: number): InteractiveNode[] {
-  if (nodes.length <= limit) return nodes; // Everything fits — no ranking needed
-
-  const intentWords = tokenizeForPrescore(intentText);
-
-  // If no usable tokens (very short intent, all <3 chars), keep DOM order
-  if (intentWords.length === 0) return nodes;
-
-  // Score each node
-  const scored: Array<{ node: InteractiveNode; score: number; domIndex: number }> = [];
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    const searchText = buildNodeSearchText(node);
-
-    let wordScore = 0;
-    for (const word of intentWords) {
-      if (searchText.includes(word)) wordScore++;
-    }
-
-    scored.push({ node, score: wordScore, domIndex: i });
-  }
-
-  // Find the median score to separate "specifically relevant" from "generically matching".
-  // Elements scoring above median are genuinely relevant; elements at or below may just
-  // share a common word (e.g. "button" appears in every element's text).
-  const scores = scored.map(s => s.score).filter(s => s > 0);
-  const medianScore = scores.length > 0
-    ? scores.sort((a, b) => a - b)[Math.floor(scores.length / 2)]
-    : 0;
-  // "Specifically scored" = above median (or above 1 if median is too low).
-  // This prevents a single generic word from promoting ALL elements.
-  const scoreThreshold = Math.max(medianScore, 1);
-
-  const highScored = scored.filter(s => s.score > scoreThreshold);
-  const rest = scored.filter(s => s.score <= scoreThreshold);
-
-  // Sort high-scored by score descending (stable — same score keeps DOM order)
-  highScored.sort((a, b) => b.score - a.score || a.domIndex - b.domIndex);
-
-  // Rest keeps DOM order (these include score=0 AND low-scored generics)
-  // Already in DOM order from the original loop
-
-  // Allocate slots: high-scored get up to SCORED_SLOT_RATIO of limit
-  const maxScoredSlots = Math.ceil(limit * SCORED_SLOT_RATIO);
-  const scoredToTake = highScored.slice(0, maxScoredSlots);
-  const remainingSlots = limit - scoredToTake.length;
-
-  // Fill remaining from rest (DOM order) — includes unscored AND low-scored
-  const domOrderFill = rest.slice(0, remainingSlots);
-
-  // If high-scored overflow AND still space, append them
-  if (domOrderFill.length < remainingSlots) {
-    const overflowScored = highScored.slice(maxScoredSlots);
-    for (const s of overflowScored) {
-      if (domOrderFill.length >= remainingSlots) break;
-      domOrderFill.push(s);
-    }
-  }
-
-  // Merge: high-scored first, then DOM-order fill
-  const result = [...scoredToTake, ...domOrderFill];
-  return result.map(s => s.node);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // DUPLICATE MARKING: Add [N of M] and CONTEXT for disambiguation
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1421,16 +1304,52 @@ Select the single best matching element. If unsure, return ref: null.`;
 
       // V14: Detect mime type from base64 header — JPEG starts with /9j/, PNG with iVBOR
       const mimeType: 'image/jpeg' | 'image/png' = screenshot.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
-      const visionResponse = await generateTextWithGeminiVision({
-        prompt: visionPrompt,
-        imageBase64: screenshot,
-        mimeType,
-        model: AI_TASK_MODELS.visionElementResolution as any,
-        temperature: 0,
-        maxTokens: 200,
-        timeout: 6000,
-      });
-      responseContent = visionResponse.content;
+
+      // Primary: Gemini vision. Fallback: OpenAI vision (gpt-5.4-mini supports
+      // multimodal content via image_url with data URL). Provider-level fallback
+      // mirrors the text-resolver path so a Gemini outage doesn't kill replay.
+      try {
+        const visionResponse = await generateTextWithGeminiVision({
+          prompt: visionPrompt,
+          imageBase64: screenshot,
+          mimeType,
+          model: AI_TASK_MODELS.visionElementResolution as any,
+          temperature: 0,
+          maxTokens: 200,
+          timeout: 6000,
+        });
+        responseContent = visionResponse.content;
+      } catch (visionPrimaryErr) {
+        const FALLBACK = AI_MODELS.fast;
+        const sameProvider =
+          (AI_TASK_MODELS.visionElementResolution as string).startsWith('gemini-') === FALLBACK.startsWith('gemini-');
+        if (sameProvider) {
+          throw visionPrimaryErr;
+        }
+        logger.warn('[ELEMENT_RESOLVER] Vision primary Gemini failed, retrying with OpenAI vision fallback', {
+          primary: AI_TASK_MODELS.visionElementResolution,
+          fallback: FALLBACK,
+          error: visionPrimaryErr instanceof Error ? visionPrimaryErr.message : String(visionPrimaryErr),
+        });
+        const fallbackResponse = await getChatCompletionWithMessages(
+          [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: visionPrompt },
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${screenshot}` } },
+              ] as any,
+            },
+          ],
+          {
+            model: FALLBACK,
+            temperature: 0,
+            max_tokens: 200,
+            response_format: { type: 'json_object' },
+          },
+        );
+        responseContent = fallbackResponse.content;
+      }
 
       logger.debug('[ELEMENT_RESOLVER] Vision-enhanced rescue response', {
         responsePreview: responseContent.slice(0, 150),
@@ -2370,6 +2289,7 @@ async function selectElementWithLLM(params: {
     })
     .join('\n');
 
+
   // Build page scene summary for top-down context
   const sceneSummary = buildSceneSummary(candidates);
   const sceneContext = sceneSummary ? `\nPAGE STATE: ${sceneSummary}` : '';
@@ -2623,23 +2543,45 @@ Select the single best matching element, or return ref=null if the intent does n
   let llmCallMs = 0;
 
   try {
-    const response = await getChatCompletionWithMessages(
-      [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      {
-        model: AI_TASK_MODELS.disambiguation,
-        temperature: 0.1,
-        // 200 tokens was too tight: Gemini Flash Lite in JSON mode occasionally
-        // hit MAX_TOKENS before closing the JSON object, producing an empty
-        // response (finishReason=MAX_TOKENS). 500 gives enough headroom for
-        // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
-        max_tokens: 500,
-        response_format: { type: 'json_object' },
-        abortSignal: controller.signal,
+    // Primary Gemini Flash Lite → fallback AI_MODELS.fast (gpt-5.4-mini) when
+    // Gemini errors out (503 / timeout). Fallback uses the SAME abort signal so
+    // the overall LLM_SELECT_TIMEOUT budget still applies.
+    const callWithModel = (model: string) =>
+      getChatCompletionWithMessages(
+        [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        {
+          model,
+          temperature: 0.1,
+          // 200 tokens was too tight: Gemini Flash Lite in JSON mode occasionally
+          // hit MAX_TOKENS before closing the JSON object, producing an empty
+          // response (finishReason=MAX_TOKENS). 500 gives enough headroom for
+          // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
+          max_tokens: 500,
+          response_format: { type: 'json_object' },
+          abortSignal: controller.signal,
+        },
+      );
+
+    let response;
+    try {
+      response = await callWithModel(AI_TASK_MODELS.disambiguation);
+    } catch (primaryErr) {
+      const FALLBACK = AI_MODELS.fast;
+      const sameProvider =
+        AI_TASK_MODELS.disambiguation.startsWith('gemini-') === FALLBACK.startsWith('gemini-');
+      if (sameProvider || controller.signal.aborted) {
+        throw primaryErr;
       }
-    );
+      logger.warn('[LLM_SELECT] Primary Gemini failed, retrying with OpenAI fallback', {
+        primary: AI_TASK_MODELS.disambiguation,
+        fallback: FALLBACK,
+        error: primaryErr instanceof Error ? primaryErr.message : String(primaryErr),
+      });
+      response = await callWithModel(FALLBACK);
+    }
 
     llmCallMs = Date.now() - llmCallStart;
     clearTimeout(timeoutId);
@@ -3200,6 +3142,11 @@ export async function resolveElement(params: {
    * automatically when this flag isn't set.
    */
   mode?: 'apply' | 'heal';
+  /** V26: Real browser viewport at snapshot time. Used by `buildAllowedSets`
+   *  for accurate modal-coverage ratio. Optional — falls back to bbox
+   *  high-water-mark heuristic when absent (works on most pages, fails on
+   *  long scrollable pages where modal coverage gets underestimated). */
+  viewport?: { width: number; height: number };
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -3208,6 +3155,7 @@ export async function resolveElement(params: {
     pageUrl,
     includeAlternatives = false,
     screenshot: screenshotOrFnRaw,
+    viewport,
   } = params;
   // V22: derive heal-mode from explicit param OR the legacy
   // `previewSessionId === 'background'` convention used by command-executor.
@@ -3287,11 +3235,20 @@ export async function resolveElement(params: {
   const intentText = sanitizeIntent(stepDraft);
 
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
-  const allowedResult = buildAllowedSets(domNodes, stepDraft.type);
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport);
   const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
   
   // Diagnostic fields for trace logging
-  const _diag = {
+  // Mutable so the V25 pruner block downstream can attach `_pruneMs` /
+  // `_prunerOutcome` without a deeper refactor of every return site. The
+  // shape is consumed by intent-step-lint.service.ts as `phaseTimings`.
+  const _diag: {
+    _ruleTrace: typeof ruleTrace;
+    _hardAllowedCount: number;
+    _softAllowedCount: number;
+    _pruneMs?: number;
+    _prunerOutcome?: 'shadow' | 'applied' | 'skipped' | 'disabled';
+  } = {
     _ruleTrace: ruleTrace,
     _hardAllowedCount: hardAllowed.length,
     _softAllowedCount: softAllowed.length,
@@ -3335,6 +3292,7 @@ export async function resolveElement(params: {
       const liveTestIds = allAllowed.map((n) => n.testIdAttr).filter(Boolean) as string[];
       const liveSvgIcons = allAllowed.map((n) => n.svgIcon).filter(Boolean) as string[];
       const liveAlts = allAllowed.map((n) => n.alt).filter(Boolean) as string[];
+      const liveHrefs = allAllowed.map((n) => n.href).filter(Boolean) as string[];
       logger.info('[ELEMENT_RESOLVER] identity fast-path diag', {
         previewSessionId,
         stepType: stepDraft.type,
@@ -3358,6 +3316,9 @@ export async function resolveElement(params: {
         idMatch: identityFp.elementId ? liveIds.includes(identityFp.elementId) : null,
         svgIconMatch: identityFp.svgIcon ? liveSvgIcons.includes(identityFp.svgIcon) : null,
         altMatch: identityFp.alt ? liveAlts.includes(identityFp.alt) : null,
+        recordedHref: identityFp.href,
+        liveHrefsSample: liveHrefs.slice(0, 8),
+        hrefMatch: identityFp.href ? liveHrefs.includes(identityFp.href) : null,
       });
     } catch { /* non-fatal */ }
     // Identity-by-attribute fast-path. For each attribute the recorder
@@ -3373,12 +3334,12 @@ export async function resolveElement(params: {
     // one row, no other code touched.
     // Only attributes that BOTH the recorder (TargetFingerprint) AND the
     // live DOM probe (InteractiveNode) carry can power a fast-path. id /
-    // testId / name satisfy that. `href` and `ariaControls` exist on the
-    // recorded fingerprint but the live snapshot collector doesn't surface
-    // them on InteractiveNode yet — adding them here would be a hardcoded
-    // assumption that breaks at runtime. When the snapshot collector is
-    // extended to emit these fields we can append a row here, no other
-    // code touched.
+    // testId / name / href / svgIcon / alt all satisfy that. `ariaControls`
+    // exists on the recorded fingerprint but the live snapshot collector
+    // doesn't surface it on InteractiveNode yet — adding it here would be
+    // a hardcoded assumption that breaks at runtime. When the snapshot
+    // collector is extended to emit it we can append a row, no other code
+    // touched.
     const identityChecks: Array<{
       attr: string;
       want: string | undefined;
@@ -3386,6 +3347,14 @@ export async function resolveElement(params: {
     }> = [
       { attr: 'id',     want: identityFp.elementId,  readNode: (n) => n.id },
       { attr: 'testId', want: identityFp.testIdAttr, readNode: (n) => n.testIdAttr },
+      // V26: <a href> — strongest identity for SPA links with semantic URLs
+      // (`/courses/mat-smart`, `/admin/users/42`). Survives label rewrites,
+      // i18n, and class changes. Listed after testId so explicit test-ids
+      // still win, but before svgIcon/name because href is more universally
+      // present and more stable than icon-name conventions.
+      // Symmetric: collector populates from `(el as HTMLAnchorElement).href`,
+      // recorder reads the same in PROBE_AT_POINT_FN.
+      { attr: 'href', want: identityFp.href, readNode: (n) => n.href },
       // Angular Material icon registry name. Read symmetrically by
       // recorder probe and snapshot-collector from <mat-icon svgicon>.
       // Stable across builds — Material apps register icons by name
@@ -3461,6 +3430,7 @@ export async function resolveElement(params: {
         const resolverPath: LintResult['resolverPath'] =
           check.attr === 'id' ? 'identity_id' :
           check.attr === 'testId' ? 'identity_testid' :
+          check.attr === 'href' ? 'identity_href' :
           check.attr === 'svgIcon' ? 'identity_svgicon' :
           check.attr === 'customElementTag' ? 'identity_custom_element' : 'identity_name';
         return {
@@ -3696,13 +3666,19 @@ export async function resolveElement(params: {
     // Falls through to Step 6 (LLM selection) below
   }
 
-  // Step 6: Multiple allowed elements → pre-score sort + LLM selection
-  // Pre-score: rank elements by text overlap with intent so the most relevant
-  // elements always land in the LLM batch, regardless of DOM position.
-  // This is a SORT, not a FILTER — score=0 elements still fill remaining slots.
-  const rankedAllowed = preScoreAndSort(allAllowed, intentText, MAX_CANDIDATES_FOR_LLM);
-  const primaryBatch = rankedAllowed.slice(0, MAX_CANDIDATES_FOR_LLM);
-  const overflowBatch = rankedAllowed.slice(MAX_CANDIDATES_FOR_LLM);
+  // Step 6: Multiple allowed elements → DOM-order cap + LLM-based pruner + LLM selection.
+  //
+  // Cap is DOM-order, not score-based. Heuristic ranking (foldText, stopwords,
+  // fuzzy edit-distance) was both fragile and language-coupled — fixed juz40
+  // cross-script bug only by accident. Replaced by `pruneCandidatesViaLLM`
+  // below, which understands cross-script intent natively (МАТ ≡ MAT).
+  //
+  // DOM-order is neutral: it doesn't lose elements due to language mismatch.
+  // The pruner does the smart shortlist (60 → 15) on top.
+  // Fail-open: if pruner skips/errors, the resolver still operates on this
+  // 60-candidate DOM-order set, which is the natural deterministic fallback.
+  const primaryBatch = allAllowed.slice(0, MAX_CANDIDATES_FOR_LLM);
+  const overflowBatch = allAllowed.slice(MAX_CANDIDATES_FOR_LLM);
 
   const candidatesToProcess: Array<{ node: InteractiveNode; candidateText: string }> = [];
   for (const node of primaryBatch) {
@@ -3712,6 +3688,173 @@ export async function resolveElement(params: {
 
   // Mark duplicate elements with [N of M] and promote CONTEXT for disambiguation
   markDuplicatesWithContext(candidatesToProcess);
+
+  // V25 Phase 2/3 — candidate pruner integration.
+  //
+  // SHADOW mode (Phase 2): pruner runs in parallel with the resolver and
+  // logs which refs it would have kept/dropped. Resolver output unchanged.
+  //
+  // LIVE mode (Phase 3): pruner output drives the resolver. The resolver
+  // receives ~15 candidates instead of ~60 → ~45% smaller prompt, faster.
+  // Phase 3 still keeps overflowBatch as a fallback when the resolver
+  // can't find a match in the pruner's shortlist (status: 'not_found') —
+  // that path is unchanged below.
+  //
+  // Both modes are gated by:
+  //   - `enabled` — master kill switch (env: PREVIEW_PRUNER_ENABLED)
+  //   - `shadowMode` — true=shadow only, false=live integration
+  //                    (env: PREVIEW_PRUNER_SHADOW)
+  //   - `candidatesToProcess.length > 16` — matches PRUNER_SKIP_THRESHOLD;
+  //     pruning a tiny set is wasted tokens.
+  //
+  // Pruner is fail-open: any error path returns `prunerSkipped:true`,
+  // we keep the original `candidatesToProcess` set unchanged.
+  let pruneMs = 0;
+  let prunerOutcome: 'shadow' | 'applied' | 'skipped' | 'disabled' = 'disabled';
+  if (
+    ELEMENT_RESOLVER_CONFIG.pruner.enabled
+    && candidatesToProcess.length > 16  // matches PRUNER_SKIP_THRESHOLD
+  ) {
+    const shadowPageSig = computePageSignature(pageUrl, domNodes);
+    // Mirror the resolver's fingerprint selection logic exactly: prefer
+    // recording-time fingerprint, fall back to compiled-plan fingerprint
+    // captured on the first successful apply. Same chain as line 4028.
+    const shadowRecordedFp = stepDraft.recordedFingerprint
+      || stepDraft.compiled?.targetFingerprint;
+    const prunerStartedAt = Date.now();
+
+    if (ELEMENT_RESOLVER_CONFIG.pruner.shadowMode) {
+      // Phase 2 shadow — fire-and-forget.
+      prunerOutcome = 'shadow';
+      void pruneCandidatesViaLLM({
+        intentText,
+        actionType: stepDraft.type,
+        candidates: candidatesToProcess,
+        pageUrl,
+        pageSignature: shadowPageSig,
+        recordedFingerprint: shadowRecordedFp,
+        priorApplyHints: stepDraft.bindingHints,
+        topK: ELEMENT_RESOLVER_CONFIG.pruner.topK,
+        mode: resolveMode,
+      }).then(prunerResult => {
+        const keptRefs = new Set(prunerResult.prunedCandidates.map(c => c.node.ref).filter(Boolean) as string[]);
+        const droppedRefs = candidatesToProcess
+          .map(c => c.node.ref)
+          .filter((r): r is string => !!r && !keptRefs.has(r));
+        logger.info('[CANDIDATE_PRUNER] Shadow result', {
+          previewSessionId,
+          intentText: intentText.slice(0, 80),
+          inputCount: prunerResult.inputCount,
+          outputCount: prunerResult.outputCount,
+          identityRescueCount: prunerResult.identityRescueCount,
+          prunerSkipped: prunerResult.prunerSkipped,
+          reason: prunerResult.reason,
+          cacheHit: prunerResult.cacheHit,
+          prunerLatencyMs: prunerResult.latencyMs,
+          wallLatencyMs: Date.now() - prunerStartedAt,
+          keptRefs: Array.from(keptRefs).slice(0, 20),
+          droppedRefs: droppedRefs.slice(0, 20),
+        });
+      }).catch(err => {
+        logger.warn('[CANDIDATE_PRUNER] Shadow call failed silently', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    } else {
+      // Phase 3 live — await the result and replace candidatesToProcess
+      // with the pruner's output. fail-open semantics: if the pruner skips
+      // / errors, we keep the original 60-candidate set and log the reason.
+      try {
+        const prunerResult = await pruneCandidatesViaLLM({
+          intentText,
+          actionType: stepDraft.type,
+          candidates: candidatesToProcess,
+          pageUrl,
+          pageSignature: shadowPageSig,
+          recordedFingerprint: shadowRecordedFp,
+          priorApplyHints: stepDraft.bindingHints,
+          topK: ELEMENT_RESOLVER_CONFIG.pruner.topK,
+          mode: resolveMode,
+        });
+        pruneMs = Date.now() - prunerStartedAt;
+        if (!prunerResult.prunerSkipped && prunerResult.prunedCandidates.length > 0) {
+          // Replace the working set with pruner output. The resolver below
+          // operates on `candidatesToProcess` directly, so this single
+          // mutation steers everything downstream (LLM prompt, selectedRef
+          // lookup, vision rescue) at once.
+          //
+          // Order is preserved from pruner — descending confidence — so the
+          // resolver sees most-likely-first, which already aligns with the
+          // resolver prompt's expectations.
+          //
+          // Splice in place to avoid re-pointing the const. We want to keep
+          // markDuplicatesWithContext(candidatesToProcess)'s mutations
+          // intact for entries that survive — pruner returns the SAME
+          // PrunerCandidate references, so the "[N of M]" / CONTEXT
+          // suffixes carry through.
+          // V26: Hard-pad — re-include any HARD-allowed candidate the pruner
+          // dropped. Hard-allowed = passed deterministic strict rules
+          // (visible, role/tag-compatible, not behind blocking modal). The
+          // pruner is a smart shortlist but it's still a probabilistic LLM
+          // call; if it removes a clean structural match in favour of soft
+          // candidates that "look related", we lose the deterministic signal
+          // entirely. Force-include hard kept-out items to a small budget so
+          // the LLM resolver always sees the strict shortlist alongside the
+          // pruner's smart picks. Capped at 5 extras to avoid bloating the
+          // prompt back to 60 — the prompt-shrink win is preserved.
+          const hardRefs = new Set(hardAllowed.map(n => n.ref).filter(Boolean) as string[]);
+          const keptRefs = new Set(prunerResult.prunedCandidates.map(c => c.node.ref).filter(Boolean) as string[]);
+          const droppedHard: typeof prunerResult.prunedCandidates = [];
+          const HARD_PAD_LIMIT = 5;
+          for (const c of candidatesToProcess) {
+            if (droppedHard.length >= HARD_PAD_LIMIT) break;
+            const r = c.node.ref;
+            if (r && hardRefs.has(r) && !keptRefs.has(r)) {
+              droppedHard.push(c);
+            }
+          }
+          const finalSet = [...prunerResult.prunedCandidates, ...droppedHard];
+          candidatesToProcess.splice(0, candidatesToProcess.length, ...finalSet);
+          prunerOutcome = 'applied';
+          logger.info('[CANDIDATE_PRUNER] Live applied', {
+            previewSessionId,
+            intentText: intentText.slice(0, 80),
+            inputCount: prunerResult.inputCount,
+            outputCount: prunerResult.outputCount,
+            identityRescueCount: prunerResult.identityRescueCount,
+            hardPadCount: droppedHard.length,
+            cacheHit: prunerResult.cacheHit,
+            pruneMs,
+          });
+        } else {
+          prunerOutcome = 'skipped';
+          logger.info('[CANDIDATE_PRUNER] Live skipped — fallback to full candidate set', {
+            previewSessionId,
+            reason: prunerResult.reason,
+            inputCount: prunerResult.inputCount,
+            pruneMs,
+          });
+        }
+      } catch (err) {
+        // Defensive: pruner already swallows its own errors and returns
+        // prunerSkipped, but if anything escapes (unhandled promise
+        // rejection in the singleflight path) we treat it as skipped.
+        pruneMs = Date.now() - prunerStartedAt;
+        prunerOutcome = 'skipped';
+        logger.warn('[CANDIDATE_PRUNER] Live call threw — fallback to full candidate set', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+          pruneMs,
+        });
+      }
+    }
+  }
+  // Surface pruner timing on _diag so intent-step-lint.service.ts can
+  // merge it into phaseTimings without re-threading the values through
+  // multiple return sites.
+  _diag._pruneMs = pruneMs;
+  _diag._prunerOutcome = prunerOutcome;
 
   // V15: Proactive vision escalation for indistinguishable icon-only buttons.
   // Trigger when EVERY candidate is an icon-button with no semantic label AND no icon hint —

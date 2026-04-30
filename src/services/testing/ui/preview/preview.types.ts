@@ -289,6 +289,11 @@ export interface DomAnalysisData {
   capturedAt: number;
   /** Version for future migrations */
   version: string;
+  /** V26: Real browser viewport at capture time. Used for modal-coverage
+   *  ratio in `buildAllowedSets` — without this, long scrollable pages
+   *  underestimate modal coverage and the blocking-modal hard-exclude rule
+   *  never fires. Optional for backwards compatibility. */
+  viewport?: { width: number; height: number };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1020,6 +1025,7 @@ export interface LintResult {
    * traced to the exact step in the resolver pipeline that picked it.
    *   identity_id     — recordedFingerprint.elementId match (uniqueness gate passed)
    *   identity_testid — recordedFingerprint.testIdAttr match
+   *   identity_href   — recordedFingerprint.href match (V26: SPA links)
    *   identity_name   — recordedFingerprint.name match
    *   evidence_shortcut — TTL/URL-valid lastSuccessRef hit
    *   compiled        — compiled plan locator hit
@@ -1028,7 +1034,7 @@ export interface LintResult {
    *   rule_fallback   — degraded mode, rule-based score
    *   user_confirmed  — user picked from clarification UI
    */
-  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
+  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_href' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
   /** Candidate elements (for ambiguous cases) */
   candidates: LintCandidate[];
   /** Elements to highlight on UI */

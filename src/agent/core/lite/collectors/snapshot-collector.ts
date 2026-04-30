@@ -2719,6 +2719,9 @@ export class SnapshotCollector {
           metadata, // P0: Visual content metadata for proactive vision detection
           pageStructure, // Manus: Tables, lists, pagination detection
           pageAlerts: pageAlerts.length > 0 ? pageAlerts.slice(0, 5) : undefined, // Max 5 alerts
+          // V26: Real viewport for modal-coverage ratio in buildAllowedSets.
+          // @ts-expect-error - window available in browser context
+          viewport: { width: window.innerWidth, height: window.innerHeight },
           __debugStats, // DEBUG: collection stats
         };
       }, __modalConsts);

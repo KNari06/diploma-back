@@ -275,6 +275,13 @@ export interface LiteSnapshot {
   pageStructure?: PageStructureMetadata;
   /** Visible page alerts/errors (non-interactive error messages, validation errors, auth failures) */
   pageAlerts?: string[];
+  /** V26: Real browser viewport (window.innerWidth/innerHeight at capture time).
+   *  Used by `buildAllowedSets` for modal-coverage ratio calculation —
+   *  without this, long scrollable pages underestimate coverage and the
+   *  modal-blocking hard-exclude rule never fires. Optional for backwards
+   *  compatibility; consumers fall back to the bbox high-water-mark heuristic
+   *  when absent. */
+  viewport?: { width: number; height: number };
 }
 
 /**

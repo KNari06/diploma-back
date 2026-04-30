@@ -26,6 +26,20 @@ function envNum(envVar: string | undefined, defaultValue: number): number {
   return Number.isNaN(parsed) ? defaultValue : parsed;
 }
 
+/**
+ * Parse a boolean env var with a safe fallback.
+ * Truthy values: '1', 'true', 'yes', 'on' (case-insensitive).
+ * Falsy values:  '0', 'false', 'no', 'off', '' or undefined.
+ * Anything else returns defaultValue.
+ */
+function envBool(envVar: string | undefined, defaultValue: boolean): boolean {
+  if (envVar === undefined || envVar === '') return defaultValue;
+  const v = envVar.toLowerCase().trim();
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+  if (['0', 'false', 'no', 'off'].includes(v)) return false;
+  return defaultValue;
+}
+
 // ─── Viewport Presets ────────────────────────────────────────────────────────
 
 export const VIEWPORT_PRESETS = {
@@ -142,8 +156,18 @@ export const ELEMENT_RESOLVER_CONFIG = {
     failureThreshold: 3,
     /** Time the circuit stays open before half-open probe (ms) */
     cooldownMs: 60_000,
-    /** Per-call LLM selection timeout (ms) */
-    timeoutMs: 7_000,
+    /**
+     * Per-call LLM selection timeout (ms).
+     *
+     * Was 7000 — too tight on busy Gemini API days where Flash Lite
+     * latency floats up to 8-12s for prompts in the 25-30 KB range
+     * (we feed ~60 candidates × scene + apply-rules prompt which sits
+     * around 29 KB). 7s aborted requests that would have answered at
+     * 8-9s, cascading into degraded fallback. Bumped to 14000 to give
+     * the loaded API enough room while still shorter than Playwright's
+     * 15s default action timeout.
+     */
+    timeoutMs: 10_000,
   },
 
   /** LLM result cache */
@@ -159,6 +183,39 @@ export const ELEMENT_RESOLVER_CONFIG = {
    * fraction of viewport area (0–1).
    */
   modalCoverageThreshold: 0.3,
+
+  /**
+   * Candidate pruner — small LLM call that narrows the resolver's candidate
+   * set from ~60 down to ~15 BEFORE the main LLM resolver runs. Cuts the
+   * resolver prompt size by ~45% and lets cross-script intents reach the
+   * resolver (failure mode: juz40-edu.kz Cyrillic "МАТ" never matched the
+   * Latin-typed intent under ASCII-only heuristic ranking).
+   *
+   * The deterministic pre-rank step it replaces (`preScoreAndSort`) was
+   * removed — pruner is now the single ranking layer on top of a neutral
+   * DOM-order top-60 cap. Shadow vs live is the only remaining knob.
+   *
+   * Phase 2 rollout uses `shadowMode` — pruner runs and logs results, but
+   * the resolver consumes the unmodified DOM-order top-60 set. Lets us
+   * measure false-negative rate (pruner removed an element the resolver
+   * would have picked) over real traffic before flipping the switch.
+   *
+   * Override: PREVIEW_PRUNER_ENABLED, PREVIEW_PRUNER_SHADOW
+   */
+  pruner: {
+    /** Master kill switch. When false, pruner is never invoked. */
+    enabled: envBool(process.env.PREVIEW_PRUNER_ENABLED, true),
+    /**
+     * Shadow mode: run pruner for telemetry, but do NOT use its output
+     * to drive the resolver. Resolver runs on the DOM-order top-60 set.
+     * Default true — Phase 2 ships gated.
+     */
+    shadowMode: envBool(process.env.PREVIEW_PRUNER_SHADOW, true),
+    /** How many candidates the pruner returns. Resolver runs on this set. */
+    topK: 15,
+    /** Per-call LLM timeout. Pruner prompt is small so 3s is enough. */
+    timeoutMs: 3_000,
+  },
 } as const;
 
 // ─── Command Executor ─────────────────────────────────────────────────────────

@@ -456,6 +456,9 @@ export function createDomAnalysis(snapshot: LiteSnapshot): DomAnalysisData {
     title: snapshot.title,
     capturedAt: snapshot.timestamp,
     version: DOM_ANALYSIS_VERSION,
+    // V26: pass real viewport through so `buildAllowedSets` can compute
+    // accurate modal-coverage ratio. Falls back to bbox heuristic if absent.
+    viewport: snapshot.viewport,
   };
 }
 

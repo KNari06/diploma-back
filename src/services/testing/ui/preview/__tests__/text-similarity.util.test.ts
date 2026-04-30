@@ -6,6 +6,10 @@ import {
   fuzzyEqual,
 } from '../text-similarity.util';
 
+// Re-export so the new "stopword filter applies after fold" test can call
+// foldText to compute expected canonical forms instead of hardcoding them
+// (otherwise a future fold change silently desyncs the test).
+
 describe('text-similarity', () => {
   describe('foldText', () => {
     it('folds Cyrillic glyph-twins to Latin (lowercase only)', () => {
@@ -46,6 +50,31 @@ describe('text-similarity', () => {
       expect(t.has('for')).toBe(false);
       expect(t.has('wait')).toBe(true);
       expect(t.has('url')).toBe(true);
+    });
+    it('drops Kazakh stopwords (және/үшін/бұл)', () => {
+      const t = tokenizeLabel('Курс және баға үшін бұл');
+      // Stopwords are stored pre-folded and tokens are also folded — Set.has must match.
+      expect(t.has(foldText('және'))).toBe(false);
+      expect(t.has(foldText('үшін'))).toBe(false);
+      expect(t.has(foldText('бұл'))).toBe(false);
+      expect(t.size).toBeGreaterThanOrEqual(2); // курс + баға survive
+    });
+    it('drops Russian stopwords beyond the original short list', () => {
+      const t = tokenizeLabel('был еще над без при');
+      // All five are in the extended STOPWORDS list — set should be empty.
+      expect(t.size).toBe(0);
+    });
+    it('stopword filter applies after fold (glyph-twin attack)', () => {
+      // Attack: write "это" with Latin 'e' / 'o' (both are CYR_TO_LAT glyph twins:
+      // е=0x0435 → e, о=0x043E → o). Pre-fix the Set.has check missed this because
+      // STOPWORDS held pure-Cyrillic "это" while the tokenized form folded to "eto".
+      // After the fix, STOPWORDS itself goes through foldText → "это" stored as
+      // "eto" → match works either way.
+      const pureCyrillic = tokenizeLabel('это тест');
+      const latinTwins = tokenizeLabel('эtо тест'); // Latin 't' + Cyrillic 'э'+'о'
+      // Both should drop the stopword; only "тест" survives.
+      expect(pureCyrillic.size).toBe(1);
+      expect(latinTwins.size).toBe(1);
     });
     it('Cyrillic-Latin twin folding is symmetric for tokens', () => {
       const a = tokenizeLabel('MAT-SMART'); // Latin

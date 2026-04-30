@@ -2231,6 +2231,9 @@ export class PreviewSessionService {
     pageSignature: string;
     screenshot?: string;           // Deprecated: use video:frame instead
     changed: boolean;
+    /** V26: Real browser viewport — used by resolver for accurate modal-coverage
+     *  ratio in `buildAllowedSets`. Optional for back-compat. */
+    viewport?: { width: number; height: number };
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
@@ -2398,6 +2401,9 @@ export class PreviewSessionService {
         pageSignature: session.lastPageSignature,
         screenshot,
         changed,
+        // V26: pass viewport through so resolver can compute accurate
+        // modal-coverage ratio. domAnalysis carries it from snapshot collector.
+        viewport: domAnalysis.viewport,
       };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Failed to get snapshot', {

@@ -65,14 +65,23 @@ export function foldText(s: string): string {
 //
 // Why: without filtering, "Wait for URL" recorded vs "Click for support"
 // chosen both contain "for" → overlap=1 → guard skipped. Real overlap = 0.
-const STOPWORDS = new Set<string>([
-  // English
-  'the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'are',
-  // Russian
-  'для', 'или', 'что', 'как', 'это',
-  // Kazakh
-  'жане',
-]);
+//
+// Stopwords are stored pre-folded (foldText applied) so the Set.has check
+// in tokenizeLabel works after the same fold is applied to incoming tokens.
+// Without folding here, "жане" written with a Latin 'e' (glyph-twin) would
+// fold to "жанe→жанe" while STOPWORDS contains pure-Cyrillic "жане" → miss.
+const STOPWORDS = new Set<string>(
+  [
+    // English
+    'the', 'and', 'for', 'with', 'from', 'this', 'that', 'into', 'are',
+    // Russian
+    'для', 'или', 'что', 'как', 'это', 'так', 'все', 'еще', 'был',
+    'была', 'было', 'быть', 'есть', 'нет', 'при', 'над', 'под', 'без',
+    // Kazakh
+    'және', 'жане', 'бірақ', 'бирак', 'бұл', 'осы', 'сол', 'үшін', 'ушин',
+    'болып', 'емес', 'дейін', 'кейін', 'себебі', 'сондықтан', 'арқылы',
+  ].map(foldText),
+);
 
 /**
  * Split a label into a Set of identity-bearing tokens.

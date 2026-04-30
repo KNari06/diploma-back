@@ -928,14 +928,32 @@ export class IntentStepLintService {
   }): Promise<LintResult> {
     // Diagnostic wrapper: captures intent + LintResult into intent_resolve.log
     // for every lint call. Implementation lives in `_lintStepWithAIImpl`.
+    //
+    // V26: AI tracking context — every LLM call inside the lint pipeline
+    // (resolver, candidate-pruner, vision rescue) reads userId/workspace
+    // from the AsyncLocalStorage context. Without this wrap, AI calls are
+    // logged as "Skipping AI log (no userId)" and never billed/audited.
+    // `lintStep` (rule-only path, line 684) has the same wrap; here we
+    // mirror it for the AI-enabled path used by Apply All / preview run.
     const startedAt = Date.now();
     let lastUrl: string | undefined;
     let domNodeCount: number | undefined;
     try {
-      const result = await IntentStepLintService._lintStepWithAIImpl(params, (url, count) => {
-        lastUrl = url;
-        domNodeCount = count;
-      });
+      const result = await withAIContext(
+        {
+          workspaceId: '',
+          userId: params.userId,
+          operationType: 'lite-test',
+          logSource: 'ai-selector',
+          logActionType: 'lint-step',
+          logEntityType: 'test_execution',
+          logEntityId: params.previewSessionId,
+        },
+        () => IntentStepLintService._lintStepWithAIImpl(params, (url, count) => {
+          lastUrl = url;
+          domNodeCount = count;
+        }),
+      ) as LintResult;
       try {
         logIntentResolveLint({
           stepDraft: params.stepDraft,
@@ -1241,6 +1259,7 @@ export class IntentStepLintService {
       stepDraft,
       domNodes,
       pageUrl: snapshot.url,
+      viewport: snapshot.viewport,
       includeAlternatives,
       screenshot: async () => {
         try {
@@ -1397,6 +1416,7 @@ export class IntentStepLintService {
           stepDraft,
           domNodes,
           pageUrl: snapshot.url,
+          viewport: snapshot.viewport,
           includeAlternatives: true,
         });
         candidatesForLLM = withCandidates.candidates;
@@ -1456,7 +1476,7 @@ export class IntentStepLintService {
       pageRef?: string;
       userId: string;
     },
-    snapshot: { url: string; domNodes: InteractiveNode[] },
+    snapshot: { url: string; domNodes: InteractiveNode[]; viewport?: { width: number; height: number } },
     resolverDegradedReason?: string,
   ): Promise<LintResult> {
     const { previewSessionId, stepDraft } = params;
