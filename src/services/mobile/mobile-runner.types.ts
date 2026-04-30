@@ -82,6 +82,9 @@ export interface MobileIntentStepOptions {
   // App management
   activityName?: string;
   clearData?: boolean;
+  /** close_app: when true the runner clears app data (Android: `pm clear`).
+   *  Absent / false keeps the soft `am force-stop` behaviour for back-compat. */
+  hard?: boolean;
   // Gesture options
   startX?: number;
   startY?: number;

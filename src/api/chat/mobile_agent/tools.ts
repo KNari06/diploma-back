@@ -1706,11 +1706,19 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
         params: { packageName: step.value ?? step.description },
       };
 
-    case 'close_app':
+    case 'close_app': {
+      const opts = step.options as { hard?: boolean } | undefined;
       return {
         type: 'close_app',
-        params: step.value ? { packageName: step.value } : {},
+        params: {
+          ...(step.value ? { packageName: step.value } : {}),
+          // Only forward when explicitly true. Absence keeps the runner on
+          // its soft default so legacy steps without the flag don't suddenly
+          // start wiping app data.
+          ...(opts?.hard === true ? { hard: true } : {}),
+        },
       };
+    }
 
     case 'assert':
     case 'ai_check':
