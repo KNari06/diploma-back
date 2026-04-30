@@ -10,6 +10,7 @@ import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Frame, FrameLocator, Locator, Page } from 'playwright';
 import { getEffectiveLabel, sanitizeIntent } from './element-resolver.service';
+import { tokenizeLabel, tokenOverlap, hasAnyOverlap } from './text-similarity.util';
 import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
@@ -1346,6 +1347,90 @@ function getLocatorContext(page: Page, step: IntentStep): Page | FrameLocator {
 }
 
 /**
+ * V24 — Conditional parasitic-overlay dismisser.
+ *
+ * Closes overlays/popups that appeared as a side-effect of a REJECTED click
+ * (i.e. our wrong-element guard fired, but the click already happened and
+ * opened something paразitic). Critically, refuses to dismiss when:
+ *   1. Overlay was already present BEFORE the click (legitimate user-recorded
+ *      popup — closing it would break the test's intended flow).
+ *   2. Caller didn't pass a pre-click snapshot (no way to tell legit from
+ *      paразitic — fail-safe to "leave it alone").
+ *
+ * Strategy: Esc covers Material/Bootstrap/Headless UI menus; backdrop click
+ * covers CDK overlays where Esc isn't bound. Both are no-ops when nothing's
+ * open.
+ */
+async function dismissParasiticOverlay(
+  page: Page,
+  preState: ClickPreState | null,
+  ctx: { previewSessionId: string; stepId: string; reason: string },
+): Promise<{ dismissed: boolean; reason: string }> {
+  if (!preState) return { dismissed: false, reason: 'no-pre-state' };
+  // Compare overlay sig now vs before. If unchanged or shrunk, no parasitic
+  // overlay was opened by our click. If the pre-sig was non-empty AND matches
+  // current, the overlay was already there — refuse to dismiss.
+  let currentOverlaySig = '';
+  try {
+    currentOverlaySig = await page.evaluate(() => {
+      // @ts-expect-error - browser context
+      const doc = document;
+      const overlaySels = [
+        '.cdk-overlay-pane',
+        '.cdk-overlay-backdrop.cdk-overlay-backdrop-showing',
+        '.modal.show',
+        '.modal-backdrop.show',
+        '[role="menu"]:not([hidden])',
+        '[aria-modal="true"]',
+      ];
+      const parts: string[] = [];
+      for (const sel of overlaySels) {
+        const els = doc.querySelectorAll(sel);
+        if (els.length > 0) parts.push(`${sel}=${els.length}`);
+      }
+      return parts.join('|');
+    });
+  } catch {
+    return { dismissed: false, reason: 'sig-eval-failed' };
+  }
+  // No overlay now → nothing to dismiss.
+  if (!currentOverlaySig) return { dismissed: false, reason: 'no-overlay-present' };
+  // Overlay existed before and is identical now → it was the user's, leave it.
+  if (preState.overlayPreSig && preState.overlayPreSig === currentOverlaySig) {
+    return { dismissed: false, reason: 'overlay-pre-existed-leave-alone' };
+  }
+  // Else: overlay is new (or grew) → likely parasitic from our click.
+  try {
+    await page.keyboard.press('Escape', { delay: 0 }).catch(() => {});
+    await page.evaluate(() => {
+      /* eslint-disable @typescript-eslint/no-explicit-any */
+      const doc = (globalThis as any).document;
+      const sels = [
+        '.cdk-overlay-backdrop.cdk-overlay-backdrop-showing',
+        '.cdk-overlay-backdrop',
+        '.modal-backdrop.show',
+        '.modal-backdrop',
+      ];
+      for (const sel of sels) {
+        const el = doc.querySelector(sel);
+        if (el) { el.click?.(); break; }
+      }
+    }).catch(() => {});
+    await page.waitForTimeout(250).catch(() => {});
+    logger.info('[PREVIEW_APPLY] Cleared parasitic overlay', {
+      previewSessionId: ctx.previewSessionId,
+      stepId: ctx.stepId,
+      reason: ctx.reason,
+      preSig: preState.overlayPreSig.slice(0, 80),
+      postSig: currentOverlaySig.slice(0, 80),
+    });
+    return { dismissed: true, reason: 'parasitic-dismissed' };
+  } catch {
+    return { dismissed: false, reason: 'dismiss-threw' };
+  }
+}
+
+/**
  * Click effect verification — detects whether a click actually changed page state.
  * Used in editor preview to catch "click in void" cases (clicking through a modal
  * backdrop, clicking a disabled-but-not-marked element, etc.) where Playwright's
@@ -1368,6 +1453,11 @@ type ClickPreState = {
   targetAriaChecked: string | null;
   targetDisabled: boolean;
   pageCount: number; // browser-context tab count for new-tab detection
+  // V24: overlay/popup signature captured BEFORE click. Used by parasitic-overlay
+  // dismiss helper to distinguish a popup that was already there (legitimate,
+  // recorded by user) from one our wrong click just opened. Format: count of
+  // each overlay class present + first text excerpt for stability.
+  overlayPreSig: string;
   // V23: download event tracker. Set to a one-shot promise that resolves true
   // if Playwright fires `'download'` event between captureClickPreState and
   // verifyClickHadEffect. Click on a "Download PDF" button doesn't change URL
@@ -1440,18 +1530,37 @@ async function captureClickPreState(
     targetAriaChecked: null,
     targetDisabled: false,
     pageCount,
+    overlayPreSig: '',
     downloadDetected: () => downloaded,
     cleanupDownloadListener,
   };
   try {
     const safeRef = ref ? ref.replace(/[^a-zA-Z0-9_-]/g, '') : '';
     // Page-level signals (URL, dialogs at top level) — always main frame.
-    let pageSig: { url: string; dialogCount: number; bodyVisibleChildSig: string };
+    let pageSig: { url: string; dialogCount: number; bodyVisibleChildSig: string; overlayPreSig: string };
     try {
       pageSig = await page.evaluate(() => {
         // @ts-expect-error - browser context
         const doc = document;
         const dialogs = doc.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open],[aria-modal="true"]');
+        // V24: overlay-presence snapshot. Catches cdk-overlay-pane (Angular Material),
+        // .modal.show (Bootstrap), and generic backdrops. Stored as a class+count
+        // signature so post-click comparison can distinguish "overlay was already here"
+        // (don't dismiss — recorded user intent) from "overlay just appeared because
+        // of a wrong click" (safe to dismiss before retry).
+        const overlaySels = [
+          '.cdk-overlay-pane',
+          '.cdk-overlay-backdrop.cdk-overlay-backdrop-showing',
+          '.modal.show',
+          '.modal-backdrop.show',
+          '[role="menu"]:not([hidden])',
+          '[aria-modal="true"]',
+        ];
+        const overlayParts: string[] = [];
+        for (const sel of overlaySels) {
+          const els = doc.querySelectorAll(sel);
+          if (els.length > 0) overlayParts.push(`${sel}=${els.length}`);
+        }
         const bodyChildren = doc.body ? Array.from(doc.body.children) as any[] : [];
         const visParts: string[] = [];
         for (const child of bodyChildren) {
@@ -1468,10 +1577,11 @@ async function captureClickPreState(
           url: window.location.href,
           dialogCount: dialogs.length,
           bodyVisibleChildSig: visParts.join('|'),
+          overlayPreSig: overlayParts.join('|'),
         };
       });
     } catch {
-      pageSig = { url: page.url(), dialogCount: 0, bodyVisibleChildSig: '' };
+      pageSig = { url: page.url(), dialogCount: 0, bodyVisibleChildSig: '', overlayPreSig: '' };
     }
     // Element/focus signals — target frame if iframe step, else main page.
     const evalCtx = (targetFrame ?? page) as Page | Frame;
@@ -4668,6 +4778,135 @@ export class PreviewStepApplyService {
           ? await captureClickPreState(page, candidate.ref, clickTargetFrame)
           : null;
 
+        // V24 — Pre-click text-overlap guard.
+        //
+        // Catches obvious wrong-element picks BEFORE the click fires, so the
+        // wrong click's side-effect (opening a profile menu, modal, drawer)
+        // never happens. Without this, a wrong click on the avatar "Б" opens
+        // the cdk-overlay-pane, which then blocks the retry's correct click.
+        //
+        // Conditions (all required to abort):
+        //   1. Click action.
+        //   2. Step has a `recordedFingerprint` — i.e. it was captured via the
+        //      recorder, not added manually. Manual-add steps are intentionally
+        //      skipped: the user already saw the lint preview (highlighted
+        //      element in editor) and explicitly chose to Run. Blocking them
+        //      here would override their judgement and produce false-positives
+        //      on multilingual / synonym descriptions ("save" vs "Сохранить").
+        //   3. Resolver did NOT come from identity fast-path (id/testId/name
+        //      match is deterministic — text might not encode the recorded
+        //      label, e.g. id="login-btn" with text="Click here").
+        //   4. We have a meaningful recorded label (≥1 token after 3-char filter).
+        //   5. Chosen candidate has a label/text we can read.
+        //   6. Zero token overlap between recorded and chosen (after Cyrillic
+        //      fold + substring tolerance).
+        //
+        // We INTENTIONALLY don't gate on confidence — LLM frequently returns
+        // 0.95 on completely wrong picks (saw "Б" with 0.95 for "MAT-SMART"
+        // on juz40). Token-overlap is a more honest signal.
+        let preClickAborted = false;
+        if (
+          stepDraft.type === 'click'
+          && !!stepDraft.recordedFingerprint  // recorded steps only — see condition 2
+          && lintResult.resolverPath !== 'identity_id'
+          && lintResult.resolverPath !== 'identity_testid'
+          && lintResult.resolverPath !== 'identity_name'
+        ) {
+          const recordedLabelForGuard =
+            stepDraft.bindingHints?.label
+            || stepDraft.bindingHints?.text
+            || stepDraft.bindingHints?.nearText
+            || stepDraft.recordedFingerprint?.text
+            || stepDraft.recordedFingerprint?.labelText
+            || stepDraft.recordedFingerprint?.ariaLabel
+            || stepDraft.description
+            || '';
+          const chosenLabelForGuard =
+            (candidate.node ? getEffectiveLabel(candidate.node) : '')
+            || (candidate as any).label
+            || (candidate.node?.text ?? '')
+            || '';
+          const recTokens = tokenizeLabel(recordedLabelForGuard);
+          const choTokens = tokenizeLabel(chosenLabelForGuard);
+          // V24 — multilang escape: if labels disagree but the chosen
+          // element sits in the same geometric position as recorded, treat
+          // as i18n / dynamic copy rather than wrong element. Same logic +
+          // thresholds as the post-click guard below.
+          // V24 — bbox-missing fail-open. If either side has no bbox (rare:
+          // degraded LLM mode, recorder corruption), default to "assume same
+          // place" so the multilang/i18n escape kicks in. Better to allow a
+          // potentially-wrong click than to block a potentially-correct one
+          // that we can't verify spatially.
+          let preClickBboxImpliesSame = false;
+          if (
+            stepDraft.recordedFingerprint?.boundingBox
+            && candidate.boundingBox
+          ) {
+            const rb = stepDraft.recordedFingerprint.boundingBox;
+            const cb = candidate.boundingBox;
+            const dx = (rb.x + rb.width / 2) - (cb.x + cb.width / 2);
+            const dy = (rb.y + rb.height / 2) - (cb.y + cb.height / 2);
+            const centerDist = Math.hypot(dx, dy);
+            const recArea = Math.max(1, rb.width * rb.height);
+            const choArea = Math.max(1, cb.width * cb.height);
+            const sizeRatio = Math.min(recArea, choArea) / Math.max(recArea, choArea);
+            preClickBboxImpliesSame = centerDist <= 50 && sizeRatio >= 0.5;
+          } else {
+            // bbox info missing — fail-open: don't escalate purely on labels
+            // when we can't verify position. Multilang false-positive is
+            // worse than letting through a wrong click (post-click guard
+            // catches that one anyway, with the click signal as evidence).
+            preClickBboxImpliesSame = true;
+          }
+          // Only guard when BOTH sides have meaningful tokens — if recorded
+          // has no usable label (recording drift / icon-only) we can't fairly
+          // judge. Same for chosen (icon-only nodes).
+          // Skip the guard if bbox suggests same element (multilang/i18n case).
+          if (
+            recTokens.size >= 1
+            && choTokens.size >= 1
+            && !hasAnyOverlap(recTokens, choTokens)
+            && !preClickBboxImpliesSame
+          ) {
+            logger.warn('[PREVIEW_APPLY] Pre-click guard: zero text overlap, aborting before click', {
+              stepId: stepDraft.id,
+              candidateRef: candidate.ref,
+              recordedLabel: recordedLabelForGuard.slice(0, 80),
+              chosenLabel: chosenLabelForGuard.slice(0, 80),
+              recordedTokens: Array.from(recTokens).slice(0, 5),
+              chosenTokens: Array.from(choTokens).slice(0, 5),
+              resolverPath: lintResult.resolverPath,
+            });
+            trace?.writeActionResult({
+              stepId: stepDraft.id,
+              stepType: stepDraft.type,
+              success: false,
+              durationMs: 0,
+              error: 'pre-click-text-overlap-zero',
+            });
+            preClickAborted = true;
+            // Cleanup the click-effect listener since we're not clicking.
+            try { clickPreState?.cleanupDownloadListener?.(); } catch { /* non-fatal */ }
+            return {
+              success: false,
+              error: `[wrong-element] Resolver wanted to click "${chosenLabelForGuard.slice(0, 60)}" for step targeting "${recordedLabelForGuard.slice(0, 60)}" — labels share no meaningful words. Click aborted to avoid side-effects. Refine the step description, or re-record so a structural fingerprint anchors the target.`,
+              attempts,
+              highlight: [{
+                ref: candidate.ref,
+                boundingBox: candidate.boundingBox,
+                type: 'error' as const,
+              }],
+              chosenRef: candidate.ref,
+              chosenLabel: chosenLabelForGuard,
+              chosenBoundingBox: candidate.boundingBox,
+              resolverPath: lintResult.resolverPath,
+              decisionTrace,
+            };
+          }
+        }
+        // Suppress unused-variable lint when guard didn't fire.
+        if (preClickAborted) { /* unreachable */ }
+
         try {
           EditorTraceService.get(previewSessionId)?.writeApplyPhaseEntry({
             stepId: stepDraft.id, phase: 'action_execute',
@@ -5091,20 +5330,126 @@ export class PreviewStepApplyService {
           // mismatch under those is suspicious but the click did clearly
           // do something the test cared about, so we let trace audit catch
           // it post-hoc rather than block.
+          // V23: hasGroundTruth widened. Originally required id/testId/name —
+          // strong identifiers. But on Angular sites (juz40-edu, documentolog
+          // curator) those don't exist on every recorded element; recorder
+          // saves `tag + text + bbox` as the fingerprint. When `bbox` is
+          // recorded AND chosen ended up far away (chosen.bbox vs
+          // recorded.bbox in geographically different regions of the page),
+          // that's identity ground-truth too — strict equality of the bbox
+          // isn't required; mismatch via `compareToRecordedFingerprint` already
+          // means tag+id+bbox don't agree. Without this widening, the LLM
+          // picking the profile-avatar `<li>` in the top-right (36×36 at
+          // x=1220) when recorded was the `<a>` MAT-SMART card (752×80 at
+          // y=120) passed as success because `hasGroundTruth=false` → guard
+          // skipped. We saw exactly that on juz40 stepIndex=8: chosenLabel="Б"
+          // for intent "MAT-SMART раздел". This widens the ground-truth set
+          // to include any recordedFingerprint with text+bbox (the recorder's
+          // baseline), keeping id/testId/name as stronger signals when they
+          // exist but no longer requiring them.
+          // V23: hasGroundTruth covers the FULL identity universe per
+          // recorder. Three tiers — strong (unique on page), accessible-name
+          // (visible label + bbox baseline), and product-specific markers.
+          // The recorder always saves bbox, so any field paired with it
+          // gives us something to compare against.
+          //
+          // Each entry is documented with WHY it counts as identity:
+          //   strong: unique attribute the dev assigned for stability
+          //   accessible-name: WCAG-recommended user-visible identifier
+          //   marker: framework/library-specific stable handle
+          const rfp = stepDraft.recordedFingerprint;
+          const hasBbox = !!rfp?.boundingBox;
           const hasGroundTruth =
             stepDraft.type === 'click' &&
-            !!stepDraft.recordedFingerprint &&
-            (!!stepDraft.recordedFingerprint.elementId ||
-             !!stepDraft.recordedFingerprint.testIdAttr ||
-             !!stepDraft.recordedFingerprint.name);
+            !!rfp &&
+            (
+              // ── TIER 1 — strong identifiers (unique by author intent) ──
+              !!rfp.elementId          ||  // <button id="login-btn">
+              !!rfp.testIdAttr         ||  // data-testid / data-cy / data-qa
+              !!rfp.name               ||  // <input name="email">
+              !!rfp.svgIcon            ||  // <mat-icon svgicon="folder"> registry name
+              !!rfp.childTestId        ||  // lifted icon-child data-testid (V22 Pkg1)
+              !!rfp.customElementTag   ||  // <app-excel-btn> semantic wrapper
+              !!rfp.dataValue          ||  // <option value="kz"> semantic key
+              !!rfp.dataRowKey         ||  // AntD <tr data-row-key="..."> stable row id
+              (!!rfp.bsToggle && !!rfp.bsTarget) ||  // Bootstrap toggle+target combo
+              !!rfp.href               ||  // <a href="..."> link destination
+
+              // ── TIER 2 — accessible-name + bbox (recorder baseline) ──
+              (!!rfp.text       && hasBbox) ||  // visible textContent
+              (!!rfp.labelText  && hasBbox) ||  // <label for=> / wrapping <label>
+              (!!rfp.ariaLabel  && hasBbox) ||  // explicit ARIA accessible name
+              (!!rfp.title      && hasBbox) ||  // <a title>/<button title> tooltip
+              (!!rfp.alt        && hasBbox) ||  // <img alt> / <input type=image alt>
+              (!!rfp.iconLabel  && hasBbox) ||  // svg <title>/data-lucide/FA class
+              (!!rfp.placeholder && hasBbox)    // input placeholder
+            );
           // 'newtab' is treated as weak under mismatch — opening an unrelated
           // tab is the canonical fake-success symptom (recorder captured a
           // settings cog with id="layout-header-setting", LLM clicked a
           // neighbouring "click me!" banner, popup→yuque.com docs, verifier
           // saw newtab and stamped pass). Real navigations land on the same
           // page (url change without popup), which is signal 'url'.
+          //
+          // V23: 'url' signal also treated as suspicious when fingerprintMatch
+          // is mismatch AND chosen bbox is geographically far from recorded.
+          // Observed on juz40: click on profile avatar (bbox x=1220 y=10)
+          // momentarily flipped URL via Angular router → signal='url' →
+          // guard let it through despite recorded bbox (x=344 y=120) being
+          // ~880px away. Verify URL actually persisted (not transient
+          // redirect/error-handler bounce) by comparing recorded vs current.
           const weakSignal = clickEffectSignal === 'focus' || clickEffectSignal === 'none' || clickEffectSignal === 'newtab' || clickEffectSignal === undefined;
-          if (hasGroundTruth && fingerprintMatch === 'mismatch' && weakSignal) {
+          // V23: bbox-distance heuristic — if chosen and recorded bboxes have
+          // no spatial overlap (centers >200px apart in either axis), even
+          // a 'url' signal becomes suspicious for a mismatch. Real navigations
+          // by the right element happen at THAT element's bbox; a URL flip
+          // from a different region is almost always a side-effect of clicking
+          // somewhere else (profile menu opens, internal nav, etc.).
+          let bboxFarApart = false;
+          // V24 — multilang escape (mirrors label guard): if chosen sits in
+          // the same geometric position as recorded AND has comparable size,
+          // treat as i18n / dynamic copy — fingerprint text mismatch is then
+          // a translation difference, not a wrong-element pick.
+          //
+          // Example:
+          //   recorded fingerprint: {text: "Save", bbox: {x:100,y:200,w:80,h:32}}
+          //   chosen: <button>Сохранить</button> at same coords
+          //   compareToRecordedFingerprint says mismatch (text differs)
+          //   weak signal (focus) → would reject WITHOUT this escape
+          //   With escape: bbox close + size similar → trust the click.
+          //
+          // Same thresholds as label guard for consistency: ≤50px center
+          // distance + ≥0.5 size ratio. See cell-by-cell rationale at the
+          // bbox helper in label guard below.
+          let identityBboxImpliesSame = false;
+          try {
+            const rb = stepDraft.recordedFingerprint?.boundingBox;
+            const cb = candidate.boundingBox;
+            if (rb && cb) {
+              const recCenterX = rb.x + rb.width / 2;
+              const recCenterY = rb.y + rb.height / 2;
+              const choCenterX = cb.x + cb.width / 2;
+              const choCenterY = cb.y + cb.height / 2;
+              const dx = Math.abs(recCenterX - choCenterX);
+              const dy = Math.abs(recCenterY - choCenterY);
+              // Threshold: 200px in either axis. Tight enough to allow
+              // legitimate layout shifts (header re-flow), wide enough to
+              // catch "clicked the avatar instead of the card" cases.
+              bboxFarApart = dx > 200 || dy > 200;
+              // Multilang escape: close + same size = same widget.
+              const centerDist = Math.hypot(dx, dy);
+              const recArea = Math.max(1, rb.width * rb.height);
+              const choArea = Math.max(1, cb.width * cb.height);
+              const sizeRatio = Math.min(recArea, choArea) / Math.max(recArea, choArea);
+              identityBboxImpliesSame = centerDist <= 50 && sizeRatio >= 0.5;
+            }
+          } catch { /* defensive */ }
+          // Treat 'url' as weak when bbox is far apart — see above.
+          const effectivelyWeak = weakSignal || (clickEffectSignal === 'url' && bboxFarApart);
+          // Multilang escape: only override for non-'none' signals. signal=none
+          // even at the same bbox means click went into a void — still suspicious.
+          const identityMultilangEscape = identityBboxImpliesSame && clickEffectSignal !== 'none';
+          if (hasGroundTruth && fingerprintMatch === 'mismatch' && effectivelyWeak && !identityMultilangEscape) {
             logger.warn('[PREVIEW_APPLY] Rejecting fake-success: fingerprint mismatch with weak click signal', {
               stepId: stepDraft.id,
               candidateRef: candidate.ref,
@@ -5137,6 +5482,14 @@ export class PreviewStepApplyService {
               success: false,
               durationMs: actionDur,
               error: 'fingerprint-mismatch-weak-signal',
+            });
+            // V24: dismiss any parasitic overlay opened by this rejected click,
+            // so the run-loop's retry can find its target. Conditional — refuses
+            // to dismiss overlays that pre-existed (legitimate user-recorded popup).
+            await dismissParasiticOverlay(page, clickPreState, {
+              previewSessionId,
+              stepId: stepDraft.id,
+              reason: 'identity-fingerprint-mismatch-rejection',
             });
             return {
               success: false,
@@ -5178,124 +5531,19 @@ export class PreviewStepApplyService {
           // those mean the click DID move the test forward, even if onto a
           // different element than the recording. That's a different class of
           // bug (recording drift) and gets caught by post-hoc trace audit.
-          // Cyrillic letters that share a glyph with a Latin letter — same
-          // visual shape, different Unicode codepoint (М U+041C vs M U+004D).
-          // Recorders see the typed-in description ("MAT-SMART раздел") with
-          // Latin M/A/T while the live page often renders the same brand in
-          // Cyrillic ("МАТ-SMART"). Without folding, identical visible
-          // strings hash to disjoint token sets and the guard mis-fires.
-          // Single-direction Cyrillic→Latin is enough — both halves go
-          // through the same fold so the comparison is symmetric.
-          const cyrillicToLatin = (s: string): string => {
-            let out = '';
-            for (const ch of s) {
-              const code = ch.charCodeAt(0);
-              switch (code) {
-                case 0x0410: out += 'a'; break;     // А
-                case 0x0412: out += 'b'; break;     // В
-                case 0x0415: out += 'e'; break;     // Е
-                case 0x041A: out += 'k'; break;     // К
-                case 0x041C: out += 'm'; break;     // М
-                case 0x041D: out += 'h'; break;     // Н
-                case 0x041E: out += 'o'; break;     // О
-                case 0x0420: out += 'p'; break;     // Р
-                case 0x0421: out += 'c'; break;     // С
-                case 0x0422: out += 't'; break;     // Т
-                case 0x0425: out += 'x'; break;     // Х
-                case 0x0423: out += 'y'; break;     // У
-                case 0x0430: out += 'a'; break;     // а
-                case 0x0432: out += 'b'; break;     // в
-                case 0x0435: out += 'e'; break;     // е
-                case 0x043A: out += 'k'; break;     // к
-                case 0x043C: out += 'm'; break;     // м
-                case 0x043D: out += 'h'; break;     // н
-                case 0x043E: out += 'o'; break;     // о
-                case 0x0440: out += 'p'; break;     // р
-                case 0x0441: out += 'c'; break;     // с
-                case 0x0442: out += 't'; break;     // т
-                case 0x0445: out += 'x'; break;     // х
-                case 0x0443: out += 'y'; break;     // у
-                default: out += ch;
-              }
-            }
-            return out;
-          };
-          const tokenize = (s: string | undefined | null): Set<string> => {
-            if (!s) return new Set();
-            return new Set(
-              cyrillicToLatin(s.toLowerCase())
-                // Cyrillic + Latin word chars; keep digits.
-                .split(/[^\p{L}\p{N}]+/u)
-                .filter(t => t.length >= 3),
-            );
-          };
-          // Damerau-Levenshtein ≤ 2 captures common single-typo / inflection
-          // pairs (раздел vs разделах, save vs saved). Cap on shorter token
-          // length so a 3-char "Yes" vs "No" doesn't collapse just because
-          // the budget is forgiving in absolute terms.
-          const fuzzyMatches = (a: string, b: string): boolean => {
-            if (a === b) return true;
-            const la = a.length, lb = b.length;
-            if (Math.abs(la - lb) > 2) return false;
-            // Substring catch (handles inflection: "разделах".includes("раздел")).
-            if (la >= 4 && lb >= 4 && (a.includes(b) || b.includes(a))) return true;
-            // Limit fuzzy edit-distance to medium-length tokens — short
-            // tokens collide too easily under Damerau-Levenshtein ≤ 2.
-            if (Math.min(la, lb) < 5) return false;
-            // Inline DL distance, capped at 2 for early bail.
-            const dp: number[][] = Array.from({ length: la + 1 }, () => new Array(lb + 1).fill(0));
-            for (let i = 0; i <= la; i++) dp[i][0] = i;
-            for (let j = 0; j <= lb; j++) dp[0][j] = j;
-            for (let i = 1; i <= la; i++) {
-              let rowMin = Infinity;
-              for (let j = 1; j <= lb; j++) {
-                const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-                dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
-                if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
-                  dp[i][j] = Math.min(dp[i][j], dp[i - 2][j - 2] + 1);
-                }
-                if (dp[i][j] < rowMin) rowMin = dp[i][j];
-              }
-              if (rowMin > 2) return false; // early exit when whole row exceeds threshold
-            }
-            return dp[la][lb] <= 2;
-          };
-          const overlap = (a: Set<string>, b: Set<string>): number => {
-            if (a.size === 0 || b.size === 0) return 0;
-            let n = 0;
-            for (const t of a) {
-              if (b.has(t)) { n++; continue; }
-              // V23: substring tolerance — catches morphological variants
-              // ("папка" ⊂ "папкалар", "courses" ⊂ "course") before falling
-              // through to the more expensive Damerau-Levenshtein path.
-              // Min 3 chars on both sides to avoid spurious "ok" inside "Bookmark".
-              let matched = false;
-              if (t.length >= 3) {
-                for (const u of b) {
-                  if (u.length >= 3 && (u.includes(t) || t.includes(u))) {
-                    matched = true; break;
-                  }
-                }
-              }
-              if (matched) { n++; continue; }
-              // Fuzzy fallback — only when exact match fails. Iterate the
-              // smaller-cardinality side (here `b`) so worst-case stays
-              // O(|a|·|b|·max-token-len²) which is a few hundred ops per
-              // check at our typical scales.
-              for (const u of b) {
-                if (fuzzyMatches(t, u)) { n++; break; }
-              }
-            }
-            return n;
-          };
+          //
+          // V24: tokenization / fuzzy / overlap helpers extracted to
+          // `text-similarity.util.ts` (shared with the pre-click guard above
+          // and unit-tested). Cyrillic↔Latin glyph fold + NFD diacritic strip
+          // + stopwords filter + Damerau-Levenshtein ≤ 2.
           const recordedLabel =
             stepDraft.bindingHints?.label
             || stepDraft.bindingHints?.text
             || stepDraft.bindingHints?.nearText
             || stepDraft.description
             || '';
-          const recordedTokens = tokenize(recordedLabel);
-          const chosenTokens = tokenize(chosenLabel);
+          const recordedTokens = tokenizeLabel(recordedLabel);
+          const chosenTokens = tokenizeLabel(chosenLabel);
           // chosenLabel sometimes degrades to `<tag>` form when the live node
           // has no accessible name (icon button, single-char avatar, generic
           // <li>/<button>). Treat that as "no usable chosen label" → guard
@@ -5303,10 +5551,28 @@ export class PreviewStepApplyService {
           // is possible. Same effect when the live label is a single char
           // (e.g. profile avatar "Б" — 1-letter tokens are dropped by
           // tokenize()'s 3-char minimum).
+          // V24 — Q2: relax for short valid labels.
+          //
+          // Old logic: chosenTokens.size === 0 → generic. But tokenizeLabel
+          // drops anything <3 chars, so valid short labels like "OK", "Go",
+          // "Yes", "Hi" all became "generic" → guard always fired against
+          // recorded steps targeting them.
+          //
+          // We keep the "single Cyrillic letter" trap (juz40 avatar "Б") and
+          // the bare-tag form ("<button>"), but accept short alpha words as
+          // legitimate labels. Rationale: real interactive elements rarely
+          // have 1-char labels by design — buttons say "OK", icons have
+          // aria-labels, single chars are usually avatars / index markers.
+          const trimmedChosen = (chosenLabel || '').trim();
+          const isBareTagForm = /^<[^>]+>$/.test(trimmedChosen);
+          const isSingleAlphaChar = trimmedChosen.length === 1 && /^[\p{L}]$/u.test(trimmedChosen);
+          const hasTokens = chosenTokens.size > 0;
+          const hasShortAlphaLabel = trimmedChosen.length >= 2 && /[\p{L}\p{N}]/u.test(trimmedChosen);
           const chosenLabelIsGeneric =
             !chosenLabel
-            || /^<[^>]+>$/.test(chosenLabel.trim())
-            || chosenTokens.size === 0;
+            || isBareTagForm
+            || isSingleAlphaChar
+            || (!hasTokens && !hasShortAlphaLabel);
           // Eligibility: don't double-fire when the identity guard above
           // already had ground truth, and require a meaningful recorded
           // anchor (≥1 token after the 3-char filter).
@@ -5320,16 +5586,131 @@ export class PreviewStepApplyService {
           // forward toward something testable.
           const labelGuardWeakSignal =
             weakSignal || clickEffectSignal === 'dom';
+          // V24 — Gap 1: respect user's lint preview for manual-add steps.
+          //
+          // Manual-add steps have no recordedFingerprint — the user typed a
+          // description and saw the lint highlight which element resolved.
+          // If they then hit Run, they explicitly approved that pick. Blocking
+          // their click here second-guesses an informed decision.
+          //
+          // BUT: between lint preview and Run, the page can mutate (SPA
+          // route, modal close). LLM re-resolves on the fresh DOM and may
+          // pick a different element the user never saw. For that race we
+          // keep a narrow safety net: signal='none' (the click did literally
+          // nothing) on a manual-add step still triggers the guard. Other
+          // weak signals (focus / dom / newtab) are interpreted as "the user
+          // approved this and the click had SOME effect" → trust them.
+          //
+          // Recorded steps are unchanged — full guard applies because the
+          // fingerprint represents real ground truth from a past run.
+          const isManualAddStep = !stepDraft.recordedFingerprint;
+          const labelGuardSignalEligible = isManualAddStep
+            ? clickEffectSignal === 'none'  // narrow: only literal no-effect
+            : labelGuardWeakSignal;          // broad: focus / none / newtab / dom
           const labelGuardEligible =
             !hasGroundTruth
             && stepDraft.type === 'click'
-            && labelGuardWeakSignal
+            && labelGuardSignalEligible
             && recordedTokens.size >= 1;
           // Reject when recorded and chosen labels share zero tokens, OR
           // when the chosen label is too generic to validate at all.
-          const labelMismatch =
+          // Compute overlap once — the value is reused in the diagnostic log.
+          const labelOverlapCount = tokenOverlap(recordedTokens, chosenTokens);
+          // V24 — Multilang escape hatch.
+          //
+          // If labels share zero tokens but the chosen element is in the SAME
+          // geometric position as the recorded element, treat it as i18n /
+          // dynamic copy (legit) rather than wrong-element.
+          //
+          // Example we'd otherwise break:
+          //   Recorded label: "Кнопка сохранить" (user wrote in Russian)
+          //   Live UI: "Сақтау" (page is in Kazakh)
+          //   Same button, just translated. text overlap = 0, but bbox is
+          //   identical → don't block.
+          //
+          // Threshold: centres within 50px AND size ratio ≥0.5 (allows minor
+          // re-flow but rejects "same place by accident" matches between an
+          // 80-px button and a 600-px banner). Tight enough that "clicked the
+          // banner instead of the button" doesn't slip through (those are
+          // usually ≥100px apart).
+          //
+          // Only for recorded steps (manual-add has no recorded bbox).
+          let bboxImpliesSameElement = false;
+          if (
+            !isManualAddStep
+            && stepDraft.recordedFingerprint?.boundingBox
+            && candidate.boundingBox
+          ) {
+            const rb = stepDraft.recordedFingerprint.boundingBox;
+            const cb = candidate.boundingBox;
+            const recCenterX = rb.x + rb.width / 2;
+            const recCenterY = rb.y + rb.height / 2;
+            const choCenterX = cb.x + cb.width / 2;
+            const choCenterY = cb.y + cb.height / 2;
+            const centerDist = Math.hypot(recCenterX - choCenterX, recCenterY - choCenterY);
+            const recArea = Math.max(1, rb.width * rb.height);
+            const choArea = Math.max(1, cb.width * cb.height);
+            const sizeRatio = Math.min(recArea, choArea) / Math.max(recArea, choArea);
+            // 50px ≈ "same widget after re-flow"; 0.5 size ratio rules out
+            // catching a giant container that happens to overlap geometrically.
+            bboxImpliesSameElement = centerDist <= 50 && sizeRatio >= 0.5;
+          }
+          // V24 — Gap 6: tighten 'none' signal handling.
+          //
+          // signal='none' means the click triggered absolutely nothing on the
+          // page (no URL change, no DOM mutation, no focus shift, no dialog).
+          // For a correct click this is rare — almost any real interactive
+          // element produces SOME effect. So 'none' on top of label-mismatch
+          // is a strong "wrong element" signal.
+          //
+          // But there are legit no-effect clicks: self-link to current page,
+          // already-toggled idempotent action, anchor to already-visible
+          // section. In those cases labels should agree (recorded "Главная"
+          // vs chosen "Главная" → overlap > 0 → guard already passes them).
+          //
+          // Edge case this catches: labels share 1 random token by accident
+          // ("form" in both "Click submit form" and "form input field") AND
+          // signal=none AND bbox is geographically far. Standard guard would
+          // pass on overlap=1; we want to block.
+          //
+          // Fail-open default: if bbox info missing (rare — recorder always
+          // captures it for clicks), don't escalate. Better to false-negative
+          // than to false-positive on a working test.
+          let noneSignalSuspicious = false;
+          if (clickEffectSignal === 'none' && labelOverlapCount > 0) {
+            // Coverage gate: if all recorded tokens have a counterpart in
+            // chosen, this is a full-label match (just bbox shifted on a
+            // re-flowed page — Self-link "Главная", responsive layout). Do
+            // NOT escalate — bbox alone after a full label match is too
+            // weak to override.
+            const fullLabelMatch = labelOverlapCount >= recordedTokens.size;
+            if (!fullLabelMatch) {
+              const rb = stepDraft.recordedFingerprint?.boundingBox;
+              const cb = candidate.boundingBox;
+              if (rb && cb) {
+                const recCenterX = rb.x + rb.width / 2;
+                const recCenterY = rb.y + rb.height / 2;
+                const choCenterX = cb.x + cb.width / 2;
+                const choCenterY = cb.y + cb.height / 2;
+                const dx = Math.abs(recCenterX - choCenterX);
+                const dy = Math.abs(recCenterY - choCenterY);
+                // Same 200px threshold as identity guard's bboxFarApart.
+                noneSignalSuspicious = dx > 200 || dy > 200;
+              }
+            }
+          }
+          const labelMismatchRaw =
             chosenLabelIsGeneric
-            || overlap(recordedTokens, chosenTokens) === 0;
+            || labelOverlapCount === 0
+            || noneSignalSuspicious;
+          // V24 — multilang escape: same geometric position implies same
+          // element regardless of label difference. But: don't override the
+          // 'none' signal — even at the same bbox, no-effect click still
+          // means the click went into a void (overlapping disabled element,
+          // hidden interactive layer). Only override pure label-disagreement.
+          const labelMismatch =
+            labelMismatchRaw
+            && !(bboxImpliesSameElement && clickEffectSignal !== 'none');
           if (labelGuardEligible && labelMismatch) {
             logger.warn('[PREVIEW_APPLY] Rejecting fake-success: label mismatch (no recorded fingerprint)', {
               stepId: stepDraft.id,
@@ -5340,7 +5721,7 @@ export class PreviewStepApplyService {
               clickEffectSignal,
               recordedTokens: Array.from(recordedTokens).slice(0, 5),
               chosenTokens: Array.from(chosenTokens).slice(0, 5),
-              tokenOverlap: overlap(recordedTokens, chosenTokens),
+              tokenOverlap: labelOverlapCount,
             });
             try {
               logIntentResolveApply({
@@ -5366,62 +5747,29 @@ export class PreviewStepApplyService {
               durationMs: actionDur,
               error: 'label-mismatch-weak-signal',
             });
-            // Clean up the side-effect of the rejected click. When LLM
-            // misclicked the profile avatar / nav-icon and the page
-            // reacted with `clickEffectSignal: 'dom'` (popup menu, modal
-            // backdrop, overlay drawer), THAT overlay now intercepts
-            // pointer events for the step's RETRY — so the retry's
-            // correctly-targeted click gets blocked, the runner waits
-            // 15s for the locator to become clickable, then fails with
-            // an "overlay intercepts pointer events" error even though
-            // we already know the right element.
+            // V24: dismiss only if the overlay is parasitic (didn't exist
+            // before our click). The helper compares pre-click overlay
+            // signature with current state — if they match, the overlay was
+            // user-recorded and we leave it alone (closing it would break
+            // the test's intended flow on the retry).
             //
-            // Sequence on hub.atk.pro / juz40-edu.kz:
+            // Sequence this protects against (juz40-edu.kz / hub.atk.pro):
             //   1. attempt 1 → wrong target (e.g. profile "Б") → opens
             //      cdk-overlay-pane (Angular Material profile menu)
             //   2. guard rejects → returns failure
-            //   3. retry → correct target found by compiled/lint → click
+            //   3. retry → correct target found → click
             //   4. cdk-overlay-backdrop intercepts → 15s timeout → fail
             //
-            // Closing strategy is best-effort — Escape covers most menus
-            // (Angular Material, Bootstrap, Headless UI), backdrop click
-            // covers CDK overlays where Escape doesn't bind. Both fail
-            // silently if there's nothing to close. We bound the wait so
-            // a stuck overlay can't extend the step timeout indefinitely.
-            try {
-              await page.keyboard.press('Escape', { delay: 0 }).catch(() => {});
-              // Click on the overlay backdrop directly. CDK + most modal
-              // libraries listen on `[role=presentation]` / `[aria-modal]`
-              // backdrops. force:true skips actionability checks (the
-              // backdrop IS the dismissal target; we don't care if it's
-              // also covered by something — we just want one click event).
-              await page.evaluate(() => {
-                /* eslint-disable @typescript-eslint/no-explicit-any */
-                const doc = (globalThis as any).document;
-                const sels = [
-                  '.cdk-overlay-backdrop.cdk-overlay-backdrop-showing',
-                  '.cdk-overlay-backdrop',
-                  '.modal-backdrop.show',
-                  '.modal-backdrop',
-                ];
-                for (const sel of sels) {
-                  const el = doc.querySelector(sel);
-                  if (el) {
-                    el.click?.();
-                    break;
-                  }
-                }
-              }).catch(() => {});
-              // Settle window — let close animation play out so the
-              // backdrop is actually removed from the hit-test stack
-              // before the next attempt resolves its locator.
-              await page.waitForTimeout(250).catch(() => {});
-              logger.info('[PREVIEW_APPLY] Cleared side-effect overlay before retry', {
-                previewSessionId,
-                stepId: stepDraft.id,
-                clickEffectSignal,
-              });
-            } catch { /* non-fatal — best-effort cleanup */ }
+            // Inverse case to NOT break (legitimate recorded popup):
+            //   step N: "Click 'Меню'" → dropdown opens
+            //   step N+1: "Click 'Настройки' in menu"
+            //   if N+1's resolver guesses wrong, we MUST NOT close the
+            //   dropdown here — the recorded user flow goes through it.
+            await dismissParasiticOverlay(page, clickPreState, {
+              previewSessionId,
+              stepId: stepDraft.id,
+              reason: 'label-mismatch-rejection',
+            });
             return {
               success: false,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the step targets "${recordedLabel.slice(0, 60)}". The click only triggered a ${clickEffectSignal || 'no'} change, and the labels share no meaningful words — almost certainly a fake-success. Re-record the step so a structural fingerprint is captured, or refine the step description.`,
