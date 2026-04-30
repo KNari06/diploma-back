@@ -252,6 +252,149 @@ async function flushPendingScroll(
 }
 
 /**
+/**
+ * V22 Pkg8: Close the active Field Session — read the LIVE input value
+ * (single source of truth) and emit a single Type step with the canonical
+ * final value, regardless of what physical events the user generated
+ * inside the focus span (typing, backspace, arrow-key navigation, mid-
+ * string edits, paste, autocomplete picks).
+ *
+ * Lifecycle contract:
+ *   - Caller must invoke BEFORE emitting any non-typing step (click,
+ *     scroll, navigate, etc.) so step order is preserved.
+ *   - Idempotent — no-op if no session open.
+ *   - When emittedStepId is set (subsequent re-reads), dispatches
+ *     `preview:recording:step:update` to merge into the existing UI list
+ *     entry. Otherwise emits a fresh `preview:recording:step:capture`.
+ *   - When the live value reverted to initialValue (user typed-and-undid),
+ *     removes the previously-emitted step via `step:remove` to keep the
+ *     trace clean. No step is emitted on first close-with-no-change.
+ *   - All async work is awaited — caller should `await closeFieldSession(...)`.
+ */
+async function closeFieldSession(
+  socket: TypedSocket,
+  previewSessionId: string,
+  userId: string,
+  sessionService: ReturnType<typeof import('@/services/testing/ui/preview/preview-session.service').getPreviewSessionService>,
+  source: string,
+): Promise<void> {
+  const fs = sessionService.getRecordingFieldSession(previewSessionId, userId);
+  if (!fs) return;
+  // Always clear session state FIRST so re-entry during live-value read
+  // cannot loop. Page evaluate may take ms-scale time during which the
+  // user might fire another focus event — we don't want a recursive close.
+  sessionService.setRecordingFieldSession(previewSessionId, userId, null);
+
+  const room = createRoomName('preview', previewSessionId);
+  const fTrace = EditorTraceService.get(previewSessionId);
+  try {
+    const page = sessionService.getPage(previewSessionId, userId);
+    if (!page) return;
+    // Read live value via Playwright. inputValue() works for input/textarea/
+    // select; for contenteditable we read textContent. We pick by tag, not
+    // by isMultiline alone, because <select multiple> is also "multiline"
+    // semantically but uses .value/inputValue.
+    let liveValue: string | null = null;
+    try {
+      // Use the recorded ref-attribute to relocate the element. The
+      // data-agent-ref is injected during recording; if it's absent now
+      // (DOM rebuilt), liveValue stays null and we fall back to the
+      // initialValue diff (no step emitted).
+      const tag = (fs.elementTag || '').toLowerCase();
+      const refSel = `[data-agent-ref="${fs.elementRef}"]`;
+      const locator = page.locator(refSel).first();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+        // inputValue() throws for non-form controls; guarded by tag check.
+        liveValue = await locator.inputValue({ timeout: 500 });
+      } else {
+        // contenteditable / div role=textbox path — read textContent.
+        liveValue = await locator.evaluate((el: any) => el?.textContent || '', undefined, { timeout: 500 });
+      }
+    } catch (err) {
+      // Element gone, ref stale, or read timeout — degrade gracefully:
+      // no live value means we can't be sure of the final state, so we
+      // skip the emission. The legacy buffer-based path may have already
+      // captured an approximate step earlier.
+      if (fTrace) fTrace.writeStepCaptured(
+        { id: 'fs-fail', type: 'type', description: `[FieldSession ${source}] live read failed` } as any,
+        'field_session_read_fail',
+      );
+      return;
+    }
+
+    if (liveValue === null) return;
+    if (liveValue === fs.initialValue) {
+      // No net change. If we previously emitted a Type step (user typed
+      // then deleted everything), remove it to keep the trace clean.
+      if (fs.emittedStepId) {
+        const stepCount = sessionService.decrementRecordingStepCount(previewSessionId, userId);
+        socket.nsp.to(room).emit('preview:recording:step:remove', {
+          previewSessionId, stepId: fs.emittedStepId, stepCount, timestamp: new Date().toISOString(),
+        });
+        if (fTrace) fTrace.writeStepRemoved(fs.emittedStepId, 'field_session_no_change');
+      }
+      return;
+    }
+
+    // Build the Type step. Use buildBindingHints from the recorded
+    // fingerprint so resolver has identifying data on first apply.
+    const { RecordingCaptureService } = await import(
+      '@/services/testing/ui/preview/recording-capture.service'
+    );
+    const truncatedValue = liveValue.length > 500 ? liveValue.slice(0, 500) : liveValue;
+    const description = `Type '${truncatedValue.slice(0, 40)}' in '${fs.elementLabel || 'element'}'`;
+    const recStepIdLocal = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const step: any = {
+      id: fs.emittedStepId || recStepIdLocal,
+      type: 'type',
+      description,
+      value: truncatedValue,
+      // V22 Pkg8: bindingHints were pre-built at open time via
+      // buildBindingHints (semantic locator hints — role/label/text/testId
+      // /etc). recordedFingerprint travels separately as the structural
+      // fingerprint snapshot. The two have intentionally different shapes
+      // — see TargetFingerprint vs BindingHints in preview.types.ts.
+      bindingHints: fs.bindingHints,
+      recordedFingerprint: fs.recordedFingerprint,
+      evidence: {
+        pageUrl: fs.pageUrl,
+      },
+    };
+
+    if (fs.emittedStepId) {
+      // Update existing — fold subsequent edits into the same list entry.
+      socket.nsp.to(room).emit('preview:recording:step:update', {
+        previewSessionId, step, timestamp: new Date().toISOString(),
+      });
+      if (fTrace) fTrace.writeStepUpdated(step, `field_session_update_${source}`);
+    } else {
+      // First-time emit — set the id BEFORE the emit so subsequent updates
+      // (in case the same session re-opens) can find it.
+      // Use emitRecordingStep so step counter / inter-step delay tracking
+      // run consistently with other capture paths.
+      emitRecordingStep(socket, room, sessionService, previewSessionId, userId, { step });
+      if (fTrace) fTrace.writeStepCaptured(step, `field_session_close_${source}`);
+    }
+
+    // Mirror to legacy lastTypeStep so that ANY subsequent legacy code
+    // path (typing buffer flush during the same session) doesn't create
+    // a duplicate step. Once Field Session is the sole path this can be
+    // removed; for now the dual-path safety prevents regressions.
+    sessionService.setRecordingLastTypeStep(previewSessionId, userId, {
+      id: step.id,
+      elementRef: fs.elementRef,
+      value: truncatedValue,
+    });
+  } catch (err) {
+    if (fTrace) fTrace.writeStepCaptured(
+      { id: 'fs-err', type: 'type', description: `[FieldSession ${source}] error` } as any,
+      'field_session_close_error',
+    );
+  }
+}
+
+/**
  * Flush pending typing buffer for a session.
  * Emits accumulated text as a recording step (or merges with previous type step).
  * Call BEFORE emitting another step to preserve correct step order.
@@ -266,6 +409,19 @@ function flushPendingTyping(
 ): void {
   const buffer = sessionService.getRecordingBuffer(previewSessionId, userId);
   if (!buffer) return;
+  // V22 Pkg8: when a Field Session is active, the canonical Type step has
+  // ALREADY been (or will be) emitted via closeFieldSession with the live
+  // input.value. Skip the legacy buffer-based emission here to prevent a
+  // duplicate step. We still clear the buffer so it doesn't leak to the
+  // next field. The Field Session close runs on its own lifecycle hooks
+  // (click / nav / stop) — caller invokes both helpers in sequence.
+  const activeFieldSession = sessionService.getRecordingFieldSession(previewSessionId, userId);
+  if (activeFieldSession) {
+    sessionService.setRecordingBuffer(previewSessionId, userId, null);
+    const timer = recordingTypingTimers.get(previewSessionId);
+    if (timer) { clearTimeout(timer); recordingTypingTimers.delete(previewSessionId); }
+    return;
+  }
 
   const room = createRoomName('preview', previewSessionId);
   const lastTypeStep = sessionService.getRecordingLastTypeStep(previewSessionId, userId);
@@ -336,6 +492,11 @@ async function finalizeRecording(
   }
 
   const finalizeTrace = EditorTraceService.get(previewSessionId);
+
+  // V22 Pkg8: close any active Field Session FIRST. Reads live input.value
+  // for canonical Type step. Runs before legacy buffer flush so the legacy
+  // path becomes a no-op (the lastTypeStep mirror is set inside close).
+  await closeFieldSession(socket, previewSessionId, userId, sessionService, `stop_${reason}`);
 
   // Flush pending typing buffer (with merge logic).
   const buffer = sessionService.getRecordingBuffer(previewSessionId, userId);
@@ -1331,6 +1492,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         userId: ensuredUserId,
         includeAlternatives: !!includeAlternatives,
         forceFreshSnapshot: true,
+        // Editor-side lint: Find button + debounced auto-lint after typing.
+        // We can't tell them apart from this socket event alone, so use the
+        // generic 'find_button' label (covers both user-triggered moments).
+        auditTrigger: 'find_button',
       });
 
       // V5: Handle needs_clarification status
@@ -1393,6 +1558,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           clarificationQuestion: result.clarificationQuestion,
           alternativesIncluded: !!includeAlternatives,
           applyDisabled: true, // V5: Apply should be disabled for needs_clarification
+          // V23: forward AMBIGUOUS coaching so the editor renders an
+          // actionable hint alongside the alternatives picker.
+          ...(result.suggestion ? { suggestion: result.suggestion } : {}),
           timestamp: new Date().toISOString(),
         });
 
@@ -1985,11 +2153,22 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const probeX = hStateRef.latestX;
               const probeY = hStateRef.latestY;
 
-              const el = await sessionService.probeInteractiveElementAt({
+              // V23: ask probe for the precise reject reason. Without this
+              // every null result trace-encodes as 'no_interactive_element'
+              // — so 53× identical rows during a stuck recording look
+              // identical regardless of whether the page is empty, the
+              // hit-test landed in a cross-origin iframe, or a non-
+              // interactive <div> covered the area.
+              const probeResult = await sessionService.probeInteractiveElementAt({
                 sessionId: previewSessionId,
                 userId: ensuredUserId,
                 x: probeX, y: probeY,
+                withRejectReason: true,
               });
+              // Narrow: a "real" element has tag/label; rejection has only rejectReason.
+              const el = probeResult && 'tag' in probeResult ? probeResult : null;
+              const rejectReason = probeResult && 'rejectReason' in probeResult
+                ? probeResult.rejectReason : undefined;
 
               const probeLatencyMs = Date.now() - probeStartMs;
 
@@ -2006,7 +2185,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 originalX: x, originalY: y,
                 latencyMs: probeLatencyMs,
                 result: el ? { tag: el.tag, label: el.label, resolvedVia: el.resolvedVia } : null,
-                skipped: el ? undefined : 'no_interactive_element',
+                skipped: el ? undefined : (rejectReason || 'no_interactive_element'),
               });
 
               const elKey = el
@@ -2123,6 +2302,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
             return; // Don't try to create a step from cross-origin element
           }
+          // V23: <webview> / <object> / <embed> host a separate browsing
+          // context Playwright cannot reach — recording silently captures
+          // nothing. Surface a clear message instead of "no element here".
+          if (preClickElement.unsupportedHost) {
+            const room = createRoomName('preview', previewSessionId);
+            const hostKind = preClickElement.unsupportedHost;
+            const hostMsg = hostKind === 'webview'
+              ? 'This site renders its content inside an Electron <webview> element. Playwright runs vanilla Chromium, so the inner content is not reachable. Recording will not capture clicks or typing here.'
+              : `This site renders content inside a <${hostKind}> element whose internals are not accessible to recording.`;
+            socket.nsp.to(room).emit('preview:recording:warning' as any, {
+              previewSessionId,
+              type: 'unsupported_host',
+              hostKind,
+              message: hostMsg,
+              timestamp: new Date().toISOString(),
+            });
+            return; // No usable target — skip step creation
+          }
           setImmediate(async () => {
             try {
               const { RecordingCaptureService } = await import(
@@ -2131,44 +2328,102 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const room = createRoomName('preview', previewSessionId);
               const cTrace = EditorTraceService.get(previewSessionId);
 
-              // Flush pending scroll + typing before click — preserve step order
+              // Flush pending scroll + typing + close Field Session BEFORE
+              // emitting the click step — preserves correct step order and
+              // captures the canonical input value before the user navigates
+              // away from the focused control.
               await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'click');
               flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'click');
+              // V22 Pkg8: close Field Session on click — re-reads live
+              // input.value for the canonical Type step. Skipped silently
+              // when no session open (idempotent).
+              await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, 'click');
 
-              // V15: Emit hover step before click only if user dwelled on a genuinely different interactive element.
-              // Fixes: V11 had hoverOnDifferentElement always true (ref never stored) → mass false positives.
-              // Now: 400ms minimum dwell + structural comparison (tag + boundingBox) of resolved targets.
-              const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
-              if (lastHover && preClickElement) {
-                const timeSinceHover = Date.now() - lastHover.timestamp;
-                // V15: Raised minimum dwell from 200ms to 400ms — real dropdown hovers require intentional pause
-                if (timeSinceHover > 400 && timeSinceHover < 5000) {
-                  try {
-                    const page = sessionService.getPage(previewSessionId, ensuredUserId);
-                    if (page) {
-                      const hoverElement = await RecordingCaptureService.probeForRecording(page, lastHover.x, lastHover.y);
-                      if (hoverElement) {
-                        // V15: Compare resolved interactive targets structurally.
-                        // data-agent-ref is NOT injected during recording, so we compare by
-                        // boundingBox (position+size) which uniquely identifies elements on page.
-                        const hBB = hoverElement.boundingBox;
-                        const cBB = preClickElement.boundingBox;
-                        const isSameElement = hBB && cBB
-                          && hBB.x === cBB.x && hBB.y === cBB.y
-                          && hBB.width === cBB.width && hBB.height === cBB.height;
-                        if (!isSameElement) {
-                          const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
-                          emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
-                          if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
-                        }
-                      }
+              // V22 Pkg5+ Patch A & C: Emit hover-steps before click using
+              //   (A) Adaptive dwell threshold — 80ms for popup-trigger
+              //       elements (aria-haspopup, dropdown classes, bsToggle),
+              //       400ms for everything else. Quick hover on a real
+              //       trigger (Documentolog Market hover-menu) now records
+              //       a hover-step even if the user moves fast.
+              //   (B) Hover CHAIN — multi-level menus (Menu → Submenu →
+              //       Click leaf) emit a hover-step per distinct ancestor
+              //       trigger, preserving order. Replays deterministically
+              //       even when CSS :hover-only menus drive the UI.
+              //
+              // Old behaviour (single 400ms dwell on lastHover) is fully
+              // subsumed — chain falls back to lastHover when empty.
+              try {
+                const page = sessionService.getPage(previewSessionId, ensuredUserId);
+                const chain = sessionService.getRecordingHoverChain(previewSessionId, ensuredUserId);
+                if (page && preClickElement) {
+                  // Build the candidate list. Prefer chain (multi-level);
+                  // fall back to lastHover (single-step legacy path).
+                  const candidates: Array<{ x: number; y: number; timestamp: number; probedElement?: any }> = [];
+                  if (chain.length > 0) {
+                    for (const c of chain) candidates.push(c);
+                  } else {
+                    const lastHover = sessionService.getRecordingLastHover(previewSessionId, ensuredUserId);
+                    if (lastHover) candidates.push(lastHover);
+                  }
+                  const cBB = preClickElement.boundingBox;
+                  const seenBBoxKeys = new Set<string>();
+                  for (let ci = 0; ci < candidates.length; ci++) {
+                    const cand = candidates[ci];
+                    const timeSinceHover = Date.now() - cand.timestamp;
+                    if (timeSinceHover >= 5000) continue; // too stale
+                    // Re-probe if no cached probedElement (legacy lastHover path)
+                    let hoverElement = cand.probedElement || null;
+                    if (!hoverElement) {
+                      hoverElement = await RecordingCaptureService.probeForRecording(page, cand.x, cand.y);
                     }
-                  } catch {
-                    // Non-critical — hover step is best-effort
+                    if (!hoverElement || !hoverElement.boundingBox) continue;
+                    // Skip if this hover-target equals the click-target (same element).
+                    const hBB = hoverElement.boundingBox;
+                    const isSameElement = hBB && cBB
+                      && hBB.x === cBB.x && hBB.y === cBB.y
+                      && hBB.width === cBB.width && hBB.height === cBB.height;
+                    if (isSameElement) continue;
+                    // De-dupe within the chain itself (rare but possible
+                    // when chain entries probed the same element from
+                    // slightly-different coords).
+                    const bboxKey = `${hBB.x}|${hBB.y}|${hBB.width}|${hBB.height}`;
+                    if (seenBBoxKeys.has(bboxKey)) continue;
+                    seenBBoxKeys.add(bboxKey);
+                    // Patch A: adaptive dwell threshold.
+                    // Popup-trigger signals (aria-haspopup, bsToggle="dropdown",
+                    // class*="dropdown|menu-trigger|has-submenu", or any
+                    // ancestor-summary that hints at a menu container) → 80ms.
+                    // Everything else → 400ms (legacy threshold).
+                    const cls = (hoverElement.cssClass || '') + ' ' + (hoverElement.ancestorSummary || '');
+                    const isLikelyPopupTrigger =
+                      !!hoverElement.ariaHasPopup
+                      || hoverElement.bsToggle === 'dropdown'
+                      || hoverElement.bsToggle === 'menu'
+                      || /\b(dropdown|menu-trigger|has-submenu|popper-trigger|has-dropdown|nav-item|MuiMenuItem|MuiMenu-)\b/i.test(cls);
+                    const minDwell = isLikelyPopupTrigger ? 80 : 400;
+                    if (timeSinceHover < minDwell) continue;
+                    // Skip generic-label hovers. If the probe couldn't find any
+                    // descriptive name for the target (no aria-label, no text,
+                    // no title, no id, no testId), the recorded step ends up as
+                    // "Hover 'element'" which is useless for replay — the
+                    // resolver has nothing semantic to match against. Most of
+                    // these come from cursor sweeps between meaningful targets
+                    // (e.g. mouse passing over a wrapper div on the way to the
+                    // language flag). Exception: keep the step when the probe
+                    // indicates a popup-trigger (aria-haspopup / dropdown class)
+                    // — there the hover IS the action even without a label.
+                    const probedLabel = RecordingCaptureService.getProbedLabel(hoverElement, 60);
+                    if (!probedLabel && !isLikelyPopupTrigger) continue;
+                    const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
+                    emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
+                    if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
                   }
                 }
+              } catch {
+                // Non-critical — hover step is best-effort
               }
               sessionService.setRecordingLastHover(previewSessionId, ensuredUserId, null);
+              sessionService.clearRecordingHoverChain(previewSessionId, ensuredUserId);
 
               // V19: Non-blocking click step emission.
               // Old flow: await LLM (up to 2s) → emit step → user sees step ~2s after click.
@@ -2198,12 +2453,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const aType = RecordingCaptureService.inferClickActionType(el, safeClickCount, safeButton);
                 const desc = RecordingCaptureService.buildDescription(aType, el);
                 const bHints = RecordingCaptureService.buildBindingHints(el);
+                // V22: Fingerprint set NOW so LLM resolver has identifying
+                // data on the first apply (before compiled plan exists).
+                const recFp = RecordingCaptureService.buildRecordedFingerprint(el);
                 const iSel = el.iframeSelector;
                 const built: PreviewIntentStep = {
                   id: stepIdForClick,
                   type: aType,
                   description: desc,
                   bindingHints: Object.keys(bHints).length > 0 ? bHints : undefined,
+                  recordedFingerprint: Object.keys(recFp).length > 0 ? recFp : undefined,
                   options: {
                     ...(hasModifiers && {
                       modifiers: {
@@ -2230,6 +2489,38 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
               // Build & emit the initial step IMMEDIATELY using pre-click probe data
               const step = buildClickStep(preClickElement!);
+
+              // Diagnostic — audit what the recorder actually built. If
+              // `hasRecordedFingerprint: false` here, the loss is upstream
+              // (probe didn't capture identity); if it's true here but
+              // false in fp_audit.log on the next Run, the loss is in
+              // frontend serialize / DB persist.
+              try {
+                const fs = await import('fs');
+                const path = await import('path');
+                const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+                const fpKeys = step.recordedFingerprint && typeof step.recordedFingerprint === 'object'
+                  ? Object.keys(step.recordedFingerprint).slice(0, 15)
+                  : undefined;
+                const probeKeys = preClickElement
+                  ? Object.keys(preClickElement).filter(k => preClickElement![k as keyof typeof preClickElement] != null).slice(0, 20)
+                  : undefined;
+                fs.appendFileSync(auditPath, JSON.stringify({
+                  ts: new Date().toISOString(),
+                  scope: 'recorder_emit',
+                  stepId: step.id?.slice(0, 8),
+                  type: step.type,
+                  hasRecordedFingerprint: !!step.recordedFingerprint,
+                  hasBindingHints: !!step.bindingHints,
+                  hasEvidence: !!step.evidence,
+                  fpKeys,
+                  probeKeys,
+                  probeTag: preClickElement?.tag,
+                  probeId: preClickElement?.elementId,
+                  probeTestId: preClickElement?.testId,
+                  probeRef: preClickElement?.ref,
+                }) + '\n');
+              } catch { /* non-fatal */ }
 
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
@@ -2758,6 +3049,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               if (isPaste) {
                 sessionService.setRecordingPendingPaste(previewSessionId, ensuredUserId, false);
 
+                // V22 Pkg8: paste replaces / appends-to live input value.
+                // Close any active Field Session FIRST so its canonical
+                // Type step is emitted with the pre-paste value (avoids
+                // a duplicate / wrong-order step). Paste itself emits as
+                // its own dedicated step below.
+                await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, 'paste');
+
                 // Immediately emit paste step — no debounce, no merge with regular typing
                 const page = sessionService.getPage(previewSessionId, ensuredUserId);
                 const focusedEl = page ? await RecordingCaptureService.probeFocusedElement(page) : null;
@@ -2789,16 +3087,72 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 // First character — probe focused element for label
                 const page = sessionService.getPage(previewSessionId, ensuredUserId);
                 const focusedEl = page ? await RecordingCaptureService.probeFocusedElement(page) : null;
+                // V22: capture fingerprint at focus time so the eventual
+                // type-step has identifying data on first apply.
+                const focusedFp = focusedEl
+                  ? RecordingCaptureService.buildRecordedFingerprint(focusedEl)
+                  : undefined;
                 buffer = {
                   text: data.text,
                   elementRef: focusedEl?.ref,
                   elementLabel: RecordingCaptureService.getElementLabel(focusedEl),
                   lastCharAt: Date.now(),
                   bindingHints: focusedEl ? RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, string> : undefined,
+                  recordedFingerprint: focusedFp && Object.keys(focusedFp).length > 0 ? focusedFp : undefined,
                   isMultiline: focusedEl?.isMultiline,
                   pageUrl: page?.url(),
                   iframeSelector: focusedEl?.iframeSelector, // V13: iframe context for replay
                 };
+
+                // V22 Pkg8: open a Field Session in parallel — captures the
+                // user's intent to FILL this control as one logical unit,
+                // independent of the per-keystroke buffer above. The session
+                // closes on focus shift / click outside / nav / submit and
+                // emits ONE step with the live input.value as the canonical
+                // final value (resilient to mid-string Backspace, arrow-key
+                // edits, paste, autocomplete picks).
+                const existingFs = sessionService.getRecordingFieldSession(previewSessionId, ensuredUserId);
+                const sameTarget = existingFs && existingFs.elementRef === focusedEl?.ref;
+                if (!sameTarget && focusedEl?.ref) {
+                  // Different target than previous session → close the prior
+                  // session first (emits its own Type step with live value),
+                  // then open a fresh one for the new control.
+                  if (existingFs) {
+                    await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, 'focus_shift_type');
+                  }
+                  // Read the initial input value so we can detect "user typed
+                  // and erased everything back to the original" later. This
+                  // is async but fast — page already loaded the control.
+                  let initialValue = '';
+                  try {
+                    const refSel = `[data-agent-ref="${focusedEl.ref}"]`;
+                    const tagL = (focusedEl.tag || '').toLowerCase();
+                    if (tagL === 'input' || tagL === 'textarea' || tagL === 'select') {
+                      initialValue = await page!.locator(refSel).first().inputValue({ timeout: 300 }).catch(() => '');
+                    } else {
+                      initialValue = await page!.locator(refSel).first().evaluate(
+                        (el: any) => el?.textContent || '',
+                        undefined,
+                        { timeout: 300 },
+                      ).catch(() => '');
+                    }
+                  } catch { /* tolerant — empty initial is the safe default */ }
+                  sessionService.setRecordingFieldSession(previewSessionId, ensuredUserId, {
+                    elementRef: focusedEl.ref,
+                    elementLabel: RecordingCaptureService.getElementLabel(focusedEl),
+                    elementTag: focusedEl.tag || '',
+                    elementType: focusedEl.type || undefined,
+                    isMultiline: focusedEl.isMultiline,
+                    initialValue,
+                    startedAt: Date.now(),
+                    pageUrl: page?.url() || '',
+                    iframeSelector: focusedEl.iframeSelector,
+                    recordedFingerprint: focusedFp && Object.keys(focusedFp).length > 0 ? focusedFp : undefined,
+                    // V22 Pkg8: pre-build BindingHints at session open so
+                    // close-time emission can reuse them — no second probe.
+                    bindingHints: RecordingCaptureService.buildBindingHints(focusedEl) as Record<string, unknown>,
+                  });
+                }
               } else {
                 buffer.text += data.text;
                 buffer.lastCharAt = Date.now();
@@ -2812,6 +3166,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
               recordingTypingTimers.set(previewSessionId, setTimeout(async () => {
                 try {
+                  // V22 Pkg8: when a Field Session is active, debounced
+                  // mid-typing flushes are pre-empted. The session closes
+                  // on click/nav/blur and reads live input.value as the
+                  // canonical Type step value — running a buffer flush
+                  // here would emit a duplicate (or worse, an outdated
+                  // intermediate value). We DO NOT close the session
+                  // from a timer because the user may still be typing
+                  // in this same field; closing on quiet would reset
+                  // the SoT contract.
+                  if (sessionService.getRecordingFieldSession(previewSessionId, ensuredUserId)) {
+                    sessionService.setRecordingBuffer(previewSessionId, ensuredUserId, null);
+                    return;
+                  }
                   const currentBuffer = sessionService.getRecordingBuffer(previewSessionId, ensuredUserId);
                   if (currentBuffer) {
                     const room = createRoomName('preview', previewSessionId);
@@ -3105,6 +3472,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 // No buffer and no lastTypeStep — fall through to emit "Press Backspace" as normal
               }
 
+              // V22 Pkg8: close Field Session on Enter/Tab/Escape — these
+              // keys terminate the editing transaction (Enter submits,
+              // Tab moves to next control, Escape cancels). Reads live
+              // input.value and emits the canonical Type step, then the
+              // legacy buffer flush below becomes a no-op (handled by
+              // the in-fn skip when session was active).
+              if (RecordingCaptureService.shouldFlushOnKey(data.key, data.modifiers, isMultiline)
+                  && sessionService.getRecordingFieldSession(previewSessionId, ensuredUserId)) {
+                await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, `key_${data.key.toLowerCase()}`);
+              }
+
               // Flush typing buffer if Enter/Tab triggers it
               if (RecordingCaptureService.shouldFlushOnKey(data.key, data.modifiers, isMultiline)) {
                 if (buffer) {
@@ -3154,9 +3532,35 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 }
               }
 
+              // V22 Pkg8: Suppress navigation keys when a Field Session is
+              // active. ArrowLeft/Right/Up/Down + Home/End inside an open
+              // input are cursor-positioning operations, not user-intent
+              // steps. The eventual Type step's value (read from live
+              // input.value at session close) already reflects whatever
+              // edits the user made at any cursor position. Emitting a
+              // separate "Press ArrowLeft × 4" step:
+              //   - clutters the UI (8 atomic steps for one fill action)
+              //   - is meaningless on replay (Playwright's locator.fill()
+              //     sets the final value directly, no cursor walk needed)
+              //   - confuses non-technical users reviewing the trace
+              // Backspace/Delete: when a Field Session is open we suppress
+              // the press emission too — the canonical Type step (read at
+              // session close from live input.value) already reflects whatever
+              // characters survived. A dangling "Press Backspace" step in
+              // the trace would replay BEFORE the Type step could correct
+              // for it, double-clobbering the input on replay.
+              const fsActive = sessionService.getRecordingFieldSession(previewSessionId, ensuredUserId);
+              const isNavKeyInsideFieldSession =
+                fsActive
+                && (
+                  data.key === 'ArrowLeft' || data.key === 'ArrowRight'
+                  || data.key === 'ArrowUp' || data.key === 'ArrowDown'
+                  || data.key === 'Home' || data.key === 'End'
+                  || data.key === 'Backspace' || data.key === 'Delete'
+                );
               // Emit press step for meaningful keys
               // V10: Skip emitting separate "Press Enter" if it was merged into the type step
-              if (!mergedEnterIntoType) {
+              if (!mergedEnterIntoType && !isNavKeyInsideFieldSession) {
                 const pressStep = RecordingCaptureService.capturePress(data.key, data.modifiers);
                 if (pressStep) {
                   // Coalesce consecutive identical presses into one step with
@@ -3361,9 +3765,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
               const room = createRoomName('preview', previewSessionId);
 
-              // Flush pending scroll + typing before refresh step
+              // Flush pending scroll + typing + close Field Session before refresh.
               await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'refresh');
               flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'refresh');
+              // V22 Pkg8: refresh wipes DOM — close session NOW while ref still valid.
+              await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, 'refresh');
 
               // V11: Record a navigate step for refresh.
               // Coalesce consecutive refreshes on the same URL so mashing F5
@@ -3463,6 +3869,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         try {
           const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
           flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'back');
+          // V22 Pkg8: close Field Session before back navigation — DOM about to swap.
+          await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, 'back');
         } catch { /* non-critical */ }
       }
 
@@ -3538,6 +3946,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         try {
           const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
           flushPendingTyping(socket, previewSessionId, ensuredUserId, sessionService, RecordingCaptureService, 'forward');
+          // V22 Pkg8: close Field Session before forward navigation.
+          await closeFieldSession(socket, previewSessionId, ensuredUserId, sessionService, 'forward');
         } catch { /* non-critical */ }
       }
 
@@ -4151,7 +4561,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:run:start', async (data) => {
     try {
       const userId = getUserId(socket);
-      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset } = data;
+      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset, startFromIndex: clientStartFromIndex } = data;
 
       // Validate input
       if (!previewSessionId || !intentTestCaseId) {
@@ -4180,6 +4590,61 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         userId,
       });
 
+      // Diagnostic — write to a dedicated file (winston dev config drops
+      // info/warn to stdout-only, which we can't read from outside the
+      // process). Bypassing winston with direct fs.appendFile gives us a
+      // disk artifact we can grep regardless of log level config.
+      try {
+        const fs = await import('fs');
+        const path = await import('path');
+        const dbSteps = ((testCase?.stepsJson || []) as unknown as Array<Record<string, unknown>>);
+        const fpAudit = dbSteps.map((s, idx) => {
+          const compiled = s?.compiled as Record<string, unknown> | undefined;
+          const evidence = s?.evidence as Record<string, unknown> | undefined;
+          const bindingHints = s?.bindingHints as Record<string, unknown> | undefined;
+          const compiledContext = compiled?.context as Record<string, unknown> | undefined;
+          const locatorPlan = compiled?.locatorPlan as Array<Record<string, unknown>> | undefined;
+          return {
+            locatorStrategies: locatorPlan?.map(l => `${l.strategy}=${typeof l.value === 'string' ? l.value.slice(0, 40) : ''}@${l.confidence}`).slice(0, 5),
+            idx,
+            id: typeof s?.id === 'string' ? s.id.slice(0, 8) : undefined,
+            type: s?.type,
+            description: typeof s?.description === 'string' ? (s.description as string).slice(0, 80) : undefined,
+            // Where the step was applied (compiled plan stamps the URL it
+            // was generated for). Run-time URL mismatch with this is the
+            // canonical "compiled stale" signal.
+            compiledPageUrl: typeof compiledContext?.pageUrl === 'string' ? compiledContext.pageUrl : undefined,
+            // What evidence ref was cached + what URL it was captured on.
+            evidencePageUrl: typeof evidence?.pageUrl === 'string' ? evidence.pageUrl : undefined,
+            evidenceLastSuccessRef: typeof evidence?.lastSuccessRef === 'string' ? evidence.lastSuccessRef : undefined,
+            evidenceCapturedAt: typeof evidence?.capturedAt === 'string' ? evidence.capturedAt : undefined,
+            // bindingHints captured at apply time — primary semantic anchor.
+            bhLabel: typeof bindingHints?.label === 'string' ? (bindingHints.label as string).slice(0, 80) : undefined,
+            bhText: typeof bindingHints?.text === 'string' ? (bindingHints.text as string).slice(0, 80) : undefined,
+            bhRole: typeof bindingHints?.role === 'string' ? bindingHints.role : undefined,
+            bhTag: typeof bindingHints?.tag === 'string' ? bindingHints.tag : undefined,
+            bhTestId: typeof bindingHints?.testId === 'string' ? bindingHints.testId : undefined,
+            bhElementId: typeof bindingHints?.elementId === 'string' ? bindingHints.elementId : undefined,
+            // Flags + fingerprint key list (compact summary for grep).
+            hasRecordedFingerprint: !!s?.recordedFingerprint,
+            hasBindingHints: !!bindingHints,
+            hasCompiled: !!compiled,
+            hasEvidence: !!evidence,
+            fpKeys: s?.recordedFingerprint && typeof s.recordedFingerprint === 'object'
+              ? Object.keys(s.recordedFingerprint as object).slice(0, 10)
+              : undefined,
+          };
+        });
+        const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+        const line = JSON.stringify({
+          ts: new Date().toISOString(),
+          intentTestCaseId,
+          stepCount: dbSteps.length,
+          steps: fpAudit,
+        }) + '\n';
+        fs.appendFileSync(auditPath, line);
+      } catch { /* non-fatal — diagnostic only */ }
+
       if (isMobile && testCase) {
         // Mobile path: delegate to mobile runner via HTTP
         logger.info('[WebSocket] Starting mobile preview run', {
@@ -4204,6 +4669,29 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // If inline steps provided, save them to DB first (Apply All flow)
         if (Array.isArray(inlineSteps) && inlineSteps.length > 0) {
+          // Diagnostic — answers "did the frontend ship `recordedFingerprint`
+          // for click/type steps, or did toIntentStepForSave drop it?". When
+          // the value is false here, the cause is upstream of this handler
+          // (frontend serialization, recorder emit, or initial DB load).
+          try {
+            const fpAudit = (inlineSteps as unknown as Array<Record<string, unknown>>).map((s, idx) => ({
+              idx,
+              id: typeof s?.id === 'string' ? s.id.slice(0, 8) : undefined,
+              type: s?.type,
+              hasRecordedFingerprint: !!s?.recordedFingerprint,
+              hasBindingHints: !!s?.bindingHints,
+              hasCompiled: !!s?.compiled,
+              hasEvidence: !!s?.evidence,
+              fpKeys: s?.recordedFingerprint && typeof s.recordedFingerprint === 'object'
+                ? Object.keys(s.recordedFingerprint as object).slice(0, 10)
+                : undefined,
+            }));
+            logger.info('[APPLY_ALL_FP_AUDIT] inline steps received', {
+              intentTestCaseId,
+              stepCount: inlineSteps.length,
+              steps: fpAudit,
+            });
+          } catch { /* non-fatal — diagnostic only */ }
           const patch: Record<string, unknown> = { steps: inlineSteps };
           if (inlineStartUrl) {
             patch.url = inlineStartUrl;
@@ -4400,10 +4888,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           ? clientAuthReset
           : undefined;
       const hasInline = Array.isArray(inlineSteps) && inlineSteps.length > 0;
+      // Sanitize startFromIndex: must be a non-negative finite integer.
+      // Anything else (NaN, negative, undefined, string, etc.) collapses to
+      // the default "run from step 0" behaviour. This is the safe fallback
+      // — a malformed value never accidentally skips steps.
+      const safeStartFromIndex =
+        typeof clientStartFromIndex === 'number'
+        && Number.isFinite(clientStartFromIndex)
+        && clientStartFromIndex > 0
+        && Math.floor(clientStartFromIndex) === clientStartFromIndex
+          ? clientStartFromIndex
+          : undefined;
       const runOptions = hasInline
-        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset }
-        : safeAuthReset
-          ? { authReset: safeAuthReset }
+        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
+        : (safeAuthReset || safeStartFromIndex !== undefined)
+          ? { authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
           : undefined;
       PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
         logger.error('[WebSocket] Preview run failed', {

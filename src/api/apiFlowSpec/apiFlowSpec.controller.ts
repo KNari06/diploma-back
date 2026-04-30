@@ -275,7 +275,10 @@ export const runFlow = async (req: Request, res: Response): Promise<void> => {
     if (!hasCredits) {
       res.status(402).json({
         success: false,
-        error: `Insufficient credits. This flow requires ${creditCost} credits (1 per endpoint).`,
+        error: 'Insufficient credits',
+        code: 'INSUFFICIENT_CREDITS',
+        message: `Insufficient credits. This flow requires ${creditCost} credits (1 per endpoint).`,
+        details: { required: creditCost },
       });
       return;
     }

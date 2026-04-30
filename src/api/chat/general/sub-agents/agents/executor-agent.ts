@@ -195,13 +195,17 @@ export async function executeTools(
         continue;
       }
 
-      // Emit pre-execution progress (UI concern — stays in executor)
+      // Emit pre-execution progress (UI concern — stays in executor).
+      // Last arg `context.testCaseId` triggers dual-broadcast to
+      // `chat:tc:<tcid>` for the per-test-case chat surface; undefined
+      // on the legacy global path leaves emit behavior unchanged.
       emitProcessingStep(
         context.chatSessionId,
         'agent_executing_tool',
         `Using ${humanizeToolName(toolName)}...`,
         computeToolProgress(toolResults.length, filteredTools.length),
-        { toolName, round: toolRound }
+        { toolName, round: toolRound },
+        context.testCaseId,
       );
 
       // Execute tool through centralized pipeline (routing, hooks, timeout, screenshot handling)
@@ -248,7 +252,8 @@ export async function executeTools(
           ? `${humanizeToolName(toolName)} done`
           : `${humanizeToolName(toolName)} had an issue`,
         computeToolProgress(toolResults.length, filteredTools.length),
-        { toolName, success: callResult.toolResult.success, durationMs: callResult.record.durationMs }
+        { toolName, success: callResult.toolResult.success, durationMs: callResult.record.durationMs },
+        context.testCaseId,
       );
     }
   }

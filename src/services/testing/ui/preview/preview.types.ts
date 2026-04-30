@@ -85,6 +85,128 @@ export interface InteractiveNode {
   ariaSelected?: boolean;
   /** aria-checked for custom checkboxes/switches */
   ariaChecked?: boolean | 'mixed';
+  /**
+   * V22 Pkg1: aria-current — for Pagination current page, Stepper active
+   * step, Breadcrumbs last crumb. Raw value: 'page' | 'step' | 'true' | etc.
+   */
+  ariaCurrent?: string;
+  /**
+   * V22 Pkg1: aria-valuenow / aria-valuetext — slider/spinbutton/progressbar
+   * current value. Mirrors recording-time extraction so heal-time fingerprint
+   * can match by semantic value.
+   */
+  ariaValueNow?: number;
+  ariaValueText?: string;
+  /**
+   * V22 Pkg1: data-value or `<option value="...">` — semantic key for select
+   * options / list items / chips, distinct from display text.
+   */
+  dataValue?: string;
+  /**
+   * V22 Pkg1: data-testid of single direct icon child (svg/i/img) when the
+   * node itself is descriptor-poor (no text/aria/testid). Lets the resolver
+   * surface a meaningful name in candidateText for IconButton-shaped targets.
+   */
+  childTestId?: string;
+  /**
+   * V22 Pkg4: Semantic icon name from svg-internal accessibility (`<title>`,
+   * `<desc>`), sprite reference (`<use href="#icon-X">`), icon-library
+   * data-attrs (`data-lucide`, `data-feather`, `data-icon`, `data-iconify-name`),
+   * FontAwesome class tokens, or background-image URL filename. Used for
+   * `<div role="button"><svg/></div>` patterns where neither testId nor
+   * childTestId is available — closes the "fully bare icon button" gap.
+   */
+  iconLabel?: string;
+  /**
+   * Angular Material icon registry name. Read from `svgicon` attribute on
+   * `<mat-icon>` (or `data-mat-icon-name` mirror). Survives across builds
+   * and re-renders — Material registers each icon once globally and the
+   * attribute is the lookup key. Strong identity signal for Material apps
+   * where the SVG itself has no `<title>`/aria-label/text.
+   *
+   *   <mat-icon svgicon="chevron-left-outline"><svg>...</svg></mat-icon>
+   *
+   * Distinct from `iconLabel` (which sources from svg <title>, data-lucide,
+   * FA classes). When both are present we prefer svgIcon as the identity —
+   * iconLabel can be derived from generic CSS class tokens that overlap
+   * across icons; svgIcon comes from the explicit registration name.
+   */
+  svgIcon?: string;
+  /**
+   * Closest semantic custom-element ancestor (`<app-foo-bar>` /
+   * `<my-button>` / etc.). See TargetFingerprint.customElementTag for
+   * the rationale and filter rules. Used by the resolver's identity
+   * fast-path so an Angular icon-only button wrapped in a meaningful
+   * `<app-X>` tag still gets a deterministic match.
+   */
+  customElementTag?: string;
+  /**
+   * V23: `<img alt="...">` — WCAG-recommended accessible name for image
+   * targets. Promoted from "checked but not stored" status so the resolver,
+   * builder, and getEffectiveLabel() can use it as a first-class identity
+   * source instead of reading via `(node as any).alt`.
+   */
+  alt?: string;
+  /**
+   * V23: `<a href="...">` — link destination. Used by builder for
+   * hash-anchor (`#section-id`) and pathname-suffix locator strategies,
+   * and by candidateText to disambiguate duplicate visible text by destination.
+   */
+  href?: string;
+  /**
+   * V23: First 1-3 stable className tokens (utility-class noise stripped at
+   * probe time). Used by builder's scoped-text fallback strategies.
+   */
+  cssClass?: string;
+  /**
+   * V23: Vue scoped-style attribute (`data-v-XXXXXX`). Stable per-component
+   * instance marker; narrows cross-redesign matches in Vue apps.
+   */
+  vueScopeId?: string;
+  /**
+   * V23: Compact ancestor chain summary like `header > div.icon-group > svg`
+   * — see TargetFingerprint.ancestorSummary for rationale.
+   */
+  ancestorSummary?: string;
+  /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
+  bsToggle?: string;
+  /** V22 Pkg2: Bootstrap data-bs-target selector. */
+  bsTarget?: string;
+  /** V22 Pkg2: aria-haspopup popup-trigger marker. */
+  ariaHasPopup?: string;
+  /** V22 Pkg2: aria-activedescendant — id of currently-active descendant. */
+  ariaActiveDescendant?: string;
+  /** V22 Pkg2: data-row-key / data-rk — stable row identity for tables. */
+  dataRowKey?: string;
+  /**
+   * V22 Pkg2: heuristic flag — row that LOOKS clickable even without
+   * role/onclick (cursor:pointer + hover-style class). Resolver weighs
+   * this when ranking candidates inside a table context.
+   */
+  rowClickable?: boolean;
+  /**
+   * V22 Pkg5: Concatenated text of sibling cells inside the nearest
+   * row container — uniqueness signal for descriptor-poor row checkboxes
+   * and action buttons. Format: "<cell1> | <cell2> | <cell3>".
+   */
+  nearestRowText?: string;
+  /**
+   * V22 Pkg5: nth-of-type index among same-class siblings. Bounded to
+   * 2..10 siblings. Anchors pagination prev/next, tabs, button groups
+   * where attribute identity is missing.
+   */
+  siblingIndex?: number;
+  /**
+   * V22 Pkg5: Recorded disabled state (combines `disabled` attr,
+   * `aria-disabled`, and disabled CSS class tokens). Distinguishes
+   * pagination prev (disabled at start) from next (enabled).
+   */
+  disabled?: boolean;
+  /**
+   * V22 Pkg5: Cardinal direction inferred from svg path geometry.
+   * Last-resort hint for svg-only buttons (prev/next, expand/collapse).
+   */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
 
   // ═══════════════════════════════════════════════════════════════════════════
   // V2: Validation state
@@ -167,6 +289,11 @@ export interface DomAnalysisData {
   capturedAt: number;
   /** Version for future migrations */
   version: string;
+  /** V26: Real browser viewport at capture time. Used for modal-coverage
+   *  ratio in `buildAllowedSets` — without this, long scrollable pages
+   *  underestimate modal coverage and the blocking-modal hard-exclude rule
+   *  never fires. Optional for backwards compatibility. */
+  viewport?: { width: number; height: number };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -243,6 +370,153 @@ export interface BindingHints {
   tag?: string;
   /** V18: data-testid/data-test/data-cy — stable test identifier for reliable element matching */
   testId?: string;
+  /**
+   * V22: DOM `id` attribute (filtered to skip framework-generated UIDs).
+   * Highest-confidence locator after testId — `#layout-header-setting`
+   * pinpoints icon-only svg/div elements where text/aria-label are empty.
+   */
+  elementId?: string;
+  /**
+   * V22: First 1-3 stable className tokens (utility-class noise stripped).
+   * Secondary locator — useful when id is missing but framework-scoped
+   * class is unique (e.g. `el-button--primary`).
+   */
+  cssClass?: string;
+  /**
+   * V22: aria-controls — semantic uniqueness signal for dropdowns/tabs/menus.
+   */
+  ariaControls?: string;
+  /**
+   * V22: href — for <a> tags, differentiates duplicate link text by destination.
+   */
+  href?: string;
+  /**
+   * V22: Vue scoped style attribute name (`data-v-XXXXXXX`). Stable per-component
+   * marker that narrows down element identity within a Vue app.
+   */
+  vueScopeId?: string;
+  /** V22: <img alt="…"> — fallback identifier for image targets. */
+  alt?: string;
+  /** V22: HTML name attribute (form fields). */
+  name?: string;
+  /**
+   * V22: ARIA state at recording time. Distinguishes "click toggle when
+   * expanded" from "click toggle when collapsed" — the resolver picks the
+   * right candidate when the page has multiple toggles in different states.
+   * `invalid` covers negative-test scenarios (records "click on invalid
+   * email field with red border" so replay can match the same visual state).
+   * `current` (V22 Pkg1) covers Pagination/Stepper/Breadcrumbs disambiguation —
+   * "click current page" stays meaningful even when all page buttons share
+   * identical text/role.
+   * `valueNow`/`valueText` (V22 Pkg1) record the live numeric / textual value
+   * of slider/spinbutton/progressbar so replay can either match the exact
+   * value or skip the step if the value already matches.
+   */
+  ariaState?: {
+    expanded?: boolean;
+    pressed?: boolean;
+    checked?: boolean;
+    invalid?: boolean;
+    current?: string;
+    valueNow?: number;
+    valueText?: string;
+  };
+  /**
+   * V22 Pkg1: data-value / `<option value>` — semantic key for select
+   * options / list items / chips, distinct from their display label.
+   */
+  dataValue?: string;
+  /**
+   * V22 Pkg1: data-testid of the SINGLE direct icon child (svg/i/img),
+   * promoted to the parent button's hints when the button itself has no
+   * descriptor. Closes the IconButton-with-icon-testid gap on MUI / AntD /
+   * Element Plus.
+   */
+  childTestId?: string;
+  /**
+   * V22 Pkg4: Semantic icon name extracted from svg-internal accessibility
+   * (`<title>`, `<desc>`, `<use href="#icon-X">`), icon-library data-attrs
+   * (`data-lucide`, `data-feather`, `data-icon`, `data-iconify-name`),
+   * FontAwesome class tokens, or background-image URL filename. Last-line
+   * defense for fully-bare icon buttons (`<div role="button"><svg/></div>`
+   * with no testId / aria-label / title).
+   */
+  iconLabel?: string;
+  /**
+   * Angular Material icon registry name (`svgicon` attribute on `<mat-icon>`).
+   * Mirror of `TargetFingerprint.svgIcon` — see that field for rationale.
+   */
+  svgIcon?: string;
+  /**
+   * Closest semantic custom-element ancestor's tag name. Mirror of
+   * `TargetFingerprint.customElementTag` — see that field for rationale.
+   */
+  customElementTag?: string;
+  /**
+   * V22 Pkg2: Bootstrap toggle marker (data-bs-toggle). Distinguishes
+   * "real Bootstrap dropdown trigger" from a static button with similar
+   * styling. Values: 'modal' | 'dropdown' | 'tab' | 'collapse' | 'tooltip' | etc.
+   */
+  bsToggle?: string;
+  /**
+   * V22 Pkg2: Bootstrap target selector (data-bs-target). Stable pointer
+   * to the controlled element — useful when same toggle text appears
+   * multiple times (e.g. all rows have a "Delete" dropdown).
+   */
+  bsTarget?: string;
+  /**
+   * V22 Pkg2: aria-haspopup — popup-trigger marker. Values per W3C: 'menu' |
+   * 'listbox' | 'tree' | 'grid' | 'dialog' | 'true' | 'false'.
+   */
+  ariaHasPopup?: string;
+  /**
+   * V22 Pkg2: aria-activedescendant — id of currently-active descendant.
+   * Combobox/Listbox/Tree typeahead state at recording time.
+   */
+  ariaActiveDescendant?: string;
+  /**
+   * V22 Pkg2: data-row-key / data-rk — stable row identity that survives
+   * table re-renders (Ant Design Table, RainbowKit).
+   */
+  dataRowKey?: string;
+  /**
+   * V22 Pkg5: Concatenated text of sibling cells in nearest row container.
+   * Identity for descriptor-poor row checkboxes / action buttons.
+   */
+  nearestRowText?: string;
+  /**
+   * V22 Pkg5: nth-of-type index among same-class siblings (2..10).
+   * Anchors pagination prev/next, tab strips, button groups.
+   */
+  siblingIndex?: number;
+  /**
+   * V22 Pkg5: Recorded disabled state (boolean). Distinguishes pagination
+   * prev (disabled) from next (enabled) when both share class & geometry.
+   */
+  disabled?: boolean;
+  /**
+   * V22 Pkg5: Cardinal direction inferred from svg path geometry.
+   * Last-resort hint for svg-only pagination/expand buttons.
+   */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
+  /**
+   * V22: Nearest ARIA landmark (banner / navigation / main / footer / etc.).
+   * Disambiguates "Settings" in nav from "Settings" in footer.
+   */
+  nearestLandmark?: string;
+  /**
+   * V22: Up to 2 enclosing container titles (form legend, dialog title,
+   * section heading). Helps the resolver when same label recurs across
+   * forms or sections.
+   */
+  containerTitles?: string[];
+  /**
+   * V22: Compact one-line ancestor chain summary. Format:
+   * `"header[role=banner] > div.icon-group > svg"`. Replaces the transient
+   * `ProbedElement.ancestorChain` for persistence — chain itself is too
+   * heavy for the JSON payload and explicitly marked non-persistent.
+   */
+  ancestorSummary?: string;
 }
 
 /**
@@ -330,6 +604,15 @@ export interface LocatorEntry {
 /**
  * Target element fingerprint for heal comparison
  * Stores identifying characteristics to help AI find the element if it changed
+ *
+ * V22: Mirrors all fields stored in `BindingHints` so the LLM resolver
+ * (`selectElementWithLLM`) and the heal-time fingerprint check
+ * (`quickFingerprintCheck`) operate from the same identifier set. Two paths
+ * read this struct:
+ *   - resolver prompt: renders fields as "hints from the original interaction"
+ *   - heal score: weighs match between live DOM and the recorded snapshot
+ * Anything in `BindingHints` that helps disambiguate icon-only targets must
+ * also live here, otherwise the resolver can't lean on it during apply.
  */
 export interface TargetFingerprint {
   tag?: string;
@@ -342,6 +625,91 @@ export interface TargetFingerprint {
   containerTitles?: string[];
   /** Nearest ARIA landmark (Phase 7) */
   nearestLandmark?: string;
+  /** V22: title attribute (icon-only buttons) */
+  title?: string;
+  /** V22: alt attribute (<img> targets) */
+  alt?: string;
+  /** V22: visible text content (when distinct from labelText) */
+  text?: string;
+  /** V22: stable DOM id, framework-generated ids already stripped at probe time */
+  elementId?: string;
+  /** V22: First 1-3 stable className tokens (utility classes stripped) */
+  cssClass?: string;
+  /** V22: aria-controls — disambiguates dropdown / tab / menu triggers */
+  ariaControls?: string;
+  /** V22: href — for <a> tags, differentiates duplicate link text by destination */
+  href?: string;
+  /** V22: Vue scoped style attribute (data-v-XXXXXXX) — narrows component instance */
+  vueScopeId?: string;
+  /** V22: HTML name attribute (form field disambiguation). */
+  name?: string;
+  /**
+   * V22: input type (`text|email|password|tel|number|date|...`). Probe
+   * already records this on `ProbedElement.type`, mirror it here so the
+   * resolver can prefer "the email input" over "the password input" when
+   * multiple `<input>` fields share the same labelText.
+   */
+  type?: string;
+  /**
+   * V22: ARIA state at recording time. Mirror of `BindingHints.ariaState`
+   * — see that interface for field rationale. `current`, `valueNow`,
+   * `valueText` added in V22 Pkg1 for Pagination/Stepper and
+   * Slider/SpinButton fidelity.
+   */
+  ariaState?: {
+    expanded?: boolean;
+    pressed?: boolean;
+    checked?: boolean;
+    invalid?: boolean;
+    current?: string;
+    valueNow?: number;
+    valueText?: string;
+  };
+  /** V22 Pkg1: data-value / `<option value>` — semantic key. */
+  dataValue?: string;
+  /** V22 Pkg1: data-testid of the single direct icon child (svg/i/img). */
+  childTestId?: string;
+  /** V22 Pkg4: semantic icon name (svg <title>/<desc>/<use href>/data-lucide/etc). */
+  iconLabel?: string;
+  /**
+   * Angular Material icon registry name (`svgicon` / `data-mat-icon-name`
+   * attribute on `<mat-icon>`). Strong identity signal for Material apps —
+   * survives rebuilds because the value is the registration key, not a
+   * generated hash. Distinct from `iconLabel` which sources from
+   * `<title>`/`data-lucide`/FA classes.
+   */
+  svgIcon?: string;
+  /**
+   * Closest meaningful custom-element ancestor's tag name. Captures the
+   * Angular component / Vue 3 SFC / Lit / Stencil semantic name that
+   * wraps an otherwise-bare button (`<app-notifications-button>` →
+   * `<button class="btn"><svg/></button>`). On Angular Material apps
+   * this is often the ONLY identity available for icon-only header
+   * actions where there's no id, testid, aria-label, title, or text.
+   * Filtered to "semantic" tags only (≥3 dash-segments, no counter
+   * suffix) so `<app-c134>` doesn't pass.
+   */
+  customElementTag?: string;
+  /** V22 Pkg2: Bootstrap toggle marker. */
+  bsToggle?: string;
+  /** V22 Pkg2: Bootstrap target selector. */
+  bsTarget?: string;
+  /** V22 Pkg2: aria-haspopup popup-trigger marker. */
+  ariaHasPopup?: string;
+  /** V22 Pkg2: aria-activedescendant — current active descendant id. */
+  ariaActiveDescendant?: string;
+  /** V22 Pkg2: data-row-key / data-rk — stable row identity. */
+  dataRowKey?: string;
+  /** V22 Pkg5: sibling-cell text inside nearest row (uniqueness signal). */
+  nearestRowText?: string;
+  /** V22 Pkg5: nth-of-type index among same-class siblings (2..10). */
+  siblingIndex?: number;
+  /** V22 Pkg5: recorded disabled state (combines disabled attr / aria / class). */
+  disabled?: boolean;
+  /** V22 Pkg5: cardinal direction inferred from svg path geometry. */
+  arrowDir?: 'left' | 'right' | 'up' | 'down';
+  /** V22: Compact ancestor chain summary (see BindingHints.ancestorSummary). */
+  ancestorSummary?: string;
 }
 
 /**
@@ -569,6 +937,19 @@ export interface IntentStep {
   /** Compiled execution plan (generated after successful apply) */
   compiled?: CompiledStepPlan;
   /**
+   * V22: Fingerprint of the element AT RECORDING TIME (probe snapshot).
+   *
+   * Distinct from `compiled.targetFingerprint`, which is built from the
+   * *resolved live DOM node* at apply time and only exists once the step has
+   * been applied at least once. `recordedFingerprint` is set the moment the
+   * recorder captures the click — so the LLM resolver has rich identifying
+   * data even on the FIRST apply (before any compiled plan exists).
+   *
+   * Mirrors the fields written to `bindingHints` so the resolver prompt and
+   * the heal-time fingerprint check operate on the same identifier set.
+   */
+  recordedFingerprint?: TargetFingerprint;
+  /**
    * Expected outcome for this step (V11: negative test support)
    * - 'success': Step should complete without errors (default)
    * - 'error': Step is a negative test — expects 4xx / validation error / error toast
@@ -638,6 +1019,22 @@ export interface LintResult {
   message: string;
   /** Overall confidence (0-1) */
   confidence: number;
+  /**
+   * Which path actually selected the chosen candidate. Surfaced into
+   * preview_run trace so a fake-success / wrong-element pass can be
+   * traced to the exact step in the resolver pipeline that picked it.
+   *   identity_id     — recordedFingerprint.elementId match (uniqueness gate passed)
+   *   identity_testid — recordedFingerprint.testIdAttr match
+   *   identity_href   — recordedFingerprint.href match (V26: SPA links)
+   *   identity_name   — recordedFingerprint.name match
+   *   evidence_shortcut — TTL/URL-valid lastSuccessRef hit
+   *   compiled        — compiled plan locator hit
+   *   llm             — LLM picked from candidates
+   *   vision          — gemini-flash vision rescue picked it
+   *   rule_fallback   — degraded mode, rule-based score
+   *   user_confirmed  — user picked from clarification UI
+   */
+  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_href' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
   /** Candidate elements (for ambiguous cases) */
   candidates: LintCandidate[];
   /** Elements to highlight on UI */
@@ -654,6 +1051,20 @@ export interface LintResult {
   interpretation?: string;
   /** V3: Clarification question for user (in user's language) */
   clarificationQuestion?: string;
+  /**
+   * V23: Resolver coaching for the editor — present when the LLM
+   * couldn't confidently pick (no_match / ambiguous / weak resolved).
+   * The frontend renders it as a hint near the description input
+   * (red on no_match, yellow on ambiguous, soft warning on weak).
+   * Always omitted on confident `resolved` results so a green badge
+   * stays clean. Examples are validated against actual candidate
+   * labels — no hallucinations are allowed through.
+   */
+  suggestion?: {
+    issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+    hint: string;
+    examples?: string[];
+  };
 
   // ═══════════════════════════════════════════════════════════════════════════
   // LLM-based resolver fields
@@ -666,6 +1077,17 @@ export interface LintResult {
   topSimilarity?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
+  /**
+   * V23: per-phase timings from `_lintStepWithAIImpl`. Surfaced into
+   * decisionTrace so analysis can answer "where did the 19s go?"
+   * — snapshot collect (DOM evaluate), full resolve (LLM/vision/identity).
+   */
+  phaseTimings?: {
+    snapshotMs?: number;
+    resolveMs?: number;
+    totalMs?: number;
+    domNodeCount?: number;
+  };
 
   // ═══════════════════════════════════════════════════════════════════════════
   // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)

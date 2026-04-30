@@ -1642,10 +1642,17 @@ function handleControllerError(
   }
 
   if (error instanceof ValidationError) {
+    // Forward the QAIError `code` so the frontend can branch on specific
+    // validation failures (e.g. INSUFFICIENT_CREDITS flips the global
+    // "credits exhausted" banner instead of showing a generic toast).
+    // Also forward `details` so the UI can render structured breakdowns
+    // (required/available/etc.) when available.
     res.status(422).json({
       success: false,
       error: 'Validation error',
+      code: (error as any).code || 'VALIDATION_ERROR',
       message: error.message,
+      ...((error as any).details ? { details: (error as any).details } : {}),
     });
     return;
   }

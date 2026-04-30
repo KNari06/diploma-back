@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
-import { ChatService } from '@/services/utils/chat.service';
+import { ChatPersistence } from '@/services/utils/chat-persistence';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 import { getPageContext } from '@/services/chat/editor-context.service';
 import { getPreviewSessionService } from '@/services/testing/ui/preview';
 import { PreviewStepApplyService } from '@/services/testing/ui/preview/preview-step-apply.service';
@@ -38,9 +39,22 @@ export async function handleEditorAction(
     context?: any;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor';
+    /**
+     * Persistence backend. Default GLOBAL_STORE preserves legacy behavior
+     * for the workspace chat path. The controller flips this to
+     * TESTCASE_STORE when the request is scoped to a test case, and our
+     * `ChatPersistence.saveMessages` call below routes accordingly so
+     * we never write test-case messages into the global table.
+     */
+    chatStore?: ChatStore;
+    /** Test-case scope marker (UUID) — passed through to fallbacks. */
+    testCaseId?: string;
   }
 ): Promise<void> {
-  const { message, parsedIntent, userId, chatSessionId, context, abortSignal, mode } = params;
+  const { message, parsedIntent, userId, chatSessionId, context, abortSignal, mode, testCaseId } = params;
+  // Resolve store with safe default. Chosen here (not earlier) so log
+  // statements below can include `chatStore: store.kind` for traceability.
+  const store: ChatStore = params.chatStore ?? GLOBAL_STORE;
 
   // Parse context to extract previewSessionId
   let contextObj: any = null;
@@ -174,9 +188,12 @@ export async function handleEditorAction(
     }
 
     // Step 7: Save chat messages
+    // Routed through ChatPersistence so test-case scoped requests land in
+    // test_case_chat_messages, while the legacy global path still writes
+    // to chat_messages — selected by `store.kind`.
     if (chatSessionId) {
       try {
-        await ChatService.saveChatMessages(chatSessionId, [
+        await ChatPersistence.saveMessages(store, chatSessionId, [
           { role: 'user', content: message, metadata: { mode: 'editor' } },
           {
             role: 'ai',
@@ -194,6 +211,7 @@ export async function handleEditorAction(
       } catch (saveError) {
         logger.warn('[EDITOR_ACTION] Failed to save chat messages (non-critical)', {
           error: saveError instanceof Error ? saveError.message : String(saveError),
+          chatStore: store.kind,
         });
       }
     }
@@ -209,7 +227,11 @@ export async function handleEditorAction(
           content: responseMessage,
           timestamp: new Date().toISOString(),
         };
-        webSocketService.emitChatMessage(chatSessionId, chatPayload);
+        // Dual-emit when in test-case scope: the message also lands in
+        // `chat:tc:<testCaseId>` so a frontend that subscribed by
+        // testCaseId (before this session row existed) sees it without
+        // a re-subscribe.
+        webSocketService.emitChatMessage(chatSessionId, chatPayload, testCaseId);
       } catch (wsError) {
         logger.warn('[EDITOR_ACTION] Failed to emit WebSocket message (non-critical)', {
           error: wsError instanceof Error ? wsError.message : String(wsError),
@@ -403,6 +425,8 @@ function fallbackToGeneralChat(
     workspace_id?: string;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor';
+    chatStore?: ChatStore;
+    testCaseId?: string;
   }
 ): Promise<void> {
   return handleGeneralChat(req, res, {
@@ -413,5 +437,9 @@ function fallbackToGeneralChat(
     workspace_id: params.workspace_id,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    // Forward persistence binding so the fallback writes to the same
+    // tables the original test-case-scoped request would have.
+    chatStore: params.chatStore,
+    testCaseId: params.testCaseId,
   });
 }

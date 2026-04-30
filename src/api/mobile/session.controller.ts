@@ -18,13 +18,17 @@ import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/m
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { ProjectService } from '@/services/core/project.service';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
+import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
+import { getIO } from '@/websocket/core/server';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 // ── Constants ────────────────────────────────────────────────────────
 
 const WARMUP_PREFIX = 'mobile_warmup:';
+// Kept in lockstep with `IDLE_TTL_MS` in `mobile-idle.service.ts` so an
+// active user can't be expired before the in-memory idle timer fires.
 const WARMUP_TTL = 900; // 15 minutes
 
 /**
@@ -212,6 +216,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             runnerSocketUrl,
             tookMs: Date.now() - warmupStart,
           });
+          // Active editor → start the per-user idle timer.
+          try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
           res.json({
             success: true,
             sessionId: parsed.sessionId,
@@ -264,6 +270,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             runnerSocketUrl,
             tookMs: Date.now() - warmupStart,
           });
+          try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
           res.json({
             success: true,
             sessionId: bootedSessionId,
@@ -321,6 +328,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             runnerSocketUrl,
             tookMs: Date.now() - warmupStart,
           });
+          try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
           res.json({
             success: true,
             sessionId: existing.sessionId,
@@ -433,6 +441,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       tookMs: Date.now() - warmupStart,
     });
 
+    try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
     res.status(201).json({
       success: true,
       sessionId: session.sessionId,
@@ -500,6 +509,9 @@ export async function destroySession(req: Request, res: Response): Promise<void>
 
     // Close editor trace file for this session
     await EditorTraceService.close(`mobile-${sessionId}`).catch(() => {});
+
+    // User explicitly closed the editor → cancel any pending idle timer.
+    try { cancelIdle(userId); } catch { /* non-fatal */ }
 
     logger.info('[MOBILE_SESSION] Session destroyed', { sessionId, userId, projectId });
 
@@ -1357,6 +1369,10 @@ async function installAppOnSession(
         reinstall: true, // use -r as safety net — if uninstall failed silently, install still works
         clearData: true, // always wipe app data for clean state after install
         autoLaunch: false, // always launch via an explicit launch_app command below for determinism
+        // Hint runner with the known packageName so it can fall back to it
+        // if `pm list packages -3` diff fails to surface the new package
+        // (rare, but happens with side-loaded splits).
+        ...(explicitPackage ? { packageName: explicitPackage } : {}),
         ...(shouldUninstallOld ? { uninstallOldPackage: oldPackage } : {}),
       },
     },

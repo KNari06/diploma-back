@@ -2,6 +2,7 @@ import { GoogleGenerativeAI, type Part } from '@google/generative-ai';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { AIUsageTracker, calculateGeminiCost } from '../tracking/ai-usage-tracker';
+import { recordAILog } from '../logging/ai-action-logger';
 
 /**
  * Gemini AI Service
@@ -47,6 +48,8 @@ export async function generateTextWithGemini(params: {
   maxTokens?: number;
   timeout?: number;
   jsonMode?: boolean;
+  /** V23: see `getChatCompletionWithGemini.signal` for rationale. */
+  signal?: AbortSignal;
 }): Promise<GeminiResponse> {
   const {
     prompt,
@@ -55,8 +58,10 @@ export async function generateTextWithGemini(params: {
     maxTokens = 100,
     timeout = 5000,
     jsonMode = false,
+    signal,
   } = params;
 
+  const _aiLogStartedAt = Date.now();
   try {
     const client = getGeminiClient();
     const genModel = client.getGenerativeModel({
@@ -68,14 +73,23 @@ export async function generateTextWithGemini(params: {
       },
     });
 
-    // Create timeout promise
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
-    });
+    if (signal?.aborted) {
+      throw new Error('Gemini request aborted before send');
+    }
 
-    // Race between generation and timeout
-    const resultPromise = genModel.generateContent(prompt);
-    const genResult = await Promise.race([resultPromise, timeoutPromise]);
+    // V23: forward signal to SDK for real cancellation; timeout stays as cap.
+    const resultPromise = genModel.generateContent(prompt, signal ? { signal } : undefined);
+    let timeoutId: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
+      (timeoutId as any)?.unref?.();
+    });
+    let genResult;
+    try {
+      genResult = await Promise.race([resultPromise, timeoutPromise]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
 
     const response = genResult.response;
     const text = response.text();
@@ -98,18 +112,41 @@ export async function generateTextWithGemini(params: {
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: { prompt_excerpt: prompt, response_excerpt: text },
     });
 
     return result;
   } catch (error) {
+    recordAILog({
+      status: 'failed',
+      provider: 'gemini',
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { prompt_excerpt: prompt },
+    });
     logger.error('[GEMINI] Text generation failed', {
       error: error instanceof Error ? error.message : String(error),
       model,
@@ -130,6 +167,20 @@ export async function getChatCompletionWithGemini(params: {
   maxTokens?: number;
   timeout?: number;
   jsonMode?: boolean;
+  /**
+   * V23 (April 2026): real cancellation. Prior to this, callers wrapped the
+   * call in `Promise.race([gemini, abortPromise])`, which only stopped
+   * waiting — the underlying fetch to Google API kept running until natural
+   * completion (observed: 19.8s requests after a 7s "abort"). The SDK's
+   * `SingleRequestOptions.signal` actually aborts the HTTP request, freeing
+   * the connection and letting the circuit breaker count the failure
+   * accurately.
+   *
+   * NOTE per SDK docs: aborting a Gemini request is client-only — Google
+   * still bills for the work it already started. We accept this; the cost
+   * matters less than freeing the caller and the connection.
+   */
+  signal?: AbortSignal;
 }): Promise<GeminiResponse> {
   const {
     messages,
@@ -138,8 +189,10 @@ export async function getChatCompletionWithGemini(params: {
     maxTokens = 1000,
     timeout = 30000,
     jsonMode = false,
+    signal,
   } = params;
 
+  const _aiLogStartedAt = Date.now();
   try {
     const client = getGeminiClient();
     // Extract system instruction and chat messages
@@ -190,14 +243,35 @@ export async function getChatCompletionWithGemini(params: {
 
     const chat = genModel.startChat({ history });
 
-    // Create timeout promise
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
-    });
+    // V23: forward AbortSignal to the SDK so cancellation reaches the network
+    // layer, not just the await wrapper. The SDK's SingleRequestOptions.signal
+    // closes the HTTP connection on abort. We KEEP the timeout promise as a
+    // belt-and-suspenders guard for the case where signal isn't supplied
+    // OR the SDK's abort path is broken in a future version.
+    //
+    // Fast-fail when signal is already aborted before the call — saves a
+    // round-trip and a useless billed token count.
+    if (signal?.aborted) {
+      throw new Error('Gemini request aborted before send');
+    }
 
-    // Send last message and get response
-    const resultPromise = chat.sendMessage(lastMessage.parts[0].text);
-    const genResult = await Promise.race([resultPromise, timeoutPromise]);
+    const sendOptions = signal ? { signal } : undefined;
+    const resultPromise = chat.sendMessage(lastMessage.parts[0].text, sendOptions);
+
+    // Timeout promise still races as a hard ceiling. When SDK signal works
+    // (V23+), cancellation arrives via the abort path; this remains as a
+    // last-resort cap if both signal AND SDK time out.
+    let timeoutId: NodeJS.Timeout | null = null;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error('Gemini request timeout')), timeout);
+      (timeoutId as any)?.unref?.();
+    });
+    let genResult;
+    try {
+      genResult = await Promise.race([resultPromise, timeoutPromise]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
 
     const response = genResult.response;
     const text = response.text();
@@ -228,18 +302,41 @@ export async function getChatCompletionWithGemini(params: {
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: { message_count: messages.length, response_excerpt: text },
     });
 
     return result;
   } catch (error) {
+    recordAILog({
+      status: 'failed',
+      provider: 'gemini',
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { message_count: messages.length },
+    });
     logger.error('[GEMINI] Chat completion failed', {
       error: error instanceof Error ? error.message : String(error),
       model,
@@ -264,6 +361,8 @@ export async function generateTextWithGeminiVision(params: {
   temperature?: number;
   maxTokens?: number;
   timeout?: number;
+  /** V23: see `getChatCompletionWithGemini.signal` for rationale. */
+  signal?: AbortSignal;
 }): Promise<GeminiResponse> {
   const {
     prompt,
@@ -273,12 +372,14 @@ export async function generateTextWithGeminiVision(params: {
     temperature = 0,
     maxTokens = 300,
     timeout = 8000,
+    signal,
   } = params;
 
   if (!imageBase64 || imageBase64.length === 0) {
     throw new Error('imageBase64 is required for vision requests');
   }
 
+  const _aiLogStartedAt = Date.now();
   try {
     const client = getGeminiClient();
     const genModel = client.getGenerativeModel({
@@ -309,7 +410,10 @@ export async function generateTextWithGeminiVision(params: {
       (timeoutId as any)?.unref?.();
     });
 
-    const resultPromise = genModel.generateContent(parts);
+    if (signal?.aborted) {
+      throw new Error('Gemini vision request aborted before send');
+    }
+    const resultPromise = genModel.generateContent(parts, signal ? { signal } : undefined);
 
     let genResult;
     try {
@@ -338,14 +442,26 @@ export async function generateTextWithGeminiVision(params: {
     };
 
     // Track AI usage for billing/analytics
+    const aiCostUSD = calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens);
     AIUsageTracker.record({
       provider: 'gemini',
       model,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
       totalTokens: result.usage.totalTokens,
-      costUSD: calculateGeminiCost(model, result.usage.inputTokens, result.usage.outputTokens),
+      costUSD: aiCostUSD,
       timestamp: Date.now(),
+    });
+
+    recordAILog({
+      status: 'succeeded',
+      provider: 'gemini',
+      model,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+      costUSD: aiCostUSD,
+      durationMs: Date.now() - _aiLogStartedAt,
+      detail: { prompt_excerpt: prompt, response_excerpt: text, has_image: true },
     });
 
     logger.info('[GEMINI] Vision generation completed', {
@@ -357,6 +473,17 @@ export async function generateTextWithGeminiVision(params: {
 
     return result;
   } catch (error) {
+    recordAILog({
+      status: 'failed',
+      provider: 'gemini',
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      costUSD: 0,
+      durationMs: Date.now() - _aiLogStartedAt,
+      error: error instanceof Error ? error.message : String(error),
+      detail: { prompt_excerpt: prompt, has_image: true },
+    });
     logger.error('[GEMINI] Vision generation failed', {
       error: error instanceof Error ? error.message : String(error),
       model,

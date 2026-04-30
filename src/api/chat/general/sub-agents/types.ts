@@ -165,6 +165,14 @@ export interface PipelineContext {
   projectName?: string; // Human-readable project name for AI responses
   previewSessionId?: string; // Active editor preview session
   mode?: 'lite' | 'pro' | 'editor';
+  /**
+   * Per-test-case chat scope marker. When set, the pipeline's
+   * `emitStep` and any sub-agent emits dual-broadcast to the
+   * `chat:tc:<testCaseId>` room so the frontend (which subscribed
+   * by testCaseId before the session was lazy-created) receives
+   * progress updates during the first request.
+   */
+  testCaseId?: string;
 }
 
 /**

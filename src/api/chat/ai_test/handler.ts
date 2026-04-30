@@ -212,10 +212,12 @@ export async function handlePlatformTest(
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
+        code: 'INSUFFICIENT_CREDITS',
         message: `❌ Insufficient credits. You need at least 1 credit to start a test, but you have ${baseCreditCheck.available}. Credits are deducted per step during execution.`,
         creditsRequired: 1,
         creditsAvailable: baseCreditCheck.available,
         shortage: 1 - baseCreditCheck.available,
+        details: { required: 1, available: baseCreditCheck.available },
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
       });

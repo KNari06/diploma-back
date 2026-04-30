@@ -269,6 +269,68 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.ariaChecked = element.ariaChecked;
   }
 
+  // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state + Select value + IconButton child lift
+  if (element.ariaCurrent) {
+    node.ariaCurrent = element.ariaCurrent;
+  }
+  if (element.ariaValueNow !== undefined) {
+    node.ariaValueNow = element.ariaValueNow;
+  }
+  if (element.ariaValueText) {
+    node.ariaValueText = element.ariaValueText;
+  }
+  if (element.dataValue) {
+    node.dataValue = element.dataValue;
+  }
+  if (element.childTestId) {
+    node.childTestId = element.childTestId;
+  }
+  // V22 Pkg4: semantic icon label from svg/icon-library extraction.
+  if ((element as any).iconLabel) {
+    (node as any).iconLabel = (element as any).iconLabel;
+  }
+  // V23: forward identity fields the collector populates that previously got
+  // dropped here. Without these, builder/resolver/helper read undefined even
+  // though collector correctly extracted them. All fields are now typed on
+  // InteractiveNode so direct assignment is type-safe; LiteSnapshotElement
+  // sourcing still goes through `(element as any)` because LiteElement type
+  // hasn't been audited for the same superset (out of scope here).
+  if ((element as any).svgIcon) {
+    node.svgIcon = (element as any).svgIcon;
+  }
+  if ((element as any).customElementTag) {
+    node.customElementTag = (element as any).customElementTag;
+  }
+  if ((element as any).href) {
+    node.href = (element as any).href;
+  }
+  if ((element as any).alt) {
+    node.alt = (element as any).alt;
+  }
+  if ((element as any).cssClass) {
+    node.cssClass = (element as any).cssClass;
+  }
+  if ((element as any).vueScopeId) {
+    node.vueScopeId = (element as any).vueScopeId;
+  }
+  if ((element as any).ancestorSummary) {
+    node.ancestorSummary = (element as any).ancestorSummary;
+  }
+
+  // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
+  if (element.bsToggle) node.bsToggle = element.bsToggle;
+  if (element.bsTarget) node.bsTarget = element.bsTarget;
+  if (element.ariaHasPopup) node.ariaHasPopup = element.ariaHasPopup;
+  if (element.ariaActiveDescendant) node.ariaActiveDescendant = element.ariaActiveDescendant;
+  if (element.dataRowKey) node.dataRowKey = element.dataRowKey;
+  if (element.rowClickable) node.rowClickable = element.rowClickable;
+
+  // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+  if ((element as any).nearestRowText) (node as any).nearestRowText = (element as any).nearestRowText;
+  if ((element as any).siblingIndex !== undefined) (node as any).siblingIndex = (element as any).siblingIndex;
+  if ((element as any).disabled !== undefined) (node as any).disabled = (element as any).disabled;
+  if ((element as any).arrowDir) (node as any).arrowDir = (element as any).arrowDir;
+
   // ═══════════════════════════════════════════════════════════════════════════
   // V2: Validation state
   // ═══════════════════════════════════════════════════════════════════════════
@@ -394,6 +456,9 @@ export function createDomAnalysis(snapshot: LiteSnapshot): DomAnalysisData {
     title: snapshot.title,
     capturedAt: snapshot.timestamp,
     version: DOM_ANALYSIS_VERSION,
+    // V26: pass real viewport through so `buildAllowedSets` can compute
+    // accurate modal-coverage ratio. Falls back to bbox heuristic if absent.
+    viewport: snapshot.viewport,
   };
 }
 

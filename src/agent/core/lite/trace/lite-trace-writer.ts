@@ -84,6 +84,38 @@ const DEFAULT_MAX_PAYLOAD_CHARS = 50_000; // 50k chars per field
 const DEFAULT_LOGS_DIR = path.join(process.cwd(), 'test_logs');
 
 // Sensitive field patterns (case-insensitive)
+//
+// Note: patterns must be precise — `/auth/i` matched harmless field names
+// like `hasAuthBinding`, `authReset`, `authMethod`, redacting valuable
+// diagnostic data. Same for `/session/i` swallowing `previewSessionId`,
+// `chatSessionId`, `sessionCreatedAt`. We now whitelist the safe siblings
+// before the broad pattern check so they survive.
+//
+// April 2026: discovered when session_context payload arrived as
+// `{ previewSessionId: "[REDACTED]", authReset: "[REDACTED]", hasAuthBinding: "[REDACTED]" }`
+// — these are not secrets; previewSessionId is the correlation key for the
+// whole trace, authReset is a 'always'|'never' flag, hasAuthBinding is a bool.
+const SAFE_FIELD_NAMES = new Set([
+  // Session identity / metadata — UUIDs and timestamps, not secrets
+  'previewSessionId',
+  'sessionId',
+  'mobileSessionId',
+  'chatSessionId',
+  'sessionCreatedAt',
+  'sessionStartedAt',
+  'isSessionOwned',
+  'sessionStorageKeyCount',
+  // Auth binding flags / resets — booleans and enum strings, not secrets
+  'authReset',
+  'hasAuthBinding',
+  'authMethod',
+  'authState',
+  'isAuthenticated',
+  'authResource',
+  // Common no-secret auth-adjacent counts/flags
+  'authCheckpointCount',
+]);
+
 const SENSITIVE_PATTERNS = [
   /password/i,
   /token/i,
@@ -355,8 +387,11 @@ export class LiteTraceWriter {
     const sanitized: Record<string, any> = {};
 
     for (const [key, value] of Object.entries(payload)) {
-      // Check if key is sensitive
-      const isSensitive = SENSITIVE_PATTERNS.some(pattern => pattern.test(key));
+      // Whitelist takes precedence — auth/session-adjacent metadata that's
+      // explicitly not a secret survives even though the broad regex would
+      // match (e.g. previewSessionId, authReset, hasAuthBinding).
+      const isSafe = SAFE_FIELD_NAMES.has(key);
+      const isSensitive = !isSafe && SENSITIVE_PATTERNS.some(pattern => pattern.test(key));
 
       if (isSensitive) {
         // Redact sensitive fields

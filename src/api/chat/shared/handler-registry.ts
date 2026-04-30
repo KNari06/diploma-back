@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import type { ChatAttachment } from '../chat.types';
+import type { ChatStore } from '@/services/utils/chat-store';
 import { handlePlatformTest as handlePlatformTestOriginal } from '../ai_test/handler';
 import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
@@ -15,6 +16,8 @@ import { handleSaveTestIntent } from '../regression/save-test.handler';
 import { handleTestRecommendationsIntent } from '../regression/test-recommendations.handler';
 import { handleEditorAction } from '../editor_action/handler';
 import { handleMobileTest as handleMobileTestOriginal } from '../mobile_test/handler';
+import { handleMobileAgent as handleMobileAgentOriginal } from '../mobile_agent/handler';
+import { handleMobileAction as handleMobileActionOriginal } from '../mobile_action/handler';
 import { handleApiFlowTest as handleApiFlowTestOriginal } from '../api_flow/handler';
 import { handleClarificationRequest as handleClarificationOriginal } from './clarification';
 
@@ -53,6 +56,17 @@ export type IntentHandler = (
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
     executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
     attachments?: ChatAttachment[]; // File attachments (images + documents)
+    /**
+     * Persistence backend. Migrated handlers (general_chat, editor_action)
+     * route reads/writes through ChatPersistence with this store. Legacy
+     * handlers ignore it and continue writing to the global tables —
+     * which is correct for them because the test-case scope blocks all
+     * non-migrated intents to general_chat upstream (see intent-parsing.ts
+     * `isTestCaseScope` guard). Default at the call sites is GLOBAL_STORE.
+     */
+    chatStore?: ChatStore;
+    /** Test-case scope marker (UUID). Mirrors the controller-level binding. */
+    testCaseId?: string;
   }
 ) => Promise<void>;
 
@@ -118,6 +132,11 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     attachments: params.attachments,
     // Strict boolean guard: LLM may return "false" (string), 0, or null — only trust actual boolean
     needsTools: params.parsedIntent?.needsTools === false ? false : undefined,
+    // Pass through persistence + test-case scope. Underlying handler
+    // routes saves through ChatPersistence using this store. When unset
+    // (legacy global path), the original behavior is preserved.
+    chatStore: params.chatStore,
+    testCaseId: params.testCaseId,
   });
 };
 
@@ -132,6 +151,12 @@ const handleClarificationRequest: IntentHandler = async (req, res, params) => {
     userId: params.userId,
     chatSessionId: params.chatSessionId,
     abortSignal: params.abortSignal,
+    mode: params.mode,
+    // Forward persistence binding + test-case scope: needs_clarification
+    // is one of the few intents allowed in test-case chats, so saves
+    // and WS emits MUST route through the per-test-case backend.
+    chatStore: params.chatStore,
+    testCaseId: params.testCaseId,
   });
 };
 
@@ -172,6 +197,42 @@ const handleMobileTest: IntentHandler = async (req, res, params) => {
 };
 
 /**
+ * Wrapper for mobile_agent handler — multi-step AI Agent for the mobile
+ * editor. Parallels the web `general_chat` sub-agent pipeline.
+ */
+const handleMobileAgent: IntentHandler = async (req, res, params) => {
+  return handleMobileAgentOriginal(req, res, {
+    message: params.message,
+    parsedIntent: params.parsedIntent,
+    userId: params.userId,
+    workspace_id: params.workspace_id,
+    chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    context: params.context,
+    abortSignal: params.abortSignal,
+    mode: params.mode,
+  });
+};
+
+/**
+ * Wrapper for mobile_action handler — single atomic action on a live
+ * device. Parallels the web `editor_action` fast-path.
+ */
+const handleMobileAction: IntentHandler = async (req, res, params) => {
+  return handleMobileActionOriginal(req, res, {
+    message: params.message,
+    parsedIntent: params.parsedIntent,
+    userId: params.userId,
+    workspace_id: params.workspace_id,
+    chatSessionId: params.chatSessionId,
+    conversationId: params.conversationId,
+    context: params.context,
+    abortSignal: params.abortSignal,
+    mode: params.mode,
+  });
+};
+
+/**
  * Registry of all available intent handlers
  * Single source of truth for intent routing
  */
@@ -201,8 +262,14 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   // Editor mode intent
   editor_action: handleEditorAction,
 
-  // Mobile testing intent
+  // Mobile testing intent (async BullMQ job for recorded steps)
   mobile_test: handleMobileTest,
+
+  // Mobile editor — single atomic action (fast path, parallels editor_action)
+  mobile_action: handleMobileAction,
+
+  // Mobile editor AI agent (multi-step authoring/exploration, parallels general_chat)
+  mobile_agent: handleMobileAgent,
 
   // API flow testing intent (Swagger/OpenAPI/Postman chain execution)
   api_flow_test: handleApiFlowTest,
@@ -265,6 +332,8 @@ export function getIntentDescriptions(): Record<string, string> {
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
     editor_action: 'User wants to perform a direct action on the live page in editor mode',
     mobile_test: 'User wants to run a mobile (Android/iOS) test on recorded steps',
+    mobile_action: 'User is in the mobile editor and wants ONE direct action on the current screen: tap, swipe, type, scroll, press key, back. Executed immediately, no planning.',
+    mobile_agent: 'User is in the mobile editor and wants the agent to handle something multi-step: author a test, explore the app, answer questions about the screen, fill a whole form. Heavier pipeline.',
     api_flow_test: 'User wants to test an API flow from a Swagger/OpenAPI/Postman spec URL or file, or pasted cURL commands',
   };
 }

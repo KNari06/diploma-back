@@ -19,6 +19,12 @@ import type { Page } from 'playwright';
 import type { LiteElement, LiteSnapshot, ObstacleFact } from '../lite-types';
 import { VisualStability } from './visual-stability';
 
+// April 2026: Module-level throttle map for [SNAPSHOT_REJECTS] logging.
+// Snapshot is collected every 500ms by recorder/preview, so per-tick logging
+// would be overwhelming. Logging once per ~30s per URL keeps the signal
+// useful for offline analysis without flooding app.log.
+const SNAPSHOT_REJECT_LOG_LAST = new Map<string, number>();
+
 export class SnapshotCollector {
   /**
    * Collect page snapshot with parent context
@@ -71,6 +77,21 @@ export class SnapshotCollector {
         if (typeof win.__agentRefCounter !== 'number') {
           win.__agentRefCounter = 0;
         }
+
+        // V22 Pkg7+: heal-side text normalizer. Mirrors normProbeText() in
+        // recording-capture.service.ts and normalizeText() in
+        // text-normalizer.util.ts. Symmetry contract — same canonicalization
+        // at probe / live-DOM / locator-builder ensures fingerprint matching
+        // works across i18n re-renders, NFC/NFD differences, and copied
+        // text contaminated with zero-width chars.
+        const INVISIBLE_RE = /[​-‏‪-‮⁠-⁩﻿]/g;
+        const normLiveText = (s: string | undefined | null): string | undefined => {
+          if (s === undefined || s === null) return undefined;
+          if (s.length === 0) return '';
+          let out = s;
+          try { out = out.normalize('NFC'); } catch { /* best-effort */ }
+          return out.replace(INVISIBLE_RE, '').replace(/\s+/g, ' ').trim();
+        };
 
         // ✅ TASK 10: Fingerprint-based ref stability for React re-renders
         // Persist refs across DOM rebuilds using element fingerprints
@@ -821,6 +842,33 @@ export class SnapshotCollector {
          */
         const MAX_SECONDARY_ELEMENTS = 300; // Cap to prevent flooding from global scan (raised from 120 for large SPAs)
 
+        // April 2026: Tier-2 (framework + cursor:pointer walk) rejection counters.
+        // Most subtle losses happen here — wrappers without text, oversized
+        // containers, custom elements without size. We need data to know which
+        // condition is fired most often before relaxing it.
+        const __tier2Rejects = {
+          alreadyCollected: 0, // duplicate of primary pass
+          hidden: 0,           // display:none / visibility:hidden / opacity<0.1
+          tooSmall: 0,         // < 5×5
+          tooLarge: 0,         // > 600×600 (likely layout wrapper)
+          noFwBinding: 0,      // exhausted all framework checks + no cursor:pointer signal
+          capReached: 0,       // hit MAX_SECONDARY_ELEMENTS
+        };
+        const __tier2RejectSamples: Record<string, string[]> = {
+          alreadyCollected: [], hidden: [], tooSmall: [], tooLarge: [], noFwBinding: [], capReached: [],
+        };
+        const __pushTier2Sample = (bucket: string, el: Element) => {
+          const arr = __tier2RejectSamples[bucket];
+          if (!arr || arr.length >= 3) return;
+          try {
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            const id = el.getAttribute('id') || '';
+            const cls = (el.getAttribute('class') || '').slice(0, 40);
+            arr.push(`${tag}${role ? `[role=${role}]` : ''}${id ? `#${id.slice(0, 30)}` : ''}${cls ? `.${cls}` : ''}`);
+          } catch { /* ignore */ }
+        };
+
         const collectFrameworkInteractiveElements = (
           container: Element,
           alreadyCollected: Set<Element>,
@@ -831,25 +879,47 @@ export class SnapshotCollector {
           let added = 0;
           for (const el of candidates) {
             // Q2 FIX: Hard cap on secondary pass elements
-            if (added >= MAX_SECONDARY_ELEMENTS) break;
+            if (added >= MAX_SECONDARY_ELEMENTS) {
+              __tier2Rejects.capReached++;
+              break;
+            }
 
             // Q3 FIX: Skip the container element itself — it's a wrapper, not a clickable target
             if (el === container) continue;
 
             // Skip if already collected by primary pass
-            if (alreadyCollected.has(el)) continue;
+            if (alreadyCollected.has(el)) {
+              __tier2Rejects.alreadyCollected++;
+              continue;
+            }
 
             // Skip non-visible elements early
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-            if (parseFloat(style.opacity) < 0.1) continue;
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              __tier2Rejects.hidden++;
+              __pushTier2Sample('hidden', el);
+              continue;
+            }
+            if (parseFloat(style.opacity) < 0.1) {
+              __tier2Rejects.hidden++;
+              __pushTier2Sample('hidden', el);
+              continue;
+            }
 
             // Skip elements too small to be interactive (lowered from 10 to catch icon buttons)
             const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) continue;
+            if (rect.width < 5 || rect.height < 5) {
+              __tier2Rejects.tooSmall++;
+              __pushTier2Sample('tooSmall', el);
+              continue;
+            }
 
             // Skip structural/container elements that are too large (likely wrappers, not clickables)
-            if (rect.width > 600 && rect.height > 600) continue;
+            if (rect.width > 600 && rect.height > 600) {
+              __tier2Rejects.tooLarge++;
+              __pushTier2Sample('tooLarge', el);
+              continue;
+            }
 
             // ── Tier 1: Framework event bindings (high confidence) ──
             let hasFrameworkBinding = false;
@@ -1005,15 +1075,53 @@ export class SnapshotCollector {
             // cursor:pointer + has text (≤200 chars) + not a large layout container
             if (!hasFrameworkBinding && style.cursor === 'pointer') {
               const totalText = (el.textContent || '').trim();
-              if (totalText.length > 0 && totalText.length < 200) {
-                // Reject large layout containers (nav, main, body, full-width sections)
-                const tag = el.tagName.toLowerCase();
-                const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
-                const rect = el.getBoundingClientRect();
-                const isFullWidth = rect.width > (window.innerWidth * 0.9);
-                if (!isLayoutContainer && !isFullWidth) {
-                  hasFrameworkBinding = true;
-                }
+              const tag = el.tagName.toLowerCase();
+              const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
+              const rect = el.getBoundingClientRect();
+              const isFullWidth = rect.width > (window.innerWidth * 0.9);
+
+              // Icon-only interactive: <svg id="...">, <i id="...">, <img id="...">,
+              // <button><svg/></button>-style wrappers. They have no text but ARE
+              // clickable (recorder's probe captures them via cursor:pointer
+              // walk-up). Without surfacing them here the resolver's identity
+              // fast-path can never match the recorded id, so id-as-description
+              // steps fall through to the LLM and the LLM grabs the loudest
+              // neighbouring CTA — the canonical fake-success path on
+              // hub.atk.pro / Element Plus icon toolbars.
+              //
+              // Symmetric with the recorder: same stable-id filter, same
+              // testId attr list, same exclusion of full-width layout
+              // containers. We additionally accept text-bearing elements
+              // (the original branch) so this only widens the set, never
+              // narrows it.
+              const rawId = el.getAttribute('id') || '';
+              const idLooksGenerated = !!rawId && (
+                /^el-id-/i.test(rawId)
+                || /^radix-/.test(rawId)
+                || /^:r[0-9a-z]+:$/i.test(rawId)
+                || /^mui-/i.test(rawId)
+                || /^headlessui-/i.test(rawId)
+                || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(rawId)
+              );
+              const hasStableId = !!rawId && !idLooksGenerated && rawId.length < 80;
+              const hasTestIdAttr = !!(el.getAttribute('data-testid')
+                || el.getAttribute('data-test-id')
+                || el.getAttribute('data-test')
+                || el.getAttribute('data-cy')
+                || el.getAttribute('data-qa'));
+              const hasText = totalText.length > 0 && totalText.length < 200;
+              const isIconish = tag === 'svg' || tag === 'i' || tag === 'img' || tag === 'path';
+              // Min-size gate: 5×5 enough to filter out invisible 0-size cursor-pointer
+              // wrappers, but small enough to keep typical 16-32px icons.
+              const hasSize = rect.width >= 5 && rect.height >= 5;
+
+              if (!isLayoutContainer && !isFullWidth && hasSize && (
+                hasText
+                || hasStableId
+                || hasTestIdAttr
+                || isIconish
+              )) {
+                hasFrameworkBinding = true;
               }
             }
 
@@ -1034,6 +1142,15 @@ export class SnapshotCollector {
               addedElements.add(el);
               elementShadowDepth.set(el, 0);
               added++;
+            } else {
+              // Element passed visibility/size but exhausted every framework
+              // signal (no React/Vue/Angular/Alpine/HTMX/Stimulus/jQuery
+              // hooks, no cursor:pointer with text/id/icon, no custom-tag
+              // shape). This is the bucket to watch: real losses live here
+              // (Web Components without text, role-less divs with delegated
+              // listeners on document, etc.).
+              __tier2Rejects.noFwBinding++;
+              __pushTier2Sample('noFwBinding', el);
             }
           }
           return addedElements;
@@ -1135,13 +1252,58 @@ export class SnapshotCollector {
         // This set ensures every element gets a unique ref in each collection pass.
         const usedRefsThisPass = new Set<string>();
 
+        // Track per-element exceptions during the forEach pass. Without this,
+        // a regression like the April 2026 `tagLower` ReferenceError silently
+        // drops every element while debugStats shows uniqueCount=300+ but
+        // elementsAfterFilter=0 — looks identical to "page is genuinely empty".
+        // Recording the first ~3 messages lets us tell those cases apart.
+        const __forEachErrors: string[] = [];
+        let __forEachSkipCount = 0;
+
+        // April 2026: Per-rule rejection counters for the main forEach pass.
+        // Lets us answer "what's getting filtered out and why" without re-running
+        // with custom logging. Counters are cheap (just integers); sample rejects
+        // are tag/role snippets to spot patterns (e.g. all Web Components dropped
+        // by aria-hidden, or all svg dropped by min-size). Capped at 3 each to
+        // avoid bloating debugStats payload.
+        const __mainRejects = {
+          hidden: 0,         // display:none / visibility:hidden
+          opacity: 0,        // opacity < 0.01
+          ariaHidden: 0,     // inside non-root aria-hidden subtree
+          pointerEvents: 0,  // pointer-events:none
+          tooSmall: 0,       // < 5×5
+          offViewport: 0,    // outside visible viewport
+        };
+        const __mainRejectSamples: Record<string, string[]> = {
+          hidden: [], opacity: [], ariaHidden: [], pointerEvents: [], tooSmall: [], offViewport: [],
+        };
+        const __pushRejectSample = (bucket: string, el: Element) => {
+          const arr = __mainRejectSamples[bucket];
+          if (!arr || arr.length >= 3) return;
+          try {
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            const id = el.getAttribute('id') || '';
+            const cls = (el.getAttribute('class') || '').slice(0, 40);
+            arr.push(`${tag}${role ? `[role=${role}]` : ''}${id ? `#${id.slice(0, 30)}` : ''}${cls ? `.${cls}` : ''}`);
+          } catch { /* ignore */ }
+        };
+
         // Process each unique element (including shadow DOM elements)
         uniqueElements.forEach((el: Element) => {
           try {
             // Skip hidden elements
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return;
-            if (parseFloat(style.opacity) < 0.01) return; // 0.01 instead of 0.1: catch fade-in animations
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              __mainRejects.hidden++;
+              __pushRejectSample('hidden', el);
+              return;
+            }
+            if (parseFloat(style.opacity) < 0.01) { // 0.01 instead of 0.1: catch fade-in animations
+              __mainRejects.opacity++;
+              __pushRejectSample('opacity', el);
+              return;
+            }
             // Skip elements inside aria-hidden containers (not accessible to users).
             // ✅ FIX: Many React/Vue apps set aria-hidden="true" on #root when a modal opens.
             // Elements inside active modal, visible dialog, or fallback modal are always kept.
@@ -1164,15 +1326,25 @@ export class SnapshotCollector {
                    Element passed visibility checks above (not display:none, not visibility:hidden).
                    Let it through — downstream buildAllowedSets soft-penalty + LLM will handle. */
               } else {
+                __mainRejects.ariaHidden++;
+                __pushRejectSample('ariaHidden', el);
                 return; // Lower-level aria-hidden — genuinely hidden block
               }
             }
             // Skip non-interactive elements (pointer-events:none = can't be clicked)
-            if (style.pointerEvents === 'none') return;
+            if (style.pointerEvents === 'none') {
+              __mainRejects.pointerEvents++;
+              __pushRejectSample('pointerEvents', el);
+              return;
+            }
 
             // Skip if too small
             const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) return;
+            if (rect.width < 5 || rect.height < 5) {
+              __mainRejects.tooSmall++;
+              __pushRejectSample('tooSmall', el);
+              return;
+            }
 
             // Skip elements that are fully outside the visible viewport
             // @ts-expect-error - window available in browser context
@@ -1181,10 +1353,18 @@ export class SnapshotCollector {
             const vh = window.innerHeight;
             if (__mc.fullPage) {
               // fullPage: skip only horizontally off-screen elements
-              if (rect.right < 0 || rect.left > vw) return;
+              if (rect.right < 0 || rect.left > vw) {
+                __mainRejects.offViewport++;
+                __pushRejectSample('offViewport', el);
+                return;
+              }
             } else {
               // default: skip everything outside viewport
-              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+                __mainRejects.offViewport++;
+                __pushRejectSample('offViewport', el);
+                return;
+              }
             }
 
             // ═══════════════════════════════════════════════════════════════
@@ -1291,6 +1471,7 @@ export class SnapshotCollector {
 
             const input = el as any;
             const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT';
+            const tagLower = el.tagName.toLowerCase();
 
             // ✅ FIX: Reuse early modal check (computed before hit test above)
             const isInsideActiveModal = isInsideModal;
@@ -1356,6 +1537,221 @@ export class SnapshotCollector {
               ariaCheckedRaw === 'false' ? false :
                 ariaCheckedRaw === 'mixed' ? 'mixed' : undefined;
 
+            // V22 Pkg1: aria-current (page|step|true|location|date|time)
+            const ariaCurrentRaw = getCleanAttr(el, 'aria-current');
+            const ariaCurrent = ariaCurrentRaw && ariaCurrentRaw.length > 0 && ariaCurrentRaw.length < 30
+              ? ariaCurrentRaw
+              : undefined;
+
+            // V22 Pkg1: aria-valuenow / aria-valuetext (slider/spinbutton/progress)
+            const ariaValueNowRaw = getCleanAttr(el, 'aria-valuenow');
+            let ariaValueNow: number | undefined;
+            if (ariaValueNowRaw) {
+              const parsed = parseFloat(ariaValueNowRaw);
+              if (!isNaN(parsed)) ariaValueNow = parsed;
+            } else if (
+              (tagLower === 'input' && (input.type === 'range' || input.type === 'number'))
+              || tagLower === 'progress' || tagLower === 'meter'
+            ) {
+              const nativeVal = parseFloat(input.value || '');
+              if (!isNaN(nativeVal)) ariaValueNow = nativeVal;
+            }
+            const ariaValueTextRaw = getCleanAttr(el, 'aria-valuetext');
+            const ariaValueText = ariaValueTextRaw && ariaValueTextRaw.length > 0 && ariaValueTextRaw.length < 100
+              ? ariaValueTextRaw
+              : undefined;
+
+            // V22 Pkg1: data-value / option value — semantic key for options
+            let dataValue: string | undefined;
+            const dvRaw = getCleanAttr(el, 'data-value');
+            if (dvRaw && dvRaw.length > 0 && dvRaw.length < 200) {
+              dataValue = dvRaw;
+            } else if (tagLower === 'option' || el.getAttribute('role') === 'option' || el.getAttribute('role') === 'menuitem') {
+              const ovRaw = el.getAttribute('value') || '';
+              if (ovRaw && ovRaw.length > 0 && ovRaw.length < 200) dataValue = ovRaw;
+            }
+
+            // V22 Pkg1: child icon testid promotion. Extract data-testid from
+            // a single direct icon child (svg/i/img/span>svg) when the node
+            // has no own descriptor (no text, aria-label, title, alt, testid).
+            let childTestId: string | undefined;
+            const ownLabelLikeText = (el.innerText || el.textContent || '').trim();
+            const ownAriaLabel = el.getAttribute('aria-label');
+            const ownTitle = el.getAttribute('title');
+            const ownAlt = el.getAttribute('alt');
+            const ownTestIdAttr = el.getAttribute('data-testid')
+              || el.getAttribute('data-test')
+              || el.getAttribute('data-cy')
+              || el.getAttribute('data-qa-test-id');
+            const elIsDescriptorPoor = !ownLabelLikeText && !ownAriaLabel && !ownTitle && !ownAlt && !ownTestIdAttr;
+            if (elIsDescriptorPoor) {
+              const directKids = el.children || [];
+              const childCands: string[] = [];
+              for (let dki = 0; dki < directKids.length && childCands.length < 3; dki++) {
+                const dk = directKids[dki] as Element;
+                const dkTag = (dk.tagName || '').toLowerCase();
+                if (dkTag === 'svg' || dkTag === 'i' || dkTag === 'img' || dkTag === 'span') {
+                  const dkTestId = dk.getAttribute('data-testid')
+                    || dk.getAttribute('data-test')
+                    || dk.getAttribute('data-cy')
+                    || dk.getAttribute('data-qa-test-id')
+                    || '';
+                  if (dkTestId) childCands.push(dkTestId);
+                  if (!dkTestId && dkTag === 'span' && dk.children && dk.children.length === 1) {
+                    const dkc = dk.children[0] as Element;
+                    const dkcTag = (dkc.tagName || '').toLowerCase();
+                    if (dkcTag === 'svg' || dkcTag === 'i' || dkcTag === 'img') {
+                      const dkcTestId = dkc.getAttribute('data-testid')
+                        || dkc.getAttribute('data-test')
+                        || dkc.getAttribute('data-cy')
+                        || dkc.getAttribute('data-qa-test-id')
+                        || '';
+                      if (dkcTestId) childCands.push(dkcTestId);
+                    }
+                  }
+                }
+              }
+              if (childCands.length === 1) childTestId = childCands[0];
+            }
+
+            // V22 Pkg2: Bootstrap markers walked up to 3 ancestors —
+            // toggle/target may sit on a wrapper, not on the trigger itself.
+            let bsToggle: string | undefined;
+            let bsTarget: string | undefined;
+            {
+              let bsW: Element | null = el;
+              for (let bi = 0; bi < 3 && bsW; bi++) {
+                if (!bsToggle) {
+                  const t = bsW.getAttribute('data-bs-toggle') || bsW.getAttribute('data-toggle') || '';
+                  if (t && t.length < 30) bsToggle = t;
+                }
+                if (!bsTarget) {
+                  const tt = bsW.getAttribute('data-bs-target') || bsW.getAttribute('data-target') || '';
+                  if (tt && tt.length < 200) bsTarget = tt;
+                }
+                if (bsToggle && bsTarget) break;
+                bsW = bsW.parentElement;
+              }
+            }
+
+            // V22 Pkg2: aria-haspopup / aria-activedescendant — direct attrs.
+            const ariaHasPopup = el.getAttribute('aria-haspopup') || undefined;
+            const ariaActiveDescendant = el.getAttribute('aria-activedescendant') || undefined;
+
+            // V22 Pkg2: data-row-key (Ant Design Table) / data-rk (RainbowKit).
+            // Walk up to 4 ancestors — usually on <tr>, click lands on cell.
+            let dataRowKey: string | undefined;
+            {
+              let rkW: Element | null = el;
+              for (let ri = 0; ri < 4 && rkW; ri++) {
+                const rk = rkW.getAttribute('data-row-key') || rkW.getAttribute('data-rk') || '';
+                if (rk && rk.length < 100) { dataRowKey = rk; break; }
+                rkW = rkW.parentElement;
+              }
+            }
+
+            // V22 Pkg2: clickable-row heuristic. Live-DOM mirror of recorder.
+            let rowClickable: boolean | undefined;
+            if (tagLower === 'tr') {
+              try {
+                // V22 Audit-fix H1: must use `window.getComputedStyle` in
+                // browser context. The earlier `globalThis.getComputedStyle`
+                // works in Node-with-jsdom test envs but is undefined in
+                // some embedded Chromium contexts (Playwright headed mode).
+                // @ts-expect-error - window available in page.evaluate scope
+                const trCursor = window.getComputedStyle(el).cursor;
+                const trClass = el.getAttribute('class') || '';
+                const hoverishClass = /\b(hover|clickable|MuiTableRow-hover|ant-table-row|el-table__row|row-clickable)\b/i.test(trClass);
+                if (trCursor === 'pointer' || hoverishClass) rowClickable = true;
+              } catch { /* best-effort */ }
+            }
+
+            // V22 Pkg5: nearestRowText — concatenate sibling-cell text.
+            // Mirrors probe extractor; tolerates <td>/<th>/[role=cell]/[role=gridcell]
+            // and falls back to direct row children for li-based grids.
+            let nearestRowText: string | undefined;
+            try {
+              const rowAnc = el.closest('tr, [role="row"], li[role="option"], li.list-row, li.list-item');
+              if (rowAnc && rowAnc !== el) {
+                const cellNodes = rowAnc.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
+                const cellList: Element[] = cellNodes.length > 0
+                  ? Array.prototype.slice.call(cellNodes, 0, 8)
+                  : Array.prototype.slice.call(rowAnc.children, 0, 8);
+                const cellTexts: string[] = [];
+                for (let ci = 0; ci < cellList.length && cellTexts.length < 4; ci++) {
+                  const cellEl = cellList[ci] as HTMLElement;
+                  if (cellEl.contains(el)) continue;
+                  // V22 Pkg7+: NFC-normalize each cell so fingerprint matches
+                  // across recordings done on different OS / keyboard layouts.
+                  const t = normLiveText(cellEl.innerText != null ? cellEl.innerText : cellEl.textContent) || '';
+                  if (t.length >= 2 && t.length <= 80) cellTexts.push(t);
+                }
+                // V22 Pkg7+: cell separator is U+241F (Information Separator
+                // One) — a control char never present in real DOM text, so
+                // .split(CELL_SEP) is collision-free even when cells contain
+                // literal " | ". Symmetric with probe + heal extractors.
+                if (cellTexts.length > 0) nearestRowText = cellTexts.join('␟').slice(0, 200);
+              }
+            } catch { /* best-effort */ }
+
+            // V22 Pkg5: siblingIndex among same-class siblings (2..10).
+            let siblingIndex: number | undefined;
+            try {
+              const firstCls = (el.getAttribute('class') || '').trim().split(/\s+/)[0] || '';
+              const skipRx = /^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/;
+              if (firstCls && firstCls.length >= 2 && !skipRx.test(firstCls)) {
+                const sibParent = el.parentElement;
+                if (sibParent) {
+                  // @ts-expect-error - CSS available in page.evaluate scope
+                  const safeCls = (typeof CSS !== 'undefined' && CSS.escape)
+                    // @ts-expect-error - CSS available in page.evaluate scope
+                    ? CSS.escape(firstCls)
+                    : firstCls.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+                  const sibs = sibParent.querySelectorAll(':scope > .' + safeCls);
+                  if (sibs.length >= 2 && sibs.length <= 10) {
+                    for (let sii = 0; sii < sibs.length; sii++) {
+                      if (sibs[sii] === el) { siblingIndex = sii; break; }
+                    }
+                  }
+                }
+              }
+            } catch { /* best-effort */ }
+
+            // V22 Pkg5: disabled boolean (attr / aria / class tokens).
+            let disabledLive: boolean | undefined;
+            try {
+              const isFormish = /^(button|input|select|textarea|fieldset|optgroup|option|a)$/.test(tagLower)
+                || el.getAttribute('role') === 'button'
+                || el.getAttribute('role') === 'link';
+              if (isFormish) {
+                let d = el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+                if (!d) {
+                  const c = ' ' + (el.getAttribute('class') || '') + ' ';
+                  if (/\s(?:Mui-disabled|is-disabled|el-button--disabled|ant-btn-disabled|disabled)\s/.test(c)) d = true;
+                }
+                disabledLive = !!d;
+              }
+            } catch { /* best-effort */ }
+
+            // V22 Pkg5: arrowDir from svg path geometry.
+            let arrowDirLive: 'left' | 'right' | 'up' | 'down' | undefined;
+            try {
+              const svgRootArrow = (tagLower === 'svg') ? el : el.querySelector('svg');
+              const firstP = svgRootArrow ? svgRootArrow.querySelector('path[d]') : null;
+              const dAttr = firstP ? (firstP.getAttribute('d') || '') : '';
+              if (dAttr.length > 0 && dAttr.length < 500) {
+                const mM = dAttr.match(/M\s*([-\d.]+)[\s,]+([-\d.]+)/);
+                const lM = dAttr.match(/L\s*([-\d.]+)[\s,]+([-\d.]+)/);
+                if (mM && lM) {
+                  const mx = parseFloat(mM[1]), my = parseFloat(mM[2]);
+                  const lx = parseFloat(lM[1]), ly = parseFloat(lM[2]);
+                  const dx = lx - mx, dy = ly - my;
+                  if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) >= 3) arrowDirLive = dx < 0 ? 'left' : 'right';
+                  else if (Math.abs(dy) >= 3) arrowDirLive = dy < 0 ? 'up' : 'down';
+                }
+              }
+            } catch { /* best-effort */ }
+
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract validation state
             // ═══════════════════════════════════════════════════════════════
@@ -1382,6 +1778,116 @@ export class SnapshotCollector {
             const ariaLabel = el.getAttribute('aria-label') || undefined;
             const titleAttr = el.getAttribute('title') || undefined;
             const labelText = getLabelText(el);
+
+            // V23: <input type="submit|button|reset" value="..."> — value IS
+            // the visible button label per HTML spec. Collector deliberately
+            // strips `input.value` for security (passwords, emails, etc.),
+            // but for these three types value carries no PII — it's a label
+            // baked into the markup. Without this, legacy forms (gov sites,
+            // banking, legacy admin panels) lose their primary identity.
+            // Strict gate: type ∈ {submit,button,reset} only.
+            let submitButtonLabel: string | undefined;
+            if (isInput) {
+              const inputType = (input.type || '').toLowerCase();
+              if (inputType === 'submit' || inputType === 'button' || inputType === 'reset') {
+                const v = (input.value || '').trim();
+                if (v.length > 0 && v.length <= 100) {
+                  submitButtonLabel = v;
+                }
+              }
+            }
+
+            // Identity fast-path requires the live DOM id / testId / name on
+            // every InteractiveNode so the resolver can match against the
+            // recorder's TargetFingerprint without an LLM call. Without this,
+            // a step like click '<svg id="layout-header-setting">' falls
+            // through to the LLM, which has no idea what the slug means and
+            // grabs the loudest neighbouring CTA — the canonical
+            // fake-success path. We mirror the same framework-id filter the
+            // recorder uses so generated ids (Element Plus el-id-XXXX,
+            // Radix radix-:rXX:, useId :r1:) don't poison the fast-path.
+            const liveRawId = el.getAttribute('id') || '';
+            const liveLooksGenerated = !!liveRawId && (
+              /^el-id-/i.test(liveRawId) ||
+              /^radix-/.test(liveRawId) ||
+              /^:r[0-9a-z]+:$/i.test(liveRawId) ||
+              /^mui-/i.test(liveRawId) ||
+              /^headlessui-/i.test(liveRawId) ||
+              /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(liveRawId)
+            );
+            const liveStableId = (liveRawId && !liveLooksGenerated && liveRawId.length < 80)
+              ? liveRawId
+              : undefined;
+            const liveTestId = el.getAttribute('data-testid')
+              || el.getAttribute('data-test-id')
+              || el.getAttribute('data-test')
+              || el.getAttribute('data-cy')
+              || el.getAttribute('data-qa')
+              || el.getAttribute('data-test-element')
+              || el.getAttribute('data-track')
+              || undefined;
+
+            // Angular Material icon registry name. Mirrors the recorder
+            // probe: read from target if it IS <mat-icon>, else closest
+            // <mat-icon> ancestor. Cap at 60 chars (defensive — values
+            // are short identifier strings like "chevron-left-outline").
+            // Symmetric with recorder so identity fast-path on svgIcon
+            // can match recorded ↔ live without normalization drift.
+            let liveSvgIcon: string | undefined;
+            try {
+              // V23: search both directions for `<mat-icon>` carrying svgicon —
+              // self, then ancestors (icon-only Material buttons where the
+              // <mat-icon> IS the clickable target), then descendants (Angular
+              // apps where <button>/<a>/<app-excel-btn> wrap the icon —
+              // common pattern: `<button>...<mat-icon svgicon="excel">`).
+              // Without descendant-search, descriptor-poor wrapper buttons
+              // like `<app-excel-btn>` lose svgIcon entirely and the resolver
+              // falls through to LLM with no identity hint.
+              const matIconHost = el.tagName.toLowerCase() === 'mat-icon'
+                ? el
+                : (el.closest ? el.closest('mat-icon') : null)
+                || (el.querySelector ? el.querySelector('mat-icon') : null);
+              if (matIconHost) {
+                const rawSvgIcon = matIconHost.getAttribute('svgicon')
+                  || matIconHost.getAttribute('data-mat-icon-name')
+                  || '';
+                if (rawSvgIcon && rawSvgIcon.length > 0 && rawSvgIcon.length <= 60) {
+                  liveSvgIcon = rawSvgIcon;
+                }
+              }
+            } catch { /* best-effort — non-Material apps will simply leave it undefined */ }
+
+            // Closest semantic custom-element ancestor. Mirrors recorder
+            // probe — same filter rules, same depth (6 levels) so the
+            // recorded fingerprint and the live snapshot agree on which
+            // wrapper "owns" the button. Without this symmetry an Angular
+            // app's `<app-notifications-button>` would land in the
+            // recorded fingerprint but the live node wouldn't carry it,
+            // identity fast-path would miss, and we'd fall to LLM (which
+            // is the bug this whole feature is closing).
+            let liveCustomElementTag: string | undefined;
+            try {
+              let ceWalk: Element | null = el;
+              for (let cwi = 0; cwi < 6 && ceWalk && ceWalk !== document.body; cwi++) {
+                const ceTag = (ceWalk.tagName || '').toLowerCase();
+                if (ceTag.indexOf('-') >= 0
+                  && ceTag.length >= 5
+                  && ceTag.length <= 60
+                  && !/^(?:app|ng|ion|sl|stencil)-c\d+$/.test(ceTag)
+                  && ceTag !== 'router-outlet'
+                  && ceTag !== 'ng-component'
+                  && ceTag !== 'mat-icon'
+                  && ceTag !== 'mat-menu'
+                  && ceTag !== 'mat-select'
+                  && ceTag !== 'mat-form-field'
+                  && ceWalk !== el
+                ) {
+                  liveCustomElementTag = ceTag;
+                  break;
+                }
+                ceWalk = ceWalk.parentElement;
+              }
+            } catch { /* best-effort */ }
 
             // Detect icon-only buttons/links: element has child SVG/img but no visible text.
             // Covers: <button>, <a>, any element with role="button", and clickable
@@ -1486,7 +1992,95 @@ export class SnapshotCollector {
                       const name = (suffixed?.[1] || suffixed?.[2] || '').toLowerCase().trim();
                       if (name.length > 0 && name.length <= 50 && name !== 'icon') iconChildLabel = name;
                     }
+                    // V23: company-style namespaced classes — `dg_uikit_arrowDropDown_000000wqx84w`,
+                    // `app_HeaderButton_a8f3b2`, `mui_StyledIcon_xyz123`. Format:
+                    //   <namespace>_<CamelOrSnakeName>_<hash>
+                    // Extract the CamelCase middle segment as the icon's semantic
+                    // name. Skip when middle is generic ("root", "wrapper", "container",
+                    // "content", "label", "box", "inner") — those are layout primitives,
+                    // not identity. Lowercased to align with other icon-name fields.
+                    if (!iconChildLabel) {
+                      // Match: prefix_MidSegment_hash where:
+                      //   - prefix: 2+ letters, NO digits (rejects `jss123_X_Y`,
+                      //     `sc-Abc_Y_Z` styled-components hash that already
+                      //     fails the broader skipRx but be defensive).
+                      //   - MidSegment: starts with letter, 3-40 chars, with at
+                      //     least one CamelCase boundary OR an underscore inside
+                      //     ('arrowDropDown' or 'arrow_drop_down') — reduces false
+                      //     positives on simple words ('button', 'icon') that
+                      //     could collide with layout primitives.
+                      //   - hash: 5+ lowercase alphanumeric trailing (the random
+                      //     suffix that namespaced libraries emit per build).
+                      const namespaced = classStr.match(/\b([a-z]{2,})_([A-Za-z][A-Za-z0-9_]{2,40})_[a-z0-9]{5,}\b/);
+                      const namespacePrefix = namespaced?.[1];
+                      const midSegment = namespaced?.[2];
+                      const hasCamelOrSnake = midSegment
+                        ? /[A-Z]/.test(midSegment) || /_/.test(midSegment)
+                        : false;
+                      // Skip when the prefix LOOKS like a generic CSS hash
+                      // generator (jss/sc/css/makeStyles/emotion) — those names
+                      // don't correspond to product semantics.
+                      const genericPrefixRx = /^(jss|sc|css|emotion|makeStyles|styled)$/i;
+                      if (
+                        midSegment
+                        && namespacePrefix
+                        && !genericPrefixRx.test(namespacePrefix)
+                        && hasCamelOrSnake
+                      ) {
+                        // skip layout primitives that don't identify the element
+                        const layoutSkipRx = /^(root|wrapper|container|content|label|box|inner|outer|main|body|header|footer|sidebar|panel|section)$/i;
+                        if (!layoutSkipRx.test(midSegment)) {
+                          // CamelCase → space-separated lowercase; works for snake_case too.
+                          const name = midSegment
+                            .replace(/([a-z])([A-Z])/g, '$1 $2')
+                            .replace(/_/g, ' ')
+                            .toLowerCase()
+                            .trim();
+                          if (name.length >= 3 && name.length <= 50) iconChildLabel = name;
+                        }
+                      }
+                    }
                   }
+                }
+                // Last-resort: <img src=".../filename.svg"> filename. Catches
+                // file-type icons (pdf.svg, doc.svg, image.svg) on LMS /
+                // file managers and arrow/chevron icons on legacy sites
+                // where the only identity left is the asset filename. Two
+                // hard guards so we don't poison candidates with garbage:
+                //   1. Filename must be a slug-shaped word (lowercase
+                //      letters, digits, dashes/underscores) — rejects
+                //      hash names like "a8f3b2c1d4e5.svg".
+                //   2. Length 2..30 — rejects empty stems and UUID-ish.
+                // Looks at the host element first (case where <img> itself
+                // IS the candidate via cursor:pointer) and falls back to a
+                // direct <img> child. Mirrors recorder probe to keep
+                // recorded fingerprint and live snapshot in sync.
+                if (!iconChildLabel) {
+                  try {
+                    const imgEl = (el.tagName.toLowerCase() === 'img'
+                      ? (el as HTMLImageElement)
+                      : el.querySelector('img[src]') as HTMLImageElement | null);
+                    if (imgEl) {
+                      const src = (imgEl.getAttribute('src') || '').trim();
+                      if (src && src.indexOf('data:') !== 0) {
+                        // Strip query/hash, take last path segment, drop extension.
+                        const cleanPath = src.split('?')[0].split('#')[0];
+                        const file = (cleanPath.split('/').pop() || '').toLowerCase();
+                        const m = file.match(/^([a-z][a-z0-9_-]{1,29})\.(?:svg|png|jpe?g|webp|gif|ico)$/);
+                        if (m && m[1]) {
+                          const stem = m[1];
+                          // Reject hex / digit-heavy stems (asset hashes,
+                          // upload UUIDs that snuck past the slug shape).
+                          // Threshold: >=4 digits OR >=8 hex-only chars.
+                          const digitCount = (stem.match(/\d/g) || []).length;
+                          const looksHashed = digitCount >= 4 || /^[a-f0-9]{8,}$/.test(stem);
+                          if (!looksHashed) {
+                            iconChildLabel = stem.replace(/[-_]/g, ' ').trim();
+                          }
+                        }
+                      }
+                    }
+                  } catch { /* best-effort */ }
                 }
               } catch { /* ignore */ }
             }
@@ -1524,6 +2118,12 @@ export class SnapshotCollector {
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
                 getReadableElementText(el).slice(0, 50) || '',
+              // Identity fields — populated for the resolver's identity
+              // fast-path. Read from the live DOM, NOT computed from labels,
+              // so they line up byte-for-byte with TargetFingerprint values
+              // captured at recording time.
+              id: liveStableId,
+              testIdAttr: liveTestId,
               tag: el.tagName.toLowerCase(),
               type: isInput ? input.type : undefined,
               // SECURITY: Never include raw input values in snapshots.
@@ -1565,6 +2165,25 @@ export class SnapshotCollector {
               ariaPressed,
               ariaSelected,
               ariaChecked,
+              // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state
+              ariaCurrent,
+              ariaValueNow,
+              ariaValueText,
+              // V22 Pkg1: Select option semantic key + IconButton child testid lift
+              dataValue,
+              childTestId,
+              // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
+              bsToggle,
+              bsTarget,
+              ariaHasPopup,
+              ariaActiveDescendant,
+              dataRowKey,
+              rowClickable,
+              // V22 Pkg5: row text + sibling index + disabled + arrow direction.
+              nearestRowText,
+              siblingIndex,
+              disabled: disabledLive,
+              arrowDir: arrowDirLive,
               // Validation state
               required: required || undefined,
               readOnly: readOnly || undefined,
@@ -1573,8 +2192,23 @@ export class SnapshotCollector {
               // Labels
               ariaLabel,
               title: titleAttr || iconChildLabel,
+              // V23: alt attribute as its own field (not just consumed for
+              // descriptor-poor check). <img alt="..."> is the WCAG-recommended
+              // accessible name for image targets; without persisting it,
+              // resolver/builder/helper can't read it from the node.
+              alt: ownAlt || undefined,
+              // V22 Pkg4: dedicated semantic icon label field (alongside title
+              // for backward compat). Used by candidateText / fpHintLines /
+              // heal-time score so icon-only buttons get a stable "name" even
+              // when title was already taken by a real tooltip.
+              iconLabel: iconChildLabel,
+              svgIcon: liveSvgIcon,
+              customElementTag: liveCustomElementTag,
               isIconButton: isIconButton || undefined,
-              labelText,
+              // V23: prefer explicit submitButtonLabel (legacy <input type=submit
+              // value="...">) when no labelText computed; downstream consumers
+              // treat both via the same field.
+              labelText: labelText || submitButtonLabel,
               // Hierarchy
               parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,
               containerRef,
@@ -1720,8 +2354,13 @@ export class SnapshotCollector {
               })(),
             });
           } catch (err) {
-            // Skip element if any error
-            // No logging needed here - errors are expected for dynamic elements
+            __forEachSkipCount++;
+            if (__forEachErrors.length < 3) {
+              const msg = err instanceof Error
+                ? err.name + ': ' + err.message
+                : String(err);
+              __forEachErrors.push(msg.slice(0, 200));
+            }
           }
         });
 
@@ -2048,6 +2687,22 @@ export class SnapshotCollector {
           documentBodyChildCount: document.body ? document.body.children.length : -1,
           // @ts-expect-error
           totalDomElements: document.querySelectorAll('*').length,
+          // April 2026: surface silent forEach throws (e.g. ReferenceError
+          // from a missed variable declaration) so 0-element snapshots can
+          // be diagnosed without code spelunking.
+          forEachSkipCount: __forEachSkipCount,
+          forEachErrors: __forEachErrors,
+          // April 2026: per-rule rejection counters for the main forEach pass
+          // and the Tier-2 (framework + cursor:pointer) walk. Lets us answer
+          // "what's getting filtered out and why" data-driven, instead of
+          // guessing which rule to relax. Sample arrays carry up to 3
+          // tag/role/id snippets per bucket to spot patterns.
+          rejects: {
+            main: __mainRejects,
+            mainSamples: __mainRejectSamples,
+            tier2: __tier2Rejects,
+            tier2Samples: __tier2RejectSamples,
+          },
         };
 
         return {
@@ -2064,6 +2719,9 @@ export class SnapshotCollector {
           metadata, // P0: Visual content metadata for proactive vision detection
           pageStructure, // Manus: Tables, lists, pagination detection
           pageAlerts: pageAlerts.length > 0 ? pageAlerts.slice(0, 5) : undefined, // Max 5 alerts
+          // V26: Real viewport for modal-coverage ratio in buildAllowedSets.
+          // @ts-expect-error - window available in browser context
+          viewport: { width: window.innerWidth, height: window.innerHeight },
           __debugStats, // DEBUG: collection stats
         };
       }, __modalConsts);
@@ -2086,6 +2744,40 @@ export class SnapshotCollector {
         });
       }
 
+      // April 2026: Periodic rejection summary at debug level. Throttled to
+      // once per ~30s per page so 500ms-tick recordings don't flood logs.
+      // Goal: collect data on which filter rule is firing most often, so
+      // future relaxation of snapshot-collector heuristics is data-driven.
+      // Read with: `grep '[SNAPSHOT_REJECTS]' app.log | jq` over a few days.
+      try {
+        const debugStats = (snapshot as any).__debugStats;
+        const rejects = debugStats?.rejects;
+        if (rejects && snapshot.elements.length > 0) {
+          const pageKey = (snapshot.url || '').split('?')[0].slice(0, 200);
+          const now = Date.now();
+          const last = SNAPSHOT_REJECT_LOG_LAST.get(pageKey) || 0;
+          if (now - last > 30_000) {
+            SNAPSHOT_REJECT_LOG_LAST.set(pageKey, now);
+            // Cap the map so a long-running session doesn't leak unbounded URLs.
+            if (SNAPSHOT_REJECT_LOG_LAST.size > 200) {
+              const oldestKey = SNAPSHOT_REJECT_LOG_LAST.keys().next().value;
+              if (oldestKey !== undefined) SNAPSHOT_REJECT_LOG_LAST.delete(oldestKey);
+            }
+            logger.debug('[SNAPSHOT_REJECTS] filter rejection summary', {
+              url: pageKey,
+              kept: snapshot.elements.length,
+              totalDom: debugStats.totalDomElements,
+              uniqueScanned: debugStats.uniqueElementsCount,
+              main: rejects.main,
+              mainSamples: rejects.mainSamples,
+              tier2: rejects.tier2,
+              tier2Samples: rejects.tier2Samples,
+              iframes: debugStats.iframeRejects,
+            });
+          }
+        }
+      } catch { /* logging is best-effort */ }
+
       // ═══════════════════════════════════════════════════════════════════════
       // IFRAME ELEMENT COLLECTION (same-origin only)
       // ═══════════════════════════════════════════════════════════════════════
@@ -2100,19 +2792,33 @@ export class SnapshotCollector {
               frameName = frame.name() || 'iframe';
             }
 
-            const iframeElements = await frame.evaluate((fName: string) => {
+            const iframeResult = await frame.evaluate((fName: string) => {
               const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="option"], [role="combobox"], [role="switch"], [role="menuitem"], [role="slider"], [role="searchbox"], [role="textbox"], [role="gridcell"], [role="rowheader"], [role="columnheader"], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
               const els: any[] = [];
               let idx = 0;
               const MAX_IFRAME_ELEMENTS = 50;
+              // April 2026: minimal iframe rejection counters. iframes are
+              // already a fallback path; we just want to know if a lot of
+              // matches got filtered before MAX_IFRAME_ELEMENTS could even
+              // bite — that signals the cap is wrong, not the filter.
+              const rejects = { hidden: 0, tooSmall: 0, capReached: 0 };
 
               document.querySelectorAll(selectors).forEach((el) => {
-                if (idx >= MAX_IFRAME_ELEMENTS) return;
+                if (idx >= MAX_IFRAME_ELEMENTS) {
+                  rejects.capReached++;
+                  return;
+                }
                 const htmlEl = el as HTMLElement;
                 const rect = htmlEl.getBoundingClientRect();
                 const style = window.getComputedStyle(htmlEl);
-                if (style.display === 'none' || style.visibility === 'hidden') return;
-                if (rect.width < 5 || rect.height < 5) return;
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  rejects.hidden++;
+                  return;
+                }
+                if (rect.width < 5 || rect.height < 5) {
+                  rejects.tooSmall++;
+                  return;
+                }
 
                 const tag = htmlEl.tagName.toLowerCase();
                 const role = (htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button')).replace(/["']/g, '').trim();
@@ -2133,11 +2839,22 @@ export class SnapshotCollector {
                 });
                 idx++;
               });
-              return els;
+              return { els, rejects, frameName: fName };
             }, frameName);
 
+            const iframeElements = iframeResult.els;
             if (iframeElements.length > 0) {
               (snapshot as any).elements.push(...iframeElements);
+            }
+            // Attach iframe rejection stats so the debug logger can see them.
+            const stats = (snapshot as any).__debugStats;
+            if (stats) {
+              if (!stats.iframeRejects) stats.iframeRejects = [];
+              stats.iframeRejects.push({
+                frame: iframeResult.frameName,
+                collected: iframeElements.length,
+                rejects: iframeResult.rejects,
+              });
             }
           } catch {
             // Cross-origin or detached iframe — skip silently

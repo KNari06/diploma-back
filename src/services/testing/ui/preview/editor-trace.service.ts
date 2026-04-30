@@ -30,6 +30,27 @@ const EDITOR_LOGS_DIR = path.join(process.cwd(), 'test_logs', 'editor');
 const EDITOR_MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB per editor session
 const EDITOR_MAX_PAYLOAD_CHARS = 10_000;
 
+/**
+ * String.slice cuts at UTF-16 code unit boundaries, which splits
+ * surrogate pairs when an emoji (🤝, U+1F91D = 🤝) sits
+ * astride the slice index. The resulting JSON contains a lone high
+ * surrogate that breaks every JSON parser downstream (jq, json.loads).
+ * This helper trims one extra code unit when the boundary lands on
+ * a high surrogate so the pair stays intact (or both halves get cut).
+ *
+ * Bug reproduction (2026-04-27): a 14-line trace turned unreadable
+ * because writeElementResolution sliced an LLM prompt containing 🤝
+ * exactly on the surrogate boundary — `\uD83E` survived alone.
+ */
+function safeSlice(s: string, max: number): string {
+  if (typeof s !== 'string' || s.length <= max) return s;
+  let end = max;
+  // If we'd cut between surrogates, drop the orphan high surrogate too.
+  const code = s.charCodeAt(end - 1);
+  if (code >= 0xD800 && code <= 0xDBFF) end -= 1;
+  return s.slice(0, end);
+}
+
 /** Active writers indexed by previewSessionId */
 const activeWriters = new Map<string, EditorTraceService>();
 
@@ -55,7 +76,7 @@ function summarizeRuleTrace(trace: RuleTraceEntry[]): Array<{
       grouped.set(key, {
         action: entry.action,
         refs: [...entry.affectedRefs],
-        sample: entry.evidence.slice(0, 120),
+        sample: safeSlice(entry.evidence, 120),
       });
     }
   }
@@ -489,7 +510,7 @@ export class EditorTraceService {
       type: n.type || undefined,
       label: n.labelText || undefined,
       ariaLabel: n.ariaLabel || undefined,
-      text: n.text ? n.text.slice(0, 60) : undefined,
+      text: n.text ? safeSlice(n.text, 60) : undefined,
       placeholder: n.placeholder || undefined,
       isVisible: n.isVisible,
       isDisabled: n.isDisabled || undefined,
@@ -531,8 +552,8 @@ export class EditorTraceService {
           model: data.result._llmTrace.model,
           path: data.result._llmTrace.path,
           latencyMs: data.result._llmTrace.latencyMs,
-          prompt: data.result._llmTrace.prompt.slice(0, 2000),
-          response: data.result._llmTrace.response.slice(0, 500),
+          prompt: safeSlice(data.result._llmTrace.prompt, 2000),
+          response: safeSlice(data.result._llmTrace.response, 500),
         }
       : undefined;
 
@@ -829,11 +850,12 @@ export class EditorTraceService {
   writeActionVerify(data: {
     stepId: string;
     stepType: string;
-    verificationMethod: 'aria-expanded' | 'aria-pressed' | 'aria-checked' | 'checked' | 'isVisible' | 'permissive' | 'none';
+    verificationMethod: 'aria-expanded' | 'aria-pressed' | 'aria-checked' | 'checked' | 'isVisible' | 'permissive' | 'click-effect' | 'none';
     verified: boolean;
     durationMs: number;
     beforeState?: Record<string, any>;
     afterState?: Record<string, any>;
+    signal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'download' | 'none';
   }): void {
     this.writer.write({
       stage: 'action',
@@ -869,6 +891,319 @@ export class EditorTraceService {
     this.writer.write({
       stage: 'page_state',
       eventType: 'page_state_snapshot',
+      payload: data,
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // ENRICHED DIAGNOSTIC EVENTS
+  // ─────────────────────────────────────────────────────────────────────────
+  // Added April 2026 to make logs answer "what did the user want?" / "where
+  // did applyStep hang?" / "what did the LLM see?" without code spelunking.
+  // Each event is small (under ~500 bytes) and bounded; truncations applied
+  // to user-supplied strings so a 10MB description can't bloat the trace.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * One-time snapshot of who/what/where for this run. Emitted once when a Run
+   * starts. Lets a reader reconstruct the full context without correlating
+   * events. Sensitive fields (userId truncated, no auth headers, no cookies).
+   */
+  writeSessionContext(data: {
+    previewSessionId: string;
+    userId: string;
+    intentTestCaseId?: string;
+    isMobile: boolean;
+    isRecording: boolean;
+    viewport?: { width: number; height: number };
+    startUrl?: string;
+    currentUrl?: string;
+    stepCount: number;
+    hasAuthBinding: boolean;
+    authReset?: 'always' | 'never';
+    runMode: 'single_apply' | 'run_all' | 'apply_all' | 'editor_action';
+  }): void {
+    this.writer.write({
+      stage: 'context',
+      eventType: 'session_context',
+      payload: data,
+    });
+  }
+
+  /**
+   * What this step is supposed to do. Emitted at step_start so we never have
+   * to ask "what did the user want?" — the answer is in the trace. Truncates
+   * `value` and `description` to 200 chars each to bound payload size.
+   */
+  writeStepMeta(data: {
+    stepId: string;
+    type: string;
+    kind?: string;
+    description: string;
+    value?: string;
+    targetText?: string;
+    cssSelector?: string;
+    iframeSelector?: string;
+    /** Prompt for ai_check — surfaces "what was the AI asked to verify?" */
+    assertionText?: string;
+    hasCompiled: boolean;
+    hasEvidence: boolean;
+    isManual: boolean; // step added in editor (not from recording) — UUID id, no `rec_` prefix
+    options?: Record<string, unknown>;
+  }): void {
+    // Redact `value` for `type` actions. We can't reliably tell whether the
+    // recorded field is a password from this layer (no DOM access here), so
+    // we err on the side of safety: type-action values are surfaced as
+    // length+head only. For non-type actions value is usually a key name
+    // ('Enter') or option text, safe to keep with a 200-char cap.
+    let safeValue: string | undefined;
+    if (typeof data.value === 'string') {
+      if (data.type === 'type' || data.type === 'fill') {
+        safeValue = `[redacted len=${data.value.length}]`;
+      } else {
+        safeValue = safeSlice(data.value, 200);
+      }
+    }
+    // Same redaction policy for any value that crept into options.
+    let safeOptions: Record<string, unknown> | undefined = data.options;
+    if (safeOptions && typeof (safeOptions as { value?: unknown }).value === 'string'
+        && (data.type === 'type' || data.type === 'fill')) {
+      const v = (safeOptions as { value: string }).value;
+      safeOptions = { ...safeOptions, value: `[redacted len=${v.length}]` };
+    }
+    this.writer.write({
+      stage: 'step_meta',
+      eventType: 'step_meta',
+      payload: {
+        ...data,
+        description: typeof data.description === 'string' ? safeSlice(data.description, 200) : '',
+        value: safeValue,
+        targetText: typeof data.targetText === 'string' ? safeSlice(data.targetText, 200) : data.targetText,
+        assertionText: typeof data.assertionText === 'string' ? safeSlice(data.assertionText, 500) : data.assertionText,
+        options: safeOptions,
+      },
+    });
+  }
+
+  /**
+   * Active modal / dialog / drawer currently mounted on the page when the
+   * step starts. Without this we can't tell whether the click was supposed
+   * to land on a backdrop or whether the step was added against a context
+   * where the target is now obscured.
+   */
+  writePageModalState(data: {
+    stepId?: string;
+    activeModalRef?: string;
+    activeModalText?: string;
+    dialogCount: number;
+    bodyChildCount: number;
+    topZIndex?: number;
+    hasOverlay?: boolean;
+  }): void {
+    this.writer.write({
+      stage: 'page_state',
+      eventType: 'page_modal_state',
+      payload: {
+        ...data,
+        activeModalText: typeof data.activeModalText === 'string'
+          ? safeSlice(data.activeModalText, 150) : data.activeModalText,
+      },
+    });
+  }
+
+  /**
+   * Apply phase entry. Pair with writeApplyPhaseExit. Phases are nested
+   * fine-grained checkpoints inside applyStep — answers "where did we hang?"
+   * by showing the last entered phase that never exited.
+   */
+  writeApplyPhaseEntry(data: {
+    stepId: string;
+    phase: 'pre_wait' | 'compiled_resolve' | 'lint_resolve' | 'llm_call' | 'action_execute' | 'verify' | 'post_wait';
+    note?: string;
+  }): void {
+    this.writer.write({
+      stage: 'apply_phase',
+      eventType: 'apply_phase_entry',
+      payload: data,
+    });
+  }
+
+  writeApplyPhaseExit(data: {
+    stepId: string;
+    phase: 'pre_wait' | 'compiled_resolve' | 'lint_resolve' | 'llm_call' | 'action_execute' | 'verify' | 'post_wait';
+    durationMs: number;
+    success: boolean;
+    skipped?: boolean;
+    skipReason?: string;
+    note?: string;
+  }): void {
+    this.writer.write({
+      stage: 'apply_phase',
+      eventType: 'apply_phase_exit',
+      payload: data,
+    });
+  }
+
+  /**
+   * LLM round-trip diagnostics. We never log prompt/response text (privacy +
+   * size) — only the metadata that tells us "did the model time out, error,
+   * or actually return something useful?".
+   */
+  writeLlmRequestStart(data: {
+    stepId?: string;
+    purpose: 'element_resolve' | 'diagnosis' | 'editor_action' | 'plan_repair' | 'other';
+    model?: string;
+    timeoutMs?: number;
+    domNodesCount?: number;
+    candidatesCount?: number;
+  }): void {
+    this.writer.write({
+      stage: 'llm',
+      eventType: 'llm_request_start',
+      payload: data,
+    });
+  }
+
+  writeLlmRequestEnd(data: {
+    stepId?: string;
+    purpose: 'element_resolve' | 'diagnosis' | 'editor_action' | 'plan_repair' | 'other';
+    durationMs: number;
+    success: boolean;
+    timedOut?: boolean;
+    promptTokens?: number;
+    responseTokens?: number;
+    chosenRef?: string;
+    confidence?: number;
+    errorReason?: string;
+    cacheHit?: boolean;
+    circuitOpen?: boolean;
+    model?: string;
+  }): void {
+    this.writer.write({
+      stage: 'llm',
+      eventType: 'llm_request_end',
+      payload: data,
+    });
+  }
+
+  /**
+   * Top-N resolver candidates emitted right before action_attempt. Lets us
+   * see "weak step" cases — e.g. only 1 candidate at score 0.3 means the
+   * step description doesn't match anything well, even if the action runs.
+   */
+  writeResolverCandidates(data: {
+    stepId: string;
+    source: 'compiled' | 'evidence' | 'lint' | 'clarification';
+    totalCount: number;
+    chosenRef?: string;
+    chosenScore?: number;
+    top3?: Array<{ ref: string; score?: number; role?: string; text?: string }>;
+  }): void {
+    this.writer.write({
+      stage: 'resolution',
+      eventType: 'resolver_candidates',
+      payload: {
+        ...data,
+        top3: Array.isArray(data.top3)
+          ? data.top3.slice(0, 3).map((c) => ({
+              ref: c.ref,
+              score: c.score,
+              role: c.role,
+              text: typeof c.text === 'string' ? safeSlice(c.text, 80) : c.text,
+            }))
+          : undefined,
+      },
+    });
+  }
+
+  /**
+   * Evidence-cache shortcut audit. Today the cache hit/miss is invisible
+   * — we don't know if a step ran via cache or via fresh resolution.
+   */
+  writeEvidenceShortcut(data: {
+    stepId: string;
+    hit: boolean;
+    cachedRef?: string;
+    reason?: string; // 'ttl_expired' | 'url_mismatch' | 'semantic_mismatch' | 'no_evidence' | 'ok' | ...
+    detail?: Record<string, unknown>;
+  }): void {
+    this.writer.write({
+      stage: 'resolution',
+      eventType: 'evidence_shortcut',
+      payload: data,
+    });
+  }
+
+  /**
+   * Compiled fast-path postcondition outcome. Today fingerprint_mismatch is
+   * the only failure event — we can't tell whether expectsNavigation,
+   * dom-mutation, or click-effect was the failing condition.
+   */
+  writeCompiledPostcondition(data: {
+    stepId: string;
+    expectsNavigation: boolean;
+    urlChanged: boolean;
+    domChanged?: boolean;
+    clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'download' | 'none';
+    accepted: boolean;
+    reason?: string;
+  }): void {
+    this.writer.write({
+      stage: 'resolution',
+      eventType: 'compiled_postcondition',
+      payload: data,
+    });
+  }
+
+  /**
+   * A swallowed exception in a hot path. Critical for diagnosing "everything
+   * looks fine but step never executed" — silent catches are now visible.
+   * Caller must keep `where` short and stable for grep-ability.
+   */
+  writeCaughtError(data: {
+    where: string; // 'snapshot_collect.forEach' | 'verify.click_effect' | 'apply.lint' | ...
+    stepId?: string;
+    message: string;
+    stack?: string;
+    fatal?: boolean; // true = step failed because of this; false = retried/recovered
+  }): void {
+    this.writer.write({
+      stage: 'error',
+      eventType: 'caught_error',
+      payload: {
+        ...data,
+        message: typeof data.message === 'string' ? safeSlice(data.message, 500) : '',
+        stack: typeof data.stack === 'string' ? safeSlice(data.stack, 800) : data.stack,
+      },
+    });
+  }
+
+  /**
+   * One-shot summary at end of Run. Replaces having to grep through 500
+   * events to count passes / failures / LLM cost. Fields cumulative.
+   */
+  writeRunSummary(data: {
+    previewSessionId: string;
+    intentTestCaseId?: string;
+    totalSteps: number;
+    passed: number;
+    failed: number;
+    skipped: number;
+    cancelled: boolean;
+    timedOut: boolean;
+    totalDurationMs: number;
+    /** Aggregated by reader from compiled_postcondition events; emit only when measured. */
+    compiledHits?: number;
+    compiledMisses?: number;
+    /** Aggregated by reader from llm_request_end events; emit only when measured. */
+    llmCalls?: number;
+    llmTotalDurationMs?: number;
+    failedStepIds?: string[];
+    failedStepReasons?: string[];
+  }): void {
+    this.writer.write({
+      stage: 'run',
+      eventType: 'run_summary',
       payload: data,
     });
   }

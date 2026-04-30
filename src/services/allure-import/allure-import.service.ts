@@ -15,10 +15,13 @@
  *  - Never throws from the top-level processImport() method.
  */
 
-import fs from 'fs/promises';
-import path from 'path';
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
+import {
+  downloadAllureObject,
+  removeAllureObject,
+  resolveStorageKey,
+} from './allure-import.storage';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { parseAllureZip } from './allure-parser';
 import {
@@ -161,7 +164,7 @@ export interface AllureImportResult {
 /**
  * Process a full Allure ZIP import.
  *
- * @param jobData       - BullMQ job data (importId, projectId, userId, zipFilePath, options)
+ * @param jobData       - BullMQ job data (importId, projectId, userId, storageKey, options)
  * @param emitProgress  - Callback for WebSocket progress events
  * @returns Final stats + hierarchy tree (always — never throws)
  */
@@ -170,7 +173,7 @@ export async function processAllureImport(
   emitProgress: ProgressEmitter,
 ): Promise<AllureImportResult> {
   const { importId, projectId, userId, workspaceId, options } = jobData;
-  const filePath = jobData.filePath ?? jobData.zipFilePath!;
+  const storageKey = resolveStorageKey(jobData);
   const stats = emptyStats();
   const startTime = Date.now();
 
@@ -198,23 +201,6 @@ export async function processAllureImport(
     }
   };
 
-  /**
-   * Clean up the temp ZIP file and its parent directory.
-   * Fire-and-forget — failures are logged but don't affect the import result.
-   */
-  const cleanupTempFile = async (): Promise<void> => {
-    try {
-      const dir = path.dirname(filePath);
-      await fs.rm(dir, { recursive: true, force: true });
-      logger.debug('[AllureImport] Cleaned up temp file', { filePath });
-    } catch (e) {
-      logger.warn('[AllureImport] Failed to clean up temp file (non-fatal)', {
-        filePath,
-        error: e instanceof Error ? e.message : String(e),
-      });
-    }
-  };
-
   // ── Bootstrap ────────────────────────────────────────────────────────────
   await createImportRecord({ importId, projectId, userId, workspaceId });
 
@@ -224,7 +210,7 @@ export async function processAllureImport(
   let parsedData: Awaited<ReturnType<typeof parseAllureZip>>;
 
   try {
-    const zipBuffer = await fs.readFile(filePath);
+    const zipBuffer = await downloadAllureObject(storageKey);
     parsedData = await parseAllureZip(zipBuffer);
 
     stats.totalFiles =
@@ -261,7 +247,7 @@ export async function processAllureImport(
       error_message: message,
     });
 
-    await cleanupTempFile();
+    await removeAllureObject(storageKey);
 
     // Only phase where we propagate — caller (job handler) decides whether to retry
     throw err;
@@ -462,7 +448,7 @@ export async function processAllureImport(
     file_size: jobData.originalFileSize,
   });
 
-  await cleanupTempFile();
+  await removeAllureObject(storageKey);
 
   return { stats, hierarchy };
 }
@@ -486,7 +472,7 @@ async function processCsvPdfImport(
   emitProgress: ProgressEmitter,
 ): Promise<AllureImportResult> {
   const { importId, projectId, userId, workspaceId, options } = jobData;
-  const filePath = jobData.filePath ?? jobData.zipFilePath!;
+  const storageKey = resolveStorageKey(jobData);
   const sourceFormat = jobData.sourceFormat ?? 'csv';
   const stats = emptyStats();
   const startTime = Date.now();
@@ -515,18 +501,6 @@ async function processCsvPdfImport(
     }
   };
 
-  const cleanupTempFile = async (): Promise<void> => {
-    try {
-      const dir = path.dirname(filePath);
-      await fs.rm(dir, { recursive: true, force: true });
-    } catch (e) {
-      logger.warn('[AllureCsvPdfImport] Failed to clean up temp file (non-fatal)', {
-        filePath,
-        error: e instanceof Error ? e.message : String(e),
-      });
-    }
-  };
-
   // ── Bootstrap ────────────────────────────────────────────────────────────
   await createImportRecord({ importId, projectId, userId, workspaceId });
 
@@ -536,15 +510,17 @@ async function processCsvPdfImport(
   let parsedTestCases: ParsedTestCaseFromLLM[];
 
   try {
+    const objectBuffer = await downloadAllureObject(storageKey);
+
     if (sourceFormat === 'csv') {
-      const csvContent = await fs.readFile(filePath, 'utf-8');
+      const csvContent = objectBuffer.toString('utf-8');
       const csvResult = await parseAllureCsv(csvContent, (current, total) => {
         emitPhase('parsing', current, total, `Parsing CSV rows (batch ${current}/${total})…`);
       });
       parsedTestCases = csvResult.testCases;
       stats.errors.push(...csvResult.errors);
     } else {
-      const pdfResult = await parseAllurePdf(filePath, (current, total) => {
+      const pdfResult = await parseAllurePdf(objectBuffer, (current, total) => {
         emitPhase('parsing', current, total, `Parsing PDF pages (chunk ${current}/${total})…`);
       });
       parsedTestCases = pdfResult.testCases;
@@ -574,7 +550,7 @@ async function processCsvPdfImport(
     } catch (_) { /* ignore */ }
 
     await updateImportRecord(importId, { status: 'failed', stats, error_message: message });
-    await cleanupTempFile();
+    await removeAllureObject(storageKey);
     throw err;
   }
 
@@ -741,7 +717,7 @@ async function processCsvPdfImport(
     file_name: jobData.originalFileName,
     file_size: jobData.originalFileSize,
   });
-  await cleanupTempFile();
+  await removeAllureObject(storageKey);
 
   return { stats, hierarchy };
 }

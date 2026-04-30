@@ -14,8 +14,24 @@ import {
   updateChatSessionTitle,
 } from './chat-sessions.controller';
 import { debugChatData, getChatHistory, getCurrentChatHistory, handleChat } from './chat.controller';
+import testCaseChatRoutes from './test-case-chat.route';
 
 const router = Router();
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-test-case chat sub-router
+//
+// Mounted FIRST so its more-specific path (`/test-cases/:testCaseId/...`)
+// wins over any future generic `/:something` patterns added below. The
+// sub-router applies `requireTestCaseAccess` itself — we don't add it
+// here so a future maintainer who reorders mounts cannot accidentally
+// drop access checks.
+//
+// Auth chain at this point: requireAuth + requireApproved (set in
+// src/index.ts at the parent mount); requireTestCaseAccess is then
+// applied inside `testCaseChatRoutes`.
+// ─────────────────────────────────────────────────────────────────────
+router.use('/test-cases/:testCaseId', testCaseChatRoutes);
 
 // ============================================================================
 // MULTER CONFIGURATION FOR CHAT FILE UPLOADS
@@ -414,29 +430,68 @@ router.post('/cancel',
       }
     } else {
       // ✅ FIX #2: Verify user owns this chat session (per-user chat model)
+      //
+      // sessionId may belong to either backend:
+      //   - chat_sessions          (legacy global workspace chat)
+      //   - test_case_chat_sessions (per-test-case chat, lazy-created)
+      //
+      // We probe both tables and remember which one matched. The match
+      // determines:
+      //   (a) ownership check (user_id must match), and
+      //   (b) which cancellation registry to hit below.
+      //
+      // 404 only when NEITHER table has the row. 403 when the row exists
+      // but belongs to another user — same response in both backends so
+      // we don't leak which kind of session id this was.
       try {
         const { supabaseAdmin } = await import('@/db/supabase');
-        const { data: session, error: sessionError } = await supabaseAdmin
+
+        // Probe global first (hot path — vast majority of cancel calls
+        // today are workspace-chat). Falls through to test-case probe
+        // only if global doesn't have the row.
+        const { data: globalSession } = await supabaseAdmin
           .from('chat_sessions')
-          .select('id, workspace_id, user_id')
+          .select('id, user_id')
           .eq('id', chatSessionId)
           .maybeSingle();
 
-        if (sessionError || !session) {
+        let resolvedKind: 'global' | 'testcase' | null = null;
+        let resolvedOwner: string | null = null;
+        if (globalSession) {
+          resolvedKind = 'global';
+          resolvedOwner = (globalSession as any).user_id;
+        } else {
+          const { data: tcSession } = await supabaseAdmin
+            .from('test_case_chat_sessions')
+            .select('id, user_id')
+            .eq('id', chatSessionId)
+            .maybeSingle();
+          if (tcSession) {
+            resolvedKind = 'testcase';
+            resolvedOwner = (tcSession as any).user_id;
+          }
+        }
+
+        if (!resolvedKind) {
           res.status(404).json({
             success: false,
             error: 'Chat session not found',
           });
           return;
         }
-
-        if (session.user_id !== userId) {
+        if (resolvedOwner !== userId) {
           res.status(403).json({
             success: false,
             error: 'Access denied to this chat session',
           });
           return;
         }
+
+        // Stash the kind on the request locals so the cancel block below
+        // doesn't have to repeat the probe. Express types don't have a
+        // `locals` for Request — using a plain property is the path of
+        // least resistance and stays type-safe via the as-any below.
+        (req as any)._chatSessionKind = resolvedKind;
       } catch (error) {
         logger.error('[CHAT] Failed to verify session access', {
           error: error instanceof Error ? error.message : String(error),
@@ -451,15 +506,35 @@ router.post('/cancel',
       }
     }
 
-    // ✅ CRITICAL: Cancel active request processing first
-    // ✅ FIX #3: Handle errors from cancelActiveRequest
+    // ✅ CRITICAL: Cancel active request processing first.
+    //
+    // Route to the correct cancellation registry:
+    //   - global   → legacy `cancelActiveRequest` (in-memory Map keyed
+    //                by sessionId; today's behavior, byte-for-byte)
+    //   - testcase → namespaced registry via `RequestKey` so we abort
+    //                the AbortController stored in the test-case Map
+    //                rather than miss the lookup in the global Map.
+    //
+    // Without this branch, calling /chat/cancel for a test-case sessionId
+    // would silently return {cancelled: false} and the in-flight LLM
+    // request would never abort — a real bug, not just a smell.
     let requestCancelResult: { cancelled: boolean; message?: string } = {
       cancelled: false,
-      message: undefined
+      message: undefined,
     };
     try {
-      const { cancelActiveRequest } = await import('./shared/request-cancellation');
-      requestCancelResult = await cancelActiveRequest(chatSessionId, userId);
+      const sessionKind = (req as any)._chatSessionKind as 'global' | 'testcase' | undefined;
+      if (sessionKind === 'testcase') {
+        const { cancel: registryCancel, keyOfTestCase } = await import('./shared/request-key');
+        requestCancelResult = await registryCancel(keyOfTestCase(chatSessionId), userId);
+      } else {
+        // Default to legacy registry. Covers:
+        //   - sessionKind === 'global' (resolved by the probe above)
+        //   - sessionKind === undefined (request without explicit sessionId
+        //     — getOrCreateChatSession resolved a global one)
+        const { cancelActiveRequest } = await import('./shared/request-cancellation');
+        requestCancelResult = await cancelActiveRequest(chatSessionId, userId);
+      }
     } catch (error) {
       logger.error('[CHAT] Failed to cancel active request', {
         error: error instanceof Error ? error.message : String(error),

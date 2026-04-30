@@ -82,6 +82,9 @@ export interface MobileIntentStepOptions {
   // App management
   activityName?: string;
   clearData?: boolean;
+  /** close_app: when true the runner clears app data (Android: `pm clear`).
+   *  Absent / false keeps the soft `am force-stop` behaviour for back-compat. */
+  hard?: boolean;
   // Gesture options
   startX?: number;
   startY?: number;
@@ -300,6 +303,28 @@ export interface MobileHealthResponse {
   service: string;
   uptime: number;
   activeSessions: number;
+}
+
+// ── UI State (live read of current screen for AI Agent) ─────────────
+// Mirror of the runner's UiStateSnapshot. Kept as a loose shape here
+// because the backend only reads these fields — we don't want to import
+// the runner's A11yTree type into the backend just to re-export it.
+
+export interface MobileUiState {
+  sessionId: string;
+  platform: 'android' | 'ios';
+  app?: string;
+  activity?: string;
+  fingerprint: string;
+  screenSize: { width: number; height: number };
+  windowInfo?: { keyboardVisible?: boolean; hasDialog?: boolean };
+  /** Compact ASCII dump of the a11y tree — drop straight into an LLM prompt. */
+  formattedTree: string;
+  /** Raw A11yTree. Opaque to the backend; omit from the wire with ?includeTree=false. */
+  tree?: unknown;
+  /** base64-encoded PNG. Omit with ?includeScreenshot=false. */
+  screenshotBase64?: string;
+  capturedAt: string;
 }
 
 // ── BullMQ Job Data ──────────────────────────────────────────────

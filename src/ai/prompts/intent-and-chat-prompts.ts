@@ -22,7 +22,8 @@ export interface IntentParserContext {
 
   // Editor mode context
   mode?: 'lite' | 'pro' | 'editor';
-  previewSessionId?: string;   // Active preview session (editor mode)
+  previewSessionId?: string;   // Active preview session (web editor mode)
+  mobileSessionId?: string;    // Active runner session (mobile editor mode)
 
   // Regression context (for save/run test intents)
   lastTestId?: string;          // ID of last executed test
@@ -105,16 +106,97 @@ CONTEXT RULES:
 }
 
 /**
- * Build editor mode context section for intent prompt.
- * Only included when user is in editor mode with a live preview session.
+ * Build mobile editor mode context section for intent prompt.
+ * Mirror of buildEditorModeSection for the mobile runner preview
+ * (Android / iOS / Flutter / React-Native emulator). Triggers on the
+ * presence of `mobileSessionId` — the mobile editor is a capability
+ * surfaced through context, not a separate `mode` literal (symmetric
+ * with how the web editor uses `previewSessionId`, not a bespoke `mode`).
+ *
+ * DELIBERATELY omits the raw mobileSessionId value from the prompt body.
+ * The classifier has no use for it, and injecting it would poison the
+ * OpenAI / Gemini prefix cache (every session → unique prefix → 0% cache
+ * hit). See the block-ordering comment at the bottom of buildIntentPrompt.
+ */
+function buildMobileEditorModeSection(context?: IntentParserContext): string {
+  if (!context || !context.mobileSessionId) return '';
+
+  return `
+--- MOBILE EDITOR MODE (ACTIVE) ---
+
+The user is in the MOBILE EDITOR with a live device preview (Android / iOS / Flutter / React Native).
+The chat is embedded inside the mobile editor — there is NO platform_test flow here.
+
+CRITICAL CONTEXT PRIORITY:
+The user is actively working in the mobile editor RIGHT NOW. Any previous chat history about
+web tests, API tests, or other projects is SECONDARY context. Focus on the CURRENT message
+in the context of the live mobile screen. The classifier has no screen snapshot — if the
+request requires reading UI state, prefer mobile_agent (it will observe the device itself)
+over guessing.
+
+MOBILE EDITOR INTENT RULES (override general rules):
+- "platform_test" is NOT AVAILABLE in mobile editor mode. NEVER choose it.
+- "mobile_test" is the async BullMQ job-queuer for recorded step replay — NEVER choose it
+  for live interactive requests. Only when the user explicitly says "replay recorded steps"
+  with no saved test case should mobile_test be considered.
+- "editor_action" is the WEB fast-path. NEVER choose it in mobile editor mode.
+- "mobile_action" — ONE atomic action on the current screen: tap, swipe, type into a field,
+  scroll, press key (back / home / enter), long-press. Fast path, no planning.
+  Examples: "tap login", "swipe up", "type 'hello' in search", "press back", "scroll down".
+- "mobile_agent" — ANYTHING multi-step or that needs observation/planning:
+    • authoring: "create a checkout test", "make a registration flow"
+    • exploration: "explore this app", "map the main flows"
+    • screen questions: "what's on the screen?", "is the login visible?"
+    • form filling (whole form, not one field): "fill the registration form"
+    • verification: "check that the error appears"
+- "run_regression" — user wants to replay a SAVED test case by id/name. The regression
+  service routes mobile saved cases to the mobile queue; no mobile-specific handler needed.
+- "save_test" — user wants to persist the last completed mobile run (requires lastTestId).
+- "general_chat" — pure conversation, explanations, analytics about PAST tests.
+- "needs_clarification" — remains available. If the user's mobile request is genuinely
+  ambiguous ("fix it", "make it work"), ask instead of guessing between action and agent.
+
+DECIDING mobile_action vs mobile_agent:
+  Pick mobile_action ONLY when the message describes a SINGLE, CONCRETE, ATOMIC gesture
+  that can be done without observing prior state. If in doubt → mobile_agent.
+  • "tap cart icon"                       → mobile_action  (single gesture)
+  • "type admin in the login field"       → mobile_action  (single gesture)
+  • "scroll down"                         → mobile_action  (single gesture)
+  • "fill the form"                       → mobile_agent   (multi-field)
+  • "log in"                              → mobile_agent   (multi-step flow)
+  • "tap login, then tap submit"          → mobile_agent   (multiple gestures)
+  • "is the login button visible?"        → mobile_agent   (needs observation)
+
+ANTI-CONFUSION RULES:
+- If chat history mentions web tests but user asks about the mobile screen → mobile_action
+  or mobile_agent per the rule above. Never editor_action.
+- The user's CURRENT message + mobile editor mode context ALWAYS wins over chat history.
+- Credentials mentioned in the message (login/password) are still extracted into the
+  "credentials" field regardless of intent — mobile handlers use them downstream.
+
+`;
+}
+
+/**
+ * Build web editor mode context section for intent prompt.
+ * Only included when user is in editor mode with a live preview session AND
+ * they are NOT in the mobile editor. When both signals are present (shouldn't
+ * happen but defends against a frontend bug sending both ids), mobile wins
+ * because mobile_action / mobile_agent are strict subsets of "editor mode"
+ * concepts and the classifier cannot serve two conflicting rule sets.
+ *
+ * Note: previewSessionId is NOT injected into the prompt body — same cache
+ * reason as the mobile block. The classifier has no use for the raw id.
  */
 function buildEditorModeSection(context?: IntentParserContext): string {
   if (!context || context.mode !== 'editor' || !context.previewSessionId) return '';
+  // Mobile editor takes precedence — see buildMobileEditorModeSection jsdoc.
+  if (context.mobileSessionId) return '';
 
   return `
 --- EDITOR MODE (ACTIVE) ---
 
-The user is in EDITOR MODE with a live browser preview (previewSessionId: ${context.previewSessionId}).
+The user is in EDITOR MODE with a live browser preview.
 The chat is embedded inside the editor — there is NO platform_test flow here.
 
 CRITICAL CONTEXT PRIORITY:
@@ -167,8 +249,9 @@ export function buildIntentPrompt(
     'coverage_analysis',
   ];
 
-  // Build regression context if available
-  const regressionContextStr = buildRegressionContextSection(context);
+  // NOTE: dynamic context sections are appended at the end of this function,
+  // AFTER the static rules + examples, to preserve a cacheable prefix for
+  // OpenAI/Gemini prompt caching. See the comment block near the bottom.
 
   let prompt = `You are an AI assistant understanding natural language like ChatGPT. Analyze the MESSAGE CONTEXT to determine what the user truly wants.
 
@@ -252,8 +335,6 @@ AVAILABLE INTENTS: ${intents.join(', ')}
    - Only when user has a live preview session (previewSessionId in context)
    - NOT for questions about the page — use general_chat for those
 
-${regressionContextStr}
-${buildEditorModeSection(context)}
 --- DECISION TREE ---
 
 1. Short approval message ("yes", "go", "давай", "запусти", "ok", etc.) — look at CONVERSATION HISTORY:
@@ -297,7 +378,7 @@ If the user provides login+password in their message (ANY language), extract int
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "editor_action",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "editor_action" | "mobile_test" | "mobile_action" | "mobile_agent" | "api_flow_test",
   "intent_confidence": 0.0-1.0,
   "rawText": string
 }
@@ -404,22 +485,69 @@ Ex17: "привет" / "hello" / "спасибо" / "thanks"
 Ex18: "что ты умеешь?" / "what can you do?"
 → {"intent": "general_chat", "intent_confidence": 0.95, "needsTools": false, "rawText": "..."}
 
-Ex23: "click the login button" (previewSessionId in context)
+Ex23: "click the login button" (previewSessionId in context — WEB editor, NOT mobile)
 → {"intent": "editor_action", "intent_confidence": 0.95, "rawText": "..."}
 
-Ex24: "type hello in the search input" (previewSessionId in context)
+Ex24: "type hello in the search input" (previewSessionId in context — WEB editor, NOT mobile)
 → {"intent": "editor_action", "intent_confidence": 0.93, "rawText": "..."}
 
-Ex25: "run the registration test" (previewSessionId in context, editor mode)
+Ex25: "run the registration test" (previewSessionId in context, WEB editor mode)
 → {"intent": "run_regression", "intent_confidence": 0.88, "rawText": "..."}
 
 Ex26: "explore this site https://myapp.com" / "найди все flow на repetino.kz"
 → {"intent": "platform_test", "intent_confidence": 0.92, "page": "https://myapp.com", "scope": "full", "executionStrategy": "exploration", "rawText": "..."}
 
 Ex27: "Проверь авторизацию на juz40-edu.kz Логин: admin Пароль: qwerty123"
-→ {"intent": "platform_test", "intent_confidence": 0.92, "scope": "auth", "target": "authorization", "page": "juz40-edu.kz", "credentials": {"login": "admin", "loginType": "username", "password": "qwerty123"}, "rawText": "..."}`;
+→ {"intent": "platform_test", "intent_confidence": 0.92, "scope": "auth", "target": "authorization", "page": "juz40-edu.kz", "credentials": {"login": "admin", "loginType": "username", "password": "qwerty123"}, "rawText": "..."}
 
-  // Add context if available
+Ex28: "tap the login button" (mobileSessionId in context)
+→ {"intent": "mobile_action", "intent_confidence": 0.95, "target": "login button", "rawText": "..."}
+
+Ex29: "swipe up" / "скролл вниз" (mobileSessionId in context)
+→ {"intent": "mobile_action", "intent_confidence": 0.93, "rawText": "..."}
+
+Ex30: "type 'admin' in the email field" (mobileSessionId in context)
+→ {"intent": "mobile_action", "intent_confidence": 0.93, "target": "email field", "value": "admin", "rawText": "..."}
+
+Ex31: "press back" / "нажми назад" (mobileSessionId in context)
+→ {"intent": "mobile_action", "intent_confidence": 0.95, "rawText": "..."}
+
+Ex32: "что сейчас на экране?" / "what's on the screen?" (mobileSessionId in context)
+→ {"intent": "mobile_agent", "intent_confidence": 0.90, "rawText": "..."}
+
+Ex33: "create a checkout test" / "создай тест регистрации" (mobileSessionId in context)
+→ {"intent": "mobile_agent", "intent_confidence": 0.92, "target": "checkout flow", "rawText": "..."}
+
+Ex34: "log in with admin/qwerty123" (mobileSessionId in context) — multi-step
+→ {"intent": "mobile_agent", "intent_confidence": 0.90, "target": "login flow", "credentials": {"login": "admin", "loginType": "username", "password": "qwerty123"}, "rawText": "..."}
+
+Ex35: "запусти сохраненный мобильный тест abc-123" (mobileSessionId in context)
+→ {"intent": "run_regression", "intent_confidence": 0.92, "savedTestCaseId": "abc-123", "rawText": "..."}
+
+Ex36: "fix it" / "сделай нормально" (mobileSessionId in context, ambiguous)
+→ {"intent": "needs_clarification", "intent_confidence": 0.55, "clarificationQuestion": "What exactly would you like me to do on this screen?", "possibleIntents": ["mobile_action", "mobile_agent"], "clarificationReason": "Request too vague for a mobile action or flow", "rawText": "..."}`;
+
+  // ─────────────────────────────────────────────────────────────────────
+  // DYNAMIC SECTIONS (appended AFTER the static prefix on purpose)
+  //
+  // Prefix-caching strategy:
+  //   - OpenAI auto prompt cache needs ≥1024 tokens of IDENTICAL prefix
+  //     → ~50% token discount, ~2× TTFB.
+  //   - Gemini implicit caching (2.5 Flash / Pro) → ~75% discount when
+  //     the prefix matches byte-for-byte across calls.
+  //   - Anthropic cache_control works the same way when we introduce it.
+  //
+  // Anything that varies per-user / per-turn goes HERE, below the static
+  // rules + examples, so the cacheable prefix stays hot across all users
+  // of the classifier. Do NOT interleave dynamic blocks back into the
+  // static body without measuring the cache-hit regression.
+  // ─────────────────────────────────────────────────────────────────────
+  const regressionContextStr = buildRegressionContextSection(context);
+  if (regressionContextStr) prompt += `\n${regressionContextStr}`;
+  prompt += buildEditorModeSection(context);
+  prompt += buildMobileEditorModeSection(context);
+
+  // RAG / traces / project metadata — also per-call, also dynamic.
   if (context) {
     if (context.documentation && context.documentation.length > 0) {
       prompt += `\n📚 DOCS: ${context.documentation.slice(0, 3).join('\n')}`;

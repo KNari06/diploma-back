@@ -2,6 +2,7 @@ import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logge
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import type { ChatAttachment } from '../chat.types';
+import type { ChatStore } from '@/services/utils/chat-store';
 import { PROGRESS } from './constants';
 import { getHandler, type IntentHandler } from './handler-registry';
 import { checkRequestAborted } from './request-cancellation';
@@ -28,6 +29,23 @@ export async function routeToHandler(
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
     executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
     attachments?: ChatAttachment[]; // File attachments (images + documents)
+    /**
+     * Persistence backend for this request. Set by the controller branch:
+     * GLOBAL_STORE for legacy workspace chat, TESTCASE_STORE for per-test-
+     * case chat. Handlers MUST use ChatPersistence.* with this store rather
+     * than calling ChatService.* directly — otherwise test-case writes leak
+     * into the global tables. New handlers thread this through unchanged;
+     * legacy handlers default to GLOBAL_STORE so the global path stays
+     * byte-for-byte identical until they're individually migrated.
+     */
+    chatStore?: ChatStore;
+    /**
+     * The exact RequestKey under which this request was registered with
+     * the cancellation registry. Handlers don't need this for happy-path
+     * work — but pass it through so quick-action endpoints / sub-handlers
+     * that may emit further WS traffic can target the right room.
+     */
+    testCaseId?: string;
   }
 ): Promise<void> {
   // ═══════════════════════════════════════════════════════════════════════
@@ -44,7 +62,11 @@ export async function routeToHandler(
     params.chatSessionId,
     'generating_plan',
     routingMessage,
-    PROGRESS.ROUTING
+    PROGRESS.ROUTING,
+    undefined,
+    // Pass testCaseId for dual-emit into `chat:tc:<tcid>` room. When
+    // unset (legacy global path) emit goes only to `chat:<sessionId>`.
+    params.testCaseId,
   );
 
   if (params.abortSignal) {
@@ -87,6 +109,12 @@ export async function routeToHandler(
     mode: params.mode,
     executionStrategy: params.executionStrategy,
     attachments: params.attachments,
+    // Pass through persistence backend + test-case binding. Migrated
+    // handlers (general_chat, editor_action) read these and route their
+    // saves accordingly. Non-migrated handlers receive but ignore them
+    // (TypeScript widens IntentHandlerParams below to accept extras).
+    chatStore: params.chatStore,
+    testCaseId: params.testCaseId,
   });
 }
 
@@ -96,7 +124,7 @@ export async function routeToHandler(
 function getRoutingMessage(intent: string): string {
   switch (intent) {
     case 'general_chat':
-      return 'Connecting to assistant...';
+      return 'Thinking...';
     case 'platform_test':
       return 'Preparing test environment...';
     case 'api_test':
@@ -124,6 +152,10 @@ function getRoutingMessage(intent: string): string {
       return 'Executing action...';
     case 'mobile_test':
       return 'Preparing mobile emulator...';
+    case 'mobile_action':
+      return 'Tapping on the device...';
+    case 'mobile_agent':
+      return 'Reading the mobile screen...';
     default:
       return 'Processing your request...';
   }

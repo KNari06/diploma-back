@@ -186,10 +186,48 @@ const envSchema = z.object({
   FEATURE_ORG_MEMBERS_ENABLED: z.string().transform(v => v === 'true').default('true'),
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
+  // ──────────────────────────────────────────────────────────────────
+  // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
+  //
+  // When false (default), POST /chat with `testCaseId` returns 404
+  // and the per-test-case routes / WS subscribe channel are
+  // unreachable. The legacy global chat path is unaffected. This lets
+  // us merge backend changes ahead of frontend without exposing the
+  // half-wired surface to clients.
+  //
+  // Migration `20260429_test_case_chat.sql` is independent of this
+  // flag — it can be applied first; tables stay empty until the flag
+  // flips on.
+  //
+  // To enable: set ENABLE_TEST_CASE_CHAT=true in the deployment env.
+  //   - Per-test-case REST endpoints become live
+  //   - POST /chat accepts testCaseId
+  //   - WS subscribe:chat:testcase begins responding
+  // ──────────────────────────────────────────────────────────────────
+  ENABLE_TEST_CASE_CHAT: z.string().transform(v => v === 'true').default('false'),
+
   // Mobile Runner (qait-mobile-runner microservice)
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
+
+  // Intent classifier fast-path — set to 'true' to disable the deterministic
+  // whitelist that short-circuits trivial messages (greetings, cancels, yes/no
+  // after pending confirmation). Kill-switch for the rare case the whitelist
+  // misclassifies something.
+  INTENT_FAST_PATH_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // Intent classifier short-TTL cache — guards against double-submit and
+  // instant retries by caching the full (message + context) pair for 60s.
+  // Set to 'true' to disable.
+  INTENT_CACHE_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // Mobile-agent reasoning persistence. When true (default), each turn's
+  // think_aloud entries are written to chat_messages.metadata.reasoningTrace.
+  // Set to 'false' for cost-sensitive deployments where JSONB bloat
+  // matters more than the post-hoc "why did the agent do X" debug surface.
+  // WebSocket streaming is unaffected by this flag.
+  MOBILE_AGENT_PERSIST_REASONING: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
 });
 
 // Parse and validate environment variables

@@ -3428,12 +3428,16 @@ export class CommandExecutor {
             }
           }
 
-          // Run LLM-based element resolution
+          // Run LLM-based element resolution.
+          // V22: regression / replay path → use HEAL prompt that biases
+          // toward finding the closest match using recordedFingerprint.
+          // The element existed before; returning null breaks the test.
           const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
           // V14: Lazy screenshot callback for vision rescue when 0 candidates match
           const pageForScreenshot = this.page;
           const resolveResult = await resolveElement({
             previewSessionId: 'background', // Not a preview session
+            mode: 'heal',
             stepDraft: {
               id: stepId,
               type: intentMeta.actionType as any,
@@ -3561,6 +3565,7 @@ export class CommandExecutor {
 
                   const scrollResolve = await resolveElement({
                     previewSessionId: 'background',
+                    mode: 'heal', // V22: regression heal path
                     stepDraft: {
                       id: stepId,
                       type: intentMeta.actionType as any,

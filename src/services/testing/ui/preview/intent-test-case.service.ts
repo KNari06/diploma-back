@@ -341,7 +341,7 @@ export class IntentTestCaseService {
         // evidence from execution). Without this merge, any PATCH that includes steps (reorder,
         // rename, add step) would wipe compiled plans and force LLM fallback on next background run.
         const hasStepsMissingBackendFields = mergedSteps.some(s =>
-          !s.compiled || !s.evidence
+          !s.compiled || !s.evidence || !s.recordedFingerprint
         );
 
         if (hasStepsMissingBackendFields) {
@@ -376,6 +376,19 @@ export class IntentTestCaseService {
                 }
                 if (!step.bindingHints && existing.bindingHints) {
                   merged.bindingHints = existing.bindingHints;
+                  changed = true;
+                }
+                // recordedFingerprint comes from one of two origins:
+                //   1. recorder probe at click time (genuine recording)
+                //   2. preview-step-apply.service.ts:buildSyntheticFingerprintFromNode
+                //      after the first successful manual-step apply
+                // Frontend's `toIntentStepForSave` never serializes this
+                // field (manual draft conversion path strips it), so any
+                // frontend-driven PATCH would otherwise wipe a synthesized
+                // fingerprint. Preserve it from DB just like compiled /
+                // evidence / bindingHints — same backend-owned policy.
+                if (!step.recordedFingerprint && existing.recordedFingerprint) {
+                  merged.recordedFingerprint = existing.recordedFingerprint;
                   changed = true;
                 }
 

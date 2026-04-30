@@ -6,36 +6,66 @@
  */
 
 import { randomUUID } from 'crypto';
-import os from 'os';
-import path from 'path';
-import fs from 'fs/promises';
 import type { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
 import { supabaseAdmin } from '@/db/supabase';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { resolveImportOptions } from '@/services/allure-import/allure-import.types';
+import {
+  ALLURE_IMPORTS_BUCKET,
+  buildStorageKey,
+  contentTypeForFormat,
+  removeAllureObject,
+} from '@/services/allure-import/allure-import.storage';
+import { PERMISSIONS, WorkspaceAccessService } from '@/services/core/workspace-access.service';
 import type { AllureImportJobData, AllureSourceFormat } from '@/services/allure-import/allure-import.types';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Prefix for temp upload files — makes cleanup easy if orphaned. */
-const TEMP_DIR_PREFIX = 'qai-allure-';
+/**
+ * Upload the buffer to Supabase Storage and return the object key.
+ * Both API and worker pods read this bucket, so the worker can fetch the file
+ * regardless of which pod the upload landed on.
+ */
+async function uploadToStorage(
+  buffer: Buffer,
+  storageKey: string,
+  contentType: string,
+): Promise<void> {
+  const { error } = await supabaseAdmin.storage
+    .from(ALLURE_IMPORTS_BUCKET)
+    .upload(storageKey, buffer, {
+      contentType,
+      upsert: false,
+      cacheControl: '3600',
+    });
+
+  if (error) {
+    logger.error('[AllureImportController] Storage upload failed', {
+      storageKey,
+      error: error.message,
+    });
+    throw new Error(`Failed to upload Allure file to storage: ${error.message}`);
+  }
+}
 
 /**
- * Write the uploaded buffer to a temp file on disk and return the path.
- * This avoids storing the entire file as base64 in Redis (~133% bloat).
+ * Parse a multipart-form boolean field with strict semantics.
+ *
+ * Multer/multipart turns every body field into a string, so a JSON `false` is
+ * sent as the literal `"false"`. Treat any of `"false"|"0"|"off"|"no"` (case
+ * insensitive) as opt-out. Missing field → default (true for our toggles).
  */
-async function writeUploadToTempFile(
-  buffer: Buffer,
-  importId: string,
-  extension: string,
-): Promise<string> {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), TEMP_DIR_PREFIX));
-  const filePath = path.join(tempDir, `${importId}.${extension}`);
-  await fs.writeFile(filePath, buffer);
-  return filePath;
+function parseBoolField(value: unknown, defaultValue: boolean): boolean {
+  if (value === undefined || value === null || value === '') return defaultValue;
+  if (typeof value === 'boolean') return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (normalized === 'false' || normalized === '0' || normalized === 'off' || normalized === 'no') {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -49,29 +79,53 @@ function detectSourceFormat(file: Express.Multer.File): AllureSourceFormat {
 }
 
 /**
- * Verify that the requesting user has access to the given project.
- * Returns false if the project doesn't exist or user isn't a member.
+ * Verify the user can write tests in the given project.
+ *
+ * Looks up the project's workspace, then checks `TEST_WRITE` membership in that
+ * workspace. Allows owner + any teammate with the right role — not just the
+ * project's original creator.
+ *
+ * Returns false if the project is missing, the workspace doesn't match, or the
+ * user lacks permission. Also returns false on transient DB errors (logged).
  */
-async function verifyProjectAccess(
+async function verifyProjectWriteAccess(
   projectId: string,
+  workspaceId: string,
   userId: string,
 ): Promise<boolean> {
-  const { data, error } = await supabaseAdmin
+  const { data: project, error } = await supabaseAdmin
     .from('projects')
-    .select('id')
+    .select('id, workspace_id')
     .eq('id', projectId)
-    .eq('user_id', userId)
     .maybeSingle();
 
   if (error) {
-    logger.warn('[AllureImportController] Project access check error', {
+    logger.warn('[AllureImportController] Project lookup error', {
       projectId,
       userId,
       error: error.message,
     });
+    return false;
   }
 
-  return !!data;
+  if (!project || project.workspace_id !== workspaceId) {
+    return false;
+  }
+
+  return WorkspaceAccessService.hasPermission(userId, workspaceId, PERMISSIONS.TEST_WRITE);
+}
+
+/**
+ * Verify the user can read import records in the given workspace.
+ *
+ * Used by GET status/details endpoints. Workspace is resolved via the import
+ * record itself, so callers don't need to pass it.
+ */
+async function verifyWorkspaceReadAccess(
+  workspaceId: string,
+  userId: string,
+): Promise<boolean> {
+  return WorkspaceAccessService.hasPermission(userId, workspaceId, PERMISSIONS.PROJECT_READ);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,6 +141,11 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
     }
 
     const fileBuffer = req.file.buffer;
+    if (fileBuffer.length === 0) {
+      res.status(400).json({ success: false, error: 'Uploaded file is empty.' });
+      return;
+    }
+
     const sourceFormat = detectSourceFormat(req.file);
 
     // ── 2. Validate required fields ───────────────────────────────────────
@@ -107,8 +166,8 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // ── 3. Project access check ───────────────────────────────────────────
-    const hasAccess = await verifyProjectAccess(projectId, userId);
+    // ── 3. Project access check (workspace membership + TEST_WRITE) ──────
+    const hasAccess = await verifyProjectWriteAccess(projectId, workspaceId, userId);
     if (!hasAccess) {
       res.status(403).json({
         success: false,
@@ -119,11 +178,11 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
 
     // ── 4. Resolve import options from request body ───────────────────────
     const options = resolveImportOptions({
-      importTestCases:    req.body.importTestCases   !== 'false',
-      autoCreateModules:  req.body.autoCreateModules !== 'false',
-      autoCreateFlows:    req.body.autoCreateFlows   !== 'false',
-      deduplicateTests:   req.body.deduplicateTests  !== 'false',
-      saveDocsToKB:       req.body.saveDocsToKB      !== 'false',
+      importTestCases:   parseBoolField(req.body.importTestCases,   true),
+      autoCreateModules: parseBoolField(req.body.autoCreateModules, true),
+      autoCreateFlows:   parseBoolField(req.body.autoCreateFlows,   true),
+      deduplicateTests:  parseBoolField(req.body.deduplicateTests,  true),
+      saveDocsToKB:      parseBoolField(req.body.saveDocsToKB,      true),
     });
 
     const importId = randomUUID();
@@ -136,9 +195,9 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       fileSizeBytes: fileBuffer.length,
     });
 
-    // ── 5. Write file to temp (avoids base64 bloat in Redis) ──────────
-    const extension = sourceFormat === 'csv' ? 'csv' : sourceFormat === 'pdf' ? 'pdf' : 'zip';
-    const filePath = await writeUploadToTempFile(fileBuffer, importId, extension);
+    // ── 5. Upload file to Supabase Storage (shared between API + worker) ─
+    const storageKey = buildStorageKey(userId, importId, sourceFormat);
+    await uploadToStorage(fileBuffer, storageKey, contentTypeForFormat(sourceFormat));
 
     // ── 6. Always dispatch via BullMQ (avoids blocking event loop) ────
     const jobData: AllureImportJobData = {
@@ -147,13 +206,20 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
       userId,
       workspaceId,
       sourceFormat,
-      filePath,
+      storageKey,
       originalFileName: req.file.originalname,
       originalFileSize: fileBuffer.length,
       options,
     };
 
-    await QueueManager.addAllureImportJob(jobData);
+    try {
+      await QueueManager.addAllureImportJob(jobData);
+    } catch (queueErr) {
+      // Storage upload already succeeded but the job never got queued — drop the
+      // object so we don't leak it into the bucket forever.
+      await removeAllureObject(storageKey);
+      throw queueErr;
+    }
 
     res.status(202).json({
       success: true,
@@ -201,12 +267,10 @@ export async function getImportStatus(req: Request, res: Response): Promise<void
       return;
     }
 
-    // Look up the import record
     const { data, error } = await supabaseAdmin
       .from('allure_imports')
-      .select('id, status, stats, error_message, created_at, completed_at')
+      .select('id, workspace_id, status, stats, error_message, created_at, completed_at')
       .eq('id', importId)
-      .eq('user_id', userId)
       .maybeSingle();
 
     if (error) {
@@ -219,6 +283,11 @@ export async function getImportStatus(req: Request, res: Response): Promise<void
     }
 
     if (!data) {
+      res.status(404).json({ success: false, error: 'Import not found' });
+      return;
+    }
+
+    if (!(await verifyWorkspaceReadAccess(data.workspace_id, userId))) {
       res.status(404).json({ success: false, error: 'Import not found' });
       return;
     }
@@ -264,9 +333,8 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
     // 1. Fetch the import record
     const { data: importRecord, error: importError } = await supabaseAdmin
       .from('allure_imports')
-      .select('id, project_id, status, stats, error_message, file_name, created_at, completed_at')
+      .select('id, project_id, workspace_id, status, stats, error_message, file_name, created_at, completed_at')
       .eq('id', importId)
-      .eq('user_id', userId)
       .maybeSingle();
 
     if (importError) {
@@ -278,8 +346,15 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
       return;
     }
 
+    if (!(await verifyWorkspaceReadAccess(importRecord.workspace_id, userId))) {
+      res.status(404).json({ success: false, error: 'Import not found' });
+      return;
+    }
+
     // 2. Fetch test cases created during this import window
-    //    Match by project_id + created_at between import start and completion
+    //    Match by project_id + created_at between import start and completion.
+    //    Workspace membership was already verified above, so we don't re-filter
+    //    by user_id (which would exclude tests created by other teammates).
     const projectId = importRecord.project_id;
     const importStart = importRecord.created_at;
     const importEnd = importRecord.completed_at ?? new Date().toISOString();
@@ -288,7 +363,6 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
       .from('intent_test_cases')
       .select('id, name, description, steps_json, flow_id, tags, priority, status, created_at, test_flows(name, module_id, test_modules(name))')
       .eq('project_id', projectId)
-      .eq('user_id', userId)
       .gte('created_at', importStart)
       .lte('created_at', importEnd)
       .order('created_at', { ascending: true })

@@ -457,6 +457,7 @@ async function checkWorkspaceCredits(
     res.status(402).json({
       success: false,
       error: 'Insufficient credits',
+      code: 'INSUFFICIENT_CREDITS',
       message: `Your organization needs at least ${requiredCredits} credits to perform this action. Current: ${currentCredits}`,
       currentCredits,
       requiredCredits,

@@ -18,6 +18,7 @@ import type {
   MobileHealthResponse,
   MobileIntentStep,
   MobileTestMetadata,
+  MobileUiState,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 
@@ -180,7 +181,7 @@ export class MobileRunnerClient {
   async executeBatchCommands(
     sessionId: string,
     commands: unknown[],
-    opts?: { interactive?: boolean; timeoutMs?: number },
+    opts?: { interactive?: boolean; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<{ results: unknown[] }> {
     return this.request<{ results: unknown[] }>(
       'POST',
@@ -192,6 +193,7 @@ export class MobileRunnerClient {
         // Interactive commands must not retry — a failed tap should not
         // be silently retried (user may have already moved on).
         noRetry: opts?.interactive,
+        signal: opts?.signal,
       },
     );
   }
@@ -343,6 +345,56 @@ export class MobileRunnerClient {
         ? { intent, actionType, bindingHints }
         : { intent, actionType },
       timeoutMs: 15_000, // LLM resolve can take a few seconds
+    });
+  }
+
+  // ── UI State (live read for mobile AI Agent) ───────────────────
+
+  /**
+   * Snapshot the current foreground screen of a live session. Returns the
+   * a11y tree (pre-formatted + optionally raw), screenshot, app identity,
+   * and a stable fingerprint.
+   *
+   * Thin wrapper over the runner's `GET /api/sessions/:id/ui-state`. Read
+   * only — no graph or scratchpad mutation on the runner side.
+   *
+   * Defaults to `includeTree=false` because the backend's mobile-agent
+   * only consumes `formattedTree` (the raw tree would just waste wire
+   * bandwidth). Screenshot defaults to ON — the executor LLM is multimodal
+   * and reading the image noticeably improves element resolution vs tree
+   * alone.
+   *
+   * Errors surface as MobileRunnerError with the runner's status code:
+   *   - 404 → session not found (stale mobileSessionId from the frontend)
+   *   - 409 → screen unreadable (splash, semantics disabled, transient)
+   *   - 500 → capture threw on the runner
+   * Callers should handle 404/409 as user-visible messages; 5xx as
+   * "try again".
+   */
+  async fetchUiState(
+    sessionId: string,
+    opts?: {
+      includeTree?: boolean;
+      includeScreenshot?: boolean;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    },
+  ): Promise<MobileUiState> {
+    const params = new URLSearchParams();
+    if (opts?.includeTree === false) params.set('includeTree', 'false');
+    // Screenshot defaults: on (multimodal prompt helps). Only opt out.
+    if (opts?.includeScreenshot === false) params.set('includeScreenshot', 'false');
+    const qs = params.toString();
+    const path = `/api/sessions/${sessionId}/ui-state${qs ? `?${qs}` : ''}`;
+
+    return this.request<MobileUiState>('GET', path, {
+      // Capture involves a device a11y dump + screencap — typically 200-800ms,
+      // but a busy emulator can spike. Budget 8s, don't retry (a stale read
+      // with 2s latency is fine; a double-screenshot on retry wastes the
+      // device's time).
+      timeoutMs: opts?.timeoutMs ?? 8_000,
+      noRetry: true,
+      signal: opts?.signal,
     });
   }
 

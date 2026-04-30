@@ -4,17 +4,21 @@
  * Resolves intent steps to candidate elements using LLM semantic matching
  */
 
-import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
+import { AI_MODELS, AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
+    getEffectiveLabel,
     resolveElement,
     sanitizeIntent,
 } from './element-resolver.service';
 import { EditorTraceService } from './editor-trace.service';
 import { evaluateEvidenceShortcut } from './evidence-shortcut.utils';
+import { logIntentResolveLint } from './intent-resolve-audit';
+import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { getPreviewSessionService } from './preview-session.service';
+import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
     IntentStep,
     InteractiveNode,
@@ -54,6 +58,24 @@ const CONFIDENCE = {
   LOW: 0.3,
   AMBIGUOUS_THRESHOLD: 0.15, // Max score difference to consider ambiguous
   AI_FALLBACK_THRESHOLD: 0.4, // Below this, trigger AI fallback
+  /**
+   * V23 (April 2026): Score floor for rule-based scoring.
+   *
+   * When LLM is degraded and rule-based scoring runs, top candidates routinely
+   * land in the 0.03-0.10 confidence band — that means "matched on tag-only,
+   * no semantic overlap". Showing 3 such candidates as "did you mean one of
+   * these?" misleads users: they look like real suggestions, but they're just
+   * the first three <a>/<button> on the page.
+   *
+   * Below this floor (~15% of max possible score), the right answer is
+   * not_found with a clear "no element matches" message — NOT a forced top-3
+   * list. Above the floor, the candidates are at least semantically related
+   * and showing them helps the user disambiguate.
+   *
+   * 0.15 chosen empirically: above this requires at least one of
+   * label/aria/text/placeholder partial match; below means tag-only.
+   */
+  RULE_SCORE_FLOOR: 0.15,
 };
 
 // Action type to element type mappings (V2: added check/uncheck/toggle/open/close)
@@ -249,6 +271,27 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
     if (matchCount > 0) {
       score += WEIGHTS.ARIA_LABEL_MATCH * (matchCount / keywords.length);
       reasons.push(`AriaLabel matches ${matchCount} keywords`);
+    }
+  }
+
+  // V23: title attribute keyword match — same scoring tier as aria-label
+  // because per WAI-ARIA spec `title` IS an accessible name source. Without
+  // this, intents matching `<a title="Папкалар">` (Angular routerLink icon
+  // menus) score 0 from rule-based path even though title carries identity.
+  if (node.title && keywords.length > 0) {
+    const matchCount = keywords.filter(kw => normalizeText(node.title).includes(kw)).length;
+    if (matchCount > 0) {
+      score += WEIGHTS.ARIA_LABEL_MATCH * (matchCount / keywords.length);
+      reasons.push(`Title matches ${matchCount} keywords`);
+    }
+  }
+  // V23: <img alt> match — accessible name for image targets. Same tier.
+  const altAttr = (node as any).alt as string | undefined;
+  if (altAttr && keywords.length > 0) {
+    const matchCount = keywords.filter(kw => normalizeText(altAttr).includes(kw)).length;
+    if (matchCount > 0) {
+      score += WEIGHTS.ARIA_LABEL_MATCH * (matchCount / keywords.length);
+      reasons.push(`Alt matches ${matchCount} keywords`);
     }
   }
 
@@ -459,6 +502,168 @@ function rankCandidatesByFingerprint(
     .sort((a, b) => b.score - a.score);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// V23: Clarification scenario classifier
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Determines WHY lint couldn't resolve a step, so the clarification message
+// addresses the actual problem instead of always saying "describe better".
+//
+// Order matters — earlier scenarios take precedence when multiple apply.
+//
+// PAGE_MISMATCH        — recorded URL doesn't match current URL (covered by
+//                        URL guard upstream; this scenario is the prompt-side
+//                        fallback for cases where guard passes but content
+//                        diverges, e.g. SPA same-URL).
+// AI_DEGRADED          — LLM resolver failed (timeout / circuit breaker /
+//                        rate limit / parse). Showing "describe better" lies;
+//                        the issue is on our side.
+// NO_RECORDED_MATCH    — step has recordedFingerprint with TIER1 tokens
+//                        (id/testId/dataValue) but no live candidate carries
+//                        any of them. Probably wrong page or DOM rebuilt.
+// AMBIGUOUS_RIGHT_PAGE — top score is reasonable but multiple candidates tie.
+//                        User actually needs to pick or refine.
+// VAGUE_DESC           — top confidence < 0.3 with recorded match present
+//                        (one candidate matches recordedFp but description
+//                        is too short to be sure). Suggest improving wording.
+// GENERIC              — generic intent ("button", "ссылка"), many candidates.
+type ClarifyScenario =
+  | 'PAGE_MISMATCH'
+  | 'AI_DEGRADED'
+  | 'NO_RECORDED_MATCH'
+  | 'AMBIGUOUS_RIGHT_PAGE'
+  | 'VAGUE_DESC'
+  | 'GENERIC';
+
+interface ClarifyScenarioInput {
+  stepDraft: IntentStep;
+  candidates: LintCandidate[];
+  topConfidence: number;
+  currentUrl: string;
+  degradedReason?: string;
+  isSemanticZero?: boolean;
+}
+
+/**
+ * Cyrillic↔Latin glyph fold for visually identical letters. Lets us match
+ * "MAT-SMART" (Latin M-A-T) against "МАТ-SMART" (Cyrillic М-А-Т) when the
+ * intent and DOM disagree on script. Mirrors the fold used in apply-mode
+ * label guard.
+ */
+function cyrLatFold(s: string): string {
+  return (s || '').toLowerCase()
+    .replace(/[аА]/g, 'a')
+    .replace(/[еЕ]/g, 'e')
+    .replace(/[оО]/g, 'o')
+    .replace(/[рР]/g, 'p')
+    .replace(/[сС]/g, 'c')
+    .replace(/[хХ]/g, 'x')
+    .replace(/[уУ]/g, 'y')
+    .replace(/[мМ]/g, 'm')
+    .replace(/[тТ]/g, 't')
+    .replace(/[кК]/g, 'k')
+    .replace(/[вВ]/g, 'b')
+    .replace(/[нН]/g, 'h');
+}
+
+/**
+ * Tokenize for set-overlap comparison: drop short / numeric / pure-symbol
+ * tokens, fold script, dedupe. Compatible with the apply-mode tokenizer.
+ */
+function clarifyTokenize(s: string): Set<string> {
+  return new Set(
+    cyrLatFold(s)
+      .split(/[\s\W_]+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length >= 3 && !/^\d+$/.test(t)),
+  );
+}
+
+function classifyClarifyScenario(input: ClarifyScenarioInput): ClarifyScenario {
+  const { stepDraft, candidates, topConfidence, degradedReason } = input;
+
+  // 1. AI_DEGRADED — anything that came in with a degradedReason from the
+  //    upstream resolver. URL_mismatch is excluded because URL guard already
+  //    handled it before the rule fallback ever ran.
+  if (degradedReason && degradedReason !== 'url_mismatch') {
+    return 'AI_DEGRADED';
+  }
+
+  // 2. NO_RECORDED_MATCH — recorded TIER1/2 tokens present, none in any candidate.
+  const recordedFp = stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint;
+  if (recordedFp && candidates.length > 0) {
+    const recordedTier1: string[] = [
+      recordedFp.elementId,
+      recordedFp.testIdAttr,
+      (recordedFp as any).childTestId,
+      (recordedFp as any).dataValue,
+      (recordedFp as any).dataRowKey,
+      recordedFp.name,
+    ].filter(Boolean) as string[];
+
+    const recordedTextTokens = new Set<string>();
+    // V23: parity with live-side liveText — include alt/iconLabel/svgIcon/etc
+    // so manually-recorded steps with identity in those fields cross-match too.
+    [
+      recordedFp.labelText, recordedFp.ariaLabel, recordedFp.text, recordedFp.title,
+      (recordedFp as any).alt, (recordedFp as any).iconLabel, (recordedFp as any).svgIcon,
+      (recordedFp as any).childTestId, (recordedFp as any).customElementTag,
+    ]
+      .filter(Boolean)
+      .forEach((t) => clarifyTokenize(t!).forEach((tok) => recordedTextTokens.add(tok)));
+
+    if (recordedTier1.length > 0 || recordedTextTokens.size > 0) {
+      const anyMatch = candidates.some((c) => {
+        const node = c.node;
+        if (!node) return false;
+        // TIER1 exact id/testId/etc match
+        for (const v of recordedTier1) {
+          const folded = cyrLatFold(v);
+          if (
+            cyrLatFold(node.id || '') === folded ||
+            cyrLatFold(node.testIdAttr || '') === folded ||
+            cyrLatFold((node as any).dataValue || '') === folded ||
+            cyrLatFold(node.name || '') === folded
+          ) {
+            return true;
+          }
+        }
+        // text token overlap
+        if (recordedTextTokens.size > 0) {
+          // V23: include all identity sources — alt/iconLabel/svgIcon/childTestId/
+          // customElementTag — so cross-fingerprint match isn't blocked when
+          // identity lives on derived fields (Angular Material `<a title>`,
+          // Lucide `<svg data-lucide>`, Vue `<img alt>` etc).
+          const liveText = [
+            node.labelText, node.ariaLabel, node.text, node.placeholder, node.title,
+            (node as any).alt, (node as any).iconLabel, (node as any).svgIcon,
+            (node as any).childTestId, (node as any).customElementTag,
+          ].filter(Boolean).join(' ');
+          const liveTokens = clarifyTokenize(liveText);
+          for (const t of recordedTextTokens) {
+            if (liveTokens.has(t)) return true;
+          }
+        }
+        return false;
+      });
+      if (!anyMatch) return 'NO_RECORDED_MATCH';
+    }
+  }
+
+  // 3. AMBIGUOUS_RIGHT_PAGE — multiple candidates, top confidence ≥ 0.5.
+  if (candidates.length >= 2 && topConfidence >= 0.5) {
+    return 'AMBIGUOUS_RIGHT_PAGE';
+  }
+
+  // 4. VAGUE_DESC — recorded fp present, low top confidence, short intent.
+  if (recordedFp && topConfidence < 0.5 && (stepDraft.description || '').trim().length < 25) {
+    return 'VAGUE_DESC';
+  }
+
+  // 5. GENERIC — fallthrough.
+  return 'GENERIC';
+}
+
 /**
  * Intent Step Lint Service
  */
@@ -467,6 +672,30 @@ export class IntentStepLintService {
    * Lint a step against the current page context
    */
   static async lintStep(params: {
+    previewSessionId: string;
+    stepDraft: IntentStep;
+    pageRef?: string;
+    userId: string;
+  }): Promise<LintResult> {
+    const { previewSessionId, stepDraft, userId } = params;
+
+    // Attribute every LLM call made during this lint to the editor user,
+    // labelled as 'ai-selector' so it shows up in the AI activity feed.
+    return withAIContext(
+      {
+        workspaceId: '',
+        userId,
+        operationType: 'lite-test',
+        logSource: 'ai-selector',
+        logActionType: 'lint-step',
+        logEntityType: 'test_execution',
+        logEntityId: previewSessionId,
+      },
+      () => this._lintStepInner(params),
+    ) as Promise<LintResult>;
+  }
+
+  private static async _lintStepInner(params: {
     previewSessionId: string;
     stepDraft: IntentStep;
     pageRef?: string;
@@ -561,6 +790,30 @@ export class IntentStepLintService {
       const maxPossibleScore = WEIGHTS.LABEL_TEXT_EXACT + WEIGHTS.ROLE_MATCH + WEIGHTS.TYPE_MATCH + WEIGHTS.AUTOCOMPLETE_MATCH;
       const confidence = Math.min(topScore / maxPossibleScore, 1);
 
+      // V23: Score floor — if every candidate matched on tag-only (no semantic
+      // overlap with intent label/aria/text), surfacing them as suggestions is
+      // misleading. The user gets a "did you mean one of these?" panel filled
+      // with the first 3 <a>/<button> on the page that have nothing to do with
+      // their intent. Better to return not_found with a clear message and let
+      // the LLM pipeline / URL guard / sceneSummary explain WHY.
+      if (confidence < CONFIDENCE.RULE_SCORE_FLOOR) {
+        logger.info('[INTENT_LINT] Rule-based score below floor, returning not_found', {
+          previewSessionId,
+          topScore,
+          confidence: Math.round(confidence * 100) / 100,
+          floor: CONFIDENCE.RULE_SCORE_FLOOR,
+          candidatesCount: scoredCandidates.length,
+        });
+        return {
+          status: 'not_found',
+          message: `Не найдено элемента, подходящего под описание "${stepDraft.description}". Возможно, страница ещё не загрузилась или нужно уточнить описание (текст, роль, расположение).`,
+          confidence,
+          candidates: [],
+          highlight: [],
+          needsAiFallback: true,
+        };
+      }
+
       // Check for ambiguous candidates (multiple high scorers)
       const topCandidates = scoredCandidates.filter(
         c => (topScore - c.score) / topScore <= CONFIDENCE.AMBIGUOUS_THRESHOLD
@@ -572,7 +825,7 @@ export class IntentStepLintService {
       // Build result (V2: prefer labelText for label display)
       const candidateResults: LintCandidate[] = topCandidates.slice(0, 5).map(c => ({
         ref: c.node.ref,
-        label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+        label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
         reason: c.reasons.slice(0, 3).join(', '),
         confidence: Math.min(c.score / maxPossibleScore, 1),
         boundingBox: c.node.boundingBox,
@@ -667,7 +920,81 @@ export class IntentStepLintService {
      * Defaults to false so library consumers keep the historical throttled behavior.
      */
     forceFreshSnapshot?: boolean;
+    /**
+     * Audit-only context for logs/intent_resolve.log so apply-time pre-lints
+     * vs editor lints can be told apart in analysis.
+     */
+    auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other';
   }): Promise<LintResult> {
+    // Diagnostic wrapper: captures intent + LintResult into intent_resolve.log
+    // for every lint call. Implementation lives in `_lintStepWithAIImpl`.
+    //
+    // V26: AI tracking context — every LLM call inside the lint pipeline
+    // (resolver, candidate-pruner, vision rescue) reads userId/workspace
+    // from the AsyncLocalStorage context. Without this wrap, AI calls are
+    // logged as "Skipping AI log (no userId)" and never billed/audited.
+    // `lintStep` (rule-only path, line 684) has the same wrap; here we
+    // mirror it for the AI-enabled path used by Apply All / preview run.
+    const startedAt = Date.now();
+    let lastUrl: string | undefined;
+    let domNodeCount: number | undefined;
+    try {
+      const result = await withAIContext(
+        {
+          workspaceId: '',
+          userId: params.userId,
+          operationType: 'lite-test',
+          logSource: 'ai-selector',
+          logActionType: 'lint-step',
+          logEntityType: 'test_execution',
+          logEntityId: params.previewSessionId,
+        },
+        () => IntentStepLintService._lintStepWithAIImpl(params, (url, count) => {
+          lastUrl = url;
+          domNodeCount = count;
+        }),
+      ) as LintResult;
+      try {
+        logIntentResolveLint({
+          stepDraft: params.stepDraft,
+          result,
+          url: lastUrl,
+          durationMs: Date.now() - startedAt,
+          trigger: params.auditTrigger || 'other',
+          domNodeCount,
+        });
+      } catch { /* never break lint on diagnostics */ }
+      return result;
+    } catch (err) {
+      try {
+        logIntentResolveLint({
+          stepDraft: params.stepDraft,
+          result: {
+            status: 'error' as LintStatus,
+            message: err instanceof Error ? err.message : String(err),
+            confidence: 0,
+            candidates: [],
+            highlight: [],
+          },
+          url: lastUrl,
+          durationMs: Date.now() - startedAt,
+          trigger: params.auditTrigger || 'other',
+          domNodeCount,
+        });
+      } catch { /* never break lint on diagnostics */ }
+      throw err;
+    }
+  }
+
+  private static async _lintStepWithAIImpl(params: {
+    previewSessionId: string;
+    stepDraft: IntentStep;
+    pageRef?: string;
+    userId: string;
+    includeAlternatives?: boolean;
+    forceFreshSnapshot?: boolean;
+    auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other';
+  }, onContext?: (url: string | undefined, domNodeCount: number) => void): Promise<LintResult> {
     const { previewSessionId, stepDraft, userId, includeAlternatives = false, forceFreshSnapshot = false } = params;
 
     logger.debug('[INTENT_LINT] Linting step with LLM resolver', {
@@ -688,16 +1015,27 @@ export class IntentStepLintService {
       };
     }
 
+    // V23: phase timings — snapshot/evidence/resolve. Replay analysis used
+    // to think `decisionTrace.llm.latencyMs=19820` meant "LLM was slow", but
+    // it actually measured the whole lint pipeline. Snapshot collect on a
+    // 59K-DOM page took 17s; the LLM itself was 1.7s. Without per-phase
+    // numbers we'd keep blaming the wrong layer. Each phase timer starts
+    // right before its work begins; values are passed up through
+    // `onContext` and surfaced in `decisionTrace.timing` for diff analysis.
+    const lintImplStart = Date.now();
+
     // Get snapshot. Throttle is bypassed when the caller signals user intent
     // (Find button, debounced lint, apply) — the 500ms cache may be stale if a
     // modal/dropdown just appeared or the user interacted with the page since
     // the last interval tick. fullPage: include below-viewport elements.
     const sessionService = getPreviewSessionService();
+    const snapshotStart = Date.now();
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       includeDomNodes: true,
       fullPage: true,
       force: forceFreshSnapshot,
     });
+    const snapshotMs = Date.now() - snapshotStart;
 
     if (!snapshot) {
       return {
@@ -710,6 +1048,75 @@ export class IntentStepLintService {
     }
 
     const domNodes = snapshot.domNodes ?? [];
+    try { onContext?.(snapshot.url, domNodes.length); } catch { /* audit-only */ }
+    // Log per-phase right when it finishes — independent of return path so
+    // huge-page regressions are visible even when the step ultimately passes.
+    if (snapshotMs > 1000) {
+      logger.warn('[INTENT_LINT_TIMING] snapshot collect was slow', {
+        previewSessionId,
+        snapshotMs,
+        domNodeCount: domNodes.length,
+        url: snapshot.url,
+        forceFreshSnapshot,
+      });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // URL guard (V23): if the step was recorded / previously applied on a URL
+    // that doesn't match the current page, short-circuit before LLM and
+    // rule-based fallback. Without this guard, lint on the wrong page returns
+    // 3 random <a> tags with confidence 0.04 and a misleading "description
+    // too vague" message — actually the navigation didn't reach the right
+    // page (or the user is editing the step on the landing instead of the
+    // page where the element lives).
+    //
+    // Manual-add steps (no compiled.context.pageUrl AND no evidence.pageUrl)
+    // are intentionally skipped — there's no recorded URL to compare against.
+    //
+    // Uses the same `normalizeUrlForComparison` (origin + pathname, no query
+    // / hash / trailing slash) that evidence-shortcut and apply's
+    // `compiledUrlStale` check use, so behaviour is consistent across paths.
+    //
+    // Known limitations (intentional, mirror evidence-shortcut policy):
+    //   - SPA same-URL different-content: guard passes (no false positive,
+    //     but also no protection — relied on resolver downstream).
+    //   - Parametrized paths (/courses/123 vs /courses/456): guard fires.
+    //     Acceptable: better a clear "wrong page" message than 3 random links.
+    //   - Hash routing: normalizer strips hash. Known limitation, same as
+    //     evidence-shortcut.
+    // ═══════════════════════════════════════════════════════════════════════════
+    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'wait_for_email']);
+    if (!NON_TARGETING_FOR_URL_GUARD.has(stepDraft.type)) {
+      const recordedUrl = stepDraft.compiled?.context?.pageUrl || stepDraft.evidence?.pageUrl;
+      if (recordedUrl) {
+        const recordedNorm = normalizeUrlForComparison(recordedUrl);
+        const currentNorm = normalizeUrlForComparison(snapshot.url);
+        if (recordedNorm && currentNorm && recordedNorm !== currentNorm) {
+          logger.info('[INTENT_LINT] URL guard tripped — step recorded on different page', {
+            previewSessionId,
+            stepId: stepDraft.id,
+            recordedUrl,
+            currentUrl: snapshot.url,
+            recordedNorm,
+            currentNorm,
+            source: stepDraft.compiled?.context?.pageUrl ? 'compiled' : 'evidence',
+          });
+          return {
+            status: 'not_found',
+            message: `Шаг записан для страницы ${recordedNorm}, сейчас открыто ${currentNorm}. Проверьте, что предыдущие шаги привели на нужную страницу — возможно, навигация не сработала.`,
+            confidence: 0,
+            candidates: [],
+            highlight: [],
+            // Carry the URL pair for the editor UI / audit log so the user
+            // sees exactly which navigation failed instead of a generic
+            // "describe better" hint.
+            // Reusing degradedReason so existing UI paths surface it.
+            degradedMode: false,
+            degradedReason: 'url_mismatch' as any,
+          } as LintResult;
+        }
+      }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // V5: Evidence shortcut - try lastSuccessRef first (when caching is enabled)
@@ -756,6 +1163,15 @@ export class IntentStepLintService {
         // semantic_mismatch). Helps spot drift after pipeline changes.
         cacheMetrics.inc('evidence-shortcut', shortcut.reason);
         cacheMetrics.inc('evidence-shortcut', 'miss');
+        try {
+          EditorTraceService.get(previewSessionId)?.writeEvidenceShortcut({
+            stepId: stepDraft.id,
+            hit: false,
+            cachedRef: stepDraft.evidence.lastSuccessRef,
+            reason: shortcut.reason,
+            detail: shortcut.details,
+          });
+        } catch { /* non-fatal */ }
       } else {
         const { node: cachedNode, ref: cachedRef } = shortcut;
         // Preview-specific: validate the cached node's tag/role against the action
@@ -779,7 +1195,7 @@ export class IntentStepLintService {
             confidence: 0.95,
             candidates: [{
               ref: cachedRef,
-              label: cachedNode.labelText || cachedNode.ariaLabel || cachedNode.text || cachedNode.placeholder || `<${cachedNode.tag}>`,
+              label: getEffectiveLabel(cachedNode) || `<${cachedNode.tag}>`,
               reason: 'Evidence shortcut (lastSuccessRef)',
               confidence: 0.95,
               boundingBox: cachedNode.boundingBox,
@@ -807,6 +1223,12 @@ export class IntentStepLintService {
                 evidenceShortcut: true,
                 evidenceRef: cachedRef,
                 latencyMs: 0,
+              });
+              trace.writeEvidenceShortcut({
+                stepId: stepDraft.id,
+                hit: true,
+                cachedRef,
+                reason: 'ok',
               });
             }
           } catch { /* trace logging must never break resolution */ }
@@ -837,6 +1259,7 @@ export class IntentStepLintService {
       stepDraft,
       domNodes,
       pageUrl: snapshot.url,
+      viewport: snapshot.viewport,
       includeAlternatives,
       screenshot: async () => {
         try {
@@ -869,6 +1292,36 @@ export class IntentStepLintService {
     });
     const resolveLatencyMs = Date.now() - resolveStartMs;
 
+    // V23: attach phase timings to resolverResult so they propagate up into
+    // decisionTrace via the LintResult contract. All paths below that
+    // ultimately return a LintResult inherit these via spread. Mutating is
+    // safe — resolverResult is a local LintResult, not shared.
+    const totalMs = Date.now() - lintImplStart;
+    resolverResult.phaseTimings = {
+      snapshotMs,
+      resolveMs: resolveLatencyMs,
+      totalMs,
+      domNodeCount: domNodes.length,
+    };
+
+    // V23: per-phase summary log. Always emitted at debug for every lint;
+    // promoted to info when total lint took >2s so slowdowns surface in
+    // production logs without flooding under normal load. Phases:
+    //   snapshotMs  — DOM collect from page.evaluate
+    //   resolveMs   — full resolveElement (incl. LLM, vision, identity,
+    //                 evidence, prescore, candidate building)
+    //   totalMs     — start of _lintStepWithAIImpl to here
+    const lvl = totalMs > 2000 ? 'info' : 'debug';
+    logger[lvl]('[INTENT_LINT_TIMING] lint phase breakdown', {
+      previewSessionId,
+      stepType: stepDraft.type,
+      snapshotMs,
+      resolveMs: resolveLatencyMs,
+      totalMs,
+      domNodeCount: domNodes.length,
+      resolverPath: resolverResult.resolverPath,
+    });
+
     // ── TRACE: Write full element resolution diagnostic to editor JSONL ──
     try {
       const trace = EditorTraceService.get(previewSessionId);
@@ -896,7 +1349,11 @@ export class IntentStepLintService {
       });
 
       // Use old rule-based + LLM fallback
-      return this.lintStepWithRuleBasedFallback(params, { url: snapshot.url, domNodes });
+      return this.lintStepWithRuleBasedFallback(
+        params,
+        { url: snapshot.url, domNodes },
+        resolverResult.degradedReason, // V23: preserve real cause (circuit/timeout/error)
+      );
     }
 
     // Step 2.5: V2 - Handle semantic-zero with explicit AI fallback
@@ -907,14 +1364,25 @@ export class IntentStepLintService {
         topSimilarity: resolverResult.topSimilarity,
       });
 
-      // Generate a helpful clarification message using AI
+      // V23: classify scenario so the message addresses the actual problem.
+      const scenarioSemanticZero = classifyClarifyScenario({
+        stepDraft,
+        candidates: resolverResult.candidates.slice(0, 5),
+        topConfidence: resolverResult.confidence ?? 0,
+        currentUrl: snapshot.url,
+        degradedReason: undefined, // resolver succeeded, just no semantic match
+        isSemanticZero: true,
+      });
       const clarifyResult = await this.generateClarificationQuestion({
         userIntent: sanitizeIntent(stepDraft),
         actionType: stepDraft.type,
         pageUrl: snapshot.url,
-        candidates: resolverResult.candidates.slice(0, 5), // Use top candidates for context
+        candidates: resolverResult.candidates.slice(0, 5),
         domNodes,
-        isSemanticZero: true, // V2: Flag for semantic-zero specific messaging
+        isSemanticZero: true, // legacy compat
+        scenario: scenarioSemanticZero,
+        stepDraft,
+        topConfidence: resolverResult.confidence ?? 0,
       });
 
       // Build descriptive message
@@ -948,18 +1416,28 @@ export class IntentStepLintService {
           stepDraft,
           domNodes,
           pageUrl: snapshot.url,
+          viewport: snapshot.viewport,
           includeAlternatives: true,
         });
         candidatesForLLM = withCandidates.candidates;
       }
 
-      // Generate clarification message using LLM
+      // V23: classify scenario.
+      const scenarioNeedsClarif = classifyClarifyScenario({
+        stepDraft,
+        candidates: candidatesForLLM,
+        topConfidence: resolverResult.confidence ?? 0,
+        currentUrl: snapshot.url,
+      });
       const clarifyResult = await this.generateClarificationQuestion({
         userIntent: sanitizeIntent(stepDraft),
         actionType: stepDraft.type,
         pageUrl: snapshot.url,
         candidates: candidatesForLLM,
         domNodes,
+        scenario: scenarioNeedsClarif,
+        stepDraft,
+        topConfidence: resolverResult.confidence ?? 0,
       });
 
       // Build the message with examples if available
@@ -984,6 +1462,12 @@ export class IntentStepLintService {
   /**
    * V4: Rule-based fallback (used when LLM resolver fails)
    * IMPORTANT: LLM is allowed ONLY to generate clarification text (never selects refs).
+   *
+   * V23 (April 2026): Accepts the upstream `resolverDegradedReason` so the
+   * actual LLM failure mode (`circuit_breaker_open`, `llm_error`, `timeout`,
+   * `rate_limited`) survives into the final LintResult instead of being
+   * collapsed to the generic `'llm_unavailable'`. Audit logs and UI can then
+   * differentiate "AI временно лежит из-за каскада" vs "одиночный таймаут".
    */
   private static async lintStepWithRuleBasedFallback(
     params: {
@@ -992,9 +1476,14 @@ export class IntentStepLintService {
       pageRef?: string;
       userId: string;
     },
-    snapshot: { url: string; domNodes: InteractiveNode[] }
+    snapshot: { url: string; domNodes: InteractiveNode[]; viewport?: { width: number; height: number } },
+    resolverDegradedReason?: string,
   ): Promise<LintResult> {
     const { previewSessionId, stepDraft } = params;
+    // Preserve the upstream reason; fall back to the generic label only when
+    // upstream didn't supply one (e.g. lint reached this method via paths that
+    // don't carry resolverResult).
+    const degradedReason = resolverDegradedReason || 'llm_unavailable';
 
     // Rule-based scoring (degraded path)
     const ruleResult = await this.lintStep(params);
@@ -1004,7 +1493,7 @@ export class IntentStepLintService {
       return {
         ...ruleResult,
         degradedMode: true,
-        degradedReason: 'llm_unavailable',
+        degradedReason,
       };
     }
 
@@ -1013,7 +1502,7 @@ export class IntentStepLintService {
       return {
         ...ruleResult,
         degradedMode: true,
-        degradedReason: 'llm_unavailable',
+        degradedReason,
       };
     }
 
@@ -1030,7 +1519,7 @@ export class IntentStepLintService {
         candidates: [],
         highlight: [],
         degradedMode: true,
-        degradedReason: 'llm_unavailable',
+        degradedReason,
       };
     }
 
@@ -1079,7 +1568,7 @@ export class IntentStepLintService {
             type: 'success' as const,
           }],
           degradedMode: true,
-          degradedReason: 'llm_unavailable',
+          degradedReason,
         };
       }
       logger.debug('[INTENT_LINT_V4] Degraded mode: fingerprint did not yield clear winner', {
@@ -1095,12 +1584,24 @@ export class IntentStepLintService {
       candidateCount: validCandidates.length,
     });
 
+    // V23: classify — degraded path; the upstream degradedReason flows through.
+    const scenarioDegraded = classifyClarifyScenario({
+      stepDraft,
+      candidates: validCandidates,
+      topConfidence: ruleResult.confidence ?? 0,
+      currentUrl: snapshot.url,
+      degradedReason, // real cause: circuit_breaker_open / llm_error / timeout
+    });
     const clarifyResult = await this.generateClarificationQuestion({
       userIntent: sanitizeIntent(stepDraft),
       actionType: stepDraft.type,
       pageUrl: snapshot.url,
       candidates: validCandidates,
       domNodes: snapshot.domNodes,
+      scenario: scenarioDegraded,
+      stepDraft,
+      topConfidence: ruleResult.confidence ?? 0,
+      degradedReason,
     });
 
     return {
@@ -1117,7 +1618,7 @@ export class IntentStepLintService {
       clarificationQuestion: clarifyResult.question,
       needsAiFallback: false,
       degradedMode: true,
-      degradedReason: 'llm_unavailable',
+      degradedReason,
     };
   }
 
@@ -1130,8 +1631,28 @@ export class IntentStepLintService {
    * Does NOT select elements - just helps user refine their description.
    */
   /**
-   * V5: Generate LLM clarification question for ambiguous or semantic-zero cases
-   * V2 update: Added isSemanticZero flag for different messaging approach
+   * V23: Generate context-aware clarification message.
+   *
+   * The classifier (`classifyClarifyScenario`) decides WHY lint failed; this
+   * method translates that into a message + examples for the user. The LLM
+   * is asked to produce localized, scenario-appropriate text — but each
+   * branch ALSO has a deterministic fallback so when LLM is degraded the
+   * user still gets the right WHY (just less polished).
+   *
+   * Inputs the prompt now sees that v2 didn't:
+   *   - recordedFingerprint snapshot (id/testId/labelText/role)
+   *   - bindingHints (label/text/role/landmark)
+   *   - recordedPageUrl vs currentPageUrl pair
+   *   - top candidate confidence (number)
+   *   - degradedReason (real cause if AI lay)
+   *   - scenario label (PAGE_MISMATCH / AI_DEGRADED / etc.)
+   *
+   * Output stays the same shape (`question` / `interpretation` / `examples`)
+   * so existing callers don't change.
+   *
+   * V2 backwards-compat: callers that still pass `isSemanticZero=true` are
+   * implicitly mapped to scenario='NO_RECORDED_MATCH' if they don't pass
+   * `scenario` directly.
    */
   private static async generateClarificationQuestion(params: {
     userIntent: string;
@@ -1139,80 +1660,227 @@ export class IntentStepLintService {
     pageUrl: string;
     candidates: LintCandidate[];
     domNodes: InteractiveNode[];
-    /** V2: Flag indicating semantic-zero scenario (no good matches found) */
+    /** V2 legacy flag — kept for callers that haven't migrated. */
     isSemanticZero?: boolean;
+    /** V23 — scenario classified by `classifyClarifyScenario`. */
+    scenario?: ClarifyScenario;
+    /** V23 — full step for promot context. */
+    stepDraft?: IntentStep;
+    /** V23 — top candidate confidence after rule scoring. */
+    topConfidence?: number;
+    /** V23 — degraded cause from upstream resolver, when applicable. */
+    degradedReason?: string;
   }): Promise<{
     question?: string;
     interpretation?: string;
     examples?: string[];
   }> {
+    // Map legacy isSemanticZero → scenario when caller hasn't explicitly set one.
+    const scenario: ClarifyScenario =
+      params.scenario ?? (params.isSemanticZero ? 'NO_RECORDED_MATCH' : 'GENERIC');
+
+    const recordedFp = params.stepDraft?.recordedFingerprint
+      || params.stepDraft?.compiled?.targetFingerprint;
+    const recordedPageUrl = params.stepDraft?.compiled?.context?.pageUrl
+      || params.stepDraft?.evidence?.pageUrl;
+
+    // Real visible labels we can offer as examples — never invent.
+    const realExamples: string[] = params.candidates
+      .slice(0, 3)
+      .map((c) => {
+        const node = params.domNodes.find((n) => n.ref === c.ref) || c.node;
+        return (getEffectiveLabel(node) || c.label || '').trim();
+      })
+      .filter((x) => x.length > 0 && x.length < 80);
+
+    // ── Deterministic fallback messages per scenario (used when LLM is down
+    //    or when a quick local answer is enough). All localized to RU since
+    //    the editor is RU-first; the LLM branch tries to match intent language.
+    const deterministicMessage = (s: ClarifyScenario): string => {
+      switch (s) {
+        case 'PAGE_MISMATCH':
+          return recordedPageUrl
+            ? `Шаг записан для страницы ${recordedPageUrl}, сейчас открыто ${params.pageUrl}. Проверьте, что предыдущие шаги привели на нужную страницу.`
+            : 'Похоже, текущая страница отличается от той, на которой записан шаг. Проверьте навигацию.';
+        case 'AI_DEGRADED':
+          return `AI-резолвер временно недоступен (${params.degradedReason || 'unknown'}). Подождите минуту и повторите, либо выберите элемент вручную из подсказок.`;
+        case 'NO_RECORDED_MATCH': {
+          // V23: include title in the recorded-label chain — same reason
+          // as everywhere else (Angular routerLink etc. carry identity in title).
+          const recordedLabel = recordedFp?.labelText || recordedFp?.ariaLabel || recordedFp?.title || (recordedFp as any)?.alt || recordedFp?.text || recordedFp?.elementId;
+          return recordedLabel
+            ? `На странице нет элемента, похожего на записанный («${recordedLabel}»). Возможно, навигация не дошла до нужной страницы или элемент скрыт.`
+            : 'На текущей странице нет элемента, соответствующего записанному. Проверьте навигацию или уточните описание.';
+        }
+        case 'AMBIGUOUS_RIGHT_PAGE':
+          return `Несколько элементов подходят под описание «${params.userIntent}». Уточните: текст в кавычках, роль, или раздел страницы.`;
+        case 'VAGUE_DESC':
+          return `Описание «${params.userIntent}» слишком общее. Добавьте текст элемента, его роль или ближайший заголовок раздела.`;
+        case 'GENERIC':
+        default:
+          return `Не удалось однозначно определить элемент по описанию «${params.userIntent}». Уточните: текст в кавычках, роль, или ближайший элемент.`;
+      }
+    };
+
+    // Try LLM for polish + i18n; fall back to deterministic message on any error.
     try {
       const { getChatCompletionWithMessages } = await import('@/services/ai/core/openai.service');
 
-      // Build candidate descriptions for context
       const candidateList = params.candidates.slice(0, 3).map((c, i) => {
-        const node = params.domNodes.find(n => n.ref === c.ref);
+        const node = params.domNodes.find((n) => n.ref === c.ref) || c.node;
         const details: string[] = [];
         if (node?.labelText) details.push(`label="${node.labelText}"`);
         if (node?.ariaLabel) details.push(`aria="${node.ariaLabel}"`);
+        if (node?.text && node.text !== node.labelText) details.push(`text="${node.text.slice(0, 40)}"`);
         if (node?.placeholder) details.push(`placeholder="${node.placeholder}"`);
-        if (node?.autocomplete) details.push(`autocomplete="${node.autocomplete}"`);
+        if (node?.role) details.push(`role="${node.role}"`);
         if (node?.containerTitles?.length) details.push(`in section "${node.containerTitles[0]}"`);
-        return `${i + 1}. <${node?.tag || 'element'}> ${details.join(', ')}`;
+        return `${i + 1}. ref="${c.ref}" <${node?.tag || 'element'}> ${details.join(', ')} (confidence=${c.confidence.toFixed(2)})`;
       }).join('\n');
 
-      // V2: Different prompt for semantic-zero vs multiple matches
-      const scenarioContext = params.isSemanticZero
-        ? `The user wrote "${params.userIntent}" for a ${params.actionType} action, but NONE of the elements on the page seem to match this description. The elements below are the closest we found, but similarity is very low.`
-        : `The user wrote "${params.userIntent}" for a ${params.actionType} action, but it matches multiple elements.`;
+      const recordedFpText = recordedFp ? [
+        recordedFp.elementId ? `id="${recordedFp.elementId}"` : '',
+        recordedFp.testIdAttr ? `testId="${recordedFp.testIdAttr}"` : '',
+        recordedFp.labelText ? `label="${recordedFp.labelText}"` : '',
+        recordedFp.ariaLabel ? `aria="${recordedFp.ariaLabel}"` : '',
+        recordedFp.text ? `text="${recordedFp.text.slice(0, 50)}"` : '',
+        recordedFp.role ? `role="${recordedFp.role}"` : '',
+        recordedFp.tag ? `tag="${recordedFp.tag}"` : '',
+      ].filter(Boolean).join(', ') : '';
 
-      const prompt = `You are helping a user write a clearer element description for UI testing.
-${scenarioContext}
+      // V23: compact scenario directives. Each line: action verb + examples
+      // policy (E=examples). Format kept terse on purpose — gemini-flash-lite
+      // reads sequentially and tight directives ship better than prose.
+      // Smart parts preserved: each scenario's WHY, recorded label hint,
+      // anti-blame guard for PAGE_MISMATCH/AI_DEGRADED.
+      const recordedLabel = recordedFp?.labelText || recordedFp?.ariaLabel || recordedFp?.title || (recordedFp as any)?.alt || recordedFp?.text || recordedFp?.elementId || '';
+      const scenarioDirective: Record<ClarifyScenario, string> = {
+        PAGE_MISMATCH: `Wrong page (recorded vs current URL differ). Tell user to check navigation. Don't blame their wording. E=[].`,
+        AI_DEGRADED: `AI down (reason=${params.degradedReason || 'unknown'}). Tell user to retry shortly. Candidates shown are rule-based fallback. Don't blame wording. E=[].`,
+        NO_RECORDED_MATCH: `Recorded element${recordedLabel ? ` ("${recordedLabel.slice(0, 50)}")` : ''} not present here. Page changed or wrong page. E=[].`,
+        AMBIGUOUS_RIGHT_PAGE: `Multiple matches on right page. Ask for disambiguator (exact text/role/section). E=1-3 real labels from candidates.`,
+        VAGUE_DESC: `Description too short${recordedLabel ? `; suggest using recorded label "${recordedLabel.slice(0, 40)}"` : ''}. E=1-3 real labels.`,
+        GENERIC: `Generic word match. Suggest exact text/role/section. E=1-3 real labels.`,
+      };
 
-MATCHING ELEMENTS:
-${candidateList}
+      // Compose context block — only include lines that have data.
+      const ctxLines = [
+        `INTENT: "${params.userIntent}" (action=${params.actionType})`,
+        `URL: now=${params.pageUrl}${recordedPageUrl ? ` recorded=${recordedPageUrl}` : ''}`,
+        recordedFpText ? `RECORDED: ${recordedFpText}` : '',
+        `CONFIDENCE: ${params.topConfidence?.toFixed(2) ?? 'n/a'}`,
+      ].filter(Boolean).join('\n');
 
-Generate a helpful message and 2-3 example descriptions that would uniquely identify ONE element.
+      const prompt = `Output JSON {message, examples, interpretation}. Explain WHY this step couldn't auto-resolve. Don't pick elements.
 
-Use these patterns in examples:
-- Exact text in quotes: 'Submit' button, 'Email' input
-- Role mentions: the password input, the login button
-- Position hints: above the "Sign Up" link, inside the "Login" form
-- Label references: the 'Username' field, input with placeholder 'Enter email'
+SCENARIO=${scenario}: ${scenarioDirective[scenario]}
 
-Respond in the SAME LANGUAGE as the user's original intent.
+${ctxLines}
 
-Reply with JSON:
-{
-  "message": "Brief helpful message explaining the issue (1 sentence)",
-  "examples": ["example 1", "example 2"],
-  "interpretation": "What the user wants to do"
-}`;
+CANDIDATES (rule-based, may be unrelated):
+${candidateList || '(none)'}
 
-      const result = await getChatCompletionWithMessages(
-        [{ role: 'user', content: prompt }],
-        {
-          max_tokens: 200,
-          temperature: 0.2,
-          model: AI_TASK_MODELS.intentLint,
-          response_format: { type: 'json_object' },
+Rules:
+- message: in INTENT's language/script (RU→RU, KZ→KZ, EN→EN), one sentence ≤200 chars.
+- examples: ONLY strings already in CANDIDATES (label/text/aria/placeholder). Empty [] when scenario says E=[]. Never invent.
+- interpretation: one phrase, what user wants to do.`;
+
+      // V23: model fallback chain. Primary is gemini-2.5-flash-lite (fast,
+      // predictable, multilingual). If it fails for ANY reason — provider
+      // outage, rate limit, parse error, hard 5s timeout — fall back to
+      // gpt-5.4-mini so the lint result is always informative. Same prompt;
+      // OpenAI service auto-routes by model name prefix.
+      //
+      // Per-model timeout 5s (clarification is short — a real provider just
+      // needs 300-1500ms). Without it, gemini's internal 30s default could
+      // mask outages and gpt-5.4-mini's variable CoT could spike to 14s.
+      const PRIMARY: string = AI_TASK_MODELS.intentLint;  // gemini-2.5-flash-lite
+      const FALLBACK: string = AI_MODELS.fast;            // gpt-5.4-mini
+      const PER_MODEL_TIMEOUT_MS = 5_000;
+
+      const callOnce = async (model: string) => {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), PER_MODEL_TIMEOUT_MS);
+        try {
+          return await getChatCompletionWithMessages(
+            [{ role: 'user', content: prompt }],
+            {
+              max_tokens: 250,
+              temperature: 0.2,
+              model,
+              response_format: { type: 'json_object' },
+              abortSignal: ac.signal,
+            }
+          );
+        } finally {
+          clearTimeout(timer);
         }
-      );
+      };
+
+      let result;
+      let usedModel = PRIMARY;
+      try {
+        result = await callOnce(PRIMARY);
+      } catch (primaryErr) {
+        // Don't retry the same provider on the fallback — when primary is gemini
+        // and fallback is also gemini (unlikely but possible env override),
+        // the second call would just hit the same outage.
+        const sameProvider = PRIMARY.startsWith('gemini-') === FALLBACK.startsWith('gemini-');
+        if (sameProvider) {
+          throw primaryErr;
+        }
+        logger.warn('[INTENT_LINT_V23] Primary clarification model failed, retrying with fallback', {
+          primary: PRIMARY,
+          fallback: FALLBACK,
+          error: primaryErr instanceof Error ? primaryErr.message : String(primaryErr),
+        });
+        result = await callOnce(FALLBACK);
+        usedModel = FALLBACK;
+      }
+
+      logger.debug('[INTENT_LINT_V23] Clarification LLM resolved', {
+        scenario,
+        usedModel,
+        wasFallback: usedModel !== PRIMARY,
+      });
 
       const parsed = JSON.parse(result.content);
+
+      // Validate examples — only keep ones that appear in real candidate text.
+      // Stops the LLM from inventing labels even when prompt forbids it.
+      const realExampleSet = new Set(realExamples.map((s) => s.toLowerCase()));
+      const safeExamples = Array.isArray(parsed.examples)
+        ? parsed.examples
+            .filter((x: any) => typeof x === 'string')
+            .filter((x: string) => {
+              if (scenario === 'PAGE_MISMATCH' || scenario === 'AI_DEGRADED' || scenario === 'NO_RECORDED_MATCH') {
+                return false; // examples disallowed by scenario contract
+              }
+              return realExampleSet.has(x.trim().toLowerCase()) || realExamples.some((r) => x.toLowerCase().includes(r.toLowerCase()));
+            })
+            .slice(0, 3)
+        : [];
+
       return {
-        question: parsed.message,
-        interpretation: parsed.interpretation,
-        examples: parsed.examples,
+        question: typeof parsed.message === 'string' && parsed.message.trim().length > 0
+          ? parsed.message
+          : deterministicMessage(scenario),
+        interpretation: typeof parsed.interpretation === 'string' ? parsed.interpretation : undefined,
+        examples: safeExamples,
       };
     } catch (error) {
-      logger.warn('[INTENT_LINT_V5] Clarification message generation failed', {
+      logger.warn('[INTENT_LINT_V23] Clarification LLM failed, using deterministic fallback', {
+        scenario,
         error: error instanceof Error ? error.message : String(error),
       });
-      // Fallback to a generic message
+      // Deterministic fallback — message tied to scenario, examples only for
+      // the scenarios where they make sense.
+      const examplesAllowed = scenario === 'AMBIGUOUS_RIGHT_PAGE'
+        || scenario === 'VAGUE_DESC'
+        || scenario === 'GENERIC';
       return {
-        question: 'Multiple elements match your description. Try using exact text in quotes or specify the element\'s position.',
-        examples: ["the 'Submit' button", "password input below the username field"],
+        question: deterministicMessage(scenario),
+        examples: examplesAllowed ? realExamples : [],
       };
     }
   }

@@ -11,7 +11,7 @@ import { randomUUID } from 'crypto';
 import { Browser, BrowserContext, Page, chromium } from 'playwright';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { DomAnalysisExtractorService } from './dom-analysis-extractor.service';
-import type { InteractiveNode, PreviewSession } from './preview.types';
+import type { InteractiveNode, PreviewSession, TargetFingerprint } from './preview.types';
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { waitForPageInteractive } from './page-interactive.utils';
@@ -373,6 +373,67 @@ interface InternalSession extends PreviewSession {
     pageUrl?: string;
     /** V13: CSS selector of iframe containing the focused element */
     iframeSelector?: string;
+    /**
+     * V22: Probe-time fingerprint of the focused input. Travels with the
+     * buffer through `flushTypingBuffer` into the resulting type-step's
+     * `recordedFingerprint`, giving the LLM resolver full identifying
+     * data on first apply (no need to wait for compiled-plan generation).
+     */
+    recordedFingerprint?: TargetFingerprint;
+  } | null;
+  /**
+   * V22 Pkg8: Field Session — captures the user's *intent* to fill a form
+   * field as ONE logical step, regardless of how many physical events
+   * (typing, backspace, arrow keys, mid-string edits, copy-paste) the user
+   * generates inside the field.
+   *
+   * Why exist alongside recordingTypingBuffer:
+   *   - The legacy buffer model coalesces letter-by-letter and patches
+   *     edge-cases via per-key absorption (backspace trims last char,
+   *     arrow keys fall through to press-coalesce). This model BREAKS
+   *     whenever the user navigates the cursor into the middle of the
+   *     value and edits there — we end up with 8+ steps in the trace
+   *     and the Type step's value drifts from the real <input>.value.
+   *   - Field Session treats the focus span as a single editing transaction.
+   *     Internal events are absorbed; on close (blur / focus-shift /
+   *     submit / nav) we read the LIVE input.value and emit ONE Type
+   *     step with the canonical final value. Single source of truth.
+   *
+   * Lifecycle:
+   *   open  — focus enters an interactive form control while recording
+   *   live  — internal events (key, arrow, backspace, paste) absorbed
+   *   close — focus shift / blur / submit / nav / recording stop →
+   *           read live value, emit Type step (or remove if value
+   *           reverted to initial), clear session
+   */
+  recordingFieldSession?: {
+    /** data-agent-ref of the focused control (anchors live-value re-read). */
+    elementRef: string;
+    /** Probed label for description ("Phone", "Email", etc). */
+    elementLabel: string;
+    /** Probed tag (input/textarea/select). Used for value-read strategy. */
+    elementTag: string;
+    /** Type attr (text/number/email/password/...) — controls placeholder vs value masking. */
+    elementType?: string;
+    /** True for textarea / contenteditable — value reads via .value vs .textContent. */
+    isMultiline?: boolean;
+    /** initial input.value at session open — diff against final to detect no-op. */
+    initialValue: string;
+    /** monotonic ts of session open — for stale-session timeout safety. */
+    startedAt: number;
+    /** Page URL at open — guards cross-navigation false-merges. */
+    pageUrl: string;
+    /** Iframe selector if the input lives in a child frame. */
+    iframeSelector?: string;
+    /** Full fingerprint of the focused control — flows into recorded step. */
+    recordedFingerprint?: TargetFingerprint;
+    /** Pre-built BindingHints (semantic locator hints). Captured at open time
+     *  via RecordingCaptureService.buildBindingHints so close-time emission
+     *  doesn't need to re-probe. Distinct from recordedFingerprint (raw shape). */
+    bindingHints?: Record<string, unknown>;
+    /** Step ID emitted for THIS session — reused when session value
+     *  re-emits on subsequent updates (`step:update`). Set after first emit. */
+    emittedStepId?: string;
   } | null;
   recordingLastUrl: string;
   /** V10: Drag state tracked between mouse:down and mouse:up */
@@ -444,6 +505,22 @@ interface InternalSession extends PreviewSession {
     /** V18: Full probe result from hover — reused by click to avoid double-probe divergence */
     probedElement?: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement | null;
   } | null;
+  /**
+   * V22 Pkg5+: Hover CHAIN — all distinct hover-targets dwelt on between
+   * consecutive clicks. Replaces "single last hover" semantics so multi-
+   * level menus (Menu → Submenu → click leaf) survive replay deterministically
+   * — each menu trigger gets its own hover-step in trace order.
+   *
+   * Distinctness is by boundingBox (same x/y/w/h = same element). Capped
+   * at 4 entries to bound memory; oldest dropped when full. Cleared after
+   * each click flush in preview.handler.ts.
+   */
+  recordingHoverChain?: Array<{
+    x: number;
+    y: number;
+    timestamp: number;
+    probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement;
+  }>;
 
   /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
   recordingStartUrl?: string;
@@ -1356,6 +1433,25 @@ export class PreviewSessionService {
     try {
       logger.info('[PREVIEW_SESSION] Stopping session', { sessionId });
 
+      // Force-cancel any in-flight preview run BEFORE we close the
+      // browser context. Without this, the run loop keeps trying to
+      // page.evaluate against a closed page → throws → unwind path may
+      // leave `activeRuns` populated, blocking every future run for
+      // this session id with "Run already in progress" until process
+      // restart. forceCancelOnSessionStop is a no-op when nothing is
+      // active. Lazy-import to dodge a circular dependency between
+      // session and run services (each pulls the other's API surface
+      // at module-eval time).
+      try {
+        const { PreviewRunService } = await import('./preview-run.service');
+        PreviewRunService.forceCancelOnSessionStop(sessionId);
+      } catch (e) {
+        logger.warn('[PREVIEW_SESSION] forceCancelOnSessionStop threw (non-fatal)', {
+          sessionId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
       // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
       try {
         const { EditorTraceService } = await import('./editor-trace.service');
@@ -1980,21 +2076,34 @@ export class PreviewSessionService {
     userId: string;
     x: number;
     y: number;
+    /**
+     * When set, populates `rejectReason` on the result instead of just
+     * returning null. Lets the WS handler write a precise reason into the
+     * hover_probe trace ('cross_origin_iframe' vs 'direct_hit' vs
+     * 'no_bounding_box' vs 'no_probe_result') so a stuck recording doesn't
+     * look like 53× identical 'no_interactive_element' rows.
+     */
+    withRejectReason?: boolean;
   }): Promise<{
     tag: string;
     label: string;
     boundingBox: { x: number; y: number; width: number; height: number };
     resolvedVia: string;
+    rejectReason?: undefined;
+  } | {
+    rejectReason: 'no_session' | 'invalid_coords' | 'no_viewport' | 'no_probe_result' | 'cross_origin_iframe' | 'direct_hit_non_interactive' | 'no_bounding_box' | 'error';
   } | null> {
-    const { sessionId, userId, x, y } = params;
+    const { sessionId, userId, x, y, withRejectReason } = params;
     const session = this.getAuthorizedSession(sessionId, userId);
-    if (!session) return null;
+    if (!session) return withRejectReason ? { rejectReason: 'no_session' } : null;
 
     try {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return withRejectReason ? { rejectReason: 'invalid_coords' } : null;
+      }
 
       const viewport = session.page.viewportSize();
-      if (!viewport) return null;
+      if (!viewport) return withRejectReason ? { rejectReason: 'no_viewport' } : null;
 
       const clampedX = Math.max(0, Math.min(x, viewport.width - 1));
       const clampedY = Math.max(0, Math.min(y, viewport.height - 1));
@@ -2014,11 +2123,24 @@ export class PreviewSessionService {
         session.recordingLastHover.probedElement = probed;
       }
 
-      if (!probed) return null;
-      if (probed.crossOriginIframe) return null;
+      if (!probed) return withRejectReason ? { rejectReason: 'no_probe_result' } : null;
+      if (probed.crossOriginIframe) return withRejectReason ? { rejectReason: 'cross_origin_iframe' } : null;
       // directHit = no interactive element found — don't highlight plain divs
-      if (probed.resolvedVia === 'directHit') return null;
-      if (!probed.boundingBox) return null;
+      if (probed.resolvedVia === 'directHit') return withRejectReason ? { rejectReason: 'direct_hit_non_interactive' } : null;
+      if (!probed.boundingBox) return withRejectReason ? { rejectReason: 'no_bounding_box' } : null;
+
+      // V22 Pkg5+ Patch C: append to hover chain — distinct hover-targets
+      // accumulated between two consecutive clicks. Skips noise via:
+      //   - directHit / crossOriginIframe / no-bbox already filtered above
+      //   - de-dupe vs last entry by boundingBox in appendRecordingHoverChain
+      // Recording-only — no overhead when not recording.
+      if (session.recording) {
+        try {
+          this.appendRecordingHoverChain(sessionId, userId, {
+            x, y, timestamp: Date.now(), probedElement: probed,
+          });
+        } catch { /* chain append best-effort */ }
+      }
 
       // Hover caps label at 40 chars to fit the floating tooltip; record/DB path uses 60.
       // `getProbedLabel` returns null for literal tag-only fallbacks so we can surface a
@@ -2036,7 +2158,7 @@ export class PreviewSessionService {
         sessionId, x, y,
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
+      return withRejectReason ? { rejectReason: 'error' } : null;
     }
   }
 
@@ -2109,6 +2231,9 @@ export class PreviewSessionService {
     pageSignature: string;
     screenshot?: string;           // Deprecated: use video:frame instead
     changed: boolean;
+    /** V26: Real browser viewport — used by resolver for accurate modal-coverage
+     *  ratio in `buildAllowedSets`. Optional for back-compat. */
+    viewport?: { width: number; height: number };
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
@@ -2276,6 +2401,9 @@ export class PreviewSessionService {
         pageSignature: session.lastPageSignature,
         screenshot,
         changed,
+        // V26: pass viewport through so resolver can compute accurate
+        // modal-coverage ratio. domAnalysis carries it from snapshot collector.
+        viewport: domAnalysis.viewport,
       };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Failed to get snapshot', {
@@ -2372,6 +2500,10 @@ export class PreviewSessionService {
       session.recordingLastNavigateStep = null;
       session.recordingLastScrollStep = null;
       session.recordingLastHover = null;
+      // V22 Pkg5+: clear hover chain on recording stop too.
+      session.recordingHoverChain = [];
+      // V22 Pkg8: clear field session on recording stop.
+      session.recordingFieldSession = null;
       session.recordingLastStepEmittedAt = undefined;
       session.recordingStepCount = 0;
     }
@@ -2435,6 +2567,51 @@ export class PreviewSessionService {
   setRecordingBuffer(sessionId: string, userId: string, buffer: InternalSession['recordingTypingBuffer']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingTypingBuffer = buffer;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // V22 Pkg8: Field Session — focus-span editing transaction
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /** Read the active field session (or null when none open). */
+  getRecordingFieldSession(
+    sessionId: string,
+    userId?: string,
+  ): NonNullable<InternalSession['recordingFieldSession']> | null {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingFieldSession ?? null;
+  }
+
+  /**
+   * Open a new field session. Caller is responsible for closing any
+   * previous session BEFORE calling this (handler does close → emit step
+   * → open new). Idempotent for the same elementRef — overwriting with
+   * identical ref is a no-op (caller should detect & skip).
+   */
+  setRecordingFieldSession(
+    sessionId: string,
+    userId: string,
+    fs: NonNullable<InternalSession['recordingFieldSession']> | null,
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingFieldSession = fs;
+  }
+
+  /**
+   * Update the emittedStepId on the active field session — called after
+   * the first Type step is emitted, so subsequent live-value re-reads
+   * can dispatch `preview:recording:step:update` with the same id and
+   * merge into the existing list entry instead of stacking duplicates.
+   */
+  setRecordingFieldSessionStepId(
+    sessionId: string,
+    userId: string,
+    stepId: string,
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session?.recordingFieldSession) {
+      session.recordingFieldSession.emittedStepId = stepId;
+    }
   }
 
   /**
@@ -2584,6 +2761,59 @@ export class PreviewSessionService {
   setRecordingLastHover(sessionId: string, userId: string, state: InternalSession['recordingLastHover']): void {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (session) session.recordingLastHover = state;
+  }
+
+  /**
+   * V22 Pkg5+: Append a distinct hover-target to the chain. Distinctness
+   * is checked by boundingBox (same x/y/w/h = same element). Caps at 4
+   * entries to bound memory — oldest dropped when full.
+   *
+   * Called from preview.handler.ts after each successful hover-probe so
+   * the chain reflects the user's mouse-movement history between two
+   * consecutive clicks. Cleared on click-flush so next click starts fresh.
+   */
+  appendRecordingHoverChain(
+    sessionId: string,
+    userId: string,
+    entry: { x: number; y: number; timestamp: number; probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement },
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return;
+    if (!session.recordingHoverChain) session.recordingHoverChain = [];
+    const chain = session.recordingHoverChain;
+    // De-dupe vs the LAST entry — if same boundingBox, just refresh timestamp.
+    const newBB = entry.probedElement.boundingBox;
+    const last = chain.length > 0 ? chain[chain.length - 1] : null;
+    if (last && newBB && last.probedElement.boundingBox) {
+      const lbb = last.probedElement.boundingBox;
+      if (lbb.x === newBB.x && lbb.y === newBB.y
+        && lbb.width === newBB.width && lbb.height === newBB.height) {
+        last.timestamp = entry.timestamp; // freshen, but don't add duplicate
+        return;
+      }
+    }
+    chain.push(entry);
+    // Cap at 4 — multi-level menus rarely exceed 3 (root → submenu → leaf).
+    while (chain.length > 4) chain.shift();
+  }
+
+  /**
+   * V22 Pkg5+: Read the hover chain (read-only snapshot).
+   */
+  getRecordingHoverChain(
+    sessionId: string,
+    userId?: string,
+  ): NonNullable<InternalSession['recordingHoverChain']> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    return session?.recordingHoverChain ?? [];
+  }
+
+  /**
+   * V22 Pkg5+: Clear the hover chain after a click is flushed.
+   */
+  clearRecordingHoverChain(sessionId: string, userId: string): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (session) session.recordingHoverChain = [];
   }
 
   /**

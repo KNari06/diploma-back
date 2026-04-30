@@ -5,7 +5,7 @@ import { TokenCalculatorService } from '@/services/core/token-calculator.service
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { BUG_REPORT_CREDITS } from '@/jobs/ai-analysis.job';
 import { WorkspaceAccessService } from '@/services/core/workspace-access.service';
-import { NotFoundError, ValidationError } from '@/types';
+import { NotFoundError, ValidationError, InsufficientCreditsError } from '@/types';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import type {
   Priority,
@@ -300,9 +300,36 @@ export class RegressionRunService {
 
     // Soft balance check — verify user can afford estimated steps, but don't deduct
     const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
+    // Log the REAL totalRequired up-front so triage doesn't get fooled by
+    // CreditCostTrackerService's own "required: 1" log (that logs the single
+    // test-type cost, not the aggregated plan cost computed here).
+    logger.info('[REGRESSION_RUN] Credit balance pre-flight', {
+      userId,
+      source,
+      totalRequired,
+      uiStepCredits,
+      apiCount,
+      apiCreditCost,
+      bugReportBudget,
+      available: creditCheck.available,
+      uiTestCount: uiCases.length,
+    });
     if (creditCheck.available < totalRequired) {
-      throw new ValidationError(
-        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.available}`
+      // Use the dedicated error class so the controller can surface a stable
+      // `code: 'INSUFFICIENT_CREDITS'` to the frontend (which then flips the
+      // global "credits exhausted" banner instead of a generic toast).
+      throw new InsufficientCreditsError(
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.available}`,
+        {
+          required: totalRequired,
+          available: creditCheck.available,
+          breakdown: {
+            uiStepCredits,
+            apiCount,
+            apiCreditCost,
+            bugReportBudget,
+          },
+        },
       );
     }
 

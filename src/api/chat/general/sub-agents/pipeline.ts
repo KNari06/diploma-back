@@ -114,7 +114,14 @@ export class SubAgentPipeline {
     progress: number,
     metadata?: Record<string, any>
   ): void {
-    emitProcessingStep(this.context.chatSessionId, step, message, progress, metadata);
+    emitProcessingStep(
+      this.context.chatSessionId,
+      step,
+      message,
+      progress,
+      metadata,
+      this.context.testCaseId,
+    );
   }
 
   async execute(input: PipelineInput): Promise<SubAgentPipelineResult> {

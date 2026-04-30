@@ -322,9 +322,9 @@ export type AllureSourceFormat = 'zip' | 'csv' | 'pdf';
 /**
  * Data stored in the BullMQ job for async Allure imports.
  *
- * The uploaded file is written to a temp file on disk and only the file path
- * is stored in Redis. This avoids base64-encoding (133% size expansion) into
- * Redis memory, which would cause OOM for large files or concurrent imports.
+ * The uploaded file is stored in Supabase Storage (bucket `allure_reports`)
+ * and only the storage key is carried in Redis. This is required because the
+ * API and worker run in separate pods and don't share a local filesystem.
  */
 export interface AllureImportJobData {
   importId: string;
@@ -333,13 +333,15 @@ export interface AllureImportJobData {
   workspaceId: string;
   /** Source file format: 'zip' (Allure results), 'csv' or 'pdf' (Allure TestOps export). */
   sourceFormat: AllureSourceFormat;
-  /** Path to the uploaded file on disk (temp file). Cleaned up after processing. */
-  filePath: string;
+  /** Object key in the Supabase Storage bucket (e.g. `allure/{userId}/{importId}.zip`). */
+  storageKey: string;
   /** Original filename from the upload (for display in UI). */
   originalFileName?: string;
   /** Original file size in bytes. */
   originalFileSize?: number;
-  /** @deprecated Use filePath. Kept for backward compat with in-flight jobs. */
+  /** @deprecated Pre-Storage migration. In-flight jobs may still carry a local temp path. */
+  filePath?: string;
+  /** @deprecated Use storageKey. Kept for backward compat with in-flight jobs. */
   zipFilePath?: string;
   options: ResolvedAllureImportOptions;
 }

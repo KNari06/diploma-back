@@ -8,6 +8,7 @@ import type {
   StepOptions,
   BindingHints,
   StepEvidence,
+  TargetFingerprint,
 } from '@/services/testing/ui/preview/preview.types';
 
 // ============================================================================
@@ -23,6 +24,21 @@ export interface ClientToServerEvents {
     callback?: (response: { ok: boolean; error?: string }) => void,
   ) => void;
   'unsubscribe:chat': (data: { sessionId: string }) => void;
+
+  // Per-test-case chat subscription. Keyed by `testCaseId`, NOT a session
+  // id — the per-test-case session is lazy-created on first POST /chat,
+  // so the frontend has no session id to subscribe to when the editor
+  // opens. Server resolves the existing session (if any) at subscribe
+  // time and joins both `chat:tc:<testCaseId>` (always) and
+  // `chat:<sessionId>` (when the session already exists). New emits
+  // from the chat handlers always go to BOTH rooms when `testCaseId` is
+  // known, so the frontend doesn't need to re-subscribe after the first
+  // message creates the session row.
+  'subscribe:chat:testcase': (
+    data: { testCaseId: string },
+    callback?: (response: { ok: boolean; error?: string; sessionId?: string }) => void,
+  ) => void;
+  'unsubscribe:chat:testcase': (data: { testCaseId: string }) => void;
 
   // Preview subscriptions
   'subscribe:preview': (data: { previewSessionId: string }) => void;
@@ -170,6 +186,12 @@ export interface ServerToClientEvents {
   'ai:analysis:completed': (data: AIAnalysisCompletedPayload) => void;
   'ai:bug:found': (data: AIBugFoundPayload) => void;
 
+  // AI action log (one row per LLM call) — pushed to the owning user.
+  'ai:log:new': (data: AIActionLogPayload) => void;
+
+  // System (Winston) log entry — pushed only to users with `users.show_logs=true`.
+  'system:log:new': (data: SystemLogPayload) => void;
+
   // Chat events
   'chat:message': (data: ChatMessagePayload) => void;
   'chat:test:update': (data: ChatTestUpdatePayload) => void;
@@ -243,6 +265,29 @@ export interface ServerToClientEvents {
     reason: string;
     timestamp: string;
   }) => void;
+
+  // Per-step URL mismatch warning. Fires when the live preview URL differs
+  // (after origin+path normalization) from the URL captured at recording
+  // time for that step. Non-fatal — the run continues. Frontend uses this
+  // to show a yellow badge on the step row so the user can spot why a fail
+  // happened: "step recorded on /admin/users, ran on /". The most common
+  // cause is the user clicking around the preview between Apply All and
+  // recording the next batch, leaving step N+1's recorded fingerprint
+  // pointing at a page state that no longer exists at run time.
+  'preview:run:url-mismatch': (data: {
+    previewSessionId: string;
+    stepIndex: number;
+    stepId: string;
+    recordedUrl: string;
+    actualUrl: string;
+  }) => void;
+
+  // Mobile editor session has expired (idle for IDLE_TTL_MS, or backend
+  // detected the FE↔BE socket has gone away). Frontend should close the
+  // editor modal, clear `intentTestCaseId` from the URL, toast the user,
+  // and bounce back to the Repository view. The runner emulator is
+  // intentionally left alive on idle so re-opening the test case is fast.
+  'mobile:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
 
   // Response to `preview:session:inspect`. Contains non-sensitive counts
   // + sameOrigin flag so the frontend can decide whether to prompt the
@@ -1206,6 +1251,13 @@ export interface PreviewIntentStep {
   options?: StepOptions;
   /** Cached evidence from recording or prior execution (used as evidence shortcut during apply/run) */
   evidence?: StepEvidence;
+  /**
+   * V22: Fingerprint of the element captured AT RECORDING TIME (probe snapshot).
+   * Mirror of `IntentStep.recordedFingerprint` — see preview.types.ts for the
+   * full rationale. Travels with the step from recorder → frontend → DB → LLM
+   * resolver, so the FIRST apply already has rich identifying data.
+   */
+  recordedFingerprint?: TargetFingerprint;
   /** V15: Tab index this step targets (0 = initial tab, 1+ = popups) */
   tabIndex?: number;
   /**
@@ -1268,6 +1320,25 @@ export interface PreviewRunStartRequest {
    * explicitly chooses when an active session is detected before Run.
    */
   authReset?: 'always' | 'never';
+  /**
+   * "Apply New Only" (April 2026): start execution at this step index
+   * instead of step 0, preserving the live preview state. Used when the
+   * user already ran Apply All on steps 0..N-1 and now wants to apply
+   * only the freshly-recorded steps N..end without re-running everything
+   * (faster, no auth wipe, runs against current preview state).
+   *
+   * When set:
+   *   - Backend skips goto(startUrl) — preview stays where it is
+   *   - Backend ignores authReset='always' (forced to 'never')
+   *   - Steps before the index are not executed but ARE saved to DB
+   *     alongside the new ones (single source of truth)
+   *
+   * The frontend pre-flight checks that current preview URL matches the
+   * recorded `pageUrl` of step at this index before sending. Backend
+   * trusts that check — unsafe values still won't crash the run, but
+   * step N may fail with a "page mismatch" badge from per-step URL diag.
+   */
+  startFromIndex?: number;
 }
 
 /**
@@ -2041,6 +2112,58 @@ export interface AllureImportFailedWSPayload {
 }
 
 // ============================================================================
+// SYSTEM LOG PAYLOAD (Winston ring buffer entry, live-tailed over WS)
+// ============================================================================
+
+export interface SystemLogPayload {
+  seq: number;
+  timestamp: string;
+  level: 'error' | 'warn' | 'info' | 'http' | 'debug' | string;
+  message: string;
+  meta?: Record<string, unknown>;
+  source?: 'api' | 'worker' | 'scheduler' | string;
+}
+
+// ============================================================================
+// AI ACTION LOG PAYLOAD (one row per LLM call)
+// ============================================================================
+
+export interface AIActionLogPayload {
+  id: string;
+  created_at: string;
+  user_id: string;
+  workspace_id: string | null;
+  source:
+    | 'chat'
+    | 'analysis'
+    | 'explorer-web'
+    | 'explorer-mobile'
+    | 'ai-selector'
+    | 'ai-check'
+    | 'form-filler';
+  action_type: string;
+  status: 'succeeded' | 'failed';
+  summary: string;
+  detail: Record<string, unknown>;
+  entity_type:
+    | 'regression_run'
+    | 'test_execution'
+    | 'chat_session'
+    | 'exploration_run'
+    | 'mobile_run'
+    | null;
+  entity_id: string | null;
+  iteration: number | null;
+  duration_ms: number | null;
+  model: string | null;
+  provider: 'openai' | 'gemini' | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  cost_usd: number | null;
+  error: string | null;
+}
+
+// ============================================================================
 // ROOM TYPES
 // ============================================================================
 
@@ -2063,6 +2186,24 @@ export const createRoomName = (type: RoomType, id: string): string => {
   }
 
   return `${type}:${id.trim()}`;
+};
+
+/**
+ * Per-test-case chat room.
+ *
+ * Format: `chat:tc:<testCaseId>` — a `chat:` room with a `tc:` prefixed
+ * id. We deliberately do NOT add 'test-case-chat' to RoomType: that
+ * would change the public surface of `createRoomName` and ripple into
+ * many call sites in the test/preview/user code paths that have no
+ * relationship with test-case chat. Keeping the room as a `chat`-typed
+ * room with a sub-prefix means `emitToRoom('chat', ...)` patterns still
+ * work and Socket.IO room semantics are unchanged.
+ */
+export const createTestCaseChatRoomName = (testCaseId: string): string => {
+  if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
+    throw new Error('Test case room id must be a non-empty string');
+  }
+  return `chat:tc:${testCaseId.trim()}`;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
