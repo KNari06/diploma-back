@@ -27,6 +27,24 @@ import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.se
 import { waitForPageInteractive } from './page-interactive.utils';
 
 /** Base timeout for run setup (navigation, init). */
+/**
+ * V23: Decision-trace emission gate. Trace is BUILT in every env (so the
+ * apply contract stays the same and unit tests can assert on it), but only
+ * WRITTEN to preview_run JSONL when not in production. Override via
+ * `PREVIEW_TRACE_DECISIONS=true` if you ever need it on prod for one-off
+ * diagnosis — default off because the payload can be ~2 KB per step and we
+ * don't want to bloat regression run logs that travel through the upload
+ * pipeline.
+ *
+ * Resolution is per-call (not module-level) so changes to env at runtime
+ * (tests, dynamic config) take effect without a process restart.
+ */
+function shouldEmitDecisionTrace(): boolean {
+  if (process.env.PREVIEW_TRACE_DECISIONS === 'true') return true;
+  if (process.env.PREVIEW_TRACE_DECISIONS === 'false') return false;
+  return process.env.NODE_ENV !== 'production';
+}
+
 const BASE_RUN_TIMEOUT_MS = 60 * 1000; // 1 minute for setup
 /** Per-step timeout budget. Total = BASE + (steps × PER_STEP). */
 const PER_STEP_TIMEOUT_MS = 15 * 1000; // 15 seconds per step
@@ -1899,6 +1917,18 @@ export class PreviewRunService {
                 ...(result.waitForChangedFrom !== undefined ? { waitForChangedFrom: result.waitForChangedFrom } : {}),
                 ...(result.waitForUrlBefore !== undefined ? { waitForUrlBefore: result.waitForUrlBefore } : {}),
                 ...(result.fastPathSettled !== undefined ? { fastPathSettled: result.fastPathSettled } : {}),
+                // V23: Full decision trace — paths/identity/evidence/llm/chosen
+                // /recorded/overlay/timing. Lets you `diff` two runs of the
+                // same step to see WHY identical inputs produced different
+                // outcomes (compiled stale, LLM cache hit, overlay block, ...).
+                //
+                // Dev-only by default. Trace is always BUILT (so apply contract
+                // is the same in all envs), but only written to JSONL when
+                // NODE_ENV !== 'production' OR PREVIEW_TRACE_DECISIONS=true.
+                // Prod doesn't pay the JSONL size cost; local debugging keeps
+                // full visibility.
+                ...(result.decisionTrace !== undefined && shouldEmitDecisionTrace()
+                  ? { decisionTrace: result.decisionTrace } : {}),
                 retried,
               },
             });
@@ -2185,6 +2215,8 @@ export class PreviewRunService {
                 ...(result.chosenBoundingBox !== undefined ? { chosenBbox: result.chosenBoundingBox } : {}),
                 ...(result.fingerprintMatch !== undefined ? { fingerprintMatch: result.fingerprintMatch } : {}),
                 ...(result.resolverPath !== undefined ? { resolverPath: result.resolverPath } : {}),
+                ...(result.decisionTrace !== undefined && shouldEmitDecisionTrace()
+                  ? { decisionTrace: result.decisionTrace } : {}),
               },
             });
 
@@ -2333,6 +2365,8 @@ export class PreviewRunService {
                     urlChanged: retryResult.urlChanged,
                     url: retryResult.url,
                     retried: true,
+                    ...(retryResult.decisionTrace !== undefined && shouldEmitDecisionTrace()
+                      ? { decisionTrace: retryResult.decisionTrace } : {}),
                   },
                 });
 

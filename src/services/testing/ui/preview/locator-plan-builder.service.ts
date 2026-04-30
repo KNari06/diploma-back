@@ -5,6 +5,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
+import { getEffectiveLabel } from './element-resolver.service';
 import type {
   CompiledStepPlan,
   IntentStep,
@@ -53,11 +54,24 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
   // The compiled-locator-executor already filters out 'ref' strategies, but the root fix
   // is to not generate them in the first place.
 
-  // 1. getByRole(role, { name: labelText/ariaLabel }) - accessibility-first
-  // Skip generic roles that don't provide meaningful identification
+  // 1. getByRole(role, { name: <accessible name> }) - accessibility-first
+  // Skip generic roles that don't provide meaningful identification.
+  //
+  // V23: include `title` in the accessible-name chain. Per WAI-ARIA Accessible
+  // Name and Description Computation, a `title` attribute IS an accessible
+  // name source when no aria-label/aria-labelledby/labelText present. Angular
+  // routerLink icon menus (`<a title="Папкалар"><svg/></a>`) used to fall
+  // through to weaker strategies because we only read labelText/ariaLabel/text.
+  //
+  // We deliberately DON'T inline `getEffectiveLabel` here — that one lifts
+  // iconLabel/svgIcon/childTestId/customElementTag, which are derived
+  // *display* labels, not accessible names. Playwright's `getByRole({name})`
+  // matches against the live a11y tree; passing a derived value (e.g. a
+  // Lucide class token "folder") would yield a substring match that doesn't
+  // correspond to anything the screen reader announces. Stay strict here;
+  // the LLM/candidateText path already sees the wider set via getEffectiveLabel.
   if (node.role && !GENERIC_ROLES.has(node.role)) {
-    const accessibleName = node.labelText || node.ariaLabel || node.text;
-    // Skip role-only locator without accessible name (usually too ambiguous).
+    const accessibleName = node.labelText || node.ariaLabel || node.title || node.text;
     if (accessibleName) {
       locators.push({
         strategy: 'role',
@@ -192,6 +206,50 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
           strategy: 'css',
           value: `${tagPrefix}:has([data-lucide="${safe}"], [data-feather="${safe}"], [data-icon="${safe}"], [data-iconify-name="${safe}"])`,
           confidence: 0.60,
+        });
+      }
+    }
+  }
+
+  // V23: Angular Material `<mat-icon svgicon="...">` registry name. Strong
+  // identity for Material icon-only buttons — survives builds, themes, and
+  // language because the value is a registration key. Two strategy variants:
+  //   1. <mat-icon svgicon="X"> directly (when the target IS the mat-icon)
+  //   2. <tag>:has(mat-icon[svgicon="X"]) (when target wraps the icon, e.g.
+  //      `<app-excel-btn><mat-icon svgicon="excel">` — common Angular pattern)
+  // Confidence between testId (0.80) and id-css (0.78) — registry names are
+  // stable but a re-organisation of the icon library can alias keys.
+  if (node.svgIcon
+      && !node.testIdAttr
+      && !node.text
+      && !node.ariaLabel
+      && !node.labelText
+      && !node.title) {
+    const svgIcon = String(node.svgIcon).slice(0, 60);
+    if (svgIcon.length >= 2) {
+      const safe = escapeCssAttrValue(svgIcon);
+      const tagPrefix = node.tag || '*';
+      // Variant 1: target IS the mat-icon (rare — usually has role="img" so
+      // wouldn't pass interactive filter, but covered for completeness).
+      if (node.tag === 'mat-icon') {
+        locators.push({
+          strategy: 'css',
+          value: `mat-icon[svgicon="${safe}"]`,
+          confidence: 0.79,
+        });
+      } else {
+        // Variant 2: wrapper button/link contains the mat-icon.
+        locators.push({
+          strategy: 'css',
+          value: `${tagPrefix}:has(mat-icon[svgicon="${safe}"])`,
+          confidence: 0.77,
+        });
+        // Mirror via data-mat-icon-name (same value, different attribute path)
+        // — covers Material versions where svgicon was renamed in v15+.
+        locators.push({
+          strategy: 'css',
+          value: `${tagPrefix}:has(mat-icon[data-mat-icon-name="${safe}"])`,
+          confidence: 0.76,
         });
       }
     }
@@ -334,6 +392,20 @@ function buildLocatorChain(node: InteractiveNode): LocatorEntry[] {
       strategy: 'placeholder',
       value: node.placeholder,
       confidence: 0.75,
+    });
+  }
+
+  // V23: <img alt> / <area alt> — accessible name for image targets. Stable
+  // across asset hash rotation when the alt text stays consistent. Confidence
+  // sits between placeholder (0.75) and title (0.7) — alt is more deliberately
+  // authored than title for screen readers. Only emit when alt is non-trivial
+  // (≥2 chars) and there's no stronger label already (else we'd redundant-pick).
+  if (node.alt && node.alt.length >= 2 && !node.testIdAttr && !node.id) {
+    const safeAlt = escapeCssAttrValue(node.alt);
+    locators.push({
+      strategy: 'css',
+      value: `${node.tag || '*'}[alt="${safeAlt}"]`,
+      confidence: 0.73,
     });
   }
 

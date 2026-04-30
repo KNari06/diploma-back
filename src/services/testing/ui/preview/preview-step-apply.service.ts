@@ -9,7 +9,7 @@ import { logIntentResolveApply } from './intent-resolve-audit';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import type { Frame, FrameLocator, Locator, Page } from 'playwright';
-import { sanitizeIntent } from './element-resolver.service';
+import { getEffectiveLabel, sanitizeIntent } from './element-resolver.service';
 import { EditorTraceService } from './editor-trace.service';
 import { IntentStepLintService } from './intent-step-lint.service';
 import { LocatorPlanBuilder } from './locator-plan-builder.service';
@@ -1169,7 +1169,7 @@ interface ApplyResult {
    * indistinguishable from "fake-passed" — focus-only successes look the
    * same as real navigations in run summaries.
    */
-  clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
+  clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'download' | 'none';
   /**
    * Identity of the element the resolver actually clicked. Without this we
    * can't tell whether "passed" landed on the recorded target or on a
@@ -1223,6 +1223,112 @@ interface ApplyResult {
   waitForChangedFrom?: string;
   /** Diagnostic only — `page.url()` value at the moment the wait_for branch was decided. */
   waitForUrlBefore?: string;
+  /**
+   * V23: Compact decision trace for postmortem comparison of two runs of the
+   * same step. Lets you diff `run1.jsonl` vs `run2.jsonl` and immediately
+   * see WHY identical steps produced different results — was compiled stale,
+   * did identity fast-path miss, did LLM cache hit, was an overlay blocking,
+   * etc. Surfaced into preview_run JSONL `step_result.decisionTrace`.
+   *
+   * All fields are optional — only populated for the path the step actually
+   * took. Use `jq '.payload.decisionTrace' run.jsonl` for inspection.
+   */
+  decisionTrace?: StepDecisionTrace;
+}
+
+/**
+ * V23: Per-step decision trace. One JSON blob per applied step that captures
+ * the path through the resolver pipeline, the chosen element, the recorded
+ * fingerprint, overlay block check, and timings. Designed for diff analysis
+ * of two runs of the same step. Keep field set narrow on purpose — this
+ * payload travels through preview_run JSONL on every step.
+ */
+interface StepDecisionTrace {
+  /** Which resolver path produced the candidate that was actually clicked. */
+  resolverPath?: import('./preview.types').LintResult['resolverPath'];
+  /** Compiled fast-path diagnostic. */
+  compiled?: {
+    available: boolean;
+    urlStale?: boolean;
+    compiledPageUrl?: string;
+    currentPageUrl?: string;
+    locatorCount?: number;
+    succeededStrategy?: string;
+    succeededWithFingerprintMatch?: number;
+    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | null;
+  };
+  /** Identity fast-path diagnostic (id/testId/name match against live DOM). */
+  identity?: {
+    recordedId?: string;
+    recordedTestId?: string;
+    recordedName?: string;
+    matched: boolean;
+    matchType?: 'id' | 'testid' | 'name';
+    liveIdsCount?: number;
+    liveIdsSample?: string[];
+  };
+  /** Evidence shortcut (cached lastSuccessRef hit). */
+  evidence?: {
+    cachedRef?: string;
+    cachedAtIso?: string;
+    foundInLiveDom: boolean;
+    bypassReason?: string;
+  };
+  /** LLM resolver decision (when path = 'llm' or 'vision'). */
+  llm?: {
+    cacheHit: boolean;
+    latencyMs?: number;
+    candidatesCount?: number;
+    selectedRef?: string;
+    confidence?: number;
+    degraded?: boolean;
+    degradedReason?: string;
+  };
+  /** Element actually clicked. Compare against `recorded` to spot drift. */
+  chosen?: {
+    ref?: string;
+    tag?: string;
+    role?: string;
+    label?: string;
+    text?: string;
+    id?: string;
+    testIdAttr?: string;
+    bbox?: { x: number; y: number; width: number; height: number };
+  };
+  /** What the recorder captured (or compiled targetFingerprint). */
+  recorded?: {
+    tag?: string;
+    role?: string;
+    label?: string;
+    text?: string;
+    id?: string;
+    testIdAttr?: string;
+    bbox?: { x: number; y: number; width: number; height: number };
+  };
+  /** Same-element check after the click. */
+  fingerprintMatch?: 'id' | 'testid' | 'bbox' | 'tag' | 'no_recorded' | 'mismatch';
+  /** Pre-click overlay hit-test result. */
+  overlayBlock?: {
+    blocked: boolean;
+    overlayRef?: string;
+    overlayText?: string;
+    diagnosisConfidence?: number;
+    waitForSelector?: string;
+    overlayDisappearedAfterWait?: boolean;
+  };
+  /** Click-effect verifier output. */
+  clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'download' | 'none';
+  /** Was this a soft-pass for manual-add no-effect (V23). */
+  softPassedOnNoEffect?: boolean;
+  /** Latency breakdown — helps spot which phase ate the budget. */
+  timing?: {
+    compiledMs?: number;
+    lintMs?: number;
+    llmMs?: number;
+    actionMs?: number;
+    verifyMs?: number;
+    totalMs?: number;
+  };
 }
 
 /**
@@ -1262,9 +1368,18 @@ type ClickPreState = {
   targetAriaChecked: string | null;
   targetDisabled: boolean;
   pageCount: number; // browser-context tab count for new-tab detection
+  // V23: download event tracker. Set to a one-shot promise that resolves true
+  // if Playwright fires `'download'` event between captureClickPreState and
+  // verifyClickHadEffect. Click on a "Download PDF" button doesn't change URL
+  // or DOM — without this signal the fake-success guard would mark a real
+  // download as fail. Listener is registered with { once: true } so it
+  // doesn't leak across steps.
+  downloadDetected: () => boolean;
+  // Cleanup function to remove the listener when verifier finishes.
+  cleanupDownloadListener: () => void;
 };
 
-type ClickEffectSignal = 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
+type ClickEffectSignal = 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none' | 'download';
 
 /**
  * Resolve the JS-execution context for click verification. When the step
@@ -1292,6 +1407,29 @@ async function captureClickPreState(
 ): Promise<ClickPreState> {
   let pageCount = 1;
   try { pageCount = page.context().pages().length; } catch { /* best-effort */ }
+  // V23: install one-shot 'download' listener BEFORE click so a "Download
+  // PDF" button (no URL change, no DOM change) is still recognised as
+  // legitimate. Without this, click on download triggers a download but the
+  // verifier sees signal='none' and the fake-success guard fails the step.
+  let downloaded = false;
+  const downloadHandler = () => { downloaded = true; };
+  let cleanupDownloadListener = (): void => { /* no-op fallback */ };
+  try {
+    page.on('download', downloadHandler);
+    let cleaned = false;
+    cleanupDownloadListener = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try { page.off('download', downloadHandler); } catch { /* non-fatal */ }
+    };
+    // Self-cleanup after 30s in case verifier path never runs (e.g. action
+    // threw before verify, caller forgot to call cleanup). Listener leak
+    // would otherwise accumulate across long sessions. Idempotent — verifier's
+    // explicit cleanup wins; this fires only if verifier didn't.
+    const safetyTimer = setTimeout(() => cleanupDownloadListener(), 30_000);
+    (safetyTimer as any)?.unref?.();
+  } catch { /* best-effort — page may be navigating */ }
+
   const fallback: ClickPreState = {
     url: page.url(),
     dialogCount: 0,
@@ -1302,6 +1440,8 @@ async function captureClickPreState(
     targetAriaChecked: null,
     targetDisabled: false,
     pageCount,
+    downloadDetected: () => downloaded,
+    cleanupDownloadListener,
   };
   try {
     const safeRef = ref ? ref.replace(/[^a-zA-Z0-9_-]/g, '') : '';
@@ -1352,7 +1492,7 @@ async function captureClickPreState(
           : false,
       };
     }, { refSel: safeRef });
-    return { ...pageSig, ...elemSig, pageCount };
+    return { ...pageSig, ...elemSig, pageCount, downloadDetected: () => downloaded, cleanupDownloadListener };
   } catch {
     return fallback;
   }
@@ -1373,13 +1513,28 @@ async function verifyClickHadEffect(
   for (const delay of checkpoints) {
     if (delay > 0) await page.waitForTimeout(delay).catch(() => {});
 
+    // V23: download detection — checked first because download events fire
+    // synchronously after click for direct file links (`<a download>`,
+    // server `Content-Disposition: attachment`). Cleanup deferred to caller
+    // so the listener still catches downloads that fire during the 800ms
+    // settle window. Cheaper than evaluate — just reads a boolean flag.
+    try {
+      if (pre.downloadDetected && pre.downloadDetected()) {
+        pre.cleanupDownloadListener?.();
+        return { effected: true, signal: 'download' };
+      }
+    } catch { /* best-effort */ }
+
     // Browser-context check: new tab opened? Cheap, runs against the
     // BrowserContext (no page.evaluate round-trip needed) so it survives
     // the case where evaluate would throw because the active page is
     // mid-navigating.
     try {
       const nowPageCount = page.context().pages().length;
-      if (nowPageCount > pre.pageCount) return { effected: true, signal: 'newtab' };
+      if (nowPageCount > pre.pageCount) {
+        pre.cleanupDownloadListener?.();
+        return { effected: true, signal: 'newtab' };
+      }
     } catch { /* best-effort */ }
 
     // Page-level signals — always main page (URL, top-level dialog, top-level body
@@ -1413,9 +1568,13 @@ async function verifyClickHadEffect(
       }, pre);
     } catch {
       // Page navigating mid-eval — that itself is an effect.
+      pre.cleanupDownloadListener?.();
       return { effected: true, signal: 'url' };
     }
-    if (pageResult.signal !== 'none') return { effected: true, signal: pageResult.signal };
+    if (pageResult.signal !== 'none') {
+      pre.cleanupDownloadListener?.();
+      return { effected: true, signal: pageResult.signal };
+    }
 
     // Element-level signals — inside the targeted iframe (if any), else main page.
     // If the iframe was destroyed by the click (cross-origin nav, unmount), the
@@ -1444,8 +1603,17 @@ async function verifyClickHadEffect(
       // Frame detached / navigating — count as effect.
       return { effected: true, signal: 'detach' };
     }
-    if (elemResult.signal !== 'none') return { effected: true, signal: elemResult.signal };
+    if (elemResult.signal !== 'none') {
+      pre.cleanupDownloadListener?.();
+      return { effected: true, signal: elemResult.signal };
+    }
   }
+  // V23: final download check — event may have fired during the 800ms wait
+  // even though no other signal triggered. Cleanup listener regardless.
+  let downloadFinal = false;
+  try { if (pre.downloadDetected && pre.downloadDetected()) downloadFinal = true; } catch { /* best-effort */ }
+  pre.cleanupDownloadListener?.();
+  if (downloadFinal) return { effected: true, signal: 'download' };
   return { effected: false, signal: 'none' };
 }
 
@@ -2219,9 +2387,22 @@ async function executeAction(
 
         // V13: If next step expects navigation (wait_for changedFrom), wrap click with
         // waitForNavigation to reliably capture the navigation event.
+        //
+        // V23: `waitForNavigation({waitUntil:'load'})` only fires for FULL page
+        // loads — SPA pushState/replaceState never triggers `load` so the race
+        // would resolve via timeout, leaving `page.url()` lagging. Add a
+        // parallel `waitForURL` with predicate "url changed from urlBefore" so
+        // SPAs (Angular Router, React Router, Vue Router with router-link) are
+        // covered too. Either path resolves the race; whichever fires first
+        // wins. Both swallow errors so click never fails because of nav waits.
         if (options?.expectsNavigation) {
+          const urlBeforeClick = page.url();
           await Promise.all([
             page.waitForNavigation({ waitUntil: 'load', timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs }).catch(() => {}),
+            page.waitForURL(
+              (u: URL) => u.toString() !== urlBeforeClick,
+              { timeout: COMMAND_EXECUTOR_CONFIG.clickNavigationTimeoutMs },
+            ).catch(() => {}),
             locator.click(clickOpts),
           ]);
         } else {
@@ -2649,6 +2830,36 @@ export class PreviewStepApplyService {
   }): Promise<ApplyResult> {
     const { previewSessionId, userId, selectedRef, skipPostActionWait, expectsNavigation } = params;
     let { stepDraft } = params;
+
+    // V23: Aggregate decision trace across all branches. Every meaningful
+    // decision point writes into this; final result returns it. Use a
+    // fresh object — never mutate from a caller's reference.
+    const decisionTrace: StepDecisionTrace = {};
+    const traceTimingStart = Date.now();
+    const setTrace = (patch: Partial<StepDecisionTrace>): void => {
+      Object.assign(decisionTrace, patch);
+    };
+    const setTraceCompiled = (patch: Partial<NonNullable<StepDecisionTrace['compiled']>>): void => {
+      decisionTrace.compiled = { ...(decisionTrace.compiled || { available: false }), ...patch };
+    };
+    const setTraceTiming = (patch: Partial<NonNullable<StepDecisionTrace['timing']>>): void => {
+      decisionTrace.timing = { ...(decisionTrace.timing || {}), ...patch };
+    };
+    // Capture the recorded snapshot once at the start so all branches share
+    // the same baseline for diff against `chosen`. Truncate text fields to
+    // keep the JSONL line readable.
+    if (stepDraft.recordedFingerprint) {
+      const rfp = stepDraft.recordedFingerprint;
+      decisionTrace.recorded = {
+        tag: rfp.tag,
+        role: rfp.role,
+        label: rfp.labelText || rfp.ariaLabel || rfp.title,
+        text: rfp.text ? rfp.text.slice(0, 60) : undefined,
+        id: rfp.elementId,
+        testIdAttr: rfp.testIdAttr,
+        bbox: rfp.boundingBox,
+      };
+    }
 
     // ── Scratchpad: interpolate {{key}} context variable placeholders ──
     // Resolves cross-step data (OTP codes, stored values, extracted text) before
@@ -3562,6 +3773,16 @@ export class PreviewStepApplyService {
       const compiledUrlStale = !compiledPageUrl
         || (normalizeUrlForComparison(compiledPageUrl) !== normalizeUrlForComparison(currentPageUrl));
 
+      // V23: snapshot compiled-path state regardless of branch taken below.
+      setTraceCompiled({
+        available: !!(stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0),
+        urlStale: compiledUrlStale,
+        compiledPageUrl,
+        currentPageUrl,
+        locatorCount: stepDraft.compiled?.locatorPlan?.length,
+        ...(params.skipCompiled || compiledUrlStale ? { fellThroughTo: 'skipped' as const } : {}),
+      });
+
       if (
         stepDraft.compiled && stepDraft.compiled.locatorPlan && stepDraft.compiled.locatorPlan.length > 0
         && !params.skipCompiled
@@ -3600,6 +3821,14 @@ export class PreviewStepApplyService {
               previewSessionId,
               stepId: stepDraft.id,
               strategy: compiledResult.usedStrategy,
+            });
+            // V23: compiled fast-path won — record it. fellThroughTo cleared
+            // because we're staying in compiled.
+            setTrace({ resolverPath: 'compiled' });
+            setTraceCompiled({
+              succeededStrategy: compiledResult.usedStrategy,
+              succeededWithFingerprintMatch: compiledResult.confidence,
+              fellThroughTo: null,
             });
 
             // Build candidate from compiled result
@@ -3654,11 +3883,28 @@ export class PreviewStepApplyService {
               // pushState/replaceState often fires asynchronously after the
               // click handler returns — 300ms covers React Router, Next.js,
               // Vue Router, and most SPA frameworks.
+              //
+              // V23: Angular routers with route guards / resolvers / lazy
+              // module loading can take >300ms before URL updates. Observed
+              // on juz40-edu Angular curator: click resolved to navigation
+              // but page.url() lagged ~150ms past our 300ms ceiling →
+              // postcondition reported false-failure → fall through to lint
+              // → URL guard fired (URL had since updated) → false positive
+              // FAIL on a successful click. Bump to 1000ms with poll interval
+              // so we exit early on fast routers but tolerate slow ones.
               let urlActuallyChanged = result.urlChanged;
               if (expectedNav && !urlActuallyChanged) {
-                await page.waitForTimeout(300).catch(() => {});
-                const urlNow = page.url();
-                urlActuallyChanged = normalizeUrlForComparison(urlNow) !== normalizeUrlForComparison(currentPageUrl);
+                const SPA_NAV_WAIT_MS = 1000;
+                const POLL_INTERVAL_MS = 100;
+                const start = Date.now();
+                while (Date.now() - start < SPA_NAV_WAIT_MS) {
+                  await page.waitForTimeout(POLL_INTERVAL_MS).catch(() => {});
+                  const urlNow = page.url();
+                  if (normalizeUrlForComparison(urlNow) !== normalizeUrlForComparison(currentPageUrl)) {
+                    urlActuallyChanged = true;
+                    break;
+                  }
+                }
               }
               if (expectedNav && !urlActuallyChanged) {
                 // Before falling through, check if DOM visibly changed (modal/popup/
@@ -3724,6 +3970,7 @@ export class PreviewStepApplyService {
                   } catch { /* non-fatal */ }
                   // Fall through to lint instead of returning success
                   compiledWasTried = true;
+                  setTraceCompiled({ fellThroughTo: 'postcondition' });
                 }
               }
 
@@ -3796,7 +4043,10 @@ export class PreviewStepApplyService {
                     } catch { /* non-fatal */ }
                     compiledWasTried = true;
                     compiledClickEffected = false;
+                    setTraceCompiled({ fellThroughTo: 'click_no_effect' });
+                    decisionTrace.clickEffectSignal = effect.signal as any;
                   } else {
+                    decisionTrace.clickEffectSignal = effect.signal as any;
                     try {
                       editorTrace?.writeActionVerify({
                         stepId: stepDraft.id,
@@ -3929,12 +4179,37 @@ export class PreviewStepApplyService {
                   } catch { /* synthesis is non-fatal */ }
                 }
 
+                // V23: compiled fast-path success — pull live node info into
+                // chosen for trace. Always populate ref (even when DOM lookup
+                // fails) so the field is never silently empty — analysis
+                // tooling assumes `decisionTrace.chosen.ref` is set on any
+                // success path.
+                try {
+                  const sess2 = sessionService.getSession(previewSessionId);
+                  const liveNode2 = sess2?.pageState?.domNodes?.find((n) => n.ref === compiledRef);
+                  decisionTrace.chosen = liveNode2
+                    ? {
+                        ref: compiledRef,
+                        tag: liveNode2.tag,
+                        role: liveNode2.role,
+                        label: getEffectiveLabel(liveNode2),
+                        text: liveNode2.text ? liveNode2.text.slice(0, 60) : undefined,
+                        id: liveNode2.id ?? undefined,
+                        testIdAttr: liveNode2.testIdAttr,
+                        bbox: liveNode2.boundingBox,
+                      }
+                    : { ref: compiledRef };
+                } catch {
+                  decisionTrace.chosen = { ref: compiledRef };
+                }
+                setTraceTiming({ totalMs: Date.now() - traceTimingStart });
                 return {
                   success: true,
                   appliedStep: updatedStep,
                   urlChanged: result.urlChanged,
                   url: page.url(),
                   attempts: 1,
+                  decisionTrace,
                 };
               }
             }
@@ -3942,6 +4217,9 @@ export class PreviewStepApplyService {
 
           // Compiled failed or element not found - fallthrough to lint
           compiledWasTried = true;
+          if (!decisionTrace.compiled?.fellThroughTo) {
+            setTraceCompiled({ fellThroughTo: 'click_failed' });
+          }
           logger.debug('[PREVIEW_APPLY] Compiled locator failed, falling back to lint', {
             previewSessionId,
             stepId: stepDraft.id,
@@ -3950,6 +4228,9 @@ export class PreviewStepApplyService {
         } catch (compiledError) {
           // Compiled execution threw - fallthrough to lint
           compiledWasTried = true;
+          if (!decisionTrace.compiled?.fellThroughTo) {
+            setTraceCompiled({ fellThroughTo: 'lint' });
+          }
           logger.debug('[PREVIEW_APPLY] Compiled execution error, falling back to lint', {
             previewSessionId,
             stepId: stepDraft.id,
@@ -3975,6 +4256,59 @@ export class PreviewStepApplyService {
         forceFreshSnapshot: true,
         auditTrigger: 'apply_prelint',
       });
+      // V23: lint phase finished — record path + LLM diagnostics. resolverPath
+      // here may be 'identity_*' / 'evidence_shortcut' / 'compiled' (rare from
+      // lint) / 'llm' / 'vision' / 'rule_fallback'.
+      setTrace({ resolverPath: lintResult.resolverPath });
+      // V23: surface lint phase timings (snapshot/resolve/total) through trace
+      // so analysis can answer "where did the 19s go?". Without this, llm.latencyMs
+      // looks like LLM was slow when really snapshot collect on a 50K DOM was slow.
+      if (lintResult.phaseTimings) {
+        setTraceTiming({
+          // mirror lint phases into the existing timing block (lintMs already exists)
+          // and add granular sub-phases via direct assignment.
+        });
+        (decisionTrace.timing as any) = {
+          ...(decisionTrace.timing || {}),
+          lintSnapshotMs: lintResult.phaseTimings.snapshotMs,
+          lintResolveMs: lintResult.phaseTimings.resolveMs,
+          lintTotalMs: lintResult.phaseTimings.totalMs,
+          lintDomNodeCount: lintResult.phaseTimings.domNodeCount,
+        };
+      }
+      decisionTrace.llm = {
+        cacheHit: !!lintResult.cacheHit,
+        latencyMs: Date.now() - lintPhaseStart,
+        candidatesCount: lintResult.candidates?.length,
+        selectedRef: lintResult.candidates?.[0]?.ref,
+        confidence: lintResult.confidence,
+        degraded: !!lintResult.degradedMode,
+        degradedReason: lintResult.degradedReason,
+      };
+      // Identity fast-path may have fired inside the resolver — surface that
+      // separately so a future "identity_id but wrong element" pattern is
+      // visible at a glance.
+      if (lintResult.resolverPath === 'identity_id' || lintResult.resolverPath === 'identity_testid' || lintResult.resolverPath === 'identity_name') {
+        const fp = stepDraft.recordedFingerprint;
+        decisionTrace.identity = {
+          recordedId: fp?.elementId,
+          recordedTestId: fp?.testIdAttr,
+          recordedName: fp?.name,
+          matched: true,
+          matchType: lintResult.resolverPath === 'identity_id' ? 'id'
+            : lintResult.resolverPath === 'identity_testid' ? 'testid'
+            : 'name',
+        };
+      }
+      if (lintResult.resolverPath === 'evidence_shortcut') {
+        decisionTrace.evidence = {
+          cachedRef: stepDraft.evidence?.lastSuccessRef,
+          cachedAtIso: stepDraft.evidence?.capturedAt,
+          foundInLiveDom: true,
+          bypassReason: 'ok',
+        };
+      }
+      setTraceTiming({ lintMs: Date.now() - lintPhaseStart });
       try {
         const traceForLint = EditorTraceService.get(previewSessionId);
         traceForLint?.writeApplyPhaseExit({
@@ -4009,20 +4343,24 @@ export class PreviewStepApplyService {
       } catch { /* non-fatal */ }
 
       if (lintResult.status === 'needs_clarification') {
+        setTraceTiming({ totalMs: Date.now() - traceTimingStart });
         return {
           success: false,
           error: lintResult.message || 'Please clarify which element to use',
           highlight: lintResult.highlight,
           attempts: 0,
+          decisionTrace,
         };
       }
 
       if (lintResult.status === 'error') {
+        setTraceTiming({ totalMs: Date.now() - traceTimingStart });
         return {
           success: false,
           error: lintResult.message || 'Linting failed',
           highlight: [],
           attempts: 0,
+          decisionTrace,
         };
       }
 
@@ -4051,6 +4389,12 @@ export class PreviewStepApplyService {
             modalRef: modalInfo.modalRef,
             modalText: modalInfo.modalText?.slice(0, 80),
           });
+          decisionTrace.overlayBlock = {
+            blocked: true,
+            overlayRef: modalInfo.modalRef,
+            overlayText: modalInfo.modalText ? modalInfo.modalText.slice(0, 100) : undefined,
+          };
+          setTraceTiming({ totalMs: Date.now() - traceTimingStart });
           return {
             success: false,
             error: 'A popup/modal is currently open and may be blocking the target element. Dismiss it or interact with it first.',
@@ -4059,13 +4403,16 @@ export class PreviewStepApplyService {
               type: 'warning' as const,
             }] : [],
             modalBlocking: modalInfo,
+            decisionTrace,
           };
         }
 
+        setTraceTiming({ totalMs: Date.now() - traceTimingStart });
         return {
           success: false,
           error: lintResult.message || 'No matching elements found',
           highlight: [],
+          decisionTrace,
         };
       }
 
@@ -4098,6 +4445,12 @@ export class PreviewStepApplyService {
           const modalError = modalLabel
             ? `A popup "${modalLabel.slice(0, 80)}" is covering the target. Dismiss it in the preview or interact with elements inside it first.`
             : 'A popup/modal is blocking the target element. Dismiss it or interact with elements inside the popup first.';
+          decisionTrace.overlayBlock = {
+            blocked: true,
+            overlayRef: modalDetected.modalRef,
+            overlayText: (modalLabel || '').slice(0, 100) || undefined,
+          };
+          setTraceTiming({ totalMs: Date.now() - traceTimingStart });
           return {
             success: false,
             error: modalError,
@@ -4114,6 +4467,7 @@ export class PreviewStepApplyService {
             ],
             modalBlocking: modalDetected,
             attempts: 0,
+            decisionTrace,
           };
         }
 
@@ -4165,6 +4519,28 @@ export class PreviewStepApplyService {
             overlayText: bannerLabel?.slice(0, 80),
             candidateRef: topCandidate?.ref,
           });
+          // V23: capture overlay block for trace. This is the same path that
+          // produced "Can't reach МАТ-SMART — overlay X is painting on top"
+          // in the user's juz40 logs — surfacing it lets analysis see WHICH
+          // overlay blocked WHICH candidate without grepping server stdout.
+          decisionTrace.overlayBlock = {
+            blocked: true,
+            overlayRef: overlay.modalRef,
+            overlayText: bannerLabel ? bannerLabel.slice(0, 100) : undefined,
+          };
+          if (topCandidate) {
+            decisionTrace.chosen = {
+              ref: topCandidate.ref,
+              tag: topCandidate.node?.tag,
+              role: topCandidate.node?.role,
+              label: getEffectiveLabel(topCandidate.node),
+              text: topCandidate.node?.text ? topCandidate.node.text.slice(0, 60) : undefined,
+              id: topCandidate.node?.id ?? undefined,
+              testIdAttr: topCandidate.node?.testIdAttr,
+              bbox: topCandidate.boundingBox,
+            };
+          }
+          setTraceTiming({ totalMs: Date.now() - traceTimingStart });
           return {
             success: false,
             error: errorParts.join(' '),
@@ -4185,6 +4561,7 @@ export class PreviewStepApplyService {
               boundingBox: overlay.boundingBox,
             },
             attempts: 0,
+            decisionTrace,
           };
         }
       }
@@ -4523,6 +4900,7 @@ export class PreviewStepApplyService {
               // into the strict path and failing again on the same legit no-op.
               verified = true;
               softPassedOnNoEffect = true;
+              decisionTrace.softPassedOnNoEffect = true;
             } else {
               const clickNoEffectMsg = '[click-no-effect] Click did not change page state (URL, dialog, ARIA, focus). The element may be obstructed by an overlay, or the click handler did nothing.';
               trace?.writeActionResult({
@@ -4638,11 +5016,12 @@ export class PreviewStepApplyService {
           let chosenIdLive: string | null | undefined;
           try {
             if (candidate.node) {
-              chosenLabel = candidate.node.labelText
-                || candidate.node.ariaLabel
-                || candidate.node.text
-                || candidate.node.placeholder
-                || `<${candidate.node.tag}>`;
+              // V23: universal label extractor — covers title (Angular routerLink),
+              // alt (img), iconLabel/svgIcon (Lucide / FA / Material), childTestId
+              // (lifted icon child), customElementTag (Angular wrapper). Without
+              // this, identity-poor wrappers like `<a title="Папкалар"><svg/></a>`
+              // produced chosenLabel="<a>" → label-mismatch guard always fired.
+              chosenLabel = getEffectiveLabel(candidate.node) || `<${candidate.node.tag}>`;
               chosenTagLive = candidate.node.tag;
               chosenIdLive = candidate.node.id;
             }
@@ -4661,6 +5040,22 @@ export class PreviewStepApplyService {
                 }
               : null,
           );
+
+          // V23: capture chosen element for the trace (lint+success path).
+          decisionTrace.chosen = {
+            ref: candidate.ref,
+            tag: chosenTagLive,
+            role: candidate.node?.role,
+            label: chosenLabel,
+            text: candidate.node?.text ? candidate.node.text.slice(0, 60) : undefined,
+            id: chosenIdLive ?? undefined,
+            testIdAttr: candidate.node?.testIdAttr,
+            bbox: candidate.boundingBox,
+          };
+          decisionTrace.fingerprintMatch = fingerprintMatch;
+          if (typeof clickEffectSignal !== 'undefined') {
+            decisionTrace.clickEffectSignal = clickEffectSignal;
+          }
 
           // Diagnostic: capture user intent → resolved element pair so
           // bisecting wrong-element regressions doesn't require a re-run.
@@ -4758,6 +5153,7 @@ export class PreviewStepApplyService {
               chosenBoundingBox: candidate.boundingBox,
               fingerprintMatch,
               resolverPath: lintResult.resolverPath,
+              decisionTrace,
             };
           }
 
@@ -4869,6 +5265,19 @@ export class PreviewStepApplyService {
             let n = 0;
             for (const t of a) {
               if (b.has(t)) { n++; continue; }
+              // V23: substring tolerance — catches morphological variants
+              // ("папка" ⊂ "папкалар", "courses" ⊂ "course") before falling
+              // through to the more expensive Damerau-Levenshtein path.
+              // Min 3 chars on both sides to avoid spurious "ok" inside "Bookmark".
+              let matched = false;
+              if (t.length >= 3) {
+                for (const u of b) {
+                  if (u.length >= 3 && (u.includes(t) || t.includes(u))) {
+                    matched = true; break;
+                  }
+                }
+              }
+              if (matched) { n++; continue; }
               // Fuzzy fallback — only when exact match fails. Iterate the
               // smaller-cardinality side (here `b`) so worst-case stays
               // O(|a|·|b|·max-token-len²) which is a few hundred ops per
@@ -5028,6 +5437,7 @@ export class PreviewStepApplyService {
               chosenBoundingBox: candidate.boundingBox,
               fingerprintMatch,
               resolverPath: lintResult.resolverPath,
+              decisionTrace,
             };
           }
           // Synthesize a `recordedFingerprint` for manually-added click
@@ -5063,6 +5473,8 @@ export class PreviewStepApplyService {
             }
           }
 
+          // V23: finalize trace timing for the success path.
+          setTraceTiming({ totalMs: Date.now() - traceTimingStart });
           return {
             success: true,
             appliedStep,
@@ -5087,6 +5499,7 @@ export class PreviewStepApplyService {
             resolverPath: lintResult.resolverPath,
             stateChange,
             compiledFailed: compiledWasTried,
+            decisionTrace,
           };
         }
 
@@ -5102,6 +5515,7 @@ export class PreviewStepApplyService {
       }
 
       // All attempts failed
+      setTraceTiming({ totalMs: Date.now() - traceTimingStart });
       return {
         success: false,
         error: lastError || 'All candidates failed',
@@ -5111,6 +5525,7 @@ export class PreviewStepApplyService {
           type: 'error' as const,
         })),
         attempts,
+        decisionTrace,
       };
     } catch (error) {
       logger.error('[PREVIEW_APPLY] Apply failed', {
@@ -5118,9 +5533,11 @@ export class PreviewStepApplyService {
         previewSessionId,
       });
 
+      setTraceTiming({ totalMs: Date.now() - traceTimingStart });
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Apply failed',
+        decisionTrace,
       };
     }
   }

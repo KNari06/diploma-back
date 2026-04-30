@@ -1779,6 +1779,24 @@ export class SnapshotCollector {
             const titleAttr = el.getAttribute('title') || undefined;
             const labelText = getLabelText(el);
 
+            // V23: <input type="submit|button|reset" value="..."> — value IS
+            // the visible button label per HTML spec. Collector deliberately
+            // strips `input.value` for security (passwords, emails, etc.),
+            // but for these three types value carries no PII — it's a label
+            // baked into the markup. Without this, legacy forms (gov sites,
+            // banking, legacy admin panels) lose their primary identity.
+            // Strict gate: type ∈ {submit,button,reset} only.
+            let submitButtonLabel: string | undefined;
+            if (isInput) {
+              const inputType = (input.type || '').toLowerCase();
+              if (inputType === 'submit' || inputType === 'button' || inputType === 'reset') {
+                const v = (input.value || '').trim();
+                if (v.length > 0 && v.length <= 100) {
+                  submitButtonLabel = v;
+                }
+              }
+            }
+
             // Identity fast-path requires the live DOM id / testId / name on
             // every InteractiveNode so the resolver can match against the
             // recorder's TargetFingerprint without an LLM call. Without this,
@@ -1817,9 +1835,18 @@ export class SnapshotCollector {
             // can match recorded ↔ live without normalization drift.
             let liveSvgIcon: string | undefined;
             try {
+              // V23: search both directions for `<mat-icon>` carrying svgicon —
+              // self, then ancestors (icon-only Material buttons where the
+              // <mat-icon> IS the clickable target), then descendants (Angular
+              // apps where <button>/<a>/<app-excel-btn> wrap the icon —
+              // common pattern: `<button>...<mat-icon svgicon="excel">`).
+              // Without descendant-search, descriptor-poor wrapper buttons
+              // like `<app-excel-btn>` lose svgIcon entirely and the resolver
+              // falls through to LLM with no identity hint.
               const matIconHost = el.tagName.toLowerCase() === 'mat-icon'
                 ? el
-                : (el.closest ? el.closest('mat-icon') : null);
+                : (el.closest ? el.closest('mat-icon') : null)
+                || (el.querySelector ? el.querySelector('mat-icon') : null);
               if (matIconHost) {
                 const rawSvgIcon = matIconHost.getAttribute('svgicon')
                   || matIconHost.getAttribute('data-mat-icon-name')
@@ -1964,6 +1991,54 @@ export class SnapshotCollector {
                       const suffixed = classStr.match(/\b([a-z]+)[-_]icon\b|\bicon[-_]([a-z]+)\b/i);
                       const name = (suffixed?.[1] || suffixed?.[2] || '').toLowerCase().trim();
                       if (name.length > 0 && name.length <= 50 && name !== 'icon') iconChildLabel = name;
+                    }
+                    // V23: company-style namespaced classes — `dg_uikit_arrowDropDown_000000wqx84w`,
+                    // `app_HeaderButton_a8f3b2`, `mui_StyledIcon_xyz123`. Format:
+                    //   <namespace>_<CamelOrSnakeName>_<hash>
+                    // Extract the CamelCase middle segment as the icon's semantic
+                    // name. Skip when middle is generic ("root", "wrapper", "container",
+                    // "content", "label", "box", "inner") — those are layout primitives,
+                    // not identity. Lowercased to align with other icon-name fields.
+                    if (!iconChildLabel) {
+                      // Match: prefix_MidSegment_hash where:
+                      //   - prefix: 2+ letters, NO digits (rejects `jss123_X_Y`,
+                      //     `sc-Abc_Y_Z` styled-components hash that already
+                      //     fails the broader skipRx but be defensive).
+                      //   - MidSegment: starts with letter, 3-40 chars, with at
+                      //     least one CamelCase boundary OR an underscore inside
+                      //     ('arrowDropDown' or 'arrow_drop_down') — reduces false
+                      //     positives on simple words ('button', 'icon') that
+                      //     could collide with layout primitives.
+                      //   - hash: 5+ lowercase alphanumeric trailing (the random
+                      //     suffix that namespaced libraries emit per build).
+                      const namespaced = classStr.match(/\b([a-z]{2,})_([A-Za-z][A-Za-z0-9_]{2,40})_[a-z0-9]{5,}\b/);
+                      const namespacePrefix = namespaced?.[1];
+                      const midSegment = namespaced?.[2];
+                      const hasCamelOrSnake = midSegment
+                        ? /[A-Z]/.test(midSegment) || /_/.test(midSegment)
+                        : false;
+                      // Skip when the prefix LOOKS like a generic CSS hash
+                      // generator (jss/sc/css/makeStyles/emotion) — those names
+                      // don't correspond to product semantics.
+                      const genericPrefixRx = /^(jss|sc|css|emotion|makeStyles|styled)$/i;
+                      if (
+                        midSegment
+                        && namespacePrefix
+                        && !genericPrefixRx.test(namespacePrefix)
+                        && hasCamelOrSnake
+                      ) {
+                        // skip layout primitives that don't identify the element
+                        const layoutSkipRx = /^(root|wrapper|container|content|label|box|inner|outer|main|body|header|footer|sidebar|panel|section)$/i;
+                        if (!layoutSkipRx.test(midSegment)) {
+                          // CamelCase → space-separated lowercase; works for snake_case too.
+                          const name = midSegment
+                            .replace(/([a-z])([A-Z])/g, '$1 $2')
+                            .replace(/_/g, ' ')
+                            .toLowerCase()
+                            .trim();
+                          if (name.length >= 3 && name.length <= 50) iconChildLabel = name;
+                        }
+                      }
                     }
                   }
                 }
@@ -2117,6 +2192,11 @@ export class SnapshotCollector {
               // Labels
               ariaLabel,
               title: titleAttr || iconChildLabel,
+              // V23: alt attribute as its own field (not just consumed for
+              // descriptor-poor check). <img alt="..."> is the WCAG-recommended
+              // accessible name for image targets; without persisting it,
+              // resolver/builder/helper can't read it from the node.
+              alt: ownAlt || undefined,
               // V22 Pkg4: dedicated semantic icon label field (alongside title
               // for backward compat). Used by candidateText / fpHintLines /
               // heal-time score so icon-only buttons get a stable "name" even
@@ -2125,7 +2205,10 @@ export class SnapshotCollector {
               svgIcon: liveSvgIcon,
               customElementTag: liveCustomElementTag,
               isIconButton: isIconButton || undefined,
-              labelText,
+              // V23: prefer explicit submitButtonLabel (legacy <input type=submit
+              // value="...">) when no labelText computed; downstream consumers
+              // treat both via the same field.
+              labelText: labelText || submitButtonLabel,
               // Hierarchy
               parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,
               containerRef,

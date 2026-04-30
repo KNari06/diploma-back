@@ -21,6 +21,9 @@ Lints user-written step descriptions against the live page → returns 0–5 ran
 ### Functions
 - `isEvidenceShortcutNodeCompatible(step, node, pageUrl): { ok, reason }` — exported for testing; validates a cached node against the action type.
 
+### Imports of note
+- `getEffectiveLabel` from [element-resolver.service.ts](../element-resolver.service.ts) (V23) — canonical label resolution for clarification examples, candidate rendering, and recorded-fingerprint text-token collection. Replaces the ad-hoc `labelText || ariaLabel || text || placeholder` chain in 3+ locations and keeps lint output consistent with apply-time traces.
+
 ### Types (re-exported from `preview.types.ts`)
 - `LintResult`, `LintCandidate`.
 - `LintStatus = 'resolved' | 'ambiguous' | 'not_found' | 'error' | 'needs_clarification'`.
@@ -73,6 +76,7 @@ Main entry. Calls `resolveElement()` (LLM + vision); falls back to rule-based on
   - `clarificationQuestion?: string` — LLM-generated "did you mean?" message.
   - `interpretation?: string` — one-line summary of what the user wants.
   - `aiFallbackReason?: 'semantic_zero'` — resolver found nodes but none semantically match.
+  - **`phaseTimings?: { snapshotMs, resolveMs, totalMs, domNodeCount }` (V23)** — per-phase performance breakdown. `snapshotMs` includes DOM collection + extraction; `resolveMs` is the resolver call; `totalMs` is end-to-end; `domNodeCount` is the size of the candidate pool. Used by editor latency tracing and slow-page diagnostics (logs warn when `snapshotMs > 1000`).
 - **Side-effects:** snapshot fetch (forced or 500ms cached); LLM call via `resolveElement()`; vision rescue if needed; trace writes to `EditorTraceService`; AI activity feed via `withAIContext()`.
 - **Throws:** never.
 - **Key steps:**
@@ -111,6 +115,8 @@ Main entry. Calls `resolveElement()` (LLM + vision); falls back to rule-based on
 
 Stateless scorer. Hard rejects: disabled; readonly+fill/type/clear. Multiplicative penalty/boost order: penalties first (invisible -100, disabled -50, not-topmost -20, readonly -40, state-mismatch -80, dynamic-id -30); then boosts (testId 150 / labelText 120 / aria 100 / text 90 / placeholder 85 / partial 70–90 / role 30 / type 40 / autocomplete 60 / container title 35 / container keyword 20 / tag-for-action 10).
 
+**V23 — title and alt as accessible-name sources.** `node.title` (tooltip, critical for icon-only buttons) and `node.alt` (image accessible name) are now treated alongside `ariaLabel` for matching purposes. No new `WEIGHTS` keys — the existing aria/text tier covers them. Observable: icon-only buttons with only a `title=` attribute now rank correctly instead of dropping to tag-only.
+
 ### `rankCandidatesByFingerprint(candidates, domNodes, recordedFp)`
 
 Re-rank against `recordedFp`. Combined score: `0.7 × structuralOverlap + 0.3 × bboxProximity`. Cyrillic↔Latin fold-aware. Used only in degraded mode + multi-candidate.
@@ -124,6 +130,8 @@ Deterministic classifier (no LLM). Returns one of:
 - `AMBIGUOUS_RIGHT_PAGE` — >1 candidate, conf ≥ 0.5.
 - `VAGUE_DESC` — recorded FP exists, conf < 0.5, intent < 25 chars.
 - `GENERIC` — fallthrough.
+
+**V23 — extended candidate text comparison.** Scenario detection now matches against `alt`, `iconLabel`, `svgIcon`, `childTestId`, `customElementTag` in addition to the existing label/aria/text fields. Same return enum, same signature — only precision improves (fewer false `GENERIC` for icon-only Angular Material / Vue components).
 
 ### `generateClarificationQuestion(params)` → `{ question, interpretation, examples }`
 

@@ -855,7 +855,7 @@ export class EditorTraceService {
     durationMs: number;
     beforeState?: Record<string, any>;
     afterState?: Record<string, any>;
-    signal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
+    signal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'download' | 'none';
   }): void {
     this.writer.write({
       stage: 'action',
@@ -1144,7 +1144,7 @@ export class EditorTraceService {
     expectsNavigation: boolean;
     urlChanged: boolean;
     domChanged?: boolean;
-    clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none';
+    clickEffectSignal?: 'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'download' | 'none';
     accepted: boolean;
     reason?: string;
   }): void {

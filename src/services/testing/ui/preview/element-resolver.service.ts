@@ -655,6 +655,73 @@ function computePageSignature(url: string, nodes: InteractiveNode[]): string {
  * @param node - Interactive node from DOM analysis
  * @returns Semantic text for LLM matching (max 200 chars)
  */
+
+/**
+ * V23 (April 2026): Universal "effective visible label" extractor.
+ *
+ * Various sites under test surface element identity through different
+ * attributes — Angular Material puts a Kazakh tooltip on `<a title="...">`,
+ * MUI uses `aria-label`, Bootstrap relies on visible `text`, Vue + i18n on
+ * `<img alt>`, icon-only Element Plus / AntD on `data-testid` lifted
+ * children, etc. Every site should give the resolver SOME readable label.
+ *
+ * Before this helper, multiple sites in the resolver pipeline read only
+ * `labelText || ariaLabel || text || placeholder` and dropped on the floor:
+ *   • `title`          — Angular `<a title="Папкалар">` for icon-link cards
+ *   • `alt`            — `<img>` accessible name
+ *   • `iconLabel`      — Lucide / FA / svg `<title>` derivative
+ *   • `svgIcon`        — Angular Material `<mat-icon svgicon="folder">`
+ * That dropped data caused semantic-floor reject + label-mismatch reject
+ * even when the candidate WAS the right element — it just identified itself
+ * via an attribute the chain forgot.
+ *
+ * Use this helper everywhere a "single representative string for this node"
+ * is needed: candidate label display, semantic floor token comparison,
+ * label-mismatch guard, scene summary, dedup keys. Keep `buildCandidateText`
+ * separate — that one renders the FULL multi-field candidate description
+ * for the LLM prompt, not a single fallback.
+ *
+ * Order is intentional, most-specific → most-general:
+ *   1. labelText      — explicit `<label for=>` association (strongest)
+ *   2. ariaLabel      — explicit ARIA accessible name
+ *   3. title          — `title=` attribute (Angular routerLink, tooltips)
+ *   4. alt            — `<img>` accessible name
+ *   5. text            — visible textContent
+ *   6. placeholder    — input placeholder (only meaningful for inputs)
+ *   7. iconLabel      — derived from svg `<title>`/data-lucide/FA class
+ *   8. svgIcon        — Angular Material registry name (`svgicon` attr)
+ *   9. childTestId    — lifted single-icon-child data-testid (V22 Pkg1)
+ *   10. customElementTag — `<app-notifications-button>` semantic wrapper
+ *
+ * Returns empty string when ALL fields are missing (genuinely unidentifiable
+ * node like a bare `<li>` with no children carrying signals — that's a real
+ * detection problem, not something this helper can fix).
+ */
+export function getEffectiveLabel(node: InteractiveNode | undefined | null): string {
+  if (!node) return '';
+  // Order: most-specific (W3C accessible name spec) → most-general fallbacks.
+  //
+  // Per WAI-ARIA Accessible Name Computation:
+  //   labelText (covers aria-labelledby, <label for>, wrapping <label>),
+  //   ariaLabel, title, alt, then visible text.
+  // Then product-specific identity fallbacks for descriptor-poor targets.
+  return (
+    node.labelText            // includes aria-labelledby + native <label>
+    || node.ariaLabel
+    || node.title             // WAI-ARIA accessible name source
+    || node.alt               // <img>/<area>/<input type=image> accessible name
+    || node.text              // visible textContent
+    || node.placeholder       // input fallback
+    || node.iconLabel         // svg <title>/data-lucide/sprite/FA class
+    || node.svgIcon           // Angular Material registry name
+    || node.childTestId       // lifted single-icon-child data-testid
+    || node.dataValue         // <option value>/<li data-value> semantic key
+    || node.dataRowKey        // AntD/RainbowKit table row identity
+    || node.customElementTag  // <app-X>/<my-button> semantic wrapper
+    || ''
+  ).toString();
+}
+
 export function buildCandidateText(node: InteractiveNode): string {
   const parts: string[] = [];
 
@@ -922,14 +989,14 @@ function buildSceneSummary(
   // Detect expanded containers (open dropdowns, accordions, menus)
   const expanded = candidates.filter(c => c.node.ariaExpanded === true);
   for (const c of expanded) {
-    const label = c.node.labelText || c.node.ariaLabel || c.node.text || c.node.tag;
+    const label = getEffectiveLabel(c.node) || c.node.tag;
     scenes.push(`"${label}" is expanded/open`);
   }
 
   // Detect selected tabs
   const selected = candidates.filter(c => c.node.ariaSelected === true);
   for (const c of selected) {
-    const label = c.node.labelText || c.node.ariaLabel || c.node.text || c.node.tag;
+    const label = getEffectiveLabel(c.node) || c.node.tag;
     scenes.push(`"${label}" tab is selected`);
   }
 
@@ -980,6 +1047,20 @@ function buildNodeSearchText(node: InteractiveNode): string {
   // Splits "lucide-folder" / "icon-folder" / "mdi:folder" into scannable tokens so
   // intent "folder icon" matches the right element instead of falling back to DOM order.
   if (node.iconClasses) parts.push(node.iconClasses.replace(/[-_:]/g, ' '));
+  // V23: additional identity sources for searchable text — gives preScoreAndSort
+  // a chance on icon-only / Angular-Material / Vue / Bootstrap targets where
+  // identity lives on derived fields. Each is split on hyphen/underscore so
+  // a multi-word value like "folder-outline" matches an intent like "folder".
+  const alt = (node as any).alt as string | undefined;
+  if (alt) parts.push(alt);
+  const iconLabel = (node as any).iconLabel as string | undefined;
+  if (iconLabel) parts.push(iconLabel.replace(/[-_]/g, ' '));
+  const svgIcon = (node as any).svgIcon as string | undefined;
+  if (svgIcon) parts.push(svgIcon.replace(/[-_]/g, ' '));
+  const childTestId = (node as any).childTestId as string | undefined;
+  if (childTestId) parts.push(childTestId.replace(/[-_]/g, ' '));
+  const customElementTag = (node as any).customElementTag as string | undefined;
+  if (customElementTag) parts.push(customElementTag.replace(/[-_]/g, ' '));
   return parts.join(' ').toLowerCase();
 }
 
@@ -1082,13 +1163,13 @@ function markDuplicatesWithContext(
 ): void {
   const labelCounts = new Map<string, number>();
   for (const c of candidates) {
-    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    const label = getEffectiveLabel(c.node).trim().toLowerCase();
     if (label) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
   }
 
   const labelIndex = new Map<string, number>();
   for (const c of candidates) {
-    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    const label = getEffectiveLabel(c.node).trim().toLowerCase();
     if (label && (labelCounts.get(label) || 0) > 1) {
       const idx = (labelIndex.get(label) || 0) + 1;
       labelIndex.set(label, idx);
@@ -1100,7 +1181,7 @@ function markDuplicatesWithContext(
         const textWithoutNear = c.candidateText
           .replace(` | ${nearSegment}`, '')
           .replace(nearSegment, '');
-        const primaryLabel = c.node.labelText || c.node.ariaLabel || c.node.text || '';
+        const primaryLabel = getEffectiveLabel(c.node);
         // Find end of container prefix "[section > Title]" — it's always followed by " | "
         // Use first "] |" to avoid matching state hints like [disabled] that appear later
         const containerEndMarker = textWithoutNear.indexOf('] |');
@@ -2486,6 +2567,15 @@ Select the single best matching element, or return ref=null if the intent does n
   // null when the description is gibberish or doesn't fit any candidate.
   const systemPrompt = mode === 'heal' ? LLM_SELECT_HEAL_PROMPT : LLM_SELECT_APPLY_PROMPT;
 
+  // V23: split timing into prepare/llm/post phases. The composite `latencyMs`
+  // measures startTime → result, but a 19s "LLM latency" we saw in production
+  // could be 6s gemini + 13s post-processing — we couldn't tell from one
+  // number. Now we log all three so the next slow step is unambiguous.
+  const prepareMs = Date.now() - startTime;
+  const promptChars = systemPrompt.length + userPrompt.length;
+  const llmCallStart = Date.now();
+  let llmCallMs = 0;
+
   try {
     const response = await getChatCompletionWithMessages(
       [
@@ -2505,7 +2595,23 @@ Select the single best matching element, or return ref=null if the intent does n
       }
     );
 
+    llmCallMs = Date.now() - llmCallStart;
     clearTimeout(timeoutId);
+
+    // V23: SLA breach guard. If we asked for a 7s budget and got 1.5× past
+    // it AND we still received a response, the abort signal failed to
+    // propagate. Surface as warn so we notice repeats; don't throw — caller
+    // would lose a successful response just for diagnostics.
+    if (llmCallMs > LLM_SELECT_TIMEOUT_MS * 1.5) {
+      logger.warn('[LLM_SELECT] SLA breach — call exceeded 1.5× timeout despite abort signal', {
+        llmCallMs,
+        timeoutMs: LLM_SELECT_TIMEOUT_MS,
+        model: AI_TASK_MODELS.disambiguation,
+        candidateCount: candidates.length,
+        promptChars,
+        signalAborted: controller.signal.aborted,
+      });
+    }
 
     // Parse response
     // V15: Use balanced-brace parser instead of greedy regex.
@@ -2686,13 +2792,12 @@ Select the single best matching element, or return ref=null if the intent does n
       let semanticFloorRejected = false;
       if (mode !== 'heal' && confidence < 0.85) {
         const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
-        const chosenText = (
-          chosenCandidate?.node.labelText
-          || chosenCandidate?.node.ariaLabel
-          || chosenCandidate?.node.text
-          || chosenCandidate?.node.placeholder
-          || ''
-        ).toLowerCase();
+        // V23: use the universal `getEffectiveLabel` so semantic floor sees
+        // identity that lives on title/alt/iconLabel/svgIcon/etc., not just
+        // labelText|ariaLabel|text|placeholder. Without this, an Angular
+        // routerLink `<a title="Папкалар">` would falsely fail the semantic
+        // floor because none of the four read fields were populated.
+        const chosenText = getEffectiveLabel(chosenCandidate?.node).toLowerCase();
         // Same Cyrillic↔Latin glyph fold the apply-time guard uses (M↔М,
         // A↔А, T↔Т, …) so "MAT-SMART" and "МАТ-SMART" agree on tokens.
         // Cheap inline copy — pulling the helper out of preview-step-apply
@@ -2725,8 +2830,21 @@ Select the single best matching element, or return ref=null if the intent does n
         const intentTokens = tok(intentText.toLowerCase());
         const chosenTokens = tok(chosenText);
         if (intentTokens.size > 0 && chosenTokens.size > 0) {
+          // V23: shared = exact OR substring (≥3 chars). Russian/Kazakh/etc.
+          // morphology means "папка" (intent) vs "папкалар" (label) are
+          // semantically the same word but fail set equality. Substring with
+          // a 3-char floor catches morphological variants without globbing
+          // unrelated tokens (e.g. "ok" inside "Bookmark").
           let shared = 0;
-          for (const t of intentTokens) if (chosenTokens.has(t)) { shared++; break; }
+          outer: for (const i of intentTokens) {
+            for (const c of chosenTokens) {
+              if (i === c) { shared = 1; break outer; }
+              // Prefix-or-substring overlap, both directions, min 3 chars.
+              if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
+                shared = 1; break outer;
+              }
+            }
+          }
           if (shared === 0) semanticFloorRejected = true;
         }
       }
@@ -2884,12 +3002,22 @@ Select the single best matching element, or return ref=null if the intent does n
     result._response = content;
     result._model = AI_TASK_MODELS.disambiguation;
 
+    // V23: phase breakdown — prepareMs (build prompt), llmCallMs (network),
+    // postMs (parse + validate + suggestion). totalMs is from startTime.
+    const totalMs = Date.now() - startTime;
+    const postMs = Math.max(0, totalMs - prepareMs - llmCallMs);
     logger.info('[LLM_SELECT] Element selection complete', {
       event: 'llm_select_complete',
       status: result.status,
       selectedRef: result.selectedRef,
       confidence: result.confidence,
       latencyMs: result.latencyMs,
+      // V23 breakdown
+      prepareMs,
+      llmCallMs,
+      postMs,
+      totalMs,
+      promptChars,
       candidateCount: candidates.length,
       actionType,
     });
@@ -3159,18 +3287,31 @@ export async function resolveElement(params: {
     try {
       const liveIds = allAllowed.map((n) => n.id).filter(Boolean) as string[];
       const liveTestIds = allAllowed.map((n) => n.testIdAttr).filter(Boolean) as string[];
+      const liveSvgIcons = allAllowed.map((n) => n.svgIcon).filter(Boolean) as string[];
+      const liveAlts = allAllowed.map((n) => n.alt).filter(Boolean) as string[];
       logger.info('[ELEMENT_RESOLVER] identity fast-path diag', {
         previewSessionId,
         stepType: stepDraft.type,
         recordedId: identityFp.elementId,
         recordedTestId: identityFp.testIdAttr,
         recordedTag: identityFp.tag,
+        // V23: svgIcon and alt are now identity-fast-path attributes too —
+        // surface them in the diag so failures on Material/img targets are
+        // diagnosable without guesswork.
+        recordedSvgIcon: identityFp.svgIcon,
+        recordedAlt: identityFp.alt,
+        recordedName: identityFp.name,
+        recordedCustomElementTag: identityFp.customElementTag,
         allAllowedCount: allAllowed.length,
         liveIdsSample: liveIds.slice(0, 8),
         liveIdsCount: liveIds.length,
         liveTestIdsSample: liveTestIds.slice(0, 8),
         liveTestIdsCount: liveTestIds.length,
+        liveSvgIconsSample: liveSvgIcons.slice(0, 8),
+        liveAltsSample: liveAlts.slice(0, 8),
         idMatch: identityFp.elementId ? liveIds.includes(identityFp.elementId) : null,
+        svgIconMatch: identityFp.svgIcon ? liveSvgIcons.includes(identityFp.svgIcon) : null,
+        altMatch: identityFp.alt ? liveAlts.includes(identityFp.alt) : null,
       });
     } catch { /* non-fatal */ }
     // Identity-by-attribute fast-path. For each attribute the recorder
@@ -3212,14 +3353,16 @@ export async function resolveElement(params: {
       // wrapped-in-`<app-notifications-button>` pattern that's common
       // on Angular apps and otherwise has zero stable identifiers.
       { attr: 'customElementTag', want: identityFp.customElementTag, readNode: (n) => n.customElementTag },
-      // NOTE: `n.name` in InteractiveNode is the *computed label* string
-      // (ariaLabel || title || placeholder || text), not the live HTML
-      // `name` attribute. Comparing it to `recordedFingerprint.name`
-      // (which IS the HTML name attribute) is a category error and would
-      // never match. The snapshot-collector doesn't expose the raw HTML
-      // name attribute today, so we skip this row until it does. Adding
-      // it back is a one-line change in snapshot-collector — see comment
-      // there about identity fields.
+      // V23: HTML `name` attribute (form fields). InteractiveNode.name is
+      // populated from element.htmlName by the extractor (NOT computed
+      // label — earlier comment was outdated). Comparing recordedFp.name to
+      // node.name is correct: both refer to the HTML attribute. Strong
+      // identity for form inputs that lack id/testid (login forms, search).
+      { attr: 'name', want: identityFp.name, readNode: (n) => n.name },
+      // V23: <img alt> accessible name. WAI-ARIA accessible name source for
+      // image targets — survives src/path changes (logo asset hash rotation,
+      // CDN moves). Stable when product naming stays consistent.
+      { attr: 'alt', want: identityFp.alt, readNode: (n) => n.alt },
     ];
 
     const wantTagLc = identityFp.tag?.toLowerCase();
@@ -3263,7 +3406,7 @@ export async function resolveElement(params: {
         });
         const lintCandidate: LintCandidate = {
           ref: chosen.ref,
-          label: chosen.labelText || chosen.ariaLabel || chosen.text || chosen.placeholder || `<${chosen.tag}>`,
+          label: getEffectiveLabel(chosen) || `<${chosen.tag}>`,
           reason: `identity match (${check.attr}${mode === 'value+tag' ? '+tag' : ''})`,
           confidence: 1.0,
           boundingBox: chosen.boundingBox,
@@ -3331,7 +3474,7 @@ export async function resolveElement(params: {
 
         const lintCandidate: LintCandidate = {
           ref: rescuedNode.ref,
-          label: rescuedNode.labelText || rescuedNode.ariaLabel || rescuedNode.text || rescuedNode.placeholder || `<${rescuedNode.tag}>`,
+          label: getEffectiveLabel(rescuedNode) || `<${rescuedNode.tag}>`,
           reason: `AI rescue: ${rescueResult.reason}`,
           confidence: rescueResult.confidence,
           boundingBox: rescuedNode.boundingBox,
@@ -3413,7 +3556,7 @@ export async function resolveElement(params: {
 
             const lintCandidate: LintCandidate = {
               ref: bestNode.ref,
-              label: bestNode.labelText || bestNode.ariaLabel || bestNode.text || bestNode.placeholder || `<${bestNode.tag}>`,
+              label: getEffectiveLabel(bestNode) || `<${bestNode.tag}>`,
               reason: `Vision rescue (coordinates): ${rescueResult.reason}`,
               confidence: adjustedConfidence,
               boundingBox: bestNode.boundingBox,
@@ -3464,11 +3607,11 @@ export async function resolveElement(params: {
     // V8: Include nearby suggestions so the user sees "Did you mean?" instead of dead end.
     // Gather visible elements with labels as suggestions (regardless of tag compatibility).
     const suggestions: LintCandidate[] = domNodes
-      .filter(n => n.ref && n.isVisible !== false && (n.labelText || n.ariaLabel || n.text))
+      .filter(n => n.ref && n.isVisible !== false && getEffectiveLabel(n).length > 0)
       .slice(0, 5)
       .map(n => ({
         ref: n.ref,
-        label: n.labelText || n.ariaLabel || n.text || n.placeholder || `<${n.tag}>`,
+        label: getEffectiveLabel(n) || `<${n.tag}>`,
         reason: 'Visible element on page',
         confidence: 0,
         boundingBox: n.boundingBox,
@@ -3502,7 +3645,7 @@ export async function resolveElement(params: {
       previewSessionId,
       ref: allAllowed[0].ref,
       intentText: intentText.slice(0, 50),
-      nodeLabel: (allAllowed[0].labelText || allAllowed[0].ariaLabel || allAllowed[0].text || '').slice(0, 50),
+      nodeLabel: getEffectiveLabel(allAllowed[0]).slice(0, 50),
     });
     // Falls through to Step 6 (LLM selection) below
   }
@@ -3575,7 +3718,7 @@ export async function resolveElement(params: {
           });
           const lintCandidate: LintCandidate = {
             ref: pickedNode.ref,
-            label: pickedNode.labelText || pickedNode.ariaLabel || pickedNode.text || `<${pickedNode.tag}>`,
+            label: getEffectiveLabel(pickedNode) || `<${pickedNode.tag}>`,
             reason: `Vision match (icon-only): ${visionResult.reason}`,
             confidence: visionResult.confidence,
             boundingBox: pickedNode.boundingBox,
@@ -3628,7 +3771,7 @@ export async function resolveElement(params: {
           const confidence = Math.min(visionResult.confidence, 0.8);
           const lintCandidate: LintCandidate = {
             ref: best.ref,
-            label: best.labelText || best.ariaLabel || best.text || `<${best.tag}>`,
+            label: getEffectiveLabel(best) || `<${best.tag}>`,
             reason: `Vision match by coordinates: ${visionResult.reason}`,
             confidence,
             boundingBox: best.boundingBox,
@@ -3656,7 +3799,7 @@ export async function resolveElement(params: {
       });
       const altCandidates: LintCandidate[] = iconOnlyBlind.map(c => ({
         ref: c.node.ref,
-        label: c.node.labelText || c.node.ariaLabel || c.node.text || `<${c.node.tag}>`,
+        label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
         reason: 'Icon-only button — no semantic label, vision could not disambiguate',
         confidence: 0.3,
         boundingBox: c.node.boundingBox,
@@ -3758,7 +3901,7 @@ export async function resolveElement(params: {
         if (selectedNode) {
           const lintCandidate: LintCandidate = {
             ref: selectedNode.node.ref,
-            label: selectedNode.node.labelText || selectedNode.node.ariaLabel || selectedNode.node.text || selectedNode.node.placeholder || `<${selectedNode.node.tag}>`,
+            label: getEffectiveLabel(selectedNode.node) || `<${selectedNode.node.tag}>`,
             reason: `AI match: ${llmResult.reason}`,
             confidence: llmResult.confidence,
             boundingBox: selectedNode.node.boundingBox,
@@ -3810,7 +3953,7 @@ export async function resolveElement(params: {
         if (altCandidates.length > 0) {
           const lintCandidates: LintCandidate[] = altCandidates.map(c => ({
             ref: c.node.ref,
-            label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+            label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
             reason: `AI: ${llmResult.reason}`,
             confidence: 0.5,
             boundingBox: c.node.boundingBox,
@@ -3934,7 +4077,7 @@ export async function resolveElement(params: {
 
                 const lintCandidate: LintCandidate = {
                   ref: visionNode.node.ref,
-                  label: visionNode.node.labelText || visionNode.node.ariaLabel || visionNode.node.text || visionNode.node.placeholder || `<${visionNode.node.tag}>`,
+                  label: getEffectiveLabel(visionNode.node) || `<${visionNode.node.tag}>`,
                   reason: `Vision match: ${visionResult.reason}`,
                   confidence: visionResult.confidence,
                   boundingBox: visionNode.node.boundingBox,
@@ -4014,7 +4157,7 @@ export async function resolveElement(params: {
 
               const lintCandidate: LintCandidate = {
                 ref: selectedNode.node.ref,
-                label: selectedNode.node.labelText || selectedNode.node.ariaLabel || selectedNode.node.text || selectedNode.node.placeholder || `<${selectedNode.node.tag}>`,
+                label: getEffectiveLabel(selectedNode.node) || `<${selectedNode.node.tag}>`,
                 reason: `AI match (overflow): ${overflowResult.reason}`,
                 confidence: overflowResult.confidence,
                 boundingBox: selectedNode.node.boundingBox,
@@ -4060,7 +4203,7 @@ export async function resolveElement(params: {
           .slice(0, 5)
           .map(c => ({
             ref: c.node.ref,
-            label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+            label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
             reason: 'Available on page',
             confidence: 0,
             boundingBox: c.node.boundingBox,

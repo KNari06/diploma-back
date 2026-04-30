@@ -190,6 +190,10 @@ export async function getChatCompletionWithMessages(
         role: (m.role === 'tool' ? 'user' : m.role) as 'user' | 'assistant' | 'system',
         content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
       }));
+      // V23: pass the AbortSignal directly to the SDK. The Promise.race
+      // wrapper still runs (catches the case where signal abort fails to
+      // propagate through Google's fetch), but real cancellation now goes
+      // through the SDK and closes the underlying HTTP connection.
       const geminiPromise = getChatCompletionWithGemini({
         messages: geminiMessages,
         model: model as any,
@@ -197,6 +201,7 @@ export async function getChatCompletionWithMessages(
         maxTokens: options?.max_tokens,
         jsonMode: !!options?.response_format,
         timeout: (options as any)?.timeout,
+        signal: options?.abortSignal,
       });
       const response = abortPromise
         ? await Promise.race([geminiPromise, abortPromise])

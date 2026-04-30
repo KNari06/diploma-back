@@ -22,6 +22,7 @@ Identity fast-path and evidence shortcut short-circuit expensive LLM calls when 
 - `buildAllowedSets(nodes, actionType): AllowedSetResult` — sync structural filter.
 - `buildCandidateText(node): string` — semantic textualization for LLM batch.
 - `sanitizeIntent(step): string` — normalize + redact intent.
+- **`getEffectiveLabel(node): string` (V23)** — canonical label resolution; consolidates 12 identity sources in priority order: `labelText` → `ariaLabel` → `title` → `alt` → `text` → `placeholder` → `iconLabel` → `svgIcon` → `childTestId` → `dataValue` → `dataRowKey` → `customElementTag`. Imported and used by `preview-step-apply.service.ts` and `intent-step-lint.service.ts` so trace labels and candidate display stay consistent across services.
 
 ### Types
 - `AllowedSetResult` = `{ hardAllowed, softAllowed, ruleTrace }`.
@@ -86,7 +87,7 @@ When step has `lastSuccessRef` from prior successful apply (manually-added steps
 Triggers when ≥1 allowed candidates and stages 2–3 didn't fire.
 
 Preprocessing:
-1. **Pre-score & sort** — rank candidates by text-overlap with intent (median token threshold). Allocate slots 60% scored / 40% DOM-order to cover cross-language and visual-only cases.
+1. **Pre-score & sort** — rank candidates by text-overlap with intent (median token threshold). Allocate slots 60% scored / 40% DOM-order to cover cross-language and visual-only cases. **V23:** the search text per node (`buildNodeSearchText`) now also includes `alt`, `iconLabel`, `svgIcon`, `childTestId`, `customElementTag` — captures icon-only / Angular Material / Vue targets that would previously fall out of pre-scoring. Observable: candidate rank order may differ on icon-heavy pages.
 2. **Build candidate text** — `buildCandidateText(node)`, ≤200 chars.
 3. **Mark duplicates** — `[N of M]` suffix + `(CONTEXT: ...)` for disambiguation.
 4. **Scene summary** — detect expanded dropdowns, selected tabs, active modals for top-down LLM context.
@@ -204,6 +205,7 @@ Heal-mode overrides:
 - **Invariants / gotchas:**
   - Identity fast-path requires uniqueness; otherwise LLM (only LLM uses context).
   - **Semantic floor (apply):** confidence ≥ 0.55 but chosen candidate shares zero meaningful tokens with intent → treat as no-match. Fake-success prevention.
+  - **Semantic floor — substring tolerance (V23):** "shared meaningful token" definition relaxed — accepts a 3-char substring match OR prefix overlap, not only exact set membership. E.g. `папка` ⊆ `папкалар` now passes. Multilingual stems (RU/KZ/agglutinative) that previously failed at 0.55 now pass when truly relevant.
   - Vision returns screenshot-space coordinates → map to viewport before comparing to `node.boundingBox`.
   - Screenshot lazy callback memoized once per call; reused across rescue/proactive/second-opinion (≤3 calls).
   - Cache key includes `mode` — apply vs heal cached separately.
@@ -259,6 +261,17 @@ Heal-mode overrides:
   - Screenshot memoization within a single `resolveElement()` call.
 - **Timeouts:** LLM 8000ms; vision 6000ms; overall typically <2s (identity fast-path) to <5s (LLM + vision).
 - **Lost on process restart.**
+
+### Phase timings (V23)
+
+LLM stage now logs a phase breakdown alongside the existing `latencyMs`:
+
+- `prepareMs` — prompt building, candidate batching, scene summary.
+- `llmCallMs` — network call to Gemini Flash Lite.
+- `postMs` — JSON parse, validation, candidate matching.
+- `promptChars` — total prompt size for cost/limit tracking.
+
+**SLA breach guard:** if `llmCallMs > LLM_SELECT_TIMEOUT_MS × 1.5` (i.e. >12s when timeout is 8s), `logger.warn()` fires. Diagnostic-only, no impact on the result. Surfaced in editor trace JSONL.
 
 ## Confidence calibration (apply)
 

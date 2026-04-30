@@ -289,6 +289,33 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if ((element as any).iconLabel) {
     (node as any).iconLabel = (element as any).iconLabel;
   }
+  // V23: forward identity fields the collector populates that previously got
+  // dropped here. Without these, builder/resolver/helper read undefined even
+  // though collector correctly extracted them. All fields are now typed on
+  // InteractiveNode so direct assignment is type-safe; LiteSnapshotElement
+  // sourcing still goes through `(element as any)` because LiteElement type
+  // hasn't been audited for the same superset (out of scope here).
+  if ((element as any).svgIcon) {
+    node.svgIcon = (element as any).svgIcon;
+  }
+  if ((element as any).customElementTag) {
+    node.customElementTag = (element as any).customElementTag;
+  }
+  if ((element as any).href) {
+    node.href = (element as any).href;
+  }
+  if ((element as any).alt) {
+    node.alt = (element as any).alt;
+  }
+  if ((element as any).cssClass) {
+    node.cssClass = (element as any).cssClass;
+  }
+  if ((element as any).vueScopeId) {
+    node.vueScopeId = (element as any).vueScopeId;
+  }
+  if ((element as any).ancestorSummary) {
+    node.ancestorSummary = (element as any).ancestorSummary;
+  }
 
   // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
   if (element.bsToggle) node.bsToggle = element.bsToggle;

@@ -65,6 +65,9 @@ Grouped by purpose. All fields are optional unless marked.
 | `tag` | `string` | HTML tag (lowercase). |
 | `id` | `string?` | HTML id attribute (filtered; framework-generated dropped). |
 | `testIdAttr` | `string?` | `data-testid` / `data-test` / `data-cy` / `data-qa` / `data-automation-id`. |
+| `href` | `string?` | (V23) `<a>` destination — used by hash-anchor and external-link strategies in the locator plan. Stable for intra-page anchors; filtered out when generated. |
+| `cssClass` | `string?` | (V23) Stable class-token shortlist (framework-generated classes like `jss123` / `sc-…` / `css-…` / `makeStyles-…` are filtered out). Used for sibling-index strategy and visual hints. |
+| `vueScopeId` | `string?` | (V23) Vue scoped-style attribute (`data-v-…`). Identity hint for Vue components when `id` and `testId` are absent. |
 
 ### Semantics & roles
 | Field | Type | Meaning |
@@ -81,6 +84,7 @@ Grouped by purpose. All fields are optional unless marked.
 | `ariaLabel` | `string?` | `aria-label` attribute. |
 | `title` | `string?` | `title` attribute (tooltips; critical for icon-only). |
 | `placeholder` | `string?` | `placeholder` attribute. |
+| `alt` | `string?` | (V23) `<img alt>` — accessible name for image targets. Used by V23 scoring as additional accessible-name source. |
 | `isIconButton` | `boolean?` | Button has only icon child(ren). |
 | `iconLabel` | `string?` | Semantic icon name (SVG `<title>`, sprite ref, `data-lucide`, FontAwesome class, …). |
 | `svgIcon` | `string?` | Angular Material registry name (e.g. `chevron-left-outline`). |
@@ -130,6 +134,7 @@ Grouped by purpose. All fields are optional unless marked.
 | `containerTitles` | `string[]?` | Titles of key containers (legend, fieldset, heading). |
 | `nearestLandmark` | `string?` | ARIA landmark (banner/navigation/main/complementary/form/search). |
 | `customElementTag` | `string?` | Closest semantic custom element ancestor (`app-button`, `my-icon`, …). |
+| `ancestorSummary` | `string?` | (V23) Compact ancestor chain string — `header#layout-header > div.icon-group > svg`. Priority per segment: testId → id → role → text → class. Mirrors `ProbedElement.ancestorSummary` from the recorder; gives the resolver structural context for icon-only / unlabelled elements. |
 
 ### Tables / lists
 | Field | Type | Meaning |

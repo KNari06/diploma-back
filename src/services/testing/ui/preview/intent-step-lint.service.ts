@@ -9,6 +9,7 @@ import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { extractKeywordsSync } from '@/utils/text-processing/ai-keyword-extractor';
 import {
+    getEffectiveLabel,
     resolveElement,
     sanitizeIntent,
 } from './element-resolver.service';
@@ -270,6 +271,27 @@ function scoreCandidate(node: InteractiveNode, step: IntentStep): { score: numbe
     if (matchCount > 0) {
       score += WEIGHTS.ARIA_LABEL_MATCH * (matchCount / keywords.length);
       reasons.push(`AriaLabel matches ${matchCount} keywords`);
+    }
+  }
+
+  // V23: title attribute keyword match — same scoring tier as aria-label
+  // because per WAI-ARIA spec `title` IS an accessible name source. Without
+  // this, intents matching `<a title="Папкалар">` (Angular routerLink icon
+  // menus) score 0 from rule-based path even though title carries identity.
+  if (node.title && keywords.length > 0) {
+    const matchCount = keywords.filter(kw => normalizeText(node.title).includes(kw)).length;
+    if (matchCount > 0) {
+      score += WEIGHTS.ARIA_LABEL_MATCH * (matchCount / keywords.length);
+      reasons.push(`Title matches ${matchCount} keywords`);
+    }
+  }
+  // V23: <img alt> match — accessible name for image targets. Same tier.
+  const altAttr = (node as any).alt as string | undefined;
+  if (altAttr && keywords.length > 0) {
+    const matchCount = keywords.filter(kw => normalizeText(altAttr).includes(kw)).length;
+    if (matchCount > 0) {
+      score += WEIGHTS.ARIA_LABEL_MATCH * (matchCount / keywords.length);
+      reasons.push(`Alt matches ${matchCount} keywords`);
     }
   }
 
@@ -580,7 +602,13 @@ function classifyClarifyScenario(input: ClarifyScenarioInput): ClarifyScenario {
     ].filter(Boolean) as string[];
 
     const recordedTextTokens = new Set<string>();
-    [recordedFp.labelText, recordedFp.ariaLabel, recordedFp.text, recordedFp.title]
+    // V23: parity with live-side liveText — include alt/iconLabel/svgIcon/etc
+    // so manually-recorded steps with identity in those fields cross-match too.
+    [
+      recordedFp.labelText, recordedFp.ariaLabel, recordedFp.text, recordedFp.title,
+      (recordedFp as any).alt, (recordedFp as any).iconLabel, (recordedFp as any).svgIcon,
+      (recordedFp as any).childTestId, (recordedFp as any).customElementTag,
+    ]
       .filter(Boolean)
       .forEach((t) => clarifyTokenize(t!).forEach((tok) => recordedTextTokens.add(tok)));
 
@@ -602,9 +630,15 @@ function classifyClarifyScenario(input: ClarifyScenarioInput): ClarifyScenario {
         }
         // text token overlap
         if (recordedTextTokens.size > 0) {
-          const liveText = [node.labelText, node.ariaLabel, node.text, node.placeholder, node.title]
-            .filter(Boolean)
-            .join(' ');
+          // V23: include all identity sources — alt/iconLabel/svgIcon/childTestId/
+          // customElementTag — so cross-fingerprint match isn't blocked when
+          // identity lives on derived fields (Angular Material `<a title>`,
+          // Lucide `<svg data-lucide>`, Vue `<img alt>` etc).
+          const liveText = [
+            node.labelText, node.ariaLabel, node.text, node.placeholder, node.title,
+            (node as any).alt, (node as any).iconLabel, (node as any).svgIcon,
+            (node as any).childTestId, (node as any).customElementTag,
+          ].filter(Boolean).join(' ');
           const liveTokens = clarifyTokenize(liveText);
           for (const t of recordedTextTokens) {
             if (liveTokens.has(t)) return true;
@@ -791,7 +825,7 @@ export class IntentStepLintService {
       // Build result (V2: prefer labelText for label display)
       const candidateResults: LintCandidate[] = topCandidates.slice(0, 5).map(c => ({
         ref: c.node.ref,
-        label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+        label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
         reason: c.reasons.slice(0, 3).join(', '),
         confidence: Math.min(c.score / maxPossibleScore, 1),
         boundingBox: c.node.boundingBox,
@@ -963,16 +997,27 @@ export class IntentStepLintService {
       };
     }
 
+    // V23: phase timings — snapshot/evidence/resolve. Replay analysis used
+    // to think `decisionTrace.llm.latencyMs=19820` meant "LLM was slow", but
+    // it actually measured the whole lint pipeline. Snapshot collect on a
+    // 59K-DOM page took 17s; the LLM itself was 1.7s. Without per-phase
+    // numbers we'd keep blaming the wrong layer. Each phase timer starts
+    // right before its work begins; values are passed up through
+    // `onContext` and surfaced in `decisionTrace.timing` for diff analysis.
+    const lintImplStart = Date.now();
+
     // Get snapshot. Throttle is bypassed when the caller signals user intent
     // (Find button, debounced lint, apply) — the 500ms cache may be stale if a
     // modal/dropdown just appeared or the user interacted with the page since
     // the last interval tick. fullPage: include below-viewport elements.
     const sessionService = getPreviewSessionService();
+    const snapshotStart = Date.now();
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       includeDomNodes: true,
       fullPage: true,
       force: forceFreshSnapshot,
     });
+    const snapshotMs = Date.now() - snapshotStart;
 
     if (!snapshot) {
       return {
@@ -986,6 +1031,17 @@ export class IntentStepLintService {
 
     const domNodes = snapshot.domNodes ?? [];
     try { onContext?.(snapshot.url, domNodes.length); } catch { /* audit-only */ }
+    // Log per-phase right when it finishes — independent of return path so
+    // huge-page regressions are visible even when the step ultimately passes.
+    if (snapshotMs > 1000) {
+      logger.warn('[INTENT_LINT_TIMING] snapshot collect was slow', {
+        previewSessionId,
+        snapshotMs,
+        domNodeCount: domNodes.length,
+        url: snapshot.url,
+        forceFreshSnapshot,
+      });
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // URL guard (V23): if the step was recorded / previously applied on a URL
@@ -1121,7 +1177,7 @@ export class IntentStepLintService {
             confidence: 0.95,
             candidates: [{
               ref: cachedRef,
-              label: cachedNode.labelText || cachedNode.ariaLabel || cachedNode.text || cachedNode.placeholder || `<${cachedNode.tag}>`,
+              label: getEffectiveLabel(cachedNode) || `<${cachedNode.tag}>`,
               reason: 'Evidence shortcut (lastSuccessRef)',
               confidence: 0.95,
               boundingBox: cachedNode.boundingBox,
@@ -1216,6 +1272,36 @@ export class IntentStepLintService {
       },
     });
     const resolveLatencyMs = Date.now() - resolveStartMs;
+
+    // V23: attach phase timings to resolverResult so they propagate up into
+    // decisionTrace via the LintResult contract. All paths below that
+    // ultimately return a LintResult inherit these via spread. Mutating is
+    // safe — resolverResult is a local LintResult, not shared.
+    const totalMs = Date.now() - lintImplStart;
+    resolverResult.phaseTimings = {
+      snapshotMs,
+      resolveMs: resolveLatencyMs,
+      totalMs,
+      domNodeCount: domNodes.length,
+    };
+
+    // V23: per-phase summary log. Always emitted at debug for every lint;
+    // promoted to info when total lint took >2s so slowdowns surface in
+    // production logs without flooding under normal load. Phases:
+    //   snapshotMs  — DOM collect from page.evaluate
+    //   resolveMs   — full resolveElement (incl. LLM, vision, identity,
+    //                 evidence, prescore, candidate building)
+    //   totalMs     — start of _lintStepWithAIImpl to here
+    const lvl = totalMs > 2000 ? 'info' : 'debug';
+    logger[lvl]('[INTENT_LINT_TIMING] lint phase breakdown', {
+      previewSessionId,
+      stepType: stepDraft.type,
+      snapshotMs,
+      resolveMs: resolveLatencyMs,
+      totalMs,
+      domNodeCount: domNodes.length,
+      resolverPath: resolverResult.resolverPath,
+    });
 
     // ── TRACE: Write full element resolution diagnostic to editor JSONL ──
     try {
@@ -1583,7 +1669,7 @@ export class IntentStepLintService {
       .slice(0, 3)
       .map((c) => {
         const node = params.domNodes.find((n) => n.ref === c.ref) || c.node;
-        return (node?.labelText || node?.ariaLabel || node?.text || node?.placeholder || c.label || '').trim();
+        return (getEffectiveLabel(node) || c.label || '').trim();
       })
       .filter((x) => x.length > 0 && x.length < 80);
 
@@ -1599,7 +1685,9 @@ export class IntentStepLintService {
         case 'AI_DEGRADED':
           return `AI-резолвер временно недоступен (${params.degradedReason || 'unknown'}). Подождите минуту и повторите, либо выберите элемент вручную из подсказок.`;
         case 'NO_RECORDED_MATCH': {
-          const recordedLabel = recordedFp?.labelText || recordedFp?.ariaLabel || recordedFp?.text || recordedFp?.elementId;
+          // V23: include title in the recorded-label chain — same reason
+          // as everywhere else (Angular routerLink etc. carry identity in title).
+          const recordedLabel = recordedFp?.labelText || recordedFp?.ariaLabel || recordedFp?.title || (recordedFp as any)?.alt || recordedFp?.text || recordedFp?.elementId;
           return recordedLabel
             ? `На странице нет элемента, похожего на записанный («${recordedLabel}»). Возможно, навигация не дошла до нужной страницы или элемент скрыт.`
             : 'На текущей странице нет элемента, соответствующего записанному. Проверьте навигацию или уточните описание.';
@@ -1645,7 +1733,7 @@ export class IntentStepLintService {
       // reads sequentially and tight directives ship better than prose.
       // Smart parts preserved: each scenario's WHY, recorded label hint,
       // anti-blame guard for PAGE_MISMATCH/AI_DEGRADED.
-      const recordedLabel = recordedFp?.labelText || recordedFp?.ariaLabel || recordedFp?.text || recordedFp?.elementId || '';
+      const recordedLabel = recordedFp?.labelText || recordedFp?.ariaLabel || recordedFp?.title || (recordedFp as any)?.alt || recordedFp?.text || recordedFp?.elementId || '';
       const scenarioDirective: Record<ClarifyScenario, string> = {
         PAGE_MISMATCH: `Wrong page (recorded vs current URL differ). Tell user to check navigation. Don't blame their wording. E=[].`,
         AI_DEGRADED: `AI down (reason=${params.degradedReason || 'unknown'}). Tell user to retry shortly. Candidates shown are rule-based fallback. Don't blame wording. E=[].`,

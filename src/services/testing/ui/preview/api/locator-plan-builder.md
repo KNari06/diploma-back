@@ -75,7 +75,7 @@ For actions that don't target an element (`navigate`, `wait`, `scroll`, `refresh
 
 | # | Strategy | Confidence | Generated when | Selector form (at executor) |
 |---|---|---|---|---|
-| 1 | `role` + accessible name | 0.9 | role exists, not generic, accessible name from `labelText` ∥ `ariaLabel` ∥ `text`. | `getByRole(role, { name })` |
+| 1 | `role` + accessible name | 0.9 | role exists, not generic, accessible name from `labelText` ∥ `ariaLabel` ∥ `title` (V23) ∥ `text`. | `getByRole(role, { name })` |
 | 2 | `label` | 0.85 | `node.labelText` present. | `getByLabel(value)` |
 | 3 | `testId` | 0.8 | `node.testIdAttr` present. | `getByTestId(value)` / `[data-testid=…]` |
 | 4 | `css` (id) | 0.78 | `node.id` non-dynamic. | `[id="…"]` |
@@ -98,6 +98,8 @@ For actions that don't target an element (`navigate`, `wait`, `scroll`, `refresh
 | 20 | `css` (tag + testId combo) | 0.65 | `node.tag` AND `testIdAttr` AND id strategy NOT added. | `<tag>[data-testid=…]` |
 
 **Dedup rules:** the bare-text and aria-label-standalone strategies skip themselves if the role strategy already used the same value. Container titles are capped at top 2 to keep the plan compact.
+
+**V23 — `title` as accessible-name source.** Per WAI-ARIA Accessible Name Computation, `title` is a valid name source when `aria-label` / `aria-labelledby` / `<label>` are absent. Fixes Angular `routerLink` icon menus and similar icon-only triggers. Note: this strategy intentionally does NOT lift derived display labels (`iconLabel`, `svgIcon`, `childTestId`, `customElementTag`) — those are for resolver display, not for Playwright's `getByRole({ name })` which matches the actual a11y tree.
 
 **CSS escaping:** all interpolated values pass through `escapeCssAttrValue()` — `\` → `\\`, `"` → `\"`, `]` → `\]`, `[` → `\[`, newlines → space.
 

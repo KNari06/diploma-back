@@ -140,6 +140,34 @@ export interface InteractiveNode {
    * `<app-X>` tag still gets a deterministic match.
    */
   customElementTag?: string;
+  /**
+   * V23: `<img alt="...">` — WCAG-recommended accessible name for image
+   * targets. Promoted from "checked but not stored" status so the resolver,
+   * builder, and getEffectiveLabel() can use it as a first-class identity
+   * source instead of reading via `(node as any).alt`.
+   */
+  alt?: string;
+  /**
+   * V23: `<a href="...">` — link destination. Used by builder for
+   * hash-anchor (`#section-id`) and pathname-suffix locator strategies,
+   * and by candidateText to disambiguate duplicate visible text by destination.
+   */
+  href?: string;
+  /**
+   * V23: First 1-3 stable className tokens (utility-class noise stripped at
+   * probe time). Used by builder's scoped-text fallback strategies.
+   */
+  cssClass?: string;
+  /**
+   * V23: Vue scoped-style attribute (`data-v-XXXXXX`). Stable per-component
+   * instance marker; narrows cross-redesign matches in Vue apps.
+   */
+  vueScopeId?: string;
+  /**
+   * V23: Compact ancestor chain summary like `header > div.icon-group > svg`
+   * — see TargetFingerprint.ancestorSummary for rationale.
+   */
+  ancestorSummary?: string;
   /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap data-bs-target selector. */
@@ -1043,6 +1071,17 @@ export interface LintResult {
   topSimilarity?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
+  /**
+   * V23: per-phase timings from `_lintStepWithAIImpl`. Surfaced into
+   * decisionTrace so analysis can answer "where did the 19s go?"
+   * — snapshot collect (DOM evaluate), full resolve (LLM/vision/identity).
+   */
+  phaseTimings?: {
+    snapshotMs?: number;
+    resolveMs?: number;
+    totalMs?: number;
+    domNodeCount?: number;
+  };
 
   // ═══════════════════════════════════════════════════════════════════════════
   // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)

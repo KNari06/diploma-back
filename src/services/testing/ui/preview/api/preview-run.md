@@ -164,6 +164,10 @@ const NO_RETRY_STEP_TYPES    = new Set([
 const URL_MISMATCH_HINT_MAX_STEPS = 5;
 ```
 
+## Env vars
+
+- **`PREVIEW_TRACE_DECISIONS`** (V23) — when truthy, every `preview:run:step` event includes the full `decisionTrace` payload. In `NODE_ENV !== 'production'` it defaults to ON. In production it defaults to OFF — opt in per deploy when capturing postmortems. The gate lives in `shouldEmitDecisionTrace()`.
+
 ## State
 
 ```ts
@@ -209,6 +213,8 @@ Status-discriminated:
 - `'fail'` — adds `error` (augmented), `failScreenshot?` (base64 JPEG, 500KB cap), `failPageSummary?` (`{ url, title, headings, landmarks }`).
 - `'skipped'` — minimal payload.
 - `'cancelled'` — emitted as `skipped` when run was cancelled.
+
+**V23 — optional `decisionTrace?` field.** All emit sites for `pass` / `fail` / `skipped` may carry `decisionTrace: StepDecisionTrace` (the same payload returned by `PreviewStepApplyService.applyStep()` — see [preview-step-apply.md](preview-step-apply.md)). Inclusion is gated by the `shouldEmitDecisionTrace()` helper (module-private) which returns `true` when `PREVIEW_TRACE_DECISIONS` env var is truthy or `NODE_ENV !== 'production'`. In production the field is omitted to keep WS payloads small; turn the env on per-deploy for postmortem capture.
 
 ### `preview:run:completed`
 ```ts

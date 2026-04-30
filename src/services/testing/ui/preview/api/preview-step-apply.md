@@ -17,7 +17,8 @@
 - **Functions:**
   - `globToRegexPatternForWaitFor(glob: string): string`
   - `normalizeTypeActionValue(rawValue: string | undefined): string`
-- **Types:** `ApplyResult`, `ClickPreState`, `ClickEffectSignal` (`'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none'`).
+- **Types:** `ApplyResult`, `ClickPreState`, `ClickEffectSignal` (`'url' | 'dialog' | 'aria' | 'focus' | 'detach' | 'dom' | 'newtab' | 'none'`), `StepDecisionTrace` (V23).
+- **Re-exports:** `getEffectiveLabel(node)` is imported from [element-resolver.service.ts](../element-resolver.service.ts) and used throughout for canonical label extraction (title / alt / iconLabel / svgIcon / childTestId / customElementTag fallbacks). Trace consistency depends on it.
 
 ---
 
@@ -56,10 +57,12 @@ static async applyStep(params: {
   - `highlight?: Array<{ ref, boundingBox, type }>` — elements to highlight in UI for debugging.
   - `fastPathSettled?: boolean` — `wait_for` took fast-path (URL already changed).
   - `waitForBranch?: 'fast_path' | 'runtime_settle' | 'runtime_changed' | 'slow_path' | 'no_matcher'`.
+  - **`decisionTrace?: StepDecisionTrace` (V23)** — structured postmortem trace populated on every return path. Primary diagnostic surface; see schema below.
 - **Side-effects:**
   - Playwright actions on the live page.
   - WS emits: `preview:loading` (navigate progress), session state on tab switches and dialogs.
   - Trace writes: `step_start`, `step_result` events (LiteTraceWriter).
+  - **`decisionTrace` aggregation (V23):** mutated throughout every code path (compiled / identity / evidence / lint / LLM / overlay / click-effect). Initialized at action entry, populated by each stage, returned on `ApplyResult.decisionTrace`. Structured logging contract — not a WS emit.
   - Updates session `contextData` (for `store` meta-steps).
   - May auto-switch active tab if `step.tabIndex` differs (V15).
 - **Throws:** `Error` on session not found, DOM selection failure, action timeout, unrecoverable Playwright error.
@@ -83,6 +86,29 @@ static async applyStep(params: {
   - **Post-action buffer (V15.3):** `noWaitAfter: true` actions get +1s before snapshot invalidation so handlers run.
   - **Field-session single-shot:** `type` records one input.value snapshot from blur/navigation; if value didn't change, the recording event is removed, not stored.
   - **Fake-success trap:** weak signal (`focus`/`none`/`newtab`) + fingerprint mismatch + recorded fingerprint → FAIL even if action succeeded.
+  - **Soft-pass on no-effect (V23):** when a manually-added step (no recorded fingerprint) executes against a plausible candidate but produces no observable effect, the action is accepted as success and `decisionTrace.softPassedOnNoEffect = true`. Prevents stalling on idempotent / already-in-state actions; trace flag lets postmortem audit the relaxed acceptance.
+  - **Substring text-field tolerance (V23):** in fuzzy text-field matching the candidate scoring now allows morphological variants (3-char substring or prefix overlap) before falling back to Damerau-Levenshtein. Affects RU/KZ/multilingual sites where stem variation previously dropped valid candidates.
+
+---
+
+## `StepDecisionTrace` (V23)
+
+Structured payload returned in `ApplyResult.decisionTrace`. Every resolver path, overlay block, and click-effect verification populates the relevant section. Used by editor postmortem UI and trace JSONL aggregation.
+
+| Field | Meaning |
+|---|---|
+| `resolverPath` | Which path resolved the element (`compiled` / `identity_id` / `identity_testid` / `identity_svgicon` / `identity_custom_element` / `evidence_shortcut` / `llm` / `vision` / `not_found`). |
+| `compiled` | `{ tried: boolean, hit: boolean, strategy?, fallthroughReason? }` — compiled fast-path attempt and why it fell through. |
+| `identity` | Identity fast-path diagnostics: `{ recordedId?, recordedTestId?, liveIdsSample?, idMatch?, uniqueness? }`. |
+| `evidence` | Evidence-shortcut diagnostics: `{ lastSuccessRef?, hit?, reason? }`. |
+| `llm` | LLM stage breakdown: `{ candidatesCount, prepareMs, llmCallMs, postMs, promptChars, confidence?, slaBreached? }`. |
+| `chosen` | Snapshot of the picked element: `{ ref, label, role, tag, testId? }` (label via `getEffectiveLabel`). |
+| `recorded` | Recorded fingerprint snapshot when present. |
+| `fingerprintMatch` | `'match' \| 'mismatch' \| 'missing'` verdict against `recorded`. |
+| `overlayBlock` | If overlay detected: `{ blocked: boolean, blockerRef?, recoveryAttempted? }`. |
+| `clickEffectSignal` | Post-action effect (`url` / `dialog` / `aria` / `focus` / `detach` / `dom` / `newtab` / `none`). |
+| `softPassedOnNoEffect` | `true` when V23 soft-pass accepted an action with no observable effect (manual-add only). |
+| `timing` | Phase breakdown: `{ readinessMs, resolveMs, actionMs, postVerifyMs, totalMs }`. |
 
 ---
 
