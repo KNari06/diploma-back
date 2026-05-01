@@ -1052,12 +1052,16 @@ export class IntentStepLintService {
     // Log per-phase right when it finishes — independent of return path so
     // huge-page regressions are visible even when the step ultimately passes.
     if (snapshotMs > 1000) {
+      // V26: phase timings come straight from snapshot.phaseTimings (added
+      // by getSnapshot, sourced from in-page performance.now() markers).
+      // Defensive: optional, old callers without the field still log fine.
       logger.warn('[INTENT_LINT_TIMING] snapshot collect was slow', {
         previewSessionId,
         snapshotMs,
         domNodeCount: domNodes.length,
         url: snapshot.url,
         forceFreshSnapshot,
+        phaseTimings: (snapshot as any).phaseTimings,
       });
     }
 

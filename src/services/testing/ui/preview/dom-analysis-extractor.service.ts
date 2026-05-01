@@ -175,6 +175,12 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.text = truncateText(element.name);
   }
 
+  // V26: Pass through firstTextFragment for builder/resolver to use as a
+  // single-DOM-node text locator (Angular Material card pattern, etc.).
+  if (element.firstTextFragment) {
+    node.firstTextFragment = truncateText(element.firstTextFragment);
+  }
+
   // Add placeholder
   if (element.placeholder) {
     node.placeholder = truncateText(element.placeholder);

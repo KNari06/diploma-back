@@ -1421,6 +1421,13 @@ Select the single best matching element. If unsure, return ref: null.`;
 // ═══════════════════════════════════════════════════════════════════════════
 
 const LLM_SELECT_TIMEOUT_MS = ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.timeoutMs;
+// V26: per-provider budget for the Gemini → OpenAI cascade. Each provider
+// gets its own AbortController + this much wall-time. Total worst-case
+// for a select is `2 × LLM_SELECT_PER_PROVIDER_TIMEOUT_MS` (Gemini full
+// timeout → OpenAI full timeout). Fixes the May-2026 outage symptom where
+// Gemini ate the whole 10s budget and the fallback refused to fire.
+const LLM_SELECT_PER_PROVIDER_TIMEOUT_MS =
+  ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.perProviderTimeoutMs;
 
 let llmSelectFailures = 0;
 let llmSelectBreakerOpenUntil = 0;
@@ -2524,7 +2531,12 @@ ${candidateList}
 
 Select the single best matching element, or return ref=null if the intent does not meaningfully describe any element.`;
 
-  // Call LLM with timeout
+  // V26: per-provider AbortControllers. The OUTER controller enforces the
+  // total LLM_SELECT_TIMEOUT_MS hard cap (covers prepare + LLM call + post).
+  // Each call to a provider also gets its OWN inner controller scoped to
+  // LLM_SELECT_PER_PROVIDER_TIMEOUT_MS so a slow primary doesn't burn the
+  // budget the fallback needs. `controller` (outer) is what downstream code
+  // checks via `controller.signal.aborted` — keep its semantics unchanged.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), LLM_SELECT_TIMEOUT_MS);
 
@@ -2543,11 +2555,38 @@ Select the single best matching element, or return ref=null if the intent does n
   let llmCallMs = 0;
 
   try {
-    // Primary Gemini Flash Lite → fallback AI_MODELS.fast (gpt-5.4-mini) when
-    // Gemini errors out (503 / timeout). Fallback uses the SAME abort signal so
-    // the overall LLM_SELECT_TIMEOUT budget still applies.
-    const callWithModel = (model: string) =>
-      getChatCompletionWithMessages(
+    // Primary Gemini Flash Lite → fallback AI_MODELS.fast (gpt-5.4-mini)
+    // when Gemini errors out (503 / timeout / abort). Each provider gets
+    // its OWN AbortController scoped to LLM_SELECT_PER_PROVIDER_TIMEOUT_MS
+    // so the primary using up its full budget doesn't starve the fallback.
+    //
+    // Outer `controller` (LLM_SELECT_TIMEOUT_MS) is the absolute cap:
+    // when it aborts, BOTH inner controllers cascade-abort via the
+    // forwarder, and we throw out of the try.
+    //
+    // The forwarder is one-direction: outer → inner. Inner abort (its own
+    // per-provider timer) does NOT abort the outer — the outer must
+    // remain healthy so the next provider attempt can run.
+    const callWithModel = (model: string) => {
+      const inner = new AbortController();
+      const innerTimer = setTimeout(
+        () => inner.abort(),
+        LLM_SELECT_PER_PROVIDER_TIMEOUT_MS,
+      );
+      // If the OUTER (total) budget is exhausted while this provider is in
+      // flight, propagate the cancellation downward. One-way; abort listener
+      // is removed in finally so we don't leak refs across provider attempts.
+      const onOuterAbort = () => inner.abort();
+      if (controller.signal.aborted) {
+        inner.abort();
+      } else {
+        controller.signal.addEventListener('abort', onOuterAbort, { once: true });
+      }
+      const cleanup = () => {
+        clearTimeout(innerTimer);
+        controller.signal.removeEventListener('abort', onOuterAbort);
+      };
+      return getChatCompletionWithMessages(
         [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -2561,9 +2600,10 @@ Select the single best matching element, or return ref=null if the intent does n
           // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
           max_tokens: 500,
           response_format: { type: 'json_object' },
-          abortSignal: controller.signal,
+          abortSignal: inner.signal,
         },
-      );
+      ).finally(cleanup);
+    };
 
     let response;
     try {
@@ -2572,6 +2612,9 @@ Select the single best matching element, or return ref=null if the intent does n
       const FALLBACK = AI_MODELS.fast;
       const sameProvider =
         AI_TASK_MODELS.disambiguation.startsWith('gemini-') === FALLBACK.startsWith('gemini-');
+      // V26: only short-circuit on the OUTER (total) abort. Inner abort
+      // (per-provider timeout) is exactly the case where we WANT the
+      // fallback to fire — that was the May-2026 outage symptom.
       if (sameProvider || controller.signal.aborted) {
         throw primaryErr;
       }
@@ -2579,6 +2622,7 @@ Select the single best matching element, or return ref=null if the intent does n
         primary: AI_TASK_MODELS.disambiguation,
         fallback: FALLBACK,
         error: primaryErr instanceof Error ? primaryErr.message : String(primaryErr),
+        primaryWasAborted: !controller.signal.aborted,  // true ⇒ inner-only abort, fallback worth a try
       });
       response = await callWithModel(FALLBACK);
     }

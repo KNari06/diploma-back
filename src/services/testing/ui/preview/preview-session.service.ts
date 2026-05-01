@@ -2234,6 +2234,16 @@ export class PreviewSessionService {
     /** V26: Real browser viewport — used by resolver for accurate modal-coverage
      *  ratio in `buildAllowedSets`. Optional for back-compat. */
     viewport?: { width: number; height: number };
+    /** V26: per-phase wall-time inside page.evaluate (ms). Surfaced so the
+     *  slow-snapshot warn can show where the bottleneck is. */
+    phaseTimings?: {
+      primaryMs: number;
+      dedupeMs: number;
+      secondaryMs: number;
+      forEachMs: number;
+      tailMs: number;
+      totalMs: number;
+    };
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
@@ -2404,6 +2414,10 @@ export class PreviewSessionService {
         // V26: pass viewport through so resolver can compute accurate
         // modal-coverage ratio. domAnalysis carries it from snapshot collector.
         viewport: domAnalysis.viewport,
+        // V26: surface in-page phase timings so the slow-snapshot warning
+        // upstream can call out the real bottleneck (primary querySelectorAll
+        // vs Tier-2 walk vs forEach extract). Optional — old callers ignore.
+        phaseTimings: debugStats?.phaseTimings,
       };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Failed to get snapshot', {

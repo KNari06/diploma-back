@@ -524,12 +524,111 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
     const hrefForMatch = node.href.split('?')[0].split('#')[0];
     if (hrefForMatch.length >= 4) {
       const safeHref = escapeCssAttrValue(hrefForMatch);
+      // V26: prefer ends-with for short relative paths or the unique tail
+      // segment of a longer URL — `[href$="/uuid"]` is faster to evaluate
+      // than `[href*=...]` and survives origin / proxy rewrites that
+      // change the prefix while preserving the route. We emit it FIRST
+      // (higher confidence) so the executor probes it before the looser
+      // substring locator. The `*=` variant stays as a fallback so
+      // existing planning paths (relative paths, query-string variations)
+      // continue to work — locators are tried in confidence order, the
+      // first to match wins.
+      const tailSegment = hrefForMatch.split('/').filter(Boolean).pop();
+      if (tailSegment && tailSegment.length >= 4) {
+        const safeTail = escapeCssAttrValue('/' + tailSegment);
+        locators.push({
+          strategy: 'css',
+          value: `a[href$="${safeTail}"]`,
+          // Slightly above the substring variant — endsWith is stricter
+          // and faster, but we don't want to outrank testId / id / role.
+          confidence: 0.74,
+        });
+      }
       locators.push({
         strategy: 'css',
         value: `a[href*="${safeHref}"]`,
         // Below testId (0.8) — paths get reorganised more often than
         // testIds, but they survive copy-edits to the visible label.
         confidence: 0.72,
+      });
+    }
+  }
+
+  // V26: WRAPPER + LEAF-TAG locator. Angular / Vue / Web Components render
+  // branded wrappers (`<app-folders>`, `<v-card>`) AROUND a real leaf tag
+  // (`<li>`, `<a>`, `<button>`). The bare-wrapper locator below
+  // (`app-folders:has-text(...)`) finds the WRAPPER, not the leaf — when
+  // the recorded fingerprint expects `tag=li`, fingerprint validation
+  // rejects with matchScore=0. Solution: scope from wrapper DOWN to the
+  // recorded leaf tag, then constrain by visible text.
+  //
+  // Universality: works on every framework that uses custom elements
+  // (Angular/Vue/Web Components/Stencil/Lit/etc.). Plain-HTML pages don't
+  // have `customElementTag` set → this branch is silently skipped.
+  //
+  // Confidence above the bare-wrapper variant — the leaf-tag scope removes
+  // the wrapper-vs-leaf ambiguity that was the entire reason the bare
+  // form fails on Angular Material list-item patterns.
+  if (node.customElementTag
+      && node.customElementTag.length >= 3
+      && node.tag
+      && node.tag !== node.customElementTag
+      && (node.firstTextFragment || node.text || stableTokens.length > 0)) {
+    // Prefer V26 firstTextFragment (single DOM unit, matches getByText
+    // contracts), then stable token, then full text. Fragment gives us
+    // the most precise text-anchor on cards where text is split across
+    // child components — exactly the juz40 MAT-SMART/folders pattern.
+    const anchorText = node.firstTextFragment
+      || stableTokens[0]
+      || node.text
+      || '';
+    const trimmedAnchor = anchorText.trim();
+    if (trimmedAnchor.length >= 2) {
+      const safeWrapper = escapeCssAttrValue(node.customElementTag);
+      const safeLeaf = escapeCssAttrValue(node.tag);
+      const safeAnchor = escapeHasText(trimmedAnchor);
+      locators.push({
+        strategy: 'css',
+        value: `${safeWrapper} ${safeLeaf}:has-text("${safeAnchor}")`,
+        // Above bare wrapper (0.75) and bare text (0.7): the leaf-tag
+        // scope is what makes the fingerprint validate (tag matches
+        // recorded). Below testId (0.8) — testIds win when present.
+        confidence: 0.78,
+      });
+    }
+  }
+
+  // V26: ROLE-SCOPED leaf locator. For frameworks WITHOUT custom-element
+  // wrappers (plain React/MUI, Bootstrap, vanilla HTML): combine the
+  // leaf's tag + role attribute + visible text. Same idea as the wrapper
+  // strategy above, but uses ARIA role as the structural anchor instead
+  // of a custom-element ancestor.
+  //
+  // Why both: a card might have BOTH a custom wrapper AND a role
+  // (e.g. `<app-folders><li role="listitem">`); we emit both locators —
+  // executor tries by confidence and the first to validate wins. On
+  // pages with neither — both branches skip and we fall back to the
+  // existing wrapper/text locators.
+  //
+  // Filter out generic roles (presentation/none/group) which would just
+  // multiply the matches without disambiguating.
+  if (node.role
+      && node.tag
+      && !GENERIC_ROLES.has(node.role)
+      && (node.firstTextFragment || node.text)) {
+    const anchorText = node.firstTextFragment || node.text || '';
+    const trimmedAnchor = anchorText.trim();
+    if (trimmedAnchor.length >= 2) {
+      const safeLeaf = escapeCssAttrValue(node.tag);
+      const safeRole = escapeCssAttrValue(node.role);
+      const safeAnchor = escapeHasText(trimmedAnchor);
+      locators.push({
+        strategy: 'css',
+        value: `${safeLeaf}[role="${safeRole}"]:has-text("${safeAnchor}")`,
+        // Slightly below wrapper+leaf because role attributes get
+        // dropped/refactored more often than custom-element wrappers.
+        // Above bare-wrapper (0.75) for the same reason: tag pinned.
+        confidence: 0.76,
       });
     }
   }
@@ -669,6 +768,46 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
     });
   }
 
+  // V26: 6.5. firstTextFragment — title-only `getByText(...)` for cases
+  // where `node.text` is the concatenated full innerText (Angular Material
+  // / Vue scoped / Web Component card pattern: title + description live
+  // in DIFFERENT children). The full-text strategy below CANNOT match a
+  // single text node when the DOM splits it; the fragment IS a single
+  // node and matches on its own.
+  //
+  // Confidence above the bare-text variant (0.7) because narrowing to the
+  // title alone is more discriminative — a card title is far less likely
+  // to appear elsewhere on the page than a substring of the description.
+  // Below role/testId/id (≥0.78) so explicit identity always wins first.
+  //
+  // Two variants:
+  //   1. Plain `getByText(fragment)` — pierces shadow DOM, fastest
+  //   2. Wrapper-scoped `${tag}:has-text(fragment)` — kills false positives
+  //      when the same title text appears in a sidebar / breadcrumb etc.
+  let firstFragmentTextAdded = false;
+  if (node.firstTextFragment
+      && node.firstTextFragment.length >= 2
+      && node.firstTextFragment !== node.text) {
+    const fragmentValue = node.firstTextFragment.slice(0, 80);
+    locators.push({
+      strategy: 'text',
+      value: fragmentValue,
+      confidence: 0.78,
+    });
+    firstFragmentTextAdded = true;
+    if (node.tag) {
+      const safeFragment = escapeHasText(fragmentValue);
+      locators.push({
+        strategy: 'css',
+        value: `${node.tag}:has-text("${safeFragment}")`,
+        // Slightly below bare text — the wrapper scope helps when there
+        // ARE duplicates, but for unique-text pages the bare match is
+        // already correct and a degree faster on Playwright's end.
+        confidence: 0.76,
+      });
+    }
+  }
+
   // 7. getByText(text) — fallback for buttons/links with visible text.
   // Pierces shadow DOM and is more resilient than CSS selectors.
   // Always included as a fallback (lower confidence than role/label/testId/placeholder),
@@ -680,7 +819,14 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
     const roleAlreadyUsesText = locators.some(
       l => l.strategy === 'role' && l.value === node.text
     );
-    if (!roleAlreadyUsesText) {
+    // V26: also skip when firstTextFragment-based locator already covers
+    // the same content (firstTextFragment is a prefix of the full text in
+    // the common case — emitting both bare strategies would be redundant
+    // and waste an executor probe slot).
+    const fragmentDuplicatesText = firstFragmentTextAdded
+      && node.firstTextFragment
+      && node.text.startsWith(node.firstTextFragment);
+    if (!roleAlreadyUsesText && !fragmentDuplicatesText) {
       locators.push({
         strategy: 'text',
         value: node.text,

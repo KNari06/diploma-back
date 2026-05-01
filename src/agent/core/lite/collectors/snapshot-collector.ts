@@ -69,6 +69,19 @@ export class SnapshotCollector {
       // Collect snapshot in page context
       // @ts-expect-error - DOM types available in browser context
       const snapshot = await page.evaluate((__mc) => {
+        // V26: phase timings — surface where the in-page work actually
+        // goes. On dense pages (e.g. juz40 folders-control with 11k DOM
+        // nodes) total page.evaluate hits ~16s. Without per-phase numbers
+        // it's impossible to know if the bottleneck is querySelectorAll,
+        // the cursor:pointer walk, or the per-element forEach with
+        // getComputedStyle/getBoundingClientRect. Each phase records
+        // duration so debugStats can call it out.
+        const __t0 = performance.now();
+        let __tPrimary = 0;   // after collectFromRoot (querySelectorAll + shadow walk)
+        let __tDedupe = 0;    // after dedup
+        let __tSecondary = 0; // after Tier-2 framework + cursor:pointer walk
+        let __tForEach = 0;   // after main extract loop (with getComputedStyle/bbox)
+        let __tEnd = 0;       // just before return
         const elements: any[] = [];
         // Keep stable refs across snapshots to enable meaningful diffs.
         // Use monotonic counter stored on window to avoid reassigning refs every time.
@@ -1220,6 +1233,7 @@ export class SnapshotCollector {
         // Collect all elements starting from document (depth 0)
         const allElements: Element[] = [];
         collectFromRoot(document, allElements, 0);
+        __tPrimary = performance.now();
 
         // Deduplicate (element might be collected multiple times)
         const seenElements = new Set<Element>();
@@ -1228,6 +1242,7 @@ export class SnapshotCollector {
           seenElements.add(el);
           return true;
         });
+        __tDedupe = performance.now();
 
         // activeModalElement is already computed above via detectActiveModal + activeModalRef.
 
@@ -1245,6 +1260,155 @@ export class SnapshotCollector {
               uniqueElements
             )
           : new Set<Element>();
+        __tSecondary = performance.now();
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // V26 #A: Page-level overlay detection — decide ONCE if hit-testing
+        // is needed at all. The forEach below was calling
+        // `document.elementFromPoint()` for every in-viewport candidate
+        // (~80% × 500 = 400 calls × 5-15ms each = 2-6s on dense pages).
+        // Real purpose of hit-test: detect "covered by something" — modal,
+        // sticky header, dropdown, toast. On a calm page with NO such layer
+        // every in-viewport candidate IS topmost by definition.
+        //
+        // Gate the call once on three signals:
+        //   1. Active or fallback modal already detected (existing state)
+        //   2. Any positioned overlay-like element (obstacleFacts already
+        //      collected these with z-index + size threshold)
+        //   3. Any open popover (role=menu/tooltip/listbox visible, or
+        //      element with aria-expanded=true present somewhere)
+        //
+        // When ALL three say no → fast-path: hit-test skipped, candidate is
+        // marked topmost (true). When ANY says yes → existing per-element
+        // hit-test logic runs unchanged. False positives ("we thought no
+        // overlay but there is one") are caught downstream by the
+        // fake-success guard in preview-step-apply.
+        const __hasModal = !!(activeModalElement || fallbackModalElement);
+        const __hasObstacles = obstacleFacts.length > 0;
+        // V26 #A: obstacleFacts has a z-index>=1 + coverage filter, so it
+        // misses sticky/fixed elements WITHOUT explicit z-index (e.g. plain
+        // <header style="position:sticky;top:0">). Catch THESE via inline
+        // style attribute — that targets exactly hand-coded positioned
+        // wrappers without picking up every body child like the broader
+        // POSITIONAL_CANDIDATES_SELECTOR does.
+        //
+        // Trade-off: doesn't catch positioned elements set via stylesheet
+        // (no inline style attr). But those are typically component-library
+        // elements which DO have role / aria-expanded / class hooks → the
+        // OTHER signals (obstacles via z-index, open-popover via ARIA)
+        // pick them up. The narrow inline-style check just catches the
+        // common "raw HTML sticky header" case without false-positive
+        // every page.
+        let __hasInlinePositioned = false;
+        try {
+          __hasInlinePositioned = !!document.querySelector(
+            '[style*="position:fixed"], [style*="position: fixed"], [style*="position:sticky"], [style*="position: sticky"]'
+          );
+        } catch { __hasInlinePositioned = true; }
+        let __hasOpenPopover = false;
+        try {
+          // querySelectorAll('[aria-expanded="true"]') is cheap (string match,
+          // no layout). Same for [role=menu/tooltip/listbox]. We don't need
+          // visibility validation here — the per-element style/visibility
+          // checks below will catch hidden ones during forEach.
+          __hasOpenPopover = !!document.querySelector(
+            '[role="menu"]:not([hidden]), [role="tooltip"]:not([hidden]), [role="listbox"]:not([hidden]), [aria-expanded="true"]'
+          );
+        } catch { /* querySelector throwing is fine — assume worst case */ __hasOpenPopover = true; }
+        const __hitTestNeeded = __hasModal || __hasObstacles || __hasOpenPopover || __hasInlinePositioned;
+        let __hitTestSkippedCount = 0;
+        let __hitTestRunCount = 0;
+
+        // V26 #B: Framework-presence gates. Each framework-specific extraction
+        // (mat-icon walk, Bootstrap data-bs-* walk-up) was running on EVERY
+        // candidate × 500 — even when the page has zero Material / Bootstrap
+        // DNA. One querySelector per framework here costs ~0.5ms total and
+        // gates 200-500ms of per-element work later. False negatives (gate
+        // misses framework that IS on page) → behaviour reverts to current
+        // for that framework only; other gates unaffected.
+        const __frameworkGates = {
+          // Angular Material — has <mat-*> tags or Material class prefix
+          hasMaterial: !!(
+            document.querySelector('mat-icon')
+            || document.querySelector('[class^="mat-"]')
+            || document.querySelector('[class*=" mat-"]')
+          ),
+          // Bootstrap — data-bs-* (5+) or legacy data-toggle (4-)
+          hasBootstrap: !!(
+            document.querySelector('[data-bs-toggle]')
+            || document.querySelector('[data-bs-target]')
+            || document.querySelector('[data-toggle]')
+          ),
+        };
+
+        // V26 #C: Batch reads — collect getComputedStyle + getBoundingClientRect
+        // for every candidate in ONE tight pre-pass loop. Browsers batch
+        // adjacent layout reads under one synchronous reflow when no DOM
+        // mutations occur between them. Doing this BEFORE the main forEach
+        // means we pay ONE reflow for the whole pass instead of 500.
+        //
+        // The forEach below reads from `__cached[i]` instead of calling
+        // window.getComputedStyle(el) / el.getBoundingClientRect() per
+        // iteration — those calls trigger fresh layouts when interleaved
+        // with DOM reads from other branches (closest, querySelector, etc.).
+        //
+        // Critical: this loop must be PURE READ. No setAttribute, no DOM
+        // mutation. Otherwise the batching guarantee breaks. ref-writes
+        // happen inside forEach later (after all reads landed).
+        // @ts-expect-error - window available in browser context
+        const __vw = window.innerWidth;
+        // @ts-expect-error - window available in browser context
+        const __vh = window.innerHeight;
+        // Cached style snapshot is a plain object (NOT live CSSStyleDeclaration).
+        // Live wrapper would re-trigger layout if something between pre-pass
+        // and forEach mutated the page (rare here — we don't await — but a
+        // hypothetical CSS rule keyed on data-agent-ref would invalidate
+        // stylesets on every setAttribute we do later). Copying values once
+        // up-front guarantees forEach is layout-free.
+        type __StyleSnapshot = {
+          display: string;
+          visibility: string;
+          opacity: string;
+          pointerEvents: string;
+          cursor: string;
+          position: string;
+          zIndex: string;
+          // V8 visual properties (consumed in elements.push downstream)
+          backgroundColor: string;
+          color: string;
+          borderRadius: string;
+        };
+        const __cached: Array<{
+          style: __StyleSnapshot;
+          rect: DOMRect;
+        } | null> = new Array(uniqueElements.length);
+        const __tCacheStart = performance.now();
+        for (let __i = 0; __i < uniqueElements.length; __i++) {
+          const __el = uniqueElements[__i];
+          try {
+            // @ts-expect-error - window available in browser context
+            const __live = window.getComputedStyle(__el);
+            __cached[__i] = {
+              style: {
+                display: __live.display,
+                visibility: __live.visibility,
+                opacity: __live.opacity,
+                pointerEvents: __live.pointerEvents,
+                cursor: __live.cursor,
+                position: __live.position,
+                zIndex: __live.zIndex,
+                backgroundColor: __live.backgroundColor,
+                color: __live.color,
+                borderRadius: __live.borderRadius,
+              },
+              rect: __el.getBoundingClientRect(),
+            };
+          } catch {
+            // detached / dead element — forEach checks for null and skips
+            __cached[__i] = null;
+          }
+        }
+        const __cacheMs = Math.round(performance.now() - __tCacheStart);
 
         // ✅ FIX BUG 5: Track refs used in THIS snapshot pass to prevent duplicates
         // When two elements produce the same fingerprint (e.g. repeated UI cards),
@@ -1290,10 +1454,21 @@ export class SnapshotCollector {
         };
 
         // Process each unique element (including shadow DOM elements)
-        uniqueElements.forEach((el: Element) => {
+        // V26 #C: forEach now reads style/rect from `__cached[__idx]` —
+        // the per-element pre-pass above paid ONE reflow for the whole
+        // batch. Per-element calls would re-trigger layout when interleaved
+        // with DOM walks (closest, parentElement, etc.) elsewhere.
+        uniqueElements.forEach((el: Element, __idx: number) => {
           try {
+            const __c = __cached[__idx];
+            if (!__c) {
+              // Element was detached between collectFromRoot and pre-pass;
+              // treat as hidden so downstream sees consistent state.
+              __mainRejects.hidden++;
+              return;
+            }
+            const style = __c.style;
             // Skip hidden elements
-            const style = window.getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden') {
               __mainRejects.hidden++;
               __pushRejectSample('hidden', el);
@@ -1338,8 +1513,8 @@ export class SnapshotCollector {
               return;
             }
 
-            // Skip if too small
-            const rect = el.getBoundingClientRect();
+            // Skip if too small (V26 #C: rect from pre-pass cache)
+            const rect = __c.rect;
             if (rect.width < 5 || rect.height < 5) {
               __mainRejects.tooSmall++;
               __pushRejectSample('tooSmall', el);
@@ -1347,10 +1522,10 @@ export class SnapshotCollector {
             }
 
             // Skip elements that are fully outside the visible viewport
-            // @ts-expect-error - window available in browser context
-            const vw = window.innerWidth;
-            // @ts-expect-error - window available in browser context
-            const vh = window.innerHeight;
+            // V26 #C: viewport already captured in pre-pass — saves 2 window
+            // accesses per element (cheap, but adds up at 500 iterations).
+            const vw = __vw;
+            const vh = __vh;
             if (__mc.fullPage) {
               // fullPage: skip only horizontally off-screen elements
               if (rect.right < 0 || rect.left > vw) {
@@ -1398,30 +1573,43 @@ export class SnapshotCollector {
             // legitimate interactive elements to be lost from the snapshot entirely.
             const cx = rect.left + rect.width / 2;
             const cy = rect.top + rect.height / 2;
-            // @ts-expect-error - window available in browser context
-            const inVp = cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight;
+            // V26 #C: use cached viewport (avoid window.innerWidth read here too)
+            const inVp = cx >= 0 && cx <= __vw && cy >= 0 && cy <= __vh;
             let hitTestTopEl: Element | null = null;
             let hitTestDone = false;
             if (inVp) {
-              try {
-                hitTestTopEl = document.elementFromPoint(cx, cy);
+              if (!__hitTestNeeded) {
+                // V26 #A fast-path: page has no modal, no positioned
+                // overlays, no open popover → an in-viewport element is
+                // topmost at its center BY DEFINITION. Skip the
+                // ~5-15ms force-layout call. We mark hitTestDone=true
+                // and treat self as the hit so downstream
+                // isTopMostAtCenter computes to `true`.
+                hitTestTopEl = el;
                 hitTestDone = true;
-                if (hitTestTopEl && hitTestTopEl !== el && !el.contains(hitTestTopEl) && !hitTestTopEl.contains(el)) {
-                  // For shadow DOM elements, elementFromPoint returns the shadow host
-                  // which won't match ancestor/descendant checks above.
-                  // Check if the hit element is the shadow host that contains our element.
-                  const elRoot = el.getRootNode();
-                  const isShadowHostMatch = elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl;
+                __hitTestSkippedCount++;
+              } else {
+                try {
+                  hitTestTopEl = document.elementFromPoint(cx, cy);
+                  hitTestDone = true;
+                  __hitTestRunCount++;
+                  if (hitTestTopEl && hitTestTopEl !== el && !el.contains(hitTestTopEl) && !hitTestTopEl.contains(el)) {
+                    // For shadow DOM elements, elementFromPoint returns the shadow host
+                    // which won't match ancestor/descendant checks above.
+                    // Check if the hit element is the shadow host that contains our element.
+                    const elRoot = el.getRootNode();
+                    const isShadowHostMatch = elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl;
 
-                  // ✅ FIX: Don't filter out elements that are inside the active modal/popup.
-                  // Also check if the hit element itself is inside the same modal (sibling layers within popup).
-                  const hitIsInsideSameModal = isInsideModal && activeModalElement && activeModalElement.contains(hitTestTopEl);
+                    // ✅ FIX: Don't filter out elements that are inside the active modal/popup.
+                    // Also check if the hit element itself is inside the same modal (sibling layers within popup).
+                    const hitIsInsideSameModal = isInsideModal && activeModalElement && activeModalElement.contains(hitTestTopEl);
 
-                  // Don't return — let element continue with isTopMostAtCenter=false.
-                  // buildAllowedSets handles soft penalty (no modal) / hard exclude (modal present).
+                    // Don't return — let element continue with isTopMostAtCenter=false.
+                    // buildAllowedSets handles soft penalty (no modal) / hard exclude (modal present).
+                  }
+                } catch {
+                  // elementFromPoint can fail in edge cases — don't skip
                 }
-              } catch {
-                // elementFromPoint can fail in edge cases — don't skip
               }
             }
 
@@ -1616,9 +1804,10 @@ export class SnapshotCollector {
 
             // V22 Pkg2: Bootstrap markers walked up to 3 ancestors —
             // toggle/target may sit on a wrapper, not on the trigger itself.
+            // V26 #B: skip walk entirely when page has no Bootstrap DNA.
             let bsToggle: string | undefined;
             let bsTarget: string | undefined;
-            {
+            if (__frameworkGates.hasBootstrap) {
               let bsW: Element | null = el;
               for (let bi = 0; bi < 3 && bsW; bi++) {
                 if (!bsToggle) {
@@ -1656,10 +1845,10 @@ export class SnapshotCollector {
               try {
                 // V22 Audit-fix H1: must use `window.getComputedStyle` in
                 // browser context. The earlier `globalThis.getComputedStyle`
-                // works in Node-with-jsdom test envs but is undefined in
-                // some embedded Chromium contexts (Playwright headed mode).
-                // @ts-expect-error - window available in page.evaluate scope
-                const trCursor = window.getComputedStyle(el).cursor;
+                // V26 #C: reuse cached style — same instance the
+                // pre-pass populated. Saves one extra getComputedStyle
+                // call per <tr> element.
+                const trCursor = style.cursor;
                 const trClass = el.getAttribute('class') || '';
                 const hoverishClass = /\b(hover|clickable|MuiTableRow-hover|ant-table-row|el-table__row|row-clickable)\b/i.test(trClass);
                 if (trCursor === 'pointer' || hoverishClass) rowClickable = true;
@@ -1833,29 +2022,37 @@ export class SnapshotCollector {
             // are short identifier strings like "chevron-left-outline").
             // Symmetric with recorder so identity fast-path on svgIcon
             // can match recorded ↔ live without normalization drift.
+            //
+            // V26 #B: gate on page-level Material detection. closest('mat-icon')
+            // + querySelector('mat-icon') were running on every node × 500
+            // even on plain HTML / React / Vue pages. Material absent → both
+            // calls return null but each costs DOM walk time. Skipping saves
+            // ~500ms-1s on non-Material pages.
             let liveSvgIcon: string | undefined;
-            try {
-              // V23: search both directions for `<mat-icon>` carrying svgicon —
-              // self, then ancestors (icon-only Material buttons where the
-              // <mat-icon> IS the clickable target), then descendants (Angular
-              // apps where <button>/<a>/<app-excel-btn> wrap the icon —
-              // common pattern: `<button>...<mat-icon svgicon="excel">`).
-              // Without descendant-search, descriptor-poor wrapper buttons
-              // like `<app-excel-btn>` lose svgIcon entirely and the resolver
-              // falls through to LLM with no identity hint.
-              const matIconHost = el.tagName.toLowerCase() === 'mat-icon'
-                ? el
-                : (el.closest ? el.closest('mat-icon') : null)
-                || (el.querySelector ? el.querySelector('mat-icon') : null);
-              if (matIconHost) {
-                const rawSvgIcon = matIconHost.getAttribute('svgicon')
-                  || matIconHost.getAttribute('data-mat-icon-name')
-                  || '';
-                if (rawSvgIcon && rawSvgIcon.length > 0 && rawSvgIcon.length <= 60) {
-                  liveSvgIcon = rawSvgIcon;
+            if (__frameworkGates.hasMaterial) {
+              try {
+                // V23: search both directions for `<mat-icon>` carrying svgicon —
+                // self, then ancestors (icon-only Material buttons where the
+                // <mat-icon> IS the clickable target), then descendants (Angular
+                // apps where <button>/<a>/<app-excel-btn> wrap the icon —
+                // common pattern: `<button>...<mat-icon svgicon="excel">`).
+                // Without descendant-search, descriptor-poor wrapper buttons
+                // like `<app-excel-btn>` lose svgIcon entirely and the resolver
+                // falls through to LLM with no identity hint.
+                const matIconHost = el.tagName.toLowerCase() === 'mat-icon'
+                  ? el
+                  : (el.closest ? el.closest('mat-icon') : null)
+                  || (el.querySelector ? el.querySelector('mat-icon') : null);
+                if (matIconHost) {
+                  const rawSvgIcon = matIconHost.getAttribute('svgicon')
+                    || matIconHost.getAttribute('data-mat-icon-name')
+                    || '';
+                  if (rawSvgIcon && rawSvgIcon.length > 0 && rawSvgIcon.length <= 60) {
+                    liveSvgIcon = rawSvgIcon;
+                  }
                 }
-              }
-            } catch { /* best-effort — non-Material apps will simply leave it undefined */ }
+              } catch { /* best-effort — non-Material apps will simply leave it undefined */ }
+            }
 
             // Closest semantic custom-element ancestor. Mirrors recorder
             // probe — same filter rules, same depth (6 levels) so the
@@ -2111,13 +2308,98 @@ export class SnapshotCollector {
               }
             };
 
+            /**
+             * V26: Extract the FIRST meaningful text fragment as a single
+             * DOM unit (not concatenation of multiple children).
+             *
+             * Why a separate field, not just `text.split('•')[0]`:
+             *   - works for ANY separator the page chose (newline, em-dash,
+             *     middle-dot, pipe, no separator at all just structural)
+             *   - matches what `page.getByText(...)` actually requires:
+             *     a single Text node OR a single element with that text
+             *   - survives wrappers: `<a><h3>МАТ-SMART</h3><span>desc</span></a>`
+             *     has firstTextFragment = "МАТ-SMART", regardless of how
+             *     the wrapping changes
+             *
+             * Algorithm: depth-first, skip Comment + decorative leaves
+             * (img/svg/i/picture without text), accept first child whose
+             * own innerText is non-empty AND short enough (≤80 chars to
+             * skip "this is the entire card description as one node").
+             */
+            const extractFirstTextFragment = (node: Element): string | undefined => {
+              try {
+                const TEXT_NODE = 3;
+                const ELEMENT_NODE = 1;
+                const MAX_LEN = 80;
+                const DECORATIVE = new Set(['img', 'svg', 'i', 'picture', 'use', 'path', 'br', 'hr']);
+
+                // 1) Direct text-node child first — fastest path, also the
+                //    only correct answer for `<a>Hello <span>world</span></a>`
+                //    where "Hello" is the leaf-most identity-bearing token.
+                for (let ci = 0; ci < node.childNodes.length; ci++) {
+                  const ch = node.childNodes[ci];
+                  if (ch.nodeType === TEXT_NODE) {
+                    const t = (ch.nodeValue || '').replace(/\s+/g, ' ').trim();
+                    if (t.length >= 2 && t.length <= MAX_LEN) return t;
+                  }
+                }
+
+                // 2) Then walk element children depth-first looking for a
+                //    leaf with a short visible string. We bail out as soon
+                //    as we find one — caller wants ONE representative
+                //    fragment, not a synthesis.
+                const stack: Element[] = [];
+                for (let ci = node.childNodes.length - 1; ci >= 0; ci--) {
+                  const ch = node.childNodes[ci];
+                  if (ch.nodeType === ELEMENT_NODE) stack.push(ch as Element);
+                }
+                let visited = 0;
+                while (stack.length > 0 && visited < 30) {
+                  visited++;
+                  const cur = stack.pop()!;
+                  const tagLc = (cur.tagName || '').toLowerCase();
+                  if (DECORATIVE.has(tagLc)) continue;
+                  // Direct text under this child? Take it.
+                  for (let cci = 0; cci < cur.childNodes.length; cci++) {
+                    const cch = cur.childNodes[cci];
+                    if (cch.nodeType === TEXT_NODE) {
+                      const t = (cch.nodeValue || '').replace(/\s+/g, ' ').trim();
+                      if (t.length >= 2 && t.length <= MAX_LEN) return t;
+                    }
+                  }
+                  // No direct text — push this child's element children
+                  // for further descent. Reverse-order push keeps DFS in
+                  // visual order (first child explored first).
+                  for (let cci = cur.childNodes.length - 1; cci >= 0; cci--) {
+                    const cch = cur.childNodes[cci];
+                    if (cch.nodeType === ELEMENT_NODE) stack.push(cch as Element);
+                  }
+                }
+              } catch { /* best-effort */ }
+              return undefined;
+            };
+
+            // V26: Compute firstTextFragment ONCE here so we can also
+            // compare against full readable text below — no point storing
+            // it when it equals the full text (that path has no fix to
+            // offer over `name` / `text`).
+            const v26FullReadable = getReadableElementText(el);
+            const v26FirstFragment = extractFirstTextFragment(el);
+            const v26FirstFragmentToStore =
+              (v26FirstFragment && v26FirstFragment.length >= 2
+                && v26FirstFragment !== v26FullReadable
+                && v26FirstFragment !== v26FullReadable.slice(0, v26FirstFragment.length))
+                ? v26FirstFragment
+                : undefined;
+
             elements.push({
               ref,
               role: (el.getAttribute('role') || el.tagName.toLowerCase()).replace(/["']/g, '').trim(),
               name: ariaLabel ||
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
-                getReadableElementText(el).slice(0, 50) || '',
+                v26FullReadable.slice(0, 50) || '',
+              firstTextFragment: v26FirstFragmentToStore,
               // Identity fields — populated for the resolver's identity
               // fast-path. Read from the live DOM, NOT computed from labels,
               // so they line up byte-for-byte with TargetFingerprint values
@@ -2363,6 +2645,7 @@ export class SnapshotCollector {
             }
           }
         });
+        __tForEach = performance.now();
 
         // ═══════════════════════════════════════════════════════════════════════
         // PHASE 0.1: Enhanced page text extraction for credential detection
@@ -2677,6 +2960,8 @@ export class SnapshotCollector {
           // Page alert collection is non-critical — never break snapshot
         }
 
+        __tEnd = performance.now();
+
         // DEBUG: Attach collection stats for diagnosing 0-element issues
         const __debugStats = {
           allElementsCount: allElements.length,
@@ -2703,6 +2988,47 @@ export class SnapshotCollector {
             tier2: __tier2Rejects,
             tier2Samples: __tier2RejectSamples,
           },
+          // V26: per-phase wall time inside page.evaluate. All values in ms.
+          //   primaryMs   = collectFromRoot (querySelectorAll + shadow walk)
+          //   dedupeMs    = unique-set filter
+          //   secondaryMs = Tier-2 framework + cursor:pointer global scan
+          //   forEachMs   = per-element extract loop (getComputedStyle/bbox heavy)
+          //   tailMs      = everything between forEach end and return
+          //   totalMs     = full page.evaluate body
+          // Use these to find the real bottleneck on slow snapshots without
+          // re-running with custom logging.
+          phaseTimings: {
+            primaryMs: Math.round(__tPrimary - __t0),
+            dedupeMs: Math.round(__tDedupe - __tPrimary),
+            secondaryMs: Math.round(__tSecondary - __tDedupe),
+            // V26 #C: cacheMs = upfront layout-read pre-pass. forEachMs
+            // should drop by ~30-50% because per-iteration getComputedStyle
+            // and getBoundingClientRect were eliminated. cacheMs typically
+            // 1-3% of old forEachMs (one batched layout vs many).
+            cacheMs: __cacheMs,
+            forEachMs: Math.round(__tForEach - __tSecondary),
+            tailMs: Math.round(__tEnd - __tForEach),
+            totalMs: Math.round(__tEnd - __t0),
+          },
+          // V26 #A: hit-test bookkeeping — surfaces how often the
+          // page-level overlay gate let us skip elementFromPoint calls.
+          // High `hitTestSkipped` on a slow forEachMs = main optimization
+          // landed; high `hitTestRun` on a "calm" page = gate misfired
+          // (need to widen one of the three signals).
+          hitTest: {
+            needed: __hitTestNeeded,
+            hasModal: __hasModal,
+            hasObstacles: __hasObstacles,
+            hasInlinePositioned: __hasInlinePositioned,
+            hasOpenPopover: __hasOpenPopover,
+            skipped: __hitTestSkippedCount,
+            ran: __hitTestRunCount,
+          },
+          // V26 #B: framework gates — surfaces which extraction paths were
+          // skipped page-wide. False on a Material page would be a regression
+          // signal (mat-icon walk silently disabled); false on a React-only
+          // page is the optimization at work.
+          frameworkGates: __frameworkGates,
         };
 
         return {

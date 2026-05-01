@@ -1314,7 +1314,25 @@ export class PreviewRunService {
       // V13: Switch dialog handler to replay mode — use pre-installed actions from recorded dialog steps
       sessionService.setDialogMode(previewSessionId, userId, 'replay');
 
-      // Skip compiled shortcut for remaining steps if first compiled plan failed (likely stale after deploy)
+      // V26: Per-run compiled-plan failure budget instead of "skip all
+      // after first failure". The original logic was:
+      //   - one compiled fail → skip compiled for ALL remaining steps
+      // That helped against post-deploy regressions (every plan stale at
+      // once) but punished single-step failures: a card with a fragile
+      // text-only locator would disable compiled for the whole rest of
+      // the run, forcing every later step through the LLM resolver even
+      // when their plans were perfectly valid (e.g. juz40 step 10 had
+      // working compiled for "Папкалар" but never got tried because
+      // step 8's MAT-SMART card failed).
+      //
+      // New rule: count failures, only kill compiled when 3+ in a row
+      // OR 5+ across the whole run — the deploy-regression signature.
+      // Single bad plans cost ~3s each (locator timeout) but let the
+      // good ones still take the fast path.
+      let compiledFailuresInRow = 0;
+      let compiledFailuresTotal = 0;
+      const MAX_COMPILED_FAILS_IN_ROW = 3;
+      const MAX_COMPILED_FAILS_TOTAL = 5;
       let skipCompiledForRemaining = false;
 
       // ─── Step execution loop ───────────────────────────────────────────
@@ -1720,13 +1738,44 @@ export class PreviewRunService {
             skipCompiled: skipCompiledForRemaining,
           }), signal);
 
-          // If compiled plan was tried and failed, skip compiled for remaining steps
-          // (plans likely stale after deploy — don't waste 3s timeout per step)
-          if (result.compiledFailed && !skipCompiledForRemaining) {
-            skipCompiledForRemaining = true;
-            logger.info('[PreviewRun] Compiled plan failed — skipping compiled for remaining steps', {
-              previewSessionId, stepIndex: originalStepIndex, stepId: step.id,
-            });
+          // V26: per-step counter instead of global kill switch.
+          // Single fail = +1, success on a tried-compiled = reset the
+          // streak (it was a one-off bad plan, not a deploy regression).
+          // Hit 3-in-row OR 5-total → assume deploy regression, switch
+          // off compiled for the rest of the run as before.
+          if (result.compiledFailed) {
+            compiledFailuresInRow++;
+            compiledFailuresTotal++;
+            if (
+              !skipCompiledForRemaining
+              && (compiledFailuresInRow >= MAX_COMPILED_FAILS_IN_ROW
+                  || compiledFailuresTotal >= MAX_COMPILED_FAILS_TOTAL)
+            ) {
+              skipCompiledForRemaining = true;
+              logger.info('[PreviewRun] Compiled plan failure budget exhausted — disabling compiled for remaining steps', {
+                previewSessionId,
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                failuresInRow: compiledFailuresInRow,
+                failuresTotal: compiledFailuresTotal,
+              });
+            } else if (!skipCompiledForRemaining) {
+              logger.debug('[PreviewRun] Compiled plan failed — counting toward budget', {
+                previewSessionId,
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                failuresInRow: compiledFailuresInRow,
+                failuresTotal: compiledFailuresTotal,
+                budgetInRow: MAX_COMPILED_FAILS_IN_ROW,
+                budgetTotal: MAX_COMPILED_FAILS_TOTAL,
+              });
+            }
+          } else if (result.success) {
+            // Success on this step — reset the in-row streak (a single
+            // bad plan elsewhere shouldn't be held against this success).
+            // Total counter stays — many failures across the whole run
+            // is still the deploy-regression signal we want to catch.
+            compiledFailuresInRow = 0;
           }
           let retried = false;
 

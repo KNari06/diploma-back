@@ -224,6 +224,12 @@ function buildSyntheticFingerprintFromNode(node: InteractiveNode): TargetFingerp
   if (node.title) fp.title = node.title;
   if ((node as any).alt) fp.alt = (node as any).alt;
   if (node.text) fp.text = node.text;
+  // V26: First text fragment as a single DOM unit (Angular Material card
+  // pattern fix). Symmetric with collector + recorder. Without this line
+  // synthetic fingerprints carried no fragment, so card-shaped targets
+  // resolved through LLM never gained a stable text-locator on their
+  // next compiled-plan rebuild.
+  if ((node as any).firstTextFragment) fp.firstTextFragment = (node as any).firstTextFragment;
   // node.id is the live DOM id; only persist when it isn't a framework-
   // generated counter (mat-radio-3, mui-12, :r0:, etc.) so identity match
   // doesn't lock onto an unstable token. The probe path applies the same
@@ -4289,6 +4295,72 @@ export class PreviewStepApplyService {
                       }
                     }
                   } catch { /* synthesis is non-fatal */ }
+                } else if (
+                  // V26: Mirror the lint-path backfill on the compiled
+                  // fast-path. Recorded fingerprints captured by older
+                  // recorder versions don't have the new V26 identity
+                  // fields (firstTextFragment, href, etc.) — without
+                  // backfill they only get populated by re-recording
+                  // by hand. Same gate (click + has recordedFp + has
+                  // compiledRef), same predicate (only fill missing
+                  // slots, never overwrite recorded values).
+                  stepDraft.type === 'click'
+                  && stepDraft.recordedFingerprint
+                  && compiledRef
+                ) {
+                  try {
+                    const sess = sessionService.getSession(previewSessionId);
+                    const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
+                    if (liveNode) {
+                      const fp = stepDraft.recordedFingerprint;
+                      const live = liveNode as any;
+                      const backfill: Partial<TargetFingerprint> = {};
+                      const fillIfMissing = <K extends keyof TargetFingerprint>(
+                        key: K,
+                        liveKey: string = key as string,
+                      ): void => {
+                        const v = live[liveKey];
+                        if (fp[key] === undefined && v !== undefined && v !== null && v !== '') {
+                          (backfill as any)[key] = v;
+                        }
+                      };
+                      fillIfMissing('firstTextFragment');
+                      fillIfMissing('href');
+                      if (fp.elementId === undefined && live.id && !live.isDynamicId) {
+                        backfill.elementId = live.id;
+                      }
+                      fillIfMissing('testIdAttr');
+                      fillIfMissing('name');
+                      fillIfMissing('alt');
+                      fillIfMissing('svgIcon');
+                      fillIfMissing('iconLabel');
+                      fillIfMissing('customElementTag');
+                      fillIfMissing('cssClass');
+                      fillIfMissing('ariaControls');
+                      fillIfMissing('vueScopeId');
+                      fillIfMissing('childTestId');
+                      fillIfMissing('nearestLandmark');
+                      fillIfMissing('title');
+                      if (
+                        (!fp.containerTitles || fp.containerTitles.length === 0)
+                        && Array.isArray(live.containerTitles)
+                        && live.containerTitles.length > 0
+                      ) {
+                        backfill.containerTitles = live.containerTitles.slice(0, 3);
+                      }
+                      if (Object.keys(backfill).length > 0) {
+                        updatedStep = {
+                          ...updatedStep,
+                          recordedFingerprint: { ...fp, ...backfill },
+                        };
+                        logger.info('[PREVIEW_APPLY] Backfilled missing identity fields on compiled fast-path', {
+                          previewSessionId,
+                          stepId: stepDraft.id,
+                          backfilledKeys: Object.keys(backfill),
+                        });
+                      }
+                    }
+                  } catch { /* backfill is non-fatal */ }
                 }
 
                 // V23: compiled fast-path success — pull live node info into
@@ -5949,6 +6021,97 @@ export class PreviewStepApplyService {
                 previewSessionId,
                 stepId: stepDraft.id,
                 fpKeys: Object.keys(synthetic).slice(0, 10),
+                signal: clickEffectSignal,
+              });
+            }
+          } else if (
+            // V26: Backfill MISSING identity fields onto an EXISTING recorded
+            // fingerprint when the LLM resolver successfully found the step's
+            // target. Without this, fingerprints captured by older recorder
+            // versions (or recorded before each new identity field was added
+            // to the probe) never gained the new fields — the only path to
+            // populate them was re-recording the click by hand.
+            //
+            // Fix: when LLM picks a node and post-action verifies (we're in
+            // the success branch), copy every identity-bearing field from the
+            // live node onto the recorded fingerprint — but ONLY where the
+            // recorded value is missing. Never overwrite: the recorded value
+            // is the authoritative one (the human-confirmed target at record
+            // time); we're just filling in fields the recorder didn't yet
+            // know how to capture.
+            //
+            // What we INCLUDE (stable identity that helps future resolution):
+            //   firstTextFragment, href, elementId, testIdAttr, name, alt,
+            //   svgIcon, iconLabel, customElementTag, cssClass, ariaControls,
+            //   vueScopeId, childTestId, nearestLandmark, containerTitles
+            //
+            // What we EXCLUDE (state-dependent or page-layout dependent —
+            // copying these would let a stale snapshot poison the recorded
+            // identity across runs):
+            //   boundingBox, text, ariaState, disabled, siblingIndex,
+            //   arrowDir, ancestorSummary, dataValue, role, tag
+            stepDraft.type === 'click'
+            && stepDraft.recordedFingerprint
+            && !softPassedOnNoEffect
+            && candidate.node
+          ) {
+            const fp = stepDraft.recordedFingerprint;
+            const liveNode = candidate.node as any;
+            const backfill: Partial<TargetFingerprint> = {};
+
+            // Helper: only set when recorded slot is empty AND live has value.
+            // Keeps the "recorded is authoritative" invariant explicit.
+            const fillIfMissing = <K extends keyof TargetFingerprint>(
+              key: K,
+              liveKey: string = key as string,
+            ): void => {
+              const liveVal = liveNode[liveKey];
+              if (fp[key] === undefined && liveVal !== undefined && liveVal !== null && liveVal !== '') {
+                (backfill as any)[key] = liveVal;
+              }
+            };
+
+            // Identity-bearing single-value fields.
+            fillIfMissing('firstTextFragment');
+            fillIfMissing('href');
+            // node.id (live) → fp.elementId (canonical name on fingerprint).
+            // Skip framework-generated IDs — same gate as the recorder/synthetic
+            // path so identity match doesn't lock onto an unstable token.
+            if (fp.elementId === undefined && liveNode.id && !liveNode.isDynamicId) {
+              backfill.elementId = liveNode.id;
+            }
+            fillIfMissing('testIdAttr');
+            fillIfMissing('name');
+            fillIfMissing('alt');
+            fillIfMissing('svgIcon');
+            fillIfMissing('iconLabel');
+            fillIfMissing('customElementTag');
+            fillIfMissing('cssClass');
+            fillIfMissing('ariaControls');
+            fillIfMissing('vueScopeId');
+            fillIfMissing('childTestId');
+            fillIfMissing('nearestLandmark');
+            fillIfMissing('title');
+
+            // containerTitles is an array — only fill when recorded array is
+            // missing/empty AND live has at least one entry.
+            if (
+              (!fp.containerTitles || fp.containerTitles.length === 0)
+              && Array.isArray(liveNode.containerTitles)
+              && liveNode.containerTitles.length > 0
+            ) {
+              backfill.containerTitles = liveNode.containerTitles.slice(0, 3);
+            }
+
+            if (Object.keys(backfill).length > 0) {
+              appliedStep = {
+                ...updatedStep,
+                recordedFingerprint: { ...fp, ...backfill },
+              };
+              logger.info('[PREVIEW_APPLY] Backfilled missing identity fields on recorded fingerprint', {
+                previewSessionId,
+                stepId: stepDraft.id,
+                backfilledKeys: Object.keys(backfill),
                 signal: clickEffectSignal,
               });
             }

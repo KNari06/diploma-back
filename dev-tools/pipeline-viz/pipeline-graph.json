@@ -1,0 +1,3571 @@
+{
+  "generatedAt": "2026-05-01T18:11:43.537Z",
+  "layers": [
+    "snapshot",
+    "dom-analysis",
+    "lint",
+    "locator-plan",
+    "resolver",
+    "step-apply",
+    "run",
+    "session",
+    "recording"
+  ],
+  "services": [
+    {
+      "id": "SnapshotCollector",
+      "name": "SnapshotCollector",
+      "layer": "snapshot",
+      "file": "src/agent/core/lite/collectors/snapshot-collector.ts",
+      "hub": true,
+      "methodCount": 2
+    },
+    {
+      "id": "DomAnalysisExtractorService",
+      "name": "DomAnalysisExtractorService",
+      "layer": "dom-analysis",
+      "file": "src/services/testing/ui/preview/dom-analysis-extractor.service.ts",
+      "hub": false,
+      "methodCount": 5
+    },
+    {
+      "id": "IntentStepLintService",
+      "name": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "hub": false,
+      "methodCount": 8
+    },
+    {
+      "id": "LocatorPlanBuilder",
+      "name": "LocatorPlanBuilder",
+      "layer": "locator-plan",
+      "file": "src/services/testing/ui/preview/locator-plan-builder.service.ts",
+      "hub": false,
+      "methodCount": 2
+    },
+    {
+      "id": "ElementResolver",
+      "name": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "hub": true,
+      "methodCount": 10
+    },
+    {
+      "id": "PreviewStepApplyService",
+      "name": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "hub": true,
+      "methodCount": 21
+    },
+    {
+      "id": "PreviewRunService",
+      "name": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "hub": true,
+      "methodCount": 6
+    },
+    {
+      "id": "PreviewSessionService",
+      "name": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "hub": false,
+      "methodCount": 87
+    },
+    {
+      "id": "RecordingCaptureService",
+      "name": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "hub": false,
+      "methodCount": 30
+    }
+  ],
+  "methods": [
+    {
+      "id": "SnapshotCollector.collect",
+      "name": "collect",
+      "service": "SnapshotCollector",
+      "layer": "snapshot",
+      "file": "src/agent/core/lite/collectors/snapshot-collector.ts",
+      "line": 36,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, options: { fullPage?: boolean; skipStab…) => Promise<LiteSnapshot>",
+      "emitsWs": []
+    },
+    {
+      "id": "SnapshotCollector.format",
+      "name": "format",
+      "service": "SnapshotCollector",
+      "layer": "snapshot",
+      "file": "src/agent/core/lite/collectors/snapshot-collector.ts",
+      "line": 3245,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(snapshot: LiteSnapshot, keepRefs: Set<string> | undefined) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "DomAnalysisExtractorService.extract",
+      "name": "extract",
+      "service": "DomAnalysisExtractorService",
+      "layer": "dom-analysis",
+      "file": "src/services/testing/ui/preview/dom-analysis-extractor.service.ts",
+      "line": 481,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(snapshot: LiteSnapshot) => DomAnalysisData",
+      "emitsWs": []
+    },
+    {
+      "id": "DomAnalysisExtractorService.extractNodes",
+      "name": "extractNodes",
+      "service": "DomAnalysisExtractorService",
+      "layer": "dom-analysis",
+      "file": "src/services/testing/ui/preview/dom-analysis-extractor.service.ts",
+      "line": 490,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(snapshot: LiteSnapshot) => InteractiveNode[]",
+      "emitsWs": []
+    },
+    {
+      "id": "DomAnalysisExtractorService.getVersion",
+      "name": "getVersion",
+      "service": "DomAnalysisExtractorService",
+      "layer": "dom-analysis",
+      "file": "src/services/testing/ui/preview/dom-analysis-extractor.service.ts",
+      "line": 497,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "() => string",
+      "emitsWs": []
+    },
+    {
+      "id": "DomAnalysisExtractorService.extractInteractiveNodes",
+      "name": "extractInteractiveNodes",
+      "service": "DomAnalysisExtractorService",
+      "layer": "dom-analysis",
+      "file": "src/services/testing/ui/preview/dom-analysis-extractor.service.ts",
+      "line": 423,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(snapshot: LiteSnapshot) => InteractiveNode[]",
+      "emitsWs": []
+    },
+    {
+      "id": "DomAnalysisExtractorService.createDomAnalysis",
+      "name": "createDomAnalysis",
+      "service": "DomAnalysisExtractorService",
+      "layer": "dom-analysis",
+      "file": "src/services/testing/ui/preview/dom-analysis-extractor.service.ts",
+      "line": 456,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(snapshot: LiteSnapshot) => DomAnalysisData",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService.lintStep",
+      "name": "lintStep",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 674,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…) => Promise<LintResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService._lintStepInner",
+      "name": "_lintStepInner",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 698,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…) => Promise<LintResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService.isEvidenceShortcutNodeCompatible",
+      "name": "isEvidenceShortcutNodeCompatible",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 890,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(step: IntentStep, node: InteractiveNode, pageUrl: string) => { ok: boolean; reason?: string; }",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService.lintStepWithAI",
+      "name": "lintStepWithAI",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 908,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…) => Promise<LintResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService._lintStepWithAIImpl",
+      "name": "_lintStepWithAIImpl",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 989,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…, onContext: ((url: string | undefined, dom…) => Promise<LintResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService.lintStepWithRuleBasedFallback",
+      "name": "lintStepWithRuleBasedFallback",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 1476,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…, snapshot: { url: string; domNodes: Inter…, resolverDegradedReason: string | undefined) => Promise<LintResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService.generateClarificationQuestion",
+      "name": "generateClarificationQuestion",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 1661,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { userIntent: string; actionTy…) => Promise<{ question?: string; interpretation?: …",
+      "emitsWs": []
+    },
+    {
+      "id": "IntentStepLintService.isEvidenceShortcutNodeCompatible",
+      "name": "isEvidenceShortcutNodeCompatible",
+      "service": "IntentStepLintService",
+      "layer": "lint",
+      "file": "src/services/testing/ui/preview/intent-step-lint.service.ts",
+      "line": 1915,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(step: IntentStep, node: InteractiveNode, pageUrl: string) => { ok: boolean; reason?: string; }",
+      "emitsWs": []
+    },
+    {
+      "id": "LocatorPlanBuilder.buildCompiledPlan",
+      "name": "buildCompiledPlan",
+      "service": "LocatorPlanBuilder",
+      "layer": "locator-plan",
+      "file": "src/services/testing/ui/preview/locator-plan-builder.service.ts",
+      "line": 1090,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { step: IntentStep; resolvedNo…) => Promise<CompiledStepPlan>",
+      "emitsWs": []
+    },
+    {
+      "id": "LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction",
+      "name": "buildCompiledPlanForNonTargetingAction",
+      "service": "LocatorPlanBuilder",
+      "layer": "locator-plan",
+      "file": "src/services/testing/ui/preview/locator-plan-builder.service.ts",
+      "line": 1188,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(params: { step: IntentStep; pageUrl: s…) => CompiledStepPlan",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.buildAllowedSets",
+      "name": "buildAllowedSets",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 213,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(nodes: InteractiveNode[], actionType: IntentActionType, viewport: { width: number; height: numbe…) => AllowedSetResult",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.getEffectiveLabel",
+      "name": "getEffectiveLabel",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 722,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(node: InteractiveNode | null | undef…) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.buildCandidateText",
+      "name": "buildCandidateText",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 747,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(node: InteractiveNode) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.buildSceneSummary",
+      "name": "buildSceneSummary",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 1006,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(candidates: { node: InteractiveNode; candi…) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.sanitizeIntent",
+      "name": "sanitizeIntent",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 1094,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(step: IntentStep) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.rescueWithGeminiFlash",
+      "name": "rescueWithGeminiFlash",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 1210,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { intentText: string; actionTy…) => Promise<{ ref: string; confidence: number; rea…",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.invalidateLlmSelectionsForRef",
+      "name": "invalidateLlmSelectionsForRef",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 1481,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(args: { rejectedRef: string | undefi…) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.selectElementWithLLM",
+      "name": "selectElementWithLLM",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 2140,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { intentText: string; actionTy…) => Promise<LlmSelectResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.resolveScreenshot",
+      "name": "resolveScreenshot",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 3113,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(src: ScreenshotResult | (() => Prom…) => Promise<NormalizedScreenshot | undefined>",
+      "emitsWs": []
+    },
+    {
+      "id": "ElementResolver.resolveElement",
+      "name": "resolveElement",
+      "service": "ElementResolver",
+      "layer": "resolver",
+      "file": "src/services/testing/ui/preview/element-resolver.service.ts",
+      "line": 3172,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…) => Promise<LintResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.applyStep",
+      "name": "applyStep",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 2939,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(params: { previewSessionId: string; st…) => Promise<ApplyResult>",
+      "emitsWs": [
+        "preview:loading"
+      ]
+    },
+    {
+      "id": "PreviewStepApplyService.shouldUpgradeCompiledPlan",
+      "name": "shouldUpgradeCompiledPlan",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 68,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(existing: CompiledStepPlan | undefined, candidate: CompiledStepPlan) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.buildBindingHintsFromNode",
+      "name": "buildBindingHintsFromNode",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 112,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(node: InteractiveNode) => BindingHints",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.buildSyntheticFingerprintFromNode",
+      "name": "buildSyntheticFingerprintFromNode",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 215,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(node: InteractiveNode) => TargetFingerprint",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.detectModalBlockingFromSession",
+      "name": "detectModalBlockingFromSession",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 305,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(previewSessionId: string, userId: string) => { modalRef: string; modalText?: string; boundi…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.verifyModalActuallyBlocks",
+      "name": "verifyModalActuallyBlocks",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 365,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, candidateRefs: string[], modalRef: string) => Promise<{ blocked: boolean; reason: string; oc…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.detectOverlayBlockingCandidate",
+      "name": "detectOverlayBlockingCandidate",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 555,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, previewSessionId: string, candidateRefs: string[]) => Promise<{ modalRef: string; modalText?: string…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.classifyNavigationError",
+      "name": "classifyNavigationError",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 642,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(error: Error, url: string) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.globToRegexPatternForWaitFor",
+      "name": "globToRegexPatternForWaitFor",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 693,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(glob: string) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.normalizeTypeActionValue",
+      "name": "normalizeTypeActionValue",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 738,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(rawValue: string | undefined) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.waitForPageSettled",
+      "name": "waitForPageSettled",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 769,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, timeoutMs: number, _quietMs: number) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.executeWaitFor",
+      "name": "executeWaitFor",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 896,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, matcher: UrlMatcher | undefined, timeoutMs: number, isAutoInjected: boolean) => Promise<{ success: boolean; error?: string; de…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.dismissParasiticOverlay",
+      "name": "dismissParasiticOverlay",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1372,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, preState: ClickPreState | null, ctx: { previewSessionId: string; st…) => Promise<{ dismissed: boolean; reason: string; }>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.captureClickPreState",
+      "name": "captureClickPreState",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1501,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, ref: string | undefined, targetFrame: Frame | null) => Promise<ClickPreState>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.verifyClickHadEffect",
+      "name": "verifyClickHadEffect",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1619,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, pre: ClickPreState, ref: string | undefined, targetFrame: Frame | null) => Promise<{ effected: boolean; signal: ClickEffe…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.compareToRecordedFingerprint",
+      "name": "compareToRecordedFingerprint",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1746,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(chosen: { tag?: string; id?: string | …, recorded: { tag?: string; elementId?: st…) => \"id\" | \"bbox\" | \"tag\" | \"no_recorded\" | \"misma…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.verifyActionEffect",
+      "name": "verifyActionEffect",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1780,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, step: IntentStep, ref: string) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.dispatchFileDrop",
+      "name": "dispatchFileDrop",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1969,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, locator: Locator, localFilePath: string, filename: string, contentType: string | undefined) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.uploadViaFileChooserOrDrop",
+      "name": "uploadViaFileChooserOrDrop",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 2022,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, locator: Locator, localFilePath: string, filename: string, contentType: string | undefined, timeout: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.selectFromCustomDropdown",
+      "name": "selectFromCustomDropdown",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 2103,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, triggerLocator: Locator, value: string, timeout: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.executeAction",
+      "name": "executeAction",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 2262,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, step: IntentStep, candidate: LintCandidate, preResolvedLocator: Locator | undefined, options: { expectsNavigation?: boolean;…) => Promise<{ success: boolean; error?: string; ur…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewRunService.runSavedSteps",
+      "name": "runSavedSteps",
+      "service": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "line": 509,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(previewSessionId: string, intentTestCaseId: string, userId: string, options: { inlineSteps?: IntentStep[]; …) => Promise<PreviewRunSummary>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewRunService.runStepsOnPreview",
+      "name": "runStepsOnPreview",
+      "service": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "line": 649,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(previewSessionId: string, steps: IntentStep[], startUrl: string, userId: string, options: { intentTestCaseId?: string; p…) => Promise<PreviewRunSummary>",
+      "emitsWs": [
+        "preview:page",
+        "preview:run:auth-reset",
+        "preview:run:completed",
+        "preview:run:started",
+        "preview:run:step",
+        "preview:run:url-mismatch"
+      ]
+    },
+    {
+      "id": "PreviewRunService.cancelRun",
+      "name": "cancelRun",
+      "service": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "line": 2916,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(previewSessionId: string, userId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewRunService.forceCancelOnSessionStop",
+      "name": "forceCancelOnSessionStop",
+      "service": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "line": 2951,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(previewSessionId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewRunService.isRunning",
+      "name": "isRunning",
+      "service": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "line": 2982,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(previewSessionId: string) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewRunService.__dangerousClearRunsForTests",
+      "name": "__dangerousClearRunsForTests",
+      "service": "PreviewRunService",
+      "layer": "run",
+      "file": "src/services/testing/ui/preview/preview-run.service.ts",
+      "line": 2992,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "() => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getInstance",
+      "name": "getInstance",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 572,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "() => PreviewSessionService",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.acquireUserLock",
+      "name": "acquireUserLock",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 583,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(userId: string) => Promise<() => void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.safeCloseBrowserResources",
+      "name": "safeCloseBrowserResources",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 615,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(browser: Browser | undefined, context: BrowserContext | undefined, page: Page | undefined) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.startSession",
+      "name": "startSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 685,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { userId: string; projectId: s…) => Promise<{ previewSessionId: string; url: strin…",
+      "emitsWs": [
+        "preview:session:progress"
+      ]
+    },
+    {
+      "id": "PreviewSessionService.resetSession",
+      "name": "resetSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 984,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ url: string; domNodes?: InteractiveN…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.refreshPage",
+      "name": "refreshPage",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1178,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string) => Promise<{ url: string; domNodes?: InteractiveN…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.goBack",
+      "name": "goBack",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1247,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string) => Promise<{ url: string; domNodes?: InteractiveN…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.goForward",
+      "name": "goForward",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1351,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string) => Promise<{ url: string; domNodes?: InteractiveN…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.stopSession",
+      "name": "stopSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1420,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string | undefined) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.stopSessionInternal",
+      "name": "stopSessionInternal",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1489,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getSession",
+      "name": "getSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1555,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string) => InternalSession | undefined",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.isSessionOwned",
+      "name": "isSessionOwned",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1567,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getAuthorizedSession",
+      "name": "getAuthorizedSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1580,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => InternalSession | undefined",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getSessionCreatedAt",
+      "name": "getSessionCreatedAt",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1609,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string) => number | null",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getSessionForUser",
+      "name": "getSessionForUser",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1617,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(userId: string) => InternalSession | undefined",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getViewportMetadata",
+      "name": "getViewportMetadata",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1630,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { width: number; height: number; devicePixelRa…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setViewport",
+      "name": "setViewport",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1653,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string, width: number, height: number) => Promise<{ success: boolean; error?: string; }>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.executeMouseAction",
+      "name": "executeMouseAction",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1706,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ success: boolean; error?: string; ne…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.executeMouseWheel",
+      "name": "executeMouseWheel",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1825,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ success: boolean; error?: string; }>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.executeKeyboardType",
+      "name": "executeKeyboardType",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1886,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ success: boolean; error?: string; }>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.executeKeyboardPress",
+      "name": "executeKeyboardPress",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1930,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ success: boolean; error?: string; }>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.probeElementAt",
+      "name": "probeElementAt",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 1994,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ element?: { tag: string; id?: string…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.probeInteractiveElementAt",
+      "name": "probeInteractiveElementAt",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2074,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { sessionId: string; userId: s…) => Promise<{ tag: string; label: string; bounding…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.computePageSignature",
+      "name": "computePageSignature",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2173,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(url: string, domNodes: InteractiveNode[]) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.captureScreenshot",
+      "name": "captureScreenshot",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2182,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<string | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getSnapshot",
+      "name": "getSnapshot",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2215,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string | undefined, options: { force?: boolean; includeScre…) => Promise<{ url: string; pageTitle?: string; dom…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getDomVersion",
+      "name": "getDomVersion",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2434,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => number | null",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getLastEmittedSignature",
+      "name": "getLastEmittedSignature",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2445,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.markEmittedSignature",
+      "name": "markEmittedSignature",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2456,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined, signature: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getContextData",
+      "name": "getContextData",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2466,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { version: number; data: Record<string, any>; …",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setContextData",
+      "name": "setContextData",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2478,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, data: Record<string, any>) => { version: number; data: Record<string, any>; …",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecording",
+      "name": "setRecording",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2498,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, recording: boolean) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingStepCount",
+      "name": "getRecordingStepCount",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2533,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.incrementRecordingStepCount",
+      "name": "incrementRecordingStepCount",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2543,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.decrementRecordingStepCount",
+      "name": "decrementRecordingStepCount",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2555,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.isRecording",
+      "name": "isRecording",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2565,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingBuffer",
+      "name": "getRecordingBuffer",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2573,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { text: string; elementRef?: string; elementLa…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingBuffer",
+      "name": "setRecordingBuffer",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2581,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, buffer: { text: string; elementRef?: s…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingFieldSession",
+      "name": "getRecordingFieldSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2591,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { elementRef: string; elementLabel: string; el…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingFieldSession",
+      "name": "setRecordingFieldSession",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2605,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, fs: { elementRef: string; elementL…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingFieldSessionStepId",
+      "name": "setRecordingFieldSessionStepId",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2620,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, stepId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastUrl",
+      "name": "getRecordingLastUrl",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2634,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => string | undefined",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastUrl",
+      "name": "setRecordingLastUrl",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2642,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, url: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingStartUrl",
+      "name": "getRecordingStartUrl",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2651,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => string | undefined",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingStartUrl",
+      "name": "setRecordingStartUrl",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2659,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, url: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingDragState",
+      "name": "getRecordingDragState",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2667,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { startX: number; startY: number; startElement…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingDragState",
+      "name": "setRecordingDragState",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2675,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, state: { startX: number; startY: numb…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastTypeStep",
+      "name": "getRecordingLastTypeStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2683,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { id: string; elementRef?: string; value: stri…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastTypeStep",
+      "name": "setRecordingLastTypeStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2691,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, step: { id: string; elementRef?: str…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastPressStep",
+      "name": "getRecordingLastPressStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2697,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { id: string; key: string; modifiersKey: strin…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastPressStep",
+      "name": "setRecordingLastPressStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2703,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, step: { id: string; key: string; mod…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastClickStep",
+      "name": "getRecordingLastClickStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2709,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { id: string; elementSignature: string; emitte…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastClickStep",
+      "name": "setRecordingLastClickStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2715,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, step: { id: string; elementSignature…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastNavigateStep",
+      "name": "getRecordingLastNavigateStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2721,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { id: string; url: string; kind: \"navigate\" | …",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastNavigateStep",
+      "name": "setRecordingLastNavigateStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2727,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, step: { id: string; url: string; kin…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.isRecordingPendingPaste",
+      "name": "isRecordingPendingPaste",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2735,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingPendingPaste",
+      "name": "setRecordingPendingPaste",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2743,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, isPaste: boolean) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastScrollStep",
+      "name": "getRecordingLastScrollStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2751,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { id: string; totalDelta: number; totalDeltaX:…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastScrollStep",
+      "name": "setRecordingLastScrollStep",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2759,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, step: { id: string; totalDelta: numb…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingLastHover",
+      "name": "getRecordingLastHover",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2767,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { x: number; y: number; ref?: string; timestam…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setRecordingLastHover",
+      "name": "setRecordingLastHover",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2775,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, state: { x: number; y: number; ref?: …) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.appendRecordingHoverChain",
+      "name": "appendRecordingHoverChain",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2789,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, entry: { x: number; y: number; timest…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getRecordingHoverChain",
+      "name": "getRecordingHoverChain",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2817,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => { x: number; y: number; timestamp: number; pro…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.clearRecordingHoverChain",
+      "name": "clearRecordingHoverChain",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2828,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.stampInterStepDelay",
+      "name": "stampInterStepDelay",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2838,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, step: { evidence?: { interStepDelayM…) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.resetRecordingStepTimestamp",
+      "name": "resetRecordingStepTimestamp",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2858,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setDialogMode",
+      "name": "setDialogMode",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2869,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, mode: \"passive\" | \"recording\" | \"rep…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.setPendingDialogAction",
+      "name": "setPendingDialogAction",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2881,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, action: { action: \"accept\" | \"dismiss\"…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.attachDialogHandler",
+      "name": "attachDialogHandler",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 2893,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(page: Page, previewSessionId: string) => void",
+      "emitsWs": [
+        "preview:dialog",
+        "preview:dialog:pending",
+        "preview:recording:step"
+      ]
+    },
+    {
+      "id": "PreviewSessionService.attachPopupHandler",
+      "name": "attachPopupHandler",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3030,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(context: BrowserContext, previewSessionId: string) => void",
+      "emitsWs": [
+        "preview:page:navigated",
+        "preview:tab:opened"
+      ]
+    },
+    {
+      "id": "PreviewSessionService.setOnPageSwitch",
+      "name": "setOnPageSwitch",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3226,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string, callback: (newPage: Page, previousUrl: s…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.switchTab",
+      "name": "switchTab",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3241,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string, tabIndex: number) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.closeTab",
+      "name": "closeTab",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3312,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, userId: string, tabIndex: number) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getTabsInfo",
+      "name": "getTabsInfo",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3358,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => import(\"./preview.types\").PreviewTabInfo[]",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.buildTabsInfo",
+      "name": "buildTabsInfo",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3367,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(session: InternalSession) => import(\"./preview.types\").PreviewTabInfo[]",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.attachTabCloseListener",
+      "name": "attachTabCloseListener",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3379,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(page: Page, previewSessionId: string) => void",
+      "emitsWs": [
+        "preview:tab:closed"
+      ]
+    },
+    {
+      "id": "PreviewSessionService.attachCrashHandler",
+      "name": "attachCrashHandler",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3432,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(page: Page, previewSessionId: string) => void",
+      "emitsWs": [
+        "preview:error"
+      ]
+    },
+    {
+      "id": "PreviewSessionService.attachFrameNavigatedTrace",
+      "name": "attachFrameNavigatedTrace",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3463,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(page: Page, previewSessionId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.attachPageDownloadHandler",
+      "name": "attachPageDownloadHandler",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3490,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(page: Page, previewSessionId: string) => void",
+      "emitsWs": [
+        "preview:download",
+        "preview:recording:step"
+      ]
+    },
+    {
+      "id": "PreviewSessionService.getPage",
+      "name": "getPage",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3558,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => Page | null",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getContext",
+      "name": "getContext",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3568,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string, userId: string | undefined) => BrowserContext | null",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.navigate",
+      "name": "navigate",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3576,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(sessionId: string, url: string, userId: string | undefined) => Promise<{ url: string; domNodes?: InteractiveN…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.cleanupExpiredSessions",
+      "name": "cleanupExpiredSessions",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3635,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "() => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.startCleanupInterval",
+      "name": "startCleanupInterval",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3661,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "() => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.shutdown",
+      "name": "shutdown",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3676,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "() => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.getSessionCount",
+      "name": "getSessionCount",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 3693,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "() => number",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewSessionService.classifyNavigationError",
+      "name": "classifyNavigationError",
+      "service": "PreviewSessionService",
+      "layer": "session",
+      "file": "src/services/testing/ui/preview/preview-session.service.ts",
+      "line": 280,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(error: Error, url: string) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.probeForRecording",
+      "name": "probeForRecording",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2083,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, x: number, y: number) => Promise<ProbedElement | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.probeInChildFrames",
+      "name": "probeInChildFrames",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2204,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, x: number, y: number) => Promise<ProbedElement | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.probeFocusedElement",
+      "name": "probeFocusedElement",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2293,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<ProbedElement | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.probeFocusedInChildFrames",
+      "name": "probeFocusedInChildFrames",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2312,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<ProbedElement | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.resolveInteractiveTarget",
+      "name": "resolveInteractiveTarget",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2373,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, probed: ProbedElement, x: number, y: number) => Promise<ProbedElement>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.reprobeAtAncestorIndex",
+      "name": "reprobeAtAncestorIndex",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2462,
+      "kind": "method",
+      "visibility": "private",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, x: number, y: number, original: ProbedElement, ancestorIndex: number) => Promise<ProbedElement>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.getProbedLabel",
+      "name": "getProbedLabel",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2571,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(element: ProbedElement | null, maxLen: number) => string | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.getElementLabel",
+      "name": "getElementLabel",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2654,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(element: ProbedElement | null) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.buildDescription",
+      "name": "buildDescription",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2663,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(actionType: IntentActionType, element: ProbedElement | null, value: string | undefined) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.buildBindingHints",
+      "name": "buildBindingHints",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2713,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(element: ProbedElement) => BindingHints",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.buildRecordedFingerprint",
+      "name": "buildRecordedFingerprint",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2808,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(element: ProbedElement) => TargetFingerprint",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.inferClickActionType",
+      "name": "inferClickActionType",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2884,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(elementBefore: ProbedElement, clickCount: number, button: \"left\" | \"right\" | \"middle\") => IntentActionType",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.capturePress",
+      "name": "capturePress",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2921,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(key: string, modifiers: string[] | undefined) => PreviewIntentStep | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.shouldFlushOnKey",
+      "name": "shouldFlushOnKey",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2946,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(key: string, modifiers: string[] | undefined, isMultiline: boolean | undefined) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.isNewlineInsertion",
+      "name": "isNewlineInsertion",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2965,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(key: string, modifiers: string[] | undefined, isMultiline: boolean | undefined) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureNavigation",
+      "name": "captureNavigation",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 2977,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(currentUrl: string, previousUrl: string) => PreviewIntentStep | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureSelectChange",
+      "name": "captureSelectChange",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3002,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(params: { label: string; selectedText:…) => PreviewIntentStep",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureDragAndDrop",
+      "name": "captureDragAndDrop",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3040,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(dragState: RecordingDragState, endX: number, endY: number, endElement: ProbedElement | null, pageUrl: string | undefined) => PreviewIntentStep | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureFileUpload",
+      "name": "captureFileUpload",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3090,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(filePaths: string[], element: ProbedElement | null, pageUrl: string | undefined) => PreviewIntentStep | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureScroll",
+      "name": "captureScroll",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3135,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(accumulatedDeltaY: number, pageUrl: string | undefined, accumulatedDeltaX: number | undefined, scrollTargetHints: BindingHints | undefined, containerSelector: string | null | undefined) => PreviewIntentStep | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.probeScrollTarget",
+      "name": "probeScrollTarget",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3181,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<BindingHints | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.detectScrollContainer",
+      "name": "detectScrollContainer",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3250,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, x: number, y: number) => Promise<string | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureHover",
+      "name": "captureHover",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3305,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(element: ProbedElement, pageUrl: string | undefined) => PreviewIntentStep",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureDialog",
+      "name": "captureDialog",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3333,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(params: { dialogType: \"alert\" | \"confi…) => PreviewIntentStep",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.captureDownload",
+      "name": "captureDownload",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3372,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(params: { filename: string; url?: stri…) => PreviewIntentStep",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.flushTypingBuffer",
+      "name": "flushTypingBuffer",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3408,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(buffer: RecordingTypingBuffer | null, triggeredByEnter: boolean) => PreviewIntentStep | null",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.injectSelectChangeListener",
+      "name": "injectSelectChangeListener",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3452,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, callbackName: string) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.removeSelectChangeListener",
+      "name": "removeSelectChangeListener",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3506,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.injectAutofillListener",
+      "name": "injectAutofillListener",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3536,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page, callbackName: string) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "RecordingCaptureService.removeAutofillListener",
+      "name": "removeAutofillListener",
+      "service": "RecordingCaptureService",
+      "layer": "recording",
+      "file": "src/services/testing/ui/preview/recording-capture.service.ts",
+      "line": 3631,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<void>",
+      "emitsWs": []
+    }
+  ],
+  "edges": [
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 14
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.executeAction",
+      "count": 4
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.resolveScreenshot",
+      "count": 3
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.rescueWithGeminiFlash",
+      "count": 3
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "IntentStepLintService.generateClarificationQuestion",
+      "count": 2
+    },
+    {
+      "from": "ElementResolver.buildSceneSummary",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 2
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.buildCandidateText",
+      "count": 2
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.selectElementWithLLM",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.buildBindingHintsFromNode",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.captureClickPreState",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.verifyClickHadEffect",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.buildSyntheticFingerprintFromNode",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.detectModalBlockingFromSession",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.dismissParasiticOverlay",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.uploadViaFileChooserOrDrop",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.safeCloseBrowserResources",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.goBack",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 2
+    },
+    {
+      "from": "RecordingCaptureService.probeForRecording",
+      "to": "RecordingCaptureService.probeInChildFrames",
+      "count": 2
+    },
+    {
+      "from": "RecordingCaptureService.resolveInteractiveTarget",
+      "to": "RecordingCaptureService.reprobeAtAncestorIndex",
+      "count": 2
+    },
+    {
+      "from": "RecordingCaptureService.captureDragAndDrop",
+      "to": "RecordingCaptureService.getElementLabel",
+      "count": 2
+    },
+    {
+      "from": "DomAnalysisExtractorService.extract",
+      "to": "DomAnalysisExtractorService.createDomAnalysis",
+      "count": 1
+    },
+    {
+      "from": "DomAnalysisExtractorService.extractNodes",
+      "to": "DomAnalysisExtractorService.extractInteractiveNodes",
+      "count": 1
+    },
+    {
+      "from": "DomAnalysisExtractorService.createDomAnalysis",
+      "to": "DomAnalysisExtractorService.extractInteractiveNodes",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.lintStep",
+      "to": "IntentStepLintService._lintStepInner",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.isEvidenceShortcutNodeCompatible",
+      "to": "IntentStepLintService.isEvidenceShortcutNodeCompatible",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.lintStepWithAI",
+      "to": "IntentStepLintService._lintStepWithAIImpl",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "IntentStepLintService.isEvidenceShortcutNodeCompatible",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "IntentStepLintService.lintStepWithRuleBasedFallback",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.lintStepWithRuleBasedFallback",
+      "to": "IntentStepLintService.lintStep",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.lintStepWithRuleBasedFallback",
+      "to": "IntentStepLintService.generateClarificationQuestion",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.selectElementWithLLM",
+      "to": "ElementResolver.buildSceneSummary",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.selectElementWithLLM",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.sanitizeIntent",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "ElementResolver.buildAllowedSets",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.waitForPageSettled",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.executeWaitFor",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.shouldUpgradeCompiledPlan",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.verifyModalActuallyBlocks",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.detectOverlayBlockingCandidate",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.verifyActionEffect",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewStepApplyService.compareToRecordedFingerprint",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.detectOverlayBlockingCandidate",
+      "to": "PreviewStepApplyService.verifyModalActuallyBlocks",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeWaitFor",
+      "to": "PreviewStepApplyService.waitForPageSettled",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeWaitFor",
+      "to": "PreviewStepApplyService.globToRegexPatternForWaitFor",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.uploadViaFileChooserOrDrop",
+      "to": "PreviewStepApplyService.dispatchFileDrop",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.normalizeTypeActionValue",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.selectFromCustomDropdown",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.classifyNavigationError",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runSavedSteps",
+      "to": "PreviewRunService.runStepsOnPreview",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.acquireUserLock",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.stopSessionInternal",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.computePageSignature",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.attachDialogHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.attachPopupHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.attachTabCloseListener",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.attachCrashHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.attachFrameNavigatedTrace",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.attachPageDownloadHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "PreviewSessionService.safeCloseBrowserResources",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.acquireUserLock",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.attachDialogHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.attachPopupHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.attachCrashHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.attachFrameNavigatedTrace",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.attachPageDownloadHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.attachTabCloseListener",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.refreshPage",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.refreshPage",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.goBack",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.goBack",
+      "to": "PreviewSessionService.goBack",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.goBack",
+      "to": "PreviewSessionService.closeTab",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.goForward",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.goForward",
+      "to": "PreviewSessionService.goForward",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.goForward",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stopSession",
+      "to": "PreviewSessionService.acquireUserLock",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stopSession",
+      "to": "PreviewSessionService.safeCloseBrowserResources",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stopSessionInternal",
+      "to": "PreviewSessionService.safeCloseBrowserResources",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSessionCreatedAt",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSessionForUser",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getViewportMetadata",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setViewport",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.executeMouseAction",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.executeMouseWheel",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.executeKeyboardType",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.executeKeyboardPress",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.probeElementAt",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.probeInteractiveElementAt",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.probeInteractiveElementAt",
+      "to": "PreviewSessionService.appendRecordingHoverChain",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "PreviewSessionService.computePageSignature",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "PreviewSessionService.captureScreenshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getDomVersion",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getLastEmittedSignature",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.markEmittedSignature",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getContextData",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setContextData",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecording",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingStepCount",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.incrementRecordingStepCount",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.decrementRecordingStepCount",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.isRecording",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingBuffer",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingBuffer",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingFieldSession",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingFieldSession",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingFieldSessionStepId",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastUrl",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastUrl",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingStartUrl",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingStartUrl",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingDragState",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingDragState",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastTypeStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastTypeStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastPressStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastPressStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastClickStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastClickStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastNavigateStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastNavigateStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.isRecordingPendingPaste",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingPendingPaste",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastScrollStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastScrollStep",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingLastHover",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setRecordingLastHover",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.appendRecordingHoverChain",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getRecordingHoverChain",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.clearRecordingHoverChain",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stampInterStepDelay",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetRecordingStepTimestamp",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setDialogMode",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setPendingDialogAction",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "PreviewSessionService.attachDialogHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "PreviewSessionService.attachCrashHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "PreviewSessionService.attachFrameNavigatedTrace",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "PreviewSessionService.attachPageDownloadHandler",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "PreviewSessionService.attachTabCloseListener",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "PreviewSessionService.buildTabsInfo",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.setOnPageSwitch",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.switchTab",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.closeTab",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getTabsInfo",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getTabsInfo",
+      "to": "PreviewSessionService.buildTabsInfo",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachTabCloseListener",
+      "to": "PreviewSessionService.buildTabsInfo",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachCrashHandler",
+      "to": "PreviewSessionService.stopSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getPage",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getContext",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.navigate",
+      "to": "PreviewSessionService.getAuthorizedSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.navigate",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.cleanupExpiredSessions",
+      "to": "PreviewSessionService.stopSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startCleanupInterval",
+      "to": "PreviewSessionService.cleanupExpiredSessions",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.shutdown",
+      "to": "PreviewSessionService.stopSession",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.probeFocusedElement",
+      "to": "RecordingCaptureService.probeFocusedInChildFrames",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.getElementLabel",
+      "to": "RecordingCaptureService.getProbedLabel",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.buildDescription",
+      "to": "RecordingCaptureService.getProbedLabel",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureSelectChange",
+      "to": "RecordingCaptureService.buildDescription",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureDragAndDrop",
+      "to": "RecordingCaptureService.buildBindingHints",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureFileUpload",
+      "to": "RecordingCaptureService.buildDescription",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureFileUpload",
+      "to": "RecordingCaptureService.buildBindingHints",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureHover",
+      "to": "RecordingCaptureService.getElementLabel",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureHover",
+      "to": "RecordingCaptureService.buildRecordedFingerprint",
+      "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.captureHover",
+      "to": "RecordingCaptureService.buildBindingHints",
+      "count": 1
+    }
+  ],
+  "externalEdges": [
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.getSession",
+      "count": 16
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.getPage",
+      "count": 4
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 4
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "LocatorPlanBuilder.buildCompiledPlan",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "ElementResolver.invalidateLlmSelectionsForRef",
+      "count": 3
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "PreviewSessionService.getSession",
+      "count": 3
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "PreviewSessionService.setDialogMode",
+      "count": 3
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "PreviewStepApplyService.applyStep",
+      "count": 3
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "ElementResolver.resolveElement",
+      "count": 2
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "ElementResolver.sanitizeIntent",
+      "count": 2
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "PreviewSessionService.computePageSignature",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.switchTab",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 2
+    },
+    {
+      "from": "IntentStepLintService._lintStepInner",
+      "to": "ElementResolver.sanitizeIntent",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepInner",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepInner",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "PreviewSessionService.getSessionCreatedAt",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.lintStepWithRuleBasedFallback",
+      "to": "ElementResolver.sanitizeIntent",
+      "count": 1
+    },
+    {
+      "from": "IntentStepLintService.generateClarificationQuestion",
+      "to": "ElementResolver.getEffectiveLabel",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "ElementResolver.sanitizeIntent",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.setContextData",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "PreviewSessionService.setPendingDialogAction",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "IntentStepLintService.lintStepWithAI",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.detectModalBlockingFromSession",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.detectOverlayBlockingCandidate",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runSavedSteps",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runSavedSteps",
+      "to": "PreviewSessionService.getRecordingStartUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "PreviewSessionService.setContextData",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.cancelRun",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "SnapshotCollector.collect",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "DomAnalysisExtractorService.extract",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stopSession",
+      "to": "PreviewRunService.forceCancelOnSessionStop",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.probeInteractiveElementAt",
+      "to": "RecordingCaptureService.probeForRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.probeInteractiveElementAt",
+      "to": "RecordingCaptureService.getProbedLabel",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "SnapshotCollector.collect",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "DomAnalysisExtractorService.extract",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachDialogHandler",
+      "to": "RecordingCaptureService.captureDialog",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPageDownloadHandler",
+      "to": "RecordingCaptureService.captureDownload",
+      "count": 1
+    }
+  ],
+  "unresolved": [],
+  "stats": {
+    "files": 9,
+    "services": 9,
+    "methods": 171,
+    "edges": 210,
+    "unresolved": 0
+  }
+}

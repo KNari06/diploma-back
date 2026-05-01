@@ -24,6 +24,15 @@ export interface LiteElement {
   ref: string;
   role: string;
   name: string;
+  /**
+   * V26: First non-empty text fragment from a single DOM child (not the
+   * concatenated full innerText). Set when extraction logic finds a Text
+   * leaf or short element child whose text is meaningfully different from
+   * the full `name`. Used by the preview-side locator-plan-builder to
+   * generate title-only `getByText(...)` locators for Angular/Vue card
+   * patterns where title and description live in separate children.
+   */
+  firstTextFragment?: string;
   tag: string;
   type?: string;
   value?: string;

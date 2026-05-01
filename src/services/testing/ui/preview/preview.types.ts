@@ -34,6 +34,25 @@ export interface InteractiveNode {
   inputType?: string;
   /** Text content (truncated) */
   text?: string;
+  /**
+   * V26: First non-empty text fragment as it actually appears in the DOM —
+   * not the concatenated full innerText. Used to handle Angular Material /
+   * Vue scoped / Web Component patterns where a card's title and
+   * description live in DIFFERENT child elements:
+   *
+   *   <a><app-title>МАТ-SMART</app-title><span>Бекнұр • Курс аяқталды</span></a>
+   *
+   * `text` would be the joined "МАТ-SMART Бекнұр • Курс аяқталды" — which
+   * `getByText(...)` cannot match because the DOM has no single text node
+   * with that string. `firstTextFragment` is "МАТ-SMART" alone, which IS a
+   * single-text-node match.
+   *
+   * Set ONLY when it differs from `text` (otherwise the locator builder
+   * would generate a redundant strategy). Symmetric: recorder and
+   * collector use the same extraction logic, so recorded fingerprints and
+   * live snapshots agree byte-for-byte.
+   */
+  firstTextFragment?: string;
   /** Associated label text (from <label for=>, wrapping <label>, aria-labelledby) */
   labelText?: string;
   /** ARIA label */
@@ -631,6 +650,15 @@ export interface TargetFingerprint {
   alt?: string;
   /** V22: visible text content (when distinct from labelText) */
   text?: string;
+  /**
+   * V26: First non-empty DOM-unit text fragment (single Text node OR
+   * single descendant element with leaf text). Symmetric with
+   * InteractiveNode.firstTextFragment. Stored ONLY when it differs from
+   * `text` -- otherwise locator-plan-builder would emit redundant text
+   * strategies. Powers title-only getByText() locators on Angular/Vue
+   * card patterns where title and description live in separate children.
+   */
+  firstTextFragment?: string;
   /** V22: stable DOM id, framework-generated ids already stripped at probe time */
   elementId?: string;
   /** V22: First 1-3 stable className tokens (utility classes stripped) */

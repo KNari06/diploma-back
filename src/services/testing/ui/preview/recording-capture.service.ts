@@ -38,6 +38,12 @@ export interface ProbedElement {
   role?: string;
   type?: string;
   text?: string;
+  /**
+   * V26: First text fragment as a single DOM unit. See
+   * `InteractiveNode.firstTextFragment` for the rationale — Angular Material
+   * card pattern et al. Symmetric with snapshot-collector's extractor.
+   */
+  firstTextFragment?: string;
   ariaLabel?: string;
   labelText?: string;
   placeholder?: string;
@@ -487,6 +493,54 @@ const PROBE_AT_POINT_FN = `
       .replace(INVISIBLE_CHARS_RE_PROBE, '')
       .replace(/\\s+/g, ' ')
       .trim();
+  }
+
+  // V26: First-text-fragment extractor — symmetric with snapshot-collector.
+  // Finds the FIRST single DOM unit (text node OR child element with leaf
+  // text) so the recorded fingerprint can store it for the locator builder
+  // to emit getByText(titleOnly) strategies on Angular Material / Vue
+  // card patterns where the title and description live in DIFFERENT
+  // children. Implementation MUST stay byte-equivalent to the collector
+  // version in src/agent/core/lite/collectors/snapshot-collector.ts --
+  // without symmetry, recorded fingerprints and live snapshots disagree.
+  function extractFirstTextFragment(node) {
+    try {
+      var TEXT_NODE = 3, ELEMENT_NODE = 1, MAX_LEN = 80;
+      var DECORATIVE = { img: 1, svg: 1, i: 1, picture: 1, use: 1, path: 1, br: 1, hr: 1 };
+      // 1) Direct text child
+      for (var ci = 0; ci < node.childNodes.length; ci++) {
+        var ch = node.childNodes[ci];
+        if (ch.nodeType === TEXT_NODE) {
+          var t = (ch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+          if (t.length >= 2 && t.length <= MAX_LEN) return t;
+        }
+      }
+      // 2) Element children DFS, skip decorative leaves
+      var stack = [];
+      for (var ci2 = node.childNodes.length - 1; ci2 >= 0; ci2--) {
+        var ch2 = node.childNodes[ci2];
+        if (ch2.nodeType === ELEMENT_NODE) stack.push(ch2);
+      }
+      var visited = 0;
+      while (stack.length > 0 && visited < 30) {
+        visited++;
+        var cur = stack.pop();
+        var tagLc = (cur.tagName || '').toLowerCase();
+        if (DECORATIVE[tagLc]) continue;
+        for (var cci = 0; cci < cur.childNodes.length; cci++) {
+          var cch = cur.childNodes[cci];
+          if (cch.nodeType === TEXT_NODE) {
+            var tt = (cch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+            if (tt.length >= 2 && tt.length <= MAX_LEN) return tt;
+          }
+        }
+        for (var cci2 = cur.childNodes.length - 1; cci2 >= 0; cci2--) {
+          var cch2 = cur.childNodes[cci2];
+          if (cch2.nodeType === ELEMENT_NODE) stack.push(cch2);
+        }
+      }
+    } catch (e) { /* best-effort */ }
+    return undefined;
   }
 
   // ── Pass 1: Collect ancestor chain (up to 12 ancestors) ──────────────
@@ -1782,6 +1836,19 @@ const PROBE_AT_POINT_FN = `
     // V22 Pkg7+: normalize so re-renders with NFD-encoded characters or
     // copied-text zero-width contamination still produce equal fingerprints.
     text: ((normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80) || undefined),
+    // V26: First text fragment as a single DOM unit. Stored ONLY when it
+    // differs from text -- otherwise builder would generate a redundant
+    // locator. See extractFirstTextFragment for symmetry-with-collector.
+    firstTextFragment: (function() {
+      var raw = extractFirstTextFragment(target);
+      if (!raw) return undefined;
+      var normed = normProbeText(raw);
+      if (!normed || normed.length < 2) return undefined;
+      var fullText = (normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80);
+      if (normed === fullText) return undefined;
+      if (fullText && normed === fullText.slice(0, normed.length)) return undefined;
+      return normed.slice(0, 80);
+    })(),
     ariaLabel: normProbeText(target.getAttribute('aria-label')) || undefined,
     labelText: labelText,
     placeholder: normProbeText(target.getAttribute('placeholder')) || undefined,
@@ -1863,6 +1930,48 @@ const PROBE_FOCUSED_FN = `
       .trim();
   }
 
+  // V26: First-text-fragment extractor — symmetric copy of the
+  // PROBE_AT_POINT_FN version above. See snapshot-collector for the
+  // canonical implementation; this one mirrors it byte-for-byte so
+  // recorded fingerprints (point + focus) and live snapshots all agree.
+  function extractFirstTextFragment(node) {
+    try {
+      var TEXT_NODE = 3, ELEMENT_NODE = 1, MAX_LEN = 80;
+      var DECORATIVE = { img: 1, svg: 1, i: 1, picture: 1, use: 1, path: 1, br: 1, hr: 1 };
+      for (var ci = 0; ci < node.childNodes.length; ci++) {
+        var ch = node.childNodes[ci];
+        if (ch.nodeType === TEXT_NODE) {
+          var t = (ch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+          if (t.length >= 2 && t.length <= MAX_LEN) return t;
+        }
+      }
+      var stack = [];
+      for (var ci2 = node.childNodes.length - 1; ci2 >= 0; ci2--) {
+        var ch2 = node.childNodes[ci2];
+        if (ch2.nodeType === ELEMENT_NODE) stack.push(ch2);
+      }
+      var visited = 0;
+      while (stack.length > 0 && visited < 30) {
+        visited++;
+        var cur = stack.pop();
+        var tagLc = (cur.tagName || '').toLowerCase();
+        if (DECORATIVE[tagLc]) continue;
+        for (var cci = 0; cci < cur.childNodes.length; cci++) {
+          var cch = cur.childNodes[cci];
+          if (cch.nodeType === TEXT_NODE) {
+            var tt = (cch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+            if (tt.length >= 2 && tt.length <= MAX_LEN) return tt;
+          }
+        }
+        for (var cci2 = cur.childNodes.length - 1; cci2 >= 0; cci2--) {
+          var cch2 = cur.childNodes[cci2];
+          if (cch2.nodeType === ELEMENT_NODE) stack.push(cch2);
+        }
+      }
+    } catch (e) { /* best-effort */ }
+    return undefined;
+  }
+
   var target = el;
   var tag = target.tagName.toLowerCase();
   var labelText = undefined;
@@ -1919,6 +2028,18 @@ const PROBE_FOCUSED_FN = `
     // display:none children that would otherwise leak into hints.text.
     // V22 Pkg7+: normProbeText normalizes for fingerprint stability.
     text: ((normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80) || undefined),
+    // V26: First text fragment as a single DOM unit. See PROBE_AT_POINT_FN
+    // for rationale; same predicate (only set when it differs from full text).
+    firstTextFragment: (function() {
+      var raw = extractFirstTextFragment(target);
+      if (!raw) return undefined;
+      var normed = normProbeText(raw);
+      if (!normed || normed.length < 2) return undefined;
+      var fullText = (normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80);
+      if (normed === fullText) return undefined;
+      if (fullText && normed === fullText.slice(0, normed.length)) return undefined;
+      return normed.slice(0, 80);
+    })(),
     ariaLabel: normProbeText(target.getAttribute('aria-label')) || undefined,
     labelText: labelText,
     placeholder: normProbeText(target.getAttribute('placeholder')) || undefined,
@@ -2701,6 +2822,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.title) fp.title = element.title;
     if (element.alt) fp.alt = element.alt;
     if (element.text) fp.text = element.text;
+    // V26: first DOM-unit text fragment — locator builder uses this to
+    // emit `getByText(titleOnly)` strategies that actually match Angular
+    // Material / Vue card patterns where text is split across children.
+    if (element.firstTextFragment) fp.firstTextFragment = element.firstTextFragment;
     if (element.elementId) fp.elementId = element.elementId;
     if (element.cssClass) fp.cssClass = element.cssClass;
     if (element.ariaControls) fp.ariaControls = element.ariaControls;
