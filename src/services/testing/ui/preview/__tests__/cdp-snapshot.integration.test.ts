@@ -238,12 +238,9 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       const snapshot = await CdpSnapshotService.collect(page);
       expect(snapshot.activeModalRef).toBeDefined();
 
-      const insideButton = snapshot.elements.find(
-        (e) => e.firstTextFragment === 'Inside modal' || e.name === 'Inside modal',
-      );
-      const outsideButton = snapshot.elements.find(
-        (e) => e.firstTextFragment === 'Outside' || e.name === 'Outside',
-      );
+      // Find by id (more stable than text):
+      const insideButton = snapshot.elements.find((e) => e.htmlId === 'inside');
+      const outsideButton = snapshot.elements.find((e) => e.htmlId === 'outside');
 
       expect(insideButton).toBeDefined();
       expect(outsideButton).toBeDefined();

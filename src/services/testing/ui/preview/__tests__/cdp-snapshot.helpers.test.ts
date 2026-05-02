@@ -154,17 +154,24 @@ describe('decodeBoundsForLayoutIdx', () => {
 
 describe('isInteractiveNode', () => {
   // Tier-1 native interactive tags
-  it('keeps native button/a/input/select/textarea/label/summary/details/option', () => {
+  it('keeps native interactive tags + summary structural tag', () => {
+    // After May 2026 symmetry fix: <label> and <details> dropped
+    // from INTERACTIVE_TAGS (evaluate-path doesn't treat them as
+    // interactive — they're structural). <summary> kept because
+    // evaluate-path includes it in its selector list.
     const noAttrs = new Map<string, string>();
     expect(isInteractiveNode('button', noAttrs, undefined)).toBe(true);
     expect(isInteractiveNode('a', noAttrs, undefined)).toBe(true);
     expect(isInteractiveNode('input', noAttrs, undefined)).toBe(true);
     expect(isInteractiveNode('select', noAttrs, undefined)).toBe(true);
     expect(isInteractiveNode('textarea', noAttrs, undefined)).toBe(true);
-    expect(isInteractiveNode('label', noAttrs, undefined)).toBe(true);
-    expect(isInteractiveNode('summary', noAttrs, undefined)).toBe(true);
-    expect(isInteractiveNode('details', noAttrs, undefined)).toBe(true);
     expect(isInteractiveNode('option', noAttrs, undefined)).toBe(true);
+    expect(isInteractiveNode('summary', noAttrs, undefined)).toBe(true);
+    // <label> and <details> excluded — they were causing CDP to
+    // return ~2 extra elements per form vs evaluate (false positives
+    // the LLM resolver could never pick correctly anyway).
+    expect(isInteractiveNode('label', noAttrs, undefined)).toBe(false);
+    expect(isInteractiveNode('details', noAttrs, undefined)).toBe(false);
   });
 
   // Tier-1 interactive ARIA roles on non-native tags

@@ -284,9 +284,16 @@ function decodeBoundsForLayoutIdx(
  * Tags considered structurally interactive without further checks.
  * Mirrors the Tier-1 selector set the SnapshotCollector emits today.
  */
+// Mirrors evaluate-path's `interactiveSelectors` core list. NOTE:
+// `label` deliberately excluded — evaluate-path doesn't treat <label>
+// as interactive (the input it labels is what users click). Including
+// it in CDP made shadow-mode show CDP returning 2 extra elements
+// per form (one per <label>), all of which the resolver would never
+// pick. `summary`/`details` likewise dropped — evaluate handles them
+// via separate `summary` selector entry below in tier-1 supplements.
 const INTERACTIVE_TAGS = new Set([
-  'button', 'a', 'input', 'select', 'textarea', 'label',
-  'summary', 'details', 'option',
+  'button', 'a', 'input', 'select', 'textarea',
+  'option',
 ]);
 
 /**
@@ -317,20 +324,102 @@ const INTERACTIVE_ROLES = new Set([
  * Tier-1 interactive node check — strong, deterministic signals that
  * an element is a known interactive control. No cap; every Tier-1 hit
  * is included.
+ *
+ * MUST stay symmetric with the evaluate-path's `interactiveSelectors`
+ * array in snapshot-collector.ts (~line 763). When evaluate adds a new
+ * selector and we don't, CDP path silently skips that element class —
+ * happens silently because the shadow-mode diff lists it under
+ * `onlyInEvaluate`.
  */
 function isInteractiveNodeTier1(
   tagName: string,
   attrs: DecodedAttrs,
 ): boolean {
+  // Native interactive HTML elements
   if (INTERACTIVE_TAGS.has(tagName)) return true;
+
+  // Semantic structural tags evaluate-path includes
+  if (tagName === 'li' || tagName === 'canvas') return true;
+  if (tagName === 'h1' || tagName === 'h2' || tagName === 'h3') return true;
+  if (tagName === 'summary') return true;
+
+  // ARIA widget roles
   const role = attrs.get('role')?.toLowerCase();
   if (role && INTERACTIVE_ROLES.has(role)) return true;
+  // Additional roles from evaluate-path's interactiveSelectors
+  if (role === 'menuitemcheckbox' || role === 'menuitemradio'
+      || role === 'alertdialog' || role === 'toolbar') {
+    return true;
+  }
+
+  // tabindex >= 0 (focusable via keyboard)
   const tabindex = attrs.get('tabindex');
   if (tabindex !== undefined && tabindex !== '-1') {
     const n = parseInt(tabindex, 10);
     if (!isNaN(n) && n >= 0) return true;
   }
+
+  // Attribute-based interactive signals (no role / no native tag,
+  // but framework-bound or test-targeted).
+  if (attrs.has('onclick')) return true;
+  if (attrs.has('data-testid') || attrs.has('data-test') || attrs.has('data-test-id')
+      || attrs.has('data-cy') || attrs.has('data-qa')) return true;
+  if (attrs.has('data-toggle') || attrs.has('aria-haspopup')) return true;
+  if (attrs.get('draggable') === 'true') return true;
+  if (attrs.has('contenteditable')) {
+    const v = attrs.get('contenteditable');
+    if (v === 'true' || v === '') return true;
+  }
+
+  // Native <dialog open>
+  if (tagName === 'dialog' && attrs.has('open')) return true;
+
+  // Framework-specific event attribute markers
+  // (Alpine.js x-on:click, HTMX hx-*, Stimulus data-action,
+  //  Knockout data-bind, Qwik on:click)
+  if (attrs.has('x-on:click') || attrs.has('on:click')) return true;
+  if (attrs.has('hx-get') || attrs.has('hx-post') || attrs.has('hx-put')
+      || attrs.has('hx-delete') || attrs.has('hx-patch')) return true;
+  if (attrs.has('data-hx-get') || attrs.has('data-hx-post')) return true;
+  if (attrs.has('data-action') || attrs.has('data-bind')) return true;
+
   return false;
+}
+
+/**
+ * Icon-ish secondary pass check — element is an SVG/i/img/path with
+ * a stable id or testid, even though it has no interactive role.
+ * Mirrors evaluate-path's secondary pass at snapshot-collector.ts
+ * ~line 1126. Critical for icon-only buttons / branded logos that
+ * don't have role=button but DO have stable id (e.g. `<img id="logo">`).
+ *
+ * Without this, recorder records `<img id="logo">` with id, recorder
+ * resolver tries identity fast-path on id="logo", but CDP snapshot
+ * doesn't include the img → no match → fallback to LLM → wrong CTA.
+ */
+function isInteractiveIconish(
+  tagName: string,
+  attrs: DecodedAttrs,
+): boolean {
+  if (tagName !== 'svg' && tagName !== 'i' && tagName !== 'img' && tagName !== 'path') {
+    return false;
+  }
+  const rawId = attrs.get('id') || '';
+  const idLooksGenerated = !!rawId && (
+    /^el-id-/i.test(rawId)
+    || /^radix-/.test(rawId)
+    || /^:r[0-9a-z]+:$/i.test(rawId)
+    || /^mui-/i.test(rawId)
+    || /^headlessui-/i.test(rawId)
+    || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(rawId)
+  );
+  const hasStableId = !!rawId && !idLooksGenerated && rawId.length < 80;
+  const hasTestIdAttr = attrs.has('data-testid')
+    || attrs.has('data-test-id')
+    || attrs.has('data-test')
+    || attrs.has('data-cy')
+    || attrs.has('data-qa');
+  return hasStableId || hasTestIdAttr;
 }
 
 /**
@@ -1199,10 +1288,9 @@ export class CdpSnapshotService {
         }));
       }
 
-      // Pass 2: tier-2 (cursor:pointer), capped. We re-scan the same
-      // node array — small overhead vs the floods we prevent. Skip
-      // anything already pushed in Pass 1 by checking nodes we've
-      // seen via `__dsNodeIndex` set.
+      // Build set of indexes added by Pass 1 so subsequent passes
+      // can skip them. We re-scan the node array in Pass 1.5 / Pass 2
+      // — small overhead vs. the duplication we'd cause otherwise.
       const tier1Indexes = new Set<number>();
       for (const el of elements) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1212,6 +1300,48 @@ export class CdpSnapshotService {
         }
       }
 
+      // Pass 1.5: icon-ish elements with stable id / testid.
+      // <svg id="...">, <i id="..." class="icon">, <img id="logo">,
+      // <path data-testid="...">. Mirrors evaluate-path's secondary
+      // pass (snapshot-collector.ts ~line 1126). UNCAPPED — these
+      // are explicitly-named UI elements, not decorative noise; the
+      // stable-id requirement is the cap. Without this pass:
+      //   - logo images miss from snapshot → recorder records
+      //     `<img id="logo">`, identity fast-path fires on id, no
+      //     match in CDP path → resolver falls through to LLM →
+      //     wrong CTA picked.
+      //   - icon-only toolbar buttons (Element Plus, Material) miss
+      //     when their <i id="..."> child carries the stable id.
+      for (let i = 0; i < nodeCount; i++) {
+        if (elements.length >= MAX_TOTAL_ELEMENTS) break;
+        if (tier1Indexes.has(i)) continue;
+
+        const tagName = getStr(nodes.nodeName?.[i]).toLowerCase();
+        if (!tagName || tagName.startsWith('#')) continue;
+        const attrs = decodeAttributes(nodes.attributes?.[i], getStr);
+        if (!isInteractiveIconish(tagName, attrs)) continue;
+
+        const layoutIdx = layoutByNodeIdx.get(i);
+        const bounds = layoutIdx !== undefined ? decodeBoundsForLayoutIdx(layout, layoutIdx) : undefined;
+        if (!bounds) continue;
+        // Min-size gate matches evaluate-path (5×5) — filters out
+        // 0-size hidden icon placeholders without dropping typical
+        // 16-32px button glyphs.
+        if (bounds.width < 5 || bounds.height < 5) continue;
+        const styles = layoutIdx !== undefined ? decodeStylesForLayoutIdx(layout, layoutIdx, getStr) : undefined;
+
+        const backendId = nodes.backendNodeId?.[i];
+        const axNode = typeof backendId === 'number' ? axByBackendId.get(backendId) : undefined;
+
+        elements.push(buildLiteElementFromNode({
+          tagName, attrs, bounds, styles, axNode,
+          dsNodeIndex: i, docIndex: docIdx,
+        }));
+        tier1Indexes.add(i);
+      }
+
+      // Pass 2: tier-2 (cursor:pointer), capped at MAX_TIER2_ELEMENTS
+      // to prevent pages with global cursor:pointer CSS from flooding.
       for (let i = 0; i < nodeCount; i++) {
         if (tier2Added >= MAX_TIER2_ELEMENTS) break;
         if (elements.length >= MAX_TOTAL_ELEMENTS) break;
@@ -1875,6 +2005,15 @@ export class CdpSnapshotService {
       let landmark: string | undefined;
       let shadowDepth = 0;
       let isInsideShadow = false;
+      // `context` mirrors evaluate-path's getParentContext: first
+      // semantic-container ancestor + its title. Used by
+      // hybrid-semantic-weight (LLM scoring), goal-detector,
+      // funnel-analyzer. Without it, CDP path's element scoring on
+      // dense pages diverges from evaluate-path's, which manifests
+      // as "lint picks the wrong candidate" on auth-form-class pages.
+      let parentContext: string | undefined;
+      let contextParentTag: string | undefined;
+      let contextParentTitle: string | undefined;
 
       let cur = parentIndex[dsIdx];
       let depth = 0;
@@ -1915,8 +2054,66 @@ export class CdpSnapshotService {
           shadowDepth++;
         }
 
+        // `context` derivation — first matching semantic container.
+        // Mirrors evaluate-path's `getParentContext` closest() set.
+        // First-match-wins (closest ancestor) — once set, don't
+        // overwrite on outer ancestors.
+        if (parentContext === undefined && contextParentTag === undefined) {
+          const cls = getAttr(cur, 'class') || '';
+          const ariaLabel = getAttr(cur, 'aria-label') || '';
+          const dataTitle = getAttr(cur, 'data-title') || '';
+          const dataProduct = getAttr(cur, 'data-product');
+          const dataItem = getAttr(cur, 'data-item');
+          const dataContainer = getAttr(cur, 'data-container');
+
+          let parentType: string | undefined;
+          if (
+            dataProduct !== undefined || dataItem !== undefined
+            || /\b(card|product|item)\b/.test(cls)
+          ) {
+            parentType = 'Card';
+          } else if (tag === 'article' || role === 'article') {
+            parentType = 'Article';
+          } else if (tag === 'form') {
+            parentType = 'Form';
+          } else if (role === 'dialog' || role === 'alertdialog' || /\bmodal\b/.test(cls)) {
+            parentType = 'Modal';
+          } else if (tag === 'section' || role === 'listitem') {
+            parentType = 'Section';
+          } else if (tag === 'header') {
+            parentType = 'Header';
+          } else if (tag === 'footer') {
+            parentType = 'Footer';
+          } else if (tag === 'nav') {
+            parentType = 'Navigation';
+          } else if (tag === 'aside') {
+            parentType = 'Aside';
+          } else if (dataContainer !== undefined) {
+            parentType = 'Container';
+          }
+
+          if (parentType) {
+            contextParentTag = parentType;
+            // Title preference: heading text (collected separately above
+            // — but only at MAX depth), aria-label, data-title.
+            // textByParent already has heading text for this index.
+            const headingText = (textByParent.get(cur) || '').trim();
+            const titleSrc = headingText || ariaLabel || dataTitle;
+            if (titleSrc) {
+              contextParentTitle = titleSrc.slice(0, 50);
+            }
+          }
+        }
+
         cur = parentIndex[cur];
         depth++;
+      }
+
+      // Compose `context` string identical to evaluate-path format.
+      if (contextParentTag) {
+        parentContext = contextParentTitle
+          ? `inside: ${contextParentTag} "${contextParentTitle}"`
+          : `inside: ${contextParentTag}`;
       }
 
       if (chain.length > 0) el.parentRefChain = chain;
@@ -1929,10 +2126,15 @@ export class CdpSnapshotService {
         // but LiteElement doesn't — preserve current shape.)
         void landmark;
       }
-      if (isInsideShadow) {
-        el.isInsideShadowDOM = true;
-        el.shadowDepth = shadowDepth;
-      }
+      // Shape parity with evaluate-path: ALWAYS set shadowDepth (0 if
+      // not in shadow), ALWAYS set isInsideShadowDOM (false if not in
+      // shadow). Without explicit defaults, diffSnapshots saw
+      // `undefined !== false` / `undefined !== 0` and reported every
+      // matched element as divergent. Real-Chromium symmetry test
+      // (cdp-evaluate-symmetry.integration) caught this on auth form.
+      el.isInsideShadowDOM = isInsideShadow;
+      el.shadowDepth = shadowDepth;
+      if (parentContext) el.context = parentContext;
     }
   }
 

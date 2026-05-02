@@ -441,13 +441,20 @@ describe('CdpSnapshotService.collect', () => {
       });
 
       const snapshot = await CdpSnapshotService.collect(page as never);
-      // The button is the only interactive element collected (dialog
-      // itself isn't in INTERACTIVE_TAGS / ROLES). It should have
-      // isInsideActiveModal=true because its DS ancestor chain
-      // crosses the dialog node which has `open` attribute.
-      expect(snapshot.elements).toHaveLength(1);
-      expect(snapshot.elements[0].tag).toBe('button');
-      expect(snapshot.elements[0].isInsideActiveModal).toBe(true);
+      // After May 2026 symmetry fix: <dialog open> is now Tier-1
+      // interactive (matches evaluate-path's `dialog[open]` selector),
+      // so it appears in elements[] alongside the button. Both should
+      // be flagged isInsideActiveModal — button via ancestor walk,
+      // dialog via being-inside-itself logic. We assert the button
+      // (the real test target) is properly flagged.
+      const button = snapshot.elements.find((e) => e.tag === 'button');
+      expect(button).toBeDefined();
+      expect(button!.isInsideActiveModal).toBe(true);
+      // Dialog itself: its DS ancestors don't include another modal,
+      // so isInsideActiveModal stays falsy (correct — dialog is
+      // the modal, not inside one).
+      const dialog = snapshot.elements.find((e) => e.tag === 'dialog');
+      expect(dialog).toBeDefined();
     });
   });
 
