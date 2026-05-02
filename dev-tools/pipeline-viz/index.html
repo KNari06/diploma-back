@@ -17,17 +17,18 @@
       <span class="subtitle">lint · apply · run</span>
     </div>
     <div class="controls">
-      <label class="toggle">
-        <input type="checkbox" id="t-collapse" checked />
-        <span>collapse to services</span>
-      </label>
+      <div class="seg" id="seg-mode">
+        <button data-mode="flow" class="active">flow</button>
+        <button data-mode="blocks">blocks</button>
+        <button data-mode="focus">focus</button>
+      </div>
       <label class="toggle">
         <input type="checkbox" id="t-external" checked />
-        <span>cross-service edges</span>
+        <span>cross-service</span>
       </label>
       <label class="toggle">
         <input type="checkbox" id="t-internal" />
-        <span>intra-service edges</span>
+        <span>intra-service</span>
       </label>
       <label class="toggle">
         <input type="checkbox" id="t-ws" checked />
@@ -48,17 +49,23 @@
   </main>
 
   <footer class="legend">
+    <span class="layer-chip" data-layer="ws-handler">ws-handler</span>
     <span class="layer-chip" data-layer="snapshot">snapshot</span>
     <span class="layer-chip" data-layer="dom-analysis">dom-analysis</span>
     <span class="layer-chip" data-layer="lint">lint</span>
     <span class="layer-chip" data-layer="locator-plan">locator-plan</span>
+    <span class="layer-chip" data-layer="pruner">pruner</span>
     <span class="layer-chip" data-layer="resolver">resolver</span>
+    <span class="layer-chip" data-layer="readiness">readiness</span>
+    <span class="layer-chip" data-layer="wait">wait</span>
+    <span class="layer-chip" data-layer="diagnosis">diagnosis</span>
+    <span class="layer-chip" data-layer="trace">trace</span>
     <span class="layer-chip" data-layer="step-apply">step-apply</span>
     <span class="layer-chip" data-layer="run">run</span>
     <span class="layer-chip" data-layer="session">session</span>
     <span class="layer-chip" data-layer="recording">recording</span>
     <span class="spacer"></span>
-    <span class="hint">runtime overlay: pulse = active call · click service to expand methods</span>
+    <span class="hint">click service to focus · runtime overlay: pulse = active call</span>
   </footer>
 
   <script type="module" src="./app.js"></script>

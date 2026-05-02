@@ -1,17 +1,31 @@
 {
-  "generatedAt": "2026-05-01T18:11:43.537Z",
+  "generatedAt": "2026-05-01T18:39:36.952Z",
   "layers": [
+    "ws-handler",
     "snapshot",
     "dom-analysis",
     "lint",
     "locator-plan",
+    "pruner",
     "resolver",
+    "readiness",
+    "wait",
+    "diagnosis",
+    "trace",
     "step-apply",
     "run",
     "session",
     "recording"
   ],
   "services": [
+    {
+      "id": "PreviewHandler",
+      "name": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "hub": true,
+      "methodCount": 37
+    },
     {
       "id": "SnapshotCollector",
       "name": "SnapshotCollector",
@@ -45,6 +59,14 @@
       "methodCount": 2
     },
     {
+      "id": "CandidatePrunerLlm",
+      "name": "CandidatePrunerLlm",
+      "layer": "pruner",
+      "file": "src/services/testing/ui/preview/candidate-pruner-llm.service.ts",
+      "hub": false,
+      "methodCount": 4
+    },
+    {
       "id": "ElementResolver",
       "name": "ElementResolver",
       "layer": "resolver",
@@ -53,12 +75,52 @@
       "methodCount": 10
     },
     {
+      "id": "StepReadiness",
+      "name": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "hub": false,
+      "methodCount": 18
+    },
+    {
+      "id": "AutoWaitFor",
+      "name": "AutoWaitFor",
+      "layer": "wait",
+      "file": "src/services/testing/ui/preview/auto-wait-for.utils.ts",
+      "hub": false,
+      "methodCount": 2
+    },
+    {
+      "id": "SmartStepWait",
+      "name": "SmartStepWait",
+      "layer": "wait",
+      "file": "src/services/testing/ui/smart-step-wait.service.ts",
+      "hub": false,
+      "methodCount": 2
+    },
+    {
+      "id": "StepBlockerDiagnosis",
+      "name": "StepBlockerDiagnosis",
+      "layer": "diagnosis",
+      "file": "src/services/testing/ui/preview/step-blocker-diagnosis.service.ts",
+      "hub": false,
+      "methodCount": 2
+    },
+    {
+      "id": "EditorTraceService",
+      "name": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "hub": false,
+      "methodCount": 66
+    },
+    {
       "id": "PreviewStepApplyService",
       "name": "PreviewStepApplyService",
       "layer": "step-apply",
       "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
       "hub": true,
-      "methodCount": 21
+      "methodCount": 26
     },
     {
       "id": "PreviewRunService",
@@ -86,6 +148,593 @@
     }
   ],
   "methods": [
+    {
+      "id": "PreviewHandler.acquireDomTickGuard",
+      "name": "acquireDomTickGuard",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 672,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(previewSessionId: string, inFlight: Set<string>) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.releaseDomTickGuard",
+      "name": "releaseDomTickGuard",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 683,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(previewSessionId: string, inFlight: Set<string>) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.waitForFileSelectionConfirmation",
+      "name": "waitForFileSelectionConfirmation",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 691,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(element: { evaluate: <T>(fn: (el: { fil…, wait: (ms: number) => Promise<void>, maxAttempts: number, intervalMs: number) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.subscribe:preview",
+      "name": "subscribe:preview",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 1229,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:page",
+        "preview:viewport"
+      ]
+    },
+    {
+      "id": "PreviewHandler.unsubscribe:preview",
+      "name": "unsubscribe:preview",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 1388,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(socket event)",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.preview:step:lint",
+      "name": "preview:step:lint",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 1440,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:step:clarify",
+        "preview:step:lint:result"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:step:clarify:select",
+      "name": "preview:step:clarify:select",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 1594,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:step:lint:result"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:step:apply",
+      "name": "preview:step:apply",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 1704,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:page",
+        "preview:step:apply:result"
+      ]
+    },
+    {
+      "id": "PreviewHandler.mobile:step:apply",
+      "name": "mobile:step:apply",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 1935,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "mobile:step:apply:result"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:mouse:move",
+      "name": "preview:mouse:move",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 2059,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:element:hover"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:mouse:click",
+      "name": "preview:mouse:click",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 2225,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:update",
+        "preview:recording:warning"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:mouse:down",
+      "name": "preview:mouse:down",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 2657,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.preview:mouse:up",
+      "name": "preview:mouse:up",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 2725,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.preview:mouse:wheel",
+      "name": "preview:mouse:wheel",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 2828,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:keyboard:type",
+      "name": "preview:keyboard:type",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 3010,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:keyboard:press",
+      "name": "preview:keyboard:press",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 3255,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:remove",
+        "preview:recording:step:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:viewport:set",
+      "name": "preview:viewport:set",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 3637,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:viewport"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:page:refresh",
+      "name": "preview:page:refresh",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 3713,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:page:back",
+      "name": "preview:page:back",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 3845,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.preview:page:forward",
+      "name": "preview:page:forward",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 3922,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewHandler.preview:tab:switch",
+      "name": "preview:tab:switch",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4001,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step",
+        "preview:tab:switched"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:tab:close",
+      "name": "preview:tab:close",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4075,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:tab:closed"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:page:reset",
+      "name": "preview:page:reset",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4128,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:state"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:network:detail:request",
+      "name": "preview:network:detail:request",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4303,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:network:detail"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:network:list:request",
+      "name": "preview:network:list:request",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4342,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:network:list"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:html:request",
+      "name": "preview:html:request",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4379,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:html:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:accessibility:request",
+      "name": "preview:accessibility:request",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4426,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:accessibility:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:context:set",
+      "name": "preview:context:set",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4466,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:context:update"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:mouse:probe",
+      "name": "preview:mouse:probe",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4508,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:mouse:probe:result"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:run:start",
+      "name": "preview:run:start",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4561,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:run:completed",
+        "preview:run:started",
+        "preview:run:step"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:session:inspect",
+      "name": "preview:session:inspect",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 4947,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:session:state"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:run:cancel",
+      "name": "preview:run:cancel",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 5086,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:run:cancelled"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:recording:start",
+      "name": "preview:recording:start",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 5129,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:state",
+        "preview:recording:step:remove",
+        "preview:recording:upload:prompt",
+        "preview:recording:upload:resolve",
+        "preview:recording:upload:warning"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:recording:upload:resolve",
+      "name": "preview:recording:upload:resolve",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 5514,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:remove",
+        "preview:recording:upload:warning"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:recording:upload:cancel",
+      "name": "preview:recording:upload:cancel",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 5664,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:remove"
+      ]
+    },
+    {
+      "id": "PreviewHandler.preview:recording:stop",
+      "name": "preview:recording:stop",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 5699,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": [
+        "preview:recording:step:remove"
+      ]
+    },
+    {
+      "id": "PreviewHandler.disconnect",
+      "name": "disconnect",
+      "service": "PreviewHandler",
+      "layer": "ws-handler",
+      "file": "src/websocket/handlers/preview.handler.ts",
+      "line": 6230,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(socket event)",
+      "emitsWs": []
+    },
     {
       "id": "SnapshotCollector.collect",
       "name": "collect",
@@ -325,6 +974,62 @@
       "emitsWs": []
     },
     {
+      "id": "CandidatePrunerLlm.pruneCandidatesViaLLM",
+      "name": "pruneCandidatesViaLLM",
+      "service": "CandidatePrunerLlm",
+      "layer": "pruner",
+      "file": "src/services/testing/ui/preview/candidate-pruner-llm.service.ts",
+      "line": 395,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(params: { intentText: string; actionTy…) => Promise<PrunerResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "CandidatePrunerLlm.invalidatePrunerForRef",
+      "name": "invalidatePrunerForRef",
+      "service": "CandidatePrunerLlm",
+      "layer": "pruner",
+      "file": "src/services/testing/ui/preview/candidate-pruner-llm.service.ts",
+      "line": 613,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(args: { rejectedRef: string | undefi…) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "CandidatePrunerLlm._resetPrunerCacheForTests",
+      "name": "_resetPrunerCacheForTests",
+      "service": "CandidatePrunerLlm",
+      "layer": "pruner",
+      "file": "src/services/testing/ui/preview/candidate-pruner-llm.service.ts",
+      "line": 658,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "() => void",
+      "emitsWs": []
+    },
+    {
+      "id": "CandidatePrunerLlm._getPrunerCacheSizeForTests",
+      "name": "_getPrunerCacheSizeForTests",
+      "service": "CandidatePrunerLlm",
+      "layer": "pruner",
+      "file": "src/services/testing/ui/preview/candidate-pruner-llm.service.ts",
+      "line": 664,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "() => number",
+      "emitsWs": []
+    },
+    {
       "id": "ElementResolver.buildAllowedSets",
       "name": "buildAllowedSets",
       "service": "ElementResolver",
@@ -465,6 +1170,1266 @@
       "emitsWs": []
     },
     {
+      "id": "StepReadiness.getDomStableThresholdMs",
+      "name": "getDomStableThresholdMs",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 251,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(prevActionType: IntentActionType | undefined, explicitOverride: number | undefined) => number",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.detectSpaNavigation",
+      "name": "detectSpaNavigation",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 279,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, prevUrl: string, timeoutMs: number) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForDOMStable",
+      "name": "waitForDOMStable",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 369,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, timeoutMs: number, stabilityThreshold: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.pageSettle",
+      "name": "pageSettle",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 444,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, settleMs: number, domStableThresholdMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.blindSettle",
+      "name": "blindSettle",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 466,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, domStableThresholdMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.withHardCap",
+      "name": "withHardCap",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 509,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(op: () => Promise<T>, capMs: number, onTimeout: T) => Promise<T>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.detectChallengePage",
+      "name": "detectChallengePage",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 621,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<ChallengePageInfo>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.hasLoadingIndicators",
+      "name": "hasLoadingIndicators",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 679,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForLoadingIndicatorsClear",
+      "name": "waitForLoadingIndicatorsClear",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 760,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, timeoutMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForApiIdle",
+      "name": "waitForApiIdle",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 780,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, timeoutMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForElementAnimationComplete",
+      "name": "waitForElementAnimationComplete",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 876,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(locator: Locator, timeoutMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.isElementObstructed",
+      "name": "isElementObstructed",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 941,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(locator: Locator, page: Page) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.isElementDisabledOrInert",
+      "name": "isElementDisabledOrInert",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 990,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(locator: Locator) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForElementEnabled",
+      "name": "waitForElementEnabled",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 1021,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(locator: Locator, timeoutMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForIframeContentReady",
+      "name": "waitForIframeContentReady",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 1035,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, timeoutMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForOverlayClear",
+      "name": "waitForOverlayClear",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 1072,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(locator: Locator, page: Page, timeoutMs: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.waitForStepReadiness",
+      "name": "waitForStepReadiness",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 1520,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, nextStep: IntentStep, options: LookaheadOptions) => Promise<LookaheadResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepReadiness.shouldSkipLookaheadAfter",
+      "name": "shouldSkipLookaheadAfter",
+      "service": "StepReadiness",
+      "layer": "readiness",
+      "file": "src/services/testing/ui/preview/step-readiness.service.ts",
+      "line": 2025,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(prevStepType: IntentActionType) => boolean",
+      "emitsWs": []
+    },
+    {
+      "id": "AutoWaitFor.normalizeUrlForComparison",
+      "name": "normalizeUrlForComparison",
+      "service": "AutoWaitFor",
+      "layer": "wait",
+      "file": "src/services/testing/ui/preview/auto-wait-for.utils.ts",
+      "line": 22,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(url: string) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "AutoWaitFor.injectAutoWaitForSteps",
+      "name": "injectAutoWaitForSteps",
+      "service": "AutoWaitFor",
+      "layer": "wait",
+      "file": "src/services/testing/ui/preview/auto-wait-for.utils.ts",
+      "line": 125,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(steps: IntentStep[]) => IntentStep[]",
+      "emitsWs": []
+    },
+    {
+      "id": "SmartStepWait.resetSmartWaitDiagnoseBudget",
+      "name": "resetSmartWaitDiagnoseBudget",
+      "service": "SmartStepWait",
+      "layer": "wait",
+      "file": "src/services/testing/ui/smart-step-wait.service.ts",
+      "line": 172,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(sessionId: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "SmartStepWait.smartStepWait",
+      "name": "smartStepWait",
+      "service": "SmartStepWait",
+      "layer": "wait",
+      "file": "src/services/testing/ui/smart-step-wait.service.ts",
+      "line": 472,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(ctx: SmartWaitContext) => Promise<SmartWaitResult>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepBlockerDiagnosis.diagnoseStepBlocker",
+      "name": "diagnoseStepBlocker",
+      "service": "StepBlockerDiagnosis",
+      "layer": "diagnosis",
+      "file": "src/services/testing/ui/preview/step-blocker-diagnosis.service.ts",
+      "line": 253,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, step: IntentStep, error: string) => Promise<BlockerDiagnosis | null>",
+      "emitsWs": []
+    },
+    {
+      "id": "StepBlockerDiagnosis.actOnDiagnosis",
+      "name": "actOnDiagnosis",
+      "service": "StepBlockerDiagnosis",
+      "layer": "diagnosis",
+      "file": "src/services/testing/ui/preview/step-blocker-diagnosis.service.ts",
+      "line": 318,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, diagnosis: BlockerDiagnosis) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.getOrCreate",
+      "name": "getOrCreate",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 117,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(previewSessionId: string, userId: string) => EditorTraceService",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.get",
+      "name": "get",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 127,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": false,
+      "signature": "(previewSessionId: string) => EditorTraceService | null",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.close",
+      "name": "close",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 132,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": true,
+      "isAsync": true,
+      "signature": "(previewSessionId: string) => Promise<{ filePath: string; userId: string; } …",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeRecordingStart",
+      "name": "writeRecordingStart",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 148,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(pageUrl: string | undefined) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeRecordingStop",
+      "name": "writeRecordingStop",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 156,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(reason: \"user\" | \"disconnect\" | \"max_t…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSessionStart",
+      "name": "writeSessionStart",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 164,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { startUrl: string; viewport?:…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSessionStop",
+      "name": "writeSessionStop",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 172,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(reason: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeNavigation",
+      "name": "writeNavigation",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 180,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { fromUrl: string; toUrl: stri…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSessionReset",
+      "name": "writeSessionReset",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 195,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { phase: \"start\" | \"end\"; from…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeVideoStreamEvent",
+      "name": "writeVideoStreamEvent",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 222,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { phase: \"attach\" | \"detach\" |…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeFrameNavigated",
+      "name": "writeFrameNavigated",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 244,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { url: string; isMainFrame: bo…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeExternalNavTrap",
+      "name": "writeExternalNavTrap",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 261,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { action: \"reverted\" | \"allowe…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSnapshotResult",
+      "name": "writeSnapshotResult",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 279,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { url: string; nodeCount: numb…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSnapshotError",
+      "name": "writeSnapshotError",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 293,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { url: string; source: string;…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSnapshotEmpty",
+      "name": "writeSnapshotEmpty",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 307,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { url: string; isNavigationInP…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeClick",
+      "name": "writeClick",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 324,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { x: number; y: number; button…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeMouseDown",
+      "name": "writeMouseDown",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 331,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { x: number; y: number; button…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeMouseUp",
+      "name": "writeMouseUp",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 335,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { x: number; y: number; button…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeScroll",
+      "name": "writeScroll",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 339,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { deltaX: number; deltaY: numb…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeType",
+      "name": "writeType",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 343,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { text: string; elementRef?: s…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writePress",
+      "name": "writePress",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 347,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { key: string; modifiers?: str…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeStepCaptured",
+      "name": "writeStepCaptured",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 355,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(step: PreviewIntentStep, source: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeStepUpdated",
+      "name": "writeStepUpdated",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 363,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(step: PreviewIntentStep, reason: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeStepRemoved",
+      "name": "writeStepRemoved",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 371,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(stepId: string, reason: string) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeNavDetected",
+      "name": "writeNavDetected",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 379,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { fromUrl: string; toUrl: stri…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSelectChange",
+      "name": "writeSelectChange",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 387,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { label: string; selectedText:…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeFileUpload",
+      "name": "writeFileUpload",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 395,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { fileNames: string[]; probedE…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeDragDrop",
+      "name": "writeDragDrop",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 403,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { startX: number; startY: numb…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeStepApplyRequest",
+      "name": "writeStepApplyRequest",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 418,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(stepDraft: PreviewIntentStep) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeStepApplyResult",
+      "name": "writeStepApplyResult",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 426,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(result: { success: boolean; error?: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeEditorActionRequest",
+      "name": "writeEditorActionRequest",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 440,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { message: string; previewSess…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeEditorActionExtract",
+      "name": "writeEditorActionExtract",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 448,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { type: string; description: s…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeEditorActionResult",
+      "name": "writeEditorActionResult",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 456,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { success: boolean; error?: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeElementResolution",
+      "name": "writeElementResolution",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 479,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { description: string; actionT…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeLookaheadStart",
+      "name": "writeLookaheadStart",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 592,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { nextStepId: string; nextActi…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeLookaheadPhase",
+      "name": "writeLookaheadPhase",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 618,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { phase: string; durationMs: n…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeLookaheadEnd",
+      "name": "writeLookaheadEnd",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 633,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { nextStepId: string; ready: b…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeRetryAttempt",
+      "name": "writeRetryAttempt",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 658,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { nextStepId: string; attempt:…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writePageSettle",
+      "name": "writePageSettle",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 692,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { context: \"retry_loop\" | \"bli…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeInterStepGap",
+      "name": "writeInterStepGap",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 713,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { prevStepId: string; nextStep…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeActionTiming",
+      "name": "writeActionTiming",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 735,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; stepType: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeCompiledAttempt",
+      "name": "writeCompiledAttempt",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 772,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; attempt: num…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeCompiledReorder",
+      "name": "writeCompiledReorder",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 794,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; reason: stri…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeActionAttempt",
+      "name": "writeActionAttempt",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 815,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; stepType: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeActionResult",
+      "name": "writeActionResult",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 831,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; stepType: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeActionVerify",
+      "name": "writeActionVerify",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 850,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; stepType: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writePageState",
+      "name": "writePageState",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 875,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; when: \"step_…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeSessionContext",
+      "name": "writeSessionContext",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 912,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { previewSessionId: string; us…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeStepMeta",
+      "name": "writeStepMeta",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 938,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; type: string…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writePageModalState",
+      "name": "writePageModalState",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 994,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId?: string; activeModal…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeApplyPhaseEntry",
+      "name": "writeApplyPhaseEntry",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1019,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; phase: \"pre_…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeApplyPhaseExit",
+      "name": "writeApplyPhaseExit",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1031,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; phase: \"pre_…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeLlmRequestStart",
+      "name": "writeLlmRequestStart",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1052,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId?: string; purpose: \"e…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeLlmRequestEnd",
+      "name": "writeLlmRequestEnd",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1067,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId?: string; purpose: \"e…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeResolverCandidates",
+      "name": "writeResolverCandidates",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1094,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; source: \"com…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeEvidenceShortcut",
+      "name": "writeEvidenceShortcut",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1123,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; hit: boolean…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeCompiledPostcondition",
+      "name": "writeCompiledPostcondition",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1142,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; expectsNavig…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeCaughtError",
+      "name": "writeCaughtError",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1163,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { where: string; stepId?: stri…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeRunSummary",
+      "name": "writeRunSummary",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1185,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { previewSessionId: string; in…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeHoverProbe",
+      "name": "writeHoverProbe",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1215,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { x: number; y: number; origin…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeHoverEmit",
+      "name": "writeHoverEmit",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1228,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { element: { tag: string; labe…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeError",
+      "name": "writeError",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1241,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(error: string, context: Record<string, any> | undefined) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeMobileLintRequest",
+      "name": "writeMobileLintRequest",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1256,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { description: string; actionT…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeMobileLintResult",
+      "name": "writeMobileLintResult",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1275,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { description: string; actionT…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeMobileApplyRequest",
+      "name": "writeMobileApplyRequest",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1300,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; stepType: st…) => void",
+      "emitsWs": []
+    },
+    {
+      "id": "EditorTraceService.writeMobileApplyResult",
+      "name": "writeMobileApplyResult",
+      "service": "EditorTraceService",
+      "layer": "trace",
+      "file": "src/services/testing/ui/preview/editor-trace.service.ts",
+      "line": 1317,
+      "kind": "method",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(data: { stepId: string; sessionId: s…) => void",
+      "emitsWs": []
+    },
+    {
       "id": "PreviewStepApplyService.applyStep",
       "name": "applyStep",
       "service": "PreviewStepApplyService",
@@ -565,6 +2530,20 @@
       "emitsWs": []
     },
     {
+      "id": "PreviewStepApplyService.randomIntInclusive",
+      "name": "randomIntInclusive",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 631,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(min: number, max: number) => number",
+      "emitsWs": []
+    },
+    {
       "id": "PreviewStepApplyService.classifyNavigationError",
       "name": "classifyNavigationError",
       "service": "PreviewStepApplyService",
@@ -576,6 +2555,34 @@
       "isStatic": false,
       "isAsync": false,
       "signature": "(error: Error, url: string) => string",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.sleepMs",
+      "name": "sleepMs",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 665,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, ms: number) => Promise<void>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.maybeRandomPause",
+      "name": "maybeRandomPause",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 673,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": true,
+      "signature": "(page: Page, chance: number, minMs: number, maxMs: number) => Promise<void>",
       "emitsWs": []
     },
     {
@@ -632,6 +2639,20 @@
       "isStatic": false,
       "isAsync": true,
       "signature": "(page: Page, matcher: UrlMatcher | undefined, timeoutMs: number, isAutoInjected: boolean) => Promise<{ success: boolean; error?: string; de…",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.getLocatorContext",
+      "name": "getLocatorContext",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1347,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(page: Page, step: IntentStep) => Page | FrameLocator",
       "emitsWs": []
     },
     {
@@ -702,6 +2723,20 @@
       "isStatic": false,
       "isAsync": true,
       "signature": "(page: Page, step: IntentStep, ref: string) => Promise<boolean>",
+      "emitsWs": []
+    },
+    {
+      "id": "PreviewStepApplyService.buildSelector",
+      "name": "buildSelector",
+      "service": "PreviewStepApplyService",
+      "layer": "step-apply",
+      "file": "src/services/testing/ui/preview/preview-step-apply.service.ts",
+      "line": 1942,
+      "kind": "function",
+      "visibility": "public",
+      "isStatic": false,
+      "isAsync": false,
+      "signature": "(step: IntentStep, candidate: LintCandidate) => string | undefined",
       "emitsWs": []
     },
     {
@@ -2513,8 +4548,18 @@
       "count": 14
     },
     {
+      "from": "StepReadiness.isElementObstructed",
+      "to": "StepReadiness.withHardCap",
+      "count": 4
+    },
+    {
       "from": "PreviewStepApplyService.applyStep",
       "to": "PreviewStepApplyService.executeAction",
+      "count": 4
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.randomIntInclusive",
       "count": 4
     },
     {
@@ -2525,6 +4570,11 @@
     {
       "from": "ElementResolver.resolveElement",
       "to": "ElementResolver.rescueWithGeminiFlash",
+      "count": 3
+    },
+    {
+      "from": "StepReadiness.waitForStepReadiness",
+      "to": "StepReadiness.pageSettle",
       "count": 3
     },
     {
@@ -2545,6 +4595,16 @@
     {
       "from": "ElementResolver.resolveElement",
       "to": "ElementResolver.selectElementWithLLM",
+      "count": 2
+    },
+    {
+      "from": "StepReadiness.waitForStepReadiness",
+      "to": "StepReadiness.detectSpaNavigation",
+      "count": 2
+    },
+    {
+      "from": "AutoWaitFor.injectAutoWaitForSteps",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
       "count": 2
     },
     {
@@ -2575,6 +4635,16 @@
     {
       "from": "PreviewStepApplyService.applyStep",
       "to": "PreviewStepApplyService.dismissParasiticOverlay",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.getLocatorContext",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.sleepMs",
       "count": 2
     },
     {
@@ -2683,6 +4753,96 @@
       "count": 1
     },
     {
+      "from": "StepReadiness.pageSettle",
+      "to": "StepReadiness.waitForDOMStable",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.blindSettle",
+      "to": "StepReadiness.pageSettle",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.detectChallengePage",
+      "to": "StepReadiness.withHardCap",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.hasLoadingIndicators",
+      "to": "StepReadiness.withHardCap",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForLoadingIndicatorsClear",
+      "to": "StepReadiness.hasLoadingIndicators",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForElementAnimationComplete",
+      "to": "StepReadiness.withHardCap",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.isElementDisabledOrInert",
+      "to": "StepReadiness.withHardCap",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForElementEnabled",
+      "to": "StepReadiness.isElementDisabledOrInert",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForIframeContentReady",
+      "to": "StepReadiness.withHardCap",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForOverlayClear",
+      "to": "StepReadiness.isElementObstructed",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForStepReadiness",
+      "to": "StepReadiness.getDomStableThresholdMs",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForStepReadiness",
+      "to": "StepReadiness.detectChallengePage",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForStepReadiness",
+      "to": "StepReadiness.waitForDOMStable",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForStepReadiness",
+      "to": "StepReadiness.blindSettle",
+      "count": 1
+    },
+    {
+      "from": "EditorTraceService.getOrCreate",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "EditorTraceService.get",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "EditorTraceService.close",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "EditorTraceService.close",
+      "to": "EditorTraceService.close",
+      "count": 1
+    },
+    {
       "from": "PreviewStepApplyService.applyStep",
       "to": "PreviewStepApplyService.waitForPageSettled",
       "count": 1
@@ -2723,6 +4883,16 @@
       "count": 1
     },
     {
+      "from": "PreviewStepApplyService.maybeRandomPause",
+      "to": "PreviewStepApplyService.randomIntInclusive",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.maybeRandomPause",
+      "to": "PreviewStepApplyService.sleepMs",
+      "count": 1
+    },
+    {
       "from": "PreviewStepApplyService.executeWaitFor",
       "to": "PreviewStepApplyService.waitForPageSettled",
       "count": 1
@@ -2733,13 +4903,28 @@
       "count": 1
     },
     {
+      "from": "PreviewStepApplyService.verifyActionEffect",
+      "to": "PreviewStepApplyService.getLocatorContext",
+      "count": 1
+    },
+    {
       "from": "PreviewStepApplyService.uploadViaFileChooserOrDrop",
       "to": "PreviewStepApplyService.dispatchFileDrop",
       "count": 1
     },
     {
       "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.buildSelector",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
       "to": "PreviewStepApplyService.normalizeTypeActionValue",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "PreviewStepApplyService.maybeRandomPause",
       "count": 1
     },
     {
@@ -3341,6 +5526,106 @@
     },
     {
       "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.get",
+      "count": 14
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.get",
+      "count": 13
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeActionResult",
+      "count": 9
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "RecordingCaptureService.flushTypingBuffer",
+      "count": 8
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "EditorTraceService.get",
+      "count": 7
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "EditorTraceService.get",
+      "count": 6
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.setRecordingLastTypeStep",
+      "count": 6
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.isRecording",
+      "count": 6
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
+      "count": 6
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.getPage",
+      "count": 5
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "EditorTraceService.get",
+      "count": 5
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "EditorTraceService.get",
+      "count": 5
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.setRecordingBuffer",
+      "count": 5
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "EditorTraceService.writeStepUpdated",
+      "count": 5
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "EditorTraceService.get",
+      "count": 5
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeActionVerify",
+      "count": 5
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.getRecordingLastTypeStep",
+      "count": 4
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "EditorTraceService.get",
+      "count": 4
+    },
+    {
+      "from": "CandidatePrunerLlm.pruneCandidatesViaLLM",
+      "to": "EditorTraceService.get",
+      "count": 4
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "EditorTraceService.get",
+      "count": 4
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
       "to": "PreviewSessionService.getPage",
       "count": 4
     },
@@ -3351,7 +5636,97 @@
     },
     {
       "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeApplyPhaseEntry",
+      "count": 4
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeApplyPhaseExit",
+      "count": 4
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
+      "count": 4
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "EditorTraceService.get",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "EditorTraceService.writeHoverProbe",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "EditorTraceService.get",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "EditorTraceService.get",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "RecordingCaptureService.getElementLabel",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "RecordingCaptureService.buildBindingHints",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.setRecordingBuffer",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.getRecordingBuffer",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "PreviewSessionService.getPage",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "EditorTraceService.writeSessionReset",
+      "count": 3
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "EditorTraceService.get",
+      "count": 3
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "EditorTraceService.writeLlmRequestEnd",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
       "to": "LocatorPlanBuilder.buildCompiledPlanForNonTargetingAction",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "SmartStepWait.smartStepWait",
       "count": 3
     },
     {
@@ -3361,7 +5736,22 @@
     },
     {
       "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeCompiledPostcondition",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
       "to": "ElementResolver.invalidateLlmSelectionsForRef",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "CandidatePrunerLlm.invalidatePrunerForRef",
+      "count": 3
+    },
+    {
+      "from": "PreviewStepApplyService.waitForPageSettled",
+      "to": "PreviewHandler.disconnect",
       "count": 3
     },
     {
@@ -3380,6 +5770,206 @@
       "count": 3
     },
     {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "StepReadiness.shouldSkipLookaheadAfter",
+      "count": 3
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "StepReadiness.waitForStepReadiness",
+      "count": 3
+    },
+    {
+      "from": "PreviewSessionService.safeCloseBrowserResources",
+      "to": "EditorTraceService.close",
+      "count": 3
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "EditorTraceService.get",
+      "count": 3
+    },
+    {
+      "from": "PreviewSessionService.attachPopupHandler",
+      "to": "EditorTraceService.close",
+      "count": 3
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewRunService.isRunning",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "PreviewSessionService.getPage",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "EditorTraceService.writeHoverEmit",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.getRecordingLastHover",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.probeForRecording",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "EditorTraceService.writeStepUpdated",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.setRecordingLastClickStep",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "PreviewSessionService.getPage",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "RecordingCaptureService.captureScroll",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "PreviewSessionService.setRecordingLastScrollStep",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.getPage",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "RecordingCaptureService.probeFocusedElement",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.getRecordingBuffer",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.getRecordingFieldSession",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "RecordingCaptureService.flushTypingBuffer",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.setRecordingLastTypeStep",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.isRecording",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "RecordingCaptureService.shouldFlushOnKey",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.getRecordingFieldSession",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.setRecordingLastPressStep",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewSessionService.setRecordingLastNavigateStep",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:page:back",
+      "to": "PreviewSessionService.isRecording",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:page:forward",
+      "to": "PreviewSessionService.isRecording",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.getPage",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "RecordingCaptureService.injectSelectChangeListener",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "RecordingCaptureService.injectAutofillListener",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.preview:recording:upload:resolve",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "EditorTraceService.close",
+      "count": 2
+    },
+    {
+      "from": "SnapshotCollector.collect",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
+      "count": 2
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "EditorTraceService.writeEvidenceShortcut",
+      "count": 2
+    },
+    {
+      "from": "IntentStepLintService._lintStepWithAIImpl",
+      "to": "EditorTraceService.writeElementResolution",
+      "count": 2
+    },
+    {
       "from": "IntentStepLintService._lintStepWithAIImpl",
       "to": "ElementResolver.resolveElement",
       "count": 2
@@ -3392,6 +5982,11 @@
     {
       "from": "ElementResolver.resolveElement",
       "to": "PreviewSessionService.computePageSignature",
+      "count": 2
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "CandidatePrunerLlm.pruneCandidatesViaLLM",
       "count": 2
     },
     {
@@ -3408,6 +6003,921 @@
       "from": "PreviewStepApplyService.applyStep",
       "to": "PreviewSessionService.isSessionOwned",
       "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeActionAttempt",
+      "count": 2
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeActionTiming",
+      "count": 2
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.close",
+      "count": 2
+    },
+    {
+      "from": "PreviewRunService.forceCancelOnSessionStop",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.acquireUserLock",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.stopSession",
+      "to": "EditorTraceService.close",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.stopSessionInternal",
+      "to": "EditorTraceService.get",
+      "count": 2
+    },
+    {
+      "from": "PreviewSessionService.stopSessionInternal",
+      "to": "EditorTraceService.close",
+      "count": 2
+    },
+    {
+      "from": "RecordingCaptureService.captureNavigation",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
+      "count": 2
+    },
+    {
+      "from": "PreviewHandler.subscribe:preview",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.subscribe:preview",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.subscribe:preview",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.subscribe:preview",
+      "to": "PreviewSessionService.getViewportMetadata",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.unsubscribe:preview",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:lint",
+      "to": "IntentStepLintService.lintStepWithAI",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:clarify:select",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "EditorTraceService.getOrCreate",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "EditorTraceService.writeStepApplyRequest",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewStepApplyService.applyStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "EditorTraceService.writeStepApplyResult",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewSessionService.setRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewSessionService.getSnapshot",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewSessionService.getLastEmittedSignature",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:step:apply",
+      "to": "PreviewSessionService.markEmittedSignature",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.mobile:step:apply",
+      "to": "EditorTraceService.getOrCreate",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.mobile:step:apply",
+      "to": "EditorTraceService.writeMobileApplyRequest",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.mobile:step:apply",
+      "to": "EditorTraceService.writeMobileApplyResult",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "PreviewSessionService.executeMouseAction",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "PreviewSessionService.setRecordingLastHover",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:move",
+      "to": "PreviewSessionService.probeInteractiveElementAt",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.executeMouseAction",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "EditorTraceService.writeClick",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.getRecordingHoverChain",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.getProbedLabel",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.captureHover",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.setRecordingLastHover",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.clearRecordingHoverChain",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.inferClickActionType",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.buildDescription",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.buildBindingHints",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.buildRecordedFingerprint",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.setRecordingLastScrollStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.getRecordingLastClickStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.resolveInteractiveTarget",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.getRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "EditorTraceService.writeNavDetected",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "RecordingCaptureService.captureNavigation",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "PreviewSessionService.setRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:click",
+      "to": "EditorTraceService.writeError",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "PreviewSessionService.executeMouseAction",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "EditorTraceService.writeMouseDown",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "RecordingCaptureService.probeForRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "PreviewSessionService.setRecordingDragState",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:down",
+      "to": "EditorTraceService.writeError",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "PreviewSessionService.executeMouseAction",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "EditorTraceService.writeMouseUp",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "PreviewSessionService.getRecordingDragState",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "PreviewSessionService.setRecordingDragState",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "RecordingCaptureService.probeForRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "RecordingCaptureService.captureDragAndDrop",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "EditorTraceService.writeDragDrop",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:up",
+      "to": "EditorTraceService.writeError",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "PreviewSessionService.executeMouseWheel",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "EditorTraceService.writeScroll",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "RecordingCaptureService.detectScrollContainer",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "RecordingCaptureService.probeScrollTarget",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "PreviewSessionService.getRecordingLastScrollStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "EditorTraceService.writeStepUpdated",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:wheel",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.executeKeyboardType",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "EditorTraceService.writeType",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.isRecordingPendingPaste",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.setRecordingPendingPaste",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "RecordingCaptureService.buildRecordedFingerprint",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.setRecordingFieldSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "PreviewSessionService.getRecordingLastTypeStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "EditorTraceService.writeStepUpdated",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:type",
+      "to": "EditorTraceService.writeError",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.executeKeyboardPress",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "EditorTraceService.writePress",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.setRecordingPendingPaste",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "RecordingCaptureService.isNewlineInsertion",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.decrementRecordingStepCount",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "EditorTraceService.writeStepRemoved",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "RecordingCaptureService.capturePress",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "PreviewSessionService.getRecordingLastPressStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:keyboard:press",
+      "to": "EditorTraceService.writeError",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:viewport:set",
+      "to": "PreviewSessionService.setViewport",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:viewport:set",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewSessionService.refreshPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewSessionService.getRecordingLastNavigateStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:refresh",
+      "to": "PreviewSessionService.setRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:back",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:back",
+      "to": "PreviewSessionService.goBack",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:back",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:back",
+      "to": "PreviewSessionService.setRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:forward",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:forward",
+      "to": "PreviewSessionService.goForward",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:forward",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:forward",
+      "to": "PreviewSessionService.setRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:switch",
+      "to": "PreviewSessionService.switchTab",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:switch",
+      "to": "PreviewSessionService.getTabsInfo",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:switch",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:switch",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:close",
+      "to": "PreviewSessionService.closeTab",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:close",
+      "to": "PreviewSessionService.getTabsInfo",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:tab:close",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "PreviewSessionService.getRecordingBuffer",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "RecordingCaptureService.flushTypingBuffer",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "PreviewSessionService.resetSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "EditorTraceService.writeRecordingStop",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:page:reset",
+      "to": "EditorTraceService.close",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:network:detail:request",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:network:detail:request",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:network:list:request",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:network:list:request",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:html:request",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:html:request",
+      "to": "PreviewSessionService.getDomVersion",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:html:request",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:accessibility:request",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:accessibility:request",
+      "to": "PreviewSessionService.getDomVersion",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:accessibility:request",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:context:set",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:context:set",
+      "to": "PreviewSessionService.setContextData",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:mouse:probe",
+      "to": "PreviewSessionService.probeElementAt",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:run:start",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:run:start",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:run:start",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:run:start",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:run:start",
+      "to": "PreviewRunService.runSavedSteps",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:session:inspect",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:session:inspect",
+      "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:run:cancel",
+      "to": "PreviewRunService.cancelRun",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewRunService.isRunning",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.setRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.setDialogMode",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.setRecordingStartUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "EditorTraceService.getOrCreate",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "EditorTraceService.writeRecordingStart",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.setRecordingLastUrl",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "RecordingCaptureService.captureSelectChange",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "EditorTraceService.writeSelectChange",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.getRecordingBuffer",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "PreviewSessionService.getRecordingLastTypeStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "RecordingCaptureService.probeForRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "RecordingCaptureService.buildBindingHints",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:start",
+      "to": "EditorTraceService.writeFileUpload",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:upload:resolve",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:upload:resolve",
+      "to": "RecordingCaptureService.captureFileUpload",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:upload:resolve",
+      "to": "EditorTraceService.writeStepCaptured",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:upload:cancel",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:upload:cancel",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.preview:recording:stop",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.getPage",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "RecordingCaptureService.removeSelectChangeListener",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.setRecordingBuffer",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.setRecordingLastTypeStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.setRecordingLastScrollStep",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.setRecordingDragState",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "PreviewSessionService.setRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewHandler.disconnect",
+      "to": "EditorTraceService.writeRecordingStop",
+      "count": 1
     },
     {
       "from": "IntentStepLintService._lintStepInner",
@@ -3455,6 +6965,31 @@
       "count": 1
     },
     {
+      "from": "ElementResolver.invalidateLlmSelectionsForRef",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.selectElementWithLLM",
+      "to": "AutoWaitFor.normalizeUrlForComparison",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.selectElementWithLLM",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "ElementResolver.resolveElement",
+      "to": "EditorTraceService.writeLlmRequestStart",
+      "count": 1
+    },
+    {
+      "from": "StepReadiness.waitForDOMStable",
+      "to": "PreviewHandler.disconnect",
+      "count": 1
+    },
+    {
       "from": "PreviewStepApplyService.applyStep",
       "to": "ElementResolver.sanitizeIntent",
       "count": 1
@@ -3471,7 +7006,22 @@
     },
     {
       "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeLlmRequestStart",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeLlmRequestEnd",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
       "to": "IntentStepLintService.lintStepWithAI",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.applyStep",
+      "to": "EditorTraceService.writeResolverCandidates",
       "count": 1
     },
     {
@@ -3482,6 +7032,11 @@
     {
       "from": "PreviewStepApplyService.detectOverlayBlockingCandidate",
       "to": "PreviewSessionService.getSession",
+      "count": 1
+    },
+    {
+      "from": "PreviewStepApplyService.executeAction",
+      "to": "SmartStepWait.smartStepWait",
       "count": 1
     },
     {
@@ -3501,7 +7056,32 @@
     },
     {
       "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.writeSessionContext",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
       "to": "PreviewSessionService.isRecording",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "AutoWaitFor.injectAutoWaitForSteps",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.writeStepMeta",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.writePageState",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.writePageModalState",
       "count": 1
     },
     {
@@ -3510,8 +7090,33 @@
       "count": 1
     },
     {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.writeInterStepGap",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "StepReadiness.waitForApiIdle",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.runStepsOnPreview",
+      "to": "EditorTraceService.writeRunSummary",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.cancelRun",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
       "from": "PreviewRunService.cancelRun",
       "to": "PreviewSessionService.isSessionOwned",
+      "count": 1
+    },
+    {
+      "from": "PreviewRunService.isRunning",
+      "to": "EditorTraceService.get",
       "count": 1
     },
     {
@@ -3525,8 +7130,53 @@
       "count": 1
     },
     {
+      "from": "PreviewSessionService.startSession",
+      "to": "EditorTraceService.getOrCreate",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.startSession",
+      "to": "EditorTraceService.writeSessionStart",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.resetSession",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stopSession",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
       "from": "PreviewSessionService.stopSession",
       "to": "PreviewRunService.forceCancelOnSessionStop",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.stopSessionInternal",
+      "to": "EditorTraceService.writeSessionStop",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSession",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.isSessionOwned",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getAuthorizedSession",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSessionForUser",
+      "to": "EditorTraceService.get",
       "count": 1
     },
     {
@@ -3550,22 +7200,82 @@
       "count": 1
     },
     {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "EditorTraceService.writeSnapshotEmpty",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "EditorTraceService.writeSnapshotError",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getSnapshot",
+      "to": "EditorTraceService.writeSnapshotResult",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachDialogHandler",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
       "from": "PreviewSessionService.attachDialogHandler",
       "to": "RecordingCaptureService.captureDialog",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.closeTab",
+      "to": "EditorTraceService.close",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.getTabsInfo",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachTabCloseListener",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachFrameNavigatedTrace",
+      "to": "EditorTraceService.writeFrameNavigated",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachFrameNavigatedTrace",
+      "to": "EditorTraceService.get",
+      "count": 1
+    },
+    {
+      "from": "PreviewSessionService.attachPageDownloadHandler",
+      "to": "EditorTraceService.get",
       "count": 1
     },
     {
       "from": "PreviewSessionService.attachPageDownloadHandler",
       "to": "RecordingCaptureService.captureDownload",
       "count": 1
+    },
+    {
+      "from": "RecordingCaptureService.resolveInteractiveTarget",
+      "to": "EditorTraceService.get",
+      "count": 1
     }
   ],
   "unresolved": [],
   "stats": {
-    "files": 9,
-    "services": 9,
-    "methods": 171,
-    "edges": 210,
+    "files": 16,
+    "services": 16,
+    "methods": 307,
+    "edges": 545,
     "unresolved": 0
   }
 }

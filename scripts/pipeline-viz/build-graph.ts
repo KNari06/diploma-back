@@ -26,11 +26,17 @@ const ROOT = path.resolve(__dirname, '..', '..');
 const OUT = path.join(ROOT, 'dev-tools', 'pipeline-viz', 'pipeline-graph.json');
 
 type Layer =
+  | 'ws-handler'
   | 'snapshot'
   | 'dom-analysis'
   | 'lint'
   | 'locator-plan'
+  | 'pruner'
   | 'resolver'
+  | 'readiness'
+  | 'wait'
+  | 'diagnosis'
+  | 'trace'
   | 'step-apply'
   | 'run'
   | 'session'
@@ -41,26 +47,54 @@ interface SourceEntry {
   layer: Layer;
   service?: string;
   hub?: boolean;
+  /** Extract socket.on('event', handler) callbacks as pseudo-methods named after the event. */
+  extractSocketHandlers?: boolean;
 }
 
 const SOURCES: SourceEntry[] = [
+  // entry: WebSocket handlers — frontend triggers everything from here
+  { file: 'src/websocket/handlers/preview.handler.ts', layer: 'ws-handler', service: 'PreviewHandler', hub: true, extractSocketHandlers: true },
+
+  // snapshot pipeline
   { file: 'src/agent/core/lite/collectors/snapshot-collector.ts', layer: 'snapshot', service: 'SnapshotCollector', hub: true },
   { file: 'src/services/testing/ui/preview/dom-analysis-extractor.service.ts', layer: 'dom-analysis', service: 'DomAnalysisExtractorService' },
+
+  // lint + plan
   { file: 'src/services/testing/ui/preview/intent-step-lint.service.ts', layer: 'lint', service: 'IntentStepLintService' },
   { file: 'src/services/testing/ui/preview/locator-plan-builder.service.ts', layer: 'locator-plan', service: 'LocatorPlanBuilder' },
+
+  // resolver + its LLM pruner
+  { file: 'src/services/testing/ui/preview/candidate-pruner-llm.service.ts', layer: 'pruner', service: 'CandidatePrunerLlm' },
   { file: 'src/services/testing/ui/preview/element-resolver.service.ts', layer: 'resolver', service: 'ElementResolver', hub: true },
+
+  // readiness / waits / diagnosis / trace — called inside step-apply + run
+  { file: 'src/services/testing/ui/preview/step-readiness.service.ts', layer: 'readiness', service: 'StepReadiness' },
+  { file: 'src/services/testing/ui/preview/auto-wait-for.utils.ts', layer: 'wait', service: 'AutoWaitFor' },
+  { file: 'src/services/testing/ui/smart-step-wait.service.ts', layer: 'wait', service: 'SmartStepWait' },
+  { file: 'src/services/testing/ui/preview/step-blocker-diagnosis.service.ts', layer: 'diagnosis', service: 'StepBlockerDiagnosis' },
+  { file: 'src/services/testing/ui/preview/editor-trace.service.ts', layer: 'trace', service: 'EditorTraceService' },
+
+  // apply + run hubs
   { file: 'src/services/testing/ui/preview/preview-step-apply.service.ts', layer: 'step-apply', service: 'PreviewStepApplyService', hub: true },
   { file: 'src/services/testing/ui/preview/preview-run.service.ts', layer: 'run', service: 'PreviewRunService', hub: true },
+
+  // session + recording
   { file: 'src/services/testing/ui/preview/preview-session.service.ts', layer: 'session', service: 'PreviewSessionService' },
   { file: 'src/services/testing/ui/preview/recording-capture.service.ts', layer: 'recording', service: 'RecordingCaptureService' },
 ];
 
 const LAYER_ORDER: Layer[] = [
+  'ws-handler',
   'snapshot',
   'dom-analysis',
   'lint',
   'locator-plan',
+  'pruner',
   'resolver',
+  'readiness',
+  'wait',
+  'diagnosis',
+  'trace',
   'step-apply',
   'run',
   'session',
@@ -129,13 +163,30 @@ function shortSignature(node: MethodDeclaration | FunctionDeclaration): string {
   return `(${params.join(', ')}) => ${shortRet}`;
 }
 
-const WS_EMIT_REGEX = /['"`](preview:[a-z0-9:_-]+)['"`]/gi;
+// Any `prefix:event` literal — matches preview:*, run:*, recording:*, test:*, etc.
+const WS_EMIT_REGEX = /['"`]([a-z][a-z0-9]+:[a-z0-9:_-]+)['"`]/gi;
+// Common known WS-event prefixes in this project. Anything else is treated as not-a-ws-event
+// — avoids picking up CSS values (`cursor:pointer`), URLs (`http://`), error codes (`net::err_*`).
+const WS_EMIT_ALLOW_PREFIXES = new Set([
+  'preview:',
+  'mobile:',
+  'subscribe:',
+  'unsubscribe:',
+  'recording:',
+  'run:',
+  'test:',
+  'editor:',
+  'auth:',
+]);
 
 function findWsEmits(body: string): string[] {
   const out = new Set<string>();
   let m: RegExpExecArray | null;
   while ((m = WS_EMIT_REGEX.exec(body)) !== null) {
-    out.add(m[1]);
+    const tag = m[1];
+    const prefix = tag.split(':')[0] + ':';
+    if (!WS_EMIT_ALLOW_PREFIXES.has(prefix)) continue;
+    out.add(tag);
   }
   return Array.from(out).sort();
 }
@@ -143,6 +194,56 @@ function findWsEmits(body: string): string[] {
 function getMethodBody(node: MethodDeclaration | FunctionDeclaration): string {
   const b = node.getBody();
   return b ? b.getText() : '';
+}
+
+/** Find every `socket.on('event-name', handlerFn)` call and emit a pseudo-method per event. */
+function collectSocketHandlers(sf: SourceFile, source: SourceEntry): CollectedFile['rawMethodNodes'] {
+  const out: CollectedFile['rawMethodNodes'] = [];
+  const declaredService = source.service ?? path.basename(source.file).replace(/\.ts$/, '');
+  const calls = sf.getDescendantsOfKind(SyntaxKind.CallExpression);
+  const seen = new Set<string>();
+  for (const call of calls) {
+    const expr = call.getExpression();
+    if (expr.getKind() !== SyntaxKind.PropertyAccessExpression) continue;
+    const pae = expr.asKindOrThrow(SyntaxKind.PropertyAccessExpression);
+    if (pae.getName() !== 'on') continue;
+    // need it to look like socket.on / io.on — some object on the LHS, the receiver text usually contains "socket" or "io"
+    const lhs = pae.getExpression().getText();
+    if (!/socket|io\b/i.test(lhs)) continue;
+    const args = call.getArguments();
+    if (args.length < 2) continue;
+    const evt = args[0];
+    if (evt.getKind() !== SyntaxKind.StringLiteral) continue;
+    const eventName = evt.asKindOrThrow(SyntaxKind.StringLiteral).getLiteralValue();
+    const handler = args[1];
+    const handlerKind = handler.getKind();
+    if (
+      handlerKind !== SyntaxKind.ArrowFunction &&
+      handlerKind !== SyntaxKind.FunctionExpression
+    ) continue;
+
+    const id = methodId(declaredService, eventName);
+    if (seen.has(id)) continue; // duplicate registration in same file
+    seen.add(id);
+
+    const body = handler.getText();
+    const node: MethodNode = {
+      id,
+      name: eventName,
+      service: declaredService,
+      layer: source.layer,
+      file: source.file,
+      line: call.getStartLineNumber(),
+      kind: 'function',
+      visibility: 'public',
+      isStatic: false,
+      isAsync: /^async\s/.test(body) || body.includes('async ('),
+      signature: `(socket event)`,
+      emitsWs: findWsEmits(body),
+    };
+    out.push({ node, tsNode: handler });
+  }
+  return out;
 }
 
 function isWithinMethod(call: CallExpression, method: Node): boolean {
@@ -157,7 +258,7 @@ function isWithinMethod(call: CallExpression, method: Node): boolean {
 interface CollectedFile {
   source: SourceEntry;
   methods: MethodNode[];
-  rawMethodNodes: { node: MethodNode; tsNode: MethodDeclaration | FunctionDeclaration }[];
+  rawMethodNodes: { node: MethodNode; tsNode: Node }[];
 }
 
 function collectMethods(sf: SourceFile, source: SourceEntry): CollectedFile {
@@ -221,6 +322,14 @@ function collectMethods(sf: SourceFile, source: SourceEntry): CollectedFile {
     raw.push({ node, tsNode: f });
   }
 
+  if (source.extractSocketHandlers) {
+    const handlers = collectSocketHandlers(sf, source);
+    for (const h of handlers) {
+      methods.push(h.node);
+      raw.push(h);
+    }
+  }
+
   return { source, methods, rawMethodNodes: raw };
 }
 
@@ -248,6 +357,11 @@ const KEY_INTERNAL_HELPERS = new Set<string>([
   'uploadViaFileChooserOrDrop',
   'dispatchFileDrop',
   'classifyNavigationError',
+  'randomIntInclusive',
+  'getLocatorContext',
+  'buildSelector',
+  'sleepMs',
+  'maybeRandomPause',
 ]);
 
 function looksLikeKeyHelper(name: string): boolean {
@@ -359,11 +473,33 @@ function matchServiceFromLhs(lhs: string, serviceNames: Set<string>): string | n
     const pascal = tail.charAt(0).toUpperCase() + tail.slice(1);
     if (serviceNames.has(pascal)) return pascal;
   }
+  // (await import('./x')).ServiceName        → ServiceName
+  // (await import('./x')).ServiceName.method → ServiceName  (method is the call's RHS)
+  // also handles parens around the whole expression.
+  const dyn = extractDynamicImportService(lhs, serviceNames);
+  if (dyn) return dyn;
   // camelCase variants: domAnalysisExtractor → DomAnalysisExtractorService
   for (const svc of serviceNames) {
     const camel = svc.charAt(0).toLowerCase() + svc.slice(1);
     if (lhs === camel || lhs.endsWith(`.${camel}`)) return svc;
   }
+  // last segment of a dotted access: a.b.ServiceName → ServiceName
+  const lastDot = lhs.lastIndexOf('.');
+  if (lastDot >= 0) {
+    const tail = lhs.slice(lastDot + 1);
+    if (serviceNames.has(tail)) return tail;
+  }
+  return null;
+}
+
+// Match `(await import("…")).ServiceName` and `(await import("…")).ServiceName.foo`.
+// Also handles `import("…").then(m => m.ServiceName)` returning the wrapping promise
+// — but that pattern's call site is awaited as a value first, so we just match by
+// service-token presence in the textual lhs.
+const DYN_IMPORT_RE = /\(\s*await\s+import\s*\(\s*['"][^'"]+['"]\s*\)\s*\)\s*\.\s*([A-Z][A-Za-z0-9_]*)/;
+function extractDynamicImportService(lhs: string, serviceNames: Set<string>): string | null {
+  const m = DYN_IMPORT_RE.exec(lhs);
+  if (m && serviceNames.has(m[1])) return m[1];
   return null;
 }
 

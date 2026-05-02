@@ -8,11 +8,17 @@
   --hub: #f0883e;
   --warn: #d29922;
   --emit: #a371f7;
+  --layer-ws-handler: #79c0ff;
   --layer-snapshot: #2f81f7;
   --layer-dom-analysis: #3fb950;
   --layer-lint: #d29922;
   --layer-locator-plan: #db61a2;
+  --layer-pruner: #e3b341;
   --layer-resolver: #f0883e;
+  --layer-readiness: #7ee787;
+  --layer-wait: #9ed1ff;
+  --layer-diagnosis: #ff9f6d;
+  --layer-trace: #a371f7;
   --layer-step-apply: #bc8cff;
   --layer-run: #ff7b72;
   --layer-session: #56d4dd;
@@ -85,6 +91,31 @@ body {
   cursor: pointer;
 }
 .controls button:hover { border-color: var(--accent); }
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.seg button {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.seg button.active {
+  background: #1f6feb33;
+  color: var(--accent);
+}
+.seg button:hover:not(.active) {
+  background: #21262d;
+  color: var(--text);
+}
+.seg button + button { border-left: 1px solid var(--border); }
 
 #status {
   color: var(--muted);
@@ -183,11 +214,17 @@ main {
   letter-spacing: .3px;
   color: var(--text);
 }
+.layer-chip[data-layer="ws-handler"] { border-color: var(--layer-ws-handler); color: var(--layer-ws-handler); }
 .layer-chip[data-layer="snapshot"] { border-color: var(--layer-snapshot); color: var(--layer-snapshot); }
 .layer-chip[data-layer="dom-analysis"] { border-color: var(--layer-dom-analysis); color: var(--layer-dom-analysis); }
 .layer-chip[data-layer="lint"] { border-color: var(--layer-lint); color: var(--layer-lint); }
 .layer-chip[data-layer="locator-plan"] { border-color: var(--layer-locator-plan); color: var(--layer-locator-plan); }
+.layer-chip[data-layer="pruner"] { border-color: var(--layer-pruner); color: var(--layer-pruner); }
 .layer-chip[data-layer="resolver"] { border-color: var(--layer-resolver); color: var(--layer-resolver); }
+.layer-chip[data-layer="readiness"] { border-color: var(--layer-readiness); color: var(--layer-readiness); }
+.layer-chip[data-layer="wait"] { border-color: var(--layer-wait); color: var(--layer-wait); }
+.layer-chip[data-layer="diagnosis"] { border-color: var(--layer-diagnosis); color: var(--layer-diagnosis); }
+.layer-chip[data-layer="trace"] { border-color: var(--layer-trace); color: var(--layer-trace); }
 .layer-chip[data-layer="step-apply"] { border-color: var(--layer-step-apply); color: var(--layer-step-apply); }
 .layer-chip[data-layer="run"] { border-color: var(--layer-run); color: var(--layer-run); }
 .layer-chip[data-layer="session"] { border-color: var(--layer-session); color: var(--layer-session); }

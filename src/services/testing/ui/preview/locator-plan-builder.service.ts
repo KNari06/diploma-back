@@ -5,16 +5,25 @@
  */
 
 import { logger } from '@/utils/core/logger';
+import type { Page } from 'playwright';
 import { getEffectiveLabel } from './element-resolver.service';
 import type {
   CompiledStepPlan,
   IntentStep,
   InteractiveNode,
   LocatorEntry,
+  LocatorTier,
   TargetFingerprint,
 } from './preview.types';
+import { TIER_ORDER } from './preview.types';
 import { CELL_SEP, escapeHasText, normalizeText } from './text-normalizer.util';
 import { extractStableTokensViaLLM } from './stable-tokens-llm.service';
+import { buildStrategyLocator, safeCountWithTimeout } from './locator-resolution.util';
+import {
+  DEFAULT_LOCATOR_CONFIG,
+  isClassBanned,
+  type LocatorConfig,
+} from '@/config/testing/locator-config';
 
 /**
  * Escape value for CSS attribute selector.
@@ -45,7 +54,7 @@ const GENERIC_ROLES = new Set(['generic', 'none', 'presentation', 'group']);
 /**
  * Build ordered list of locators (primary + fallbacks)
  */
-async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]> {
+async function buildLocatorChain(node: InteractiveNode, config: LocatorConfig): Promise<LocatorEntry[]> {
   const locators: LocatorEntry[] = [];
 
   // V25 — Stable-token enrichment for long-text labels.
@@ -124,6 +133,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       // Above bare text (0.7) and below testId (0.8). Chained :has-text
       // is strong identity but not as durable as an explicit attribute.
       confidence: 0.82,
+      tier: 'TEXTUAL',
     });
   }
 
@@ -158,6 +168,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         value: accessibleName,
         roleName: node.role,
         confidence: 0.9,
+        tier: 'IDENTITY',
       });
       // V25 — Enhancement #2: role with stable token as accessible-name
       // partial. Playwright's `getByRole(role, {name})` does substring
@@ -188,6 +199,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
             // CSS (0.82). Last-resort "did the full name change but the
             // brand survives?" probe.
             confidence: 0.65,
+            tier: 'TEXTUAL',
           });
         }
       }
@@ -200,6 +212,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'label',
       value: node.labelText,
       confidence: 0.85,
+      tier: 'IDENTITY',
     });
   }
 
@@ -209,6 +222,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'testId',
       value: node.testIdAttr,
       confidence: 0.8,
+      tier: 'IDENTITY',
     });
   }
 
@@ -226,6 +240,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `[id="${safeId}"]`,
       confidence: 0.78,
+      tier: 'IDENTITY',
     });
   }
 
@@ -261,6 +276,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // Below id (0.78) — anchor menus can have multiple <a href="#top">
         // duplicates in long pages; waterfall keeps text-locator as backup.
         confidence: 0.72,
+        tier: 'STRUCTURAL',
       });
     }
   }
@@ -275,6 +291,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `${node.tag || '*'}:has([data-testid="${safeChildId}"])`,
       confidence: 0.77,
+      tier: 'STRUCTURAL',
     });
   }
 
@@ -303,6 +320,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         strategy: 'css',
         value: `${tagPrefix}:has(svg title:text-is("${safeIcon.replace(/"/g, '\\"')}"))`,
         confidence: 0.62,
+        tier: 'STRUCTURAL',
       });
       // Probe step ④ — icon-library data attrs. Skip when the recorded
       // value contains spaces (we normalize "menu-icon" → "menu icon"
@@ -318,6 +336,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           strategy: 'css',
           value: `${tagPrefix}:has([data-lucide="${safe}"], [data-feather="${safe}"], [data-icon="${safe}"], [data-iconify-name="${safe}"])`,
           confidence: 0.60,
+          tier: 'STRUCTURAL',
         });
       }
     }
@@ -348,6 +367,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           strategy: 'css',
           value: `mat-icon[svgicon="${safe}"]`,
           confidence: 0.79,
+          tier: 'STRUCTURAL',
         });
       } else {
         // Variant 2: wrapper button/link contains the mat-icon.
@@ -355,6 +375,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           strategy: 'css',
           value: `${tagPrefix}:has(mat-icon[svgicon="${safe}"])`,
           confidence: 0.77,
+          tier: 'STRUCTURAL',
         });
         // Mirror via data-mat-icon-name (same value, different attribute path)
         // — covers Material versions where svgicon was renamed in v15+.
@@ -362,6 +383,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           strategy: 'css',
           value: `${tagPrefix}:has(mat-icon[data-mat-icon-name="${safe}"])`,
           confidence: 0.76,
+          tier: 'STRUCTURAL',
         });
       }
     }
@@ -377,6 +399,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `${node.tag || '*'}[data-value="${safeVal}"]`,
       confidence: 0.74,
+      tier: 'STRUCTURAL',
     });
   }
 
@@ -393,7 +416,165 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `[data-row-key="${safeKey}"]`,
       confidence: 0.78,
+      tier: 'STRUCTURAL',
     });
+  }
+
+  // Etap 1B.2 — Angular `formControlName` directive.
+  //
+  // Reactive-forms identity authored by the developer:
+  // `<input formcontrolname="email">`. Survives i18n, layout refactors,
+  // and form re-renders. Strongest input identity on Angular projects
+  // that don't use data-testid.
+  //
+  // Why IDENTITY tier: this is a machine-readable, developer-authored
+  // identifier — same category as `name`, `id`, `data-testid`. Confidence
+  // 0.78 sits between testId (0.80) and id (0.78) — formControlName is
+  // as durable as `name` (which is 0.70 here) but more specific because
+  // Angular forces uniqueness within a FormGroup.
+  const formControlNameAttr = (node as any).formControlName as string | undefined;
+  if (formControlNameAttr
+      && formControlNameAttr.length >= 1
+      && !node.testIdAttr
+      && !(node.id && !node.isDynamicId)) {
+    const safe = escapeCssAttrValue(formControlNameAttr);
+    locators.push({
+      strategy: 'css',
+      // Pair with tag — formControlName is unique inside one FormGroup
+      // but the same name (`email`) can appear in multiple forms on a
+      // page (login + signup). Tag pinning is a small extra guard.
+      value: `${node.tag || '*'}[formcontrolname="${safe}"]`,
+      confidence: 0.78,
+      tier: 'IDENTITY',
+    });
+  }
+
+  // Etap 1B.2 — Angular `routerLink` directive.
+  //
+  // Declarative SPA navigation — more stable than `href` because it
+  // survives origin/proxy rewrites, auth-redirect URLs, and route
+  // reorganisations. The captured value is the directive input as
+  // written in the template (`./profile`, `/curator`, `['./users', id]`
+  // — for array form Angular renders the joined string).
+  //
+  // Why STRUCTURAL tier: it's a component-routing identifier, not a
+  // test hook. Confidence 0.77 just below mat-icon[svgicon] (0.79) —
+  // routerLink can drift when routes are reorganised, but stable across
+  // origin/auth/build refactors.
+  //
+  // Skipped when stronger anchors won so we don't bloat plans on
+  // testId-rich Angular projects.
+  const routerLinkAttr = (node as any).routerLink as string | undefined;
+  if (routerLinkAttr
+      && routerLinkAttr.length >= 1
+      && routerLinkAttr.length <= 100
+      && !node.testIdAttr
+      && !(node.id && !node.isDynamicId)) {
+    const safe = escapeCssAttrValue(routerLinkAttr);
+    locators.push({
+      strategy: 'css',
+      // Pair with tag — routerLink is typically on `<a>` but Angular
+      // can also bind it to `<button>` via `[routerLink]`. Pinning to
+      // recorded tag avoids cross-tag false matches.
+      value: `${node.tag || '*'}[routerlink="${safe}"]`,
+      confidence: 0.77,
+      tier: 'STRUCTURAL',
+    });
+  }
+
+  // Etap 1B.2 — Vue scoped style attribute (`data-v-XXXXXXXX`).
+  //
+  // Captured by the recorder as the attribute NAME (value is empty —
+  // see PROBE_AT_POINT_FN: `vueScopeId = attr.name`). The attribute is
+  // shared by every element of one Vue SFC (Single File Component), so
+  // selecting `[data-v-2a3b4c5d]` narrows to the component subtree.
+  //
+  // Why STRUCTURAL: it's a build-time component identifier, not a test
+  // hook — survives content edits, fails when the component is rebuilt
+  // with different `data-v-` salt (rare but possible across major Vue
+  // upgrades).
+  //
+  // Combined with `tag` to disambiguate when the wrapper component
+  // contains multiple leaf elements of different tags. Without `tag`,
+  // `[data-v-XXX]` picks the first one (the wrapper itself).
+  //
+  // Skipped when stronger anchors (testId / id) already won so we don't
+  // bloat plans on testId-rich Vue projects.
+  const vueScopeIdAttr = (node as any).vueScopeId as string | undefined;
+  if (vueScopeIdAttr
+      && /^data-v-[a-f0-9]{6,}$/i.test(vueScopeIdAttr)
+      && !node.testIdAttr
+      && !(node.id && !node.isDynamicId)) {
+    const safeAttr = escapeCssAttrValue(vueScopeIdAttr);
+    locators.push({
+      strategy: 'css',
+      // Attribute presence selector — Vue scoped attrs have empty values
+      // by spec, so `[data-v-XXX]` (no `=`) is the correct form.
+      value: `${node.tag || '*'}[${safeAttr}]`,
+      // Below testId (0.8), id (0.78), data-row-key (0.78). Above
+      // placeholder (0.75) — vueScopeId narrows to component scope which
+      // is more discriminative than a placeholder string.
+      confidence: 0.76,
+      tier: 'STRUCTURAL',
+    });
+  }
+
+  // Etap 1B.2 — cssClass-based selector for projects with stable class
+  // conventions (BEM, Tailwind utility-stripped, design-system roots).
+  //
+  // The recorder already filters cssClass aggressively — see the token
+  // filter in PROBE_AT_POINT_FN around line 1245 of recording-capture
+  // .service.ts. By the time `cssClass` reaches the builder it has
+  // already been stripped of:
+  //   - Tailwind utilities (w-*, p-*, flex, grid, hover:, ...)
+  //   - CSS-in-JS hashes (jss\d+, sc-*, css-*, makeStyles-*)
+  //   - Vue scoped attrs (data-v-*)
+  //   - Angular runtime (ng-tns-*, ng-star-inserted, ng-touched, ...)
+  //   - BEM state suffixes (--active, --selected, ...)
+  //   - styled-components display-name hashes
+  // What's left is the element's *semantic* class — `btn-primary`,
+  // `card-header`, `tabs__item`, etc. Genuinely useful as an anchor on
+  // sites without testIds.
+  //
+  // The builder-side guard mirrors the bannedClassPatterns from
+  // locator-config.ts (and the inline regex on line 481 below for
+  // siblingIndex) — defensive double-check in case a generated class
+  // somehow slipped through the recorder filter.
+  //
+  // Why STRUCTURAL: a stable class name is a structural component
+  // identifier authored by the developer, not a test hook (would be
+  // IDENTITY) and not visible text (TEXTUAL). Confidence below
+  // vueScopeId because BEM modifiers can drift more than scoped attrs.
+  //
+  // Skipped when stronger anchors won OR when the recorder ran in a
+  // weak-resolve mode that doesn't trust class identity.
+  const cssClassRaw = (node as any).cssClass as string | undefined;
+  if (cssClassRaw
+      && !node.testIdAttr
+      && !(node.id && !node.isDynamicId)
+      && !(node as any).childTestId
+      && !(node as any).dataRowKey) {
+    // The recorder may stash up to 3 tokens space-joined. Take the first
+    // — it is the most specific (recorder ordering puts longest / most
+    // unique first via the surrounding token filter).
+    const firstCls = cssClassRaw.split(/\s+/)[0];
+    // Etap 1B.3 — defensive class filter via shared config (was inline regex).
+    // Recorder already strips most generated classes; this catches anything
+    // that slipped through plus per-workspace bannedClassPatterns overrides.
+    if (firstCls && firstCls.length >= 2 && firstCls.length <= 60 && !isClassBanned(firstCls, config)) {
+      const safeCls = escapeCssAttrValue(firstCls);
+      locators.push({
+        strategy: 'css',
+        // Pair class with tag so `.btn` doesn't pick the first <a> on
+        // the page when the recorded element was a <button>.
+        value: `${node.tag || '*'}.${safeCls}`,
+        // Below vueScopeId (0.76) and id-attr (0.78). Above siblingIndex
+        // (0.62) and bare text (0.7) — class identity is more durable
+        // than position, less than scoped attrs.
+        confidence: 0.66,
+        tier: 'STRUCTURAL',
+      });
+    }
   }
 
   // V22 Pkg5: nearestRowText — descriptor-poor row checkboxes/buttons.
@@ -430,12 +611,14 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         strategy: 'css',
         value: `tr:has-text("${safeText}") ${tagPart}`,
         confidence: 0.73,
+        tier: 'CONTEXTUAL',
       });
       // Same idea for li-based grids (no <tr>).
       locators.push({
         strategy: 'css',
         value: `li:has-text("${safeText}") ${tagPart}`,
         confidence: 0.68,
+        tier: 'CONTEXTUAL',
       });
     }
   }
@@ -456,15 +639,15 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
     // optional without polluting the type with a fingerprint-only field.
     const rawCls = (node as any).cssClass;
     const cls = typeof rawCls === 'string' && rawCls.length > 0 ? rawCls.split(/\s+/)[0] : '';
-    // Reuse the same skip-rx as probe — keep selectors symmetric.
-    const skipRx = /^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/;
-    if (cls && cls.length >= 2 && !skipRx.test(cls)) {
+    // Etap 1B.3 — class filter via shared config (was inline regex).
+    if (cls && cls.length >= 2 && !isClassBanned(cls, config)) {
       const safeCls = escapeCssAttrValue(cls);
       // CSS :nth-of-type is 1-indexed; siblingIndex is 0-indexed → +1.
       locators.push({
         strategy: 'css',
         value: `.${safeCls}:nth-of-type(${idx + 1})`,
         confidence: 0.62,
+        tier: 'POSITIONAL',
       });
     }
   }
@@ -502,6 +685,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       // Below testId (0.8) and id (0.78) — alt drifts when designers
       // rename, but it's stable enough for nav/brand images.
       confidence: 0.74,
+      tier: 'SEMANTIC',
     });
   }
 
@@ -542,6 +726,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           // Slightly above the substring variant — endsWith is stricter
           // and faster, but we don't want to outrank testId / id / role.
           confidence: 0.74,
+          tier: 'STRUCTURAL',
         });
       }
       locators.push({
@@ -550,6 +735,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // Below testId (0.8) — paths get reorganised more often than
         // testIds, but they survive copy-edits to the visible label.
         confidence: 0.72,
+        tier: 'STRUCTURAL',
       });
     }
   }
@@ -594,6 +780,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // scope is what makes the fingerprint validate (tag matches
         // recorded). Below testId (0.8) — testIds win when present.
         confidence: 0.78,
+        tier: 'STRUCTURAL',
       });
     }
   }
@@ -629,6 +816,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // dropped/refactored more often than custom-element wrappers.
         // Above bare-wrapper (0.75) for the same reason: tag pinned.
         confidence: 0.76,
+        tier: 'STRUCTURAL',
       });
     }
   }
@@ -655,6 +843,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // component type; below testId (0.8) since custom-element names
         // can be renamed during refactors.
         confidence: 0.75,
+        tier: 'STRUCTURAL',
       });
     }
   }
@@ -686,6 +875,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // brittle than a section heading — sibling text re-orders more
         // often than container titles do.
         confidence: 0.73,
+        tier: 'CONTEXTUAL',
       });
     }
   }
@@ -700,6 +890,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `[data-bs-toggle="${safeToggle}"][data-bs-target="${safeTarget}"]`,
       confidence: 0.76,
+      tier: 'STRUCTURAL',
     });
   } else if ((node as any).bsTarget) {
     // Target alone is usually unique (CSS selector pointing to specific element).
@@ -708,6 +899,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `[data-bs-target="${safeTarget}"]`,
       confidence: 0.72,
+      tier: 'STRUCTURAL',
     });
   }
 
@@ -717,6 +909,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'placeholder',
       value: node.placeholder,
       confidence: 0.75,
+      tier: 'SEMANTIC',
     });
   }
 
@@ -731,6 +924,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `${node.tag || '*'}[alt="${safeAlt}"]`,
       confidence: 0.73,
+      tier: 'SEMANTIC',
     });
   }
 
@@ -745,6 +939,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         strategy: 'label',
         value: node.ariaLabel,
         confidence: 0.8,
+        tier: 'SEMANTIC',
       });
     }
   }
@@ -756,6 +951,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `${node.tag || '*'}[name="${safeName}"]`,
       confidence: 0.7,
+      tier: 'IDENTITY',
     });
   }
 
@@ -765,6 +961,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'title',
       value: node.title,
       confidence: 0.7,
+      tier: 'SEMANTIC',
     });
   }
 
@@ -793,6 +990,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'text',
       value: fragmentValue,
       confidence: 0.78,
+      tier: 'TEXTUAL',
     });
     firstFragmentTextAdded = true;
     if (node.tag) {
@@ -804,6 +1002,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         // ARE duplicates, but for unique-text pages the bare match is
         // already correct and a degree faster on Playwright's end.
         confidence: 0.76,
+        tier: 'TEXTUAL',
       });
     }
   }
@@ -831,6 +1030,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
         strategy: 'text',
         value: node.text,
         confidence: 0.7,
+        tier: 'TEXTUAL',
       });
       textStrategyAdded = true;
     }
@@ -886,12 +1086,14 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           strategy: 'css',
           value: `[role="${escLandmark}"] >> ${tokenChainInner}`,
           confidence: 0.80,
+          tier: 'CONTEXTUAL',
         });
       }
       locators.push({
         strategy: 'css',
         value: `[role="${escLandmark}"] >> text="${escText}"`,
         confidence: 0.78,
+        tier: 'CONTEXTUAL',
       });
       // Tag-form fallback when the page uses semantic HTML elements
       // without an explicit role attr (`<main>` instead of `<div role="main">`).
@@ -903,6 +1105,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           strategy: 'css',
           value: `${node.nearestLandmark.toLowerCase()} >> text="${escText}"`,
           confidence: 0.76,
+          tier: 'CONTEXTUAL',
         });
       }
     }
@@ -924,6 +1127,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
             strategy: 'css',
             value: `:has-text("${escTitle}") >> ${tokenChainInner}`,
             confidence: 0.76,
+            tier: 'CONTEXTUAL',
           });
         }
         locators.push({
@@ -934,6 +1138,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
           // section heading may be edited, while landmark roles are
           // structural).
           confidence: 0.74,
+          tier: 'CONTEXTUAL',
         });
       }
     }
@@ -949,6 +1154,7 @@ async function buildLocatorChain(node: InteractiveNode): Promise<LocatorEntry[]>
       strategy: 'css',
       value: `${node.tag}[data-testid="${safeTestId}"]`,
       confidence: 0.65,
+      tier: 'IDENTITY',
     });
   }
 
@@ -1006,6 +1212,12 @@ function buildTargetFingerprint(node: InteractiveNode): TargetFingerprint {
     arrowDir: (node as any).arrowDir,
     // V22 Pkg4: iconLabel pass-through.
     iconLabel: (node as any).iconLabel,
+    // Etap 1B.2 — Angular routerLink + formControlName. Persisted into
+    // the fingerprint so quickFingerprintCheck at replay can score
+    // identity drift (rename of `formcontrolname="email"` → `email-input`
+    // is detected as a real change, not silently absorbed).
+    routerLink: (node as any).routerLink,
+    formControlName: (node as any).formControlName,
     ariaState: Object.keys(ariaState).length > 0 ? ariaState : undefined,
   };
 }
@@ -1071,6 +1283,165 @@ const COMPILED_VERSION = '1.0.0';
 const RESOLVER_VERSION = '3.0.0';
 
 /**
+ * Etap 1A — Build-time validation phase.
+ *
+ * For each locator in the plan, ask Playwright `count()` on the LIVE recorded
+ * page. The result populates `matchCount` + `validated` on each entry, which
+ * downstream sortAndCap uses to drop dead locators (count==0) and to push
+ * unique matches (count==1) to the front of their tier.
+ *
+ * Symmetry guarantee: uses the same `buildStrategyLocator` as the executor.
+ * Anything the executor will resolve at replay, the builder validates here.
+ *
+ * Budget — total cap 1000ms, per-locator cap 200ms. On long pages or under
+ * load these caps fire silently: matchCount stays undefined, validated=false,
+ * and sortAndCap treats the entry as best-effort. The plan can never get
+ * stuck waiting on validation.
+ */
+async function validateOnPage(
+  plan: LocatorEntry[],
+  page: Page,
+  config: LocatorConfig,
+): Promise<LocatorEntry[]> {
+  const startedAt = Date.now();
+  const PER_LOCATOR_MS = 200;
+  // Defensive: a malformed config (deserialised partial JSON, hand-built
+  // override forgetting `thresholds`) shouldn't crash the build. Fall back
+  // field-by-field to defaults — same protection lives in sortAndCap.
+  const thresholds = config.thresholds ?? DEFAULT_LOCATOR_CONFIG.thresholds;
+  const maxAmbiguous = thresholds.maxAmbiguous ?? DEFAULT_LOCATOR_CONFIG.thresholds.maxAmbiguous;
+
+  const results = await Promise.all(
+    plan.map(async (entry) => {
+      // Guard: 'role' strategy without `roleName` would fall through in
+      // buildStrategyLocator to scope.locator(entry.value), which treats
+      // the accessible name (e.g. "Save") as a CSS selector — that always
+      // returns 0 and would mark the entry as dead even though it might
+      // be resolvable at replay through a different strategy. Skip count
+      // entirely; sortAndCap keeps it (matchCount undefined, drop only
+      // fires on explicit 0).
+      if (entry.strategy === 'role' && !entry.roleName) {
+        return { ...entry, validated: false };
+      }
+      const locator = buildStrategyLocator(page, entry);
+      if (!locator) {
+        // Unknown strategy — neither validate nor count. validated stays
+        // false; matchCount stays undefined so sortAndCap doesn't drop it
+        // (drop only on explicit matchCount === 0).
+        return { ...entry, validated: false };
+      }
+      const count = await safeCountWithTimeout(locator, PER_LOCATOR_MS);
+      // count: ≥0 actual, -1 timeout, 0 also returned on throw
+      // We can't distinguish "0 matches" from "0 due to throw" cheaply —
+      // both downgrade the locator the same way (validated=false, drop).
+      return {
+        ...entry,
+        matchCount: count >= 0 ? count : undefined,
+        validated: count > 0,
+      };
+    }),
+  );
+
+  const valid = results.filter((r) => r.validated).length;
+  const unique = results.filter((r) => r.matchCount === 1).length;
+  const dead = results.filter((r) => r.matchCount === 0).length;
+  const ambiguous = results.filter((r) => typeof r.matchCount === 'number' && r.matchCount > maxAmbiguous).length;
+  logger.info('[LOCATOR_PLAN_BUILDER] Validation phase', {
+    total: plan.length,
+    valid,
+    unique,
+    dead,
+    ambiguous,
+    maxAmbiguous,
+    durationMs: Date.now() - startedAt,
+  });
+
+  return results;
+}
+
+// Etap 1B.3 — thresholds moved to LocatorConfig.thresholds:
+//   maxLocatorsTotal — final plan size cap
+//   maxPerTier       — diversity cap per tier
+//   maxAmbiguous     — drop entries matching > N live elements
+// Defaults still 10 / 2 / 5 (see DEFAULT_LOCATOR_CONFIG); per-workspace
+// overrides will land in 1B.3+ once persistence is wired.
+
+/**
+ * Etap 1A — Sort and cap.
+ *
+ * Order rules (most → least important):
+ *   1. tier ASC (IDENTITY before SEMANTIC before STRUCTURAL …)
+ *   2. matchCount === 1 first (unique matches), then ASC count, undefined last
+ *   3. preserve original index on full tie (stable sort)
+ *
+ * Cap rules:
+ *   - drop entries with matchCount === 0 (dead locators)
+ *   - keep at most config.thresholds.maxPerTier per tier (diversity)
+ *   - keep at most config.thresholds.maxLocatorsTotal overall
+ *
+ * Fallback:
+ *   - if every locator dropped (all count===0) AND raw plan was non-empty,
+ *     return the top-3 raw entries with validated=false. This protects
+ *     against transient page state where the validation phase fired during
+ *     a re-render and saw nothing — better to ship a best-effort plan than
+ *     no plan at all. The executor will treat unverified plans as soft.
+ */
+function sortAndCap(plan: LocatorEntry[], config: LocatorConfig): LocatorEntry[] {
+  // Defensive: see validateOnPage — partial config shouldn't crash.
+  const tDefault = DEFAULT_LOCATOR_CONFIG.thresholds;
+  const t = config.thresholds ?? tDefault;
+  const maxAmbiguous = t.maxAmbiguous ?? tDefault.maxAmbiguous;
+  const maxLocatorsTotal = t.maxLocatorsTotal ?? tDefault.maxLocatorsTotal;
+  const maxPerTier = t.maxPerTier ?? tDefault.maxPerTier;
+
+  // 1. Drop count===0 (dead) and count>maxAmbiguous (way too generic).
+  // 2..maxAmbiguous pass through — small ambiguity is recoverable via
+  // fingerprint match at replay. matchCount undefined (timeout / not
+  // validated) also passes through as best-effort.
+  const alive = plan.filter((l) => {
+    if (l.matchCount === 0) return false;
+    if (typeof l.matchCount === 'number' && l.matchCount > maxAmbiguous) return false;
+    return true;
+  });
+
+  if (alive.length === 0 && plan.length > 0) {
+    return plan.slice(0, 3).map((l) => ({ ...l, validated: false }));
+  }
+
+  // 2. Sort: tier, then unique-first, then count ASC, then original index
+  const indexed = alive.map((l, i) => ({ l, i }));
+  indexed.sort((a, b) => {
+    const ta = TIER_ORDER[a.l.tier ?? 'POSITIONAL'];
+    const tb = TIER_ORDER[b.l.tier ?? 'POSITIONAL'];
+    if (ta !== tb) return ta - tb;
+
+    const aUnique = a.l.matchCount === 1 ? 0 : 1;
+    const bUnique = b.l.matchCount === 1 ? 0 : 1;
+    if (aUnique !== bUnique) return aUnique - bUnique;
+
+    const ac = a.l.matchCount ?? Number.POSITIVE_INFINITY;
+    const bc = b.l.matchCount ?? Number.POSITIVE_INFINITY;
+    if (ac !== bc) return ac - bc;
+
+    return a.i - b.i;
+  });
+
+  // 3. Cap maxPerTier + maxLocatorsTotal (from config.thresholds)
+  const perTier = new Map<LocatorTier, number>();
+  const kept: LocatorEntry[] = [];
+  for (const { l } of indexed) {
+    const t = (l.tier ?? 'POSITIONAL') as LocatorTier;
+    const used = perTier.get(t) ?? 0;
+    if (used >= maxPerTier) continue;
+    perTier.set(t, used + 1);
+    kept.push(l);
+    if (kept.length >= maxLocatorsTotal) break;
+  }
+
+  return kept;
+}
+
+/**
  * Locator Plan Builder Service
  */
 export class LocatorPlanBuilder {
@@ -1095,8 +1466,25 @@ export class LocatorPlanBuilder {
     snapshotRef?: string;
     screenshotRef?: string;
     pageSignature?: string;
+    /**
+     * Etap 1A — Live page for build-time `count()` validation. Optional:
+     * when absent (e.g. plan rebuilt from a stored artifact, or test
+     * harness without a browser) the validate phase is skipped and the
+     * raw plan from `buildLocatorChain` is returned with `unverified=true`.
+     */
+    page?: Page;
+    /**
+     * Etap 1B.3 — Locator config for thresholds + banned attribute/class
+     * lists. Optional; falls back to `DEFAULT_LOCATOR_CONFIG` when caller
+     * doesn't supply a workspace/test-case override. Tests without a
+     * config still work because the resolver tier (tier-priority sort,
+     * `count()` validation) is config-independent at the algorithm level
+     * — only the cap thresholds and ban-lists differ.
+     */
+    config?: LocatorConfig;
   }): Promise<CompiledStepPlan> {
-    const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef, pageSignature } = params;
+    const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef, pageSignature, page } = params;
+    const config = params.config ?? DEFAULT_LOCATOR_CONFIG;
 
     logger.debug('[LOCATOR_PLAN_BUILDER] Building compiled plan', {
       stepId: step.id,
@@ -1105,15 +1493,16 @@ export class LocatorPlanBuilder {
       nodeRole: resolvedNode.role,
       nodeRef: resolvedNode.ref,
       hasPageSignature: !!pageSignature,
+      hasPage: !!page,
     });
 
     // Build locator chain (primary + fallbacks). Async since V25: the
     // chain may consult the LLM-backed token extractor for long-text
     // labels without structural anchors. On testId-rich elements the
     // function returns synchronously fast (no LLM call).
-    const locatorPlan = await buildLocatorChain(resolvedNode);
+    const rawPlan = await buildLocatorChain(resolvedNode, config);
 
-    if (locatorPlan.length === 0) {
+    if (rawPlan.length === 0) {
       logger.warn('[LOCATOR_PLAN_BUILDER] Empty locator plan — element has no durable selectors', {
         stepId: step.id,
         tag: resolvedNode.tag,
@@ -1127,6 +1516,31 @@ export class LocatorPlanBuilder {
         isIconButton: resolvedNode.isIconButton,
         title: resolvedNode.title?.slice(0, 50),
       });
+    }
+
+    // Etap 1A — validateOnPage + sortAndCap.
+    //
+    // When `page` is available AND we have raw locators, run live `count()`
+    // on each one to populate matchCount/validated. sortAndCap then orders
+    // by tier + uniqueness, drops dead locators, and caps the final plan.
+    //
+    // When `page` is absent: skip validation, fall through to sortAndCap
+    // which still applies tier order + cap, marks plan unverified.
+    let locatorPlan: LocatorEntry[];
+    let unverified: boolean;
+    let validatedAt: string | undefined;
+
+    if (page && rawPlan.length > 0) {
+      const validated = await validateOnPage(rawPlan, page, config);
+      locatorPlan = sortAndCap(validated, config);
+      // Plan is unverified if not a single locator survived validation.
+      // sortAndCap's fallback path keeps top-3 with validated=false, so
+      // detecting unverified requires checking every entry's flag.
+      unverified = locatorPlan.every((l) => !l.validated);
+      validatedAt = new Date().toISOString();
+    } else {
+      locatorPlan = sortAndCap(rawPlan, config);
+      unverified = true;
     }
 
     // Build target fingerprint
@@ -1158,6 +1572,8 @@ export class LocatorPlanBuilder {
         resolverVersion: RESOLVER_VERSION,
       },
       targetFingerprint,
+      unverified,
+      validatedAt,
     };
 
     // V25: count locators that were produced by token enrichment so we can
@@ -1169,12 +1585,25 @@ export class LocatorPlanBuilder {
     const tokenChainCount = locatorPlan.filter(
       l => l.strategy === 'css' && /:has-text\([^)]*\):has-text\(/.test(l.value),
     ).length;
+    // Etap 1A — distribution by tier so we can see at a glance whether
+    // a step landed mostly on IDENTITY locators (strong) or fell back to
+    // CONTEXTUAL/POSITIONAL (descriptor-poor element). On real users this
+    // surfaces sites that need additional strategies in Etap 1B.
+    const tierDistribution: Partial<Record<LocatorTier, number>> = {};
+    for (const e of locatorPlan) {
+      if (e.tier) tierDistribution[e.tier] = (tierDistribution[e.tier] ?? 0) + 1;
+    }
     logger.info('[LOCATOR_PLAN_BUILDER] Compiled plan generated', {
       stepId: step.id,
+      rawCount: rawPlan.length,
       locatorCount: locatorPlan.length,
       primaryStrategy: locatorPlan[0]?.strategy,
+      primaryTier: locatorPlan[0]?.tier,
+      primaryMatchCount: locatorPlan[0]?.matchCount,
       primaryConfidence: locatorPlan[0]?.confidence,
       tokenChainCount,
+      tierDistribution,
+      unverified,
       compiledVersion: COMPILED_VERSION,
       resolverVersion: RESOLVER_VERSION,
     });

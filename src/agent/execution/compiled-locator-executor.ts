@@ -16,6 +16,7 @@ import {
   type CompiledStepPlan,
   type ConfidenceTier,
   type LocatorEntry,
+  type LocatorTier,
   type RuntimeSource,
   type StepRuntimeMeta,
   type TargetFingerprint,
@@ -23,13 +24,11 @@ import {
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import { CELL_SEP, normalizeText } from '@/services/testing/ui/preview/text-normalizer.util';
+import {
+  buildStrategyLocator,
+  type PageLike,
+} from '@/services/testing/ui/preview/locator-resolution.util';
 import { Frame, Locator, Page } from 'playwright';
-
-/**
- * Playwright "page-like" context that supports locator + evaluate APIs.
- * We use this to run compiled locator plans either on the main Page or inside an iframe Frame.
- */
-type PageLike = Page | Frame;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // V15: Shadow-aware locator priority
@@ -490,6 +489,13 @@ export async function quickFingerprintCheck(
       const liveText = (__norm(el?.innerText != null ? el.innerText : el?.textContent) || '').slice(0, 80) || null;
       const liveAriaControls = el?.getAttribute?.('aria-control') || el?.getAttribute?.('aria-controls') || null;
       const liveHref = el?.tagName?.toLowerCase() === 'a' ? (el?.getAttribute?.('href') || null) : null;
+      // Etap 1B.2 — Angular routerLink + formControlName. Read raw, no
+      // truncation: comparator below does an exact equality check, and
+      // the recorder already capped at 100 / 60 chars so live values that
+      // happen to be longer than recorded will mismatch by design (a
+      // route reorganisation with a longer path is a real drift).
+      const liveRouterLink = el?.getAttribute?.('routerlink') || null;
+      const liveFormControlName = el?.getAttribute?.('formcontrolname') || null;
       // ARIA state — for "click toggle while expanded" style fingerprints.
       const ae2 = el?.getAttribute?.('aria-expanded');
       const ap2 = el?.getAttribute?.('aria-pressed');
@@ -771,6 +777,9 @@ export async function quickFingerprintCheck(
         text: liveText,
         ariaControls: liveAriaControls,
         href: liveHref,
+        // Etap 1B.2 — Angular identity attributes (compared below).
+        routerLink: liveRouterLink,
+        formControlName: liveFormControlName,
         ariaState: liveAriaState,
         // V22 Pkg1: select option value + child icon testid lift.
         dataValue: liveDataValue,
@@ -886,6 +895,17 @@ export async function quickFingerprintCheck(
     if (fingerprint.href) {
       total++;
       if (element.href === fingerprint.href) matches++;
+    }
+    // Etap 1B.2 — Angular identity attributes. Each weighted as 1 because
+    // routerLink / formControlName are developer-authored identifiers, on
+    // par with `name` and `testId` in stability terms.
+    if ((fingerprint as any).routerLink) {
+      total++;
+      if ((element as any).routerLink === (fingerprint as any).routerLink) matches++;
+    }
+    if ((fingerprint as any).formControlName) {
+      total++;
+      if ((element as any).formControlName === (fingerprint as any).formControlName) matches++;
     }
 
     // ── V22: ARIA state comparison (each present-state counts as 1) ──
@@ -1131,38 +1151,30 @@ function bboxCloseScore(
  * runners-up (≥0.55 AND leads by ≥0.12). Anything closer is still reported
  * as ambiguous so the LLM can make the call on full page context.
  */
+// buildStrategyLocator + PageLike now live in locator-resolution.util.ts
+// (shared with locator-plan-builder for symmetric resolve/validate semantics).
+
 /**
- * Build a locator for a strategy entry — optionally scoped inside the
- * recorded ARIA landmark. Returns the globally-scoped locator when scoping
- * is not applicable or the scope root itself is missing, so callers never
- * need to special-case "landmark not found".
+ * Etap 1A — Resolve a locator's tier.
+ *
+ * New plans (built after the tier rollout) carry `entry.tier` directly.
+ * Legacy plans persisted before the rollout only have `confidence`; for
+ * those we infer a tier by bucketing the legacy number. The mapping mirrors
+ * the buckets the builder used when emitting strategies, so the executor
+ * orders legacy and new plans consistently.
+ *
+ * Returns 'POSITIONAL' as a safe last-resort default — affects only
+ * diagnostics ordering (executor itself iterates in plan order).
  */
-function buildStrategyLocator(
-  page: PageLike,
-  entry: LocatorEntry,
-  scope: Locator | PageLike = page,
-): Locator | null {
-  switch (entry.strategy) {
-    case 'ref':
-    case 'css':
-      return scope.locator(entry.value);
-    case 'role':
-      return entry.roleName
-        ? scope.getByRole(entry.roleName as any, { name: entry.value })
-        : scope.locator(entry.value);
-    case 'label':
-      return scope.getByLabel(entry.value);
-    case 'testId':
-      return scope.getByTestId(entry.value);
-    case 'placeholder':
-      return scope.getByPlaceholder(entry.value);
-    case 'title':
-      return scope.getByTitle(entry.value);
-    case 'text':
-      return scope.getByText(entry.value, { exact: false });
-    default:
-      return null;
-  }
+function getEntryTier(entry: LocatorEntry): LocatorTier {
+  if (entry.tier) return entry.tier;
+  const c = entry.confidence ?? 0;
+  if (c >= 0.85) return 'IDENTITY';
+  if (c >= 0.78) return 'SEMANTIC';
+  if (c >= 0.72) return 'STRUCTURAL';
+  if (c >= 0.68) return 'TEXTUAL';
+  if (c >= 0.65) return 'CONTEXTUAL';
+  return 'POSITIONAL';
 }
 
 async function tryLocatorEntry(
@@ -1359,6 +1371,14 @@ export interface CompiledExecutorTracer {
     strategy: string;
     value: string;
     confidence?: number;
+    /** Etap 1A — locator tier (IDENTITY/SEMANTIC/...) for diagnostics. */
+    tier?: string;
+    /**
+     * Etap 1A — `count()` from build-time validation. Lets the post-mortem
+     * explain "why was this strategy first?" — typically because matchCount===1
+     * pushed it ahead of ambiguous siblings within the same tier.
+     */
+    plannedMatchCount?: number;
     timeoutMs: number;
     success: boolean;
     durationMs: number;
@@ -1485,8 +1505,11 @@ export async function executeCompiledLocatorPlan(
   let attemptIdx = 0;
   for (const entry of locatorsToTry) {
     attemptIdx++;
+    const entryTier = getEntryTier(entry);
     logger.debug('[COMPILED_EXECUTOR] Trying locator', {
       strategy: entry.strategy,
+      tier: entryTier,
+      plannedMatchCount: entry.matchCount,
       value: entry.value.slice(0, 50),
       confidence: entry.confidence,
     });
@@ -1503,6 +1526,7 @@ export async function executeCompiledLocatorPlan(
         if (matchScore < 0.3) {
           logger.warn('[COMPILED_EXECUTOR] Fingerprint mismatch - element found but may be wrong', {
             strategy: entry.strategy,
+            tier: entryTier,
             matchScore: Math.round(matchScore * 100) / 100,
             fingerprint: {
               tag: compiled.targetFingerprint.tag,
@@ -1515,6 +1539,8 @@ export async function executeCompiledLocatorPlan(
             stepId: traceStepId,
             attempt: attemptIdx,
             strategy: entry.strategy,
+            tier: entryTier,
+            plannedMatchCount: entry.matchCount,
             value: entry.value.slice(0, 200),
             confidence: entry.confidence,
             timeoutMs: timeout,
@@ -1529,6 +1555,7 @@ export async function executeCompiledLocatorPlan(
 
         logger.debug('[COMPILED_EXECUTOR] Fingerprint validated', {
           strategy: entry.strategy,
+          tier: entryTier,
           matchScore: Math.round(matchScore * 100) / 100,
         });
       }
@@ -1537,6 +1564,8 @@ export async function executeCompiledLocatorPlan(
         stepId: traceStepId,
         attempt: attemptIdx,
         strategy: entry.strategy,
+        tier: entryTier,
+        plannedMatchCount: entry.matchCount,
         value: entry.value.slice(0, 200),
         confidence: entry.confidence,
         timeoutMs: timeout,
@@ -1546,6 +1575,8 @@ export async function executeCompiledLocatorPlan(
 
       logger.info('[COMPILED_EXECUTOR] Locator succeeded', {
         strategy: entry.strategy,
+        tier: entryTier,
+        plannedMatchCount: entry.matchCount,
         confidence: entry.confidence,
       });
 
@@ -1585,6 +1616,8 @@ export async function executeCompiledLocatorPlan(
       stepId: traceStepId,
       attempt: attemptIdx,
       strategy: entry.strategy,
+      tier: entryTier,
+      plannedMatchCount: entry.matchCount,
       value: entry.value.slice(0, 200),
       confidence: entry.confidence,
       timeoutMs: timeout,
@@ -1597,6 +1630,7 @@ export async function executeCompiledLocatorPlan(
 
     logger.debug('[COMPILED_EXECUTOR] Locator failed, trying next', {
       strategy: entry.strategy,
+      tier: entryTier,
       error: result.error,
     });
   }

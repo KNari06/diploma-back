@@ -167,6 +167,7 @@ function buildCacheKey(args: {
   intentText: string;
   recordedFingerprint?: TargetFingerprint;
   priorApplyHints?: BindingHints;
+  recordedDescription?: string;
   candidateRefs: string[];
   topK: number;
 }): string {
@@ -177,6 +178,10 @@ function buildCacheKey(args: {
   const bhDigest = args.priorApplyHints
     ? hash16(JSON.stringify(args.priorApplyHints))
     : '';
+  // Etap 1D.4 — recordedDescription participates in the cache key so two
+  // recordings with the same intent text but different captured-time
+  // descriptions don't collide on a stale prune result.
+  const descDigest = args.recordedDescription ? hash16(args.recordedDescription) : '';
   // Hash the truncated intent (matches the prompt cap of 500 chars) so
   // intent texts that differ only past the cap hit the same cache slot —
   // they produce identical prompts.
@@ -192,6 +197,7 @@ function buildCacheKey(args: {
     intentHash,
     fpDigest,
     bhDigest,
+    descDigest,
     refsHash,
     String(args.topK),
   ].join('|');
@@ -284,6 +290,7 @@ function buildPrompt(args: {
   actionType: string;
   recordedFingerprint?: TargetFingerprint;
   priorApplyHints?: BindingHints;
+  recordedDescription?: string;
   candidates: PrunerCandidate[];
 }): { system: string; user: string } {
   const system = SYSTEM_PROMPT.replace(/\{TOP_K\}/g, String(args.topK));
@@ -324,12 +331,20 @@ function buildPrompt(args: {
     ? `\nPRIOR APPLY HINTS:\n${hintsLines.join('\n').slice(0, 200)}\n`
     : '';
 
+  // Etap 1D.4 — recordedDescription as a soft hint here too. Pruner runs
+  // BEFORE the main resolver, so dropping the right candidate at this
+  // stage is irrecoverable. Description helps the model keep the right
+  // one in the top-K when intent text alone is generic.
+  const descBlock = args.recordedDescription
+    ? `\nRECORDED DESCRIPTION:\n"${args.recordedDescription.replace(/"/g, '\\"').slice(0, 200)}"\n`
+    : '';
+
   const candidateLines = args.candidates
     .map((c, i) => `${i + 1}. ref="${c.node.ref}" <${c.node.tag}> ${c.candidateText.slice(0, 280)}`)
     .join('\n');
 
   const user = `INTENT: "${args.intentText.slice(0, INTENT_PROMPT_CAP)}"
-ACTION: ${args.actionType}${recordedBlock}${hintsBlock}
+ACTION: ${args.actionType}${recordedBlock}${hintsBlock}${descBlock}
 CANDIDATES (${args.candidates.length}):
 ${candidateLines}
 
@@ -400,6 +415,14 @@ export async function pruneCandidatesViaLLM(params: {
   pageSignature: string;
   recordedFingerprint?: TargetFingerprint;
   priorApplyHints?: BindingHints;
+  /**
+   * Etap 1D.4 — Natural-language description of the recorded element
+   * (generated at capture time). Soft hint to help the pruner keep the
+   * right candidate in the top-K when intent text is generic. Without
+   * this the pruner can drop the target before the main resolver ever
+   * sees it — irrecoverable.
+   */
+  recordedDescription?: string;
   topK?: number;
   mode?: 'apply' | 'heal';
 }): Promise<PrunerResult> {
@@ -454,6 +477,7 @@ export async function pruneCandidatesViaLLM(params: {
     intentText: params.intentText,
     recordedFingerprint: params.recordedFingerprint,
     priorApplyHints: params.priorApplyHints,
+    recordedDescription: params.recordedDescription,
     candidateRefs,
     topK,
   });
@@ -485,6 +509,7 @@ export async function pruneCandidatesViaLLM(params: {
         actionType: params.actionType,
         recordedFingerprint: params.recordedFingerprint,
         priorApplyHints: params.priorApplyHints,
+        recordedDescription: params.recordedDescription,
         candidates: params.candidates,
       });
       const response = await withAILogFields(

@@ -182,6 +182,10 @@ export interface InteractiveNode {
    * instance marker; narrows cross-redesign matches in Vue apps.
    */
   vueScopeId?: string;
+  /** Etap 1B.2 — Angular `routerLink` directive value. */
+  routerLink?: string;
+  /** Etap 1B.2 — Angular reactive-forms `formControlName`. */
+  formControlName?: string;
   /**
    * V23: Compact ancestor chain summary like `header > div.icon-group > svg`
    * — see TargetFingerprint.ancestorSummary for rationale.
@@ -414,6 +418,10 @@ export interface BindingHints {
    * marker that narrows down element identity within a Vue app.
    */
   vueScopeId?: string;
+  /** Etap 1B.2 — Angular `routerLink` directive value. */
+  routerLink?: string;
+  /** Etap 1B.2 — Angular reactive-forms `formControlName`. */
+  formControlName?: string;
   /** V22: <img alt="…"> — fallback identifier for image targets. */
   alt?: string;
   /** V22: HTML name attribute (form fields). */
@@ -601,9 +609,177 @@ export interface StepEvidence {
   needsReview?: boolean;
 }
 
+/**
+ * Etap 1D.2 — Failure evidence bundle.
+ *
+ * Captured when an apply exhausts the full resolver waterfall (compiled
+ * plan failed AND lint/LLM/vision failed) so the user can debug WHY a
+ * step is broken without re-running it. Persisted in
+ * `IntentStep.failureEvidence`.
+ *
+ * Replaces silent failures: today a fully-failed apply emits a
+ * `success: false` WS result and disappears. The user sees a red toast
+ * but has no record of which strategies were tried, what the page looked
+ * like, or what the resolver thought went wrong.
+ *
+ * Capped storage:
+ *   - `attempts` keeps at most 10 most recent (oldest dropped)
+ *   - the bundle as a whole keeps the LAST failure (single object, not
+ *     a history array) — flaky steps would otherwise bloat JSONB rows
+ */
+export interface StepFailureEvidence {
+  /** ISO timestamp of when this bundle was collected. */
+  capturedAt: string;
+  /** URL at the moment of failure — for debugging cross-page drift. */
+  pageUrl: string;
+  /**
+   * V26 Batch A: WHERE in the apply pipeline did the failure originate.
+   * Top-level field (mirrored into `attempts[0].failureKind` for older
+   * consumers) so the dashboard can group/filter without iterating the
+   * attempts array. Distinct values are stable identifiers consumed by
+   * the editor's "stuck steps" widget — adding a new one is non-breaking
+   * but consumers should treat unknown values as `'other'`.
+   *
+   * Domain:
+   *   - `wait_for_timeout`            — wait_for didn't observe URL change
+   *   - `wait_for_email_failed`       — wait_for_email IMAP poll failed
+   *   - `select_no_match`             — no option matched the value
+   *   - `upload_no_file`              — file chooser missed all paths
+   *   - `navigate_failed`             — page.goto threw / 5xx
+   *   - `click_action_threw`          — Playwright click() threw
+   *   - `fake_success_guard`          — post-click verifier rejected
+   *   - `pre_click_label_mismatch`    — pre-click guard aborted
+   *   - `resolver_exhausted`          — full resolver waterfall failed
+   *   - `session_invalid`             — session/page expired or closed
+   *   - `apply_threw`                 — uncaught throw in applyStep
+   *   - `other`                       — catch-all
+   */
+  originatingStrategy?:
+    | 'wait_for_timeout'
+    | 'wait_for_email_failed'
+    | 'select_no_match'
+    | 'upload_no_file'
+    | 'navigate_failed'
+    | 'click_action_threw'
+    | 'fake_success_guard'
+    | 'pre_click_label_mismatch'
+    | 'resolver_exhausted'
+    | 'session_invalid'
+    | 'apply_threw'
+    | 'other';
+  /** Last error string from the resolver waterfall (already truncated). */
+  lastError?: string;
+  /**
+   * Number of attempts the apply took before giving up. Distinct from
+   * `attempts` (per-strategy detail) below — this is the high-level loop
+   * counter, useful when the bundle is consumed by a UI that wants
+   * "step retried 5 times before giving up" without rendering the full
+   * per-attempt list.
+   */
+  totalAttempts?: number;
+  /**
+   * Per-strategy attempt log. Cap 10 most recent. Each entry mirrors what
+   * the editor trace records but in a persisted, DB-friendly form.
+   */
+  attempts: Array<{
+    strategy: string;
+    tier?: string;
+    /** True when this attempt found an element (may still have failed verify). */
+    matched: boolean;
+    /** Why this attempt failed — `not_found` / `ambiguous` / `fingerprint_mismatch` / `verify_failed` / `error`. */
+    failureKind: string;
+    /** Locator value tried, capped at 200 chars. */
+    value?: string;
+    /** Time the attempt took (ms). */
+    durationMs?: number;
+    /** Free-form error message, capped at 200 chars. */
+    error?: string;
+  }>;
+  /**
+   * Reference to a saved screenshot (artifact storage path, NOT base64).
+   * Optional — collector best-effort tries to capture, falls through if
+   * the page is in a state that doesn't allow screenshot.
+   */
+  screenshotRef?: string;
+  /**
+   * Compact snapshot summary: how many interactive nodes were visible,
+   * top-level page heading. Lets the user see "page had 50 buttons but
+   * none matched" vs "page was empty / loading".
+   */
+  pageContext?: {
+    pageTitle?: string;
+    interactiveNodeCount?: number;
+    /** Did the recorder fingerprint at least *look* findable on this page? */
+    recordedFingerprintPresent?: boolean;
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPILED STEP PLAN (for reliable execution with fallback and heal)
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Locator tier — coarse category that drives executor probe order at replay
+ * time. Replaces the per-locator confidence number as the primary sort key.
+ *
+ * Within a tier, plan order is decided by the build-time validator (live
+ * `count()` on the recorded page): unique matches go first, ambiguous or
+ * dead matches go last or get dropped.
+ *
+ * Confidence stays as a derived legacy field for backward compat with old
+ * plans in the DB (see `tierToConfidence` helper) — the executor reads tier
+ * first and falls back to confidence-bucketing when tier is missing.
+ */
+export type LocatorTier =
+  /**
+   * Machine-readable identity authored as an identifier:
+   *   testId, id (non-dynamic), form `name`, role+accessible name,
+   *   label-for-input. Survives i18n, restyle, full re-renders.
+   */
+  | 'IDENTITY'
+  /**
+   * Accessible / human-described name:
+   *   ariaLabel (standalone), alt, title, placeholder. Authored for a11y or
+   *   UX, drifts faster than IDENTITY but stable across visual changes.
+   */
+  | 'SEMANTIC'
+  /**
+   * Component / domain attribute:
+   *   mat-icon[svgicon], data-bs-toggle/target, data-row-key, data-value,
+   *   childTestId (`:has([data-testid])`), customElementTag+leaf chains,
+   *   href anchors, icon library attrs (data-lucide / data-feather / ...).
+   */
+  | 'STRUCTURAL'
+  /**
+   * Visible text:
+   *   firstTextFragment, full text, token-chain (`:has-text("X"):has-text("Y")`),
+   *   role partial-name. Drifts on copy edits and i18n.
+   */
+  | 'TEXTUAL'
+  /**
+   * Text resolved through a structural ancestor:
+   *   landmark / containerTitle / nearText / row scope `>>` chains.
+   *   Used to disambiguate when the same text repeats elsewhere on the page.
+   */
+  | 'CONTEXTUAL'
+  /**
+   * Position in siblings — last resort:
+   *   siblingIndex + class + nth-of-type. Fragile to structural refactors.
+   */
+  | 'POSITIONAL';
+
+/**
+ * Tier comparison helper: lower number = higher priority. Plan executor and
+ * build-time sort use this to walk tiers in order, IDENTITY first.
+ */
+export const TIER_ORDER: Record<LocatorTier, number> = {
+  IDENTITY: 1,
+  SEMANTIC: 2,
+  STRUCTURAL: 3,
+  TEXTUAL: 4,
+  CONTEXTUAL: 5,
+  POSITIONAL: 6,
+};
 
 /**
  * Single locator strategy
@@ -616,8 +792,38 @@ export interface LocatorEntry {
   value: string;
   /** Optional role name for getByRole */
   roleName?: string;
-  /** Confidence score when generated (0-1) */
+  /**
+   * Confidence score (0-1).
+   *
+   * LEGACY — kept for old plans persisted before the tier rollout. New plans
+   * still populate this via `tierToConfidence(tier, matchCount)` so consumers
+   * that only check `confidence` keep working. Sort/dedup logic prefers
+   * `tier` + `matchCount` when both are present.
+   */
   confidence?: number;
+  /**
+   * Coarse priority category (Etap 1A). Optional: legacy plans in the DB
+   * predate tier and the executor falls back to confidence-bucketing for
+   * those. New plans always populate it.
+   */
+  tier?: LocatorTier;
+  /**
+   * Number of elements this locator matches on the recorded page at build
+   * time. Set by `validateOnPage` in the builder. Undefined when the builder
+   * was called without a live `page` (e.g. plan rebuilt from a stored
+   * artifact).
+   *
+   *   0  — locator dropped from plan (page validation rejected it)
+   *   1  — unique match, boosted to front of its tier
+   *   >1 — ambiguous, demoted within tier (or dropped if scoping fails)
+   */
+  matchCount?: number;
+  /**
+   * True when `validateOnPage` confirmed `matchCount > 0`. Distinct from
+   * "matchCount defined": a count of 0 explicitly invalidates a locator.
+   * False also covers timeout / throw — not the same as proven-broken.
+   */
+  validated?: boolean;
 }
 
 /**
@@ -669,6 +875,10 @@ export interface TargetFingerprint {
   href?: string;
   /** V22: Vue scoped style attribute (data-v-XXXXXXX) — narrows component instance */
   vueScopeId?: string;
+  /** Etap 1B.2 — Angular `routerLink` directive value. */
+  routerLink?: string;
+  /** Etap 1B.2 — Angular reactive-forms `formControlName`. */
+  formControlName?: string;
   /** V22: HTML name attribute (form field disambiguation). */
   name?: string;
   /**
@@ -784,6 +994,16 @@ export interface CompiledStepPlan {
   meta?: CompiledPlanMeta;
   /** Target element fingerprint (for heal comparison) */
   targetFingerprint?: TargetFingerprint;
+  /**
+   * Etap 1A — true when `validateOnPage` could not confirm any locator
+   * against the live page (all returned `count === 0`, or validation timed
+   * out / threw). Plans flagged `unverified` keep their raw locators as a
+   * best-effort fallback but the executor should weight them lower than
+   * verified plans.
+   */
+  unverified?: boolean;
+  /** Etap 1A — ISO timestamp of the last `validateOnPage` pass. */
+  validatedAt?: string;
 }
 
 /**
@@ -962,6 +1182,33 @@ export interface IntentStep {
   bindingHints?: BindingHints;
   /** Cached evidence from last execution (optimization, not truth) */
   evidence?: StepEvidence;
+  /**
+   * Etap 1D.2 — Last-failure bundle. Set when an apply exhausts the full
+   * resolver waterfall (compiled plan failed AND lint/LLM/vision failed).
+   * Single object (last failure wins, not a history array) to keep JSONB
+   * rows from bloating on chronically flaky steps.
+   *
+   * Cleared when the same step apply succeeds — see Apply path for the
+   * unset semantics. Frontend reads this to show a "needs review" badge
+   * with the failure detail.
+   */
+  failureEvidence?: StepFailureEvidence;
+  /**
+   * Etap 1D.3 — Natural-language description of the clicked/typed element,
+   * generated by an LLM at recording time. Fed to the resolver at replay
+   * as a 3rd channel alongside `recordedFingerprint` and snapshot,
+   * dramatically improving disambiguation for icon-only / descriptor-poor
+   * elements that have no text/aria-label/testId of their own.
+   *
+   * Examples:
+   *   - "the Save button inside the user profile modal"
+   *   - "the notification bell icon in the header navigation"
+   *   - "the first row's Edit button in the courses table"
+   *
+   * Capped at 120 chars at write time. Empty string and undefined both
+   * mean "no description" — caller should treat them identically.
+   */
+  recordedDescription?: string;
   /** Compiled execution plan (generated after successful apply) */
   compiled?: CompiledStepPlan;
   /**

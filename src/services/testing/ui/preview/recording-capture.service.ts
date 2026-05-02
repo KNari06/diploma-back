@@ -235,6 +235,20 @@ export interface ProbedElement {
    */
   vueScopeId?: string;
   /**
+   * Etap 1B.2 — Angular `routerLink` directive value. Declarative SPA
+   * navigation target authored by the developer; survives origin/proxy
+   * rewrites and route reorganisations more reliably than `href`. Builder
+   * emits a STRUCTURAL-tier `[routerlink="X"]` strategy when present.
+   */
+  routerLink?: string;
+  /**
+   * Etap 1B.2 — Angular reactive-forms `formControlName`. Authored
+   * identifier for a form input (`<input formcontrolname="email">`).
+   * Survives i18n and layout refactors. Builder emits an IDENTITY-tier
+   * `[formcontrolname="X"]` strategy when present.
+   */
+  formControlName?: string;
+  /**
    * V22: Nearest ARIA landmark (banner / navigation / main / complementary /
    * search / contentinfo / form). Computed from `target.closest('[role=...]')`
    * or implicit landmarks (`<header>`, `<nav>`, `<main>`, etc.). Crucial for
@@ -1322,6 +1336,28 @@ const PROBE_AT_POINT_FN = `
     }
   }
 
+  // Etap 1B.2 — Angular routerLink + formControlName.
+  // routerLink: declarative SPA navigation directive — more stable than
+  // href across origin/proxy rewrites and auth redirects.
+  // formControlName: reactive-forms identity, authored once, survives
+  // i18n and layout refactors.
+  // Both attribute names are read lowercase: getAttribute is case-
+  // insensitive in HTML but Angular emits lowercase anyway, keeping
+  // recorder symmetric with snapshot-collector.
+  var routerLinkAttr = target.getAttribute('routerlink');
+  if (routerLinkAttr !== null && routerLinkAttr.length > 0 && routerLinkAttr.length < 200) {
+    routerLinkAttr = routerLinkAttr.slice(0, 100);
+  } else {
+    routerLinkAttr = undefined;
+  }
+  var formControlNameAttr = target.getAttribute('formcontrolname');
+  if (formControlNameAttr !== null && formControlNameAttr.length > 0 && formControlNameAttr.length < 80) {
+    // Cap defensively (form control names are short identifiers).
+    formControlNameAttr = formControlNameAttr.slice(0, 60);
+  } else {
+    formControlNameAttr = undefined;
+  }
+
   // V22 Pkg1 — Fix 5: aria-current (page|step|date|true|location|time).
   // Pagination/Stepper/Breadcrumbs disambiguation: lets resolver tell apart
   // "click current page" from neighbouring page buttons that share text/role.
@@ -1891,6 +1927,9 @@ const PROBE_AT_POINT_FN = `
     siblingIndex: siblingIndexAttr,
     disabled: disabledAttr,
     arrowDir: arrowDirAttr,
+    // Etap 1B.2 — Angular routerLink + formControlName (probed above).
+    routerLink: routerLinkAttr,
+    formControlName: formControlNameAttr,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -2047,6 +2086,12 @@ const PROBE_FOCUSED_FN = `
     ref: target.getAttribute('data-agent-ref') || undefined,
     title: normProbeText(target.getAttribute('title')) || undefined,
     alt: target.getAttribute('alt') || undefined,
+    // Etap 1B.2 — Angular formControlName for focused field identity.
+    // routerLink not probed here: focused element is an input, not a link.
+    formControlName: (function () {
+      var v = target.getAttribute('formcontrolname');
+      return v && v.length > 0 && v.length < 80 ? v.slice(0, 60) : undefined;
+    })(),
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,

@@ -122,6 +122,59 @@ const wheelCoalesceState = new Map<string, {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Etap 1D.3 — Fire-and-forget LLM enrichment of a recording step.
+ *
+ * Called AFTER the synchronous `emitRecordingStep` so the UI never waits
+ * on the LLM. When the description is ready (~150-300ms cold, 0ms cached)
+ * we emit `preview:recording:step:update` with `{stepId, recordedDescription}`
+ * so the editor can show it on the existing step row.
+ *
+ * Skipped silently for:
+ *   - probed elements with no useful descriptors (`generateRecordedDescription`
+ *     returns undefined — see hasAnyDescriptor fast-skip in the service)
+ *   - LLM failures / timeouts (service swallows; we just see undefined)
+ *
+ * Never throws — the caller is fire-and-forget (`void scheduleRecordedDescription(...)`).
+ */
+function scheduleRecordedDescription(
+  socket: TypedSocket,
+  room: string,
+  previewSessionId: string,
+  step: import('@/services/testing/ui/preview/preview.types').IntentStep,
+  probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement,
+): void {
+  // setImmediate so the original emit is fully flushed before we touch
+  // the LLM. Eliminates any chance of accidentally blocking the WS write.
+  setImmediate(async () => {
+    try {
+      const { generateRecordedDescription } = await import(
+        '@/services/testing/ui/preview/recorded-description-llm.service'
+      );
+      const description = await generateRecordedDescription(probedElement);
+      if (!description) return;
+      // Emit the FULL step shape (per `preview:recording:step:update`
+      // contract — `PreviewRecordingStepPayload.step` is `PreviewIntentStep`,
+      // not a partial). Frontend replaces the row by id; sending only
+      // {id, recordedDescription} would clobber other fields with
+      // undefined.
+      socket.nsp.to(room).emit('preview:recording:step:update', {
+        previewSessionId,
+        step: { ...step, recordedDescription: description } as any,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      // Defensive — generateRecordedDescription already swallows internally,
+      // but a top-level catch here protects against import-time errors.
+      logger.warn('[RECORDING] Recorded-description hook failed', {
+        previewSessionId,
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
+/**
  * Emit a NEW recording step with inter-step delay stamping.
  * Replaces direct `socket.nsp.to(room).emit('preview:recording:step', ...)` calls.
  * Automatically computes and stamps interStepDelayMs on the step's evidence.
@@ -1820,9 +1873,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
           if (!PreviewRunService.isRunning(previewSessionId)) {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            // Etap 1D.2 — clear stale failureEvidence on success. The
+            // step that just succeeded is no longer "needs review"; the
+            // bundle from the previous failed apply would be misleading.
+            const stepToPersist = result.appliedStep.failureEvidence
+              ? { ...result.appliedStep, failureEvidence: undefined }
+              : result.appliedStep;
             const updated = await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
-              appliedStep: result.appliedStep!,
+              appliedStep: stepToPersist,
               userId: ensuredUserId,
             });
 
@@ -1839,6 +1898,61 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             socketId: socket.id,
             intentTestCaseId,
             error: persistError instanceof Error ? persistError.message : String(persistError),
+          });
+        }
+      }
+
+      // Etap 1D.2 — failure persistence + needs-review WS event.
+      //
+      // When apply fully failed AND the collector built a failureEvidence
+      // bundle, persist it to DB and emit `preview:step:needs-review`
+      // so the editor can show a badge/debug panel without re-fetching.
+      //
+      // Skipped when run is active: the run loop's batch-persist handles
+      // failure bundles too, and emitting per-step here would spam the
+      // frontend during a long run.
+      if (
+        !result.success
+        && intentTestCaseId
+        && result.appliedStep?.failureEvidence
+      ) {
+        try {
+          const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+          if (!PreviewRunService.isRunning(previewSessionId)) {
+            const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            await IntentTestCaseService.updateStepFromPreviewApply({
+              intentTestCaseId,
+              appliedStep: result.appliedStep,
+              userId: ensuredUserId,
+            });
+            logger.info('[WebSocket] Persisted failureEvidence', {
+              socketId: socket.id,
+              intentTestCaseId,
+              stepId: result.appliedStep.id,
+              attemptsLogged: result.appliedStep.failureEvidence.attempts.length,
+            });
+            socket.nsp.to(createRoomName('preview', previewSessionId)).emit('preview:step:needs-review', {
+              previewSessionId,
+              stepId: result.appliedStep.id,
+              intentTestCaseId,
+              summary: {
+                lastError: result.appliedStep.failureEvidence.lastError,
+                totalAttempts: result.appliedStep.failureEvidence.totalAttempts,
+                pageUrl: result.appliedStep.failureEvidence.pageUrl,
+                // V26 Batch A: top-level failure category — lets the editor
+                // dashboard group "stuck steps" by reason without parsing
+                // the full bundle. Non-breaking: optional, old clients
+                // ignore unknown fields.
+                originatingStrategy: result.appliedStep.failureEvidence.originatingStrategy,
+              },
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (failurePersistError) {
+          logger.error('[WebSocket] Failed to persist failureEvidence', {
+            socketId: socket.id,
+            intentTestCaseId,
+            error: failurePersistError instanceof Error ? failurePersistError.message : String(failurePersistError),
           });
         }
       }
@@ -2417,6 +2531,8 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
                     if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                    // Etap 1D.3 — fire-and-forget LLM enrichment.
+                    scheduleRecordedDescription(socket, room, previewSessionId, hoverStep, hoverElement);
                   }
                 }
               } catch {
@@ -2563,6 +2679,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               } else {
                 emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
                 if (cTrace) cTrace.writeStepCaptured(step, needsLLM ? 'click_pending_llm' : 'click');
+                // Etap 1D.3 — fire-and-forget LLM enrichment.
+                if (preClickElement) {
+                  scheduleRecordedDescription(socket, room, previewSessionId, step, preClickElement);
+                }
                 sessionService.setRecordingLastClickStep(previewSessionId, ensuredUserId, {
                   id: step.id,
                   elementSignature: clickElSignature,

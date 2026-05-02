@@ -86,6 +86,17 @@ export const AI_TASK_MODELS = {
    * drift between recordings of the same step.
    */
   stableTokens: 'gemini-2.5-flash-lite' as const,
+  /**
+   * Etap 1D.3 — Recorded element description.
+   * Generates a short NL description of the clicked element ("the Save
+   * button inside the user profile modal") at recording time. Fed to
+   * the LLM resolver at replay as a 3rd channel alongside fingerprint
+   * and snapshot. Same flash-lite tier as stableTokens — sub-second,
+   * multilingual (RU/KZ/EN), cheap, and the task is short text-in/
+   * text-out at temp=0.2 (slight creativity helps phrasing without
+   * sacrificing determinism).
+   */
+  recordedDescription: 'gemini-2.5-flash-lite' as const,
   /** AI check assertion evaluation */
   aiCheck: AI_MODELS.fast,
   /** AI check with screenshot (needs vision) */

@@ -2466,6 +2466,18 @@ export class SnapshotCollector {
               siblingIndex,
               disabled: disabledLive,
               arrowDir: arrowDirLive,
+              // Etap 1B.2 — Angular routerLink + formControlName. Symmetry
+              // contract with PROBE_AT_POINT_FN (recording-capture.service.ts)
+              // — both sides must read these the same way or the resolver
+              // fingerprint mismatches at replay.
+              routerLink: (function () {
+                const v = el.getAttribute('routerlink');
+                return v && v.length > 0 && v.length < 200 ? v.slice(0, 100) : undefined;
+              })(),
+              formControlName: (function () {
+                const v = el.getAttribute('formcontrolname');
+                return v && v.length > 0 && v.length < 80 ? v.slice(0, 60) : undefined;
+              })(),
               // Validation state
               required: required || undefined,
               readOnly: readOnly || undefined,

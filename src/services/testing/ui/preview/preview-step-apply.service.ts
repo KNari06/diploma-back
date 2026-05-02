@@ -26,6 +26,7 @@ import type {
     InteractiveNode,
     LintCandidate,
     ResolutionMeta,
+    StepFailureEvidence,
     TargetFingerprint,
     UrlMatcher,
 } from './preview.types';
@@ -91,6 +92,37 @@ function shouldUpgradeCompiledPlan(
   if (candidateRank > existingRank) return true;
 
   return false;
+}
+
+/**
+ * Etap 1D.1 — Derive `planQuality` for the apply result from the compiled
+ * plan that was just persisted. Returns `undefined` when the plan is fine
+ * (validation confirmed at least one locator) so the WS payload stays
+ * minimal on the happy path.
+ *
+ * `unverified` is set by `LocatorPlanBuilder.buildCompiledPlan` when:
+ *   - validation phase ran but every entry came back validated=false
+ *     (page navigated mid-build, all `count()` returned 0/timeout); OR
+ *   - validation was skipped entirely (no `page` available, e.g. plan
+ *     rebuilt from a stored artifact in a test harness).
+ *
+ * The reason string is best-effort — frontend doesn't parse it, only
+ * displays. Server logs the same field for metric aggregation.
+ */
+function derivePlanQuality(
+  compiled: CompiledStepPlan | undefined,
+): { unverified: boolean; reason?: string } | undefined {
+  if (!compiled) return undefined;
+  if (!compiled.unverified) return undefined;
+  // validatedAt missing => validation phase didn't run (e.g. page absent).
+  // validatedAt present + unverified => validation ran but produced no live
+  // matches — typically a re-rendering page or a fresh-replay scenario.
+  if (!compiled.validatedAt) {
+    return { unverified: true, reason: 'validation_skipped' };
+  }
+  const allDead = compiled.locatorPlan.every((l) => l.matchCount === 0);
+  if (allDead) return { unverified: true, reason: 'all_locators_dead' };
+  return { unverified: true, reason: 'no_validated_locators' };
 }
 
 /**
@@ -163,6 +195,12 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
   if (typeof (node as any).siblingIndex === 'number') (hints as any).siblingIndex = (node as any).siblingIndex;
   if ((node as any).disabled !== undefined) (hints as any).disabled = (node as any).disabled;
   if ((node as any).arrowDir) (hints as any).arrowDir = (node as any).arrowDir;
+
+  // Etap 1B.2 — Angular routerLink + formControlName. Surface to LLM
+  // resolver so the prompt can use these as "this exact form input"
+  // identity hints when text/role drift across renders.
+  if ((node as any).routerLink) (hints as any).routerLink = (node as any).routerLink;
+  if ((node as any).formControlName) (hints as any).formControlName = (node as any).formControlName;
 
   // V22: ARIA state at resolve-time. Records whether the resolved live
   // element was expanded/pressed/checked/invalid/current/etc. so the next
@@ -1243,6 +1281,20 @@ interface ApplyResult {
    * took. Use `jq '.payload.decisionTrace' run.jsonl` for inspection.
    */
   decisionTrace?: StepDecisionTrace;
+  /**
+   * Etap 1D.1 — Plan quality signal for the frontend. Set when a compiled
+   * plan was written but its build-time validation could not confirm any
+   * locator (`compiled.unverified === true`). Forwarded to the WS apply
+   * result payload so the editor can show an "unstable selectors" badge.
+   *
+   * Absent when the apply path didn't write a plan (soft-pass / non-
+   * targeting / compiled-fast-path that didn't upgrade), and on hard
+   * failures (success=false carries `error` instead).
+   */
+  planQuality?: {
+    unverified: boolean;
+    reason?: string;
+  };
 }
 
 /**
@@ -2932,6 +2984,165 @@ async function executeAction(
  */
 export class PreviewStepApplyService {
   /**
+   * V26 Batch A — Single failure-result builder for the whole apply path.
+   *
+   * Why this exists: applyStep historically had ~29 different `return {
+   * success: false, ... }` sites — wait_for timeouts, select-no-match,
+   * upload-no-file, navigate failures, fake-success rejections, etc. Only
+   * the final resolver-exhaustion path bothered to attach
+   * `failureEvidence`, so 95% of user-visible failures shipped to the UI
+   * with a bare error string and no diagnostic bundle.
+   *
+   * Centralizing here means:
+   *   1. Every failure that goes through this helper gets the same
+   *      page-state evidence (URL, title, node count, recorded
+   *      fingerprint presence) for the UI's "needs review" panel.
+   *   2. Adding a new field to the bundle is one diff, not 29.
+   *   3. The collector's try/catch is in ONE place — every caller is
+   *      shielded from collector throws.
+   *
+   * Constraints:
+   *   - Best-effort. Caller MUST be able to fail even if collector
+   *     throws — never re-throw, swallow + log.
+   *   - Don't override decisionTrace / highlight / etc. when caller
+   *     already populated them; pass-through.
+   *   - `skipBundle: true` for early failures where `page` may be
+   *     unusable (session expired, page closed) — return result with
+   *     no bundle but same shape.
+   *
+   * Not yet covered: per-attempt failure tracking. We don't yet thread
+   * each compiled-locator / lint-candidate failure into `attempts[]` —
+   * that needs the resolver loop to record per-attempt diagnostics. For
+   * now, `attempts` defaults to a single synthetic record built from the
+   * caller-provided context (originatingStrategy + matched flag).
+   */
+  private static async _buildFailureResult(opts: {
+    previewSessionId: string;
+    stepDraft: IntentStep;
+    page: Page | null;
+    error: string;
+    /**
+     * Where in the apply pipeline did this failure originate. Surfaced
+     * in the bundle so the dashboard can group/filter by failure mode
+     * instead of staring at 29 indistinguishable "step failed" rows.
+     */
+    originatingStrategy:
+      | 'wait_for_timeout'
+      | 'wait_for_email_failed'
+      | 'select_no_match'
+      | 'upload_no_file'
+      | 'navigate_failed'
+      | 'click_action_threw'
+      | 'fake_success_guard'
+      | 'pre_click_label_mismatch'
+      | 'resolver_exhausted'
+      | 'session_invalid'
+      | 'apply_threw'
+      | 'other';
+    /** Caller-provided count of attempts so far (default 1). */
+    attempts?: number;
+    /** Optional decisionTrace if caller already built one. */
+    decisionTrace?: StepDecisionTrace;
+    /** Optional highlight overlay (resolved candidates that we tried). */
+    highlight?: ApplyResult['highlight'];
+    /** Optional resolvedCandidates → seeds the attempts[] array in bundle. */
+    resolvedCandidates?: LintCandidate[];
+    /** Skip page-state collection (session/page is gone — collector would throw). */
+    skipBundle?: boolean;
+    /** Extra fields to merge into final ApplyResult (e.g. urlChanged, retried). */
+    extra?: Partial<ApplyResult>;
+  }): Promise<ApplyResult> {
+    const {
+      previewSessionId,
+      stepDraft,
+      page,
+      error,
+      originatingStrategy,
+      attempts = 1,
+      decisionTrace,
+      highlight,
+      resolvedCandidates,
+      skipBundle,
+      extra,
+    } = opts;
+
+    let failureBundle: StepFailureEvidence | undefined;
+    if (!skipBundle && page) {
+      try {
+        const { collectFailureEvidence } = await import('./failure-collector.service');
+        // sessionService is the module factory — calling getSession by ref
+        // is enough; helper is a static method so we can't use the
+        // applyStep-local `sessionService` const. Recreate factory here.
+        const sessSvc = getPreviewSessionService();
+        const sess = sessSvc.getSession(previewSessionId);
+        const interactiveNodeCount = sess?.pageState?.domNodes?.length;
+        // Synthetic attempts[] from resolved candidates (if any). When
+        // caller had no candidates (validation failure, session error)
+        // emit a single record marked with the originating strategy so
+        // the bundle is never empty.
+        const attemptRecords = (resolvedCandidates ?? []).length > 0
+          ? resolvedCandidates!.map((c) => ({
+              strategy: 'lint_candidate',
+              matched: !!c.ref,
+              failureKind: originatingStrategy,
+              value: c.ref ? `[data-agent-ref="${c.ref}"]` : undefined,
+            }))
+          : [{
+              strategy: originatingStrategy,
+              matched: false,
+              failureKind: originatingStrategy,
+            }];
+        failureBundle = await collectFailureEvidence({
+          step: stepDraft,
+          page,
+          totalAttempts: attempts,
+          originatingStrategy,
+          lastError: error,
+          attempts: attemptRecords,
+          interactiveNodeCount,
+        });
+      } catch (collectorErr) {
+        logger.warn('[PREVIEW_APPLY] Failure collector threw — skipping bundle', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          originatingStrategy,
+          error: collectorErr instanceof Error ? collectorErr.message : String(collectorErr),
+        });
+      }
+    }
+
+    // Merge logic: caller's `extra` may carry an appliedStep variant
+    // (e.g. navigate path stamps `compiled` onto stepDraft). We must
+    // PRESERVE that AND attach failureEvidence on top — losing either
+    // breaks downstream (no compiled = re-LLM next run; no bundle =
+    // silent failure to user). Resolve by deep-merging:
+    //   extra.appliedStep ?? stepDraft  → base
+    //   + failureEvidence on top         → final
+    const baseAppliedStep =
+      (extra && (extra as any).appliedStep)
+        ? (extra as any).appliedStep
+        : stepDraft;
+    const appliedStepWithFailure = failureBundle
+      ? { ...baseAppliedStep, failureEvidence: failureBundle }
+      : (extra && (extra as any).appliedStep ? baseAppliedStep : undefined);
+
+    // Strip appliedStep from extra so the spread below doesn't clobber
+    // our merged version — and retain everything else verbatim.
+    const extraWithoutAppliedStep = extra ? { ...extra } : {};
+    delete (extraWithoutAppliedStep as any).appliedStep;
+
+    return {
+      success: false,
+      error,
+      attempts,
+      ...(decisionTrace ? { decisionTrace } : {}),
+      ...(highlight ? { highlight } : {}),
+      ...extraWithoutAppliedStep,
+      ...(appliedStepWithFailure ? { appliedStep: appliedStepWithFailure } : {}),
+    };
+  }
+
+  /**
    * Apply a step in the preview session
    * Tries top candidates with limited retries
    * V3: If selectedRef is provided (from user clarification), use it directly
@@ -3167,9 +3378,26 @@ export class PreviewStepApplyService {
           });
         }
 
+        // V26 Batch A: navigate/wait/scroll failures used to ship a bare
+        // error string. Now we attach failureEvidence on failure so the UI
+        // shows page state at the moment things broke.
+        if (!result.success) {
+          return await PreviewStepApplyService._buildFailureResult({
+            previewSessionId,
+            stepDraft,
+            page,
+            error: result.error || `${stepDraft.type} failed`,
+            originatingStrategy: stepDraft.type === 'navigate' ? 'navigate_failed' : 'other',
+            attempts: 1,
+            extra: {
+              appliedStep: { ...stepDraft, compiled },
+              urlChanged: result.urlChanged,
+              url: page.url(),
+            },
+          });
+        }
         return {
-          success: result.success,
-          error: result.error,
+          success: true,
           appliedStep: {
             ...stepDraft,
             compiled,
@@ -3287,16 +3515,24 @@ export class PreviewStepApplyService {
             waitForUrlBefore: urlBefore,
           };
         } catch (error) {
-          return {
-            success: false,
+          // V26 Batch A: was silent failure — returns error string with no
+          // failureEvidence. UI sees "wait_for failed" with no page state.
+          // Now collects screenshot/HTML/console at the moment of timeout.
+          return await PreviewStepApplyService._buildFailureResult({
+            previewSessionId,
+            stepDraft,
+            page,
             error: error instanceof Error ? error.message : 'wait_for failed',
-            urlChanged: urlBefore !== page.url(),
-            url: page.url(),
+            originatingStrategy: 'wait_for_timeout',
             attempts: 1,
-            waitForBranch: slowPathBranch,
-            waitForChangedFrom: matcher?.changedFrom,
-            waitForUrlBefore: urlBefore,
-          };
+            extra: {
+              urlChanged: urlBefore !== page.url(),
+              url: page.url(),
+              waitForBranch: slowPathBranch,
+              waitForChangedFrom: matcher?.changedFrom,
+              waitForUrlBefore: urlBefore,
+            },
+          });
         }
       }
 
@@ -3801,6 +4037,7 @@ export class PreviewStepApplyService {
                 resolvedNode,
                 pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
+                page,
               });
             } catch (compileError) {
               logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for user-confirmed selection', {
@@ -3845,6 +4082,23 @@ export class PreviewStepApplyService {
             compiled, // NEW: compiled execution plan
           };
 
+          const planQuality = derivePlanQuality(compiled);
+          if (planQuality?.unverified) {
+            logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              reason: planQuality.reason,
+              path: 'user_confirmed',
+            });
+            try {
+              EditorTraceService.get(previewSessionId)?.writePlanQuality({
+                stepId: stepDraft.id,
+                unverified: true,
+                reason: planQuality.reason,
+                path: 'user_confirmed',
+              });
+            } catch { /* trace is advisory */ }
+          }
           return {
             success: true,
             appliedStep: updatedStep,
@@ -3855,6 +4109,7 @@ export class PreviewStepApplyService {
               type: 'success',
             }],
             attempts: 1,
+            planQuality,
           };
         }
 
@@ -4233,6 +4488,7 @@ export class PreviewStepApplyService {
                         pageUrl: page.url(),
                         pageTitle: await page.title().catch(() => undefined),
                         pageSignature: sess?.lastPageSignature,
+                        page,
                       });
                       if (shouldUpgradeCompiledPlan(stepDraft.compiled, candidatePlan)) {
                         logger.info('[PREVIEW_APPLY] Upgraded compiled plan on fast-path success', {
@@ -4387,6 +4643,23 @@ export class PreviewStepApplyService {
                   decisionTrace.chosen = { ref: compiledRef };
                 }
                 setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+                const planQuality = derivePlanQuality(upgradedCompiled);
+                if (planQuality?.unverified) {
+                  logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
+                    previewSessionId,
+                    stepId: stepDraft.id,
+                    reason: planQuality.reason,
+                    path: 'compiled_fast_path_upgrade',
+                  });
+                  try {
+                    EditorTraceService.get(previewSessionId)?.writePlanQuality({
+                      stepId: stepDraft.id,
+                      unverified: true,
+                      reason: planQuality.reason,
+                      path: 'compiled_fast_path_upgrade',
+                    });
+                  } catch { /* trace is advisory */ }
+                }
                 return {
                   success: true,
                   appliedStep: updatedStep,
@@ -4394,6 +4667,7 @@ export class PreviewStepApplyService {
                   url: page.url(),
                   attempts: 1,
                   decisionTrace,
+                  planQuality,
                 };
               }
             }
@@ -5008,21 +5282,29 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
-            return {
-              success: false,
+            // V26 Batch A: pre-click label-mismatch guard — same evidence
+            // collection as the post-click fake-success guards above.
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
               error: `[wrong-element] Resolver wanted to click "${chosenLabelForGuard.slice(0, 60)}" for step targeting "${recordedLabelForGuard.slice(0, 60)}" — labels share no meaningful words. Click aborted to avoid side-effects. Refine the step description, or re-record so a structural fingerprint anchors the target.`,
+              originatingStrategy: 'pre_click_label_mismatch',
               attempts,
+              decisionTrace,
               highlight: [{
                 ref: candidate.ref,
                 boundingBox: candidate.boundingBox,
                 type: 'error' as const,
               }],
-              chosenRef: candidate.ref,
-              chosenLabel: chosenLabelForGuard,
-              chosenBoundingBox: candidate.boundingBox,
-              resolverPath: lintResult.resolverPath,
-              decisionTrace,
-            };
+              resolvedCandidates: [candidate],
+              extra: {
+                chosenRef: candidate.ref,
+                chosenLabel: chosenLabelForGuard,
+                chosenBoundingBox: candidate.boundingBox,
+                resolverPath: lintResult.resolverPath,
+              },
+            });
           }
         }
         // Suppress unused-variable lint when guard didn't fire.
@@ -5318,6 +5600,7 @@ export class PreviewStepApplyService {
                 pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
                 pageSignature,
+                page,
               });
               logger.debug('[PREVIEW_APPLY] Compiled plan generated', {
                 stepId: stepDraft.id,
@@ -5655,23 +5938,32 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
-            return {
-              success: false,
+            // V26 Batch A: fake-success rejection — was silent (no bundle).
+            // Now collects evidence so the dashboard can show the wrong
+            // element + page state to the user.
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the recorded target had id="${stepDraft.recordedFingerprint?.elementId || stepDraft.recordedFingerprint?.testIdAttr}". The click only triggered a ${clickEffectSignal || 'no'} change, not a real navigation/dialog/state update — almost certainly a fake-success. Refine the step description or check that the recorded id still exists on the page.`,
+              originatingStrategy: 'fake_success_guard',
               attempts,
+              decisionTrace,
               highlight: [{
                 ref: candidate.ref,
                 boundingBox: candidate.boundingBox,
                 type: 'error' as const,
               }],
-              clickEffectSignal,
-              chosenRef: candidate.ref,
-              chosenLabel,
-              chosenBoundingBox: candidate.boundingBox,
-              fingerprintMatch,
-              resolverPath: lintResult.resolverPath,
-              decisionTrace,
-            };
+              resolvedCandidates: [candidate],
+              extra: {
+                clickEffectSignal,
+                chosenRef: candidate.ref,
+                chosenLabel,
+                chosenBoundingBox: candidate.boundingBox,
+                fingerprintMatch,
+                resolverPath: lintResult.resolverPath,
+              },
+            });
           }
 
           // Label-based fallback guard for steps recorded BEFORE
@@ -5975,23 +6267,31 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
-            return {
-              success: false,
+            // V26 Batch A: label-mismatch fake-success rejection — same
+            // bundle treatment as the fingerprint-mismatch sibling above.
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the step targets "${recordedLabel.slice(0, 60)}". The click only triggered a ${clickEffectSignal || 'no'} change, and the labels share no meaningful words — almost certainly a fake-success. Re-record the step so a structural fingerprint is captured, or refine the step description.`,
+              originatingStrategy: 'fake_success_guard',
               attempts,
+              decisionTrace,
               highlight: [{
                 ref: candidate.ref,
                 boundingBox: candidate.boundingBox,
                 type: 'error' as const,
               }],
-              clickEffectSignal,
-              chosenRef: candidate.ref,
-              chosenLabel,
-              chosenBoundingBox: candidate.boundingBox,
-              fingerprintMatch,
-              resolverPath: lintResult.resolverPath,
-              decisionTrace,
-            };
+              resolvedCandidates: [candidate],
+              extra: {
+                clickEffectSignal,
+                chosenRef: candidate.ref,
+                chosenLabel,
+                chosenBoundingBox: candidate.boundingBox,
+                fingerprintMatch,
+                resolverPath: lintResult.resolverPath,
+              },
+            });
           }
           // Synthesize a `recordedFingerprint` for manually-added click
           // steps. By this point both guards (identity-mismatch + weak,
@@ -6119,6 +6419,23 @@ export class PreviewStepApplyService {
 
           // V23: finalize trace timing for the success path.
           setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+          const planQuality = derivePlanQuality(compiled);
+          if (planQuality?.unverified) {
+            logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              reason: planQuality.reason,
+              path: 'lint_resolve_post_verify',
+            });
+            try {
+              EditorTraceService.get(previewSessionId)?.writePlanQuality({
+                stepId: stepDraft.id,
+                unverified: true,
+                reason: planQuality.reason,
+                path: 'lint_resolve_post_verify',
+              });
+            } catch { /* trace is advisory */ }
+          }
           return {
             success: true,
             appliedStep,
@@ -6144,6 +6461,7 @@ export class PreviewStepApplyService {
             stateChange,
             compiledFailed: compiledWasTried,
             decisionTrace,
+            planQuality,
           };
         }
 
@@ -6160,9 +6478,59 @@ export class PreviewStepApplyService {
 
       // All attempts failed
       setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+
+      // Etap 1D.2 — collect failure evidence bundle. Best-effort: any
+      // throw from the collector is swallowed so the failure return
+      // path never gets blocked by diagnostic code. The bundle is then
+      // attached to the appliedStep so callers (WS handler, run loop)
+      // can persist it to DB and emit `preview:step:needs-review`.
+      let failureBundle;
+      try {
+        const { collectFailureEvidence } = await import('./failure-collector.service');
+        const sess = sessionService.getSession(previewSessionId);
+        const interactiveNodeCount = sess?.pageState?.domNodes?.length;
+        // We don't have per-candidate failure tracking at the apply
+        // loop level today — `lastError` is the single error string
+        // accumulated across all candidates. Building synthetic attempt
+        // records with `failureKind: 'fallthrough'` etc. would lie
+        // about reality. Pass minimal entries — strategy + matched flag
+        // — and let `lastError` + `totalAttempts` carry the real signal.
+        // Per-candidate attempt detail is a follow-up that needs the
+        // resolver loop to record per-attempt failures.
+        const attemptRecords = resolvedCandidates.map((c) => ({
+          strategy: 'lint_candidate',
+          matched: !!c.ref,
+          failureKind: 'unknown',
+          value: c.ref ? `[data-agent-ref="${c.ref}"]` : undefined,
+        }));
+        failureBundle = await collectFailureEvidence({
+          step: stepDraft,
+          page,
+          totalAttempts: attempts,
+          originatingStrategy: 'resolver_exhausted',
+          lastError,
+          attempts: attemptRecords,
+          interactiveNodeCount,
+        });
+      } catch (collectorErr) {
+        logger.warn('[PREVIEW_APPLY] Failure collector threw — skipping bundle', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          error: collectorErr instanceof Error ? collectorErr.message : String(collectorErr),
+        });
+      }
+
+      // Stamp the bundle onto the applied step so the WS handler can
+      // persist it. Only attach when we have a bundle — happy path
+      // (success) clears `failureEvidence` to undefined separately.
+      const appliedStepWithFailure = failureBundle
+        ? { ...stepDraft, failureEvidence: failureBundle }
+        : undefined;
+
       return {
         success: false,
         error: lastError || 'All candidates failed',
+        appliedStep: appliedStepWithFailure,
         highlight: resolvedCandidates.map(c => ({
           ref: c.ref,
           boundingBox: c.boundingBox,
@@ -6178,9 +6546,52 @@ export class PreviewStepApplyService {
       });
 
       setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+
+      // Etap 1D.2 — also collect a bundle for thrown failures (page
+      // crash, frame detached, navigation race, etc.). These are the
+      // most diagnostically interesting failures — losing them would
+      // defeat the whole point of the collector. Same best-effort
+      // pattern as the structured-failure path above: any throw from
+      // the collector itself is swallowed.
+      //
+      // We re-resolve `page` + `session` here because outer-catch is
+      // outside the inner try where they're declared. The page may be
+      // gone (closed/crashed — that's often what threw in the first
+      // place); collector handles `page.url()` / `page.title()` throws
+      // best-effort, so we don't need to pre-validate.
+      let throwBundle;
+      try {
+        const { collectFailureEvidence } = await import('./failure-collector.service');
+        const sess = getPreviewSessionService();
+        const session = sess.getSession(previewSessionId);
+        const page = sess.getPage(previewSessionId, userId);
+        const interactiveNodeCount = session?.pageState?.domNodes?.length;
+        if (page) {
+          throwBundle = await collectFailureEvidence({
+            step: stepDraft,
+            page,
+            totalAttempts: 0,
+            originatingStrategy: 'apply_threw',
+            lastError: error instanceof Error ? error.message : String(error),
+            // No attempts log — exception was thrown before per-candidate
+            // iteration could record one. Empty array is correct here:
+            // it tells the UI "step crashed before we got to selectors".
+            attempts: [],
+            interactiveNodeCount,
+          });
+        }
+      } catch (collectorErr) {
+        logger.warn('[PREVIEW_APPLY] Failure collector threw on outer catch — skipping bundle', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          error: collectorErr instanceof Error ? collectorErr.message : String(collectorErr),
+        });
+      }
+
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Apply failed',
+        appliedStep: throwBundle ? { ...stepDraft, failureEvidence: throwBundle } : undefined,
         decisionTrace,
       };
     }
