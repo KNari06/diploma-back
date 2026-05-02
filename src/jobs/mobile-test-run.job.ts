@@ -250,12 +250,14 @@ export class MobileTestRunJobHandler {
         } catch { /* non-fatal */ }
       };
 
-      // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s)
+      // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s).
+      // Pass `ownerId: userId` so the runner switches to this user's
+      // dedicated Android multi-user — apps from other owners are hidden.
       try {
-        const claimed = await client.claimSession(platform);
+        const claimed = await client.claimSession(platform, { ownerId: userId });
         sessionId = claimed.sessionId;
         sessionSource = 'pool';
-        logger.info('[MOBILE-TEST] Pool session claimed', { testId, sessionId, platform });
+        logger.info('[MOBILE-TEST] Pool session claimed', { testId, sessionId, platform, ownerId: userId });
       } catch (poolErr) {
         // Pool exhausted, disabled, or runner unreachable — try next
         logger.debug('[MOBILE-TEST] Pool claim failed, trying warmup', {
@@ -280,13 +282,14 @@ export class MobileTestRunJobHandler {
         // Explicit heads-up: cold starts can take up to a minute, so users
         // see "Booting emulator…" instead of a long silent pause after 10%.
         emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
-        const session = await client.createSession(platform);
+        const session = await client.createSession(platform, { ownerId: userId });
         sessionId = session.sessionId;
         sessionSource = 'cold';
         logger.info('[MOBILE-TEST] Session created (cold start)', {
           testId,
           sessionId,
           platform,
+          ownerId: userId,
         });
       }
 
