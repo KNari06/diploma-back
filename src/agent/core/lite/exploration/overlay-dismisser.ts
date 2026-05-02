@@ -20,6 +20,7 @@
 import type { Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { VisualStability } from '../collectors/visual-stability';
 import type { LiteSnapshot, ObstacleFact, ObstacleType } from '../lite-types';
 import {
@@ -170,7 +171,7 @@ export class OverlayDismisser {
 
     try {
       // ── Phase 0: Wait for loading state ─────────────────────────────────
-      lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: false });
+      lastSnapshot = await SnapshotRouter.collect(page, { context: 'exploration-dismiss', skipStabilityWait: false });
 
       if (lastSnapshot.transientState?.isTransient) {
         waitedForLoading = true;
@@ -187,7 +188,7 @@ export class OverlayDismisser {
           if (Date.now() - startTime > maxTimeMs) break;
 
           await VisualStability.waitForStable(page, { checkInterval: 150, maxAttempts: 4 });
-          lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+          lastSnapshot = await SnapshotRouter.collect(page, { context: 'exploration-dismiss', skipStabilityWait: true });
 
           if (!lastSnapshot.transientState?.isTransient) break;
         }
@@ -258,7 +259,7 @@ export class OverlayDismisser {
         // Re-collect snapshot for next pass (catches stacked modals)
         if (pass < maxPasses - 1) {
           await waitForDomSettle(page);
-          lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+          lastSnapshot = await SnapshotRouter.collect(page, { context: 'exploration-dismiss', skipStabilityWait: true });
         }
       }
 
@@ -267,7 +268,7 @@ export class OverlayDismisser {
       const anyDismissed = attempts.some((a) => a.dismissed);
       if (anyDismissed) {
         await waitForDomSettle(page);
-        lastSnapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+        lastSnapshot = await SnapshotRouter.collect(page, { context: 'exploration-dismiss', skipStabilityWait: true });
       }
 
       const overlaySummary = this.buildOverlaySummary(attempts);

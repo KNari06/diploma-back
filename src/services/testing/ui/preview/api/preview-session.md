@@ -116,6 +116,8 @@ Internal — use the exported `getPreviewSessionService()`. Initializes the 2 mi
 
 The hot path — called by recording handlers, apply/run, lint, periodic DOM tick, post-navigation.
 
+**V26 routing.** Snapshot collection now goes through [`SnapshotRouter.collect()`](snapshot-router.md) instead of directly calling `SnapshotCollector`. The router decides between the legacy `page.evaluate` path and the new CDP-based hybrid pipeline (Etap 2) based on caller context and feature flags. Transparent to callers — same `LiteSnapshot` shape returned. `getSnapshot` passes `context: 'preview-tick'`, `lastDomNodeCount`, and `diagId` to the router. Router defaults to `evaluate` for now; CDP path opts in via `snapshot-router.config.ts` flags.
+
 - **`options`:** `{ force?, includeScreenshot?, onlyIfChanged?, includeDomNodes?, fullPage? }`.
 - **Returns:** `{ url, pageTitle?, domNodes?, domVersion, pageSignature, screenshot?, changed }` or `null` on auth fail.
 - **Side-effects:**
@@ -192,9 +194,17 @@ The hot path — called by recording handlers, apply/run, lint, periodic DOM tic
 - Evaluates `PROBE_AT_POINT_FN` to walk `elementsFromPoint`. Returns `ProbedElement` or error.
 - Symmetric with [dom-analysis-extractor](dom-analysis-extractor.md) (Tier-1/Tier-2 selection rules MUST match).
 
-### `probeInteractiveElementAt({ sessionId, userId, x, y })`
+### `probeInteractiveElementAt({ sessionId, userId, x, y, withRejectReason? })`
 
-- Probes + matches against current `session.pageState.domNodes` to get a full `InteractiveNode` (id, testIdAttr, role, …).
+- Wraps `RecordingCaptureService.probeForRecording()` and matches against current `session.pageState.domNodes`.
+- **Returns:** `{ tag, label, boundingBox, resolvedVia }` on success; `{ rejectReason }` when `withRejectReason=true` and probe finds no interactive target.
+- **Caller:** `preview:mouse:probe` WS event (V26 on-demand element inspect).
+
+### `setContextData({ sessionId, userId, key, value }): Promise<{ version, data } | null>`
+
+- Updates session `contextData` scratchpad key/value.
+- **Returns:** `{ version: number, data: Record<string,any> }` or `null` if session not found.
+- **Caller:** `preview:context:set` WS event.
 
 ### `setViewport({ sessionId, userId, width, height })`
 

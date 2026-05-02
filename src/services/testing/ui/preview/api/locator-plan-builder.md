@@ -97,13 +97,37 @@ For actions that don't target an element (`navigate`, `wait`, `scroll`, `refresh
 | 19 | `css` (container title + text) | 0.74 | bare text added AND `containerTitles[]` (top 2). | `:has-text("title") >> text="…"` |
 | 20 | `css` (tag + testId combo) | 0.65 | `node.tag` AND `testIdAttr` AND id strategy NOT added. | `<tag>[data-testid=…]` |
 
+### V26 — new strategies (Angular / Vue / class-based)
+
+| # | Strategy | Tier | Confidence | Generated when | Selector form |
+|---|---|---|---|---|---|
+| 21 | `css` (Angular `formControlName`) | IDENTITY | 0.78 | `node.formControlName` set (reactive forms). | `[formcontrolname="…"]` |
+| 22 | `css` (Angular `routerLink`) | STRUCTURAL | 0.77 | `node.routerLink` set (declarative SPA navigation). | `[routerlink="…"]` |
+| 23 | `css` (Vue scoped-style attr) | STRUCTURAL | 0.76 | `node.vueScopeId` matches `data-v-XXXXXXXX`. | `[data-v-…]` (combined with tag) |
+| 24 | `css` (stable BEM / design-system class) | STRUCTURAL | 0.66 | first stable class token survives `isClassBanned()`. | `<tag>.<class>` |
+
+### Class-banning refactor (V26)
+
+The previous inline regex `/^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)/` for sibling-index strategy is gone — replaced by `isClassBanned(cls, config)` imported from `locator-config.ts`. Single source of truth, easier to extend.
+
+### Tier vocabulary (V26)
+
+Each `LocatorEntry` now carries an explicit tier so the resolver can scope priority:
+
+- `IDENTITY` — testId / id / labels / formControlName.
+- `STRUCTURAL` — data-attrs, icon hooks, paths, routerLink, vueScopeId, BEM classes.
+- `CONTEXTUAL` — row-based lookups (nearest row text, dataRowKey).
+- `POSITIONAL` — sibling-index, nth-of-type.
+- `TEXTUAL` — bare text, role+text.
+- `SEMANTIC` — alt text for images.
+
 **Dedup rules:** the bare-text and aria-label-standalone strategies skip themselves if the role strategy already used the same value. Container titles are capped at top 2 to keep the plan compact.
 
 **V23 — `title` as accessible-name source.** Per WAI-ARIA Accessible Name Computation, `title` is a valid name source when `aria-label` / `aria-labelledby` / `<label>` are absent. Fixes Angular `routerLink` icon menus and similar icon-only triggers. Note: this strategy intentionally does NOT lift derived display labels (`iconLabel`, `svgIcon`, `childTestId`, `customElementTag`) — those are for resolver display, not for Playwright's `getByRole({ name })` which matches the actual a11y tree.
 
 **CSS escaping:** all interpolated values pass through `escapeCssAttrValue()` — `\` → `\\`, `"` → `\"`, `]` → `\]`, `[` → `\[`, newlines → space.
 
-**Class-skip regex (sibling-index strategy):** skips framework-generated classes `^(jss\d+|sc-[a-zA-Z0-9]{6,}|css-[a-z0-9]{6,}|makeStyles-)`.
+**Class banning (V26 refactor).** The old inline regex `^(jss\d+|sc-…|css-…|makeStyles-)` lives now in `locator-config.ts` as `isClassBanned(cls, config)`. Used by sibling-index AND the new V26 stable-class strategy. Update `locator-config.ts` (not this builder) to ban new framework prefixes.
 
 ---
 

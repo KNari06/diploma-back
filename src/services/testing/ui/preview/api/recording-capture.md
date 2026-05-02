@@ -57,6 +57,12 @@ Stored as a string and injected via `page.evaluate()`. Symmetric with [dom-analy
 - **Container:** `containerText` (nearest heading), `containerTitles` (up to 2), `nearestLandmark` (banner/navigation/main/complementary/contentinfo/form), `ancestorSummary` (compact `outer > middle > inner` chain), `ancestorChain` (array up to 6 levels with id/testId per segment).
 - **Resolution:** `resolvedVia` ∈ `'nativeTag' | 'ariaRole' | 'behavioral' | 'cssClass' | 'cursorPointer' | 'directHit' | 'llm'`.
 - **Cross-origin:** `iframeSelector`, `crossOriginIframe`, `unsupportedHost` (`'webview' | 'object' | 'embed'`).
+- **V26 additions:**
+  - `firstTextFragment?: string` — first single DOM-unit of text (text node or leaf-text element), 2–80 chars. Walks DFS skipping decorative tags (`img`, `svg`, `i`, `picture`, `use`, `path`, `br`, `hr`). Stored only when it differs from full `text`. **Symmetric with `snapshot-collector.ts`** — divergence breaks wrong-element guards.
+  - `routerLink?: string` (Etap 1B.2) — Angular `routerLink` directive (declarative SPA navigation; stable across origin rewrites). Capped 100 chars; lowercase attribute read.
+  - `formControlName?: string` (Etap 1B.2) — Angular reactive-forms control name. Capped 60 chars.
+  - `hitStack?: string[]` — `document.elementsFromPoint(px, py)` stack, top→bottom, max 8 entries in compact form `tag[role=X]#id.firstClass`. **Diagnostic only** — does NOT affect target selection.
+  - `probeAmbiguity?: string[]` — heuristic flags: `'multiple_interactive_top'` (2+ interactive in top 3), `'iframe_at_top'` (cross-origin or same-origin opaque), `'canvas_at_top'` (no DOM identity), `'overlay_above_target'` (backdrop class regex: `cdk-overlay-backdrop` / `modal-backdrop` / `MuiBackdrop` / `ant-modal-mask` / `el-overlay`), `'deep_stack'` (6+ at one pixel). Surfaced in warning log so postmortem can prioritize replays at risk.
 
 ### Resolution strategy (wrapper → icon descent)
 
@@ -74,10 +80,20 @@ Post-selection fixes:
 - **MUI OutlinedInput fieldset → input** — fieldset (`notchedOutline` / `MuiOutlinedInput-notchedOutline`) → walk up and pick the inner `<input>`.
 - **Label → control elevation** — child of `<label>` → follow `for=` or pick the only form control descendant.
 - **Wrapper → icon descent** — selected target is generic (`div/span/button`) with exactly one child `svg[id] / img[id] / i[id]` carrying a stable id, AND click hit lies inside icon's bounding rect (±2px) → descend to the icon. Fixes Element Plus / MUI IconButton patterns where the icon, not the wrapper, holds the semantic id.
+- **Card-style heading fallback (V26):** when no native `h1..h6` is found in the container, scan for `<div class*="title">` / `<div class*="heading">` / `<p class*="caption">` to seed `containerTitles`. Rejects chrome UI (`dialog-title`, `sidebar-title`, `nav-title`, …) — item-scoped only. Disambiguates "Add" buttons in 40-card grids where every card has identical button text.
+- **Image filename fallback for icons (V26):** when an icon has no alt / `data-lucide` / FontAwesome class, fall back to the `<img src=".../filename.svg">` filename (e.g. `pdf.svg`, `doc.svg`) for icon identity. Filter rules mirror snapshot-collector.
 
 ### Dynamic-id regex (must mirror [dynamic-id.util.ts](../dynamic-id.util.ts))
 
 Filters: UUIDs, long hex tokens (≥24 hex), 20+ alphanumeric, epoch timestamps (10+ digits), `:r…:`/`:R…:` (React useId), `radix-`, `mui-`, `headlessui-`, `chakra-`, `downshift-`, Angular CDK/Material, Ant Design, PrimeVue, BootstrapVue, Lit, Ionic, Quasar, Naive UI, Salesforce, AngularJS `ng-…`, Emotion/styled-components long-hash prefix `_[a-zA-Z0-9]{12,}`. Filtered ids drop out of `elementId` and `ancestorChain`.
+
+### State-class filtering (V26 expansion)
+
+The probe drops state classes from `cssClass` so transient UI state (`is-active`, `selected`, `error`, …) doesn't pollute fingerprints.
+
+- **BEM suffix regex** (extended): now also matches `first | last | initial | terminal | empty | filled | valid | invalid | dirty | touched | pristine | untouched | pending | error | success | warning`.
+- **Standalone state regex** (NEW, Bootstrap-style): `^(?:active | selected | … | warning | empty | filled | readonly | required | focused | hidden | visible | collapsed | expanded)$` — drops these even when not in BEM form.
+- The regex is duplicated across two sites in `PROBE_AT_POINT_FN` (probe + ancestor walk). They MUST stay byte-identical — drift = wrong-element bugs.
 
 ### Ancestor summary
 Compact `header#layout-header > div.icon-group > svg` string. Priority per segment: testId → id → role → text → class. Travels with every step's fingerprint and gives the resolver structural context for icon-only / unlabelled elements.
@@ -107,7 +123,7 @@ A field session is a single-shot open/close lifecycle for typing in a focused in
 - **Visibility:** `public static`.
 - **Caller:** [preview.handler.ts](../../../../../websocket/handlers/preview.handler.ts) click path.
 - **Returns:** `ProbedElement` or `null`.
-- **Side-effects:** debug logs on null result; iframe descent attempts; `<webview>` detection.
+- **Side-effects:** debug logs on null result; iframe descent attempts; `<webview>` detection. **(V26)** also emits a warning log when `probeAmbiguity` is non-empty — includes `(x, y)`, target tag/role/text, `resolvedVia`, ambiguity flags, first 6 entries of `hitStack`.
 - **Throws:** never (errors caught, logged, null returned).
 - **Key steps:**
   1. `page.evaluate(PROBE_AT_POINT_FN, x, y)` in main frame.
@@ -291,6 +307,9 @@ write editor trace
 7. **Iframe descent.** Coordinates translated to child-frame viewport. Cross-origin → `crossOriginIframe: true`.
 8. **Debounce + throttle interaction.** Typing 1500 / scroll 500 / scroll-merge 3000 / hover 200 — different on purpose to avoid cross-event stutter.
 9. **Auto-stop.** `RECORDING_MAX_STEPS=50` and `RECORDING_MAX_TIME_MS=30min`. Apply or commit before re-recording.
+10. **`firstTextFragment` symmetry (V26).** Implementation MUST stay byte-equivalent with the `snapshot-collector.ts` extractor. Divergence = wrong-element bugs (the resolver wouldn't see the same single-unit text the recorder captured).
+11. **State-class regex symmetry (V26).** BEM suffix regex and standalone state regex are duplicated across two sites in `PROBE_AT_POINT_FN`. Keep them in lockstep.
+12. **`hitStack` / `probeAmbiguity` are diagnostic-only (V26).** They never change target selection — they exist so postmortem can prioritize replays where the click landed in a noisy stack.
 
 ## Skipped / not covered
 

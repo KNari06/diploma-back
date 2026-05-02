@@ -20,6 +20,7 @@ import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
+import { runV1WithShadow } from './step-readiness-v2.service';
 import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
@@ -2117,15 +2118,28 @@ export class PreviewRunService {
                     });
                   }
                 } catch { /* non-fatal */ }
-                const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
-                  maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                  settleMs: adaptiveSettle,
-                  autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
-                  prevActionType: step.type,
-                  prevUrl: trackedUrl,
-                  recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                  tracer: lookaheadTracer,
-                }), signal);
+                const lookahead = await raceAbort(
+                  runV1WithShadow(
+                    () => waitForStepReadiness(session.page, nextStep, {
+                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                      settleMs: adaptiveSettle,
+                      autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                      prevActionType: step.type,
+                      prevUrl: trackedUrl,
+                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                      tracer: lookaheadTracer,
+                    }),
+                    session.page,
+                    nextStep,
+                    {
+                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                      prevActionType: step.type,
+                      prevUrl: trackedUrl,
+                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                    },
+                  ),
+                  signal,
+                );
 
                 // Track actual settle time per action category for adaptive threshold
                 if (lookahead.waited > 0) {
@@ -2446,14 +2460,27 @@ export class PreviewRunService {
                 if (i < stepsToExecute.length - 1 && !skipLookaheadRetry && !runState.cancelled) {
                   const nextStep = stepsToExecute[i + 1];
                   try {
-                    await raceAbort(waitForStepReadiness(session.page, nextStep, {
-                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                      settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
-                      autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
-                      prevActionType: step.type,
-                      prevUrl: trackedUrl,
-                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                    }), signal);
+                    await raceAbort(
+                      runV1WithShadow(
+                        () => waitForStepReadiness(session.page, nextStep, {
+                          maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                          settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                          autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                          prevActionType: step.type,
+                          prevUrl: trackedUrl,
+                          recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                        }),
+                        session.page,
+                        nextStep,
+                        {
+                          maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                          prevActionType: step.type,
+                          prevUrl: trackedUrl,
+                          recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                        },
+                      ),
+                      signal,
+                    );
                   } catch (laError) {
                     if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                     // Lookahead failure is non-fatal — apply DOM stability fallback
@@ -2507,14 +2534,27 @@ export class PreviewRunService {
                   if (i < stepsToExecute.length - 1 && !skipLookaheadFinal && !runState.cancelled) {
                     const nextStep = stepsToExecute[i + 1];
                     try {
-                      await raceAbort(waitForStepReadiness(session.page, nextStep, {
-                        maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                        settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
-                        autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
-                        prevActionType: step.type,
-                        prevUrl: trackedUrl,
-                        recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                      }), signal);
+                      await raceAbort(
+                        runV1WithShadow(
+                          () => waitForStepReadiness(session.page, nextStep, {
+                            maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                            settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                            autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                            prevActionType: step.type,
+                            prevUrl: trackedUrl,
+                            recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                          }),
+                          session.page,
+                          nextStep,
+                          {
+                            maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                            prevActionType: step.type,
+                            prevUrl: trackedUrl,
+                            recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                          },
+                        ),
+                        signal,
+                      );
                     } catch (laError) {
                       if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                       await waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default).catch(() => {});

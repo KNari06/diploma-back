@@ -39,6 +39,9 @@ Element resolution and auto-healing serve all three.
 | [../../../../websocket/handlers/preview.handler.ts](../../../../websocket/handlers/preview.handler.ts) | [api/preview-handler.md](api/preview-handler.md) | All `preview:*` WS events — recording, mouse/keyboard, navigation, apply, devtools, video. |
 | [intent-test-case.service.ts](intent-test-case.service.ts) | — | CRUD for intent test cases (steps + metadata). Import/export. |
 | [intent-step-converter.service.ts](intent-step-converter.service.ts) | — | `IntentStep` ↔ Playwright commands (used by background replay). |
+| [snapshot-router.service.ts](snapshot-router.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2 / WIP) Routes snapshot collection between legacy `evaluate` and new CDP path. Default = evaluate. |
+| [cdp-snapshot.service.ts](cdp-snapshot.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2 / WIP) CDP-based snapshot pipeline — skeleton, most phases TODO. |
+| [snapshot-diff.util.ts](snapshot-diff.util.ts) | [api/snapshot-router.md](api/snapshot-router.md) | Shadow-mode validator: field-level diff between evaluate and CDP snapshots. |
 
 ### Supporting services
 

@@ -28,6 +28,10 @@ const SERVICE_MAP = [
   ["src/services/testing/ui/preview/dom-analysis-extractor.service.ts", "src/services/testing/ui/preview/api/dom-analysis-extractor.md"],
   ["src/services/testing/ui/preview/preview-session.service.ts",    "src/services/testing/ui/preview/api/preview-session.md"],
   ["src/websocket/handlers/preview.handler.ts",                     "src/services/testing/ui/preview/api/preview-handler.md"],
+  // Etap 2 (CDP snapshot path) — single doc covers all 3 services + config.
+  ["src/services/testing/ui/preview/snapshot-router.service.ts",    "src/services/testing/ui/preview/api/snapshot-router.md"],
+  ["src/services/testing/ui/preview/cdp-snapshot.service.ts",       "src/services/testing/ui/preview/api/snapshot-router.md"],
+  ["src/services/testing/ui/preview/snapshot-diff.util.ts",         "src/services/testing/ui/preview/api/snapshot-router.md"],
 ];
 
 // folder prefix → folder-level CLAUDE.md

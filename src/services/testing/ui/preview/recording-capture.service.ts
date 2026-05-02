@@ -311,6 +311,27 @@ export interface ProbedElement {
     ariaLabel?: string;
     className?: string;
   }>;
+  /**
+   * V26 #1+#2: full hit-test stack (top→bottom paint order) at the click
+   * coordinates, captured via `document.elementsFromPoint(px, py)`. Up to
+   * 8 entries, each in compact form `tag[role=X]#id.firstClass`. Pure
+   * diagnostic — does NOT influence which element the recorder picked
+   * as `target`. Used by post-mortem audit and the wrong-element widget
+   * to answer "what else was on top of where the user clicked?".
+   */
+  hitStack?: string[];
+  /**
+   * V26 #1+#2: probe ambiguity verdict — heuristic flags that mark
+   * recordings the resolver may struggle to replay reliably. Computed
+   * from the `hitStack` above. Domain (extensible — treat unknown as
+   * generic warning):
+   *   - `multiple_interactive_top`  — 2+ interactive elements stacked
+   *   - `iframe_at_top`             — iframe at hit point (replay limit)
+   *   - `canvas_at_top`             — no DOM identity, vision needed
+   *   - `overlay_above_target`      — modal/backdrop above target
+   *   - `deep_stack`                — 6+ elements at one pixel
+   */
+  probeAmbiguity?: string[];
 }
 
 /** Typing buffer stored on session */
@@ -485,6 +506,99 @@ const PROBE_AT_POINT_FN = `
     shadowDepth++;
   }
   if (!el) return null;
+
+  // V26 #1+#2: Hit-test diagnostics. Captures the FULL elementsFromPoint
+  // stack at click coordinates (top→bottom paint order) plus a "probe
+  // ambiguity" verdict — so post-mortem of wrong-element bugs can answer
+  // "what else was layered on top of where the user clicked?" without
+  // re-running.
+  //
+  // elementsFromPoint (plural) returns the full hit-test stack including
+  // overlays / backdrops / sticky bars / dropdowns that elementFromPoint
+  // (singular) silently flattens to a single answer. Diagnostic only --
+  // does NOT change which element we pick. Recorded into the trace as
+  // hitStackDiag so a later read can spot:
+  //   - target was covered by a tooltip / drag-ghost at click time
+  //   - multiple overlapping buttons in same spot (z-index race)
+  //   - iframe at the top of the stack (recorder hit limitation)
+  //   - opacity-0 modal still hit-tested (animation race)
+  var __hitStack = [];
+  try {
+    // Same px/py as the singular call — we want THE SAME hit context.
+    // Cap at 8 entries: deeper stacks are noise, top of pile is what
+    // matters. Each entry: tag/role/id/class snippet — never raw element
+    // refs (those don't serialize back through page.evaluate).
+    var __stackRaw = (typeof document.elementsFromPoint === 'function')
+      ? document.elementsFromPoint(px, py)
+      : [];
+    for (var __si = 0; __si < __stackRaw.length && __hitStack.length < 8; __si++) {
+      var __sel = __stackRaw[__si];
+      if (!__sel || !__sel.tagName) continue;
+      var __sTag = __sel.tagName.toLowerCase();
+      var __sRole = __sel.getAttribute && (__sel.getAttribute('role') || '');
+      var __sId = __sel.getAttribute && (__sel.getAttribute('id') || '');
+      var __sCls = __sel.getAttribute && (__sel.getAttribute('class') || '');
+      // Compact form: tag[role=X]#id.firstClass — keeps payload small
+      // when shipped to the trace. Trim each piece defensively.
+      var __sigil = __sTag
+        + (__sRole ? '[role=' + __sRole.slice(0, 20) + ']' : '')
+        + (__sId ? '#' + __sId.slice(0, 30) : '')
+        + (__sCls ? '.' + __sCls.split(/\\s+/)[0].slice(0, 30) : '');
+      __hitStack.push(__sigil);
+    }
+  } catch (__hitErr) {
+    // elementsFromPoint can throw in exotic frames / detached docs.
+    // Diagnostic is best-effort, never block the probe.
+    __hitStack = [];
+  }
+
+  // Ambiguity verdict — heuristics that flag clicks the resolver
+  // probably can't replay reliably. Surfaced into the recorded
+  // step so a later batch audit ("which steps recorded with
+  // ambiguous probe?") doesn't need code spelunking.
+  var __probeAmbiguity = [];
+  try {
+    // Many overlapping interactive elements at this exact pixel
+    // (>= 3 in stack, top-3 contain interactive tags) — z-index race.
+    var __interactiveTopCount = 0;
+    for (var __ai = 0; __ai < Math.min(3, __hitStack.length); __ai++) {
+      var __ent = __hitStack[__ai];
+      if (/^(button|a|input|select|textarea|summary)\\b/.test(__ent)
+        || /\\[role=(button|link|tab|menuitem|option|checkbox|radio)/.test(__ent)) {
+        __interactiveTopCount++;
+      }
+    }
+    if (__interactiveTopCount >= 2) {
+      __probeAmbiguity.push('multiple_interactive_top');
+    }
+    // Top of stack is iframe — recorder cannot probe inside it
+    // (cross-origin or same-origin both opaque to elementFromPoint).
+    if (__hitStack.length > 0 && /^iframe\\b/.test(__hitStack[0])) {
+      __probeAmbiguity.push('iframe_at_top');
+    }
+    // Top of stack is canvas — no DOM identity, replay will need vision.
+    if (__hitStack.length > 0 && /^canvas\\b/.test(__hitStack[0])) {
+      __probeAmbiguity.push('canvas_at_top');
+    }
+    // Backdrop / overlay sitting above target — z-index from a closed
+    // animation or a modal that's mid-fade. Class regex catches the
+    // common library names.
+    for (var __bi = 0; __bi < Math.min(3, __hitStack.length); __bi++) {
+      var __bent = __hitStack[__bi];
+      if (/\\.(cdk-overlay-backdrop|modal-backdrop|MuiBackdrop|ant-modal-mask|el-overlay)/.test(__bent)) {
+        __probeAmbiguity.push('overlay_above_target');
+        break;
+      }
+    }
+    // Deep-stack signal — anything > 6 layers at one pixel is unusually
+    // dense (sticky header + nav + sidebar + cards + cell + …). Worth
+    // logging because target-walk priorities may drift on next render.
+    if (__hitStack.length >= 6) {
+      __probeAmbiguity.push('deep_stack');
+    }
+  } catch (__amberr) {
+    /* heuristics best-effort — never block probe */
+  }
 
   // V22 Pkg7+: in-probe text normalizer. NFC + invisible-char strip +
   // whitespace collapse. Mirrors normalizeText() in text-normalizer.util.ts
@@ -1943,7 +2057,14 @@ const PROBE_AT_POINT_FN = `
     // and the resolver can lean on it for any resolvedVia. Earlier gating
     // to directHit/cssClass left icon targets (cursorPointer/nativeTag)
     // without ancestor context exactly when they needed it most.
-    ancestorChain: ancestorChain
+    ancestorChain: ancestorChain,
+    // V26 #1+#2: hit-test diagnostics — captured at the top of this
+    // function from elementsFromPoint(). Always present on click probes
+    // even when target resolved cleanly via priority pass — lets a
+    // post-mortem diff "happy probe" vs "wrong-element bug" recordings
+    // by their hit-stack alone.
+    hitStack: __hitStack,
+    probeAmbiguity: __probeAmbiguity
   };
 })
 `;
@@ -2194,6 +2315,27 @@ export class RecordingCaptureService {
         if (result.tag === 'webview' && result.resolvedVia === 'directHit') {
           return { tag: 'webview', unsupportedHost: 'webview', crossOriginIframe: false };
         }
+        // V26 #1+#2: emit warning ONLY when probe flagged ambiguity.
+        // Quiet on the 99% happy path (no log spam) — visible signal
+        // when the recorder caught a click that the resolver may struggle
+        // to replay (z-index race, iframe / canvas at top, modal above
+        // target, deep stack). Surfaces in logs WITHOUT writing to trace
+        // / DB — minimum-cost diagnostic.
+        try {
+          const flags = (result as any).probeAmbiguity as string[] | undefined;
+          if (flags && flags.length > 0) {
+            logger.warn('[RECORDING] Probe ambiguity detected at click point', {
+              x,
+              y,
+              targetTag: result.tag,
+              targetRole: result.role,
+              targetText: result.text ? result.text.slice(0, 60) : undefined,
+              resolvedVia: result.resolvedVia,
+              ambiguity: flags,
+              hitStack: ((result as any).hitStack as string[] | undefined)?.slice(0, 6),
+            });
+          }
+        } catch { /* logging is best-effort, never block the probe return */ }
         return result;
       }
 

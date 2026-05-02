@@ -62,6 +62,46 @@ export class PreviewVideoStreamService {
   private cdpSession: CDPSession | null = null;
   private isStreaming = false;
   private isStopped = false;
+
+  /**
+   * Etap 2 Phase 5 — DEPRECATED, piggyback DOES NOT WORK.
+   *
+   * Originally added to support snapshot-collector reusing the
+   * screencast CDP session. Empirical measurement (see
+   * `cdp-screencast-collision.integration.test.ts`) showed that
+   * running DOMSnapshot.captureSnapshot on the same CDP session
+   * BLOCKS Page.screencastFrame events for the entire duration of
+   * the snapshot:
+   *
+   *   baseline:        60.5 FPS
+   *   during snapshot: 0.0 FPS    ← 100% frame drop
+   *   recovery:        59.9 FPS   ← snaps back instantly
+   *
+   * For preview (live editor with screencast), this means a 200-1500ms
+   * video freeze per snapshot — worse UX than evaluate-path's 16s
+   * main-thread blocks (which don't freeze video; compositor keeps
+   * painting from layer tree).
+   *
+   * This getter is kept for one POSSIBLE future use: a non-snapshot
+   * CDP read that doesn't synchronously block (e.g., DOM.getDocument
+   * for shallow tree). For now NO caller in the codebase invokes it.
+   *
+   * Don't delete: removing now would create churn if a future feature
+   * legitimately needs lightweight CDP piggyback that doesn't lock
+   * the channel. The cost of keeping a 6-line getter is zero.
+   *
+   * For snapshot collection specifically: NEVER pass this into
+   * SnapshotRouter — the router's preview-context safety guard will
+   * accept it but the empirical contract above means video freezes.
+   */
+  getCdpSessionForPiggyback(): CDPSession | null {
+    if (!this.cdpSession) return null;
+    if (this.cdpSessionClosed) return null;
+    if (this.isStopped) return null;
+    if (!this.isStreaming) return null;
+    return this.cdpSession;
+  }
+
   private previewSessionId: string;
   private userId: string;
   private room: string;

@@ -77,7 +77,7 @@ Main entry. Calls `resolveElement()` (LLM + vision); falls back to rule-based on
   - `interpretation?: string` — one-line summary of what the user wants.
   - `aiFallbackReason?: 'semantic_zero'` — resolver found nodes but none semantically match.
   - **`phaseTimings?: { snapshotMs, resolveMs, totalMs, domNodeCount }` (V23)** — per-phase performance breakdown. `snapshotMs` includes DOM collection + extraction; `resolveMs` is the resolver call; `totalMs` is end-to-end; `domNodeCount` is the size of the candidate pool. Used by editor latency tracing and slow-page diagnostics (logs warn when `snapshotMs > 1000`).
-- **Side-effects:** snapshot fetch (forced or 500ms cached); LLM call via `resolveElement()`; vision rescue if needed; trace writes to `EditorTraceService`; AI activity feed via `withAIContext()`.
+- **Side-effects:** snapshot fetch (forced or 500ms cached); LLM call via `resolveElement()`; vision rescue if needed; trace writes to `EditorTraceService`; AI activity feed via `withAIContext()`. **(V26)** the entire body is wrapped in `withAIContext({ userId })` so every downstream LLM call (resolver, candidate-pruner, vision) is logged against the user via `AsyncLocalStorage` — without this wrapper LLM calls were dropped as "no userId" and never billed/audited.
 - **Throws:** never.
 - **Key steps:**
   1. Non-targeting actions → `'resolved'` early.
@@ -89,7 +89,7 @@ Main entry. Calls `resolveElement()` (LLM + vision); falls back to rule-based on
   7. `needs_clarification` → `generateClarificationQuestion()` for scenario-aware message.
   8. Trace every path to JSONL.
 - **Gotchas:**
-  - **Evidence-shortcut TTL 5 min** OR session started after evidence recorded → invalid. Prevents stale refs across reloads.
+  - **Evidence-shortcut TTL 60 min** (`EVIDENCE_REF_TTL_MS`) OR session started after evidence recorded → invalid. Prevents stale refs across reloads.
   - **URL-guard normalization** = origin + pathname only; SPA same-URL different-content is NOT caught.
   - **`includeAlternatives=false` (default)** returns 0 candidates on resolved/not_found/error; only `needs_clarification` returns the candidate list for UI selection.
   - **Degraded fallback** passes the real cause to clarification — message blames LLM outage, not the user's wording.
@@ -193,7 +193,7 @@ Deterministic classifier (no LLM). Returns one of:
 ### Timing
 - **Snapshot throttle:** 500ms (cached) unless `forceFreshSnapshot`.
 - **Clarification LLM:** 5s per model, two-tier (Gemini → GPT).
-- **Evidence-shortcut TTL:** 5 minutes or session start (whichever earlier).
+- **Evidence-shortcut TTL:** **60 minutes** (`EVIDENCE_REF_TTL_MS = 60 * 60 * 1000` in `evidence-shortcut.utils.ts`) or session start (whichever earlier). _Note: previous versions of this doc said "5 minutes" — that was wrong; corrected May 2026._
 
 ---
 

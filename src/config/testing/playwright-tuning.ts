@@ -130,6 +130,58 @@ export const STEP_READINESS_CONFIG = {
     autoWaitThresholdMs: 800,
     maxRetries: 2,
   },
+
+  /**
+   * V2 (smart-waiter) mode.
+   * 'off'    — only V1 runs (current behaviour).
+   * 'shadow' — V1 runs as primary, V2 runs in parallel for diff logging only.
+   * 'primary'— V2 is authoritative, V1 is dead path.
+   * Override: STEP_READINESS_V2_MODE
+   */
+  v2Mode: ((): 'off' | 'shadow' | 'primary' => {
+    const raw = (process.env.STEP_READINESS_V2_MODE ?? '').toLowerCase().trim();
+    if (raw === 'shadow' || raw === 'primary') return raw;
+    return 'off';
+  })(),
+
+  /**
+   * V2 tuning. Cheap, single-pass, deadline-respecting.
+   * No additive phases — one budget, soft-OR escape at 70%.
+   */
+  v2: {
+    /** Background replay budget. preview uses defaults.maxWaitMs (5s). */
+    backgroundMaxWaitMs: envNum(process.env.STEP_READINESS_V2_BG_MAX_MS, 7_000),
+    /** Quiet window for pageStable consensus, by prev action class. */
+    quietMs: {
+      navigation: 500,   // click/open/close/toggle/press/hover/scroll/upload/drag/navigate
+      input: 300,        // type/select
+      assertion: 150,    // assert/hover (light)
+      default: 300,
+    },
+    /** Hard cap per individual Playwright check (isVisible/isEnabled/count). */
+    perCheckCapMs: 500,
+    /** Polling interval for actionability (level 1+2). */
+    pollIntervalMs: 80,
+    /** Bbox stability — coords must not move more than this (px) within quiet window. */
+    bboxJitterPx: 1,
+    /** Delay between two bbox reads. Less than this = stability check is meaningless. */
+    bboxRecheckDelayMs: 60,
+    /** Identity check: fingerprint compared on element only when level1 ✓. */
+    identity: {
+      /** Strong fields — match means strong identity. */
+      strongFields: ['elementId', 'testIdAttr', 'name', 'href', 'svgIcon', 'routerLink'] as const,
+      /** Weak fields — used as fallback if strong unavailable. */
+      weakFields: ['ariaLabel', 'labelText', 'placeholder', 'text', 'role', 'tag'] as const,
+    },
+    /**
+     * Soft-OR escape: after this fraction of budget, pageStable gate is dropped
+     * and identity downgrades from strong to weak. Prevents "never settled" on
+     * SaaS pages with permanent background polling.
+     */
+    softEscapeRatio: 0.7,
+    /** Default for autoWaitApplied flag. */
+    autoWaitThresholdMs: 800,
+  },
 } as const;
 
 // ─── Element Resolver ─────────────────────────────────────────────────────────

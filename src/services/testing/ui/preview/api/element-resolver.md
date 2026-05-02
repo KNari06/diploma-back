@@ -38,19 +38,23 @@ Identity fast-path and evidence shortcut short-circuit expensive LLM calls when 
 | `ACTION_TO_TAGS` | record | Allowed tags per action (click → button/a/div/span/...; type → input/textarea). |
 | `CLICK_ALLOWED_ROLES` | set | Roles passing click filter without tag match. |
 | `SELECT_ALLOWED_ROLES` | set | combobox/listbox/option/menu/menuitem. |
+| `SELECT_SOFT_TAGS` | set | `['button','div','span','input','a','li']` — common tags soft-allowed for `select` actions so custom dropdown triggers aren't hard-excluded. |
 | `WRITABLE_ACTIONS` | set | `{fill, type, clear}`. |
 | `STATE_AWARE_ACTIONS` | record | check (→unchecked), uncheck (→checked), open/close (→aria-expanded). |
-| `LLM_SELECT_TIMEOUT_MS` | `8000` | Gemini Flash timeout. |
+| `LLM_SELECT_TIMEOUT_MS` | `8000` | Outer LLM timeout (whole stage). |
+| `LLM_SELECT_PER_PROVIDER_TIMEOUT_MS` (V26) | from `llmCircuitBreaker.perProviderTimeoutMs` | Per-provider budget. Outer timeout enforces total; inner timeout per provider lets the fallback (OpenAI) fire when primary (Gemini) hangs. Fixes May-2026 outage where Gemini timeout starved OpenAI. |
 | `MAX_CANDIDATES_FOR_LLM` | `70` | LLM batch size. |
 | `LLM_SELECT_CACHE_TTL_MS` | `900_000` (15 min) | Cache lifetime. |
 | `LLM_SELECT_CACHE_MAX_SIZE` | `2000` | LRU max. |
-| `SCORED_SLOT_RATIO` | `0.6` | 60% slots scored by text overlap, 40% by DOM order. |
+| ~~`SCORED_SLOT_RATIO`~~ | _removed (V26)_ | Pre-score & sort function deleted; replaced by DOM-order cap + LLM candidate pruner (Phase 2/3). |
 
 ---
 
 ## The 5-stage waterfall
 
-### Stage 1 — `buildAllowedSets()` (sync structural filter)
+### Stage 1 — `buildAllowedSets(nodes, actionType, viewport?)` (sync structural filter)
+
+**V26:** accepts optional `viewport: { width, height }` for accurate modal-coverage calculation on long scrollable pages (fixes 9% → 100% underestimation when page bbox high-water-mark was used as a proxy).
 
 Partitions nodes into `hardAllowed` / `softAllowed` based on deterministic rules. **No hardcoded text matching** — semantic decisions are deferred to LLM.
 
@@ -68,11 +72,15 @@ Rules in order:
 
 ### Stage 2 — Identity fast-path (sync)
 
-Triggers when a `recordedFingerprint` (or `compiled.targetFingerprint`) is present and there are ≥1 allowed nodes. Checks whether the recorded element's stable identity (`id`, `testId`, `svgIcon`, `customElementTag`) matches a UNIQUE live candidate.
+Skipped entirely for `wait` and `wait_for` action types (no element targeting needed).
+
+Triggers when a `recordedFingerprint` (or `compiled.targetFingerprint`) is present and there are ≥1 allowed nodes. Checks whether the recorded element's stable identity (`id`, `testId`, `svgIcon`, `customElementTag`, `href` (V26)) matches a UNIQUE live candidate.
 
 **Uniqueness gate:** exactly 1 match → return immediately; ≥2 matches → try narrowing by tag; still ambiguous → fall through to LLM.
 
-`resolverPath ∈ { 'identity_id', 'identity_testid', 'identity_svgicon', 'identity_custom_element' }`.
+`resolverPath ∈ { 'identity_id', 'identity_testid', 'identity_svgicon', 'identity_custom_element', 'identity_href' (V26) }`.
+
+**V26 — `identity_href`.** SPA links with semantic URLs (`/courses/mat-smart`, `/admin/users/42`) get a tier-1 fast-path between testId and svgIcon. Stable across origin rewrites; especially useful for Angular `routerLink` and Vue Router targets where `id`/`testId` may be missing.
 
 Skipped when no recorded fingerprint, 0 allowed candidates, or ambiguous (let LLM use context).
 
@@ -87,10 +95,21 @@ When step has `lastSuccessRef` from prior successful apply (manually-added steps
 Triggers when ≥1 allowed candidates and stages 2–3 didn't fire.
 
 Preprocessing:
-1. **Pre-score & sort** — rank candidates by text-overlap with intent (median token threshold). Allocate slots 60% scored / 40% DOM-order to cover cross-language and visual-only cases. **V23:** the search text per node (`buildNodeSearchText`) now also includes `alt`, `iconLabel`, `svgIcon`, `childTestId`, `customElementTag` — captures icon-only / Angular Material / Vue targets that would previously fall out of pre-scoring. Observable: candidate rank order may differ on icon-heavy pages.
+1. **DOM-order cap + candidate pruner (V26).** The old "pre-score & sort with 60/40 scored/DOM-order split" was removed. Now: take candidates in DOM order up to the cap, then optionally run them through the LLM-based candidate pruner (Phase 2/3 — see below).
+   - Search text per node (`buildNodeSearchText`) still includes `alt`, `iconLabel`, `svgIcon`, `childTestId`, `customElementTag` (V23) — captures icon-only / Angular Material / Vue targets.
 2. **Build candidate text** — `buildCandidateText(node)`, ≤200 chars.
 3. **Mark duplicates** — `[N of M]` suffix + `(CONTEXT: ...)` for disambiguation.
 4. **Scene summary** — detect expanded dropdowns, selected tabs, active modals for top-down LLM context.
+
+**Stage 4.5 — LLM candidate pruner (V25/V26).** Optional intermediate stage between candidate build and the main selection prompt:
+- **Modes:** `'shadow'` (run in parallel, log only) / `'applied'` (replace `candidatesToProcess`) / `'skipped'` / `'disabled'`. Outcome surfaces in `LintResult._prunerOutcome`.
+- **Hard-pad:** up to 5 hard-allowed candidates dropped by the pruner are re-included to keep the prompt safe. Order is preserved (descending pruner confidence); duplicate marking carries through.
+- **Skip rules:** disabled, or input candidate set ≤16 (no win available).
+- **Cache key includes `descDigest`** — hash of `recordedDescription`. Prevents collisions on same intent text but different element descriptions.
+
+**Per-provider AbortControllers (V26).** The selection LLM call has TWO timeouts:
+- Outer `LLM_SELECT_TIMEOUT_MS` enforces total budget.
+- Inner `LLM_SELECT_PER_PROVIDER_TIMEOUT_MS` per provider (Gemini, OpenAI fallback). Cascade is one-way (outer → inner): primary timeout no longer starves the fallback.
 
 Two prompt modes:
 - **Apply mode (default)** — user authoring step. Returning `null` is correct for no-match.
@@ -114,6 +133,8 @@ Triggers in three cases:
 Prompt = same rules + screenshot annotation + viewport size. Can return ref OR a `boundingBox` in screenshot space (mapped to viewport via `mapVisionBboxToViewport`).
 
 Confidence floor: `0.5`. Distance penalty for bbox→DOM mapping: 0 if contained, up to 0.3 if 100px+ away.
+
+**Etap 1D.4 — `recordedDescription` soft hint.** When the calling step has a stored `recordedDescription`, the vision and selection prompts include it as a 3rd channel alongside the recorded fingerprint and binding hints. Acts as disambiguation only — does NOT override identity-tier matches. Useful for similar-text candidates and generic intents.
 
 `resolverPath = 'vision'`.
 
@@ -180,6 +201,8 @@ Heal-mode overrides:
   includeAlternatives?: boolean;            // default false
   screenshot?: ScreenshotResult | (() => Promise<ScreenshotResult | null>);  // lazy callback OK
   mode?: 'apply' | 'heal';                  // default 'apply'
+  viewport?: { width: number; height: number };  // V26 — used for modal-coverage calculations
+  recordedDescription?: string;             // Etap 1D.4 — soft hint for vision rescue + LLM selection
 }
 ```
 
@@ -187,9 +210,11 @@ Heal-mode overrides:
   - `status: 'resolved' | 'not_found' | 'needs_clarification'`.
   - `message`, `confidence`, `candidates: LintCandidate[]`.
   - `highlight: Array<{ ref, boundingBox, type: 'success' | 'warning' }>`.
-  - `resolverPath: 'identity_id' | 'identity_testid' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | …`.
+  - `resolverPath: 'identity_id' | 'identity_testid' | 'identity_svgicon' | 'identity_custom_element' | 'identity_href' (V26) | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | …`.
   - `cacheHit`, `suggestion?`, `alternativesIncluded?`, `needsAiFallback?`, `degradedMode?`.
   - `_ruleTrace?`, `_hardAllowedCount?`, `_softAllowedCount?`.
+  - `_pruneMs?: number` (V25) — pruner latency.
+  - `_prunerOutcome?: 'shadow' | 'applied' | 'skipped' | 'disabled'` (V25) — candidate-pruner status.
 - **Side-effects:** LLM call (~200ms typical), vision call (~6s timeout) if screenshot, cache reads/writes, trace writes.
 - **Key steps:**
   1. Skip non-targeting actions (`navigate`, `wait`, `ai_check`, `switch_tab`).

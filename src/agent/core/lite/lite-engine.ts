@@ -37,6 +37,7 @@ import { ConsoleCollector } from './collectors/console-collector';
 import { ErrorCollector } from './collectors/error-collector';
 import { NetworkTracker } from './collectors/network-tracker';
 import { SnapshotCollector } from './collectors/snapshot-collector';
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { VisualStability } from './collectors/visual-stability';
 import { ActionExecutor } from './execution/action-executor';
 import { PageWatcher } from './execution/page-watcher';
@@ -1407,7 +1408,7 @@ export class LiteEngine {
         }
 
         try {
-          const snapshot = await SnapshotCollector.collect(this.page);
+          const snapshot = await SnapshotRouter.collect(this.page, { context: 'lite-action' });
           let command = step.command;
 
           // Override credentials in fill commands (security: never send to LLM)
@@ -1711,7 +1712,7 @@ export class LiteEngine {
         }
 
         // 2. Collect snapshot BEFORE (with visual stability)
-        let snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
+        let snapshotBefore = await SnapshotRouter.collect(this.page, { context: 'lite-action', fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
         const pageErrorsBefore = await ErrorCollector.collectFromPage(this.page);
 
         // 2a. Guard: check if snapshot is too empty (page still loading)
@@ -1723,7 +1724,7 @@ export class LiteEngine {
           });
           await this.page.waitForLoadState('domcontentloaded');
           await this.page.waitForTimeout(2000);
-          snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
+          snapshotBefore = await SnapshotRouter.collect(this.page, { context: 'lite-action', fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
         }
 
         // 2b. Guard: stale snapshot after credential fill.
@@ -1751,7 +1752,7 @@ export class LiteEngine {
             } catch {
               // Timeout OK — maybe it's a real login failure
             }
-            snapshotBefore = await SnapshotCollector.collect(this.page, { fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
+            snapshotBefore = await SnapshotRouter.collect(this.page, { context: 'lite-action', fullPage: LITE_ENGINE_FLAGS.enableFullPageSnapshot });
           }
         }
 
@@ -2338,7 +2339,7 @@ export class LiteEngine {
               );
 
               // Re-collect fresh post-navigation snapshot to avoid stale auth-page context.
-              const freshPostCredSnapshot = await SnapshotCollector.collect(this.page);
+              const freshPostCredSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-action' });
 
               // Build enriched goal context with credential-fill + auth signals
               const credGoalContext: GoalContext = {
@@ -2931,7 +2932,7 @@ export class LiteEngine {
                     newUrl: urlFallbackResult.finalUrl,
                   });
                   // Re-collect snapshot after navigation
-                  snapshotBefore = await SnapshotCollector.collect(this.page);
+                  snapshotBefore = await SnapshotRouter.collect(this.page, { context: 'lite-action' });
                   // Reset stuck counter since we made progress
                   this.state.resetConsecutiveStuckCount();
                 }
@@ -3910,7 +3911,7 @@ export class LiteEngine {
         // 8. Screenshot AFTER - REMOVED for Lite mode (no screenshots)
 
         // 9. Collect after snapshot
-        const snapshotAfter = await SnapshotCollector.collect(this.page);
+        const snapshotAfter = await SnapshotRouter.collect(this.page, { context: 'lite-action' });
         const pageErrorsAfter = await ErrorCollector.collectFromPage(this.page);
         const consoleErrors = this.consoleCollector.getErrorsSince(execResult.startTime);
         const networkErrors = this.networkTracker.getErrorsSince(execResult.startTime);
@@ -4661,7 +4662,7 @@ export class LiteEngine {
         if (response && response.ok() && finalUrl !== currentUrl) {
           // Verify page contains goal-relevant content (not 404→redirect)
           await this.page.waitForTimeout(1000);
-          const verificationSnapshot = await SnapshotCollector.collect(this.page);
+          const verificationSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-verification' });
 
           const contentVerified = this.verifyGoalRelevantPage(
             verificationSnapshot,
@@ -5219,7 +5220,7 @@ export class LiteEngine {
       await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
       await VisualStability.waitForStable(this.page);
 
-      const newSnapshot = await SnapshotCollector.collect(this.page);
+      const newSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
 
       // Check if last command is safe to retry
       const safeActions = ['click', 'fill', 'select', 'scroll', 'wait', 'hover'];
@@ -5241,7 +5242,7 @@ export class LiteEngine {
             await this.networkTracker.waitForNetworkIdle(5000);
             await VisualStability.waitForStable(this.page);
           } catch { /* timeout OK */ }
-          const postRetrySnapshot = await SnapshotCollector.collect(this.page);
+          const postRetrySnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
           logger.info('[RECOVERY] Reload + retry successful', { testId: this.config.testId });
           return { recovered: true, method: 'reload', newSnapshot: postRetrySnapshot, shouldEscalate: false };
         } catch (retryError) {
@@ -5299,7 +5300,7 @@ export class LiteEngine {
           await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
           await VisualStability.waitForStable(this.page);
 
-          const newSnapshot = await SnapshotCollector.collect(this.page);
+          const newSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
 
           // TASK 8: Verify content changed for SPA success detection
           const newContentHash = this.state.computeContentHash(newSnapshot);
@@ -5316,7 +5317,7 @@ export class LiteEngine {
           await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
           await VisualStability.waitForStable(this.page);
 
-          const newSnapshot = await SnapshotCollector.collect(this.page);
+          const newSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
 
           // TASK 8: Verify content matches recovery point for SPA detection
           const newContentHash = this.state.computeContentHash(newSnapshot);
@@ -5352,13 +5353,13 @@ export class LiteEngine {
       if (this.config.credentials) {
         const fallbackResult = await this.tryDirectUrlFallback(currentUrl, { forceLogin: true });
         if (fallbackResult.navigated) {
-          const newSnapshot = await SnapshotCollector.collect(this.page);
+          const newSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
           return { recovered: true, method: 're-auth', newSnapshot, shouldEscalate: false };
         }
 
         // If already on auth URL, just proceed with current page
         if (isAuthUrl) {
-          const newSnapshot = await SnapshotCollector.collect(this.page);
+          const newSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
           return { recovered: true, method: 're-auth', newSnapshot, shouldEscalate: false };
         }
       }
@@ -5414,7 +5415,7 @@ export class LiteEngine {
     await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
     await this.networkTracker.waitForNetworkIdle(this.adaptiveTimeouts?.networkIdleMs || 5000);
     await VisualStability.waitForStable(this.page);
-    return await SnapshotCollector.collect(this.page);
+    return await SnapshotRouter.collect(this.page, { context: 'lite-recovery' });
   }
 
   /**
@@ -5645,7 +5646,7 @@ export class LiteEngine {
   private async initializeTaskPlan(): Promise<void> {
     try {
       // Get initial snapshot for plan generation
-      const initialSnapshot = await SnapshotCollector.collect(this.page);
+      const initialSnapshot = await SnapshotRouter.collect(this.page, { context: 'lite-engine' });
       const snapshotSummary = initialSnapshot.elements
         .slice(0, 20)
         .map(el => `${el.tag}[${el.role}]: ${el.name || el.placeholder || ''}`.slice(0, 60));

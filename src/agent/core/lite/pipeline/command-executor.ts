@@ -25,6 +25,7 @@ import { isDownloadText, isFileUploadTarget, isPaymentContext } from '../analysi
 import { classifyField } from '../analysis/field-classifier';
 import type { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import type { ConsoleCollector } from '../collectors/console-collector';
 import type { NetworkTracker } from '../collectors/network-tracker';
 import { VisualStability } from '../collectors/visual-stability';
@@ -302,7 +303,7 @@ export class CommandExecutor {
 
   private async observePage(): Promise<CommandResult> {
     try {
-      let snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+      let snapshot = await SnapshotRouter.collect(this.page, { context: 'pipeline-observe', fullPage: true });
 
       // Intra-flow overlay gate: cheap check on the snapshot we just took.
       // If a cookie banner / chat widget / toast / onboarding popup appeared
@@ -322,7 +323,7 @@ export class CommandExecutor {
           // re-collection fails we fall back to the original snapshot so
           // the round still progresses.
           try {
-            snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+            snapshot = await SnapshotRouter.collect(this.page, { context: 'pipeline-observe', fullPage: true });
           } catch { /* keep original snapshot */ }
           this.blackboard.addInsight(
             `Intra-flow overlay cleanup: dismissed ${gate.noiseTypes.join(', ')}`,

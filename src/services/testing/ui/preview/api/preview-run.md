@@ -162,7 +162,17 @@ const NO_RETRY_STEP_TYPES    = new Set([
   'ai_check','wait','wait_for_email','dialog','download','switch_tab',
 ]);
 const URL_MISMATCH_HINT_MAX_STEPS = 5;
+
+// V26 — per-run compiled-plan failure budget
+const MAX_COMPILED_FAILS_IN_ROW = 3;   // disable compiled planning after N consecutive misses
+const MAX_COMPILED_FAILS_TOTAL  = 5;   // also disable after N cumulative misses across the run
 ```
+
+**Compiled-failure budget (V26).** Two run-scoped counters (`compiledFailuresInRow`, `compiledFailuresTotal`) decide when to stop building compiled plans for the rest of the run:
+
+- Consecutive failures: a successful step **resets `inRow` to 0**, a compiled-plan miss increments it. At `≥ MAX_COMPILED_FAILS_IN_ROW (3)`, compiled planning is disabled.
+- Total failures: incremented on every miss, never reset. At `≥ MAX_COMPILED_FAILS_TOTAL (5)`, compiled planning is disabled.
+- Replaces the old "skip compiled after first failure" rule. Allows recovery from a single bad plan while still catching post-deploy regressions where every plan is stale.
 
 ## Env vars
 
