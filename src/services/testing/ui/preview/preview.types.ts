@@ -1036,6 +1036,15 @@ export interface CompiledStepPlan {
   unverified?: boolean;
   /** Etap 1A — ISO timestamp of the last `validateOnPage` pass. */
   validatedAt?: string;
+  /**
+   * May 2026 — ISO timestamp of the apply that confirmed this plan via
+   * runtime success (action ran AND post-verification passed). Set in
+   * the same write that flips `unverified` from `true` to `false`, so
+   * an audit trail explains why a plan that build-time validation
+   * couldn't verify is no longer flagged. Independent of `validatedAt`,
+   * which records the build-time `count()` probe.
+   */
+  runtimeConfirmedAt?: string;
 }
 
 /**

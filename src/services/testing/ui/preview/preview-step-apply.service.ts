@@ -139,6 +139,41 @@ function derivePlanQuality(
 }
 
 /**
+ * May 2026 — Runtime confirmation of compiled plan stability.
+ *
+ * `LocatorPlanBuilder.buildCompiledPlan` flags a plan as `unverified=true`
+ * when its build-time `count()` probe couldn't confirm any locator on the
+ * live page. That probe is fragile by design — a click that navigates,
+ * a popover that closes mid-build, a re-rendering Angular page, all
+ * legitimately race the validation and produce false positives.
+ *
+ * When the apply that just finished demonstrates that the element WAS
+ * found AND the action produced an observable effect (verifyClickHadEffect
+ * positive, or non-click action verified), runtime success is strictly
+ * stronger evidence than the build-time probe — and we clear the flag
+ * IN PLACE on the plan object. The cleared plan then flows through to
+ * `step.compiled` and ultimately the DB via run-loop's batch persist,
+ * so the editor's "⚠ unstable" badge (which reads `compiled.unverified`)
+ * stops showing on steps that demonstrably work.
+ *
+ * Mutates the input — the plan was just constructed in the same apply
+ * call, no other reader has it yet. Idempotent: noop if already cleared
+ * or if there was no plan to confirm.
+ *
+ * Callers MUST only invoke this on the success-path (after action ran
+ * and post-verification passed). Failure paths return early before
+ * reaching here, so the flag stays as evidence for next-run diagnostics.
+ */
+function clearUnverifiedOnRuntimeMatch(
+  compiled: CompiledStepPlan | undefined,
+): void {
+  if (!compiled) return;
+  if (compiled.unverified !== true) return;
+  compiled.unverified = false;
+  compiled.runtimeConfirmedAt = new Date().toISOString();
+}
+
+/**
  * V2: Build bindingHints from resolved InteractiveNode.
  * Auto-populates hints for better runtime resolution.
  *
@@ -4142,6 +4177,14 @@ export class PreviewStepApplyService {
             compiled, // NEW: compiled execution plan
           };
 
+          // user_confirmed path: we just clicked the user-picked element
+          // successfully, so the plan that targets that node is by-construction
+          // valid at runtime even if its build-time count() raced navigation.
+          // Mutate the plan to clear `unverified` BEFORE deriving WS-payload
+          // planQuality and BEFORE the run-loop persists `step.compiled` to
+          // DB — this is what makes the editor's "unstable" badge stop
+          // showing on next session.
+          clearUnverifiedOnRuntimeMatch(compiled);
           const planQuality = derivePlanQuality(compiled);
           if (planQuality?.unverified) {
             logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
@@ -4723,6 +4766,15 @@ export class PreviewStepApplyService {
                   decisionTrace.chosen = { ref: compiledRef };
                 }
                 setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+                // compiled fast-path upgrade: we got here ONLY because the
+                // compiled plan just successfully matched, clicked, and
+                // (for non-nav clicks) passed verifyClickHadEffect. That's
+                // direct runtime proof of plan stability — beats build-time
+                // count() which races click→navigation on click steps.
+                // Clear `unverified` on the plan that will be persisted (also
+                // covers the `compiled === upgradedCompiled` case where the
+                // upgrade was skipped due to navigation).
+                clearUnverifiedOnRuntimeMatch(upgradedCompiled);
                 const planQuality = derivePlanQuality(upgradedCompiled);
                 if (planQuality?.unverified) {
                   logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
@@ -6499,6 +6551,15 @@ export class PreviewStepApplyService {
 
           // V23: finalize trace timing for the success path.
           setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+          // lint_resolve_post_verify: `verified === true` here means the
+          // resolver-picked element was actually clicked AND
+          // verifyClickHadEffect returned a positive signal. That's runtime
+          // proof that whatever the compiled plan now describes (built from
+          // the same node) does the right thing — beats build-time count()
+          // which races navigation. Soft-pass path skips compile entirely
+          // (`softPassedOnNoEffect` → no `compiled` write), so this branch
+          // only runs on real success.
+          if (verified) clearUnverifiedOnRuntimeMatch(compiled);
           const planQuality = derivePlanQuality(compiled);
           if (planQuality?.unverified) {
             logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
