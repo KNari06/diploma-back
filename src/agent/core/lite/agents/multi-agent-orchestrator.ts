@@ -1364,11 +1364,54 @@ export class MultiAgentOrchestrator {
         visitCount: 1,
         lastIteration: iteration,
       };
+      // P0 fix — cap visitedPages to prevent unbounded growth on long
+      // tests with heavy navigation. Each entry is small (~100 bytes)
+      // but unconstrained: a 200-iteration crawl across 200 unique
+      // URLs accumulates 200 entries forever (used by Strategist for
+      // "have we been here before" loop detection).
+      // LRU policy: when over cap, drop the oldest by `lastIteration`.
+      // Cap = 50 unique URLs is more than enough for loop detection
+      // (most tests visit ≤20 unique pages); keeps the structure
+      // bounded under any test length.
+      const MAX_VISITED_PAGES = 50;
+      const keys = Object.keys(this.workingMemory.visitedPages);
+      if (keys.length > MAX_VISITED_PAGES) {
+        // Find oldest by lastIteration (smallest = stalest).
+        let oldestKey = keys[0];
+        let oldestIter = this.workingMemory.visitedPages[oldestKey].lastIteration;
+        for (const k of keys) {
+          const it = this.workingMemory.visitedPages[k].lastIteration;
+          if (it < oldestIter) {
+            oldestIter = it;
+            oldestKey = k;
+          }
+        }
+        // Don't evict the entry we just added (rare race when
+        // iteration === oldestIter and oldestKey === urlKey, but be
+        // defensive).
+        if (oldestKey !== urlKey) {
+          delete this.workingMemory.visitedPages[oldestKey];
+        }
+      }
     }
 
     // Update form progress from Observer's formAnalysis
     if (observation.formAnalysis) {
       this.workingMemory.lastFormAnalysis = observation.formAnalysis;
+      // P1 fix — prune formProgress entries whose refs no longer
+      // exist in the current form. Without pruning, every form the
+      // test ever touched leaves its field refs behind forever
+      // (multi-step flows: login form → settings form → checkout
+      // form → ... accumulating field refs the rest of the test
+      // doesn't care about, but Strategist re-reads on every
+      // iteration). Pruning to current-form-refs only is correct:
+      // a field that left the DOM cannot be filled again.
+      const currentRefs = new Set(observation.formAnalysis.fields.map((f) => f.ref));
+      for (const ref of Object.keys(this.workingMemory.formProgress)) {
+        if (!currentRefs.has(ref)) {
+          delete this.workingMemory.formProgress[ref];
+        }
+      }
       for (const field of observation.formAnalysis.fields) {
         const current = this.workingMemory.formProgress[field.ref];
         if (field.hasValue && current !== 'filled') {
@@ -1376,6 +1419,12 @@ export class MultiAgentOrchestrator {
         } else if (!field.hasValue && !current) {
           // Field exists but not yet interacted with — don't overwrite 'failed'
         }
+      }
+    } else {
+      // No form on current page → drop stale form progress entirely.
+      // Strategist will re-populate when next form appears.
+      if (Object.keys(this.workingMemory.formProgress).length > 0) {
+        this.workingMemory.formProgress = {};
       }
     }
   }

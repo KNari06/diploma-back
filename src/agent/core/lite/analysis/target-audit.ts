@@ -64,26 +64,33 @@ export class TargetAudit {
    * @param candidates Top ranked candidate elements
    * @param expandedGoal Expanded goal from GoalExpander
    * @param funnelPhase Current funnel phase
+   * @param options.scoringMode Default 'deweighted' (Stage 2). Bucket
+   *   scores 0/1/2/3 → score legend in the prompt explains the scale.
+   *   'legacy' kept for backward compatibility with non-Lite callers
+   *   (composite float scores 0..15).
    * @returns Audit result with potential correction
    */
   static async audit(
     command: AICommand,
     candidates: RankedCandidate[],
     expandedGoal: ExpandedGoal,
-    funnelPhase: FunnelPhase
+    funnelPhase: FunnelPhase,
+    options: { scoringMode?: 'legacy' | 'deweighted' } = {},
   ): Promise<AuditResult> {
     const startTime = Date.now();
+    const scoringMode = options.scoringMode ?? 'deweighted';
 
     logger.info('[TARGET_AUDIT] Starting L4 audit', {
       proposedRef: command.ref?.slice(0, 20),
       action: command.action,
       candidateCount: candidates.length,
       funnelPhase,
+      scoringMode,
     });
 
     try {
       const response = await Promise.race([
-        this.callAuditAI(command, candidates, expandedGoal, funnelPhase),
+        this.callAuditAI(command, candidates, expandedGoal, funnelPhase, scoringMode),
         this.timeout(this.TIMEOUT_MS),
       ]);
 
@@ -126,7 +133,8 @@ export class TargetAudit {
     command: AICommand,
     candidates: RankedCandidate[],
     expandedGoal: ExpandedGoal,
-    funnelPhase: FunnelPhase
+    funnelPhase: FunnelPhase,
+    scoringMode: 'legacy' | 'deweighted' = 'legacy',
   ): Promise<AIAuditResponse | null> {
     // Find proposed element in candidates
     const proposedCandidate = candidates.find(c => c.ref === command.ref);
@@ -135,6 +143,14 @@ export class TargetAudit {
 Your task is to verify that the AI chose the CORRECT element for the user's goal.
 If the chosen element is wrong, select the best alternative from the candidates.
 Return ONLY a JSON object.`;
+
+    // Audit H2: legacy scores ranged 0.05–~15 (composite). Deweighted
+    // scores are 0/1/2/3 (4 buckets). The LLM has no way to know
+    // `3.00` means "strongest candidate" in deweighted mode unless we
+    // tell it. Choose legend by mode so the prompt explains itself.
+    const scoreLegend = scoringMode === 'deweighted'
+      ? '(scoring: 3=visible+goal-relevant, 2=visible only, 1=goal-relevant but covered, 0=neither — higher is better, ALL candidates may share the same bucket)'
+      : '(scoring: composite of heuristic × funnel × z-index × goal-relevance — typical range 0.05–15, higher is better)';
 
     const userPrompt = `USER GOAL: "${expandedGoal.original}"
 ACTION: ${command.action}
@@ -148,8 +164,8 @@ PROPOSED ELEMENT:
 - tag: ${proposedCandidate?.tag || 'unknown'}
 - score: ${proposedCandidate?.score?.toFixed(2) || 'N/A'}
 
-TOP CANDIDATES (sorted by score):
-${candidates.slice(0, 5).map((c, i) =>
+TOP CANDIDATES sorted by score ${scoreLegend}:
+${candidates.map((c, i) =>
   `${i + 1}. ref="${c.ref}" name="${c.name}" tag=${c.tag} score=${c.score.toFixed(2)}`
 ).join('\n')}
 
@@ -174,7 +190,12 @@ RULES:
           model: AI_TASK_MODELS.targetAudit,
           temperature: 0,
           response_format: { type: 'json_object' },
-          max_tokens: 200,
+          // 250 tokens covers JSON output for up to 10 candidates plus
+          // a short reason. Was 200 (sized for 5). The output schema
+          // is fixed-size (isCorrect / correctedRef / reason / confidence)
+          // — the +50 is purely for `reason` headroom when the model
+          // describes a specific candidate among 10 instead of 5.
+          max_tokens: 250,
         }
       );
 

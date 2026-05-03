@@ -577,12 +577,26 @@ If overriding, use ONLY refs from PAGE ELEMENTS above:
   "confidence": 0.85
 }
 
+Element-marker reference (per-line in PAGE ELEMENTS):
+- [EXPANDED] / [COLLAPSED] / [CHECKED] / [SELECTED] / [PRESSED] — ARIA toggle states.
+- [STATE=open|closed|active|inactive|on|off] — Radix UI / shadcn / Vaul data-state attribute.
+  Many primitives do not mirror to aria-* — these markers are the ONLY signal of
+  open/active state for Dialog, Popover, DropdownMenu, Collapsible, Tabs.
+- [DISABLED] / [INVALID] — input cannot be used / failed validation.
+
 Rules:
 - Be SKEPTICAL. Your job is to find flaws, not agree.
 - Check goal alignment: does this action ACTUALLY help reach the goal?
 - Check element correctness: is this the RIGHT element?
 - "approve" should still include a failureRisk (what COULD go wrong)
 - Override refs MUST exist in PAGE ELEMENTS above — never invent refs
+- **TOGGLE-REGRESSION REJECTION**: REJECT a click when:
+  (a) goal text implies "open" / "show" / "expand" AND
+  (b) the target element shows [STATE=open], [STATE=active], [STATE=on], or [EXPANDED]
+  Reason: clicking such a trigger TOGGLES it closed — that's a regression, not progress.
+  Inverse case: REJECT clicks on [STATE=closed]/[COLLAPSED] triggers when goal is "close"/"collapse".
+  Suggested fix: respond with verdict "reject" and failureRisk noting the toggle regression;
+  Strategist will mark goal done next iteration.
 - Return ONLY valid JSON`;
   }
 }

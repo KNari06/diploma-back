@@ -175,6 +175,12 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.text = truncateText(element.name);
   }
 
+  // V26: Pass through firstTextFragment for builder/resolver to use as a
+  // single-DOM-node text locator (Angular Material card pattern, etc.).
+  if (element.firstTextFragment) {
+    node.firstTextFragment = truncateText(element.firstTextFragment);
+  }
+
   // Add placeholder
   if (element.placeholder) {
     node.placeholder = truncateText(element.placeholder);
@@ -268,6 +274,15 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if (element.ariaChecked !== undefined) {
     node.ariaChecked = element.ariaChecked;
   }
+  // Radix/shadcn data-state — symmetry partner of probe / collector.
+  // Without this assignment, snapshot collector populates dataState on
+  // collected elements but probed elements (recorded steps) have it
+  // dropped here → fingerprint compare reads recordedFp.dataState=undefined
+  // vs live el.dataState='open' → false "page state changed since
+  // recording" diagnosis on every Radix replay.
+  if (element.dataState) {
+    node.dataState = element.dataState;
+  }
 
   // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state + Select value + IconButton child lift
   if (element.ariaCurrent) {
@@ -288,6 +303,33 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   // V22 Pkg4: semantic icon label from svg/icon-library extraction.
   if ((element as any).iconLabel) {
     (node as any).iconLabel = (element as any).iconLabel;
+  }
+  // V23: forward identity fields the collector populates that previously got
+  // dropped here. Without these, builder/resolver/helper read undefined even
+  // though collector correctly extracted them. All fields are now typed on
+  // InteractiveNode so direct assignment is type-safe; LiteSnapshotElement
+  // sourcing still goes through `(element as any)` because LiteElement type
+  // hasn't been audited for the same superset (out of scope here).
+  if ((element as any).svgIcon) {
+    node.svgIcon = (element as any).svgIcon;
+  }
+  if ((element as any).customElementTag) {
+    node.customElementTag = (element as any).customElementTag;
+  }
+  if ((element as any).href) {
+    node.href = (element as any).href;
+  }
+  if ((element as any).alt) {
+    node.alt = (element as any).alt;
+  }
+  if ((element as any).cssClass) {
+    node.cssClass = (element as any).cssClass;
+  }
+  if ((element as any).vueScopeId) {
+    node.vueScopeId = (element as any).vueScopeId;
+  }
+  if ((element as any).ancestorSummary) {
+    node.ancestorSummary = (element as any).ancestorSummary;
   }
 
   // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
@@ -429,6 +471,9 @@ export function createDomAnalysis(snapshot: LiteSnapshot): DomAnalysisData {
     title: snapshot.title,
     capturedAt: snapshot.timestamp,
     version: DOM_ANALYSIS_VERSION,
+    // V26: pass real viewport through so `buildAllowedSets` can compute
+    // accurate modal-coverage ratio. Falls back to bbox heuristic if absent.
+    viewport: snapshot.viewport,
   };
 }
 

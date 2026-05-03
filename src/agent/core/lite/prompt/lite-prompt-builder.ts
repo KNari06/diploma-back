@@ -89,7 +89,7 @@ export class LitePromptBuilder {
     stateDriftAnalysis?: string;
     /** ✅ NEW: Last action for context in drift analysis */
     lastAction?: string;
-    /** ✅ NEW: Goal-Oriented Summary from HybridSemanticWeightCalculator (Secret Sauce) */
+    /** Goal-Oriented Summary from `buildDeterministicSummary` in progress-evaluator.ts */
     goalOrientedSummary?: string;
     /** ✅ NEW: Transition summary from previous action (for done detection) */
     transitionSummary?: string;
@@ -214,8 +214,10 @@ NOTE: Some elements may be in Shadow DOM or Iframes. The system will handle cont
       ? `\n${params.stateDriftAnalysis}\n`
       : '';
 
-    // ✅ NEW: Goal-Oriented Summary section (Secret Sauce from HybridSemanticWeightCalculator)
-    // Shows semantic analysis of changes: errors, forms, goal-relevant elements
+    // Goal-Oriented Summary section. Sourced from
+    // `buildDeterministicSummary` in progress-evaluator.ts — surfaces
+    // errors, forms/dialogs/menus, goal-relevant additions, URL change,
+    // API success, removals, sentiment line.
     const goalOrientedSummarySection = params.goalOrientedSummary
       ? `
 📊 WHAT CHANGED (Goal-Oriented Summary):

@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import type { ChatAttachment } from '../chat.types';
+import type { ChatStore } from '@/services/utils/chat-store';
 import { handlePlatformTest as handlePlatformTestOriginal } from '../ai_test/handler';
 import { handleApiTest as handleApiTestOriginal } from '../api_test/handler';
 import { handleGeneralChat as handleGeneralChatOriginal } from '../general/handler';
@@ -55,6 +56,17 @@ export type IntentHandler = (
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
     executionStrategy?: 'standard' | 'exploration'; // Execution strategy from frontend
     attachments?: ChatAttachment[]; // File attachments (images + documents)
+    /**
+     * Persistence backend. Migrated handlers (general_chat, editor_action)
+     * route reads/writes through ChatPersistence with this store. Legacy
+     * handlers ignore it and continue writing to the global tables —
+     * which is correct for them because the test-case scope blocks all
+     * non-migrated intents to general_chat upstream (see intent-parsing.ts
+     * `isTestCaseScope` guard). Default at the call sites is GLOBAL_STORE.
+     */
+    chatStore?: ChatStore;
+    /** Test-case scope marker (UUID). Mirrors the controller-level binding. */
+    testCaseId?: string;
   }
 ) => Promise<void>;
 
@@ -120,6 +132,11 @@ const handleGeneralChat: IntentHandler = async (req, res, params) => {
     attachments: params.attachments,
     // Strict boolean guard: LLM may return "false" (string), 0, or null — only trust actual boolean
     needsTools: params.parsedIntent?.needsTools === false ? false : undefined,
+    // Pass through persistence + test-case scope. Underlying handler
+    // routes saves through ChatPersistence using this store. When unset
+    // (legacy global path), the original behavior is preserved.
+    chatStore: params.chatStore,
+    testCaseId: params.testCaseId,
   });
 };
 
@@ -134,6 +151,12 @@ const handleClarificationRequest: IntentHandler = async (req, res, params) => {
     userId: params.userId,
     chatSessionId: params.chatSessionId,
     abortSignal: params.abortSignal,
+    mode: params.mode,
+    // Forward persistence binding + test-case scope: needs_clarification
+    // is one of the few intents allowed in test-case chats, so saves
+    // and WS emits MUST route through the per-test-case backend.
+    chatStore: params.chatStore,
+    testCaseId: params.testCaseId,
   });
 };
 

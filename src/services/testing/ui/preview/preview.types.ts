@@ -34,6 +34,25 @@ export interface InteractiveNode {
   inputType?: string;
   /** Text content (truncated) */
   text?: string;
+  /**
+   * V26: First non-empty text fragment as it actually appears in the DOM —
+   * not the concatenated full innerText. Used to handle Angular Material /
+   * Vue scoped / Web Component patterns where a card's title and
+   * description live in DIFFERENT child elements:
+   *
+   *   <a><app-title>МАТ-SMART</app-title><span>Бекнұр • Курс аяқталды</span></a>
+   *
+   * `text` would be the joined "МАТ-SMART Бекнұр • Курс аяқталды" — which
+   * `getByText(...)` cannot match because the DOM has no single text node
+   * with that string. `firstTextFragment` is "МАТ-SMART" alone, which IS a
+   * single-text-node match.
+   *
+   * Set ONLY when it differs from `text` (otherwise the locator builder
+   * would generate a redundant strategy). Symmetric: recorder and
+   * collector use the same extraction logic, so recorded fingerprints and
+   * live snapshots agree byte-for-byte.
+   */
+  firstTextFragment?: string;
   /** Associated label text (from <label for=>, wrapping <label>, aria-labelledby) */
   labelText?: string;
   /** ARIA label */
@@ -86,6 +105,17 @@ export interface InteractiveNode {
   /** aria-checked for custom checkboxes/switches */
   ariaChecked?: boolean | 'mixed';
   /**
+   * Radix UI / shadcn / Vaul / many headless React libs encode toggle state
+   * via `data-state="open|closed|active|inactive|on|off|checked|unchecked"`.
+   * Some Radix primitives (Dialog, Popover, DropdownMenu) do NOT mirror it
+   * to `aria-expanded` — without this signal verifier reports the click
+   * had no effect even when the menu actually opened (canonical fake-success
+   * symptom). Length-capped at 30 chars to stay defensive against
+   * pathological values; raw casing preserved (Radix uses camelCase like
+   * 'forceMount'). Mirror of LiteElement.dataState.
+   */
+  dataState?: string;
+  /**
    * V22 Pkg1: aria-current — for Pagination current page, Stepper active
    * step, Breadcrumbs last crumb. Raw value: 'page' | 'step' | 'true' | etc.
    */
@@ -117,6 +147,61 @@ export interface InteractiveNode {
    * childTestId is available — closes the "fully bare icon button" gap.
    */
   iconLabel?: string;
+  /**
+   * Angular Material icon registry name. Read from `svgicon` attribute on
+   * `<mat-icon>` (or `data-mat-icon-name` mirror). Survives across builds
+   * and re-renders — Material registers each icon once globally and the
+   * attribute is the lookup key. Strong identity signal for Material apps
+   * where the SVG itself has no `<title>`/aria-label/text.
+   *
+   *   <mat-icon svgicon="chevron-left-outline"><svg>...</svg></mat-icon>
+   *
+   * Distinct from `iconLabel` (which sources from svg <title>, data-lucide,
+   * FA classes). When both are present we prefer svgIcon as the identity —
+   * iconLabel can be derived from generic CSS class tokens that overlap
+   * across icons; svgIcon comes from the explicit registration name.
+   */
+  svgIcon?: string;
+  /**
+   * Closest semantic custom-element ancestor (`<app-foo-bar>` /
+   * `<my-button>` / etc.). See TargetFingerprint.customElementTag for
+   * the rationale and filter rules. Used by the resolver's identity
+   * fast-path so an Angular icon-only button wrapped in a meaningful
+   * `<app-X>` tag still gets a deterministic match.
+   */
+  customElementTag?: string;
+  /**
+   * V23: `<img alt="...">` — WCAG-recommended accessible name for image
+   * targets. Promoted from "checked but not stored" status so the resolver,
+   * builder, and getEffectiveLabel() can use it as a first-class identity
+   * source instead of reading via `(node as any).alt`.
+   */
+  alt?: string;
+  /**
+   * V23: `<a href="...">` — link destination. Used by builder for
+   * hash-anchor (`#section-id`) and pathname-suffix locator strategies,
+   * and by candidateText to disambiguate duplicate visible text by destination.
+   */
+  href?: string;
+  /**
+   * V23: First 1-3 stable className tokens (utility-class noise stripped at
+   * probe time). Used by builder's scoped-text fallback strategies.
+   */
+  cssClass?: string;
+  /**
+   * V23: Vue scoped-style attribute (`data-v-XXXXXX`). Stable per-component
+   * instance marker; narrows cross-redesign matches in Vue apps.
+   */
+  vueScopeId?: string;
+  /** Etap 1B.2 — Angular `routerLink` directive value. */
+  routerLink?: string;
+  /** Etap 1B.2 — Angular reactive-forms `formControlName`. */
+  formControlName?: string;
+  /**
+   * V23: Compact ancestor chain summary like `header > div.icon-group > svg`
+   * — see TargetFingerprint.ancestorSummary for rationale.
+   */
+  ancestorSummary?: string;
   /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap data-bs-target selector. */
@@ -238,6 +323,11 @@ export interface DomAnalysisData {
   capturedAt: number;
   /** Version for future migrations */
   version: string;
+  /** V26: Real browser viewport at capture time. Used for modal-coverage
+   *  ratio in `buildAllowedSets` — without this, long scrollable pages
+   *  underestimate modal coverage and the blocking-modal hard-exclude rule
+   *  never fires. Optional for backwards compatibility. */
+  viewport?: { width: number; height: number };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -339,6 +429,10 @@ export interface BindingHints {
    * marker that narrows down element identity within a Vue app.
    */
   vueScopeId?: string;
+  /** Etap 1B.2 — Angular `routerLink` directive value. */
+  routerLink?: string;
+  /** Etap 1B.2 — Angular reactive-forms `formControlName`. */
+  formControlName?: string;
   /** V22: <img alt="…"> — fallback identifier for image targets. */
   alt?: string;
   /** V22: HTML name attribute (form fields). */
@@ -366,6 +460,18 @@ export interface BindingHints {
     valueText?: string;
   };
   /**
+   * Radix/shadcn/Vaul `data-state` at recording time. Captured separately
+   * from `ariaState` because (a) it doesn't fit the boolean schema (raw
+   * string keyword), and (b) it can be set INDEPENDENTLY of aria-* — many
+   * Radix primitives don't mirror to aria. Used by the click-effect
+   * verifier (post-action-verify state-reflected phase) to recognise
+   * Radix open/close transitions; used by `inferClickActionType` to
+   * record the right step type ('open' vs 'click') when aria-expanded
+   * is missing. Read by element-resolver candidateText / scene summary
+   * for LLM disambiguation between already-open and closed triggers.
+   */
+  dataState?: string;
+  /**
    * V22 Pkg1: data-value / `<option value>` — semantic key for select
    * options / list items / chips, distinct from their display label.
    */
@@ -386,6 +492,16 @@ export interface BindingHints {
    * with no testId / aria-label / title).
    */
   iconLabel?: string;
+  /**
+   * Angular Material icon registry name (`svgicon` attribute on `<mat-icon>`).
+   * Mirror of `TargetFingerprint.svgIcon` — see that field for rationale.
+   */
+  svgIcon?: string;
+  /**
+   * Closest semantic custom-element ancestor's tag name. Mirror of
+   * `TargetFingerprint.customElementTag` — see that field for rationale.
+   */
+  customElementTag?: string;
   /**
    * V22 Pkg2: Bootstrap toggle marker (data-bs-toggle). Distinguishes
    * "real Bootstrap dropdown trigger" from a static button with similar
@@ -516,9 +632,177 @@ export interface StepEvidence {
   needsReview?: boolean;
 }
 
+/**
+ * Etap 1D.2 — Failure evidence bundle.
+ *
+ * Captured when an apply exhausts the full resolver waterfall (compiled
+ * plan failed AND lint/LLM/vision failed) so the user can debug WHY a
+ * step is broken without re-running it. Persisted in
+ * `IntentStep.failureEvidence`.
+ *
+ * Replaces silent failures: today a fully-failed apply emits a
+ * `success: false` WS result and disappears. The user sees a red toast
+ * but has no record of which strategies were tried, what the page looked
+ * like, or what the resolver thought went wrong.
+ *
+ * Capped storage:
+ *   - `attempts` keeps at most 10 most recent (oldest dropped)
+ *   - the bundle as a whole keeps the LAST failure (single object, not
+ *     a history array) — flaky steps would otherwise bloat JSONB rows
+ */
+export interface StepFailureEvidence {
+  /** ISO timestamp of when this bundle was collected. */
+  capturedAt: string;
+  /** URL at the moment of failure — for debugging cross-page drift. */
+  pageUrl: string;
+  /**
+   * V26 Batch A: WHERE in the apply pipeline did the failure originate.
+   * Top-level field (mirrored into `attempts[0].failureKind` for older
+   * consumers) so the dashboard can group/filter without iterating the
+   * attempts array. Distinct values are stable identifiers consumed by
+   * the editor's "stuck steps" widget — adding a new one is non-breaking
+   * but consumers should treat unknown values as `'other'`.
+   *
+   * Domain:
+   *   - `wait_for_timeout`            — wait_for didn't observe URL change
+   *   - `wait_for_email_failed`       — wait_for_email IMAP poll failed
+   *   - `select_no_match`             — no option matched the value
+   *   - `upload_no_file`              — file chooser missed all paths
+   *   - `navigate_failed`             — page.goto threw / 5xx
+   *   - `click_action_threw`          — Playwright click() threw
+   *   - `fake_success_guard`          — post-click verifier rejected
+   *   - `pre_click_label_mismatch`    — pre-click guard aborted
+   *   - `resolver_exhausted`          — full resolver waterfall failed
+   *   - `session_invalid`             — session/page expired or closed
+   *   - `apply_threw`                 — uncaught throw in applyStep
+   *   - `other`                       — catch-all
+   */
+  originatingStrategy?:
+    | 'wait_for_timeout'
+    | 'wait_for_email_failed'
+    | 'select_no_match'
+    | 'upload_no_file'
+    | 'navigate_failed'
+    | 'click_action_threw'
+    | 'fake_success_guard'
+    | 'pre_click_label_mismatch'
+    | 'resolver_exhausted'
+    | 'session_invalid'
+    | 'apply_threw'
+    | 'other';
+  /** Last error string from the resolver waterfall (already truncated). */
+  lastError?: string;
+  /**
+   * Number of attempts the apply took before giving up. Distinct from
+   * `attempts` (per-strategy detail) below — this is the high-level loop
+   * counter, useful when the bundle is consumed by a UI that wants
+   * "step retried 5 times before giving up" without rendering the full
+   * per-attempt list.
+   */
+  totalAttempts?: number;
+  /**
+   * Per-strategy attempt log. Cap 10 most recent. Each entry mirrors what
+   * the editor trace records but in a persisted, DB-friendly form.
+   */
+  attempts: Array<{
+    strategy: string;
+    tier?: string;
+    /** True when this attempt found an element (may still have failed verify). */
+    matched: boolean;
+    /** Why this attempt failed — `not_found` / `ambiguous` / `fingerprint_mismatch` / `verify_failed` / `error`. */
+    failureKind: string;
+    /** Locator value tried, capped at 200 chars. */
+    value?: string;
+    /** Time the attempt took (ms). */
+    durationMs?: number;
+    /** Free-form error message, capped at 200 chars. */
+    error?: string;
+  }>;
+  /**
+   * Reference to a saved screenshot (artifact storage path, NOT base64).
+   * Optional — collector best-effort tries to capture, falls through if
+   * the page is in a state that doesn't allow screenshot.
+   */
+  screenshotRef?: string;
+  /**
+   * Compact snapshot summary: how many interactive nodes were visible,
+   * top-level page heading. Lets the user see "page had 50 buttons but
+   * none matched" vs "page was empty / loading".
+   */
+  pageContext?: {
+    pageTitle?: string;
+    interactiveNodeCount?: number;
+    /** Did the recorder fingerprint at least *look* findable on this page? */
+    recordedFingerprintPresent?: boolean;
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPILED STEP PLAN (for reliable execution with fallback and heal)
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Locator tier — coarse category that drives executor probe order at replay
+ * time. Replaces the per-locator confidence number as the primary sort key.
+ *
+ * Within a tier, plan order is decided by the build-time validator (live
+ * `count()` on the recorded page): unique matches go first, ambiguous or
+ * dead matches go last or get dropped.
+ *
+ * Confidence stays as a derived legacy field for backward compat with old
+ * plans in the DB (see `tierToConfidence` helper) — the executor reads tier
+ * first and falls back to confidence-bucketing when tier is missing.
+ */
+export type LocatorTier =
+  /**
+   * Machine-readable identity authored as an identifier:
+   *   testId, id (non-dynamic), form `name`, role+accessible name,
+   *   label-for-input. Survives i18n, restyle, full re-renders.
+   */
+  | 'IDENTITY'
+  /**
+   * Accessible / human-described name:
+   *   ariaLabel (standalone), alt, title, placeholder. Authored for a11y or
+   *   UX, drifts faster than IDENTITY but stable across visual changes.
+   */
+  | 'SEMANTIC'
+  /**
+   * Component / domain attribute:
+   *   mat-icon[svgicon], data-bs-toggle/target, data-row-key, data-value,
+   *   childTestId (`:has([data-testid])`), customElementTag+leaf chains,
+   *   href anchors, icon library attrs (data-lucide / data-feather / ...).
+   */
+  | 'STRUCTURAL'
+  /**
+   * Visible text:
+   *   firstTextFragment, full text, token-chain (`:has-text("X"):has-text("Y")`),
+   *   role partial-name. Drifts on copy edits and i18n.
+   */
+  | 'TEXTUAL'
+  /**
+   * Text resolved through a structural ancestor:
+   *   landmark / containerTitle / nearText / row scope `>>` chains.
+   *   Used to disambiguate when the same text repeats elsewhere on the page.
+   */
+  | 'CONTEXTUAL'
+  /**
+   * Position in siblings — last resort:
+   *   siblingIndex + class + nth-of-type. Fragile to structural refactors.
+   */
+  | 'POSITIONAL';
+
+/**
+ * Tier comparison helper: lower number = higher priority. Plan executor and
+ * build-time sort use this to walk tiers in order, IDENTITY first.
+ */
+export const TIER_ORDER: Record<LocatorTier, number> = {
+  IDENTITY: 1,
+  SEMANTIC: 2,
+  STRUCTURAL: 3,
+  TEXTUAL: 4,
+  CONTEXTUAL: 5,
+  POSITIONAL: 6,
+};
 
 /**
  * Single locator strategy
@@ -531,8 +815,38 @@ export interface LocatorEntry {
   value: string;
   /** Optional role name for getByRole */
   roleName?: string;
-  /** Confidence score when generated (0-1) */
+  /**
+   * Confidence score (0-1).
+   *
+   * LEGACY — kept for old plans persisted before the tier rollout. New plans
+   * still populate this via `tierToConfidence(tier, matchCount)` so consumers
+   * that only check `confidence` keep working. Sort/dedup logic prefers
+   * `tier` + `matchCount` when both are present.
+   */
   confidence?: number;
+  /**
+   * Coarse priority category (Etap 1A). Optional: legacy plans in the DB
+   * predate tier and the executor falls back to confidence-bucketing for
+   * those. New plans always populate it.
+   */
+  tier?: LocatorTier;
+  /**
+   * Number of elements this locator matches on the recorded page at build
+   * time. Set by `validateOnPage` in the builder. Undefined when the builder
+   * was called without a live `page` (e.g. plan rebuilt from a stored
+   * artifact).
+   *
+   *   0  — locator dropped from plan (page validation rejected it)
+   *   1  — unique match, boosted to front of its tier
+   *   >1 — ambiguous, demoted within tier (or dropped if scoping fails)
+   */
+  matchCount?: number;
+  /**
+   * True when `validateOnPage` confirmed `matchCount > 0`. Distinct from
+   * "matchCount defined": a count of 0 explicitly invalidates a locator.
+   * False also covers timeout / throw — not the same as proven-broken.
+   */
+  validated?: boolean;
 }
 
 /**
@@ -565,6 +879,15 @@ export interface TargetFingerprint {
   alt?: string;
   /** V22: visible text content (when distinct from labelText) */
   text?: string;
+  /**
+   * V26: First non-empty DOM-unit text fragment (single Text node OR
+   * single descendant element with leaf text). Symmetric with
+   * InteractiveNode.firstTextFragment. Stored ONLY when it differs from
+   * `text` -- otherwise locator-plan-builder would emit redundant text
+   * strategies. Powers title-only getByText() locators on Angular/Vue
+   * card patterns where title and description live in separate children.
+   */
+  firstTextFragment?: string;
   /** V22: stable DOM id, framework-generated ids already stripped at probe time */
   elementId?: string;
   /** V22: First 1-3 stable className tokens (utility classes stripped) */
@@ -575,6 +898,10 @@ export interface TargetFingerprint {
   href?: string;
   /** V22: Vue scoped style attribute (data-v-XXXXXXX) — narrows component instance */
   vueScopeId?: string;
+  /** Etap 1B.2 — Angular `routerLink` directive value. */
+  routerLink?: string;
+  /** Etap 1B.2 — Angular reactive-forms `formControlName`. */
+  formControlName?: string;
   /** V22: HTML name attribute (form field disambiguation). */
   name?: string;
   /**
@@ -599,12 +926,40 @@ export interface TargetFingerprint {
     valueNow?: number;
     valueText?: string;
   };
+  /**
+   * Radix/shadcn/Vaul `data-state` recorded at click time. Mirror of
+   * `BindingHints.dataState`. NOT an identity-uniqueness gate (multiple
+   * elements can share data-state="open"); used as a soft signal:
+   * (1) heal-time tiebreaker when 2 candidates have equal id-quality,
+   * (2) input to "did this click do anything?" verifier — recorded
+   * 'closed' → live 'open' is a confirmed open transition.
+   */
+  dataState?: string;
   /** V22 Pkg1: data-value / `<option value>` — semantic key. */
   dataValue?: string;
   /** V22 Pkg1: data-testid of the single direct icon child (svg/i/img). */
   childTestId?: string;
   /** V22 Pkg4: semantic icon name (svg <title>/<desc>/<use href>/data-lucide/etc). */
   iconLabel?: string;
+  /**
+   * Angular Material icon registry name (`svgicon` / `data-mat-icon-name`
+   * attribute on `<mat-icon>`). Strong identity signal for Material apps —
+   * survives rebuilds because the value is the registration key, not a
+   * generated hash. Distinct from `iconLabel` which sources from
+   * `<title>`/`data-lucide`/FA classes.
+   */
+  svgIcon?: string;
+  /**
+   * Closest meaningful custom-element ancestor's tag name. Captures the
+   * Angular component / Vue 3 SFC / Lit / Stencil semantic name that
+   * wraps an otherwise-bare button (`<app-notifications-button>` →
+   * `<button class="btn"><svg/></button>`). On Angular Material apps
+   * this is often the ONLY identity available for icon-only header
+   * actions where there's no id, testid, aria-label, title, or text.
+   * Filtered to "semantic" tags only (≥3 dash-segments, no counter
+   * suffix) so `<app-c134>` doesn't pass.
+   */
+  customElementTag?: string;
   /** V22 Pkg2: Bootstrap toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap target selector. */
@@ -671,6 +1026,16 @@ export interface CompiledStepPlan {
   meta?: CompiledPlanMeta;
   /** Target element fingerprint (for heal comparison) */
   targetFingerprint?: TargetFingerprint;
+  /**
+   * Etap 1A — true when `validateOnPage` could not confirm any locator
+   * against the live page (all returned `count === 0`, or validation timed
+   * out / threw). Plans flagged `unverified` keep their raw locators as a
+   * best-effort fallback but the executor should weight them lower than
+   * verified plans.
+   */
+  unverified?: boolean;
+  /** Etap 1A — ISO timestamp of the last `validateOnPage` pass. */
+  validatedAt?: string;
 }
 
 /**
@@ -849,6 +1214,33 @@ export interface IntentStep {
   bindingHints?: BindingHints;
   /** Cached evidence from last execution (optimization, not truth) */
   evidence?: StepEvidence;
+  /**
+   * Etap 1D.2 — Last-failure bundle. Set when an apply exhausts the full
+   * resolver waterfall (compiled plan failed AND lint/LLM/vision failed).
+   * Single object (last failure wins, not a history array) to keep JSONB
+   * rows from bloating on chronically flaky steps.
+   *
+   * Cleared when the same step apply succeeds — see Apply path for the
+   * unset semantics. Frontend reads this to show a "needs review" badge
+   * with the failure detail.
+   */
+  failureEvidence?: StepFailureEvidence;
+  /**
+   * Etap 1D.3 — Natural-language description of the clicked/typed element,
+   * generated by an LLM at recording time. Fed to the resolver at replay
+   * as a 3rd channel alongside `recordedFingerprint` and snapshot,
+   * dramatically improving disambiguation for icon-only / descriptor-poor
+   * elements that have no text/aria-label/testId of their own.
+   *
+   * Examples:
+   *   - "the Save button inside the user profile modal"
+   *   - "the notification bell icon in the header navigation"
+   *   - "the first row's Edit button in the courses table"
+   *
+   * Capped at 120 chars at write time. Empty string and undefined both
+   * mean "no description" — caller should treat them identically.
+   */
+  recordedDescription?: string;
   /** Compiled execution plan (generated after successful apply) */
   compiled?: CompiledStepPlan;
   /**
@@ -934,6 +1326,22 @@ export interface LintResult {
   message: string;
   /** Overall confidence (0-1) */
   confidence: number;
+  /**
+   * Which path actually selected the chosen candidate. Surfaced into
+   * preview_run trace so a fake-success / wrong-element pass can be
+   * traced to the exact step in the resolver pipeline that picked it.
+   *   identity_id     — recordedFingerprint.elementId match (uniqueness gate passed)
+   *   identity_testid — recordedFingerprint.testIdAttr match
+   *   identity_href   — recordedFingerprint.href match (V26: SPA links)
+   *   identity_name   — recordedFingerprint.name match
+   *   evidence_shortcut — TTL/URL-valid lastSuccessRef hit
+   *   compiled        — compiled plan locator hit
+   *   llm             — LLM picked from candidates
+   *   vision          — gemini-flash vision rescue picked it
+   *   rule_fallback   — degraded mode, rule-based score
+   *   user_confirmed  — user picked from clarification UI
+   */
+  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_href' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
   /** Candidate elements (for ambiguous cases) */
   candidates: LintCandidate[];
   /** Elements to highlight on UI */
@@ -950,6 +1358,20 @@ export interface LintResult {
   interpretation?: string;
   /** V3: Clarification question for user (in user's language) */
   clarificationQuestion?: string;
+  /**
+   * V23: Resolver coaching for the editor — present when the LLM
+   * couldn't confidently pick (no_match / ambiguous / weak resolved).
+   * The frontend renders it as a hint near the description input
+   * (red on no_match, yellow on ambiguous, soft warning on weak).
+   * Always omitted on confident `resolved` results so a green badge
+   * stays clean. Examples are validated against actual candidate
+   * labels — no hallucinations are allowed through.
+   */
+  suggestion?: {
+    issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+    hint: string;
+    examples?: string[];
+  };
 
   // ═══════════════════════════════════════════════════════════════════════════
   // LLM-based resolver fields
@@ -962,6 +1384,17 @@ export interface LintResult {
   topSimilarity?: number;
   /** Whether LLM cache was hit */
   cacheHit?: boolean;
+  /**
+   * V23: per-phase timings from `_lintStepWithAIImpl`. Surfaced into
+   * decisionTrace so analysis can answer "where did the 19s go?"
+   * — snapshot collect (DOM evaluate), full resolve (LLM/vision/identity).
+   */
+  phaseTimings?: {
+    snapshotMs?: number;
+    resolveMs?: number;
+    totalMs?: number;
+    domNodeCount?: number;
+  };
 
   // ═══════════════════════════════════════════════════════════════════════════
   // DIAGNOSTIC FIELDS (for trace logging, not sent to frontend)

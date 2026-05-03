@@ -46,6 +46,129 @@ const RAW_CMD_MAP: Record<string, string> = {
   double_tap: 'double_tap', long_press: 'long_press',
 };
 
+// ── Plan upgrade ranking ─────────────────────────────────────────────────
+//
+// Mobile equivalent of preview-step-apply.service.ts STRATEGY_RANK. Used by
+// shouldUpgradeCompiledPlan to decide whether a freshly-built plan should
+// REPLACE an existing one in the DB. Higher rank = more reliable strategy.
+//
+// Why each rank:
+//   resource_id / accessibility_id (8) — developer-controlled IDs, stable
+//     across translations / DPI changes / minor refactors. The strongest
+//     signal we have on Android (`android:id`) and iOS
+//     (`accessibilityIdentifier`).
+//   label_exact (5) — visible text + className/role. Translation-fragile
+//     but exact match is unambiguous when text is unique.
+//   label_partial (4) — substring match (e.g. "Cart" → "Cart (3)"). Weaker
+//     than exact because of false positives, but stronger than positional.
+//   near_text (2) — anchor-relative; depends on layout staying close.
+//     Useful for icon-only elements, brittle on reflow.
+//   bounds_region (1) — 3×3 grid last-resort; matches lots of unrelated
+//     elements in the same screen quadrant.
+//
+// Numbers are gaps so a future strategy can slot in without renumbering.
+const MOBILE_STRATEGY_RANK: Record<string, number> = {
+  resource_id: 8,
+  accessibility_id: 8,
+  label_exact: 5,
+  label_partial: 4,
+  near_text: 2,
+  bounds_region: 1,
+};
+
+/**
+ * Decide whether to REPLACE `existing` compiled plan with `candidate` in
+ * the DB. Returns `true` only when the candidate is provably as strong or
+ * stronger; defaults to `false` (preserve) on any ambiguity. The contract
+ * is asymmetric on purpose: a working plan in the DB is a known-good asset,
+ * a fresh apply may have been a flake.
+ *
+ * Decision rules (first match wins):
+ *
+ *   1. No candidate / empty → refuse. Never overwrite with nothing.
+ *
+ *   2. No existing / empty → upgrade. First plan wins by default.
+ *
+ *   3. candidate.bestRank > existing.bestRank → upgrade.
+ *      Example: existing has only [label_exact], candidate found
+ *      [resource_id, label_exact]. resource_id beats label_exact at the
+ *      top tier — clear win.
+ *
+ *   4. candidate.bestRank < existing.bestRank → refuse.
+ *      Example: existing was [resource_id, label_exact], candidate is
+ *      [label_exact] only (LLM missed the resource_id this time, or
+ *      bounds_region last-resort fallback). Replacing here would
+ *      silently downgrade healing strength.
+ *
+ *   5. Tied bestRank:
+ *        - existing.kinds ⊆ candidate.kinds AND candidate has MORE kinds
+ *          → upgrade (enrichment — same primary, more fallbacks).
+ *        - Otherwise → refuse. This intentionally rejects:
+ *          - identical plans (no churn for no benefit),
+ *          - secondary swaps (existing label_exact replaced by near_text
+ *            keeps the same primary but loses secondary strength),
+ *          - cross-platform primary changes (accessibility_id ↔ resource_id
+ *            at the top tier — shouldn't happen in practice; if it does,
+ *            preserving the original platform's plan is the safer call).
+ *
+ * Why "best rank" instead of "primary index 0":
+ *   The previous draft compared existing.strategies[0].kind directly and
+ *   missed the case "candidate primary same kind, but secondary swapped
+ *   to weaker". By taking the max rank across all strategies and additionally
+ *   gating on subset-ness for ties, we never accept a plan whose
+ *   strategy SET is strictly weaker than existing.
+ *
+ * Web equivalent: preview-step-apply.service.ts:shouldUpgradeCompiledPlan.
+ * Mobile rules are stricter because mobile plans see less churn between
+ * applies (a single test case typically has 5-50 steps vs web's deeper
+ * funnels), so the cost of a false-upgrade is higher per step.
+ */
+export function shouldUpgradeCompiledPlan(
+  existing: MobileCompiledPlan | undefined,
+  candidate: MobileCompiledPlan | undefined,
+): boolean {
+  // Rule 1: no candidate → cannot upgrade.
+  if (!candidate || !candidate.strategies || candidate.strategies.length === 0) {
+    return false;
+  }
+  // Rule 2: no existing → take the candidate.
+  if (!existing || !existing.strategies || existing.strategies.length === 0) {
+    return true;
+  }
+
+  // Helper: best (highest) rank across the plan's strategies. Unknown kinds
+  // fall through to -1 sentinel so they never beat a known kind. Two unknown
+  // kinds compare equal at -1, leaving the subset-check below as tiebreaker.
+  const bestRank = (plan: MobileCompiledPlan): number => {
+    let best = -1;
+    for (const s of plan.strategies) {
+      const rank = MOBILE_STRATEGY_RANK[String(s.kind)] ?? -1;
+      if (rank > best) best = rank;
+    }
+    return best;
+  };
+
+  const existingBest = bestRank(existing);
+  const candidateBest = bestRank(candidate);
+
+  // Rule 3: strictly stronger top-tier strategy.
+  if (candidateBest > existingBest) return true;
+  // Rule 4: strictly weaker top-tier strategy.
+  if (candidateBest < existingBest) return false;
+
+  // Rule 5: tied on best — accept only when candidate is a strict superset.
+  const existingKinds = new Set(existing.strategies.map((s) => String(s.kind)));
+  const candidateKinds = new Set(candidate.strategies.map((s) => String(s.kind)));
+
+  // Existing must be a subset of candidate (no kind dropped).
+  for (const kind of existingKinds) {
+    if (!candidateKinds.has(kind)) return false;
+  }
+  // And candidate must have at least one extra kind (otherwise identical sets
+  // → no churn).
+  return candidateKinds.size > existingKinds.size;
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 export interface MobileApplyInput {
@@ -118,9 +241,11 @@ export class MobileStepApplyService {
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
     const stepType = STEP_TYPE_MAP[rawStepType] || rawStepType;
 
-    // Normalize description: strip surrounding quotes (users often type "Login" etc.)
-    const rawDescription = stepDraft.elementDescription || stepDraft.description || '';
-    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+    // Normalize description: strip surrounding quotes (handles whole-wrap +
+    // balanced inline pairs). See normalize-description.ts for the failure
+    // modes of the previous one-shot regex.
+    const { normalizeMobileDescription } = await import('./normalize-description');
+    const description = normalizeMobileDescription(stepDraft.elementDescription || stepDraft.description);
 
     const applyStart = Date.now();
 
@@ -149,7 +274,23 @@ export class MobileStepApplyService {
           const coordsConfidence = typeof lintResult.confidence === 'number'
             ? lintResult.confidence
             : undefined;
-          const coordParams: Record<string, unknown> = { x: centerX, y: centerY };
+          // Pass `intent` (the normalized description) alongside the
+          // coordinates so the runner's smartResolve can re-validate the
+          // target if `coordsConfidence < 0.9`. Without intent, smartResolve
+          // takes the early-return passthrough branch (no-intent → no
+          // re-resolve possible) and dispatches the bare coordinates blindly
+          // — which is wrong when 200-700ms have elapsed between lint and
+          // dispatch (HTTP roundtrip + lint compute) and the screen has
+          // shifted (animation finished, snackbar dismissed, app pushed a
+          // dialog). With intent + low confidence the runner re-fetches a
+          // fresh tree and re-resolves, correcting the coords. With intent
+          // + high confidence (≥ 0.9) it still passthroughs — no perf hit
+          // on the happy path.
+          const coordParams: Record<string, unknown> = {
+            x: centerX,
+            y: centerY,
+            intent: description,
+          };
           if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
 
           const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
@@ -236,8 +377,18 @@ export class MobileStepApplyService {
       assertionText: stepDraft.assertionText,
       appPackage: stepDraft.appPackage,
       options: stepDraft.options,
-      bindingHints: stepDraft.intentStep?.bindingHints || stepDraft.bindingHints || {},
-      compiled: stepDraft.intentStep?.compiled || stepDraft.compiled,
+      // Priority: top-level `stepDraft.bindingHints` (edited by the user in
+      // the inspector) > `stepDraft.intentStep.bindingHints` (recorded
+      // snapshot). The frontend `buildStepDraft` already applies the same
+      // precedence when picking which hints to set on `stepDraft.bindingHints`,
+      // so reaching `intentStep.bindingHints` here means the user did not
+      // edit and we fall back to the recorded set. The previous order had
+      // intentStep first which silently ignored in-editor hint edits.
+      bindingHints: stepDraft.bindingHints || stepDraft.intentStep?.bindingHints || {},
+      // Compiled plan: top-level (manual rebuild path) > intentStep (saved
+      // step / recorded session). Either source has already passed the
+      // frontend's intentStepDirty safeguard, so trust whichever exists.
+      compiled: stepDraft.compiled || stepDraft.intentStep?.compiled,
     };
 
     const result = await client.runSteps(sessionId, [intentStep], {
@@ -249,7 +400,29 @@ export class MobileStepApplyService {
     const stepResult = result.steps?.[0];
     const success = stepResult?.success ?? false;
 
-    const appliedStep = success
+    // On failure we still want to forward `appliedStep` when the runner
+    // emitted a compiled plan AND it was a "proven" plan — i.e. resolveVia
+    // was compiled_fast_path or cache, meaning the plan already matched the
+    // current tree before the run started; the failure happened downstream
+    // of resolution (dispatch / VTE / app crash) and the plan is still
+    // worth persisting. Without this, every failed run discards a
+    // perfectly-good plan and the next run re-pays full LLM cost.
+    // We do NOT forward fresh LLM plans on failure — that would risk
+    // locking in an incorrect element pick.
+    const PROVEN_RESOLVED_VIA: ReadonlySet<string> = new Set([
+      'compiled', 'compiled_fast_path', 'cache',
+    ]);
+    const planIsProven = !!stepResult?.resolvedVia
+      && PROVEN_RESOLVED_VIA.has(stepResult.resolvedVia);
+    // Runner-flagged stale plan (VTE mismatch / foreground mismatch) —
+    // dispatch reported success but evidence contradicts the resolved
+    // element. Don't carry such a plan onto appliedStep.compiled, otherwise
+    // the next run's fast-path locks in the wrong element.
+    const planIsStale = !!stepResult?.planStaleReason;
+    const shouldEmitAppliedStep = success
+      || (!!stepResult?.compiledPlan && planIsProven && !planIsStale);
+
+    const appliedStep = shouldEmitAppliedStep
       ? {
           id: intentStep.id,
           type: stepType,
@@ -264,7 +437,11 @@ export class MobileStepApplyService {
           },
           // Carry the runner-built compiled plan onto the IntentStep. Next run's
           // apply will short-circuit the LLM pipeline if this plan still matches.
-          ...(stepResult!.compiledPlan ? { compiled: stepResult!.compiledPlan } : {}),
+          // Strip the plan when the runner flagged it stale post-dispatch even
+          // though `success === true` — saving it would re-introduce the bug.
+          ...(stepResult!.compiledPlan && !planIsStale
+            ? { compiled: stepResult!.compiledPlan }
+            : {}),
         }
       : undefined;
 

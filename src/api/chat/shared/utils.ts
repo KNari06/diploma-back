@@ -182,7 +182,12 @@ export function emitProcessingStep(
   step: ChatProcessingStepPayload['step'],
   message: string,
   progress: number,
-  metadata?: Record<string, any>
+  metadata?: Record<string, any>,
+  // Optional. When set, the processing-step event is also broadcast
+  // to the per-test-case room `chat:tc:<testCaseId>`. Without this,
+  // a frontend that subscribed by testCaseId (before the session was
+  // lazy-created) sees no progress updates during the first request.
+  testCaseId?: string,
 ): void {
   // ✅ FIX: Skip if no sessionId (can't send to chat room)
   if (!sessionId) {
@@ -231,7 +236,7 @@ export function emitProcessingStep(
       timestamp: new Date().toISOString(),
     };
 
-    webSocketService.emitChatProcessingStep(sessionId, payload);
+    webSocketService.emitChatProcessingStep(sessionId, payload, testCaseId);
   } catch (error) {
     // ✅ CRITICAL: Don't let WebSocket errors break the HTTP request
     // Log error but continue processing - WebSocket is optional for progress updates

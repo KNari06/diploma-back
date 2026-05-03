@@ -19,7 +19,7 @@
 import { generateText } from '@/services/ai/core/ai-provider.service';
 import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
+import { AI_MODELS, AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { cacheMetrics } from '@/utils/core/cache-metrics';
 import type {
@@ -38,6 +38,8 @@ import type {
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
+import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { pruneCandidatesViaLLM } from './candidate-pruner-llm.service';
 
 const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
 const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
@@ -211,6 +213,15 @@ function isFillCompatibleTextField(node: InteractiveNode): boolean {
 export function buildAllowedSets(
   nodes: InteractiveNode[],
   actionType: IntentActionType,
+  // V26: real viewport dimensions. When provided, used for modal coverage
+  // ratio calculation. Without it we fall back to the high-water-mark
+  // bounding box of all visible nodes — which UNDERESTIMATES coverage on
+  // long scrollable pages (a 1280×720 modal on a 1280×8000 page reads as
+  // 9% coverage instead of 100%, so the modal isn't treated as blocking
+  // and background elements aren't hard-excluded). Caller passes
+  // `{ width: window.innerWidth, height: window.innerHeight }` from the
+  // snapshot collector.
+  viewport?: { width: number; height: number },
 ): AllowedSetResult {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
@@ -244,17 +255,29 @@ export function buildAllowedSets(
   if (modalNode) {
     const bb = modalNode.boundingBox;
     if (bb && bb.width > 0 && bb.height > 0) {
-      // Estimate viewport as max bounding box across all visible nodes
-      let maxRight = 0;
-      let maxBottom = 0;
-      for (const n of nodes) {
-        if (n.boundingBox && n.isVisible) {
-          maxRight = Math.max(maxRight, n.boundingBox.x + n.boundingBox.width);
-          maxBottom = Math.max(maxBottom, n.boundingBox.y + n.boundingBox.height);
+      // V26: prefer real viewport when caller provides it. Fall back to
+      // high-water-mark bbox across visible nodes only when viewport is
+      // unknown — that fallback underestimates coverage on long pages.
+      let viewportArea = 0;
+      if (viewport && viewport.width > 0 && viewport.height > 0) {
+        viewportArea = viewport.width * viewport.height;
+      } else {
+        let maxRight = 0;
+        let maxBottom = 0;
+        for (const n of nodes) {
+          if (n.boundingBox && n.isVisible) {
+            maxRight = Math.max(maxRight, n.boundingBox.x + n.boundingBox.width);
+            maxBottom = Math.max(maxBottom, n.boundingBox.y + n.boundingBox.height);
+          }
         }
+        viewportArea = maxRight * maxBottom;
       }
-      const viewportArea = maxRight * maxBottom;
-      const modalArea = bb.width * bb.height;
+      // Modal area is also clamped to viewport — a modal taller than the
+      // viewport (very rare; usually scrollable internally) shouldn't
+      // produce coverage > 1 and be treated as "extra blocking".
+      const clampedModalW = viewport ? Math.min(bb.width, viewport.width) : bb.width;
+      const clampedModalH = viewport ? Math.min(bb.height, viewport.height) : bb.height;
+      const modalArea = clampedModalW * clampedModalH;
       // Modal must cover at least 30% of visible area to be considered blocking
       // This filters out cookie banners, notification bars, etc.
       const coverageRatio = viewportArea > 0 ? modalArea / viewportArea : 0;
@@ -654,6 +677,73 @@ function computePageSignature(url: string, nodes: InteractiveNode[]): string {
  * @param node - Interactive node from DOM analysis
  * @returns Semantic text for LLM matching (max 200 chars)
  */
+
+/**
+ * V23 (April 2026): Universal "effective visible label" extractor.
+ *
+ * Various sites under test surface element identity through different
+ * attributes — Angular Material puts a Kazakh tooltip on `<a title="...">`,
+ * MUI uses `aria-label`, Bootstrap relies on visible `text`, Vue + i18n on
+ * `<img alt>`, icon-only Element Plus / AntD on `data-testid` lifted
+ * children, etc. Every site should give the resolver SOME readable label.
+ *
+ * Before this helper, multiple sites in the resolver pipeline read only
+ * `labelText || ariaLabel || text || placeholder` and dropped on the floor:
+ *   • `title`          — Angular `<a title="Папкалар">` for icon-link cards
+ *   • `alt`            — `<img>` accessible name
+ *   • `iconLabel`      — Lucide / FA / svg `<title>` derivative
+ *   • `svgIcon`        — Angular Material `<mat-icon svgicon="folder">`
+ * That dropped data caused semantic-floor reject + label-mismatch reject
+ * even when the candidate WAS the right element — it just identified itself
+ * via an attribute the chain forgot.
+ *
+ * Use this helper everywhere a "single representative string for this node"
+ * is needed: candidate label display, semantic floor token comparison,
+ * label-mismatch guard, scene summary, dedup keys. Keep `buildCandidateText`
+ * separate — that one renders the FULL multi-field candidate description
+ * for the LLM prompt, not a single fallback.
+ *
+ * Order is intentional, most-specific → most-general:
+ *   1. labelText      — explicit `<label for=>` association (strongest)
+ *   2. ariaLabel      — explicit ARIA accessible name
+ *   3. title          — `title=` attribute (Angular routerLink, tooltips)
+ *   4. alt            — `<img>` accessible name
+ *   5. text            — visible textContent
+ *   6. placeholder    — input placeholder (only meaningful for inputs)
+ *   7. iconLabel      — derived from svg `<title>`/data-lucide/FA class
+ *   8. svgIcon        — Angular Material registry name (`svgicon` attr)
+ *   9. childTestId    — lifted single-icon-child data-testid (V22 Pkg1)
+ *   10. customElementTag — `<app-notifications-button>` semantic wrapper
+ *
+ * Returns empty string when ALL fields are missing (genuinely unidentifiable
+ * node like a bare `<li>` with no children carrying signals — that's a real
+ * detection problem, not something this helper can fix).
+ */
+export function getEffectiveLabel(node: InteractiveNode | undefined | null): string {
+  if (!node) return '';
+  // Order: most-specific (W3C accessible name spec) → most-general fallbacks.
+  //
+  // Per WAI-ARIA Accessible Name Computation:
+  //   labelText (covers aria-labelledby, <label for>, wrapping <label>),
+  //   ariaLabel, title, alt, then visible text.
+  // Then product-specific identity fallbacks for descriptor-poor targets.
+  return (
+    node.labelText            // includes aria-labelledby + native <label>
+    || node.ariaLabel
+    || node.title             // WAI-ARIA accessible name source
+    || node.alt               // <img>/<area>/<input type=image> accessible name
+    || node.text              // visible textContent
+    || node.placeholder       // input fallback
+    || node.iconLabel         // svg <title>/data-lucide/sprite/FA class
+    || node.svgIcon           // Angular Material registry name
+    || node.childTestId       // lifted single-icon-child data-testid
+    || node.dataValue         // <option value>/<li data-value> semantic key
+    || node.dataRowKey        // AntD/RainbowKit table row identity
+    || node.customElementTag  // <app-X>/<my-button> semantic wrapper
+    || ''
+  ).toString();
+}
+
 export function buildCandidateText(node: InteractiveNode): string {
   const parts: string[] = [];
 
@@ -737,12 +827,26 @@ export function buildCandidateText(node: InteractiveNode): string {
   // makes the candidate identifiable to the resolver.
   if ((node as any).childTestId) {
     parts.push(`icon: ${(node as any).childTestId}`);
+  } else if ((node as any).svgIcon) {
+    // Angular Material `<mat-icon svgicon="...">` — preferred over
+    // iconLabel when present because it's an explicit registry name,
+    // not a derived guess. LLM still gets the same `icon:` key so the
+    // prompt rules apply uniformly across libraries.
+    parts.push(`icon: ${(node as any).svgIcon}`);
   } else if ((node as any).iconLabel) {
     // V22 Pkg4: semantic icon label from svg <title> / data-lucide /
     // sprite href / FA class. Fallback for `<div role="button"><svg/></div>`
     // patterns where childTestId is unavailable. Same `icon:` key so the
     // LLM-prompt rules apply uniformly.
     parts.push(`icon: ${(node as any).iconLabel}`);
+  }
+  // Custom-element wrapper tag — emitted as a separate semantic hint,
+  // NOT under `icon:` because it's not the icon's name but the
+  // component's name (e.g. "wrappedBy: app-notifications-button"). The
+  // LLM treats it as context: the button is officially a "notifications
+  // button" component, even though its `<button>` is otherwise bare.
+  if ((node as any).customElementTag) {
+    parts.push(`wrappedBy: ${(node as any).customElementTag}`);
   }
 
   // V22 Pkg1: data-value for Select option / MenuItem / chip semantic key.
@@ -825,6 +929,24 @@ export function buildCandidateText(node: InteractiveNode): string {
   else if (node.ariaExpanded === false) stateHints.push('collapsed');
   if (node.ariaChecked === true || node.checked === true) stateHints.push('checked');
   else if (node.ariaChecked === 'mixed') stateHints.push('indeterminate');
+  // Radix/shadcn/Vaul `data-state` — many primitives don't mirror to
+  // aria-* attributes. Resolver must see this so "click open menu" vs
+  // "close open menu" disambiguation works. Skip when value is
+  // already conveyed by aria-* hints above.
+  const ds = (node as { dataState?: string }).dataState;
+  if (ds) {
+    const isDup = (
+      (ds === 'open' && node.ariaExpanded === true)
+      || (ds === 'closed' && node.ariaExpanded === false)
+      || (ds === 'checked' && (node.ariaChecked === true || node.checked === true))
+      || (ds === 'unchecked' && (node.ariaChecked === false || node.checked === false))
+      || (ds === 'on' && node.ariaPressed === true)
+      || (ds === 'off' && node.ariaPressed === false)
+      || (ds === 'active' && node.ariaSelected === true)
+      || (ds === 'inactive' && node.ariaSelected === false)
+    );
+    if (!isDup) stateHints.push(`state=${ds}`);
+  }
   // V22: invalid state — recorded "click on invalid email field with red border"
   // must match a live invalid input, not a freshly-cleared valid one.
   if ((node as any).invalid === true) stateHints.push('invalid');
@@ -907,14 +1029,14 @@ function buildSceneSummary(
   // Detect expanded containers (open dropdowns, accordions, menus)
   const expanded = candidates.filter(c => c.node.ariaExpanded === true);
   for (const c of expanded) {
-    const label = c.node.labelText || c.node.ariaLabel || c.node.text || c.node.tag;
+    const label = getEffectiveLabel(c.node) || c.node.tag;
     scenes.push(`"${label}" is expanded/open`);
   }
 
   // Detect selected tabs
   const selected = candidates.filter(c => c.node.ariaSelected === true);
   for (const c of selected) {
-    const label = c.node.labelText || c.node.ariaLabel || c.node.text || c.node.tag;
+    const label = getEffectiveLabel(c.node) || c.node.tag;
     scenes.push(`"${label}" tab is selected`);
   }
 
@@ -926,131 +1048,6 @@ function buildSceneSummary(
 
   if (scenes.length === 0) return '';
   return scenes.slice(0, 5).join('; ');
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PRE-SCORE: Rank elements by text overlap with intent
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Tokenize text into lowercase words (3+ chars). No stop-word lists — no hardcode.
- * Short tokens (<3 chars) are noise in any language and excluded.
- */
-function tokenizeForPrescore(text: string): string[] {
-  if (!text) return [];
-  return text
-    .toLowerCase()
-    .split(/[\s|,;:.()\[\]{}'"!?/\\<>@#$%^&*+=~`\-_]+/)
-    .filter(w => w.length >= 3);
-}
-
-/**
- * Build searchable text blob for an InteractiveNode.
- * Combines all text fields that a user might reference when describing an element.
- */
-function buildNodeSearchText(node: InteractiveNode): string {
-  const parts: string[] = [];
-  if (node.labelText) parts.push(node.labelText);
-  if (node.text) parts.push(node.text);
-  if (node.ariaLabel) parts.push(node.ariaLabel);
-  if (node.placeholder) parts.push(node.placeholder);
-  if (node.title) parts.push(node.title);
-  if (node.nearText) parts.push(node.nearText);
-  if (node.testIdAttr) parts.push(node.testIdAttr);
-  if (node.name && !node.isDynamicId) parts.push(node.name);
-  if (node.containerTitles?.length) parts.push(node.containerTitles.join(' '));
-  if (node.autocomplete) parts.push(node.autocomplete);
-  if (node.nearestLandmark) parts.push(node.nearestLandmark);
-  // V15: Icon semantic signals — critical for icon-only buttons where no text/aria-label exists.
-  // Splits "lucide-folder" / "icon-folder" / "mdi:folder" into scannable tokens so
-  // intent "folder icon" matches the right element instead of falling back to DOM order.
-  if (node.iconClasses) parts.push(node.iconClasses.replace(/[-_:]/g, ' '));
-  return parts.join(' ').toLowerCase();
-}
-
-/** Proportion of LLM slots reserved for scored elements (rest go to DOM-order) */
-const SCORED_SLOT_RATIO = 0.6; // 60% scored, 40% DOM-order
-
-/**
- * Pre-score elements and build a merged batch that GUARANTEES both:
- * 1. Elements with text overlap are prioritized (covers 65% of intents)
- * 2. DOM-order elements always get slots (covers cross-language, visual, synonym intents)
- *
- * CRITICAL: No element is ever filtered out by score. Score only determines
- * which RESERVED SLOTS an element fills. Zero-score elements fill DOM slots.
- *
- * Layout for limit=70:
- *   [up to 42 scored elements (desc)] + [up to 28 DOM-order elements not already included]
- *   = always 70 (or fewer if total < 70)
- *
- * If scored < 42, remaining slots go to DOM-order (total still 70).
- * If scored >= 42, overflow scored elements go to DOM-order slots if space permits.
- *
- * This means: even if pre-score has 42 false positives, 28 DOM-order elements
- * still get through — covering cross-language, synonym, and visual description cases.
- */
-function preScoreAndSort(nodes: InteractiveNode[], intentText: string, limit: number): InteractiveNode[] {
-  if (nodes.length <= limit) return nodes; // Everything fits — no ranking needed
-
-  const intentWords = tokenizeForPrescore(intentText);
-
-  // If no usable tokens (very short intent, all <3 chars), keep DOM order
-  if (intentWords.length === 0) return nodes;
-
-  // Score each node
-  const scored: Array<{ node: InteractiveNode; score: number; domIndex: number }> = [];
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    const searchText = buildNodeSearchText(node);
-
-    let wordScore = 0;
-    for (const word of intentWords) {
-      if (searchText.includes(word)) wordScore++;
-    }
-
-    scored.push({ node, score: wordScore, domIndex: i });
-  }
-
-  // Find the median score to separate "specifically relevant" from "generically matching".
-  // Elements scoring above median are genuinely relevant; elements at or below may just
-  // share a common word (e.g. "button" appears in every element's text).
-  const scores = scored.map(s => s.score).filter(s => s > 0);
-  const medianScore = scores.length > 0
-    ? scores.sort((a, b) => a - b)[Math.floor(scores.length / 2)]
-    : 0;
-  // "Specifically scored" = above median (or above 1 if median is too low).
-  // This prevents a single generic word from promoting ALL elements.
-  const scoreThreshold = Math.max(medianScore, 1);
-
-  const highScored = scored.filter(s => s.score > scoreThreshold);
-  const rest = scored.filter(s => s.score <= scoreThreshold);
-
-  // Sort high-scored by score descending (stable — same score keeps DOM order)
-  highScored.sort((a, b) => b.score - a.score || a.domIndex - b.domIndex);
-
-  // Rest keeps DOM order (these include score=0 AND low-scored generics)
-  // Already in DOM order from the original loop
-
-  // Allocate slots: high-scored get up to SCORED_SLOT_RATIO of limit
-  const maxScoredSlots = Math.ceil(limit * SCORED_SLOT_RATIO);
-  const scoredToTake = highScored.slice(0, maxScoredSlots);
-  const remainingSlots = limit - scoredToTake.length;
-
-  // Fill remaining from rest (DOM order) — includes unscored AND low-scored
-  const domOrderFill = rest.slice(0, remainingSlots);
-
-  // If high-scored overflow AND still space, append them
-  if (domOrderFill.length < remainingSlots) {
-    const overflowScored = highScored.slice(maxScoredSlots);
-    for (const s of overflowScored) {
-      if (domOrderFill.length >= remainingSlots) break;
-      domOrderFill.push(s);
-    }
-  }
-
-  // Merge: high-scored first, then DOM-order fill
-  const result = [...scoredToTake, ...domOrderFill];
-  return result.map(s => s.node);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1067,13 +1064,13 @@ function markDuplicatesWithContext(
 ): void {
   const labelCounts = new Map<string, number>();
   for (const c of candidates) {
-    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    const label = getEffectiveLabel(c.node).trim().toLowerCase();
     if (label) labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
   }
 
   const labelIndex = new Map<string, number>();
   for (const c of candidates) {
-    const label = (c.node.labelText || c.node.ariaLabel || c.node.text || '').trim().toLowerCase();
+    const label = getEffectiveLabel(c.node).trim().toLowerCase();
     if (label && (labelCounts.get(label) || 0) > 1) {
       const idx = (labelIndex.get(label) || 0) + 1;
       labelIndex.set(label, idx);
@@ -1085,7 +1082,7 @@ function markDuplicatesWithContext(
         const textWithoutNear = c.candidateText
           .replace(` | ${nearSegment}`, '')
           .replace(nearSegment, '');
-        const primaryLabel = c.node.labelText || c.node.ariaLabel || c.node.text || '';
+        const primaryLabel = getEffectiveLabel(c.node);
         // Find end of container prefix "[section > Title]" — it's always followed by " | "
         // Use first "] |" to avoid matching state hints like [disabled] that appear later
         const containerEndMarker = textWithoutNear.indexOf('] |');
@@ -1237,8 +1234,16 @@ async function rescueWithGeminiFlash(params: {
   screenshot?: string;
   /** Phase 6: Optional viewport for coordinate-based results */
   viewport?: { width: number; height: number };
+  /**
+   * Etap 1D.4 — Natural-language description of the recorded element
+   * (generated at capture time). Vision rescue is the LAST line of
+   * defense — losing this hint here is the most expensive miss in the
+   * whole resolver. Inject as a soft hint into the prompt; identity
+   * still wins where present.
+   */
+  recordedDescription?: string;
 }): Promise<{ ref: string; confidence: number; reason: string; boundingBox?: { x: number; y: number; width: number; height: number } } | null> {
-  const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport } = params;
+  const { intentText, actionType, excludedNodes, pageUrl, screenshot, viewport, recordedDescription } = params;
 
   // V8: Prioritize candidates by a11y richness (no hardcoded text matching — LLM decides).
   // Elements with more semantic info (labels, roles) are more useful for LLM to evaluate.
@@ -1299,15 +1304,25 @@ RULES:
 5. If multiple elements could match, pick the one whose label/text is semantically closest.
 6. Only use refs from the provided list — never invent refs.
 7. If no element is a confident match, return ref as null. NEVER return the first candidate as a default guess.
-8. Respond ONLY with valid JSON, no markdown or extra text.
+8. ADJACENCY ≠ SAME FUNCTION. Two controls sitting next to each other in a header / toolbar / row are SEPARATE elements with SEPARATE behaviour. A settings cog and a neighbouring "Click me!" banner are not interchangeable just because they share a row. Spatial / visual prominence is a TIE-BREAKER between candidates whose semantics already match the intent — never a reason to OVERRIDE semantics.
+9. NO "FALLBACK TO LOUDEST CTA". When no candidate semantically matches the intent, the correct answer is ref=null. Picking the most action-y looking element ("Submit", "Get started", "Click me!", "Try it") because something must be clicked is the #1 source of fake-success. Refuse the guess; return null.
+10. Respond ONLY with valid JSON, no markdown or extra text.
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
 If none match: {"ref":null,"confidence":0,"reason":"no match"}`;
 
+  // Etap 1D.4 — recordedDescription as a soft hint when present.
+  // Identity-tier matches still win; this just helps disambiguate
+  // among candidates that the text-LLM rejected and we're re-trying
+  // with screenshot context.
+  const descriptionBlock = recordedDescription
+    ? `\nRECORDED DESCRIPTION (natural-language note from the recorder — describes the element's purpose plus immediate visible context; use as a soft hint when intent text is generic or candidates look similar):\n"${recordedDescription.replace(/"/g, '\\"')}"\n`
+    : '';
+
   const userPrompt = `USER INTENT: "${intentText}"
 ACTION: ${actionType}
-PAGE: ${pageUrl}
+PAGE: ${pageUrl}${descriptionBlock}
 
 CANDIDATE ELEMENTS:
 ${candidateList}
@@ -1323,16 +1338,52 @@ Select the single best matching element. If unsure, return ref: null.`;
 
       // V14: Detect mime type from base64 header — JPEG starts with /9j/, PNG with iVBOR
       const mimeType: 'image/jpeg' | 'image/png' = screenshot.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
-      const visionResponse = await generateTextWithGeminiVision({
-        prompt: visionPrompt,
-        imageBase64: screenshot,
-        mimeType,
-        model: AI_TASK_MODELS.visionElementResolution as any,
-        temperature: 0,
-        maxTokens: 200,
-        timeout: 6000,
-      });
-      responseContent = visionResponse.content;
+
+      // Primary: Gemini vision. Fallback: OpenAI vision (gpt-5.4-mini supports
+      // multimodal content via image_url with data URL). Provider-level fallback
+      // mirrors the text-resolver path so a Gemini outage doesn't kill replay.
+      try {
+        const visionResponse = await generateTextWithGeminiVision({
+          prompt: visionPrompt,
+          imageBase64: screenshot,
+          mimeType,
+          model: AI_TASK_MODELS.visionElementResolution as any,
+          temperature: 0,
+          maxTokens: 200,
+          timeout: 6000,
+        });
+        responseContent = visionResponse.content;
+      } catch (visionPrimaryErr) {
+        const FALLBACK = AI_MODELS.fast;
+        const sameProvider =
+          (AI_TASK_MODELS.visionElementResolution as string).startsWith('gemini-') === FALLBACK.startsWith('gemini-');
+        if (sameProvider) {
+          throw visionPrimaryErr;
+        }
+        logger.warn('[ELEMENT_RESOLVER] Vision primary Gemini failed, retrying with OpenAI vision fallback', {
+          primary: AI_TASK_MODELS.visionElementResolution,
+          fallback: FALLBACK,
+          error: visionPrimaryErr instanceof Error ? visionPrimaryErr.message : String(visionPrimaryErr),
+        });
+        const fallbackResponse = await getChatCompletionWithMessages(
+          [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: visionPrompt },
+                { type: 'image_url', image_url: { url: `data:${mimeType};base64,${screenshot}` } },
+              ] as any,
+            },
+          ],
+          {
+            model: FALLBACK,
+            temperature: 0,
+            max_tokens: 200,
+            response_format: { type: 'json_object' },
+          },
+        );
+        responseContent = fallbackResponse.content;
+      }
 
       logger.debug('[ELEMENT_RESOLVER] Vision-enhanced rescue response', {
         responsePreview: responseContent.slice(0, 150),
@@ -1404,6 +1455,13 @@ Select the single best matching element. If unsure, return ref: null.`;
 // ═══════════════════════════════════════════════════════════════════════════
 
 const LLM_SELECT_TIMEOUT_MS = ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.timeoutMs;
+// V26: per-provider budget for the Gemini → OpenAI cascade. Each provider
+// gets its own AbortController + this much wall-time. Total worst-case
+// for a select is `2 × LLM_SELECT_PER_PROVIDER_TIMEOUT_MS` (Gemini full
+// timeout → OpenAI full timeout). Fixes the May-2026 outage symptom where
+// Gemini ate the whole 10s budget and the fallback refused to fire.
+const LLM_SELECT_PER_PROVIDER_TIMEOUT_MS =
+  ELEMENT_RESOLVER_CONFIG.llmCircuitBreaker.perProviderTimeoutMs;
 
 let llmSelectFailures = 0;
 let llmSelectBreakerOpenUntil = 0;
@@ -1435,12 +1493,97 @@ const llmSelectCache = new Map<string, { result: LlmSelectResult; createdAt: num
 const LLM_SELECT_CACHE_TTL_MS = ELEMENT_RESOLVER_CONFIG.llmCache.ttlMs;
 const LLM_SELECT_CACHE_MAX_SIZE = ELEMENT_RESOLVER_CONFIG.llmCache.maxSize;
 
+/**
+ * V24 — Invalidate cached LLM selections that returned a now-rejected ref.
+ *
+ * Why: when a guard (pre-click / identity / label) rejects a click as
+ * wrong-element, the LLM cache may still hold the same wrong pick for the
+ * same `(intent text, URL)` combo. Next retry / next run hits cache, gets
+ * the same wrong ref in 200ms, fails again. Cache poisoning is the canonical
+ * symptom: cacheHit=true + fingerprintMatch=mismatch in trace.
+ *
+ * Strategy: walk the cache and drop any entry whose CACHED result returned
+ * the rejected ref AND whose key encodes the same normalized URL + intent
+ * text hash. Other entries (different intents, different URLs) untouched.
+ *
+ * Conservative — we don't invalidate by URL alone or by ref alone, only by
+ * the intersection. This avoids wiping legitimate entries for unrelated
+ * steps on the same page.
+ *
+ * Returns the number of entries removed for diagnostics.
+ */
+export function invalidateLlmSelectionsForRef(args: {
+  rejectedRef: string | undefined;
+  pageUrl: string;
+  intentText: string;
+}): number {
+  if (!args.rejectedRef) return 0;
+  const urlKey = (() => {
+    try { return normalizeUrlForComparison(args.pageUrl); } catch { return args.pageUrl || ''; }
+  })();
+  const intentHash = computeTextHash(args.intentText || '');
+  let removed = 0;
+  for (const [key, entry] of llmSelectCache) {
+    // Cache key shape: ${mode}|${urlKey}|${pageSignature}|${actionType}|${textHash}|${fpDigest}|${bhDigest}|${refsList}
+    // Match on URL key + intent text hash via substring — both segments are
+    // pipe-delimited, the textHash is unique enough that false-positive
+    // matches across keys are statistically negligible.
+    const keyMatchesContext =
+      key.includes(`|${urlKey}|`) && key.includes(`|${intentHash}|`);
+    if (!keyMatchesContext) continue;
+    if (entry.result?.selectedRef === args.rejectedRef) {
+      llmSelectCache.delete(key);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
+ * Coaching payload surfaced to the editor when the resolver couldn't
+ * confidently match. Two callers use this:
+ *   - Apply-mode no-match → frontend renders a red "no match — try X / Y"
+ *     hint near the description input
+ *   - Apply-mode partial match (confidence < 0.85) → frontend shows a soft
+ *     warning so the user knows the description could be tightened
+ *
+ * Designed to be fully advisory: callers that don't read this field
+ * keep their existing behaviour. All values are bounded and validated
+ * in backend before being added — the LLM cannot smuggle an arbitrarily
+ * long string or a hallucinated example label here.
+ */
+interface ResolverSuggestion {
+  /**
+   * Why we couldn't confidently pick. Drives the icon / wording on the
+   * frontend without forcing it to parse free text.
+   */
+  issue: 'NO_MATCH' | 'AMBIGUOUS' | 'GENERIC_INTENT' | 'VAGUE_INTENT' | 'LOW_CONFIDENCE';
+  /**
+   * One-line user-facing explanation, in the SAME language as the user's
+   * INTENT. Capped at 200 chars in the post-processor.
+   */
+  hint: string;
+  /**
+   * Up to 3 candidate descriptions the user might have meant — pulled
+   * from candidates' visible labels. Each is validated against the
+   * candidate list (no hallucinations) and trimmed to 80 chars.
+   */
+  examples?: string[];
+}
+
 interface LlmSelectResult {
   status: 'resolved' | 'needs_clarification' | 'not_found';
   selectedRef: string | null;
   confidence: number;
   reason: string;
   alternativeRefs?: string[];
+  /**
+   * Optional coaching for the editor UI — present when the resolver
+   * either rejected a low-confidence pick or genuinely found no match.
+   * Always omitted on confident `resolved` results so a successful pick
+   * isn't muddied with warning chrome.
+   */
+  suggestion?: ResolverSuggestion;
   latencyMs: number;
   cacheHit: boolean;
   /** @internal LLM prompt sent (for trace) */
@@ -1636,13 +1779,148 @@ semantically describes any element.
 
 ${LLM_SHARED_RULES}
 
-16. REJECT GIBBERISH / IRRELEVANT TEXT (Apply-mode safety):
+16. ID-AS-DESCRIPTION (CRITICAL — fake-success prevention):
+    When the INTENT is wrapped in apostrophes and looks like a slug —
+    'layout-header-setting', 'btn-submit-form', 'nav_user_menu',
+    kebab-case / snake_case strings with no spaces or with internal
+    dashes/underscores — it is the recorded element's HTML id, NOT a
+    label users would see on screen. The recorder writes the id as the
+    description ONLY when the target had no visible text (icon-only
+    button, <svg>, etc).
+
+    For id-like intents:
+    - The ONLY correct match is a candidate whose own id, testId, name
+      or data-* attribute carries that exact value.
+    - If RECORDED IDENTITY supplies id/testId and a candidate matches —
+      pick it, confidence 0.95+ (this case should normally be caught by
+      the deterministic identity fast-path; you only see it if that
+      path missed for a fingerprint reason).
+    - If NO candidate has that id/testId/name → return ref=null with
+      confidence 0. NEVER pick the nearest visually-prominent button
+      ("Click me!", "Get started", "Learn more") just because the user
+      has to click something. A wrong click that opens an unrelated
+      page is far worse than a not_found that the user can refine.
+
+17. ADJACENCY ≠ SAME FUNCTION:
+    Two elements next to each other in a header / toolbar / row are
+    SEPARATE controls with SEPARATE functions. A settings cog and a
+    "Mouse sleeps abnormally, click me!" banner sitting in the same
+    header strip are not interchangeable — clicking the cog opens
+    settings, clicking the banner opens a help article. Spatial
+    proximity is a TIE-BREAKER between candidates whose semantics
+    already match the intent, never a reason to OVERRIDE semantics.
+
+18. NO "FALLBACK TO LOUDEST CTA":
+    When no candidate semantically matches the intent, the correct
+    answer is ref=null. Picking the most action-y looking element
+    ("Submit", "Get started", "Click me!", "Try it") because something
+    must be clicked is the #1 source of fake-success in this system.
+    Verifier will see the click had effect (URL changed, popup opened)
+    and mark the step pass — but the test is now driving a completely
+    different flow than what was recorded. Refuse the guess; return
+    null.
+
+19. REJECT GIBBERISH / IRRELEVANT TEXT (Apply-mode safety):
     Return ref=null when the intent is:
     - Random/gibberish: "asdfgh", "ываыва", "xyzabc"
     - Copied content / random sentences (not element descriptions)
     - Has no semantic relationship to ANY candidate's label/text/role/icon
     Forcing a match on irrelevant input is WORSE than returning null —
     the user will see no-match feedback and refine their intent.
+
+21. INTENT QUALITY ASSESSMENT (informs confidence + suggestion):
+    Before picking, classify the user's INTENT into one of three buckets.
+    The classification is internal — you don't emit a label, but it
+    governs your confidence and whether you emit a "suggestion".
+
+    - SPECIFIC: contains a unique anchor — exact label/text fragment,
+      icon name, role + position together, identifier-shaped value, or
+      a phrase that can only describe one element on the page.
+      Examples: "кнопка Сохранить", "settings cog in header",
+      "carousel next arrow", "MAT-SMART курс карточка".
+      → Confident pick allowed (≥0.75 if a candidate matches).
+
+    - GENERIC: refers to an element class without a specifier.
+      Examples: "кнопка", "ссылка", "icon", "input field", "button".
+      Multiple candidates plausibly match.
+      → Cap confidence at 0.6. Emit suggestion (issue=GENERIC_INTENT)
+        listing the 3 most likely interpretations.
+
+    - VAGUE: positional or quantitative without a visual anchor.
+      Examples: "четвертая иконка", "first link", "the third button",
+      "последняя кнопка".
+      → Cap confidence at 0.7 even with a strong positional candidate.
+        Emit suggestion (issue=VAGUE_INTENT) recommending the user add
+        a label/role/section so the locator survives layout changes.
+
+    Action-words at the start ("нажать на", "click", "press", "выбрать")
+    are stripped mentally — focus on what's being acted upon.
+
+22. SUGGESTION OUTPUT (UX assistance for ambiguous / no-match):
+    When the result would be:
+      • ref=null (no candidate matches the intent), OR
+      • a low-confidence pick (<0.7), OR
+      • intent classified as GENERIC / VAGUE,
+    ALSO emit a "suggestion" object alongside the usual fields.
+
+    Format:
+      "suggestion": {
+        "issue": "NO_MATCH" | "AMBIGUOUS" | "GENERIC_INTENT" | "VAGUE_INTENT",
+        "hint": "<one short sentence in INTENT's language>",
+        "examples": ["<label1>", "<label2>", "<label3>"]
+      }
+
+    Rules for the fields:
+      • hint: matches the language/script of INTENT. RU → RU, KZ → KZ,
+        EN → EN, ZH → ZH. ≤140 chars. No prose, no apology, just the
+        actionable advice ("Уточни описание: укажи текст карточки или
+        раздел").
+      • examples: 1–3 STRINGS that already appear as visible text on a
+        candidate (label / text / ariaLabel / placeholder). Never
+        invent — if no candidate visibly looks like what the user
+        described, emit examples=[] (empty list is fine).
+      • Reflect actual candidates, not idealized possibilities.
+
+    On confident matches (≥0.75 with a clear winner), DO NOT emit
+    suggestion — a successful pick should not carry a warning.
+
+20. CONFIDENCE CALIBRATION (Apply-mode — strict scoring):
+    Anchor your number to the evidence, not your prose certainty:
+
+    - 0.90–1.00: identity match. id/testId/name/dataValue exact (case-
+      insensitive); OR a candidate's label IS the intent (after Cyrillic↔
+      Latin glyph folding for visually identical scripts: М↔M, А↔A, Т↔T,
+      etc.). Use this band ONLY when one candidate clearly outranks
+      every alternative.
+
+    - 0.75–0.89: strong semantic match. Candidate's label or text
+      contains every meaningful word in the intent (or vice versa) AND
+      the role/landmark fits the intent's intent (button vs link vs
+      input). E.g. INTENT "Save changes" → label "Save changes". Only
+      enter this band if no other candidate also satisfies the same
+      conditions; if two do, return alternatives instead.
+
+    - 0.55–0.74: partial match. Several intent words found in the
+      candidate's text but NOT all, OR fits role/landmark but text
+      diverges. Use sparingly — this band exists for legitimate drift
+      (i18n change, button restyle), NOT to label "the element kind of
+      relates to the intent topic."
+
+    - <0.55: do NOT pick. Return ref=null. Examples that BELONG here:
+        • INTENT "Save" with no label-similar candidate ("OK", "Cancel"
+          present but not "Save").
+        • INTENT mentions a feature name ("MAT-SMART раздел", "checkout")
+          on a page that doesn't visually show that feature.
+        • Intent is a hint about a DIFFERENT page than the one in
+          ELEMENTS (e.g. recorded against archive page; live page is the
+          landing hero with promo content). Returning the loudest
+          available CTA here is a fake-success.
+
+    Picking 0.85 to feel decisive when the evidence is 0.6 is a bug.
+    The downstream verifier will catch the bad click on a strong-signal
+    page, but the same wrong pick on a weak-signal page (focus-only,
+    DOM-only) becomes a fake pass that breaks the test silently. Better
+    to undershoot.
 
 EXAMPLES (Apply-mode — diverse domains, calibrated confidence):
 
@@ -1653,6 +1931,21 @@ CANDIDATES:
   2. ref="e11" <li> Kyrgyzstan [role: option] value: kg
 RECORDED HINTS: dataValue="kz"
 EXPECTED: {"ref":"e10","confidence":0.95,"reason":"dataValue=kz exact match; UI text localized but key stable"}
+
+— TIER 1 id match where INTENT is the id itself (icon-only target, high confidence 0.97) —
+The recorder uses the DOM id as the step description when the target is an
+icon/svg with no visible text — e.g. <svg id="layout-header-setting">. The
+INTENT will look like a slug ('layout-header-setting'). Do NOT treat it as
+free text and do NOT pick something just because its label contains a
+similar word. If RECORDED IDENTITY supplies an id="..." and one candidate
+carries that exact id, that candidate IS the target.
+INTENT: "'layout-header-setting'"
+CANDIDATES:
+  1. ref="e3" <button> "Learn more" [role: button]
+  2. ref="e7" <svg> id="layout-header-setting" [role: button]
+  3. ref="e9" <span> "Settings" [role: link]
+RECORDED IDENTITY: id="layout-header-setting"
+EXPECTED: {"ref":"e7","confidence":0.97,"reason":"recorded id=layout-header-setting matches the live svg exactly; intent text is the id itself, not a label"}
 
 — TIER 1 childTestId for icon-only button (high confidence 0.92) —
 INTENT: "show password"
@@ -1757,6 +2050,29 @@ E. POSITIONAL DRIFT IS NORMAL.
    recordedAt=(x,y,w,h) may be off by 200+ pixels after a redesign. Use
    it only as a tie-breaker among same-identity candidates, not as a
    filter.
+
+F. ADJACENCY ≠ SAME FUNCTION (fake-success prevention).
+   Two controls sitting next to each other in a header / toolbar / row
+   are SEPARATE elements with SEPARATE behaviour. A settings cog and a
+   neighbouring "Click me!" banner are not interchangeable just because
+   they share a row. When the recorded fingerprint clearly points at
+   one (id, testId, childTestId, icon name) but no live candidate
+   carries that identity, do NOT substitute the loudest visible CTA
+   ("Click me!", "Get started", "Submit", "Try it") in the same area —
+   that's the canonical fake-success path. Spatial / visual prominence
+   is a TIE-BREAKER between identity-matched candidates, never a
+   reason to override identity. If no live candidate matches the
+   recorded identity AND no candidate matches by text/role/icon, return
+   ref=null with confidence 0 — the regression has truly broken and
+   the user needs to know.
+
+G. ID-AS-INTENT (recorder's icon-only fallback).
+   When the INTENT looks like a slug ('layout-header-setting',
+   'btn-submit-form'), the recorder used the DOM id as the description
+   because the target had no visible text. The ONLY correct match is a
+   candidate carrying that exact id / testId / name / data-* value.
+   Picking a nearby element whose label happens to share a word with
+   the slug is the same fake-success class as F.
 
 ${LLM_SHARED_RULES}
 
@@ -1870,6 +2186,36 @@ async function selectElementWithLLM(params: {
    */
   recordedFingerprint?: TargetFingerprint;
   /**
+   * Hints captured from the LAST successful apply (not from recorder).
+   * Manual-add steps (no `recordedFingerprint`) accumulate `bindingHints`
+   * once they resolve correctly the first time. Re-feeding those hints
+   * to the LLM on subsequent runs anchors the choice to "the element we
+   * matched last time", dramatically reducing the LLM-stochastic flip
+   * across runs that ship without recording-time identity.
+   *
+   * Treated as soft hints (advisory): drift in any single field doesn't
+   * disqualify a candidate, but a candidate matching multiple fields is
+   * preferred over a description-only match. Distinct from
+   * `recordedFingerprint` so the prompt can render both groups separately
+   * — recorded identity is "must match where present", apply hints are
+   * "preferred where they line up".
+   */
+  priorApplyHints?: BindingHints;
+  /**
+   * Etap 1D.4 — Natural-language description of the recorded element,
+   * generated by an LLM at recording time (see
+   * recorded-description-llm.service.ts). Optional 3rd channel alongside
+   * `recordedFingerprint` and `priorApplyHints`. Used most by descriptor-
+   * poor targets (icon-only buttons, blank inputs) where structural
+   * fingerprint alone often loses uniqueness.
+   *
+   * Treated as a SOFT hint with the same weight as `priorApplyHints`:
+   * a candidate matching the description well is preferred when the
+   * other channels don't decisively pick — but a strong identity match
+   * (id/testId/name) still wins. Never overrides MUST-MATCH identity.
+   */
+  recordedDescription?: string;
+  /**
    * V22: which prompt to use.
    *   - 'apply' (default): user is authoring a step. Returning null on a
    *     no-match is correct — the user will refine the description.
@@ -1878,7 +2224,7 @@ async function selectElementWithLLM(params: {
    */
   mode?: 'apply' | 'heal';
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, mode = 'apply' } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply' } = params;
   const startTime = Date.now();
 
   // Check cache
@@ -1945,12 +2291,51 @@ async function selectElementWithLLM(params: {
         (recordedFingerprint.containerTitles || []).join('|'),
       ].join(':')
     : '';
+  // Cache key participation for prior-apply hints. Without this, two manual
+  // steps with identical description but different past resolutions would
+  // collide on the cache and reuse a stale answer. The digest covers the
+  // same identity-leaning fields the prompt renders below — drift in any
+  // of them invalidates the cache entry, forcing a fresh LLM call.
+  const bhDigest = priorApplyHints
+    ? [
+        dEsc(priorApplyHints.tag),
+        dEsc(priorApplyHints.role),
+        dEsc(priorApplyHints.label),
+        dEsc(priorApplyHints.text),
+        dEsc(priorApplyHints.testId),
+        dEsc(priorApplyHints.elementId),
+        dEsc(priorApplyHints.name),
+        dEsc(priorApplyHints.href),
+        dEsc(priorApplyHints.placeholder),
+        dEsc(priorApplyHints.type),
+        dEsc(priorApplyHints.nearText),
+        dEsc((priorApplyHints as any).childTestId),
+        dEsc((priorApplyHints as any).iconLabel),
+        dEsc((priorApplyHints as any).dataValue),
+      ].join(':')
+    : '';
   // V22: include mode in cache key — apply-mode and heal-mode use different
   // prompts and may return different answers for the same inputs (heal
   // biases toward picking, apply allows null). Sharing cache slots between
   // them would leak heal's "always-pick" answers into apply (where null is
   // the right answer for gibberish) and vice versa.
-  const cacheKey = `${mode}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${candidates.map(c => c.node.ref).join(',')}`;
+  //
+  // V23 (April 2026): include normalized URL (origin + pathname, no query /
+  // hash / trailing slash) so two different pages with structurally similar
+  // candidate sets can't collide on the same cache slot. pageSignature is
+  // a strong DOM fingerprint already, but in SPAs that share component
+  // chrome (header / nav / footer) the visible refs and content hash can
+  // align by accident — adding URL eliminates that whole class of cross-page
+  // cache leaks at zero performance cost (same URL → same key, hit rate
+  // unchanged for typical Editor + Apply All flows).
+  const urlKey = (() => { try { return normalizeUrlForComparison(pageUrl); } catch { return pageUrl || ''; } })();
+  // Etap 1D.4 — recordedDescription participates in the cache key so
+  // two recordings of "the same" intent text but different element
+  // descriptions don't collide. Hash to keep key length bounded — the
+  // description itself can be up to 120 chars and would fragment the
+  // key on long intents.
+  const descDigest = recordedDescription ? computeTextHash(recordedDescription) : '';
+  const cacheKey = `${mode}|${urlKey}|${pageSignature}|${actionType}|${computeTextHash(intentText)}|${fpDigest}|${bhDigest}|${descDigest}|${candidates.map(c => c.node.ref).join(',')}`;
   const cached = llmSelectCache.get(cacheKey);
   if (cached && (Date.now() - cached.createdAt) < LLM_SELECT_CACHE_TTL_MS) {
     cacheMetrics.inc('llm-select', 'hit');
@@ -1964,6 +2349,7 @@ async function selectElementWithLLM(params: {
       return `${i + 1}. ref="${c.node.ref}" <${c.node.tag}> ${c.candidateText}`;
     })
     .join('\n');
+
 
   // Build page scene summary for top-down context
   const sceneSummary = buildSceneSummary(candidates);
@@ -2040,6 +2426,15 @@ async function selectElementWithLLM(params: {
     if ((recordedFingerprint as any).iconLabel) {
       fpHintLines.push(`iconLabel="${fpEsc((recordedFingerprint as any).iconLabel)}"`);
     }
+    // Angular Material registry name — strong identity hint.
+    if ((recordedFingerprint as any).svgIcon) {
+      fpHintLines.push(`svgIcon="${fpEsc((recordedFingerprint as any).svgIcon)}"`);
+    }
+    // Custom-element wrapper tag — semantic hint for Angular apps where
+    // the button's only stable identity is its component ancestor.
+    if ((recordedFingerprint as any).customElementTag) {
+      fpHintLines.push(`customElementTag="${fpEsc((recordedFingerprint as any).customElementTag)}"`);
+    }
     if ((recordedFingerprint as any).dataValue) {
       fpHintLines.push(`dataValue="${fpEsc((recordedFingerprint as any).dataValue)}"`);
     }
@@ -2101,9 +2496,105 @@ async function selectElementWithLLM(params: {
       if (stateBits.length > 0) fpHintLines.push(`stateAtRecord=[${stateBits.join(',')}]`);
     }
   }
-  const fpHint = fpHintLines.length > 0
-    ? `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${fpHintLines.join('\n')}`
-    : '';
+  // April 2026: split fingerprint hints into "must-match" identity and
+  // "soft" descriptive lines. Identity attributes (id, testId, name) are
+  // STRONG evidence: when present, the corresponding live element on the
+  // page IS the recorded target. Treating them as soft hints (the old
+  // "use as a guide" wording) made the model freely ignore them and pick
+  // candidates by text similarity instead — for id-as-description steps
+  // (e.g. INTENT="'layout-header-setting'" on an icon-only svg) the LLM
+  // had no visible text "layout-header-setting" anywhere and substituted
+  // an unrelated word match (a "Learn more" / `了解更多` ad button), which
+  // verifier then accepted because the click opened a new tab.
+  const identityHintKeys = new Set(['id', 'testId', 'name']);
+  const identityHintLines = fpHintLines.filter((l) => identityHintKeys.has(l.split('=')[0]));
+  const softHintLines = fpHintLines.filter((l) => !identityHintKeys.has(l.split('=')[0]));
+  const fpHintParts: string[] = [];
+  if (identityHintLines.length > 0) {
+    fpHintParts.push(
+      `\nRECORDED IDENTITY (MUST MATCH — these are stable HTML attributes on the recorded element; if a live candidate has the same id / testId / name value, it IS the target — pick it even if its visible text differs from the intent, even if the intent looks like an id-as-text string):\n${identityHintLines.join('\n')}`
+    );
+  }
+  if (softHintLines.length > 0) {
+    fpHintParts.push(
+      `\nRECORDED ELEMENT HINTS (use as a guide, not a hard filter — surface text, exact coordinates or styling may have drifted):\n${softHintLines.join('\n')}`
+    );
+  }
+
+  // PRIOR APPLY HINTS — for manual-add steps without a recorder fingerprint,
+  // bindingHints persist across runs and capture "what we resolved to last
+  // time". Treat as soft preference: a candidate matching multiple of these
+  // fields is more likely the same element the user verified during Apply.
+  // Rendered AFTER recorded hints so the model sees identity (must-match)
+  // first and apply hints (preference) second; if both are present, they
+  // reinforce each other.
+  //
+  // Skip fields already covered by recordedFingerprint blocks above to keep
+  // the prompt compact and avoid contradictory duplicate signals when the
+  // recorder fp captured an earlier value than the last apply.
+  const recordedFieldsRendered = new Set<string>();
+  for (const line of fpHintLines) {
+    const key = line.split('=')[0];
+    if (key) recordedFieldsRendered.add(key);
+  }
+  const bhHintLines: string[] = [];
+  if (priorApplyHints) {
+    const pushIfNew = (key: string, value: unknown) => {
+      if (recordedFieldsRendered.has(key)) return;
+      if (value === undefined || value === null || value === '') return;
+      bhHintLines.push(`${key}="${fpEsc(value)}"`);
+    };
+    // Same field order / naming as recorded fp block so the model treats
+    // both groups consistently.
+    if (priorApplyHints.tag) pushIfNew('tag', `<${priorApplyHints.tag}>`);
+    pushIfNew('role', priorApplyHints.role);
+    pushIfNew('id', priorApplyHints.elementId);
+    pushIfNew('testId', priorApplyHints.testId);
+    pushIfNew('name', priorApplyHints.name);
+    pushIfNew('label', priorApplyHints.label);
+    pushIfNew('text', priorApplyHints.text);
+    pushIfNew('placeholder', priorApplyHints.placeholder);
+    pushIfNew('inputType', priorApplyHints.type);
+    pushIfNew('href', priorApplyHints.href);
+    pushIfNew('ariaControls', priorApplyHints.ariaControls);
+    pushIfNew('nearText', priorApplyHints.nearText);
+    pushIfNew('inLandmark', priorApplyHints.nearestLandmark);
+    pushIfNew('childIconTestId', (priorApplyHints as any).childTestId);
+    pushIfNew('iconLabel', (priorApplyHints as any).iconLabel);
+    pushIfNew('dataValue', (priorApplyHints as any).dataValue);
+    pushIfNew('rowText', (priorApplyHints as any).nearestRowText);
+    if (priorApplyHints.containerTitles?.length && !recordedFieldsRendered.has('containers')) {
+      bhHintLines.push(`containers=${JSON.stringify(priorApplyHints.containerTitles.slice(0, 3))}`);
+    }
+  }
+  if (bhHintLines.length > 0) {
+    fpHintParts.push(
+      `\nPRIOR APPLY HINTS (the element previously verified by Apply for this step — strong preference signal, but candidates may have drifted; if a candidate matches several of these fields, prefer it over a description-only match):\n${bhHintLines.join('\n')}`
+    );
+  }
+
+  // Etap 1D.4 — RecordedDescription as a 3rd channel.
+  //
+  // Generated by recorded-description-llm.service at capture time. This is
+  // the human-readable phrasing of "what was clicked" with structural
+  // context the recorder saw (modal name, landmark, container titles).
+  // Treated as a soft signal — does NOT override RECORDED IDENTITY
+  // (id/testId/name MUST-MATCH lines) but disambiguates when:
+  //   - several candidates have similar visible text (rows in a table)
+  //   - the target is icon-only with no aria/text/testId
+  //   - the user's intent text is generic ("click submit") and the
+  //     description names the specific submit ("the Save button in the
+  //     user profile modal")
+  //
+  // Skipped silently when undefined (legacy steps recorded before
+  // 1D.3, or descriptions the LLM declined to generate).
+  if (recordedDescription) {
+    fpHintParts.push(
+      `\nRECORDED DESCRIPTION (a natural-language note from when this step was first recorded — describes the element's purpose plus immediate visible context; use it when intent text is generic or candidates look similar; identity-tier matches above still win):\n"${recordedDescription.replace(/"/g, '\\"')}"`
+    );
+  }
+
+  const fpHint = fpHintParts.join('');
 
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
@@ -2115,7 +2606,12 @@ ${candidateList}
 
 Select the single best matching element, or return ref=null if the intent does not meaningfully describe any element.`;
 
-  // Call LLM with timeout
+  // V26: per-provider AbortControllers. The OUTER controller enforces the
+  // total LLM_SELECT_TIMEOUT_MS hard cap (covers prepare + LLM call + post).
+  // Each call to a provider also gets its OWN inner controller scoped to
+  // LLM_SELECT_PER_PROVIDER_TIMEOUT_MS so a slow primary doesn't burn the
+  // budget the fallback needs. `controller` (outer) is what downstream code
+  // checks via `controller.signal.aborted` — keep its semantics unchanged.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), LLM_SELECT_TIMEOUT_MS);
 
@@ -2124,26 +2620,105 @@ Select the single best matching element, or return ref=null if the intent does n
   // null when the description is gibberish or doesn't fit any candidate.
   const systemPrompt = mode === 'heal' ? LLM_SELECT_HEAL_PROMPT : LLM_SELECT_APPLY_PROMPT;
 
-  try {
-    const response = await getChatCompletionWithMessages(
-      [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      {
-        model: AI_TASK_MODELS.disambiguation,
-        temperature: 0.1,
-        // 200 tokens was too tight: Gemini Flash Lite in JSON mode occasionally
-        // hit MAX_TOKENS before closing the JSON object, producing an empty
-        // response (finishReason=MAX_TOKENS). 500 gives enough headroom for
-        // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
-        max_tokens: 500,
-        response_format: { type: 'json_object' },
-        abortSignal: controller.signal,
-      }
-    );
+  // V23: split timing into prepare/llm/post phases. The composite `latencyMs`
+  // measures startTime → result, but a 19s "LLM latency" we saw in production
+  // could be 6s gemini + 13s post-processing — we couldn't tell from one
+  // number. Now we log all three so the next slow step is unambiguous.
+  const prepareMs = Date.now() - startTime;
+  const promptChars = systemPrompt.length + userPrompt.length;
+  const llmCallStart = Date.now();
+  let llmCallMs = 0;
 
+  try {
+    // Primary Gemini Flash Lite → fallback AI_MODELS.fast (gpt-5.4-mini)
+    // when Gemini errors out (503 / timeout / abort). Each provider gets
+    // its OWN AbortController scoped to LLM_SELECT_PER_PROVIDER_TIMEOUT_MS
+    // so the primary using up its full budget doesn't starve the fallback.
+    //
+    // Outer `controller` (LLM_SELECT_TIMEOUT_MS) is the absolute cap:
+    // when it aborts, BOTH inner controllers cascade-abort via the
+    // forwarder, and we throw out of the try.
+    //
+    // The forwarder is one-direction: outer → inner. Inner abort (its own
+    // per-provider timer) does NOT abort the outer — the outer must
+    // remain healthy so the next provider attempt can run.
+    const callWithModel = (model: string) => {
+      const inner = new AbortController();
+      const innerTimer = setTimeout(
+        () => inner.abort(),
+        LLM_SELECT_PER_PROVIDER_TIMEOUT_MS,
+      );
+      // If the OUTER (total) budget is exhausted while this provider is in
+      // flight, propagate the cancellation downward. One-way; abort listener
+      // is removed in finally so we don't leak refs across provider attempts.
+      const onOuterAbort = () => inner.abort();
+      if (controller.signal.aborted) {
+        inner.abort();
+      } else {
+        controller.signal.addEventListener('abort', onOuterAbort, { once: true });
+      }
+      const cleanup = () => {
+        clearTimeout(innerTimer);
+        controller.signal.removeEventListener('abort', onOuterAbort);
+      };
+      return getChatCompletionWithMessages(
+        [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        {
+          model,
+          temperature: 0.1,
+          // 200 tokens was too tight: Gemini Flash Lite in JSON mode occasionally
+          // hit MAX_TOKENS before closing the JSON object, producing an empty
+          // response (finishReason=MAX_TOKENS). 500 gives enough headroom for
+          // the {ref,confidence,reason,alternatives?} shape without blowing up cost.
+          max_tokens: 500,
+          response_format: { type: 'json_object' },
+          abortSignal: inner.signal,
+        },
+      ).finally(cleanup);
+    };
+
+    let response;
+    try {
+      response = await callWithModel(AI_TASK_MODELS.disambiguation);
+    } catch (primaryErr) {
+      const FALLBACK = AI_MODELS.fast;
+      const sameProvider =
+        AI_TASK_MODELS.disambiguation.startsWith('gemini-') === FALLBACK.startsWith('gemini-');
+      // V26: only short-circuit on the OUTER (total) abort. Inner abort
+      // (per-provider timeout) is exactly the case where we WANT the
+      // fallback to fire — that was the May-2026 outage symptom.
+      if (sameProvider || controller.signal.aborted) {
+        throw primaryErr;
+      }
+      logger.warn('[LLM_SELECT] Primary Gemini failed, retrying with OpenAI fallback', {
+        primary: AI_TASK_MODELS.disambiguation,
+        fallback: FALLBACK,
+        error: primaryErr instanceof Error ? primaryErr.message : String(primaryErr),
+        primaryWasAborted: !controller.signal.aborted,  // true ⇒ inner-only abort, fallback worth a try
+      });
+      response = await callWithModel(FALLBACK);
+    }
+
+    llmCallMs = Date.now() - llmCallStart;
     clearTimeout(timeoutId);
+
+    // V23: SLA breach guard. If we asked for a 7s budget and got 1.5× past
+    // it AND we still received a response, the abort signal failed to
+    // propagate. Surface as warn so we notice repeats; don't throw — caller
+    // would lose a successful response just for diagnostics.
+    if (llmCallMs > LLM_SELECT_TIMEOUT_MS * 1.5) {
+      logger.warn('[LLM_SELECT] SLA breach — call exceeded 1.5× timeout despite abort signal', {
+        llmCallMs,
+        timeoutMs: LLM_SELECT_TIMEOUT_MS,
+        model: AI_TASK_MODELS.disambiguation,
+        candidateCount: candidates.length,
+        promptChars,
+        signalAborted: controller.signal.aborted,
+      });
+    }
 
     // Parse response
     // V15: Use balanced-brace parser instead of greedy regex.
@@ -2161,6 +2736,14 @@ Select the single best matching element, or return ref=null if the intent does n
       confidence?: number;
       reason?: string;
       alternatives?: string[];
+      // V23: optional coaching payload — see LLM prompt rule 22.
+      // Validated below (issue allow-list, hint length cap, examples
+      // each substring-validated against a candidate's visible text).
+      suggestion?: {
+        issue?: string;
+        hint?: string;
+        examples?: string[];
+      };
     } | null;
     if (!parsed) {
       // Repair attempts exhausted — surface as a soft failure so the caller
@@ -2172,6 +2755,124 @@ Select the single best matching element, or return ref=null if the intent does n
       throw new Error('LLM response could not be parsed as JSON');
     }
 
+    // Sanitizer / validator for the LLM-emitted suggestion. The LLM is
+    // strongly instructed (rule 22) but not guaranteed — it can:
+    //   • emit hallucinated example labels that don't appear on any
+    //     candidate ("попробуй 'Save changes'" when the page has none);
+    //   • return arbitrarily long strings;
+    //   • emit issue codes outside our enum.
+    // We accept only validated values; the caller can also synthesize a
+    // suggestion from scratch when LLM omitted it (see the resolved /
+    // not_found branches below).
+    const ALLOWED_ISSUES: ReadonlySet<ResolverSuggestion['issue']> = new Set<ResolverSuggestion['issue']>(
+      ['NO_MATCH', 'AMBIGUOUS', 'GENERIC_INTENT', 'VAGUE_INTENT', 'LOW_CONFIDENCE'],
+    );
+    const candidateLabels: string[] = candidates
+      .map((c) => (
+        c.node.labelText
+        || c.node.ariaLabel
+        || c.node.text
+        || c.node.placeholder
+        || c.node.title
+        || ''
+      ).trim())
+      .filter((l) => l.length > 0);
+    const validateExamples = (raw: unknown): string[] => {
+      if (!Array.isArray(raw)) return [];
+      const out: string[] = [];
+      for (const item of raw) {
+        if (typeof item !== 'string') continue;
+        const trimmed = item.trim().slice(0, 80);
+        if (trimmed.length < 2) continue;
+        // Anti-hallucination: the example MUST appear (case-insensitive,
+        // partial) in some candidate's visible text. Otherwise the LLM
+        // invented a label and we drop it. Substring-either-way to allow
+        // either side to be the longer one (LLM may shorten "МАТ-SMART
+        // ЖЕЛТОҚСАН Т. Бекнұр" → "МАТ-SMART").
+        const trimmedLc = trimmed.toLowerCase();
+        const grounded = candidateLabels.some((l) => {
+          const lc = l.toLowerCase();
+          return lc.includes(trimmedLc) || trimmedLc.includes(lc);
+        });
+        if (grounded) out.push(trimmed);
+        if (out.length >= 3) break;
+      }
+      return out;
+    };
+    const sanitizeLlmSuggestion = (
+      raw: typeof parsed.suggestion,
+    ): ResolverSuggestion | undefined => {
+      if (!raw || typeof raw !== 'object') return undefined;
+      const issueRaw = typeof raw.issue === 'string' ? raw.issue.toUpperCase() : '';
+      const issue = (ALLOWED_ISSUES.has(issueRaw as ResolverSuggestion['issue'])
+        ? issueRaw
+        : 'NO_MATCH') as ResolverSuggestion['issue'];
+      const hint = typeof raw.hint === 'string'
+        ? raw.hint.replace(/\s+/g, ' ').trim().slice(0, 200)
+        : '';
+      const examples = validateExamples(raw.examples);
+      // No usable content → drop the suggestion entirely; let the caller
+      // synthesize a backend-side fallback if it still wants to coach.
+      if (!hint && examples.length === 0) return undefined;
+      return { issue, hint, examples: examples.length > 0 ? examples : undefined };
+    };
+
+    // Backend-side suggestion synthesizer for cases where the LLM omitted
+    // the field but we still want to help the user. Picks the top-3
+    // candidate labels by visible text length (longer = more specific
+    // anchor) and emits a generic-language hint. Never invents text —
+    // every example is a real candidate label.
+    const synthesizeFallbackSuggestion = (
+      issue: ResolverSuggestion['issue'],
+    ): ResolverSuggestion | undefined => {
+      const ranked = [...candidateLabels]
+        .filter((l) => l.length >= 2 && l.length <= 80)
+        // Prefer mid-length labels (8–60 chars) over very short generic
+        // ones ("OK", "Cancel") and over walls of text. Mid range tends
+        // to be the most useful for "you might have meant..." prompts.
+        .sort((a, b) => {
+          const score = (s: string) => {
+            const len = s.length;
+            if (len >= 8 && len <= 60) return 0;     // best
+            if (len < 8) return 1;
+            return 2;                                 // very long
+          };
+          return score(a) - score(b);
+        })
+        .slice(0, 3);
+      if (ranked.length === 0) return undefined;
+      // Detect dominant script of INTENT to produce a same-language hint.
+      // Heuristic: any Cyrillic char → Russian/Kazakh wording; otherwise
+      // English. We don't try to detect Kazakh vs Russian — Russian
+      // wording reads correctly to KZ users and avoids picking the
+      // wrong letter set on mixed pages.
+      const hasCyrillic = /[\p{Script=Cyrillic}]/u.test(intentText);
+      const issueHints: Record<ResolverSuggestion['issue'], { ru: string; en: string }> = {
+        NO_MATCH: {
+          ru: 'Не нашёл такой элемент. Уточни описание — приведи видимый текст или раздел.',
+          en: 'No element matched. Refine: include visible text or section.',
+        },
+        AMBIGUOUS: {
+          ru: 'Несколько подходящих элементов. Добавь раздел или уникальный текст.',
+          en: 'Several candidates fit. Add a section or a unique label.',
+        },
+        GENERIC_INTENT: {
+          ru: 'Описание слишком общее. Укажи текст или роль (кнопка / ссылка / иконка с подписью).',
+          en: 'Description is too generic. Add visible text or specify role.',
+        },
+        VAGUE_INTENT: {
+          ru: 'Положение без якоря ненадёжно при изменении вёрстки. Назови элемент по тексту/роли.',
+          en: 'Positional descriptions break when layout shifts. Reference text/role instead.',
+        },
+        LOW_CONFIDENCE: {
+          ru: 'Нашёл, но не уверен. Уточни описание для надёжного матча.',
+          en: 'Match was weak. Tighten the description for a stable locator.',
+        },
+      };
+      const hint = (hasCyrillic ? issueHints[issue].ru : issueHints[issue].en);
+      return { issue, hint, examples: ranked };
+    };
+
     // Validate ref against candidate list
     const validRefs = new Set(candidates.map(c => c.node.ref));
 
@@ -2179,13 +2880,97 @@ Select the single best matching element, or return ref=null if the intent does n
 
     if (parsed.ref && validRefs.has(parsed.ref)) {
       const confidence = Math.min(1, Math.max(0, parsed.confidence ?? 0.8));
-      // Reject low-confidence matches — likely nonsense/irrelevant descriptions
-      if (confidence < 0.4) {
+      // Apply-mode threshold lifted from 0.4 → 0.55: in real-world manual-add
+      // flows the LLM tends to return 0.5–0.85 on "I think this looks
+      // related" matches even when the page genuinely lacks the target.
+      // 0.4 is too generous — those mid-tier guesses are exactly the
+      // false-positive class we hunt with the label/identity guards
+      // downstream. Heal-mode keeps the looser threshold (`mode==='heal'`
+      // below) because there we already have a recorded fingerprint and
+      // we WANT the LLM to bias toward "find something close".
+      const minConfidence = mode === 'heal' ? 0.4 : 0.55;
+      // Semantic floor — when confidence is in the "good but not great"
+      // band (≥minConfidence but <0.85) AND the chosen candidate's text
+      // shares zero meaningful tokens with the user's description, treat
+      // it as a soft mismatch and return not_found. This catches the
+      // canonical "step is for a different page; LLM reaches for the
+      // loudest CTA" case (e.g. INTENT="MAT-SMART раздел" on a homepage,
+      // chosen "Артықшылықтарымыз" — strictly no overlap).
+      let semanticFloorRejected = false;
+      if (mode !== 'heal' && confidence < 0.85) {
+        const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
+        // V23: use the universal `getEffectiveLabel` so semantic floor sees
+        // identity that lives on title/alt/iconLabel/svgIcon/etc., not just
+        // labelText|ariaLabel|text|placeholder. Without this, an Angular
+        // routerLink `<a title="Папкалар">` would falsely fail the semantic
+        // floor because none of the four read fields were populated.
+        const chosenText = getEffectiveLabel(chosenCandidate?.node).toLowerCase();
+        // Same Cyrillic↔Latin glyph fold the apply-time guard uses (M↔М,
+        // A↔А, T↔Т, …) so "MAT-SMART" and "МАТ-SMART" agree on tokens.
+        // Cheap inline copy — pulling the helper out of preview-step-apply
+        // would create a circular import; the duplication is fine for two
+        // sites and lets each guard stay self-contained.
+        const cyrFold = (s: string): string => {
+          let out = '';
+          for (const ch of s) {
+            const code = ch.charCodeAt(0);
+            switch (code) {
+              case 0x0410: case 0x0430: out += 'a'; break;
+              case 0x0412: case 0x0432: out += 'b'; break;
+              case 0x0415: case 0x0435: out += 'e'; break;
+              case 0x041A: case 0x043A: out += 'k'; break;
+              case 0x041C: case 0x043C: out += 'm'; break;
+              case 0x041D: case 0x043D: out += 'h'; break;
+              case 0x041E: case 0x043E: out += 'o'; break;
+              case 0x0420: case 0x0440: out += 'p'; break;
+              case 0x0421: case 0x0441: out += 'c'; break;
+              case 0x0422: case 0x0442: out += 't'; break;
+              case 0x0425: case 0x0445: out += 'x'; break;
+              case 0x0423: case 0x0443: out += 'y'; break;
+              default: out += ch;
+            }
+          }
+          return out;
+        };
+        const tok = (s: string): Set<string> =>
+          new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
+        const intentTokens = tok(intentText.toLowerCase());
+        const chosenTokens = tok(chosenText);
+        if (intentTokens.size > 0 && chosenTokens.size > 0) {
+          // V23: shared = exact OR substring (≥3 chars). Russian/Kazakh/etc.
+          // morphology means "папка" (intent) vs "папкалар" (label) are
+          // semantically the same word but fail set equality. Substring with
+          // a 3-char floor catches morphological variants without globbing
+          // unrelated tokens (e.g. "ok" inside "Bookmark").
+          let shared = 0;
+          outer: for (const i of intentTokens) {
+            for (const c of chosenTokens) {
+              if (i === c) { shared = 1; break outer; }
+              // Prefix-or-substring overlap, both directions, min 3 chars.
+              if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
+                shared = 1; break outer;
+              }
+            }
+          }
+          if (shared === 0) semanticFloorRejected = true;
+        }
+      }
+      if (confidence < minConfidence || semanticFloorRejected) {
+        const reason = semanticFloorRejected
+          ? `chosen "${(parsed.reason || '').slice(0, 50)}" shares no tokens with intent — likely no real match on this page`
+          : (parsed.reason || 'description does not match any element');
+        logger.info('[LLM_SELECT] Rejecting low-confidence / off-semantic pick', {
+          intentText: intentText.slice(0, 80),
+          chosenRef: parsed.ref,
+          confidence,
+          minConfidence,
+          semanticFloorRejected,
+        });
         result = {
           status: 'not_found',
           selectedRef: null,
           confidence: 0,
-          reason: (parsed.reason || 'description does not match any element').slice(0, 200),
+          reason: reason.slice(0, 200),
           latencyMs: Date.now() - startTime,
           cacheHit: false,
         };
@@ -2235,6 +3020,72 @@ Select the single best matching element, or return ref=null if the intent does n
       };
     }
 
+    // V23 — attach an advisory suggestion when the resolver couldn't
+    // confidently pick. Three branches feed into this:
+    //   1. Apply-mode rejection (low confidence OR off-semantic): we
+    //      know what the LLM tried to pick — surface that label as one
+    //      example, plus 2 more from candidates so the user has options.
+    //   2. needs_clarification: LLM gave alternatives — those go straight
+    //      into examples. No need to invent.
+    //   3. Bare not_found: LLM said "nothing fits" — synthesize from
+    //      candidate labels so the editor still has something to show.
+    // Heal-mode never gets a suggestion: there the resolver is bidding
+    // hard to keep a regression alive, and a "you might have meant..."
+    // chip in the run logs would be noise.
+    //
+    // The LLM-emitted suggestion (if any) takes precedence after
+    // sanitization; we only synthesize when LLM omitted or its payload
+    // failed validation. Resolver consumers that ignore this field
+    // continue to work — the result type only adds it as optional.
+    if (mode !== 'heal') {
+      const llmSuggestion = sanitizeLlmSuggestion(parsed.suggestion);
+      if (result.status === 'not_found') {
+        const synthesized = llmSuggestion
+          ?? synthesizeFallbackSuggestion(
+            // The semantic-floor branch already established why; we tag
+            // it `LOW_CONFIDENCE` so the UI can render a softer warning
+            // ("found something but uncertain") vs the harder NO_MATCH.
+            (parsed.ref && validRefs.has(parsed.ref)) ? 'LOW_CONFIDENCE' : 'NO_MATCH',
+          );
+        if (synthesized) result = { ...result, suggestion: synthesized };
+      } else if (result.status === 'needs_clarification') {
+        // For ambiguous, prefer LLM-supplied examples; if missing, use
+        // the alternativeRefs' labels — those ARE candidates so they're
+        // automatically grounded.
+        const altLabels: string[] = (result.alternativeRefs || [])
+          .slice(0, 3)
+          .map((ref) => {
+            const c = candidates.find((cc) => cc.node.ref === ref);
+            return (
+              c?.node.labelText
+              || c?.node.ariaLabel
+              || c?.node.text
+              || c?.node.placeholder
+              || c?.node.title
+              || ''
+            ).trim().slice(0, 80);
+          })
+          .filter((l) => l.length > 0);
+        const synthesized: ResolverSuggestion | undefined = llmSuggestion
+          ?? (altLabels.length > 0
+            ? {
+                issue: 'AMBIGUOUS',
+                hint: /[\p{Script=Cyrillic}]/u.test(intentText)
+                  ? 'Несколько подходящих — выбери из вариантов или уточни описание.'
+                  : 'Several candidates fit — pick one or refine the description.',
+                examples: altLabels,
+              }
+            : undefined);
+        if (synthesized) result = { ...result, suggestion: synthesized };
+      } else if (result.status === 'resolved' && result.confidence < 0.85) {
+        // Soft warning for "weak resolved" — the user got a pick but the
+        // resolver wasn't sure. Surface only if the LLM volunteered a
+        // suggestion (per rule 22) — don't synthesize for these because
+        // a successful pick shouldn't be drowned in coaching noise.
+        if (llmSuggestion) result = { ...result, suggestion: llmSuggestion };
+      }
+    }
+
     // Cache result
     if (llmSelectCache.size >= LLM_SELECT_CACHE_MAX_SIZE) {
       const now = Date.now();
@@ -2258,14 +3109,30 @@ Select the single best matching element, or return ref=null if the intent does n
     result._response = content;
     result._model = AI_TASK_MODELS.disambiguation;
 
+    // V23: phase breakdown — prepareMs (build prompt), llmCallMs (network),
+    // postMs (parse + validate + suggestion). totalMs is from startTime.
+    const totalMs = Date.now() - startTime;
+    const postMs = Math.max(0, totalMs - prepareMs - llmCallMs);
     logger.info('[LLM_SELECT] Element selection complete', {
       event: 'llm_select_complete',
       status: result.status,
       selectedRef: result.selectedRef,
       confidence: result.confidence,
       latencyMs: result.latencyMs,
+      // V23 breakdown
+      prepareMs,
+      llmCallMs,
+      postMs,
+      totalMs,
+      promptChars,
       candidateCount: candidates.length,
       actionType,
+      // Etap 1D.4 — track which channels were available so we can build
+      // metrics like "% of LLM calls with description hint" and detect
+      // regressions where the channel stops getting populated upstream.
+      hasRecordedFingerprint: !!recordedFingerprint,
+      hasPriorApplyHints: !!priorApplyHints,
+      hasRecordedDescription: !!recordedDescription,
     });
 
     return result;
@@ -2400,6 +3267,11 @@ export async function resolveElement(params: {
    * automatically when this flag isn't set.
    */
   mode?: 'apply' | 'heal';
+  /** V26: Real browser viewport at snapshot time. Used by `buildAllowedSets`
+   *  for accurate modal-coverage ratio. Optional — falls back to bbox
+   *  high-water-mark heuristic when absent (works on most pages, fails on
+   *  long scrollable pages where modal coverage gets underestimated). */
+  viewport?: { width: number; height: number };
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -2408,6 +3280,7 @@ export async function resolveElement(params: {
     pageUrl,
     includeAlternatives = false,
     screenshot: screenshotOrFnRaw,
+    viewport,
   } = params;
   // V22: derive heal-mode from explicit param OR the legacy
   // `previewSessionId === 'background'` convention used by command-executor.
@@ -2487,11 +3360,20 @@ export async function resolveElement(params: {
   const intentText = sanitizeIntent(stepDraft);
 
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
-  const allowedResult = buildAllowedSets(domNodes, stepDraft.type);
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport);
   const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
   
   // Diagnostic fields for trace logging
-  const _diag = {
+  // Mutable so the V25 pruner block downstream can attach `_pruneMs` /
+  // `_prunerOutcome` without a deeper refactor of every return site. The
+  // shape is consumed by intent-step-lint.service.ts as `phaseTimings`.
+  const _diag: {
+    _ruleTrace: typeof ruleTrace;
+    _hardAllowedCount: number;
+    _softAllowedCount: number;
+    _pruneMs?: number;
+    _prunerOutcome?: 'shadow' | 'applied' | 'skipped' | 'disabled';
+  } = {
     _ruleTrace: ruleTrace,
     _hardAllowedCount: hardAllowed.length,
     _softAllowedCount: softAllowed.length,
@@ -2507,6 +3389,198 @@ export async function resolveElement(params: {
     softAllowedCount: softAllowed.length,
     totalAllowed: allowedCount,
   });
+
+  // Step 2.5 (April 2026): identity-by-id fast-path. When the recorder
+  // captured a stable DOM id or test-id and that exact id still exists on
+  // the page, return immediately — no LLM call needed. Without this, an
+  // id-as-description step ('layout-header-setting' on an icon-only svg)
+  // forces the LLM to interpret the id as free text. The model sees no
+  // visible "layout-header-setting" string anywhere, picks the closest
+  // word match (e.g. an unrelated 'Learn more' / `了解更多` ad button) and
+  // verifier records `pass` because the click opened a new tab. Result:
+  // hard fake-success that audit fields (fingerprintMatch=mismatch) catch
+  // post-hoc but the resolver itself missed.
+  //
+  // Both `recordedFingerprint` (canonical) and `compiled?.targetFingerprint`
+  // (legacy fallback) are checked. We require the live element to be in
+  // the allowed set so disabled / off-screen / aria-hidden matches still
+  // get filtered out.
+  const identityFp = stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint;
+  if (identityFp && allAllowed.length > 0) {
+    // Diagnostic: log id/testId distribution among live allAllowed candidates
+    // so a "fast-path didn't fire even though recordedId exists" run can be
+    // diagnosed from the log alone (vs guessing whether snapshot-collector
+    // populates id at all). Includes the recorded identity values for
+    // direct comparison.
+    try {
+      const liveIds = allAllowed.map((n) => n.id).filter(Boolean) as string[];
+      const liveTestIds = allAllowed.map((n) => n.testIdAttr).filter(Boolean) as string[];
+      const liveSvgIcons = allAllowed.map((n) => n.svgIcon).filter(Boolean) as string[];
+      const liveAlts = allAllowed.map((n) => n.alt).filter(Boolean) as string[];
+      const liveHrefs = allAllowed.map((n) => n.href).filter(Boolean) as string[];
+      logger.info('[ELEMENT_RESOLVER] identity fast-path diag', {
+        previewSessionId,
+        stepType: stepDraft.type,
+        recordedId: identityFp.elementId,
+        recordedTestId: identityFp.testIdAttr,
+        recordedTag: identityFp.tag,
+        // V23: svgIcon and alt are now identity-fast-path attributes too —
+        // surface them in the diag so failures on Material/img targets are
+        // diagnosable without guesswork.
+        recordedSvgIcon: identityFp.svgIcon,
+        recordedAlt: identityFp.alt,
+        recordedName: identityFp.name,
+        recordedCustomElementTag: identityFp.customElementTag,
+        allAllowedCount: allAllowed.length,
+        liveIdsSample: liveIds.slice(0, 8),
+        liveIdsCount: liveIds.length,
+        liveTestIdsSample: liveTestIds.slice(0, 8),
+        liveTestIdsCount: liveTestIds.length,
+        liveSvgIconsSample: liveSvgIcons.slice(0, 8),
+        liveAltsSample: liveAlts.slice(0, 8),
+        idMatch: identityFp.elementId ? liveIds.includes(identityFp.elementId) : null,
+        svgIconMatch: identityFp.svgIcon ? liveSvgIcons.includes(identityFp.svgIcon) : null,
+        altMatch: identityFp.alt ? liveAlts.includes(identityFp.alt) : null,
+        recordedHref: identityFp.href,
+        liveHrefsSample: liveHrefs.slice(0, 8),
+        hrefMatch: identityFp.href ? liveHrefs.includes(identityFp.href) : null,
+      });
+    } catch { /* non-fatal */ }
+    // Identity-by-attribute fast-path. For each attribute the recorder
+    // captured (id / testId / name / href / aria-controls), look for ONE
+    // and only ONE live candidate carrying the same value. Non-unique
+    // matches fall through to the LLM so it can disambiguate by context
+    // (e.g. two <input name="password"> forms — login vs reset).
+    //
+    // Layout: each entry is a (attr, recordedValue, nodeValue) triple
+    // sourced from the existing TargetFingerprint / InteractiveNode types.
+    // Reading by accessor function keeps the loop body type-safe and free
+    // of `as any` while making the attribute list trivial to extend — add
+    // one row, no other code touched.
+    // Only attributes that BOTH the recorder (TargetFingerprint) AND the
+    // live DOM probe (InteractiveNode) carry can power a fast-path. id /
+    // testId / name / href / svgIcon / alt all satisfy that. `ariaControls`
+    // exists on the recorded fingerprint but the live snapshot collector
+    // doesn't surface it on InteractiveNode yet — adding it here would be
+    // a hardcoded assumption that breaks at runtime. When the snapshot
+    // collector is extended to emit it we can append a row, no other code
+    // touched.
+    const identityChecks: Array<{
+      attr: string;
+      want: string | undefined;
+      readNode: (n: InteractiveNode) => string | undefined;
+    }> = [
+      { attr: 'id',     want: identityFp.elementId,  readNode: (n) => n.id },
+      { attr: 'testId', want: identityFp.testIdAttr, readNode: (n) => n.testIdAttr },
+      // V26: <a href> — strongest identity for SPA links with semantic URLs
+      // (`/courses/mat-smart`, `/admin/users/42`). Survives label rewrites,
+      // i18n, and class changes. Listed after testId so explicit test-ids
+      // still win, but before svgIcon/name because href is more universally
+      // present and more stable than icon-name conventions.
+      // Symmetric: collector populates from `(el as HTMLAnchorElement).href`,
+      // recorder reads the same in PROBE_AT_POINT_FN.
+      { attr: 'href', want: identityFp.href, readNode: (n) => n.href },
+      // Angular Material icon registry name. Read symmetrically by
+      // recorder probe and snapshot-collector from <mat-icon svgicon>.
+      // Stable across builds — Material apps register icons by name
+      // once at boot and the value is the lookup key, not a hash.
+      // Listed AFTER id/testId so explicit data-testid still wins on
+      // mixed-tag pages (test author can override).
+      { attr: 'svgIcon', want: identityFp.svgIcon,    readNode: (n) => n.svgIcon },
+      // Closest semantic custom-element ancestor (Angular component /
+      // Vue 3 SFC tag). Last in the identity chain — only fires when
+      // there's no id/testid/svgicon. Catches the icon-only-button-
+      // wrapped-in-`<app-notifications-button>` pattern that's common
+      // on Angular apps and otherwise has zero stable identifiers.
+      { attr: 'customElementTag', want: identityFp.customElementTag, readNode: (n) => n.customElementTag },
+      // V23: HTML `name` attribute (form fields). InteractiveNode.name is
+      // populated from element.htmlName by the extractor (NOT computed
+      // label — earlier comment was outdated). Comparing recordedFp.name to
+      // node.name is correct: both refer to the HTML attribute. Strong
+      // identity for form inputs that lack id/testid (login forms, search).
+      { attr: 'name', want: identityFp.name, readNode: (n) => n.name },
+      // V23: <img alt> accessible name. WAI-ARIA accessible name source for
+      // image targets — survives src/path changes (logo asset hash rotation,
+      // CDN moves). Stable when product naming stays consistent.
+      { attr: 'alt', want: identityFp.alt, readNode: (n) => n.alt },
+    ];
+
+    const wantTagLc = identityFp.tag?.toLowerCase();
+
+    for (const check of identityChecks) {
+      if (!check.want) continue;
+      const wantValue = check.want;
+
+      // Step A: collect all candidates whose value matches.
+      const valueMatches = allAllowed.filter((n) => check.readNode(n) === wantValue);
+
+      // Step B: apply uniqueness gate. Three outcomes:
+      //   1 match  → fast-path: clear single target.
+      //   0 match  → try next attribute.
+      //   ≥2 match → try narrowing by recorded tag. If exactly one of the
+      //              value-matches also shares the recorded tag, that
+      //              candidate is the disambiguated target. Otherwise let
+      //              the LLM decide by surrounding context — context is
+      //              exactly what fast-paths cannot reproduce.
+      let chosen: InteractiveNode | null = null;
+      let mode: 'value' | 'value+tag' | null = null;
+      if (valueMatches.length === 1) {
+        chosen = valueMatches[0];
+        mode = 'value';
+      } else if (valueMatches.length > 1 && wantTagLc) {
+        const tagMatches = valueMatches.filter((n) => (n.tag || '').toLowerCase() === wantTagLc);
+        if (tagMatches.length === 1) {
+          chosen = tagMatches[0];
+          mode = 'value+tag';
+        }
+      }
+
+      if (chosen) {
+        logger.info('[ELEMENT_RESOLVER] identity fast-path hit', {
+          previewSessionId,
+          stepType: stepDraft.type,
+          matchedBy: check.attr,
+          mode,
+          ref: chosen.ref,
+          tag: chosen.tag,
+        });
+        const lintCandidate: LintCandidate = {
+          ref: chosen.ref,
+          label: getEffectiveLabel(chosen) || `<${chosen.tag}>`,
+          reason: `identity match (${check.attr}${mode === 'value+tag' ? '+tag' : ''})`,
+          confidence: 1.0,
+          boundingBox: chosen.boundingBox,
+          node: chosen,
+        };
+        const resolverPath: LintResult['resolverPath'] =
+          check.attr === 'id' ? 'identity_id' :
+          check.attr === 'testId' ? 'identity_testid' :
+          check.attr === 'href' ? 'identity_href' :
+          check.attr === 'svgIcon' ? 'identity_svgicon' :
+          check.attr === 'customElementTag' ? 'identity_custom_element' : 'identity_name';
+        return {
+          status: 'resolved',
+          message: `Element resolved by recorded ${check.attr}`,
+          confidence: 1.0,
+          candidates: [lintCandidate],
+          highlight: [{ ref: chosen.ref, boundingBox: chosen.boundingBox, type: 'success' }],
+          cacheHit: false,
+          resolverPath,
+          ..._diag,
+        };
+      }
+      if (valueMatches.length > 1) {
+        logger.info('[ELEMENT_RESOLVER] identity fast-path skipped — ambiguous', {
+          previewSessionId,
+          stepType: stepDraft.type,
+          attr: check.attr,
+          matchCount: valueMatches.length,
+        });
+        // Don't break — a different attribute (later in the list) may
+        // still resolve uniquely on this same page.
+      }
+    }
+  }
 
   // Step 3: Handle case of 0 allowed elements
   // V5: Before giving up, try Gemini Flash rescue on excluded-but-visible nodes
@@ -2524,6 +3598,9 @@ export async function resolveElement(params: {
       excludedNodes,
       pageUrl,
       screenshot: shot?.base64,
+      // Etap 1D.4 — pass description into vision rescue (last line of
+      // defense — losing this hint here is the most expensive miss).
+      recordedDescription: stepDraft.recordedDescription,
     });
 
     if (rescueResult) {
@@ -2541,7 +3618,7 @@ export async function resolveElement(params: {
 
         const lintCandidate: LintCandidate = {
           ref: rescuedNode.ref,
-          label: rescuedNode.labelText || rescuedNode.ariaLabel || rescuedNode.text || rescuedNode.placeholder || `<${rescuedNode.tag}>`,
+          label: getEffectiveLabel(rescuedNode) || `<${rescuedNode.tag}>`,
           reason: `AI rescue: ${rescueResult.reason}`,
           confidence: rescueResult.confidence,
           boundingBox: rescuedNode.boundingBox,
@@ -2556,6 +3633,7 @@ export async function resolveElement(params: {
           highlight: [{ ref: rescuedNode.ref, boundingBox: rescuedNode.boundingBox, type: 'success' }],
           cacheHit: false,
           degradedMode: false,
+          resolverPath: 'vision',
           ..._diag,
         };
       }
@@ -2622,7 +3700,7 @@ export async function resolveElement(params: {
 
             const lintCandidate: LintCandidate = {
               ref: bestNode.ref,
-              label: bestNode.labelText || bestNode.ariaLabel || bestNode.text || bestNode.placeholder || `<${bestNode.tag}>`,
+              label: getEffectiveLabel(bestNode) || `<${bestNode.tag}>`,
               reason: `Vision rescue (coordinates): ${rescueResult.reason}`,
               confidence: adjustedConfidence,
               boundingBox: bestNode.boundingBox,
@@ -2642,6 +3720,7 @@ export async function resolveElement(params: {
               highlight: [{ ref: bestNode.ref, boundingBox: bestNode.boundingBox, type: status === 'resolved' ? 'success' : 'warning' }],
               cacheHit: false,
               degradedMode: false,
+              resolverPath: 'vision',
               ...(status === 'needs_clarification' ? { alternativesIncluded: true } : {}),
               ..._diag,
             };
@@ -2672,11 +3751,11 @@ export async function resolveElement(params: {
     // V8: Include nearby suggestions so the user sees "Did you mean?" instead of dead end.
     // Gather visible elements with labels as suggestions (regardless of tag compatibility).
     const suggestions: LintCandidate[] = domNodes
-      .filter(n => n.ref && n.isVisible !== false && (n.labelText || n.ariaLabel || n.text))
+      .filter(n => n.ref && n.isVisible !== false && getEffectiveLabel(n).length > 0)
       .slice(0, 5)
       .map(n => ({
         ref: n.ref,
-        label: n.labelText || n.ariaLabel || n.text || n.placeholder || `<${n.tag}>`,
+        label: getEffectiveLabel(n) || `<${n.tag}>`,
         reason: 'Visible element on page',
         confidence: 0,
         boundingBox: n.boundingBox,
@@ -2691,6 +3770,7 @@ export async function resolveElement(params: {
       highlight: [],
       needsAiFallback: true,
       degradedMode: false,
+      resolverPath: 'rule_fallback',
       // V8: Signal to frontend to show suggestions as "Did you mean?" list
       ...(suggestions.length > 0 ? { alternativesIncluded: true } : {}),
       ..._diag,
@@ -2709,18 +3789,24 @@ export async function resolveElement(params: {
       previewSessionId,
       ref: allAllowed[0].ref,
       intentText: intentText.slice(0, 50),
-      nodeLabel: (allAllowed[0].labelText || allAllowed[0].ariaLabel || allAllowed[0].text || '').slice(0, 50),
+      nodeLabel: getEffectiveLabel(allAllowed[0]).slice(0, 50),
     });
     // Falls through to Step 6 (LLM selection) below
   }
 
-  // Step 6: Multiple allowed elements → pre-score sort + LLM selection
-  // Pre-score: rank elements by text overlap with intent so the most relevant
-  // elements always land in the LLM batch, regardless of DOM position.
-  // This is a SORT, not a FILTER — score=0 elements still fill remaining slots.
-  const rankedAllowed = preScoreAndSort(allAllowed, intentText, MAX_CANDIDATES_FOR_LLM);
-  const primaryBatch = rankedAllowed.slice(0, MAX_CANDIDATES_FOR_LLM);
-  const overflowBatch = rankedAllowed.slice(MAX_CANDIDATES_FOR_LLM);
+  // Step 6: Multiple allowed elements → DOM-order cap + LLM-based pruner + LLM selection.
+  //
+  // Cap is DOM-order, not score-based. Heuristic ranking (foldText, stopwords,
+  // fuzzy edit-distance) was both fragile and language-coupled — fixed juz40
+  // cross-script bug only by accident. Replaced by `pruneCandidatesViaLLM`
+  // below, which understands cross-script intent natively (МАТ ≡ MAT).
+  //
+  // DOM-order is neutral: it doesn't lose elements due to language mismatch.
+  // The pruner does the smart shortlist (60 → 15) on top.
+  // Fail-open: if pruner skips/errors, the resolver still operates on this
+  // 60-candidate DOM-order set, which is the natural deterministic fallback.
+  const primaryBatch = allAllowed.slice(0, MAX_CANDIDATES_FOR_LLM);
+  const overflowBatch = allAllowed.slice(MAX_CANDIDATES_FOR_LLM);
 
   const candidatesToProcess: Array<{ node: InteractiveNode; candidateText: string }> = [];
   for (const node of primaryBatch) {
@@ -2730,6 +3816,178 @@ export async function resolveElement(params: {
 
   // Mark duplicate elements with [N of M] and promote CONTEXT for disambiguation
   markDuplicatesWithContext(candidatesToProcess);
+
+  // V25 Phase 2/3 — candidate pruner integration.
+  //
+  // SHADOW mode (Phase 2): pruner runs in parallel with the resolver and
+  // logs which refs it would have kept/dropped. Resolver output unchanged.
+  //
+  // LIVE mode (Phase 3): pruner output drives the resolver. The resolver
+  // receives ~15 candidates instead of ~60 → ~45% smaller prompt, faster.
+  // Phase 3 still keeps overflowBatch as a fallback when the resolver
+  // can't find a match in the pruner's shortlist (status: 'not_found') —
+  // that path is unchanged below.
+  //
+  // Both modes are gated by:
+  //   - `enabled` — master kill switch (env: PREVIEW_PRUNER_ENABLED)
+  //   - `shadowMode` — true=shadow only, false=live integration
+  //                    (env: PREVIEW_PRUNER_SHADOW)
+  //   - `candidatesToProcess.length > 16` — matches PRUNER_SKIP_THRESHOLD;
+  //     pruning a tiny set is wasted tokens.
+  //
+  // Pruner is fail-open: any error path returns `prunerSkipped:true`,
+  // we keep the original `candidatesToProcess` set unchanged.
+  let pruneMs = 0;
+  let prunerOutcome: 'shadow' | 'applied' | 'skipped' | 'disabled' = 'disabled';
+  if (
+    ELEMENT_RESOLVER_CONFIG.pruner.enabled
+    && candidatesToProcess.length > 16  // matches PRUNER_SKIP_THRESHOLD
+  ) {
+    const shadowPageSig = computePageSignature(pageUrl, domNodes);
+    // Mirror the resolver's fingerprint selection logic exactly: prefer
+    // recording-time fingerprint, fall back to compiled-plan fingerprint
+    // captured on the first successful apply. Same chain as line 4028.
+    const shadowRecordedFp = stepDraft.recordedFingerprint
+      || stepDraft.compiled?.targetFingerprint;
+    const prunerStartedAt = Date.now();
+
+    if (ELEMENT_RESOLVER_CONFIG.pruner.shadowMode) {
+      // Phase 2 shadow — fire-and-forget.
+      prunerOutcome = 'shadow';
+      void pruneCandidatesViaLLM({
+        intentText,
+        actionType: stepDraft.type,
+        candidates: candidatesToProcess,
+        pageUrl,
+        pageSignature: shadowPageSig,
+        recordedFingerprint: shadowRecordedFp,
+        priorApplyHints: stepDraft.bindingHints,
+        // Etap 1D.4 — pass description so pruner doesn't drop the right
+        // candidate before main resolver gets a chance.
+        recordedDescription: stepDraft.recordedDescription,
+        topK: ELEMENT_RESOLVER_CONFIG.pruner.topK,
+        mode: resolveMode,
+      }).then(prunerResult => {
+        const keptRefs = new Set(prunerResult.prunedCandidates.map(c => c.node.ref).filter(Boolean) as string[]);
+        const droppedRefs = candidatesToProcess
+          .map(c => c.node.ref)
+          .filter((r): r is string => !!r && !keptRefs.has(r));
+        logger.info('[CANDIDATE_PRUNER] Shadow result', {
+          previewSessionId,
+          intentText: intentText.slice(0, 80),
+          inputCount: prunerResult.inputCount,
+          outputCount: prunerResult.outputCount,
+          identityRescueCount: prunerResult.identityRescueCount,
+          prunerSkipped: prunerResult.prunerSkipped,
+          reason: prunerResult.reason,
+          cacheHit: prunerResult.cacheHit,
+          prunerLatencyMs: prunerResult.latencyMs,
+          wallLatencyMs: Date.now() - prunerStartedAt,
+          keptRefs: Array.from(keptRefs).slice(0, 20),
+          droppedRefs: droppedRefs.slice(0, 20),
+        });
+      }).catch(err => {
+        logger.warn('[CANDIDATE_PRUNER] Shadow call failed silently', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    } else {
+      // Phase 3 live — await the result and replace candidatesToProcess
+      // with the pruner's output. fail-open semantics: if the pruner skips
+      // / errors, we keep the original 60-candidate set and log the reason.
+      try {
+        const prunerResult = await pruneCandidatesViaLLM({
+          intentText,
+          actionType: stepDraft.type,
+          candidates: candidatesToProcess,
+          pageUrl,
+          pageSignature: shadowPageSig,
+          recordedFingerprint: shadowRecordedFp,
+          priorApplyHints: stepDraft.bindingHints,
+          // Etap 1D.4 — same description hint for the live pruner path.
+          recordedDescription: stepDraft.recordedDescription,
+          topK: ELEMENT_RESOLVER_CONFIG.pruner.topK,
+          mode: resolveMode,
+        });
+        pruneMs = Date.now() - prunerStartedAt;
+        if (!prunerResult.prunerSkipped && prunerResult.prunedCandidates.length > 0) {
+          // Replace the working set with pruner output. The resolver below
+          // operates on `candidatesToProcess` directly, so this single
+          // mutation steers everything downstream (LLM prompt, selectedRef
+          // lookup, vision rescue) at once.
+          //
+          // Order is preserved from pruner — descending confidence — so the
+          // resolver sees most-likely-first, which already aligns with the
+          // resolver prompt's expectations.
+          //
+          // Splice in place to avoid re-pointing the const. We want to keep
+          // markDuplicatesWithContext(candidatesToProcess)'s mutations
+          // intact for entries that survive — pruner returns the SAME
+          // PrunerCandidate references, so the "[N of M]" / CONTEXT
+          // suffixes carry through.
+          // V26: Hard-pad — re-include any HARD-allowed candidate the pruner
+          // dropped. Hard-allowed = passed deterministic strict rules
+          // (visible, role/tag-compatible, not behind blocking modal). The
+          // pruner is a smart shortlist but it's still a probabilistic LLM
+          // call; if it removes a clean structural match in favour of soft
+          // candidates that "look related", we lose the deterministic signal
+          // entirely. Force-include hard kept-out items to a small budget so
+          // the LLM resolver always sees the strict shortlist alongside the
+          // pruner's smart picks. Capped at 5 extras to avoid bloating the
+          // prompt back to 60 — the prompt-shrink win is preserved.
+          const hardRefs = new Set(hardAllowed.map(n => n.ref).filter(Boolean) as string[]);
+          const keptRefs = new Set(prunerResult.prunedCandidates.map(c => c.node.ref).filter(Boolean) as string[]);
+          const droppedHard: typeof prunerResult.prunedCandidates = [];
+          const HARD_PAD_LIMIT = 5;
+          for (const c of candidatesToProcess) {
+            if (droppedHard.length >= HARD_PAD_LIMIT) break;
+            const r = c.node.ref;
+            if (r && hardRefs.has(r) && !keptRefs.has(r)) {
+              droppedHard.push(c);
+            }
+          }
+          const finalSet = [...prunerResult.prunedCandidates, ...droppedHard];
+          candidatesToProcess.splice(0, candidatesToProcess.length, ...finalSet);
+          prunerOutcome = 'applied';
+          logger.info('[CANDIDATE_PRUNER] Live applied', {
+            previewSessionId,
+            intentText: intentText.slice(0, 80),
+            inputCount: prunerResult.inputCount,
+            outputCount: prunerResult.outputCount,
+            identityRescueCount: prunerResult.identityRescueCount,
+            hardPadCount: droppedHard.length,
+            cacheHit: prunerResult.cacheHit,
+            pruneMs,
+          });
+        } else {
+          prunerOutcome = 'skipped';
+          logger.info('[CANDIDATE_PRUNER] Live skipped — fallback to full candidate set', {
+            previewSessionId,
+            reason: prunerResult.reason,
+            inputCount: prunerResult.inputCount,
+            pruneMs,
+          });
+        }
+      } catch (err) {
+        // Defensive: pruner already swallows its own errors and returns
+        // prunerSkipped, but if anything escapes (unhandled promise
+        // rejection in the singleflight path) we treat it as skipped.
+        pruneMs = Date.now() - prunerStartedAt;
+        prunerOutcome = 'skipped';
+        logger.warn('[CANDIDATE_PRUNER] Live call threw — fallback to full candidate set', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+          pruneMs,
+        });
+      }
+    }
+  }
+  // Surface pruner timing on _diag so intent-step-lint.service.ts can
+  // merge it into phaseTimings without re-threading the values through
+  // multiple return sites.
+  _diag._pruneMs = pruneMs;
+  _diag._prunerOutcome = prunerOutcome;
 
   // V15: Proactive vision escalation for indistinguishable icon-only buttons.
   // Trigger when EVERY candidate is an icon-button with no semantic label AND no icon hint —
@@ -2765,6 +4023,8 @@ export async function resolveElement(params: {
         excludedNodes: iconOnlyBlind.map(c => c.node),
         pageUrl,
         screenshot: shot.base64,
+        // Etap 1D.4 — proactive vision for icon-only blind candidates.
+        recordedDescription: stepDraft.recordedDescription,
       });
 
       // Path 1: Vision returned a ref directly
@@ -2782,7 +4042,7 @@ export async function resolveElement(params: {
           });
           const lintCandidate: LintCandidate = {
             ref: pickedNode.ref,
-            label: pickedNode.labelText || pickedNode.ariaLabel || pickedNode.text || `<${pickedNode.tag}>`,
+            label: getEffectiveLabel(pickedNode) || `<${pickedNode.tag}>`,
             reason: `Vision match (icon-only): ${visionResult.reason}`,
             confidence: visionResult.confidence,
             boundingBox: pickedNode.boundingBox,
@@ -2800,6 +4060,7 @@ export async function resolveElement(params: {
             }],
             cacheHit: false,
             degradedMode: false,
+            resolverPath: 'vision',
             ..._diag,
           };
         }
@@ -2834,7 +4095,7 @@ export async function resolveElement(params: {
           const confidence = Math.min(visionResult.confidence, 0.8);
           const lintCandidate: LintCandidate = {
             ref: best.ref,
-            label: best.labelText || best.ariaLabel || best.text || `<${best.tag}>`,
+            label: getEffectiveLabel(best) || `<${best.tag}>`,
             reason: `Vision match by coordinates: ${visionResult.reason}`,
             confidence,
             boundingBox: best.boundingBox,
@@ -2848,6 +4109,7 @@ export async function resolveElement(params: {
             highlight: [{ ref: best.ref, boundingBox: best.boundingBox, type: confidence >= 0.5 ? 'success' : 'warning' }],
             cacheHit: false,
             degradedMode: false,
+            resolverPath: 'vision',
             ..._diag,
           };
         }
@@ -2861,7 +4123,7 @@ export async function resolveElement(params: {
       });
       const altCandidates: LintCandidate[] = iconOnlyBlind.map(c => ({
         ref: c.node.ref,
-        label: c.node.labelText || c.node.ariaLabel || c.node.text || `<${c.node.tag}>`,
+        label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
         reason: 'Icon-only button — no semantic label, vision could not disambiguate',
         confidence: 0.3,
         boundingBox: c.node.boundingBox,
@@ -2877,6 +4139,7 @@ export async function resolveElement(params: {
           : [],
         cacheHit: false,
         degradedMode: false,
+        resolverPath: 'vision',
         ...(altCandidates.length > 0 ? { alternativesIncluded: true } : {}),
         ..._diag,
       };
@@ -2892,7 +4155,20 @@ export async function resolveElement(params: {
   // gemini-2.5-flash-lite natively handles multilingual matching, context understanding,
   // and disambiguation in a single call.
   if (!isLlmSelectBreakerOpen()) {
+    const llmStartedAt = Date.now();
     try {
+      // Editor trace: llm_request_start — gives us a clear "we entered LLM
+      // round-trip" marker so a hang vs slow LLM is distinguishable from a
+      // hang in candidate filtering or page evaluation.
+      try {
+        const llmTraceStart = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        llmTraceStart?.writeLlmRequestStart({
+          stepId: stepDraft.id,
+          purpose: 'element_resolve',
+          domNodesCount: domNodes.length,
+          candidatesCount: candidatesToProcess.length,
+        });
+      } catch { /* non-fatal */ }
       const llmResult = await selectElementWithLLM({
         intentText,
         actionType: stepDraft.type,
@@ -2905,12 +4181,40 @@ export async function resolveElement(params: {
         // Without this fallback, the very first apply ran fingerprint-blind
         // even though the recorder had already gathered all the data.
         recordedFingerprint: stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint,
+        // Manual-add steps lack `recordedFingerprint`. Their ground truth
+        // builds up across runs in `bindingHints` (written by every
+        // successful apply). Pass it through so the LLM gets the same
+        // identity-leaning anchors the Apply UI flow used last time —
+        // closes the gap where Apply found the right element but the next
+        // Run picks a different one because the prompt forgot.
+        priorApplyHints: stepDraft.bindingHints,
+        // Etap 1D.4 — pass the LLM-generated description from recording
+        // time as a 3rd channel. Resolver uses it as a soft hint
+        // alongside fingerprint + bindingHints. Skipped when undefined
+        // (legacy steps from before 1D.3 or capture cases the
+        // description LLM declined).
+        recordedDescription: stepDraft.recordedDescription,
         // V22: route to apply / heal prompt — derived from previewSessionId
         // legacy convention or explicit caller flag, see resolveMode above.
         mode: resolveMode,
       });
 
       cacheHit = llmResult.cacheHit;
+
+      try {
+        const llmTraceEnd = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        llmTraceEnd?.writeLlmRequestEnd({
+          stepId: stepDraft.id,
+          purpose: 'element_resolve',
+          durationMs: Date.now() - llmStartedAt,
+          success: llmResult.status === 'resolved',
+          chosenRef: llmResult.selectedRef || undefined,
+          confidence: llmResult.confidence,
+          cacheHit: llmResult.cacheHit,
+          model: llmResult._model,
+          ...(llmResult.status !== 'resolved' ? { errorReason: llmResult.status } : {}),
+        });
+      } catch { /* non-fatal */ }
 
       // Build LLM trace for diagnostics
       const llmTrace = llmResult._prompt ? {
@@ -2927,7 +4231,7 @@ export async function resolveElement(params: {
         if (selectedNode) {
           const lintCandidate: LintCandidate = {
             ref: selectedNode.node.ref,
-            label: selectedNode.node.labelText || selectedNode.node.ariaLabel || selectedNode.node.text || selectedNode.node.placeholder || `<${selectedNode.node.tag}>`,
+            label: getEffectiveLabel(selectedNode.node) || `<${selectedNode.node.tag}>`,
             reason: `AI match: ${llmResult.reason}`,
             confidence: llmResult.confidence,
             boundingBox: selectedNode.node.boundingBox,
@@ -2960,6 +4264,12 @@ export async function resolveElement(params: {
             }],
             cacheHit,
             degradedMode: false,
+            resolverPath: 'llm',
+            // V23: surface advisory coaching when LLM volunteered it on
+            // a low-confidence pick. selectElementWithLLM only attaches
+            // suggestion to resolved when confidence < 0.85, so this is
+            // already gated correctly upstream.
+            ...(llmResult.suggestion ? { suggestion: llmResult.suggestion } : {}),
             ..._diag,
             _llmTrace: llmTrace,
           };
@@ -2973,7 +4283,7 @@ export async function resolveElement(params: {
         if (altCandidates.length > 0) {
           const lintCandidates: LintCandidate[] = altCandidates.map(c => ({
             ref: c.node.ref,
-            label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+            label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
             reason: `AI: ${llmResult.reason}`,
             confidence: 0.5,
             boundingBox: c.node.boundingBox,
@@ -3009,6 +4319,11 @@ export async function resolveElement(params: {
             highlight,
             cacheHit,
             degradedMode: false,
+            resolverPath: 'llm',
+            // V23: forward AMBIGUOUS coaching so the editor can show the
+            // "Several candidates fit — pick one or refine" hint with
+            // grounded examples derived from alternativeRefs.
+            ...(llmResult.suggestion ? { suggestion: llmResult.suggestion } : {}),
             ..._diag,
             _llmTrace: llmTrace,
           };
@@ -3021,8 +4336,29 @@ export async function resolveElement(params: {
       if (llmResult.status === 'not_found' || (llmResult.status === 'resolved' && llmResult.confidence < 0.5)) {
         // Check if candidates include visual elements that might need screenshot analysis
         const VISUAL_TAGS = new Set(['img', 'canvas', 'svg', 'video', 'picture']);
+        // Also treat as "visual" the anonymous-anchor-with-image pattern that
+        // dominates poster/banner carousels: <a target="_blank" href="..."><img/></a>
+        // with no text/aria/title. recorder probe walks up to <a> via nativeTag,
+        // so the candidate.tag is "a" — VISUAL_TAGS check above misses this
+        // case completely. The heuristic: if the anchor has none of the usual
+        // textual descriptors (text/labelText/ariaLabel/title) AND no childTestId,
+        // it's almost certainly an image-only link the user identifies by what
+        // they SEE, not what's in the DOM. Vision is the only way to match
+        // "poster about exam X" to a specific carousel slot.
+        // Conservative: gated on the SAME LLM-confidence-low precondition above
+        // so this only fires after the text path failed — never on the happy path.
+        const isImageOnlyAnchor = (n: InteractiveNode): boolean => {
+          if (n.tag !== 'a' && n.tag !== 'button' && n.tag !== 'div') return false;
+          const noText = !n.text && !n.labelText && !n.ariaLabel && !n.title;
+          if (!noText) return false;
+          const noChildIcon = !(n as any).childTestId
+            && !(n as any).iconLabel
+            && !(n as any).svgIcon;
+          if (!noChildIcon) return false;
+          return true;
+        };
         const hasVisualCandidates = candidatesToProcess.some(
-          c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton
+          c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton || isImageOnlyAnchor(c.node)
         );
 
         if (hasVisualCandidates && screenshotOrFn) {
@@ -3030,16 +4366,21 @@ export async function resolveElement(params: {
             previewSessionId,
             llmStatus: llmResult.status,
             llmConfidence: llmResult.confidence,
-            visualCandidateCount: candidatesToProcess.filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton).length,
+            visualCandidateCount: candidatesToProcess.filter(
+              c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton || isImageOnlyAnchor(c.node),
+            ).length,
           });
 
           // Capture screenshot for vision analysis (normalized with clipPageTop/scrollY)
           const visionShot = await resolveScreenshot(screenshotOrFn);
 
           if (visionShot) {
-            // Pass visual candidates as the node list for vision to match against
+            // Pass visual candidates as the node list for vision to match against.
+            // Includes image-only anchors (poster/banner pattern) so vision can
+            // match "click poster about X" against carousel slots that probe
+            // captured as bare <a> wrappers.
             const visualNodes = candidatesToProcess
-              .filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton)
+              .filter(c => VISUAL_TAGS.has(c.node.tag) || c.node.isIconButton || isImageOnlyAnchor(c.node))
               .map(c => c.node);
 
             const visionResult = await rescueWithGeminiFlash({
@@ -3048,6 +4389,8 @@ export async function resolveElement(params: {
               excludedNodes: visualNodes.length > 0 ? visualNodes : allAllowed,
               pageUrl,
               screenshot: visionShot.base64,
+              // Etap 1D.4 — last-chance vision rescue.
+              recordedDescription: stepDraft.recordedDescription,
             });
 
             if (visionResult && visionResult.ref) {
@@ -3066,7 +4409,7 @@ export async function resolveElement(params: {
 
                 const lintCandidate: LintCandidate = {
                   ref: visionNode.node.ref,
-                  label: visionNode.node.labelText || visionNode.node.ariaLabel || visionNode.node.text || visionNode.node.placeholder || `<${visionNode.node.tag}>`,
+                  label: getEffectiveLabel(visionNode.node) || `<${visionNode.node.tag}>`,
                   reason: `Vision match: ${visionResult.reason}`,
                   confidence: visionResult.confidence,
                   boundingBox: visionNode.node.boundingBox,
@@ -3085,6 +4428,7 @@ export async function resolveElement(params: {
                   }],
                   cacheHit: false,
                   degradedMode: false,
+                  resolverPath: 'vision',
                   ..._diag,
                 };
               }
@@ -3123,6 +4467,12 @@ export async function resolveElement(params: {
             // Without this fallback, the very first apply ran fingerprint-blind
             // even though the recorder had already gathered all the data.
             recordedFingerprint: stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint,
+            // Mirror primary call: feed prior apply hints so manual-add
+            // steps stay anchored to their last-verified element across
+            // overflow batches as well.
+            priorApplyHints: stepDraft.bindingHints,
+            // Etap 1D.4 — same description hint as primary call.
+            recordedDescription: stepDraft.recordedDescription,
             // V22: route to apply / heal prompt (overflow path inherits parent mode).
             mode: resolveMode,
           });
@@ -3141,7 +4491,7 @@ export async function resolveElement(params: {
 
               const lintCandidate: LintCandidate = {
                 ref: selectedNode.node.ref,
-                label: selectedNode.node.labelText || selectedNode.node.ariaLabel || selectedNode.node.text || selectedNode.node.placeholder || `<${selectedNode.node.tag}>`,
+                label: getEffectiveLabel(selectedNode.node) || `<${selectedNode.node.tag}>`,
                 reason: `AI match (overflow): ${overflowResult.reason}`,
                 confidence: overflowResult.confidence,
                 boundingBox: selectedNode.node.boundingBox,
@@ -3156,6 +4506,7 @@ export async function resolveElement(params: {
                 highlight: [{ ref: selectedNode.node.ref, boundingBox: selectedNode.node.boundingBox, type: 'success' }],
                 cacheHit: false,
                 degradedMode: false,
+                resolverPath: 'llm',
                 ..._diag,
                 _llmTrace: overflowResult._prompt ? {
                   model: overflowResult._model || 'unknown',
@@ -3186,7 +4537,7 @@ export async function resolveElement(params: {
           .slice(0, 5)
           .map(c => ({
             ref: c.node.ref,
-            label: c.node.labelText || c.node.ariaLabel || c.node.text || c.node.placeholder || `<${c.node.tag}>`,
+            label: getEffectiveLabel(c.node) || `<${c.node.tag}>`,
             reason: 'Available on page',
             confidence: 0,
             boundingBox: c.node.boundingBox,
@@ -3212,6 +4563,11 @@ export async function resolveElement(params: {
           degradedMode: false,
           needsAiFallback: true,
           ...(llmNotFoundSuggestions.length > 0 ? { alternativesIncluded: true } : {}),
+          // V23: forward NO_MATCH coaching (LLM-supplied or backend-synthesized)
+          // so the editor can render "Try refining: <example1>, <example2>...".
+          // selectElementWithLLM always attaches a suggestion to not_found
+          // results, so this propagates the user's actionable next step.
+          ...(llmResult.suggestion ? { suggestion: llmResult.suggestion } : {}),
           ..._diag,
           _llmTrace: llmTrace,
         };
@@ -3225,6 +4581,21 @@ export async function resolveElement(params: {
         error: llmErrorMsg,
         totalLatencyMs,
       });
+
+      // Editor trace: llm_request_end with timedOut/error so a hung resolver
+      // is visible without correlating logger output.
+      try {
+        const llmTraceEnd = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+        const isTimeout = /timeout|aborted/i.test(llmErrorMsg);
+        llmTraceEnd?.writeLlmRequestEnd({
+          stepId: stepDraft.id,
+          purpose: 'element_resolve',
+          durationMs: Date.now() - llmStartedAt,
+          success: false,
+          timedOut: isTimeout,
+          errorReason: llmErrorMsg.slice(0, 200),
+        });
+      } catch { /* non-fatal */ }
 
       return {
         status: 'not_found',
@@ -3245,6 +4616,20 @@ export async function resolveElement(params: {
       previewSessionId,
       totalLatencyMs,
     });
+
+    // Editor trace: emit llm_request_end with circuitOpen=true so the trace
+    // shows "we skipped LLM because the breaker was open", not "LLM was slow".
+    try {
+      const llmTraceCB = (await import('./editor-trace.service')).EditorTraceService.get(previewSessionId);
+      llmTraceCB?.writeLlmRequestEnd({
+        stepId: stepDraft.id,
+        purpose: 'element_resolve',
+        durationMs: 0,
+        success: false,
+        circuitOpen: true,
+        errorReason: 'circuit_breaker_open',
+      });
+    } catch { /* non-fatal */ }
 
     return {
       status: 'not_found',

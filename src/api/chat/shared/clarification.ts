@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
-import { ChatService } from '@/services/utils/chat.service';
+import { ChatPersistence } from '@/services/utils/chat-persistence';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 import { checkRequestAborted } from './request-cancellation';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatMessagePayload } from '@/websocket/types/types';
@@ -22,9 +23,20 @@ export async function handleClarificationRequest(
     chatSessionId?: string;
     abortSignal?: AbortSignal;
     mode?: 'lite' | 'pro' | 'editor';
+    /**
+     * Persistence backend. needs_clarification IS allowed in test-case
+     * scope (intent-parsing.ts whitelists it), so this handler MUST
+     * route saves through ChatPersistence — direct ChatService writes
+     * would crash on FK violation when chatSessionId belongs to
+     * test_case_chat_sessions instead of chat_sessions.
+     */
+    chatStore?: ChatStore;
+    /** Test-case scope marker (UUID). Used for WS dual-emit. */
+    testCaseId?: string;
   }
 ): Promise<void> {
-  const { parsedIntent, userId, chatSessionId, abortSignal, mode } = params;
+  const { parsedIntent, userId, chatSessionId, abortSignal, mode, testCaseId } = params;
+  const store: ChatStore = params.chatStore ?? GLOBAL_STORE;
 
   if (abortSignal) checkRequestAborted(abortSignal);
 
@@ -40,7 +52,11 @@ export async function handleClarificationRequest(
   // Save messages to chat history (with metadata for detection)
   const aiMessageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   if (chatSessionId) {
-    await ChatService.saveChatMessages(chatSessionId, [
+    // Through ChatPersistence so test-case sessions land in
+    // test_case_chat_messages (FK constraint would otherwise reject
+    // the row entirely — chatSessionId here would be a UUID from
+    // test_case_chat_sessions, not chat_sessions).
+    await ChatPersistence.saveMessages(store, chatSessionId, [
       { role: 'user', content: parsedIntent.rawText || 'No message', metadata: { mode: mode || 'lite' } },
       {
         role: 'ai',
@@ -82,7 +98,10 @@ export async function handleClarificationRequest(
         content: clarificationMessage,
         timestamp: new Date().toISOString(),
       };
-      webSocketService.emitChatMessage(chatSessionId, chatMessagePayload);
+      // Dual-emit: also reaches `chat:tc:<testCaseId>` room when in
+      // test-case scope, so the frontend (which subscribed before the
+      // session was created) sees the clarification question.
+      webSocketService.emitChatMessage(chatSessionId, chatMessagePayload, testCaseId);
       logger.debug('[CLARIFICATION] Sent clarification message via WebSocket', {
         chatSessionId,
         messageId: aiMessageId,

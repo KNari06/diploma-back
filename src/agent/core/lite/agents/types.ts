@@ -143,6 +143,25 @@ export interface ObserverOutput {
     reason: string;
   }>;
 
+  /**
+   * Widgets currently in an OPEN/ACTIVE state — Radix/shadcn dropdowns,
+   * dialogs, popovers, tabs, accordions whose `[STATE=open]` /
+   * `[EXPANDED]` / `[STATE=active]` markers indicate they are already
+   * showing content. Used by Strategist + Critic to detect "goal
+   * already done" or to avoid clicking a trigger that would CLOSE
+   * an already-open widget (canonical Radix toggle regression).
+   *
+   * `kind` is informational — observer can leave it 'unknown' if the
+   * widget type isn't obvious from markers alone.
+   */
+  openWidgets?: Array<{
+    ref: string;
+    /** What the widget likely is (best-effort from role/markers) */
+    kind: 'dialog' | 'menu' | 'popover' | 'tab' | 'accordion' | 'tooltip' | 'unknown';
+    /** Short human-readable label of the widget or its trigger */
+    label: string;
+  }>;
+
   /** LLM holistic page state analysis — overall blocking/loading assessment */
   pageStateAnalysis?: {
     /** Whether page is actively loading (skeleton, spinner, progress bar) */

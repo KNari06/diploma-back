@@ -19,6 +19,12 @@ import type { Page } from 'playwright';
 import type { LiteElement, LiteSnapshot, ObstacleFact } from '../lite-types';
 import { VisualStability } from './visual-stability';
 
+// April 2026: Module-level throttle map for [SNAPSHOT_REJECTS] logging.
+// Snapshot is collected every 500ms by recorder/preview, so per-tick logging
+// would be overwhelming. Logging once per ~30s per URL keeps the signal
+// useful for offline analysis without flooding app.log.
+const SNAPSHOT_REJECT_LOG_LAST = new Map<string, number>();
+
 export class SnapshotCollector {
   /**
    * Collect page snapshot with parent context
@@ -63,6 +69,19 @@ export class SnapshotCollector {
       // Collect snapshot in page context
       // @ts-expect-error - DOM types available in browser context
       const snapshot = await page.evaluate((__mc) => {
+        // V26: phase timings — surface where the in-page work actually
+        // goes. On dense pages (e.g. juz40 folders-control with 11k DOM
+        // nodes) total page.evaluate hits ~16s. Without per-phase numbers
+        // it's impossible to know if the bottleneck is querySelectorAll,
+        // the cursor:pointer walk, or the per-element forEach with
+        // getComputedStyle/getBoundingClientRect. Each phase records
+        // duration so debugStats can call it out.
+        const __t0 = performance.now();
+        let __tPrimary = 0;   // after collectFromRoot (querySelectorAll + shadow walk)
+        let __tDedupe = 0;    // after dedup
+        let __tSecondary = 0; // after Tier-2 framework + cursor:pointer walk
+        let __tForEach = 0;   // after main extract loop (with getComputedStyle/bbox)
+        let __tEnd = 0;       // just before return
         const elements: any[] = [];
         // Keep stable refs across snapshots to enable meaningful diffs.
         // Use monotonic counter stored on window to avoid reassigning refs every time.
@@ -836,6 +855,33 @@ export class SnapshotCollector {
          */
         const MAX_SECONDARY_ELEMENTS = 300; // Cap to prevent flooding from global scan (raised from 120 for large SPAs)
 
+        // April 2026: Tier-2 (framework + cursor:pointer walk) rejection counters.
+        // Most subtle losses happen here — wrappers without text, oversized
+        // containers, custom elements without size. We need data to know which
+        // condition is fired most often before relaxing it.
+        const __tier2Rejects = {
+          alreadyCollected: 0, // duplicate of primary pass
+          hidden: 0,           // display:none / visibility:hidden / opacity<0.1
+          tooSmall: 0,         // < 5×5
+          tooLarge: 0,         // > 600×600 (likely layout wrapper)
+          noFwBinding: 0,      // exhausted all framework checks + no cursor:pointer signal
+          capReached: 0,       // hit MAX_SECONDARY_ELEMENTS
+        };
+        const __tier2RejectSamples: Record<string, string[]> = {
+          alreadyCollected: [], hidden: [], tooSmall: [], tooLarge: [], noFwBinding: [], capReached: [],
+        };
+        const __pushTier2Sample = (bucket: string, el: Element) => {
+          const arr = __tier2RejectSamples[bucket];
+          if (!arr || arr.length >= 3) return;
+          try {
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            const id = el.getAttribute('id') || '';
+            const cls = (el.getAttribute('class') || '').slice(0, 40);
+            arr.push(`${tag}${role ? `[role=${role}]` : ''}${id ? `#${id.slice(0, 30)}` : ''}${cls ? `.${cls}` : ''}`);
+          } catch { /* ignore */ }
+        };
+
         const collectFrameworkInteractiveElements = (
           container: Element,
           alreadyCollected: Set<Element>,
@@ -846,25 +892,47 @@ export class SnapshotCollector {
           let added = 0;
           for (const el of candidates) {
             // Q2 FIX: Hard cap on secondary pass elements
-            if (added >= MAX_SECONDARY_ELEMENTS) break;
+            if (added >= MAX_SECONDARY_ELEMENTS) {
+              __tier2Rejects.capReached++;
+              break;
+            }
 
             // Q3 FIX: Skip the container element itself — it's a wrapper, not a clickable target
             if (el === container) continue;
 
             // Skip if already collected by primary pass
-            if (alreadyCollected.has(el)) continue;
+            if (alreadyCollected.has(el)) {
+              __tier2Rejects.alreadyCollected++;
+              continue;
+            }
 
             // Skip non-visible elements early
             const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') continue;
-            if (parseFloat(style.opacity) < 0.1) continue;
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              __tier2Rejects.hidden++;
+              __pushTier2Sample('hidden', el);
+              continue;
+            }
+            if (parseFloat(style.opacity) < 0.1) {
+              __tier2Rejects.hidden++;
+              __pushTier2Sample('hidden', el);
+              continue;
+            }
 
             // Skip elements too small to be interactive (lowered from 10 to catch icon buttons)
             const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) continue;
+            if (rect.width < 5 || rect.height < 5) {
+              __tier2Rejects.tooSmall++;
+              __pushTier2Sample('tooSmall', el);
+              continue;
+            }
 
             // Skip structural/container elements that are too large (likely wrappers, not clickables)
-            if (rect.width > 600 && rect.height > 600) continue;
+            if (rect.width > 600 && rect.height > 600) {
+              __tier2Rejects.tooLarge++;
+              __pushTier2Sample('tooLarge', el);
+              continue;
+            }
 
             // ── Tier 1: Framework event bindings (high confidence) ──
             let hasFrameworkBinding = false;
@@ -1020,15 +1088,53 @@ export class SnapshotCollector {
             // cursor:pointer + has text (≤200 chars) + not a large layout container
             if (!hasFrameworkBinding && style.cursor === 'pointer') {
               const totalText = (el.textContent || '').trim();
-              if (totalText.length > 0 && totalText.length < 200) {
-                // Reject large layout containers (nav, main, body, full-width sections)
-                const tag = el.tagName.toLowerCase();
-                const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
-                const rect = el.getBoundingClientRect();
-                const isFullWidth = rect.width > (window.innerWidth * 0.9);
-                if (!isLayoutContainer && !isFullWidth) {
-                  hasFrameworkBinding = true;
-                }
+              const tag = el.tagName.toLowerCase();
+              const isLayoutContainer = tag === 'body' || tag === 'html' || tag === 'main';
+              const rect = el.getBoundingClientRect();
+              const isFullWidth = rect.width > (window.innerWidth * 0.9);
+
+              // Icon-only interactive: <svg id="...">, <i id="...">, <img id="...">,
+              // <button><svg/></button>-style wrappers. They have no text but ARE
+              // clickable (recorder's probe captures them via cursor:pointer
+              // walk-up). Without surfacing them here the resolver's identity
+              // fast-path can never match the recorded id, so id-as-description
+              // steps fall through to the LLM and the LLM grabs the loudest
+              // neighbouring CTA — the canonical fake-success path on
+              // hub.atk.pro / Element Plus icon toolbars.
+              //
+              // Symmetric with the recorder: same stable-id filter, same
+              // testId attr list, same exclusion of full-width layout
+              // containers. We additionally accept text-bearing elements
+              // (the original branch) so this only widens the set, never
+              // narrows it.
+              const rawId = el.getAttribute('id') || '';
+              const idLooksGenerated = !!rawId && (
+                /^el-id-/i.test(rawId)
+                || /^radix-/.test(rawId)
+                || /^:r[0-9a-z]+:$/i.test(rawId)
+                || /^mui-/i.test(rawId)
+                || /^headlessui-/i.test(rawId)
+                || /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(rawId)
+              );
+              const hasStableId = !!rawId && !idLooksGenerated && rawId.length < 80;
+              const hasTestIdAttr = !!(el.getAttribute('data-testid')
+                || el.getAttribute('data-test-id')
+                || el.getAttribute('data-test')
+                || el.getAttribute('data-cy')
+                || el.getAttribute('data-qa'));
+              const hasText = totalText.length > 0 && totalText.length < 200;
+              const isIconish = tag === 'svg' || tag === 'i' || tag === 'img' || tag === 'path';
+              // Min-size gate: 5×5 enough to filter out invisible 0-size cursor-pointer
+              // wrappers, but small enough to keep typical 16-32px icons.
+              const hasSize = rect.width >= 5 && rect.height >= 5;
+
+              if (!isLayoutContainer && !isFullWidth && hasSize && (
+                hasText
+                || hasStableId
+                || hasTestIdAttr
+                || isIconish
+              )) {
+                hasFrameworkBinding = true;
               }
             }
 
@@ -1049,6 +1155,15 @@ export class SnapshotCollector {
               addedElements.add(el);
               elementShadowDepth.set(el, 0);
               added++;
+            } else {
+              // Element passed visibility/size but exhausted every framework
+              // signal (no React/Vue/Angular/Alpine/HTMX/Stimulus/jQuery
+              // hooks, no cursor:pointer with text/id/icon, no custom-tag
+              // shape). This is the bucket to watch: real losses live here
+              // (Web Components without text, role-less divs with delegated
+              // listeners on document, etc.).
+              __tier2Rejects.noFwBinding++;
+              __pushTier2Sample('noFwBinding', el);
             }
           }
           return addedElements;
@@ -1118,6 +1233,7 @@ export class SnapshotCollector {
         // Collect all elements starting from document (depth 0)
         const allElements: Element[] = [];
         collectFromRoot(document, allElements, 0);
+        __tPrimary = performance.now();
 
         // Deduplicate (element might be collected multiple times)
         const seenElements = new Set<Element>();
@@ -1126,6 +1242,7 @@ export class SnapshotCollector {
           seenElements.add(el);
           return true;
         });
+        __tDedupe = performance.now();
 
         // activeModalElement is already computed above via detectActiveModal + activeModalRef.
 
@@ -1143,6 +1260,155 @@ export class SnapshotCollector {
               uniqueElements
             )
           : new Set<Element>();
+        __tSecondary = performance.now();
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // V26 #A: Page-level overlay detection — decide ONCE if hit-testing
+        // is needed at all. The forEach below was calling
+        // `document.elementFromPoint()` for every in-viewport candidate
+        // (~80% × 500 = 400 calls × 5-15ms each = 2-6s on dense pages).
+        // Real purpose of hit-test: detect "covered by something" — modal,
+        // sticky header, dropdown, toast. On a calm page with NO such layer
+        // every in-viewport candidate IS topmost by definition.
+        //
+        // Gate the call once on three signals:
+        //   1. Active or fallback modal already detected (existing state)
+        //   2. Any positioned overlay-like element (obstacleFacts already
+        //      collected these with z-index + size threshold)
+        //   3. Any open popover (role=menu/tooltip/listbox visible, or
+        //      element with aria-expanded=true present somewhere)
+        //
+        // When ALL three say no → fast-path: hit-test skipped, candidate is
+        // marked topmost (true). When ANY says yes → existing per-element
+        // hit-test logic runs unchanged. False positives ("we thought no
+        // overlay but there is one") are caught downstream by the
+        // fake-success guard in preview-step-apply.
+        const __hasModal = !!(activeModalElement || fallbackModalElement);
+        const __hasObstacles = obstacleFacts.length > 0;
+        // V26 #A: obstacleFacts has a z-index>=1 + coverage filter, so it
+        // misses sticky/fixed elements WITHOUT explicit z-index (e.g. plain
+        // <header style="position:sticky;top:0">). Catch THESE via inline
+        // style attribute — that targets exactly hand-coded positioned
+        // wrappers without picking up every body child like the broader
+        // POSITIONAL_CANDIDATES_SELECTOR does.
+        //
+        // Trade-off: doesn't catch positioned elements set via stylesheet
+        // (no inline style attr). But those are typically component-library
+        // elements which DO have role / aria-expanded / class hooks → the
+        // OTHER signals (obstacles via z-index, open-popover via ARIA)
+        // pick them up. The narrow inline-style check just catches the
+        // common "raw HTML sticky header" case without false-positive
+        // every page.
+        let __hasInlinePositioned = false;
+        try {
+          __hasInlinePositioned = !!document.querySelector(
+            '[style*="position:fixed"], [style*="position: fixed"], [style*="position:sticky"], [style*="position: sticky"]'
+          );
+        } catch { __hasInlinePositioned = true; }
+        let __hasOpenPopover = false;
+        try {
+          // querySelectorAll('[aria-expanded="true"]') is cheap (string match,
+          // no layout). Same for [role=menu/tooltip/listbox]. We don't need
+          // visibility validation here — the per-element style/visibility
+          // checks below will catch hidden ones during forEach.
+          __hasOpenPopover = !!document.querySelector(
+            '[role="menu"]:not([hidden]), [role="tooltip"]:not([hidden]), [role="listbox"]:not([hidden]), [aria-expanded="true"]'
+          );
+        } catch { /* querySelector throwing is fine — assume worst case */ __hasOpenPopover = true; }
+        const __hitTestNeeded = __hasModal || __hasObstacles || __hasOpenPopover || __hasInlinePositioned;
+        let __hitTestSkippedCount = 0;
+        let __hitTestRunCount = 0;
+
+        // V26 #B: Framework-presence gates. Each framework-specific extraction
+        // (mat-icon walk, Bootstrap data-bs-* walk-up) was running on EVERY
+        // candidate × 500 — even when the page has zero Material / Bootstrap
+        // DNA. One querySelector per framework here costs ~0.5ms total and
+        // gates 200-500ms of per-element work later. False negatives (gate
+        // misses framework that IS on page) → behaviour reverts to current
+        // for that framework only; other gates unaffected.
+        const __frameworkGates = {
+          // Angular Material — has <mat-*> tags or Material class prefix
+          hasMaterial: !!(
+            document.querySelector('mat-icon')
+            || document.querySelector('[class^="mat-"]')
+            || document.querySelector('[class*=" mat-"]')
+          ),
+          // Bootstrap — data-bs-* (5+) or legacy data-toggle (4-)
+          hasBootstrap: !!(
+            document.querySelector('[data-bs-toggle]')
+            || document.querySelector('[data-bs-target]')
+            || document.querySelector('[data-toggle]')
+          ),
+        };
+
+        // V26 #C: Batch reads — collect getComputedStyle + getBoundingClientRect
+        // for every candidate in ONE tight pre-pass loop. Browsers batch
+        // adjacent layout reads under one synchronous reflow when no DOM
+        // mutations occur between them. Doing this BEFORE the main forEach
+        // means we pay ONE reflow for the whole pass instead of 500.
+        //
+        // The forEach below reads from `__cached[i]` instead of calling
+        // window.getComputedStyle(el) / el.getBoundingClientRect() per
+        // iteration — those calls trigger fresh layouts when interleaved
+        // with DOM reads from other branches (closest, querySelector, etc.).
+        //
+        // Critical: this loop must be PURE READ. No setAttribute, no DOM
+        // mutation. Otherwise the batching guarantee breaks. ref-writes
+        // happen inside forEach later (after all reads landed).
+        // @ts-expect-error - window available in browser context
+        const __vw = window.innerWidth;
+        // @ts-expect-error - window available in browser context
+        const __vh = window.innerHeight;
+        // Cached style snapshot is a plain object (NOT live CSSStyleDeclaration).
+        // Live wrapper would re-trigger layout if something between pre-pass
+        // and forEach mutated the page (rare here — we don't await — but a
+        // hypothetical CSS rule keyed on data-agent-ref would invalidate
+        // stylesets on every setAttribute we do later). Copying values once
+        // up-front guarantees forEach is layout-free.
+        type __StyleSnapshot = {
+          display: string;
+          visibility: string;
+          opacity: string;
+          pointerEvents: string;
+          cursor: string;
+          position: string;
+          zIndex: string;
+          // V8 visual properties (consumed in elements.push downstream)
+          backgroundColor: string;
+          color: string;
+          borderRadius: string;
+        };
+        const __cached: Array<{
+          style: __StyleSnapshot;
+          rect: DOMRect;
+        } | null> = new Array(uniqueElements.length);
+        const __tCacheStart = performance.now();
+        for (let __i = 0; __i < uniqueElements.length; __i++) {
+          const __el = uniqueElements[__i];
+          try {
+            // @ts-expect-error - window available in browser context
+            const __live = window.getComputedStyle(__el);
+            __cached[__i] = {
+              style: {
+                display: __live.display,
+                visibility: __live.visibility,
+                opacity: __live.opacity,
+                pointerEvents: __live.pointerEvents,
+                cursor: __live.cursor,
+                position: __live.position,
+                zIndex: __live.zIndex,
+                backgroundColor: __live.backgroundColor,
+                color: __live.color,
+                borderRadius: __live.borderRadius,
+              },
+              rect: __el.getBoundingClientRect(),
+            };
+          } catch {
+            // detached / dead element — forEach checks for null and skips
+            __cached[__i] = null;
+          }
+        }
+        const __cacheMs = Math.round(performance.now() - __tCacheStart);
 
         // ✅ FIX BUG 5: Track refs used in THIS snapshot pass to prevent duplicates
         // When two elements produce the same fingerprint (e.g. repeated UI cards),
@@ -1150,13 +1416,69 @@ export class SnapshotCollector {
         // This set ensures every element gets a unique ref in each collection pass.
         const usedRefsThisPass = new Set<string>();
 
-        // Process each unique element (including shadow DOM elements)
-        uniqueElements.forEach((el: Element) => {
+        // Track per-element exceptions during the forEach pass. Without this,
+        // a regression like the April 2026 `tagLower` ReferenceError silently
+        // drops every element while debugStats shows uniqueCount=300+ but
+        // elementsAfterFilter=0 — looks identical to "page is genuinely empty".
+        // Recording the first ~3 messages lets us tell those cases apart.
+        const __forEachErrors: string[] = [];
+        let __forEachSkipCount = 0;
+
+        // April 2026: Per-rule rejection counters for the main forEach pass.
+        // Lets us answer "what's getting filtered out and why" without re-running
+        // with custom logging. Counters are cheap (just integers); sample rejects
+        // are tag/role snippets to spot patterns (e.g. all Web Components dropped
+        // by aria-hidden, or all svg dropped by min-size). Capped at 3 each to
+        // avoid bloating debugStats payload.
+        const __mainRejects = {
+          hidden: 0,         // display:none / visibility:hidden
+          opacity: 0,        // opacity < 0.01
+          ariaHidden: 0,     // inside non-root aria-hidden subtree
+          pointerEvents: 0,  // pointer-events:none
+          tooSmall: 0,       // < 5×5
+          offViewport: 0,    // outside visible viewport
+        };
+        const __mainRejectSamples: Record<string, string[]> = {
+          hidden: [], opacity: [], ariaHidden: [], pointerEvents: [], tooSmall: [], offViewport: [],
+        };
+        const __pushRejectSample = (bucket: string, el: Element) => {
+          const arr = __mainRejectSamples[bucket];
+          if (!arr || arr.length >= 3) return;
           try {
+            const tag = el.tagName.toLowerCase();
+            const role = el.getAttribute('role') || '';
+            const id = el.getAttribute('id') || '';
+            const cls = (el.getAttribute('class') || '').slice(0, 40);
+            arr.push(`${tag}${role ? `[role=${role}]` : ''}${id ? `#${id.slice(0, 30)}` : ''}${cls ? `.${cls}` : ''}`);
+          } catch { /* ignore */ }
+        };
+
+        // Process each unique element (including shadow DOM elements)
+        // V26 #C: forEach now reads style/rect from `__cached[__idx]` —
+        // the per-element pre-pass above paid ONE reflow for the whole
+        // batch. Per-element calls would re-trigger layout when interleaved
+        // with DOM walks (closest, parentElement, etc.) elsewhere.
+        uniqueElements.forEach((el: Element, __idx: number) => {
+          try {
+            const __c = __cached[__idx];
+            if (!__c) {
+              // Element was detached between collectFromRoot and pre-pass;
+              // treat as hidden so downstream sees consistent state.
+              __mainRejects.hidden++;
+              return;
+            }
+            const style = __c.style;
             // Skip hidden elements
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden') return;
-            if (parseFloat(style.opacity) < 0.01) return; // 0.01 instead of 0.1: catch fade-in animations
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              __mainRejects.hidden++;
+              __pushRejectSample('hidden', el);
+              return;
+            }
+            if (parseFloat(style.opacity) < 0.01) { // 0.01 instead of 0.1: catch fade-in animations
+              __mainRejects.opacity++;
+              __pushRejectSample('opacity', el);
+              return;
+            }
             // Skip elements inside aria-hidden containers (not accessible to users).
             // ✅ FIX: Many React/Vue apps set aria-hidden="true" on #root when a modal opens.
             // Elements inside active modal, visible dialog, or fallback modal are always kept.
@@ -1179,27 +1501,45 @@ export class SnapshotCollector {
                    Element passed visibility checks above (not display:none, not visibility:hidden).
                    Let it through — downstream buildAllowedSets soft-penalty + LLM will handle. */
               } else {
+                __mainRejects.ariaHidden++;
+                __pushRejectSample('ariaHidden', el);
                 return; // Lower-level aria-hidden — genuinely hidden block
               }
             }
             // Skip non-interactive elements (pointer-events:none = can't be clicked)
-            if (style.pointerEvents === 'none') return;
+            if (style.pointerEvents === 'none') {
+              __mainRejects.pointerEvents++;
+              __pushRejectSample('pointerEvents', el);
+              return;
+            }
 
-            // Skip if too small
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) return;
+            // Skip if too small (V26 #C: rect from pre-pass cache)
+            const rect = __c.rect;
+            if (rect.width < 5 || rect.height < 5) {
+              __mainRejects.tooSmall++;
+              __pushRejectSample('tooSmall', el);
+              return;
+            }
 
             // Skip elements that are fully outside the visible viewport
-            // @ts-expect-error - window available in browser context
-            const vw = window.innerWidth;
-            // @ts-expect-error - window available in browser context
-            const vh = window.innerHeight;
+            // V26 #C: viewport already captured in pre-pass — saves 2 window
+            // accesses per element (cheap, but adds up at 500 iterations).
+            const vw = __vw;
+            const vh = __vh;
             if (__mc.fullPage) {
               // fullPage: skip only horizontally off-screen elements
-              if (rect.right < 0 || rect.left > vw) return;
+              if (rect.right < 0 || rect.left > vw) {
+                __mainRejects.offViewport++;
+                __pushRejectSample('offViewport', el);
+                return;
+              }
             } else {
               // default: skip everything outside viewport
-              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) return;
+              if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+                __mainRejects.offViewport++;
+                __pushRejectSample('offViewport', el);
+                return;
+              }
             }
 
             // ═══════════════════════════════════════════════════════════════
@@ -1233,30 +1573,43 @@ export class SnapshotCollector {
             // legitimate interactive elements to be lost from the snapshot entirely.
             const cx = rect.left + rect.width / 2;
             const cy = rect.top + rect.height / 2;
-            // @ts-expect-error - window available in browser context
-            const inVp = cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight;
+            // V26 #C: use cached viewport (avoid window.innerWidth read here too)
+            const inVp = cx >= 0 && cx <= __vw && cy >= 0 && cy <= __vh;
             let hitTestTopEl: Element | null = null;
             let hitTestDone = false;
             if (inVp) {
-              try {
-                hitTestTopEl = document.elementFromPoint(cx, cy);
+              if (!__hitTestNeeded) {
+                // V26 #A fast-path: page has no modal, no positioned
+                // overlays, no open popover → an in-viewport element is
+                // topmost at its center BY DEFINITION. Skip the
+                // ~5-15ms force-layout call. We mark hitTestDone=true
+                // and treat self as the hit so downstream
+                // isTopMostAtCenter computes to `true`.
+                hitTestTopEl = el;
                 hitTestDone = true;
-                if (hitTestTopEl && hitTestTopEl !== el && !el.contains(hitTestTopEl) && !hitTestTopEl.contains(el)) {
-                  // For shadow DOM elements, elementFromPoint returns the shadow host
-                  // which won't match ancestor/descendant checks above.
-                  // Check if the hit element is the shadow host that contains our element.
-                  const elRoot = el.getRootNode();
-                  const isShadowHostMatch = elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl;
+                __hitTestSkippedCount++;
+              } else {
+                try {
+                  hitTestTopEl = document.elementFromPoint(cx, cy);
+                  hitTestDone = true;
+                  __hitTestRunCount++;
+                  if (hitTestTopEl && hitTestTopEl !== el && !el.contains(hitTestTopEl) && !hitTestTopEl.contains(el)) {
+                    // For shadow DOM elements, elementFromPoint returns the shadow host
+                    // which won't match ancestor/descendant checks above.
+                    // Check if the hit element is the shadow host that contains our element.
+                    const elRoot = el.getRootNode();
+                    const isShadowHostMatch = elRoot instanceof ShadowRoot && elRoot.host === hitTestTopEl;
 
-                  // ✅ FIX: Don't filter out elements that are inside the active modal/popup.
-                  // Also check if the hit element itself is inside the same modal (sibling layers within popup).
-                  const hitIsInsideSameModal = isInsideModal && activeModalElement && activeModalElement.contains(hitTestTopEl);
+                    // ✅ FIX: Don't filter out elements that are inside the active modal/popup.
+                    // Also check if the hit element itself is inside the same modal (sibling layers within popup).
+                    const hitIsInsideSameModal = isInsideModal && activeModalElement && activeModalElement.contains(hitTestTopEl);
 
-                  // Don't return — let element continue with isTopMostAtCenter=false.
-                  // buildAllowedSets handles soft penalty (no modal) / hard exclude (modal present).
+                    // Don't return — let element continue with isTopMostAtCenter=false.
+                    // buildAllowedSets handles soft penalty (no modal) / hard exclude (modal present).
+                  }
+                } catch {
+                  // elementFromPoint can fail in edge cases — don't skip
                 }
-              } catch {
-                // elementFromPoint can fail in edge cases — don't skip
               }
             }
 
@@ -1378,6 +1731,16 @@ export class SnapshotCollector {
               ? ariaCurrentRaw
               : undefined;
 
+            // Radix/shadcn/Vaul/headless: data-state="open|closed|active|...".
+            // PURE ADDITIVE — undefined when attribute missing. Length-cap
+            // 30 chars (Radix values are short keywords, anything longer
+            // is pathological JSON or accidental). Trim whitespace only;
+            // do NOT lowercase — some libs use camelCase ("forceMount").
+            const dataStateRaw = getCleanAttr(el, 'data-state');
+            const dataState = dataStateRaw && dataStateRaw.length > 0 && dataStateRaw.length < 30
+              ? dataStateRaw
+              : undefined;
+
             // V22 Pkg1: aria-valuenow / aria-valuetext (slider/spinbutton/progress)
             const ariaValueNowRaw = getCleanAttr(el, 'aria-valuenow');
             let ariaValueNow: number | undefined;
@@ -1451,9 +1814,10 @@ export class SnapshotCollector {
 
             // V22 Pkg2: Bootstrap markers walked up to 3 ancestors —
             // toggle/target may sit on a wrapper, not on the trigger itself.
+            // V26 #B: skip walk entirely when page has no Bootstrap DNA.
             let bsToggle: string | undefined;
             let bsTarget: string | undefined;
-            {
+            if (__frameworkGates.hasBootstrap) {
               let bsW: Element | null = el;
               for (let bi = 0; bi < 3 && bsW; bi++) {
                 if (!bsToggle) {
@@ -1491,10 +1855,10 @@ export class SnapshotCollector {
               try {
                 // V22 Audit-fix H1: must use `window.getComputedStyle` in
                 // browser context. The earlier `globalThis.getComputedStyle`
-                // works in Node-with-jsdom test envs but is undefined in
-                // some embedded Chromium contexts (Playwright headed mode).
-                // @ts-expect-error - window available in page.evaluate scope
-                const trCursor = window.getComputedStyle(el).cursor;
+                // V26 #C: reuse cached style — same instance the
+                // pre-pass populated. Saves one extra getComputedStyle
+                // call per <tr> element.
+                const trCursor = style.cursor;
                 const trClass = el.getAttribute('class') || '';
                 const hoverishClass = /\b(hover|clickable|MuiTableRow-hover|ant-table-row|el-table__row|row-clickable)\b/i.test(trClass);
                 if (trCursor === 'pointer' || hoverishClass) rowClickable = true;
@@ -1614,6 +1978,124 @@ export class SnapshotCollector {
             const titleAttr = el.getAttribute('title') || undefined;
             const labelText = getLabelText(el);
 
+            // V23: <input type="submit|button|reset" value="..."> — value IS
+            // the visible button label per HTML spec. Collector deliberately
+            // strips `input.value` for security (passwords, emails, etc.),
+            // but for these three types value carries no PII — it's a label
+            // baked into the markup. Without this, legacy forms (gov sites,
+            // banking, legacy admin panels) lose their primary identity.
+            // Strict gate: type ∈ {submit,button,reset} only.
+            let submitButtonLabel: string | undefined;
+            if (isInput) {
+              const inputType = (input.type || '').toLowerCase();
+              if (inputType === 'submit' || inputType === 'button' || inputType === 'reset') {
+                const v = (input.value || '').trim();
+                if (v.length > 0 && v.length <= 100) {
+                  submitButtonLabel = v;
+                }
+              }
+            }
+
+            // Identity fast-path requires the live DOM id / testId / name on
+            // every InteractiveNode so the resolver can match against the
+            // recorder's TargetFingerprint without an LLM call. Without this,
+            // a step like click '<svg id="layout-header-setting">' falls
+            // through to the LLM, which has no idea what the slug means and
+            // grabs the loudest neighbouring CTA — the canonical
+            // fake-success path. We mirror the same framework-id filter the
+            // recorder uses so generated ids (Element Plus el-id-XXXX,
+            // Radix radix-:rXX:, useId :r1:) don't poison the fast-path.
+            const liveRawId = el.getAttribute('id') || '';
+            const liveLooksGenerated = !!liveRawId && (
+              /^el-id-/i.test(liveRawId) ||
+              /^radix-/.test(liveRawId) ||
+              /^:r[0-9a-z]+:$/i.test(liveRawId) ||
+              /^mui-/i.test(liveRawId) ||
+              /^headlessui-/i.test(liveRawId) ||
+              /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(liveRawId)
+            );
+            const liveStableId = (liveRawId && !liveLooksGenerated && liveRawId.length < 80)
+              ? liveRawId
+              : undefined;
+            const liveTestId = el.getAttribute('data-testid')
+              || el.getAttribute('data-test-id')
+              || el.getAttribute('data-test')
+              || el.getAttribute('data-cy')
+              || el.getAttribute('data-qa')
+              || el.getAttribute('data-test-element')
+              || el.getAttribute('data-track')
+              || undefined;
+
+            // Angular Material icon registry name. Mirrors the recorder
+            // probe: read from target if it IS <mat-icon>, else closest
+            // <mat-icon> ancestor. Cap at 60 chars (defensive — values
+            // are short identifier strings like "chevron-left-outline").
+            // Symmetric with recorder so identity fast-path on svgIcon
+            // can match recorded ↔ live without normalization drift.
+            //
+            // V26 #B: gate on page-level Material detection. closest('mat-icon')
+            // + querySelector('mat-icon') were running on every node × 500
+            // even on plain HTML / React / Vue pages. Material absent → both
+            // calls return null but each costs DOM walk time. Skipping saves
+            // ~500ms-1s on non-Material pages.
+            let liveSvgIcon: string | undefined;
+            if (__frameworkGates.hasMaterial) {
+              try {
+                // V23: search both directions for `<mat-icon>` carrying svgicon —
+                // self, then ancestors (icon-only Material buttons where the
+                // <mat-icon> IS the clickable target), then descendants (Angular
+                // apps where <button>/<a>/<app-excel-btn> wrap the icon —
+                // common pattern: `<button>...<mat-icon svgicon="excel">`).
+                // Without descendant-search, descriptor-poor wrapper buttons
+                // like `<app-excel-btn>` lose svgIcon entirely and the resolver
+                // falls through to LLM with no identity hint.
+                const matIconHost = el.tagName.toLowerCase() === 'mat-icon'
+                  ? el
+                  : (el.closest ? el.closest('mat-icon') : null)
+                  || (el.querySelector ? el.querySelector('mat-icon') : null);
+                if (matIconHost) {
+                  const rawSvgIcon = matIconHost.getAttribute('svgicon')
+                    || matIconHost.getAttribute('data-mat-icon-name')
+                    || '';
+                  if (rawSvgIcon && rawSvgIcon.length > 0 && rawSvgIcon.length <= 60) {
+                    liveSvgIcon = rawSvgIcon;
+                  }
+                }
+              } catch { /* best-effort — non-Material apps will simply leave it undefined */ }
+            }
+
+            // Closest semantic custom-element ancestor. Mirrors recorder
+            // probe — same filter rules, same depth (6 levels) so the
+            // recorded fingerprint and the live snapshot agree on which
+            // wrapper "owns" the button. Without this symmetry an Angular
+            // app's `<app-notifications-button>` would land in the
+            // recorded fingerprint but the live node wouldn't carry it,
+            // identity fast-path would miss, and we'd fall to LLM (which
+            // is the bug this whole feature is closing).
+            let liveCustomElementTag: string | undefined;
+            try {
+              let ceWalk: Element | null = el;
+              for (let cwi = 0; cwi < 6 && ceWalk && ceWalk !== document.body; cwi++) {
+                const ceTag = (ceWalk.tagName || '').toLowerCase();
+                if (ceTag.indexOf('-') >= 0
+                  && ceTag.length >= 5
+                  && ceTag.length <= 60
+                  && !/^(?:app|ng|ion|sl|stencil)-c\d+$/.test(ceTag)
+                  && ceTag !== 'router-outlet'
+                  && ceTag !== 'ng-component'
+                  && ceTag !== 'mat-icon'
+                  && ceTag !== 'mat-menu'
+                  && ceTag !== 'mat-select'
+                  && ceTag !== 'mat-form-field'
+                  && ceWalk !== el
+                ) {
+                  liveCustomElementTag = ceTag;
+                  break;
+                }
+                ceWalk = ceWalk.parentElement;
+              }
+            } catch { /* best-effort */ }
+
             // Detect icon-only buttons/links: element has child SVG/img but no visible text.
             // Covers: <button>, <a>, any element with role="button", and clickable
             // div/span wrappers common in React/Vue/Angular component libraries.
@@ -1717,7 +2199,95 @@ export class SnapshotCollector {
                       const name = (suffixed?.[1] || suffixed?.[2] || '').toLowerCase().trim();
                       if (name.length > 0 && name.length <= 50 && name !== 'icon') iconChildLabel = name;
                     }
+                    // V23: company-style namespaced classes — `dg_uikit_arrowDropDown_000000wqx84w`,
+                    // `app_HeaderButton_a8f3b2`, `mui_StyledIcon_xyz123`. Format:
+                    //   <namespace>_<CamelOrSnakeName>_<hash>
+                    // Extract the CamelCase middle segment as the icon's semantic
+                    // name. Skip when middle is generic ("root", "wrapper", "container",
+                    // "content", "label", "box", "inner") — those are layout primitives,
+                    // not identity. Lowercased to align with other icon-name fields.
+                    if (!iconChildLabel) {
+                      // Match: prefix_MidSegment_hash where:
+                      //   - prefix: 2+ letters, NO digits (rejects `jss123_X_Y`,
+                      //     `sc-Abc_Y_Z` styled-components hash that already
+                      //     fails the broader skipRx but be defensive).
+                      //   - MidSegment: starts with letter, 3-40 chars, with at
+                      //     least one CamelCase boundary OR an underscore inside
+                      //     ('arrowDropDown' or 'arrow_drop_down') — reduces false
+                      //     positives on simple words ('button', 'icon') that
+                      //     could collide with layout primitives.
+                      //   - hash: 5+ lowercase alphanumeric trailing (the random
+                      //     suffix that namespaced libraries emit per build).
+                      const namespaced = classStr.match(/\b([a-z]{2,})_([A-Za-z][A-Za-z0-9_]{2,40})_[a-z0-9]{5,}\b/);
+                      const namespacePrefix = namespaced?.[1];
+                      const midSegment = namespaced?.[2];
+                      const hasCamelOrSnake = midSegment
+                        ? /[A-Z]/.test(midSegment) || /_/.test(midSegment)
+                        : false;
+                      // Skip when the prefix LOOKS like a generic CSS hash
+                      // generator (jss/sc/css/makeStyles/emotion) — those names
+                      // don't correspond to product semantics.
+                      const genericPrefixRx = /^(jss|sc|css|emotion|makeStyles|styled)$/i;
+                      if (
+                        midSegment
+                        && namespacePrefix
+                        && !genericPrefixRx.test(namespacePrefix)
+                        && hasCamelOrSnake
+                      ) {
+                        // skip layout primitives that don't identify the element
+                        const layoutSkipRx = /^(root|wrapper|container|content|label|box|inner|outer|main|body|header|footer|sidebar|panel|section)$/i;
+                        if (!layoutSkipRx.test(midSegment)) {
+                          // CamelCase → space-separated lowercase; works for snake_case too.
+                          const name = midSegment
+                            .replace(/([a-z])([A-Z])/g, '$1 $2')
+                            .replace(/_/g, ' ')
+                            .toLowerCase()
+                            .trim();
+                          if (name.length >= 3 && name.length <= 50) iconChildLabel = name;
+                        }
+                      }
+                    }
                   }
+                }
+                // Last-resort: <img src=".../filename.svg"> filename. Catches
+                // file-type icons (pdf.svg, doc.svg, image.svg) on LMS /
+                // file managers and arrow/chevron icons on legacy sites
+                // where the only identity left is the asset filename. Two
+                // hard guards so we don't poison candidates with garbage:
+                //   1. Filename must be a slug-shaped word (lowercase
+                //      letters, digits, dashes/underscores) — rejects
+                //      hash names like "a8f3b2c1d4e5.svg".
+                //   2. Length 2..30 — rejects empty stems and UUID-ish.
+                // Looks at the host element first (case where <img> itself
+                // IS the candidate via cursor:pointer) and falls back to a
+                // direct <img> child. Mirrors recorder probe to keep
+                // recorded fingerprint and live snapshot in sync.
+                if (!iconChildLabel) {
+                  try {
+                    const imgEl = (el.tagName.toLowerCase() === 'img'
+                      ? (el as HTMLImageElement)
+                      : el.querySelector('img[src]') as HTMLImageElement | null);
+                    if (imgEl) {
+                      const src = (imgEl.getAttribute('src') || '').trim();
+                      if (src && src.indexOf('data:') !== 0) {
+                        // Strip query/hash, take last path segment, drop extension.
+                        const cleanPath = src.split('?')[0].split('#')[0];
+                        const file = (cleanPath.split('/').pop() || '').toLowerCase();
+                        const m = file.match(/^([a-z][a-z0-9_-]{1,29})\.(?:svg|png|jpe?g|webp|gif|ico)$/);
+                        if (m && m[1]) {
+                          const stem = m[1];
+                          // Reject hex / digit-heavy stems (asset hashes,
+                          // upload UUIDs that snuck past the slug shape).
+                          // Threshold: >=4 digits OR >=8 hex-only chars.
+                          const digitCount = (stem.match(/\d/g) || []).length;
+                          const looksHashed = digitCount >= 4 || /^[a-f0-9]{8,}$/.test(stem);
+                          if (!looksHashed) {
+                            iconChildLabel = stem.replace(/[-_]/g, ' ').trim();
+                          }
+                        }
+                      }
+                    }
+                  } catch { /* best-effort */ }
                 }
               } catch { /* ignore */ }
             }
@@ -1748,13 +2318,104 @@ export class SnapshotCollector {
               }
             };
 
+            /**
+             * V26: Extract the FIRST meaningful text fragment as a single
+             * DOM unit (not concatenation of multiple children).
+             *
+             * Why a separate field, not just `text.split('•')[0]`:
+             *   - works for ANY separator the page chose (newline, em-dash,
+             *     middle-dot, pipe, no separator at all just structural)
+             *   - matches what `page.getByText(...)` actually requires:
+             *     a single Text node OR a single element with that text
+             *   - survives wrappers: `<a><h3>МАТ-SMART</h3><span>desc</span></a>`
+             *     has firstTextFragment = "МАТ-SMART", regardless of how
+             *     the wrapping changes
+             *
+             * Algorithm: depth-first, skip Comment + decorative leaves
+             * (img/svg/i/picture without text), accept first child whose
+             * own innerText is non-empty AND short enough (≤80 chars to
+             * skip "this is the entire card description as one node").
+             */
+            const extractFirstTextFragment = (node: Element): string | undefined => {
+              try {
+                const TEXT_NODE = 3;
+                const ELEMENT_NODE = 1;
+                const MAX_LEN = 80;
+                const DECORATIVE = new Set(['img', 'svg', 'i', 'picture', 'use', 'path', 'br', 'hr']);
+
+                // 1) Direct text-node child first — fastest path, also the
+                //    only correct answer for `<a>Hello <span>world</span></a>`
+                //    where "Hello" is the leaf-most identity-bearing token.
+                for (let ci = 0; ci < node.childNodes.length; ci++) {
+                  const ch = node.childNodes[ci];
+                  if (ch.nodeType === TEXT_NODE) {
+                    const t = (ch.nodeValue || '').replace(/\s+/g, ' ').trim();
+                    if (t.length >= 2 && t.length <= MAX_LEN) return t;
+                  }
+                }
+
+                // 2) Then walk element children depth-first looking for a
+                //    leaf with a short visible string. We bail out as soon
+                //    as we find one — caller wants ONE representative
+                //    fragment, not a synthesis.
+                const stack: Element[] = [];
+                for (let ci = node.childNodes.length - 1; ci >= 0; ci--) {
+                  const ch = node.childNodes[ci];
+                  if (ch.nodeType === ELEMENT_NODE) stack.push(ch as Element);
+                }
+                let visited = 0;
+                while (stack.length > 0 && visited < 30) {
+                  visited++;
+                  const cur = stack.pop()!;
+                  const tagLc = (cur.tagName || '').toLowerCase();
+                  if (DECORATIVE.has(tagLc)) continue;
+                  // Direct text under this child? Take it.
+                  for (let cci = 0; cci < cur.childNodes.length; cci++) {
+                    const cch = cur.childNodes[cci];
+                    if (cch.nodeType === TEXT_NODE) {
+                      const t = (cch.nodeValue || '').replace(/\s+/g, ' ').trim();
+                      if (t.length >= 2 && t.length <= MAX_LEN) return t;
+                    }
+                  }
+                  // No direct text — push this child's element children
+                  // for further descent. Reverse-order push keeps DFS in
+                  // visual order (first child explored first).
+                  for (let cci = cur.childNodes.length - 1; cci >= 0; cci--) {
+                    const cch = cur.childNodes[cci];
+                    if (cch.nodeType === ELEMENT_NODE) stack.push(cch as Element);
+                  }
+                }
+              } catch { /* best-effort */ }
+              return undefined;
+            };
+
+            // V26: Compute firstTextFragment ONCE here so we can also
+            // compare against full readable text below — no point storing
+            // it when it equals the full text (that path has no fix to
+            // offer over `name` / `text`).
+            const v26FullReadable = getReadableElementText(el);
+            const v26FirstFragment = extractFirstTextFragment(el);
+            const v26FirstFragmentToStore =
+              (v26FirstFragment && v26FirstFragment.length >= 2
+                && v26FirstFragment !== v26FullReadable
+                && v26FirstFragment !== v26FullReadable.slice(0, v26FirstFragment.length))
+                ? v26FirstFragment
+                : undefined;
+
             elements.push({
               ref,
               role: (el.getAttribute('role') || el.tagName.toLowerCase()).replace(/["']/g, '').trim(),
               name: ariaLabel ||
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
-                getReadableElementText(el).slice(0, 50) || '',
+                v26FullReadable.slice(0, 50) || '',
+              firstTextFragment: v26FirstFragmentToStore,
+              // Identity fields — populated for the resolver's identity
+              // fast-path. Read from the live DOM, NOT computed from labels,
+              // so they line up byte-for-byte with TargetFingerprint values
+              // captured at recording time.
+              id: liveStableId,
+              testIdAttr: liveTestId,
               tag: el.tagName.toLowerCase(),
               type: isInput ? input.type : undefined,
               // SECURITY: Never include raw input values in snapshots.
@@ -1798,6 +2459,8 @@ export class SnapshotCollector {
               ariaChecked,
               // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state
               ariaCurrent,
+              // Radix/shadcn/Vaul data-state — undefined when absent.
+              dataState,
               ariaValueNow,
               ariaValueText,
               // V22 Pkg1: Select option semantic key + IconButton child testid lift
@@ -1815,6 +2478,18 @@ export class SnapshotCollector {
               siblingIndex,
               disabled: disabledLive,
               arrowDir: arrowDirLive,
+              // Etap 1B.2 — Angular routerLink + formControlName. Symmetry
+              // contract with PROBE_AT_POINT_FN (recording-capture.service.ts)
+              // — both sides must read these the same way or the resolver
+              // fingerprint mismatches at replay.
+              routerLink: (function () {
+                const v = el.getAttribute('routerlink');
+                return v && v.length > 0 && v.length < 200 ? v.slice(0, 100) : undefined;
+              })(),
+              formControlName: (function () {
+                const v = el.getAttribute('formcontrolname');
+                return v && v.length > 0 && v.length < 80 ? v.slice(0, 60) : undefined;
+              })(),
               // Validation state
               required: required || undefined,
               readOnly: readOnly || undefined,
@@ -1823,13 +2498,23 @@ export class SnapshotCollector {
               // Labels
               ariaLabel,
               title: titleAttr || iconChildLabel,
+              // V23: alt attribute as its own field (not just consumed for
+              // descriptor-poor check). <img alt="..."> is the WCAG-recommended
+              // accessible name for image targets; without persisting it,
+              // resolver/builder/helper can't read it from the node.
+              alt: ownAlt || undefined,
               // V22 Pkg4: dedicated semantic icon label field (alongside title
               // for backward compat). Used by candidateText / fpHintLines /
               // heal-time score so icon-only buttons get a stable "name" even
               // when title was already taken by a real tooltip.
               iconLabel: iconChildLabel,
+              svgIcon: liveSvgIcon,
+              customElementTag: liveCustomElementTag,
               isIconButton: isIconButton || undefined,
-              labelText,
+              // V23: prefer explicit submitButtonLabel (legacy <input type=submit
+              // value="...">) when no labelText computed; downstream consumers
+              // treat both via the same field.
+              labelText: labelText || submitButtonLabel,
               // Hierarchy
               parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,
               containerRef,
@@ -1975,10 +2660,16 @@ export class SnapshotCollector {
               })(),
             });
           } catch (err) {
-            // Skip element if any error
-            // No logging needed here - errors are expected for dynamic elements
+            __forEachSkipCount++;
+            if (__forEachErrors.length < 3) {
+              const msg = err instanceof Error
+                ? err.name + ': ' + err.message
+                : String(err);
+              __forEachErrors.push(msg.slice(0, 200));
+            }
           }
         });
+        __tForEach = performance.now();
 
         // ═══════════════════════════════════════════════════════════════════════
         // PHASE 0.1: Enhanced page text extraction for credential detection
@@ -2293,6 +2984,8 @@ export class SnapshotCollector {
           // Page alert collection is non-critical — never break snapshot
         }
 
+        __tEnd = performance.now();
+
         // DEBUG: Attach collection stats for diagnosing 0-element issues
         const __debugStats = {
           allElementsCount: allElements.length,
@@ -2303,6 +2996,63 @@ export class SnapshotCollector {
           documentBodyChildCount: document.body ? document.body.children.length : -1,
           // @ts-expect-error
           totalDomElements: document.querySelectorAll('*').length,
+          // April 2026: surface silent forEach throws (e.g. ReferenceError
+          // from a missed variable declaration) so 0-element snapshots can
+          // be diagnosed without code spelunking.
+          forEachSkipCount: __forEachSkipCount,
+          forEachErrors: __forEachErrors,
+          // April 2026: per-rule rejection counters for the main forEach pass
+          // and the Tier-2 (framework + cursor:pointer) walk. Lets us answer
+          // "what's getting filtered out and why" data-driven, instead of
+          // guessing which rule to relax. Sample arrays carry up to 3
+          // tag/role/id snippets per bucket to spot patterns.
+          rejects: {
+            main: __mainRejects,
+            mainSamples: __mainRejectSamples,
+            tier2: __tier2Rejects,
+            tier2Samples: __tier2RejectSamples,
+          },
+          // V26: per-phase wall time inside page.evaluate. All values in ms.
+          //   primaryMs   = collectFromRoot (querySelectorAll + shadow walk)
+          //   dedupeMs    = unique-set filter
+          //   secondaryMs = Tier-2 framework + cursor:pointer global scan
+          //   forEachMs   = per-element extract loop (getComputedStyle/bbox heavy)
+          //   tailMs      = everything between forEach end and return
+          //   totalMs     = full page.evaluate body
+          // Use these to find the real bottleneck on slow snapshots without
+          // re-running with custom logging.
+          phaseTimings: {
+            primaryMs: Math.round(__tPrimary - __t0),
+            dedupeMs: Math.round(__tDedupe - __tPrimary),
+            secondaryMs: Math.round(__tSecondary - __tDedupe),
+            // V26 #C: cacheMs = upfront layout-read pre-pass. forEachMs
+            // should drop by ~30-50% because per-iteration getComputedStyle
+            // and getBoundingClientRect were eliminated. cacheMs typically
+            // 1-3% of old forEachMs (one batched layout vs many).
+            cacheMs: __cacheMs,
+            forEachMs: Math.round(__tForEach - __tSecondary),
+            tailMs: Math.round(__tEnd - __tForEach),
+            totalMs: Math.round(__tEnd - __t0),
+          },
+          // V26 #A: hit-test bookkeeping — surfaces how often the
+          // page-level overlay gate let us skip elementFromPoint calls.
+          // High `hitTestSkipped` on a slow forEachMs = main optimization
+          // landed; high `hitTestRun` on a "calm" page = gate misfired
+          // (need to widen one of the three signals).
+          hitTest: {
+            needed: __hitTestNeeded,
+            hasModal: __hasModal,
+            hasObstacles: __hasObstacles,
+            hasInlinePositioned: __hasInlinePositioned,
+            hasOpenPopover: __hasOpenPopover,
+            skipped: __hitTestSkippedCount,
+            ran: __hitTestRunCount,
+          },
+          // V26 #B: framework gates — surfaces which extraction paths were
+          // skipped page-wide. False on a Material page would be a regression
+          // signal (mat-icon walk silently disabled); false on a React-only
+          // page is the optimization at work.
+          frameworkGates: __frameworkGates,
         };
 
         return {
@@ -2319,6 +3069,9 @@ export class SnapshotCollector {
           metadata, // P0: Visual content metadata for proactive vision detection
           pageStructure, // Manus: Tables, lists, pagination detection
           pageAlerts: pageAlerts.length > 0 ? pageAlerts.slice(0, 5) : undefined, // Max 5 alerts
+          // V26: Real viewport for modal-coverage ratio in buildAllowedSets.
+          // @ts-expect-error - window available in browser context
+          viewport: { width: window.innerWidth, height: window.innerHeight },
           __debugStats, // DEBUG: collection stats
         };
       }, __modalConsts);
@@ -2341,6 +3094,40 @@ export class SnapshotCollector {
         });
       }
 
+      // April 2026: Periodic rejection summary at debug level. Throttled to
+      // once per ~30s per page so 500ms-tick recordings don't flood logs.
+      // Goal: collect data on which filter rule is firing most often, so
+      // future relaxation of snapshot-collector heuristics is data-driven.
+      // Read with: `grep '[SNAPSHOT_REJECTS]' app.log | jq` over a few days.
+      try {
+        const debugStats = (snapshot as any).__debugStats;
+        const rejects = debugStats?.rejects;
+        if (rejects && snapshot.elements.length > 0) {
+          const pageKey = (snapshot.url || '').split('?')[0].slice(0, 200);
+          const now = Date.now();
+          const last = SNAPSHOT_REJECT_LOG_LAST.get(pageKey) || 0;
+          if (now - last > 30_000) {
+            SNAPSHOT_REJECT_LOG_LAST.set(pageKey, now);
+            // Cap the map so a long-running session doesn't leak unbounded URLs.
+            if (SNAPSHOT_REJECT_LOG_LAST.size > 200) {
+              const oldestKey = SNAPSHOT_REJECT_LOG_LAST.keys().next().value;
+              if (oldestKey !== undefined) SNAPSHOT_REJECT_LOG_LAST.delete(oldestKey);
+            }
+            logger.debug('[SNAPSHOT_REJECTS] filter rejection summary', {
+              url: pageKey,
+              kept: snapshot.elements.length,
+              totalDom: debugStats.totalDomElements,
+              uniqueScanned: debugStats.uniqueElementsCount,
+              main: rejects.main,
+              mainSamples: rejects.mainSamples,
+              tier2: rejects.tier2,
+              tier2Samples: rejects.tier2Samples,
+              iframes: debugStats.iframeRejects,
+            });
+          }
+        }
+      } catch { /* logging is best-effort */ }
+
       // ═══════════════════════════════════════════════════════════════════════
       // IFRAME ELEMENT COLLECTION (same-origin only)
       // ═══════════════════════════════════════════════════════════════════════
@@ -2355,19 +3142,33 @@ export class SnapshotCollector {
               frameName = frame.name() || 'iframe';
             }
 
-            const iframeElements = await frame.evaluate((fName: string) => {
+            const iframeResult = await frame.evaluate((fName: string) => {
               const selectors = 'button, a, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="option"], [role="combobox"], [role="switch"], [role="menuitem"], [role="slider"], [role="searchbox"], [role="textbox"], [role="gridcell"], [role="rowheader"], [role="columnheader"], [onclick], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
               const els: any[] = [];
               let idx = 0;
               const MAX_IFRAME_ELEMENTS = 50;
+              // April 2026: minimal iframe rejection counters. iframes are
+              // already a fallback path; we just want to know if a lot of
+              // matches got filtered before MAX_IFRAME_ELEMENTS could even
+              // bite — that signals the cap is wrong, not the filter.
+              const rejects = { hidden: 0, tooSmall: 0, capReached: 0 };
 
               document.querySelectorAll(selectors).forEach((el) => {
-                if (idx >= MAX_IFRAME_ELEMENTS) return;
+                if (idx >= MAX_IFRAME_ELEMENTS) {
+                  rejects.capReached++;
+                  return;
+                }
                 const htmlEl = el as HTMLElement;
                 const rect = htmlEl.getBoundingClientRect();
                 const style = window.getComputedStyle(htmlEl);
-                if (style.display === 'none' || style.visibility === 'hidden') return;
-                if (rect.width < 5 || rect.height < 5) return;
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  rejects.hidden++;
+                  return;
+                }
+                if (rect.width < 5 || rect.height < 5) {
+                  rejects.tooSmall++;
+                  return;
+                }
 
                 const tag = htmlEl.tagName.toLowerCase();
                 const role = (htmlEl.getAttribute('role') || (tag === 'a' ? 'link' : tag === 'input' || tag === 'select' || tag === 'textarea' ? 'input' : 'button')).replace(/["']/g, '').trim();
@@ -2388,11 +3189,22 @@ export class SnapshotCollector {
                 });
                 idx++;
               });
-              return els;
+              return { els, rejects, frameName: fName };
             }, frameName);
 
+            const iframeElements = iframeResult.els;
             if (iframeElements.length > 0) {
               (snapshot as any).elements.push(...iframeElements);
+            }
+            // Attach iframe rejection stats so the debug logger can see them.
+            const stats = (snapshot as any).__debugStats;
+            if (stats) {
+              if (!stats.iframeRejects) stats.iframeRejects = [];
+              stats.iframeRejects.push({
+                frame: iframeResult.frameName,
+                collected: iframeElements.length,
+                rejects: iframeResult.rejects,
+              });
             }
           } catch {
             // Cross-origin or detached iframe — skip silently
@@ -2571,6 +3383,36 @@ export class SnapshotCollector {
         if (el.ariaExpanded === false) line += ' [COLLAPSED]';
         if (el.ariaPressed) line += ' [PRESSED]';
         if (el.ariaSelected) line += ' [SELECTED]';
+        // Stage 1 wiring (audit gap): Radix UI / shadcn / Vaul / Headless
+        // UI encode toggle state as `data-state` and many primitives
+        // (Dialog, Popover, DropdownMenu, Collapsible, Tabs item) do NOT
+        // mirror to aria-* attributes. Without this hint LLM agent can't
+        // tell an already-OPEN dropdown trigger from a CLOSED one →
+        // canonical fake-success when agent clicks "open" trigger that
+        // simply closes itself.
+        //
+        // Skip when value already reflected by an aria-* marker above
+        // (avoid duplicate hints that confuse the LLM):
+        //   - dataState='open' AND ariaExpanded=true → skip (redundant)
+        //   - dataState='checked' AND ariaChecked=true → skip
+        //
+        // Show ALL other values — Radix-specific keywords like
+        // 'forceMount', 'submitting', 'instant' carry meaning we
+        // don't try to interpret here.
+        if (el.dataState) {
+          const s = el.dataState;
+          const dupExpanded = (s === 'open' && el.ariaExpanded === true)
+            || (s === 'closed' && el.ariaExpanded === false);
+          const dupChecked = (s === 'checked' && (el.ariaChecked === true || el.checked === true))
+            || (s === 'unchecked' && (el.ariaChecked === false || el.checked === false));
+          const dupPressed = (s === 'on' && el.ariaPressed === true)
+            || (s === 'off' && el.ariaPressed === false);
+          const dupSelected = (s === 'active' && el.ariaSelected === true)
+            || (s === 'inactive' && el.ariaSelected === false);
+          if (!dupExpanded && !dupChecked && !dupPressed && !dupSelected) {
+            line += ` [STATE=${s}]`;
+          }
+        }
         if (el.iframeSource) line += ' [IFRAME]';
         // SECURITY: Do not include raw input values in logs/prompts/traces.
         // This avoids leaking emails, passwords, OTPs, or other sensitive data.

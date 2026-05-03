@@ -116,25 +116,50 @@ async function probeState(
         ariaChecked: e.getAttribute('aria-checked') as string | null,
         ariaPressed: e.getAttribute('aria-pressed') as string | null,
         ariaExpanded: e.getAttribute('aria-expanded') as string | null,
+        // Radix UI / shadcn / Vaul / many headless React libs encode toggle
+        // state as data-state. Many primitives (Dialog, Popover,
+        // DropdownMenu, Collapsible) do NOT mirror to aria-expanded —
+        // without this read, every Radix open/close step times out the
+        // state-reflected phase even when the click actually worked.
+        dataState: e.getAttribute('data-state') as string | null,
         nativeChecked: input ? (input.checked as boolean) : null,
       };
     });
     switch (action) {
       case 'check':
-        return snapshot.ariaChecked === 'true' || snapshot.nativeChecked === true;
+        // Radix Checkbox uses data-state="checked" / "unchecked" instead of
+        // aria-checked. Native input.checked still wins when present.
+        return snapshot.ariaChecked === 'true'
+          || snapshot.dataState === 'checked'
+          || snapshot.dataState === 'on'
+          || snapshot.nativeChecked === true;
       case 'uncheck':
-        return snapshot.ariaChecked === 'false' || snapshot.nativeChecked === false;
+        return snapshot.ariaChecked === 'false'
+          || snapshot.dataState === 'unchecked'
+          || snapshot.dataState === 'off'
+          || snapshot.nativeChecked === false;
       case 'toggle':
         // We don't know prior value — accept ANY defined state.
         return (
           snapshot.ariaPressed !== null ||
           snapshot.ariaChecked !== null ||
+          snapshot.dataState !== null ||
           snapshot.nativeChecked !== null
         );
       case 'open':
-        return snapshot.ariaExpanded === 'true';
+        // Radix Dialog/Popover/DropdownMenu set data-state="open" without
+        // touching aria-expanded. Tabs use 'active' for the current tab —
+        // that's open-semantic enough for the verifier (the test author's
+        // intent "open this thing" is satisfied either way).
+        return snapshot.ariaExpanded === 'true'
+          || snapshot.dataState === 'open'
+          || snapshot.dataState === 'active'
+          || snapshot.dataState === 'on';
       case 'close':
-        return snapshot.ariaExpanded === 'false';
+        return snapshot.ariaExpanded === 'false'
+          || snapshot.dataState === 'closed'
+          || snapshot.dataState === 'inactive'
+          || snapshot.dataState === 'off';
     }
   } catch {
     return false;

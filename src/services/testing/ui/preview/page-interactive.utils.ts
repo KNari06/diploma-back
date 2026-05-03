@@ -59,6 +59,7 @@
 import { logger } from '@/utils/core/logger';
 import type { Page } from 'playwright';
 import { SnapshotCollector } from '@/agent/core/lite/collectors/snapshot-collector';
+import { SnapshotRouter } from './snapshot-router.service';
 import { VisualStability } from '@/agent/core/lite/collectors/visual-stability';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 
@@ -343,7 +344,7 @@ export async function waitForPageInteractive(
     // is a correctness guarantee.
     let fullCount = 0;
     try {
-      const snap = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+      const snap = await SnapshotRouter.collect(page, { context: 'page-interactive-check', skipStabilityWait: true });
       fullCount = Array.isArray(snap?.elements) ? snap.elements.length : 0;
       lastFullCount = fullCount;
     } catch (err) {

@@ -122,6 +122,59 @@ const wheelCoalesceState = new Map<string, {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Etap 1D.3 — Fire-and-forget LLM enrichment of a recording step.
+ *
+ * Called AFTER the synchronous `emitRecordingStep` so the UI never waits
+ * on the LLM. When the description is ready (~150-300ms cold, 0ms cached)
+ * we emit `preview:recording:step:update` with `{stepId, recordedDescription}`
+ * so the editor can show it on the existing step row.
+ *
+ * Skipped silently for:
+ *   - probed elements with no useful descriptors (`generateRecordedDescription`
+ *     returns undefined — see hasAnyDescriptor fast-skip in the service)
+ *   - LLM failures / timeouts (service swallows; we just see undefined)
+ *
+ * Never throws — the caller is fire-and-forget (`void scheduleRecordedDescription(...)`).
+ */
+function scheduleRecordedDescription(
+  socket: TypedSocket,
+  room: string,
+  previewSessionId: string,
+  step: import('@/services/testing/ui/preview/preview.types').IntentStep,
+  probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement,
+): void {
+  // setImmediate so the original emit is fully flushed before we touch
+  // the LLM. Eliminates any chance of accidentally blocking the WS write.
+  setImmediate(async () => {
+    try {
+      const { generateRecordedDescription } = await import(
+        '@/services/testing/ui/preview/recorded-description-llm.service'
+      );
+      const description = await generateRecordedDescription(probedElement);
+      if (!description) return;
+      // Emit the FULL step shape (per `preview:recording:step:update`
+      // contract — `PreviewRecordingStepPayload.step` is `PreviewIntentStep`,
+      // not a partial). Frontend replaces the row by id; sending only
+      // {id, recordedDescription} would clobber other fields with
+      // undefined.
+      socket.nsp.to(room).emit('preview:recording:step:update', {
+        previewSessionId,
+        step: { ...step, recordedDescription: description } as any,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      // Defensive — generateRecordedDescription already swallows internally,
+      // but a top-level catch here protects against import-time errors.
+      logger.warn('[RECORDING] Recorded-description hook failed', {
+        previewSessionId,
+        stepId: step.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+}
+
+/**
  * Emit a NEW recording step with inter-step delay stamping.
  * Replaces direct `socket.nsp.to(room).emit('preview:recording:step', ...)` calls.
  * Automatically computes and stamps interStepDelayMs on the step's evidence.
@@ -1492,6 +1545,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         userId: ensuredUserId,
         includeAlternatives: !!includeAlternatives,
         forceFreshSnapshot: true,
+        // Editor-side lint: Find button + debounced auto-lint after typing.
+        // We can't tell them apart from this socket event alone, so use the
+        // generic 'find_button' label (covers both user-triggered moments).
+        auditTrigger: 'find_button',
       });
 
       // V5: Handle needs_clarification status
@@ -1554,6 +1611,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           clarificationQuestion: result.clarificationQuestion,
           alternativesIncluded: !!includeAlternatives,
           applyDisabled: true, // V5: Apply should be disabled for needs_clarification
+          // V23: forward AMBIGUOUS coaching so the editor renders an
+          // actionable hint alongside the alternatives picker.
+          ...(result.suggestion ? { suggestion: result.suggestion } : {}),
           timestamp: new Date().toISOString(),
         });
 
@@ -1813,9 +1873,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
           if (!PreviewRunService.isRunning(previewSessionId)) {
             const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            // Etap 1D.2 — clear stale failureEvidence on success. The
+            // step that just succeeded is no longer "needs review"; the
+            // bundle from the previous failed apply would be misleading.
+            const stepToPersist = result.appliedStep.failureEvidence
+              ? { ...result.appliedStep, failureEvidence: undefined }
+              : result.appliedStep;
             const updated = await IntentTestCaseService.updateStepFromPreviewApply({
               intentTestCaseId,
-              appliedStep: result.appliedStep!,
+              appliedStep: stepToPersist,
               userId: ensuredUserId,
             });
 
@@ -1832,6 +1898,102 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             socketId: socket.id,
             intentTestCaseId,
             error: persistError instanceof Error ? persistError.message : String(persistError),
+          });
+        }
+      }
+
+      // Failed-but-plan-is-proven persistence.
+      //
+      // The mobile apply service forwards `appliedStep` even on failure if
+      // the runner emitted a compiled plan AND resolveVia was a "proven"
+      // strategy (compiled_fast_path / cache) — meaning the plan already
+      // matched the current tree, the failure was downstream of resolution.
+      // Persist that plan so the next run keeps fast-path coverage instead
+      // of re-paying full LLM cost. failureEvidence path below handles the
+      // "needs review" flow separately; this branch is purely about not
+      // losing valid compiled plans.
+      if (
+        !result.success
+        && intentTestCaseId
+        && result.appliedStep
+        && (result.appliedStep as { compiled?: unknown }).compiled
+        && !result.appliedStep.failureEvidence
+      ) {
+        try {
+          const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+          if (!PreviewRunService.isRunning(previewSessionId)) {
+            const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            await IntentTestCaseService.updateStepFromPreviewApply({
+              intentTestCaseId,
+              appliedStep: result.appliedStep,
+              userId: ensuredUserId,
+            });
+            logger.info('[WebSocket] Persisted proven-plan from failed apply', {
+              socketId: socket.id,
+              intentTestCaseId,
+              stepId: result.appliedStep.id,
+            });
+          }
+        } catch (provenPersistError) {
+          logger.warn('[WebSocket] Failed to persist proven-plan from failed apply', {
+            socketId: socket.id,
+            intentTestCaseId,
+            error: provenPersistError instanceof Error ? provenPersistError.message : String(provenPersistError),
+          });
+        }
+      }
+
+      // Etap 1D.2 — failure persistence + needs-review WS event.
+      //
+      // When apply fully failed AND the collector built a failureEvidence
+      // bundle, persist it to DB and emit `preview:step:needs-review`
+      // so the editor can show a badge/debug panel without re-fetching.
+      //
+      // Skipped when run is active: the run loop's batch-persist handles
+      // failure bundles too, and emitting per-step here would spam the
+      // frontend during a long run.
+      if (
+        !result.success
+        && intentTestCaseId
+        && result.appliedStep?.failureEvidence
+      ) {
+        try {
+          const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+          if (!PreviewRunService.isRunning(previewSessionId)) {
+            const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            await IntentTestCaseService.updateStepFromPreviewApply({
+              intentTestCaseId,
+              appliedStep: result.appliedStep,
+              userId: ensuredUserId,
+            });
+            logger.info('[WebSocket] Persisted failureEvidence', {
+              socketId: socket.id,
+              intentTestCaseId,
+              stepId: result.appliedStep.id,
+              attemptsLogged: result.appliedStep.failureEvidence.attempts.length,
+            });
+            socket.nsp.to(createRoomName('preview', previewSessionId)).emit('preview:step:needs-review', {
+              previewSessionId,
+              stepId: result.appliedStep.id,
+              intentTestCaseId,
+              summary: {
+                lastError: result.appliedStep.failureEvidence.lastError,
+                totalAttempts: result.appliedStep.failureEvidence.totalAttempts,
+                pageUrl: result.appliedStep.failureEvidence.pageUrl,
+                // V26 Batch A: top-level failure category — lets the editor
+                // dashboard group "stuck steps" by reason without parsing
+                // the full bundle. Non-breaking: optional, old clients
+                // ignore unknown fields.
+                originatingStrategy: result.appliedStep.failureEvidence.originatingStrategy,
+              },
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } catch (failurePersistError) {
+          logger.error('[WebSocket] Failed to persist failureEvidence', {
+            socketId: socket.id,
+            intentTestCaseId,
+            error: failurePersistError instanceof Error ? failurePersistError.message : String(failurePersistError),
           });
         }
       }
@@ -2146,11 +2308,22 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               const probeX = hStateRef.latestX;
               const probeY = hStateRef.latestY;
 
-              const el = await sessionService.probeInteractiveElementAt({
+              // V23: ask probe for the precise reject reason. Without this
+              // every null result trace-encodes as 'no_interactive_element'
+              // — so 53× identical rows during a stuck recording look
+              // identical regardless of whether the page is empty, the
+              // hit-test landed in a cross-origin iframe, or a non-
+              // interactive <div> covered the area.
+              const probeResult = await sessionService.probeInteractiveElementAt({
                 sessionId: previewSessionId,
                 userId: ensuredUserId,
                 x: probeX, y: probeY,
+                withRejectReason: true,
               });
+              // Narrow: a "real" element has tag/label; rejection has only rejectReason.
+              const el = probeResult && 'tag' in probeResult ? probeResult : null;
+              const rejectReason = probeResult && 'rejectReason' in probeResult
+                ? probeResult.rejectReason : undefined;
 
               const probeLatencyMs = Date.now() - probeStartMs;
 
@@ -2167,7 +2340,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 originalX: x, originalY: y,
                 latencyMs: probeLatencyMs,
                 result: el ? { tag: el.tag, label: el.label, resolvedVia: el.resolvedVia } : null,
-                skipped: el ? undefined : 'no_interactive_element',
+                skipped: el ? undefined : (rejectReason || 'no_interactive_element'),
               });
 
               const elKey = el
@@ -2284,6 +2457,24 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             });
             return; // Don't try to create a step from cross-origin element
           }
+          // V23: <webview> / <object> / <embed> host a separate browsing
+          // context Playwright cannot reach — recording silently captures
+          // nothing. Surface a clear message instead of "no element here".
+          if (preClickElement.unsupportedHost) {
+            const room = createRoomName('preview', previewSessionId);
+            const hostKind = preClickElement.unsupportedHost;
+            const hostMsg = hostKind === 'webview'
+              ? 'This site renders its content inside an Electron <webview> element. Playwright runs vanilla Chromium, so the inner content is not reachable. Recording will not capture clicks or typing here.'
+              : `This site renders content inside a <${hostKind}> element whose internals are not accessible to recording.`;
+            socket.nsp.to(room).emit('preview:recording:warning' as any, {
+              previewSessionId,
+              type: 'unsupported_host',
+              hostKind,
+              message: hostMsg,
+              timestamp: new Date().toISOString(),
+            });
+            return; // No usable target — skip step creation
+          }
           setImmediate(async () => {
             try {
               const { RecordingCaptureService } = await import(
@@ -2366,9 +2557,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       || /\b(dropdown|menu-trigger|has-submenu|popper-trigger|has-dropdown|nav-item|MuiMenuItem|MuiMenu-)\b/i.test(cls);
                     const minDwell = isLikelyPopupTrigger ? 80 : 400;
                     if (timeSinceHover < minDwell) continue;
+                    // Skip generic-label hovers. If the probe couldn't find any
+                    // descriptive name for the target (no aria-label, no text,
+                    // no title, no id, no testId), the recorded step ends up as
+                    // "Hover 'element'" which is useless for replay — the
+                    // resolver has nothing semantic to match against. Most of
+                    // these come from cursor sweeps between meaningful targets
+                    // (e.g. mouse passing over a wrapper div on the way to the
+                    // language flag). Exception: keep the step when the probe
+                    // indicates a popup-trigger (aria-haspopup / dropdown class)
+                    // — there the hover IS the action even without a label.
+                    const probedLabel = RecordingCaptureService.getProbedLabel(hoverElement, 60);
+                    if (!probedLabel && !isLikelyPopupTrigger) continue;
                     const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
                     if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                    // Etap 1D.3 — fire-and-forget LLM enrichment.
+                    scheduleRecordedDescription(socket, room, previewSessionId, hoverStep, hoverElement);
                   }
                 }
               } catch {
@@ -2442,6 +2647,38 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // Build & emit the initial step IMMEDIATELY using pre-click probe data
               const step = buildClickStep(preClickElement!);
 
+              // Diagnostic — audit what the recorder actually built. If
+              // `hasRecordedFingerprint: false` here, the loss is upstream
+              // (probe didn't capture identity); if it's true here but
+              // false in fp_audit.log on the next Run, the loss is in
+              // frontend serialize / DB persist.
+              try {
+                const fs = await import('fs');
+                const path = await import('path');
+                const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+                const fpKeys = step.recordedFingerprint && typeof step.recordedFingerprint === 'object'
+                  ? Object.keys(step.recordedFingerprint).slice(0, 15)
+                  : undefined;
+                const probeKeys = preClickElement
+                  ? Object.keys(preClickElement).filter(k => preClickElement![k as keyof typeof preClickElement] != null).slice(0, 20)
+                  : undefined;
+                fs.appendFileSync(auditPath, JSON.stringify({
+                  ts: new Date().toISOString(),
+                  scope: 'recorder_emit',
+                  stepId: step.id?.slice(0, 8),
+                  type: step.type,
+                  hasRecordedFingerprint: !!step.recordedFingerprint,
+                  hasBindingHints: !!step.bindingHints,
+                  hasEvidence: !!step.evidence,
+                  fpKeys,
+                  probeKeys,
+                  probeTag: preClickElement?.tag,
+                  probeId: preClickElement?.elementId,
+                  probeTestId: preClickElement?.testId,
+                  probeRef: preClickElement?.ref,
+                }) + '\n');
+              } catch { /* non-fatal */ }
+
               // V10: Click breaks scroll merge context
               sessionService.setRecordingLastScrollStep(previewSessionId, ensuredUserId, null);
 
@@ -2483,6 +2720,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               } else {
                 emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step, highlight: preClickElement?.boundingBox });
                 if (cTrace) cTrace.writeStepCaptured(step, needsLLM ? 'click_pending_llm' : 'click');
+                // Etap 1D.3 — fire-and-forget LLM enrichment.
+                if (preClickElement) {
+                  scheduleRecordedDescription(socket, room, previewSessionId, step, preClickElement);
+                }
                 sessionService.setRecordingLastClickStep(previewSessionId, ensuredUserId, {
                   id: step.id,
                   elementSignature: clickElSignature,
@@ -4481,7 +4722,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:run:start', async (data) => {
     try {
       const userId = getUserId(socket);
-      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset } = data;
+      const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset, startFromIndex: clientStartFromIndex } = data;
 
       // Validate input
       if (!previewSessionId || !intentTestCaseId) {
@@ -4510,6 +4751,61 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         userId,
       });
 
+      // Diagnostic — write to a dedicated file (winston dev config drops
+      // info/warn to stdout-only, which we can't read from outside the
+      // process). Bypassing winston with direct fs.appendFile gives us a
+      // disk artifact we can grep regardless of log level config.
+      try {
+        const fs = await import('fs');
+        const path = await import('path');
+        const dbSteps = ((testCase?.stepsJson || []) as unknown as Array<Record<string, unknown>>);
+        const fpAudit = dbSteps.map((s, idx) => {
+          const compiled = s?.compiled as Record<string, unknown> | undefined;
+          const evidence = s?.evidence as Record<string, unknown> | undefined;
+          const bindingHints = s?.bindingHints as Record<string, unknown> | undefined;
+          const compiledContext = compiled?.context as Record<string, unknown> | undefined;
+          const locatorPlan = compiled?.locatorPlan as Array<Record<string, unknown>> | undefined;
+          return {
+            locatorStrategies: locatorPlan?.map(l => `${l.strategy}=${typeof l.value === 'string' ? l.value.slice(0, 40) : ''}@${l.confidence}`).slice(0, 5),
+            idx,
+            id: typeof s?.id === 'string' ? s.id.slice(0, 8) : undefined,
+            type: s?.type,
+            description: typeof s?.description === 'string' ? (s.description as string).slice(0, 80) : undefined,
+            // Where the step was applied (compiled plan stamps the URL it
+            // was generated for). Run-time URL mismatch with this is the
+            // canonical "compiled stale" signal.
+            compiledPageUrl: typeof compiledContext?.pageUrl === 'string' ? compiledContext.pageUrl : undefined,
+            // What evidence ref was cached + what URL it was captured on.
+            evidencePageUrl: typeof evidence?.pageUrl === 'string' ? evidence.pageUrl : undefined,
+            evidenceLastSuccessRef: typeof evidence?.lastSuccessRef === 'string' ? evidence.lastSuccessRef : undefined,
+            evidenceCapturedAt: typeof evidence?.capturedAt === 'string' ? evidence.capturedAt : undefined,
+            // bindingHints captured at apply time — primary semantic anchor.
+            bhLabel: typeof bindingHints?.label === 'string' ? (bindingHints.label as string).slice(0, 80) : undefined,
+            bhText: typeof bindingHints?.text === 'string' ? (bindingHints.text as string).slice(0, 80) : undefined,
+            bhRole: typeof bindingHints?.role === 'string' ? bindingHints.role : undefined,
+            bhTag: typeof bindingHints?.tag === 'string' ? bindingHints.tag : undefined,
+            bhTestId: typeof bindingHints?.testId === 'string' ? bindingHints.testId : undefined,
+            bhElementId: typeof bindingHints?.elementId === 'string' ? bindingHints.elementId : undefined,
+            // Flags + fingerprint key list (compact summary for grep).
+            hasRecordedFingerprint: !!s?.recordedFingerprint,
+            hasBindingHints: !!bindingHints,
+            hasCompiled: !!compiled,
+            hasEvidence: !!evidence,
+            fpKeys: s?.recordedFingerprint && typeof s.recordedFingerprint === 'object'
+              ? Object.keys(s.recordedFingerprint as object).slice(0, 10)
+              : undefined,
+          };
+        });
+        const auditPath = path.join(process.cwd(), 'logs', 'fp_audit.log');
+        const line = JSON.stringify({
+          ts: new Date().toISOString(),
+          intentTestCaseId,
+          stepCount: dbSteps.length,
+          steps: fpAudit,
+        }) + '\n';
+        fs.appendFileSync(auditPath, line);
+      } catch { /* non-fatal — diagnostic only */ }
+
       if (isMobile && testCase) {
         // Mobile path: delegate to mobile runner via HTTP
         logger.info('[WebSocket] Starting mobile preview run', {
@@ -4534,6 +4830,29 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
         // If inline steps provided, save them to DB first (Apply All flow)
         if (Array.isArray(inlineSteps) && inlineSteps.length > 0) {
+          // Diagnostic — answers "did the frontend ship `recordedFingerprint`
+          // for click/type steps, or did toIntentStepForSave drop it?". When
+          // the value is false here, the cause is upstream of this handler
+          // (frontend serialization, recorder emit, or initial DB load).
+          try {
+            const fpAudit = (inlineSteps as unknown as Array<Record<string, unknown>>).map((s, idx) => ({
+              idx,
+              id: typeof s?.id === 'string' ? s.id.slice(0, 8) : undefined,
+              type: s?.type,
+              hasRecordedFingerprint: !!s?.recordedFingerprint,
+              hasBindingHints: !!s?.bindingHints,
+              hasCompiled: !!s?.compiled,
+              hasEvidence: !!s?.evidence,
+              fpKeys: s?.recordedFingerprint && typeof s.recordedFingerprint === 'object'
+                ? Object.keys(s.recordedFingerprint as object).slice(0, 10)
+                : undefined,
+            }));
+            logger.info('[APPLY_ALL_FP_AUDIT] inline steps received', {
+              intentTestCaseId,
+              stepCount: inlineSteps.length,
+              steps: fpAudit,
+            });
+          } catch { /* non-fatal — diagnostic only */ }
           const patch: Record<string, unknown> = { steps: inlineSteps };
           if (inlineStartUrl) {
             patch.url = inlineStartUrl;
@@ -4730,10 +5049,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           ? clientAuthReset
           : undefined;
       const hasInline = Array.isArray(inlineSteps) && inlineSteps.length > 0;
+      // Sanitize startFromIndex: must be a non-negative finite integer.
+      // Anything else (NaN, negative, undefined, string, etc.) collapses to
+      // the default "run from step 0" behaviour. This is the safe fallback
+      // — a malformed value never accidentally skips steps.
+      const safeStartFromIndex =
+        typeof clientStartFromIndex === 'number'
+        && Number.isFinite(clientStartFromIndex)
+        && clientStartFromIndex > 0
+        && Math.floor(clientStartFromIndex) === clientStartFromIndex
+          ? clientStartFromIndex
+          : undefined;
       const runOptions = hasInline
-        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset }
-        : safeAuthReset
-          ? { authReset: safeAuthReset }
+        ? { inlineSteps, startUrl: inlineStartUrl, authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
+        : (safeAuthReset || safeStartFromIndex !== undefined)
+          ? { authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
           : undefined;
       PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
         logger.error('[WebSocket] Preview run failed', {

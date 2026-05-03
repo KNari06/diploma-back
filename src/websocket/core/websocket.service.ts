@@ -250,6 +250,70 @@ class WebSocketService {
   }
 
   /**
+   * Emit to a per-test-case chat room.
+   *
+   * The room is keyed on `testCaseId`, not session id, because the
+   * frontend subscribes the moment the editor opens — BEFORE the chat
+   * session row is lazily created on first POST /chat. Sessions and
+   * test-case rooms can co-exist: the higher-level chat emit methods
+   * call both `emitToChat(sessionId, ...)` and
+   * `emitToTestCaseChat(testCaseId, ...)` so a socket subscribed to
+   * either room gets the event exactly once (Socket.IO de-dupes per
+   * socket across rooms in the same emit when broadcast is split).
+   *
+   * Note: a socket subscribed to BOTH rooms (which is what
+   * `subscribe:chat:testcase` does once a session exists) will receive
+   * the event TWICE because we emit in two separate `to(...)` calls.
+   * That's acceptable — the frontend already de-dupes by `messageId`.
+   * Avoiding the double-emit at the server would require maintaining a
+   * server-side socket→testcase map, which costs more than the
+   * client-side guard.
+   */
+  public emitToTestCaseChat(
+    testCaseId: string,
+    event: keyof ServerToClientEvents,
+    data: any,
+  ): void {
+    if (!this.isReady()) return;
+
+    if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid testCaseId in emitToTestCaseChat', {
+        testCaseId,
+        event,
+      });
+      return;
+    }
+    if (!event || typeof event !== 'string' || event.trim().length === 0) {
+      logger.warn('[WebSocketService] Invalid event in emitToTestCaseChat', {
+        testCaseId,
+        event,
+      });
+      return;
+    }
+
+    try {
+      // Build room name inline rather than through `createRoomName('chat', ...)`
+      // because the room id is `tc:<testCaseId>` — we want the literal
+      // helper that knows the prefix shape, not a generic chat room.
+      const room = `chat:tc:${testCaseId.trim()}`;
+      getIO().to(room).emit(event, data);
+
+      const logLevel = event === 'chat:message' ? 'info' : 'debug';
+      logger[logLevel]('[WebSocketService] Emitted to test-case chat', {
+        testCaseId,
+        event,
+        room,
+      });
+    } catch (error) {
+      logger.error('[WebSocketService] Error emitting to test-case chat', {
+        testCaseId,
+        event,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
    * Emit to specific chat room
    */
   public emitToChat(
@@ -800,53 +864,91 @@ class WebSocketService {
   // CHAT EVENTS
   // ============================================================================
 
-  public emitChatMessage(sessionId: string, payload: ChatMessagePayload): void {
+  public emitChatMessage(
+    sessionId: string,
+    payload: ChatMessagePayload,
+    // Optional. When set, the event is ALSO broadcast to the per-test-
+    // case room `chat:tc:<testCaseId>`. Lets clients subscribed before
+    // the lazy-created session row exists still receive the message.
+    // Worker-process callers route the same field through Redis target
+    // so the main-process subscriber can do the dual-emit.
+    testCaseId?: string,
+  ): void {
     // Chat events are typically from main process, but add fallback for safety
     if (!this.isReady()) {
       logger.debug('[WebSocketService] Using Redis Pub/Sub fallback for emitChatMessage (worker process)', {
         sessionId,
+        testCaseId,
       });
-      redisWebSocketBridge.publishEvent('chat:message', payload, { sessionId }).catch((error) => {
-        logger.error('[WebSocketService] Failed to publish chat:message to Redis', {
-          sessionId,
-          error: error instanceof Error ? error.message : String(error),
+      redisWebSocketBridge
+        .publishEvent('chat:message', payload, { sessionId, testCaseId })
+        .catch((error) => {
+          logger.error('[WebSocketService] Failed to publish chat:message to Redis', {
+            sessionId,
+            testCaseId,
+            error: error instanceof Error ? error.message : String(error),
+          });
         });
-      });
       return;
     }
     this.emitToChat(sessionId, 'chat:message', payload);
+    if (testCaseId) {
+      this.emitToTestCaseChat(testCaseId, 'chat:message', payload);
+    }
   }
 
-  public emitChatTestUpdate(sessionId: string, payload: ChatTestUpdatePayload): void {
+  public emitChatTestUpdate(
+    sessionId: string,
+    payload: ChatTestUpdatePayload,
+    testCaseId?: string,
+  ): void {
     if (!this.isReady()) {
       logger.debug('[WebSocketService] Using Redis Pub/Sub fallback for emitChatTestUpdate (worker process)', {
         sessionId,
+        testCaseId,
       });
-      redisWebSocketBridge.publishEvent('chat:test:update', payload, { sessionId }).catch((error) => {
-        logger.error('[WebSocketService] Failed to publish chat:test:update to Redis', {
-          sessionId,
-          error: error instanceof Error ? error.message : String(error),
+      redisWebSocketBridge
+        .publishEvent('chat:test:update', payload, { sessionId, testCaseId })
+        .catch((error) => {
+          logger.error('[WebSocketService] Failed to publish chat:test:update to Redis', {
+            sessionId,
+            testCaseId,
+            error: error instanceof Error ? error.message : String(error),
+          });
         });
-      });
       return;
     }
     this.emitToChat(sessionId, 'chat:test:update', payload);
+    if (testCaseId) {
+      this.emitToTestCaseChat(testCaseId, 'chat:test:update', payload);
+    }
   }
 
-  public emitChatProcessingStep(sessionId: string, payload: any): void {
+  public emitChatProcessingStep(
+    sessionId: string,
+    payload: any,
+    testCaseId?: string,
+  ): void {
     if (!this.isReady()) {
       logger.debug('[WebSocketService] Using Redis Pub/Sub fallback for emitChatProcessingStep (worker process)', {
         sessionId,
+        testCaseId,
       });
-      redisWebSocketBridge.publishEvent('chat:processing:step', payload, { sessionId }).catch((error) => {
-        logger.error('[WebSocketService] Failed to publish chat:processing:step to Redis', {
-          sessionId,
-          error: error instanceof Error ? error.message : String(error),
+      redisWebSocketBridge
+        .publishEvent('chat:processing:step', payload, { sessionId, testCaseId })
+        .catch((error) => {
+          logger.error('[WebSocketService] Failed to publish chat:processing:step to Redis', {
+            sessionId,
+            testCaseId,
+            error: error instanceof Error ? error.message : String(error),
+          });
         });
-      });
       return;
     }
     this.emitToChat(sessionId, 'chat:processing:step', payload);
+    if (testCaseId) {
+      this.emitToTestCaseChat(testCaseId, 'chat:processing:step', payload);
+    }
   }
 
   /**

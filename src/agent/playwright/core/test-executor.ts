@@ -27,6 +27,8 @@ import { ReplayTraceWriter } from './replay-trace-writer';
 import { createRunKey, TestRunRegistry } from './test-run-registry';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
+import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2.service';
+import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { setupThirdPartyBlocker } from '../execution/third-party-blocker';
 import {
@@ -1170,15 +1172,27 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     },
                   };
 
-                  const lookahead = await waitForStepReadiness(activePage, nextStepForLookahead, {
-                    maxWaitMs: typeof nextIntentMeta.lookaheadTimeoutMs === 'number' ? nextIntentMeta.lookaheadTimeoutMs : 10000,
-                    settleMs: 3000,
-                    autoWaitThresholdMs: 2000,
-                    // Pass context for SPA navigation detection + dynamic DOM stability threshold
-                    prevActionType,
-                    prevUrl: urlBeforeStep,
-                    recordedDelayMs: nextIntentMeta.evidence?.interStepDelayMs,
-                  });
+                  // Background replay: V2 budget = 7s (config), V1 keeps its own budget.
+                  // V2 is shadow-only here — runV1WithShadow returns V1 result unchanged.
+                  const v1MaxWait = typeof nextIntentMeta.lookaheadTimeoutMs === 'number' ? nextIntentMeta.lookaheadTimeoutMs : 10000;
+                  const lookahead = await runV1WithShadow(
+                    () => waitForStepReadiness(activePage, nextStepForLookahead, {
+                      maxWaitMs: v1MaxWait,
+                      settleMs: 3000,
+                      autoWaitThresholdMs: 2000,
+                      prevActionType,
+                      prevUrl: urlBeforeStep,
+                      recordedDelayMs: nextIntentMeta.evidence?.interStepDelayMs,
+                    }),
+                    activePage,
+                    nextStepForLookahead,
+                    {
+                      maxWaitMs: STEP_READINESS_CONFIG.v2.backgroundMaxWaitMs,
+                      prevActionType,
+                      prevUrl: urlBeforeStep,
+                      recordedDelayMs: nextIntentMeta.evidence?.interStepDelayMs,
+                    },
+                  );
 
                   if (lookahead.autoWaitApplied) {
                     logger.info('[PLAYWRIGHT] Lookahead auto-wait applied', {

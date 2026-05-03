@@ -503,6 +503,9 @@ RULES:
 4. If the element is visible in the screenshot but NOT in the list, return ref as null and provide bounding box coordinates (x, y, width, height in pixels)
 5. Only return refs from the list above — never invent refs
 6. If no element matches, return ref as null with confidence 0
+7. ADJACENCY ≠ SAME FUNCTION. Two controls sitting next to each other in a header / toolbar / row are SEPARATE elements with SEPARATE behaviour. A settings cog and a neighbouring "Click me!" banner are not interchangeable just because they share a row. Spatial / visual prominence is a TIE-BREAKER between candidates whose semantics already match the intent — never a reason to OVERRIDE semantics.
+8. NO "FALLBACK TO LOUDEST CTA". When no candidate semantically matches the intent, the correct answer is ref=null. Picking the most action-y looking element ("Submit", "Get started", "Click me!", "Try it") because something must be clicked is the #1 source of fake-success. Refuse the guess; return null.
+9. ID-AS-INTENT. When the intent looks like a slug ('layout-header-setting', 'btn-submit-form'), the recorder used the DOM id as the description because the target had no visible text. The ONLY correct match is a candidate carrying that exact id / testId / name / data-* value. Picking a nearby element whose label happens to share a word with the slug is the same fake-success class as rule 8.
 
 Respond ONLY with valid JSON:
 {"ref":"node-XX","confidence":0.0-1.0,"reason":"brief explanation"}

@@ -1,10 +1,16 @@
 /**
  * StateDiff
- * Computes structural difference between two snapshots to detect state changes
+ * Computes structural difference between two snapshots to detect state changes.
  *
- * NOTE: Semantic weights, progress sentiment, and goal-aware logic are computed
- * by HybridSemanticWeightCalculator.enrichWithAI() AFTER this structural diff.
- * This module is intentionally kept structural-only to avoid duplication.
+ * Stage 2D: progress sentiment, meaningfulChange, significantChange are
+ * filled by `applyDeweightedSentiment` in `analysis/progress-evaluator.ts`
+ * AFTER this structural diff. This module stays structural-only and
+ * sets semantic fields to safe defaults so the diff is shape-stable
+ * even if the caller skips enrichment.
+ *
+ * Note: `semanticWeight` is kept on StateDiff for back-compat (it's
+ * pinned to 0 — the legacy weight calculator is deleted; nothing reads
+ * it for decisions any more).
  */
 
 import { logger } from '@/utils/core/logger';
@@ -16,7 +22,9 @@ export class StateDiffComputer {
    * Detects URL changes, added/removed elements, and property changes
    *
    * Semantic fields (semanticWeight, meaningfulChange, significantChange, progressSentiment)
-   * are set to safe defaults here. They will be enriched by HybridSemanticWeightCalculator.
+   * are set to safe defaults here. They are filled by
+   * `applyDeweightedSentiment` in `analysis/progress-evaluator.ts`
+   * after this structural diff returns.
    *
    * @param before - Snapshot before action
    * @param after - Snapshot after action
@@ -26,7 +34,8 @@ export class StateDiffComputer {
    * @param networkErrors - Network errors during action (already time-filtered)
    * @param successfulResponses - Successful API responses (fetch/xhr, 200-299)
    * @param validationErrors - Validation errors from API (400-499 with parsed body)
-   * @param goal - Unused here; kept for API compatibility (goal used by enrichWithAI)
+   * @param goal - Unused here; kept for API compatibility (goal-aware
+   *               filtering is done in progress-evaluator at sentiment time)
    * @returns Structural state diff with safe semantic defaults
    */
   static compute(
@@ -40,7 +49,9 @@ export class StateDiffComputer {
     validationErrors: NetworkValidationError[] = [],
     goal?: string
   ): StateDiff {
-    // Goal is unused here; semantic weight calculation moved to HybridSemanticWeightCalculator
+    // Goal is unused here; goal-aware sentiment is computed by
+    // `applyDeweightedSentiment` in progress-evaluator.ts after the
+    // structural diff returns.
     void goal;
     try {
       // Check URL change
@@ -75,6 +86,14 @@ export class StateDiffComputer {
           'ariaChecked', 'ariaExpanded', 'ariaPressed', 'ariaSelected',
           // Validation state changes
           'invalid', 'required', 'readOnly',
+          // Stage 1 wiring: Radix UI / shadcn / Vaul / Headless UI all
+          // encode toggle state as data-state. Many primitives (Dialog,
+          // Popover, DropdownMenu, Collapsible) do NOT mirror to
+          // aria-expanded — without tracking data-state here, StateDiff
+          // misses widget transitions on the entire shadcn ecosystem.
+          // Caught by Stage 2 audit C1: collected in snapshot but invisible
+          // to LiteEngine progress logic. Symmetric with the ARIA list.
+          'dataState',
         ];
 
         fieldsToCheck.forEach((field) => {
@@ -100,7 +119,7 @@ export class StateDiffComputer {
         changedElements.length > 0;
 
       // Build diff with safe semantic defaults
-      // These will be enriched by HybridSemanticWeightCalculator.enrichWithAI()
+      // These are filled by applyDeweightedSentiment in progress-evaluator.ts
       const diff: StateDiff = {
         urlChanged,
         urlBefore: before.url,
@@ -112,7 +131,8 @@ export class StateDiffComputer {
         newPageErrors,
         newConsoleErrors: consoleErrors,
         newNetworkErrors: networkErrors,
-        // Safe semantic defaults (enriched later by HybridSemanticWeightCalculator)
+        // Safe semantic defaults (filled by applyDeweightedSentiment).
+        // semanticWeight pinned to 0 — kept on shape for back-compat.
         semanticWeight: 0,
         meaningfulChange: false,
         significantChange: false,
@@ -225,9 +245,10 @@ export class StateDiffComputer {
   }
 
   /**
-   * Format diff for AI prompt with actionable analysis
-   * Uses semantic weights, progress sentiment, and network-awareness
-   * (these fields are enriched by HybridSemanticWeightCalculator before this is called)
+   * Format diff for AI prompt with actionable analysis.
+   * Uses progress sentiment + meaningful/significant flags + network-awareness
+   * (filled by `applyDeweightedSentiment` in progress-evaluator.ts before
+   * this is called).
    *
    * @param diff - Enriched state diff to format
    * @param action - Action that was taken
@@ -249,7 +270,13 @@ export class StateDiffComputer {
       'Negative Change': '⚠️',
     };
     lines.push(`${sentimentEmoji[diff.progressSentiment] || '❓'} PROGRESS SENTIMENT: ${diff.progressSentiment}`);
-    lines.push(`   Semantic Weight: ${diff.semanticWeight.toFixed(2)} (Meaningful: ${diff.meaningfulChange}, Significant: ${diff.significantChange})`);
+    // Stage 2D: legacy `Semantic Weight: X.XX` line removed —
+    // semanticWeight is now permanently 0 after deletion of
+    // HybridSemanticWeightCalculator. `meaningful`/`significant` are
+    // set truthful by `applyDeweightedSentiment` in progress-evaluator;
+    // print them so the LLM gets actionable booleans without the
+    // misleading always-zero numeric weight.
+    lines.push(`   Meaningful: ${diff.meaningfulChange}, Significant: ${diff.significantChange}`);
     lines.push('');
 
     // URL Analysis
@@ -281,7 +308,7 @@ export class StateDiffComputer {
         .slice(0, 3);
 
       if (keyElements.length > 0) {
-        lines.push(`   Key new elements (high semantic weight):`);
+        lines.push(`   Key new elements (interactive widgets — likely action targets):`);
         keyElements.forEach(el => {
           const typeInfo = el.type ? ` type=${el.type}` : '';
           lines.push(`   + ${el.ref}: "${el.name}"${typeInfo}`);

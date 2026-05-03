@@ -5,6 +5,7 @@
  */
 
 import { connection } from '@/config/infrastructure/queues';
+import { env } from '@/config/environment/env';
 import { supabaseAdmin } from '@/db/supabase';
 
 import { logger } from '@/utils/core/logger';
@@ -14,11 +15,17 @@ import { getUserId } from '../middleware/middleware';
 import {
   ClientToServerEvents,
   createRoomName,
+  createTestCaseChatRoomName,
   ErrorPayload,
   ServerToClientEvents,
   SocketData,
   TestVideoFramePayload,
 } from '../types/types';
+// Per-test-case chat: ownership check + lazy session lookup live here.
+// We import lazily inside the handler block (require/await import) to
+// keep this module's load-time dependencies unchanged for the legacy
+// chat path — the existing handler doesn't pull anything from
+// services/utils, and we don't want to widen its eager import graph.
 
 // Redis client for catchup buffer
 let catchupRedis: Redis | null = null;
@@ -700,6 +707,219 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
         userId: userId || 'anonymous',
         error: error instanceof Error ? error.message : String(error),
         errorType: error instanceof Error ? error.constructor.name : typeof error,
+      });
+    }
+  });
+
+  // ═════════════════════════════════════════════════════════════════════
+  // Per-test-case chat: subscribe by testCaseId
+  // ═════════════════════════════════════════════════════════════════════
+  // The frontend subscribes the moment the editor opens, BEFORE the user
+  // sends the first message. At that point there may not be a chat
+  // session row yet (lazy-create model — the row is born inside the
+  // first POST /chat). So we key the room on `testCaseId`, not on the
+  // session id. Emits from chat handlers later target both
+  // `chat:tc:<testCaseId>` (always) and `chat:<sessionId>` (if known) —
+  // see webSocketService.emitChatMessage for the dual broadcast.
+  //
+  // Ownership: identical to the test-case REST endpoints. We invoke
+  // `assertCanAccessTestCase` (workspace-membership check) instead of
+  // the per-user session check the global path uses, because the
+  // session may not exist yet and the access right comes from the test
+  // case's workspace, not from a session row. This is the EXACT same
+  // helper that `requireTestCaseAccess` middleware wraps for HTTP —
+  // single source of truth for "can this user touch this test case".
+  // ═════════════════════════════════════════════════════════════════════
+  socket.on('subscribe:chat:testcase', async ({ testCaseId }, callback) => {
+    const ack = (response: { ok: boolean; error?: string; sessionId?: string }) => {
+      if (typeof callback === 'function') callback(response);
+    };
+
+    try {
+      // Feature-flag gate. Symmetric with the REST surface gate in
+      // test-case-chat.route.ts. When OFF, we ack with a clear error
+      // so the frontend can fall back gracefully instead of waiting
+      // for a subscribe that will never resolve. We do NOT emit on
+      // `error` channel here — that's reserved for protocol-level
+      // problems; "feature off" is a normal product state.
+      if (!env.ENABLE_TEST_CASE_CHAT) {
+        ack({ ok: false, error: 'Per-test-case chat is not enabled in this deployment' });
+        return;
+      }
+
+      // Validation
+      if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
+        socket.emit('error', {
+          code: 'VALIDATION_ERROR',
+          message: 'Invalid testCaseId provided',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Invalid testCaseId provided' });
+        return;
+      }
+
+      if (!socket.connected) {
+        ack({ ok: false, error: 'Socket disconnected' });
+        return;
+      }
+
+      if (!userId) {
+        socket.emit('error', {
+          code: 'AUTH_REQUIRED',
+          message: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Authentication required' });
+        return;
+      }
+
+      // Ownership / workspace check. Lazy import — see comment at the
+      // top of the file. The helper throws TestCaseNotFoundError or
+      // AccessDeniedError; we map both to fail-closed ack responses
+      // and an `error` emit so the frontend can show a sensible message.
+      const tcAccess = await import('@/api/chat/shared/test-case-access');
+      try {
+        await tcAccess.assertCanAccessTestCase(userId, testCaseId.trim());
+      } catch (err) {
+        const isNotFound = err instanceof tcAccess.TestCaseNotFoundError;
+        const code = isNotFound ? 'SESSION_NOT_FOUND' : 'ACCESS_DENIED';
+        const message = isNotFound
+          ? 'Test case not found'
+          : 'You do not have access to this test case';
+        logger.warn('[WebSocket] subscribe:chat:testcase denied', {
+          socketId: socket.id,
+          userId,
+          testCaseId,
+          reason: code,
+        });
+        socket.emit('error', { code, message, timestamp: new Date().toISOString() });
+        ack({ ok: false, error: message });
+        return;
+      }
+
+      if (!canSubscribe(socket.id)) {
+        socket.emit('error', {
+          code: 'SUBSCRIPTION_LIMIT',
+          message: 'Maximum subscription limit reached',
+          timestamp: new Date().toISOString(),
+        });
+        ack({ ok: false, error: 'Maximum subscription limit reached' });
+        return;
+      }
+
+      const tcRoom = createTestCaseChatRoomName(testCaseId.trim());
+      const rooms = getRoomSet(socket.id);
+
+      // Idempotent — second subscribe for the same test case is a no-op.
+      // We still try to JOIN the per-session room below in case the
+      // session was created since the last subscribe (covers the rare
+      // case of a long-lived socket whose user just sent the first
+      // message in another tab).
+      const alreadyInTcRoom = rooms.has(tcRoom);
+      if (!alreadyInTcRoom) {
+        socket.join(tcRoom);
+        rooms.add(tcRoom);
+        incrementSubscriptions(socket.id);
+      }
+
+      // Look up the existing session (if any) and additionally join the
+      // per-session room. This covers two cases at once:
+      //   1. User reopens an existing test-case chat — they should
+      //      receive history-driven emits that target `chat:<sid>`.
+      //   2. User opens a fresh test case — no session yet, we only
+      //      hold the `chat:tc:<tcid>` membership; the dual-broadcast
+      //      in emitChatMessage will reach this socket via that room
+      //      until the session is created on first POST /chat.
+      let resolvedSessionId: string | undefined;
+      try {
+        const { TestCaseChatService } = await import(
+          '@/services/utils/test-case-chat.service'
+        );
+        const session = await TestCaseChatService.findSession(userId, testCaseId.trim());
+        if (session) {
+          resolvedSessionId = session.id;
+          const sessionRoom = createRoomName('chat', session.id);
+          if (!rooms.has(sessionRoom)) {
+            socket.join(sessionRoom);
+            rooms.add(sessionRoom);
+            incrementSubscriptions(socket.id);
+          }
+        }
+      } catch (lookupErr) {
+        // Non-fatal: subscription to chat:tc:<tcid> already succeeded
+        // above. The per-session room will be picked up on the next
+        // subscribe (e.g. on reconnect after the session is created).
+        logger.warn('[WebSocket] Optional session-room join failed', {
+          socketId: socket.id,
+          userId,
+          testCaseId,
+          error: lookupErr instanceof Error ? lookupErr.message : String(lookupErr),
+        });
+      }
+
+      // ACK with the resolved sessionId (undefined when no session yet)
+      // so the frontend can stash it for cancel / feedback calls without
+      // a separate REST round-trip.
+      ack({ ok: true, sessionId: resolvedSessionId });
+    } catch (error) {
+      logger.error('[WebSocket] Error in subscribe:chat:testcase', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      socket.emit('error', {
+        code: 'SUBSCRIPTION_ERROR',
+        message: 'Failed to subscribe to test-case chat',
+        timestamp: new Date().toISOString(),
+      });
+      ack({ ok: false, error: 'Failed to subscribe to test-case chat' });
+    }
+  });
+
+  // Unsubscribe — leave both the test-case room and (if joined) the
+  // per-session room. Idempotent: leaving a room we're not in is a
+  // no-op and the subscription counter only decrements when we
+  // actually had it.
+  socket.on('unsubscribe:chat:testcase', async ({ testCaseId }) => {
+    try {
+      if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
+        return;
+      }
+      const trimmed = testCaseId.trim();
+      const tcRoom = createTestCaseChatRoomName(trimmed);
+      const rooms = getRoomSet(socket.id);
+
+      if (rooms.has(tcRoom)) {
+        socket.leave(tcRoom);
+        rooms.delete(tcRoom);
+        decrementSubscriptions(socket.id);
+      }
+
+      // Also leave the per-session room. Lookup is best-effort — if
+      // it fails the socket still gets cleaned up on disconnect.
+      if (userId) {
+        try {
+          const { TestCaseChatService } = await import(
+            '@/services/utils/test-case-chat.service'
+          );
+          const session = await TestCaseChatService.findSession(userId, trimmed);
+          if (session) {
+            const sessionRoom = createRoomName('chat', session.id);
+            if (rooms.has(sessionRoom)) {
+              socket.leave(sessionRoom);
+              rooms.delete(sessionRoom);
+              decrementSubscriptions(socket.id);
+            }
+          }
+        } catch {
+          // best-effort
+        }
+      }
+    } catch (error) {
+      logger.error('[WebSocket] Error in unsubscribe:chat:testcase', {
+        socketId: socket.id,
+        userId: userId || 'anonymous',
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   });

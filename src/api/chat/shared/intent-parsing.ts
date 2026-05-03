@@ -1,6 +1,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { parseUserIntent } from '@/services/ai/intent/intent-parser.service';
-import { ChatService } from '@/services/utils/chat.service';
+import { ChatPersistence } from '@/services/utils/chat-persistence';
+import { GLOBAL_STORE, TESTCASE_STORE, type ChatStore } from '@/services/utils/chat-store';
 import { IntentResult } from '@/types';
 import { FunctionLogger, withFunctionLogging } from '@/utils/core/function-logger';
 import { logger } from '@/utils/core/logger';
@@ -13,13 +14,54 @@ import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
 
 /**
+ * Intents that are NOT allowed when the request is scoped to a single
+ * test case (i.e. POST /chat with `testCaseId`). The parser silently
+ * rewrites any of these to `general_chat` with a logged warning —
+ * symmetric with the editor-mode `platform_test` guard above.
+ *
+ * Naming gotcha that has bitten us before: the registry exposes the API
+ * flow handler as `api_flow_test`, NOT `api_flow`. An earlier audit
+ * caught a bug where this set had `api_flow` (no-op) and the handler
+ * was reachable from test-case scope, where it would have crashed on
+ * FK violation against `chat_messages`. Tests pin the canonical names
+ * (see test-case-chat.test.ts → "Intent test-case scope partition").
+ *
+ * Exported so the partition test can read the SAME source of truth
+ * that the runtime guard reads — duplicating the list in the test was
+ * how the original bug went undetected for one phase.
+ */
+export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
+  'platform_test',  // creates a brand-new test from a URL — pointless inside a test case
+  'api_test',       // creates a new API test — same reason
+  'api_flow_test',  // multi-step API integration tests; runs against workspace, not a single test case
+  'mobile_test',
+  'mobile_action',
+  'mobile_agent',
+  'run_regression',
+  'run_plan',
+  'run_module',
+  'run_by_tag',
+  'create_plan',
+  'add_to_plan',
+  'save_test',      // we ARE the test case — nowhere to save TO
+]);
+
+/**
  * Get chat history for intent parsing (extracted helper)
  */
 export async function getChatHistoryForIntent(
   chatSessionId: string | undefined,
   userId?: string, // SECURITY: Optional userId for verification
   functionLogger?: FunctionLogger,
-  mode?: 'lite' | 'pro' | 'editor'
+  mode?: 'lite' | 'pro' | 'editor',
+  // ChatStore selects which backend tables this read targets. Default
+  // GLOBAL_STORE preserves the legacy workspace-chat behavior. Without
+  // this parameter the intent parser would always read from chat_messages
+  // (global) — for a per-test-case chat that means empty history, which
+  // silently degrades intent classification (cross-store leakage —
+  // exactly the failure mode this whole architecture was designed to
+  // prevent).
+  store: ChatStore = GLOBAL_STORE,
 ): Promise<Array<{ role: string; content: string }>> {
   if (!chatSessionId) {
     return [];
@@ -31,13 +73,22 @@ export async function getChatHistoryForIntent(
     // from non-editor conversations. Editor actions ("click X", "type Y") rarely need
     // more context. In normal mode, use 4 messages (2 exchanges) for multi-turn continuity.
     const CONTEXT_WINDOW_MESSAGES = mode === 'editor' ? 2 : 4;
+    // Route read through ChatPersistence so test-case sessions read
+    // from test_case_chat_messages instead of the global table.
+    // ChatPersistence ignores `userId` on the test-case path — ownership
+    // was already verified in the controller via requireTestCaseAccess.
     const getRecentMessagesWithLogging = functionLogger
-      ? withFunctionLogging(ChatService.getRecentMessages.bind(ChatService), 'ChatService.getRecentMessages', functionLogger)
-      : ChatService.getRecentMessages.bind(ChatService);
+      ? withFunctionLogging(
+          ChatPersistence.getRecentMessages.bind(ChatPersistence),
+          'ChatPersistence.getRecentMessages',
+          functionLogger,
+        )
+      : ChatPersistence.getRecentMessages.bind(ChatPersistence);
     const recentMessages = await getRecentMessagesWithLogging(
+      store,
       chatSessionId,
-      userId, // SECURITY: Pass userId for verification
-      Math.max(CONSTANTS.RECENT_MESSAGES_LIMIT, CONTEXT_WINDOW_MESSAGES)
+      userId,
+      Math.max(CONSTANTS.RECENT_MESSAGES_LIMIT, CONTEXT_WINDOW_MESSAGES),
     );
     // Convert 'ai' role to 'assistant' for OpenAI compatibility
     // ✅ FIX: Include test results from metadata so AI can see them in intent parsing
@@ -100,7 +151,17 @@ export async function parseIntent(
   checkRequestTimeout: () => void,
   abortSignal?: AbortSignal,
   functionLogger?: FunctionLogger,
-  mode?: 'lite' | 'pro' | 'editor'
+  mode?: 'lite' | 'pro' | 'editor',
+  // NEW: when true, this request is scoped to a per-test-case chat. We
+  // narrow the allowed intent set the same way editor mode narrows
+  // platform_test → general_chat. Default false keeps the legacy global
+  // chat behavior byte-for-byte unchanged.
+  isTestCaseScope: boolean = false,
+  // testCaseId is needed by the progress emits inside this function so
+  // they dual-broadcast to `chat:tc:<tcid>`. Without it, a frontend
+  // subscribed to the test-case room never sees "Understanding..." /
+  // "Routing..." indicators during the first user turn.
+  testCaseId?: string,
 ): Promise<any> {
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: PARSE INTENT (Only if not responding to test plan) (FIX #5)
@@ -142,7 +203,14 @@ export async function parseIntent(
   const emitProcessingStepWithLogging = functionLogger
     ? withFunctionLogging(emitProcessingStep, 'emitProcessingStep', functionLogger)
     : emitProcessingStep;
-  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', 'Understanding what you need...', PROGRESS.INTENT_PARSING);
+  emitProcessingStepWithLogging(
+    chatSessionId,
+    'parsing_intent',
+    'Understanding what you need...',
+    PROGRESS.INTENT_PARSING,
+    undefined,
+    testCaseId,
+  );
 
   // Check if request was cancelled
   if (abortSignal) {
@@ -378,12 +446,23 @@ export async function parseIntent(
       checkRequestAbortedWithLogging(abortSignal);
     }
 
-    // Normal path: Use AI to parse intent
-    // Get chat history for context
+    // Normal path: Use AI to parse intent.
+    // Get chat history for context. Pass the resolved ChatStore so
+    // test-case sessions read their own history table
+    // (test_case_chat_messages), not the global one. Without this the
+    // intent classifier sees an empty window for every test-case request
+    // and degrades to message-only heuristics — a silent regression.
+    const chatHistoryStore: ChatStore = isTestCaseScope ? TESTCASE_STORE : GLOBAL_STORE;
     const getChatHistoryForIntentWithLogging = functionLogger
       ? withFunctionLogging(getChatHistoryForIntent, 'getChatHistoryForIntent', functionLogger)
       : getChatHistoryForIntent;
-    const chatHistory = await getChatHistoryForIntentWithLogging(chatSessionId, userId, functionLogger, mode); // SECURITY: Pass userId for verification
+    const chatHistory = await getChatHistoryForIntentWithLogging(
+      chatSessionId,
+      userId,
+      functionLogger,
+      mode,
+      chatHistoryStore,
+    );
 
     // Check if request was cancelled after async operation
     if (abortSignal) {
@@ -402,9 +481,13 @@ export async function parseIntent(
 
     checkRequestTimeout();
 
-    // Get project_id from chat session if available
+    // Get project_id from chat session if available.
+    // Skip for test-case scope — test_case_chat_sessions has no project_id
+    // column (project comes from intent_test_cases → projects join, looked
+    // up at access-check time). Querying chat_sessions with a test-case
+    // session id would just return null and waste a round-trip.
     let projectId: string | undefined;
-    if (chatSessionId) {
+    if (chatSessionId && !isTestCaseScope) {
       try {
         const { data: session } = await supabaseAdmin
           .from('chat_sessions')
@@ -484,6 +567,35 @@ export async function parseIntent(
         logger.warn('[CHAT] mobile_test blocked outside editor mode, redirecting to general_chat', { userId });
         parsedIntent.intent = 'general_chat';
       }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // Hard guards: per-test-case chat scope.
+      //
+      // Inside a test case we restrict the intent set to what makes sense
+      // for "the AI agent of this single test case":
+      //   - kept: general_chat, editor_action, analyze_failure,
+      //     test_recommendations, coverage_analysis, needs_clarification.
+      //   - blocked → redirected to general_chat:
+      //       platform_test     (we already have a test case, not creating new)
+      //       mobile_test, mobile_action, mobile_agent (mobile is a parallel surface)
+      //       run_regression, run_plan, run_module, run_by_tag (suite-level, out of scope)
+      //       create_plan, add_to_plan (plan-level, out of scope)
+      //       save_test         (we ARE the test case — nowhere to save to)
+      //
+      // Same fall-through behavior as the editor-mode guards above:
+      // user gets a normal AI reply via general_chat, plus a logged warning
+      // so we can spot frontend mis-routing. Never a 4xx — frontend has no
+      // way to recover from one mid-flow.
+      // ═══════════════════════════════════════════════════════════════════
+      if (isTestCaseScope) {
+        if (BLOCKED_IN_TEST_CASE_SCOPE.has(parsedIntent.intent)) {
+          logger.warn('[CHAT] intent blocked in test-case scope, redirecting to general_chat', {
+            userId,
+            blockedIntent: parsedIntent.intent,
+          });
+          parsedIntent.intent = 'general_chat';
+        }
+      }
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
         error: intentError instanceof Error ? intentError.message : String(intentError),
@@ -513,7 +625,14 @@ export async function parseIntent(
     ? withFunctionLogging(buildIntentMessage, 'buildIntentMessage', functionLogger)
     : buildIntentMessage;
   const intentMessage = buildIntentMessageWithLogging(parsedIntent);
-  emitProcessingStepWithLogging(chatSessionId, 'parsing_intent', intentMessage, PROGRESS.INTENT_PARSED);
+  emitProcessingStepWithLogging(
+    chatSessionId,
+    'parsing_intent',
+    intentMessage,
+    PROGRESS.INTENT_PARSED,
+    undefined,
+    testCaseId,
+  );
 
   const intent = parsedIntent?.intent || 'general_chat';
 

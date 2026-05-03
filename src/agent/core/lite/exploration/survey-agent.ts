@@ -22,6 +22,7 @@ import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { VisualStability } from '../collectors/visual-stability';
 
 import type { LiteSnapshot, LiteElement } from '../lite-types';
@@ -675,7 +676,7 @@ export class SurveyAgent {
    */
   private async collectFullSnapshot(): Promise<LiteSnapshot> {
     // First snapshot at current scroll position
-    const initialSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+    const initialSnapshot = await SnapshotRouter.collect(this.page, { context: 'exploration-survey', fullPage: true });
 
     // Check if page is scrollable
     let scrollHeight: number;
@@ -722,7 +723,7 @@ export class SurveyAgent {
 
       // Collect new elements
       try {
-        const scrollSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        const scrollSnapshot = await SnapshotRouter.collect(this.page, { context: 'exploration-survey', fullPage: true });
         for (const el of scrollSnapshot.elements) {
           if (!allElements.has(el.ref)) {
             allElements.set(el.ref, el);
@@ -745,7 +746,7 @@ export class SurveyAgent {
               mode: 'survey',
             });
             // Re-collect after dismissal to get clean elements
-            const cleanScrollSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+            const cleanScrollSnapshot = await SnapshotRouter.collect(this.page, { context: 'exploration-survey', fullPage: true });
             for (const el of cleanScrollSnapshot.elements) {
               if (!allElements.has(el.ref)) {
                 allElements.set(el.ref, el);
@@ -802,7 +803,7 @@ export class SurveyAgent {
         }
 
         // Collect new elements after Load More
-        const lmSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        const lmSnapshot = await SnapshotRouter.collect(this.page, { context: 'exploration-survey', fullPage: true });
         let addedNew = false;
         for (const el of lmSnapshot.elements) {
           if (!allElements.has(el.ref)) {
@@ -1133,7 +1134,7 @@ export class SurveyAgent {
         }
 
         // Case 2: URL same but content changed → SPA route, treat as new page
-        const newSnapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+        const newSnapshot = await SnapshotRouter.collect(this.page, { context: 'exploration-survey', fullPage: true });
         const contentHashAfter = this.tree.computeContentHashPublic(newSnapshot);
 
         if (contentHashAfter !== contentHashBefore && !this.tree.isContentHashVisited(contentHashAfter)) {

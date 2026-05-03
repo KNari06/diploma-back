@@ -219,6 +219,11 @@ Respond with JSON (Manus-style with Impact Scoring):
     "mismatch": "Expected login form but got error modal - possible auth failure"
   } or null,
 
+  "openWidgets": [
+    {"ref": "e7", "kind": "menu", "label": "Settings (already open)"},
+    {"ref": "e12", "kind": "dialog", "label": "Confirm delete dialog"}
+  ] or [],
+
   "tableAnalysis": { "ref": "e20", "headers": ["Name","Email"], "rowCount": 25, "isSortable": true, "hasPagination": true, "hasBulkActions": true, "hasInlineEditing": false } or null,
   "listAnalysis": { "ref": "l0", "estimatedItems": 50, "hasLoadMore": true, "isVirtualized": false, "scrollDirection": "vertical" } or null,
   "loadingState": { "isLoading": true, "type": "skeleton", "affectedArea": "main table", "ref": "e20" } or null,
@@ -226,6 +231,16 @@ Respond with JSON (Manus-style with Impact Scoring):
   "classifiedObstacles": [{"ref":"e42","type":"cookie_consent","isBlocking":true,"isDismissible":true,"dismissStrategy":"click button ref e45 text 'Accept All'","affectedArea":"bottom 200px","reason":"Cookie consent banner"}],
   "pageStateAnalysis": {"isLoading":false,"hasFullViewportOverlay":false,"stackedObstacleCount":0,"isFlowBlocked":false}` : ''}
 }
+
+SNAPSHOT NOTATION REFERENCE (per-element markers in CURRENT PAGE SNAPSHOT):
+- [EXPANDED] / [COLLAPSED] — aria-expanded=true/false (dropdowns, accordions, menus)
+- [CHECKED] / [SELECTED] / [PRESSED] — ARIA toggle/select states
+- [STATE=open] / [STATE=closed] / [STATE=active] / [STATE=inactive] / [STATE=on] / [STATE=off]
+  — Radix UI / shadcn / Vaul / Headless UI data-state attribute. Many primitives (Dialog,
+  Popover, DropdownMenu, Collapsible) DO NOT mirror to aria-* — these markers
+  are the ONLY signal that the widget is open. Treat any element marked
+  [STATE=open], [STATE=active], or [STATE=on] as ALREADY OPEN/ACTIVE.
+- [INSIDE_MODAL] / [DISABLED] / [REQUIRED] / [INVALID] / [HAS_VALUE] / [READONLY] / [COVERED] / [SHADOW] / [IFRAME]
 
 CRITICAL MANUS RULES:
 1. **Impact Scoring**: For EVERY significant change, score it (HIGH/MEDIUM/LOW, Progress/Regression/Neutral)
@@ -241,6 +256,7 @@ CRITICAL MANUS RULES:
 11. **Validation Awareness**: [REQUIRED] = must fill, [INVALID] = has validation errors (check errorState), [HAS_VALUE] = already filled — skip unless goal requires changing.
 12. **Obstacle Classification**: If POSITIONED ELEMENTS section is present, classify each positioned element from its raw data (cls, id, text, role, ariaModal, pos, rect, coverage). Do NOT rely on any pre-classification. Report blocking obstacles in "obstacles" too.
 13. **Page State Analysis**: Analyze the OVERALL page state: Is the page loading? Is there a full-viewport overlay blocking everything? Are multiple obstacles stacked? Is the user flow completely blocked? Report in "pageStateAnalysis".
-14. Return ONLY valid JSON`;
+14. **Open Widget Detection**: Populate "openWidgets" with EVERY element that has [STATE=open], [STATE=active], [STATE=on], or [EXPANDED]. Include the trigger refs of open dropdowns/menus AND the dialog/popover container refs. Use the "kind" field to label the widget (dialog/menu/popover/tab/accordion/tooltip) when role makes it obvious; otherwise "unknown". This is critical: Strategist uses this list to recognise "goal already done" (e.g. goal "open settings menu" while a [STATE=open] Settings trigger exists) and to avoid clicking a trigger that would TOGGLE-CLOSE an already-open widget.
+15. Return ONLY valid JSON`;
   }
 }

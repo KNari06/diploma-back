@@ -125,16 +125,25 @@ describe('GoalCompletionEvaluator', () => {
   // 1. BASIC AI CALL — Verify askJson is called with correct params
   // ─────────────────────────────────────────────────────────────────────
   describe('AI call setup', () => {
-    it('should use gpt-4o-mini with low temperature', async () => {
+    it('should use the configured fast model with low temperature', async () => {
       mockAskJsonResult = { isDone: false, confidence: 0.1, reason: 'Not done' };
 
       await evaluator.evaluate(
         makeSnapshot(), makeSnapshot(), makeDiff(), 'Login to the site'
       );
 
-      expect(lastAskJsonOptions.model).toBe('gpt-4o-mini');
+      // Read from config rather than hardcoding a model name — the
+      // fast model gets bumped (gpt-4o-mini → gpt-5.4-mini → ...)
+      // without notice and we don't want this test to be the canary
+      // for OpenAI version updates. Asserts the evaluator wires the
+      // right CONFIG slot, which is the actual contract.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { AI_TASK_MODELS } = require('@/config/ai/ai-models.config');
+      expect(lastAskJsonOptions.model).toBe(AI_TASK_MODELS.goalDetection);
       expect(lastAskJsonOptions.temperature).toBe(0.05);
-      expect(lastAskJsonOptions.maxTokens).toBe(350);
+      // 400 since we added STATE CHANGES + NOTATION HINTS + ELEMENT
+      // FIELD CHANGES blocks for Radix/shadcn data-state visibility.
+      expect(lastAskJsonOptions.maxTokens).toBe(400);
       expect(lastAskJsonOptions.timeoutMs).toBe(8000);
     });
 

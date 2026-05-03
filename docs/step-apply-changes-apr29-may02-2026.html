@@ -1,0 +1,1036 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Step Apply / Element Resolution — изменения Apr 29 – May 2, 2026</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #181c27;
+    --surface2: #1e2336;
+    --border: #2a3050;
+    --accent: #4f7ef7;
+    --accent2: #7c5fe6;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --orange: #fb923c;
+    --text: #e2e8f0;
+    --muted: #8891a8;
+    --tag-bg: #1e2d4a;
+    --tag-text: #7eb3f9;
+    --code-bg: #141824;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    padding: 40px 20px 80px;
+  }
+
+  .page {
+    max-width: 960px;
+    margin: 0 auto;
+  }
+
+  /* ── Header ── */
+  .header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 28px;
+    margin-bottom: 40px;
+  }
+  .header-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 20px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .badge-date { background: var(--tag-bg); color: var(--tag-text); }
+  .badge-scope { background: #1e3a2a; color: #4ade80; }
+  .badge-commits { background: #2d1e3a; color: #c084fc; }
+
+  h1 {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    line-height: 1.2;
+    margin-bottom: 10px;
+    background: linear-gradient(135deg, #e2e8f0 0%, #7eb3f9 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 14px;
+  }
+
+  /* ── Sections ── */
+  .section {
+    margin-bottom: 48px;
+  }
+  .section-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--muted);
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-title .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+  }
+  .dot-blue { background: var(--accent); }
+  .dot-red { background: var(--red); }
+  .dot-green { background: var(--green); }
+  .dot-yellow { background: var(--yellow); }
+  .dot-purple { background: var(--accent2); }
+  .dot-orange { background: var(--orange); }
+
+  h2 {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--text);
+  }
+
+  /* ── Problem cards ── */
+  .problem-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .problem-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--red);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .problem-card h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: #fca5a5;
+    margin-bottom: 6px;
+  }
+  .problem-card p {
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  /* ── Change blocks ── */
+  .change-list {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .change-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .change-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 16px 18px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .change-number {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .change-title-wrap { flex: 1; }
+  .change-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 4px;
+  }
+  .change-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }
+  .commit-tag {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    background: var(--code-bg);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .file-tag {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    background: #1a2535;
+    color: #94a3b8;
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .change-body {
+    padding: 16px 18px;
+  }
+
+  /* ── Before / After table ── */
+  .before-after {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .ba-col {
+    background: var(--code-bg);
+    border-radius: 7px;
+    overflow: hidden;
+  }
+  .ba-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 6px 12px;
+  }
+  .ba-label-before {
+    background: rgba(248,113,113,0.12);
+    color: var(--red);
+    border-bottom: 1px solid rgba(248,113,113,0.2);
+  }
+  .ba-label-after {
+    background: rgba(52,211,153,0.1);
+    color: var(--green);
+    border-bottom: 1px solid rgba(52,211,153,0.15);
+  }
+  .ba-content {
+    padding: 10px 12px;
+    font-size: 13px;
+    color: #cbd5e1;
+    line-height: 1.55;
+  }
+  .ba-content ul {
+    padding-left: 16px;
+  }
+  .ba-content li {
+    margin-bottom: 3px;
+  }
+
+  /* ── Detail notes ── */
+  .detail-note {
+    background: rgba(79,126,247,0.07);
+    border: 1px solid rgba(79,126,247,0.2);
+    border-radius: 6px;
+    padding: 10px 13px;
+    font-size: 13px;
+    color: #93b4f5;
+    line-height: 1.5;
+    margin-top: 10px;
+  }
+  .detail-note strong {
+    color: var(--text);
+  }
+
+  /* ── Risk table ── */
+  .risk-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13.5px;
+  }
+  .risk-table th {
+    text-align: left;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface2);
+  }
+  .risk-table td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    color: #cbd5e1;
+    background: var(--surface);
+  }
+  .risk-table tr:last-child td { border-bottom: none; }
+  .risk-table tr:hover td { background: #1c2035; }
+
+  .risk-badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 12px;
+    white-space: nowrap;
+  }
+  .risk-high { background: rgba(248,113,113,0.15); color: #f87171; }
+  .risk-medium { background: rgba(251,191,36,0.15); color: #fbbf24; }
+  .risk-low { background: rgba(52,211,153,0.12); color: #34d399; }
+
+  /* ── Ideas ── */
+  .idea-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 14px;
+  }
+  .idea-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-top: 3px solid var(--accent2);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .idea-card .idea-num {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #a78bfa;
+    margin-bottom: 6px;
+  }
+  .idea-card h3 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+  .idea-card p {
+    font-size: 13px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  /* ── Commit timeline ── */
+  .timeline {
+    position: relative;
+    padding-left: 28px;
+  }
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 8px;
+    top: 6px;
+    bottom: 6px;
+    width: 2px;
+    background: var(--border);
+    border-radius: 2px;
+  }
+  .tl-item {
+    position: relative;
+    margin-bottom: 16px;
+  }
+  .tl-item::before {
+    content: '';
+    position: absolute;
+    left: -24px;
+    top: 7px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--surface2);
+    border: 2px solid var(--border);
+  }
+  .tl-item.important::before {
+    background: var(--accent);
+    border-color: var(--accent);
+    box-shadow: 0 0 8px rgba(79,126,247,0.5);
+  }
+  .tl-date {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 3px;
+    font-family: 'SF Mono', monospace;
+  }
+  .tl-title {
+    font-size: 13.5px;
+    color: var(--text);
+    font-weight: 500;
+  }
+  .tl-title code {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    background: var(--code-bg);
+    color: var(--accent);
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-right: 6px;
+  }
+  .tl-desc {
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: 3px;
+    line-height: 1.45;
+  }
+
+  /* ── New files block ── */
+  .new-files {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 10px;
+  }
+  .new-file {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--green);
+    border-radius: 6px;
+    padding: 10px 13px;
+  }
+  .new-file .nf-name {
+    font-family: 'SF Mono', monospace;
+    font-size: 12px;
+    color: #4ade80;
+    margin-bottom: 4px;
+  }
+  .new-file .nf-desc {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+
+  /* ── Misc ── */
+  code {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    background: var(--code-bg);
+    color: #7dd3fc;
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  .highlight { color: var(--yellow); font-weight: 600; }
+  .muted { color: var(--muted); }
+  p { margin-bottom: 10px; }
+  p:last-child { margin-bottom: 0; }
+
+  @media (max-width: 600px) {
+    .before-after { grid-template-columns: 1fr; }
+    .problem-grid, .idea-grid, .new-files { grid-template-columns: 1fr; }
+    h1 { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ── Header ── -->
+  <div class="header">
+    <div class="header-meta">
+      <span class="badge badge-date">Apr 29 – May 2, 2026</span>
+      <span class="badge badge-scope">Preview · Step Apply · Element Resolver</span>
+      <span class="badge badge-commits">11 коммитов</span>
+    </div>
+    <h1>Step Apply & Element Resolution<br>— что изменилось за 4 дня</h1>
+    <p class="subtitle">
+      Обзор всех значимых изменений в пайплайне применения шагов, резолвинга элементов,<br>
+      анализа кандидатов и связанных систем. Ветка <code>dev</code>.
+    </p>
+  </div>
+
+  <!-- ── Commit timeline ── -->
+  <div class="section">
+    <div class="section-title"><span class="dot dot-purple"></span> Хронология коммитов</div>
+    <div class="timeline">
+      <div class="tl-item">
+        <div class="tl-date">Apr 29, 18:18</div>
+        <div class="tl-title"><code>adace38</code> feat(chat): per-test-case scoped chat</div>
+        <div class="tl-desc">Чат сессии привязаны к конкретному тест-кейсу. Dual-broadcasting прогресс-событий.</div>
+      </div>
+      <div class="tl-item important">
+        <div class="tl-date">Apr 30, 14:34</div>
+        <div class="tl-title"><code>693f776</code> feat(snapshot-collector): enhanced identity extraction</div>
+        <div class="tl-desc">svgIcon, customElementTag, alt, href, новый effective label каскад. Decision trace в PreviewRunService.</div>
+      </div>
+      <div class="tl-item important">
+        <div class="tl-date">Apr 30, 16:04</div>
+        <div class="tl-title"><code>4b0844b</code> feat(preview-step-apply): parasitic overlay dismissal</div>
+        <div class="tl-desc">Новая функция dismissParasiticOverlay + text-similarity.util + тесты.</div>
+      </div>
+      <div class="tl-item important">
+        <div class="tl-date">Apr 30, 16:36</div>
+        <div class="tl-title"><code>1ec3370</code> feat(element-resolver): LLM cache invalidation on reject</div>
+        <div class="tl-desc">Инвалидация трёх кэшей (LLM select / pruner / tokens) при отклонении клика.</div>
+      </div>
+      <div class="tl-item important">
+        <div class="tl-date">May 1, 00:53</div>
+        <div class="tl-title"><code>9af105a</code> feat(viewport): real browser viewport for modal coverage</div>
+        <div class="tl-desc">candidate-pruner + stable-tokens + тесты. viewport пробрасывается через весь пайплайн.</div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-date">May 1, 00:54</div>
+        <div class="tl-title"><code>56730e3</code> feat(candidate-pruner): prompt v3, cross-script rank fix</div>
+        <div class="tl-desc">Cross-script semantic match ранжируется выше token overlap. Фикс для казахского/кириллицы.</div>
+      </div>
+      <div class="tl-item">
+        <div class="tl-date">May 2, 13:03</div>
+        <div class="tl-title"><code>455b01b</code> feat(pipeline-viz): +layers, flow mode, LocatorPlanBuilder refactor</div>
+        <div class="tl-desc">failure-collector, recorded-description-llm, locator-resolution.util, compiled-locator-executor Angular attrs, locator-config.ts.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Before: problems ── -->
+  <div class="section">
+    <div class="section-title"><span class="dot dot-red"></span> Как было — ключевые проблемы</div>
+    <div class="problem-grid">
+      <div class="problem-card">
+        <h3>🔲 Слепые пятна в идентификации элементов</h3>
+        <p>SVG-иконки, <code>&lt;mat-icon svgicon=""&gt;</code>, <code>&lt;img alt=""&gt;</code>, Angular <code>&lt;a title=""&gt;</code> — дропались при сборке label. LLM получал пустую строку и угадывал из общего контекста.</p>
+      </div>
+      <div class="problem-card">
+        <h3>📐 Неверный расчёт modal coverage</h3>
+        <p>Viewport вычислялся как bounding box всех видимых узлов. На длинных страницах (1280×8000px) modal 720px высотой = 9% покрытия → не признавался блокирующим → фоновые кнопки оставались в кандидатах.</p>
+      </div>
+      <div class="problem-card">
+        <h3>📦 Весь snapshot шёл в LLM без фильтрации</h3>
+        <p>100–300 кандидатов в одном LLM-запросе. Много токенов, низкое S/N ratio, медленный ответ, выше риск неверного выбора.</p>
+      </div>
+      <div class="problem-card">
+        <h3>☠️ Отравленный кэш после реджекта</h3>
+        <p>Fake-success guard отклонял клик, но LLM-кэш не чистился. Следующий retry брал тот же кешированный неверный ref снова и снова.</p>
+      </div>
+      <div class="problem-card">
+        <h3>🪟 Паразитные оверлеи блокировали retry</h3>
+        <p>Неудачный клик открывал CDK-overlay/dropdown. При следующей попытке оверлей перехватывал клик или сам оказывался в кандидатах. Ни закрытия, ни детекции не было.</p>
+      </div>
+      <div class="problem-card">
+        <h3>📋 Нет структурированного лога фейлов</h3>
+        <p>При финальном отказе шага — только текстовая строка ошибки. Нельзя было группировать по стратегии, смотреть историю попыток, строить аналитику "stuck steps".</p>
+      </div>
+      <div class="problem-card">
+        <h3>🔤 Регрессия с нелатинскими скриптами</h3>
+        <p>Candidate pruner v2 ранжировал по token overlap выше semantic match → казахские/кириллические элементы получали низкий ранг из-за script mismatch, даже при верном смысловом совпадении.</p>
+      </div>
+      <div class="problem-card">
+        <h3>🔄 Дублирование кода buildStrategyLocator</h3>
+        <p>Логика конвертации LocatorEntry → Playwright Locator дублировалась в executor и builder. Drift между ними приводил к ситуации "builder валидирует, executor не может выполнить".</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Changes ── -->
+  <div class="section">
+    <div class="section-title"><span class="dot dot-green"></span> Что изменилось — до / после</div>
+    <div class="change-list">
+
+      <!-- 1 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">1</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Effective Label Cascade — универсальный экстрактор идентичности</div>
+            <div class="change-meta">
+              <span class="commit-tag">693f776</span>
+              <span class="commit-tag">455b01b</span>
+              <span class="file-tag">element-resolver.service.ts</span>
+              <span class="file-tag">snapshot-collector.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                <code>labelText || ariaLabel || text || placeholder</code> — 4 поля.<br><br>
+                Всё остальное (title, alt, iconLabel, svgIcon, childTestId, customElementTag) дропалось без вывода.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                10-шаговый каскад (most-specific → most-general):<br>
+                <ul>
+                  <li>labelText → ariaLabel → <strong>title</strong> → <strong>alt</strong></li>
+                  <li>text → placeholder → <strong>iconLabel</strong></li>
+                  <li><strong>svgIcon</strong> → <strong>childTestId</strong> → <strong>customElementTag</strong></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>Реальный эффект:</strong> Angular <code>&lt;a title="Папкалар"&gt;</code> теперь читается на шаге 3. <code>&lt;mat-icon svgicon="folder"&gt;</code> — на шаге 8. Элементы, которые раньше получали пустой label и отклонялись на semantic-floor guard, теперь проходят. Применяется везде где нужен "один строковый ярлык" — candidate display, dedup keys, semantic floor, scene summary.
+          </div>
+          <div class="detail-note" style="margin-top:8px;">
+            <strong>snapshot-collector:</strong> <code>node.id</code> / <code>node.testIdAttr</code> теперь реально заполняются при построении nodes (раньше существовали в интерфейсе, но были <code>undefined</code> в рантайме → identity fast-path, fingerprint compare, LLM-промпт — всё было no-op).
+          </div>
+        </div>
+      </div>
+
+      <!-- 2 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">2</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Viewport для расчёта modal coverage</div>
+            <div class="change-meta">
+              <span class="commit-tag">9af105a</span>
+              <span class="file-tag">preview-session.service.ts</span>
+              <span class="file-tag">locator-plan-builder.service.ts</span>
+              <span class="file-tag">element-resolver.service.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                Viewport = max bounding box по всем видимым узлам страницы.<br><br>
+                Пример: modal 1280×720 на странице 1280×8000 = <span style="color:var(--red)">9% coverage</span> → не блокирует → фоновые элементы в кандидатах.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                <code>window.innerWidth/Height</code> из браузера передаётся через пайплайн.<br><br>
+                Тот же modal = <span style="color:var(--green)">100% coverage</span> → жёсткое исключение фоновых элементов. Modal clamp = не выходит за viewport при расчёте.
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>Цепочка передачи:</strong> <code>snapshot-collector</code> → <code>PreviewSessionService</code> → <code>IntentStepLintService</code> → <code>LocatorPlanBuilder</code> → <code>buildAllowedSets()</code>. Backward compatible — fallback на старый bbox при отсутствии.
+          </div>
+        </div>
+      </div>
+
+      <!-- 3 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">3</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Candidate Pruner — LLM-предфильтрация кандидатов</div>
+            <div class="change-meta">
+              <span class="commit-tag">9af105a</span>
+              <span class="commit-tag">56730e3</span>
+              <span class="file-tag">candidate-pruner-llm.service.ts</span>
+              <span class="file-tag">stable-tokens-llm.service.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                100–300 кандидатов → один LLM-запрос.<br>
+                Высокий шум, медленно, выше шанс ошибки.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                <strong>2-ступенчатая предфильтрация:</strong><br>
+                <ol style="padding-left:16px">
+                  <li>stable-tokens: token chain similarity</li>
+                  <li>candidate-pruner: LLM top-N с semantic rankinig</li>
+                </ol>
+                Основной LLM получает только релевантных.
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>v3 промпт:</strong> cross-script semantic match ранжируется выше token overlap. Фикс регрессии — казахский/кириллический текст больше не получает искусственно низкий ранг из-за script mismatch. Оба сервиса имеют собственный in-memory кэш с инвалидацией.
+          </div>
+        </div>
+      </div>
+
+      <!-- 4 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">4</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Инвалидация LLM-кэша после реджекта</div>
+            <div class="change-meta">
+              <span class="commit-tag">1ec3370</span>
+              <span class="file-tag">element-resolver.service.ts</span>
+              <span class="file-tag">preview-step-apply.service.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                После fake-success реджекта кэш не чистился.<br>
+                Retry → тот же неверный ref из кэша → снова реджект → цикл.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                При реджекте клика — синхронная чистка всех трёх кэшей:
+                <ul>
+                  <li><code>invalidateLlmSelectionsForRef(ref)</code></li>
+                  <li><code>invalidatePrunerForRef(ref)</code></li>
+                  <li><code>invalidateTokensForText(text)</code></li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>Logging:</strong> в лог пишется количество удалённых записей. Retry после инвалидации гарантированно переспрашивает LLM с нуля — "отравленный" кэш не возвращается.
+          </div>
+        </div>
+      </div>
+
+      <!-- 5 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">5</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Conditional Parasitic Overlay Dismissal</div>
+            <div class="change-meta">
+              <span class="commit-tag">4b0844b</span>
+              <span class="file-tag">preview-step-apply.service.ts</span>
+              <span class="file-tag">text-similarity.util.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                Overlay, открытый неудачным кликом, оставался на странице.<br>
+                Следующая попытка: клик перехватывался overlay или overlay-кнопка выбиралась как кандидат.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                <code>dismissParasiticOverlay()</code>:<br>
+                <ul>
+                  <li>Снапшот overlay <em>до</em> клика (<code>overlayPreSig</code>)</li>
+                  <li>После реджекта — сравнение. Новый overlay → закрыть (Esc + CDK backdrop click)</li>
+                  <li>Если overlay уже был до клика → не трогать</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>text-similarity.util.ts</strong> — новый утилитный модуль для сравнения overlay-сигнатур. Покрыт тестами (141 строка тестов). Использует нормализованный string-hash, не полный DOM-diff (быстро, без false positives на динамические классы).
+          </div>
+        </div>
+      </div>
+
+      <!-- 6 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">6</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Failure Evidence Bundle — структурированный лог фейлов</div>
+            <div class="change-meta">
+              <span class="commit-tag">455b01b</span>
+              <span class="file-tag">failure-collector.service.ts</span>
+              <span class="file-tag">preview.types.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                При финальном фейле шага — только строка <code>error</code>.<br>
+                Нет истории попыток, нет группировки по стратегии.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                <code>StepFailureEvidence</code> bundle:<br>
+                <ul>
+                  <li><code>originatingStrategy</code> — категория фейла</li>
+                  <li><code>attempts[]</code> — последние 10 (oldest dropped)</li>
+                  <li><code>lastError</code> — обрезан до 200 символов</li>
+                  <li><code>screenshotRef</code> — ссылка (wire-up отложен)</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>Политика:</strong> срабатывает <em>только</em> при финальном фейле (не per-attempt). Не пишет в БД сам — делегирует в <code>intent-test-case.service.ts</code>. Не эмитит WS-события. Single bundle per step — last failure wins. Cap 10 записей в <code>attempts[]</code>.
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">7</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Recorded Description LLM — NL-описание записанного элемента</div>
+            <div class="change-meta">
+              <span class="commit-tag">455b01b</span>
+              <span class="file-tag">recorded-description-llm.service.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                Элемент идентифицировался только через fingerprint + live snapshot. Для icon-only кнопок — описание отсутствовало полностью.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                При записи → LLM генерирует NL-описание: <em>"the Save button inside the user profile modal"</em>.<br>
+                Персистируется в <code>IntentStep.recordedDescription</code>. Будет 3-м каналом в resolver при replay (Etap 1D.4).
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>Performance:</strong> кэш по hash(normalized input), 24h TTL. Throttle: max 3 параллельных LLM-вызова. Таймаут 2500ms, fail-open (→ <code>undefined</code>, не блокирует запись). Многоязычность бесплатно — казахский/русский/английский.
+          </div>
+        </div>
+      </div>
+
+      <!-- 8 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">8</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Angular attrs в Compiled Locator Executor (Etap 1B.2)</div>
+            <div class="change-meta">
+              <span class="commit-tag">455b01b</span>
+              <span class="file-tag">compiled-locator-executor.ts</span>
+              <span class="file-tag">locator-resolution.util.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                <code>routerLink</code> и <code>formControlName</code> — Angular-специфичные идентификаторы — игнорировались в fingerprint и locator plan.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                Оба атрибута читаются live и сравниваются с fingerprint. Весовой коэффициент = 1 (на уровне <code>name</code> / <code>testId</code>). Exact match, без truncation (drift маршрута = реальный drift).
+              </div>
+            </div>
+          </div>
+          <div class="detail-note">
+            <strong>locator-resolution.util.ts</strong> — новый единый модуль для конвертации <code>LocatorEntry → Playwright Locator</code>. Используется и в executor, и в builder. <em>Симметрия гарантирована: что builder валидирует — executor выполнит.</em>
+          </div>
+        </div>
+      </div>
+
+      <!-- 9 -->
+      <div class="change-card">
+        <div class="change-header">
+          <div class="change-number">9</div>
+          <div class="change-title-wrap">
+            <div class="change-title">Per-test-case Chat + Decision Trace в PreviewRunService</div>
+            <div class="change-meta">
+              <span class="commit-tag">adace38</span>
+              <span class="commit-tag">693f776</span>
+              <span class="file-tag">chat.controller.ts</span>
+              <span class="file-tag">preview-run.service.ts</span>
+            </div>
+          </div>
+        </div>
+        <div class="change-body">
+          <div class="before-after">
+            <div class="ba-col">
+              <div class="ba-label ba-label-before">До</div>
+              <div class="ba-content">
+                Чат — только глобальный (workspace scope). История смешивалась для всех тест-кейсов.
+              </div>
+            </div>
+            <div class="ba-col">
+              <div class="ba-label ba-label-after">После</div>
+              <div class="ba-content">
+                Dual-mode: глобальный + per-test-case chat. Dual-broadcasting прогресс-событий в обе комнаты одновременно. Decision trace в PreviewRunService захватывает полный execution path по шагам.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── New files ── -->
+  <div class="section">
+    <div class="section-title"><span class="dot dot-green"></span> Новые файлы</div>
+    <div class="new-files">
+      <div class="new-file">
+        <div class="nf-name">candidate-pruner-llm.service.ts</div>
+        <div class="nf-desc">LLM-предфильтр кандидатов перед основным resolver. Кэш + throttle.</div>
+      </div>
+      <div class="new-file">
+        <div class="nf-name">stable-tokens-llm.service.ts</div>
+        <div class="nf-desc">Token-chain similarity для ранжирования кандидатов в pruner.</div>
+      </div>
+      <div class="new-file">
+        <div class="nf-name">recorded-description-llm.service.ts</div>
+        <div class="nf-desc">NL-описание записанного элемента при capture. 3rd channel для resolver (Etap 1D.4).</div>
+      </div>
+      <div class="new-file">
+        <div class="nf-name">failure-collector.service.ts</div>
+        <div class="nf-desc">Структурированный bundle ошибок при финальном фейле шага. Аналитика "stuck steps".</div>
+      </div>
+      <div class="new-file">
+        <div class="nf-name">text-similarity.util.ts</div>
+        <div class="nf-desc">Overlay-сигнатуры и string-hash сравнение для parasitic overlay detection.</div>
+      </div>
+      <div class="new-file">
+        <div class="nf-name">locator-resolution.util.ts</div>
+        <div class="nf-desc">Single source of truth: LocatorEntry → Playwright Locator. Используется executor + builder.</div>
+      </div>
+      <div class="new-file">
+        <div class="nf-name">locator-config.ts</div>
+        <div class="nf-desc">Per-workspace конфигурация стратегий локаторов (346 строк). Основа для кастомизации.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Risks ── -->
+  <div class="section">
+    <div class="section-title"><span class="dot dot-yellow"></span> Риски</div>
+    <table class="risk-table">
+      <thead>
+        <tr>
+          <th>Риск</th>
+          <th>Уровень</th>
+          <th>Детали</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Pruner срезает правильного кандидата</strong></td>
+          <td><span class="risk-badge risk-medium">Средний</span></td>
+          <td>Если token-overlap И семантика оба промахнулись (нестандартный label, редкий паттерн) — кандидат теряется ещё до основного LLM. Нужен мониторинг pruner precision/recall на реальных сессиях.</td>
+        </tr>
+        <tr>
+          <td><strong>Overlay dismissal не покрывает кастомные оверлеи</strong></td>
+          <td><span class="risk-badge risk-medium">Средний</span></td>
+          <td><code>dismissParasiticOverlay</code> закрывает через Esc + CDK backdrop click. Оверлеи без <code>.cdk-overlay-backdrop</code> и без Esc-binding не закроются. Список селекторов захардкожен.</td>
+        </tr>
+        <tr>
+          <td><strong>Три кэша инвалидируются синхронно — нет rate guard</strong></td>
+          <td><span class="risk-badge risk-low">Низкий</span></td>
+          <td>При массовом фейле (10 шагов подряд реджектятся) — cache miss storm на LLM. Риск rate limit / cost spike. Рассмотреть exponential backoff или per-session throttle.</td>
+        </tr>
+        <tr>
+          <td><strong>Viewport — снапшот момента записи</strong></td>
+          <td><span class="risk-badge risk-low">Низкий</span></td>
+          <td>При scroll/resize между записью и replay viewport может не совпасть. Modal coverage ratio станет неверным. Edge case — fullscreen modal на мобильном viewport или responsive breakpoint смена.</td>
+        </tr>
+        <tr>
+          <td><strong>FailureEvidence — overwrite, нет истории</strong></td>
+          <td><span class="risk-badge risk-low">Низкий сейчас</span></td>
+          <td>Single bundle per step — last failure wins. Для chronic flaky шага теряется история. При росте "stuck steps analytics" — потребуется history array с TTL или отдельная таблица.</td>
+        </tr>
+        <tr>
+          <td><strong>Recorded Description — async, fail-open</strong></td>
+          <td><span class="risk-badge risk-low">Низкий</span></td>
+          <td>Таймаут 2500ms, при LLM outage — description = undefined. Resolver при replay деградирует к 2-канальному режиму (fingerprint + snapshot) без предупреждения. Стоит логировать miss rate.</td>
+        </tr>
+        <tr>
+          <td><strong>Angular attrs — exact match без fuzzy</strong></td>
+          <td><span class="risk-badge risk-low">Низкий</span></td>
+          <td><code>routerLink</code>/<code>formControlName</code> сравниваются точно. Реструктуризация маршрутов (SPA migration) = fingerprint mismatch → fallback на LLM. Это поведение желательно (drift детектируется), но нужно знать о нём.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── Ideas ── -->
+  <div class="section">
+    <div class="section-title"><span class="dot dot-purple"></span> Идеи для развития</div>
+    <div class="idea-grid">
+      <div class="idea-card">
+        <div class="idea-num">Идея 01</div>
+        <h3>Pruner confidence score → fast path</h3>
+        <p>Если pruner возвращает confidence &gt; 0.95 по единственному кандидату — пропустить основной LLM-вызов. Потенциально экономит 50–80% LLM-расходов на простых элементах.</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 02</div>
+        <h3>Кэш инвалидация по URL-prefix</h3>
+        <p>Сейчас кэш глобальный по ref. После SPA-навигации — одни рефы → другая DOM. Инвалидация по <code>url-prefix + ref</code> точнее и не требует полного сброса при переходах.</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 03</div>
+        <h3>Overlay whitelist по роли</h3>
+        <p>Tooltip (<code>role="tooltip"</code>), cookie-banner, autocomplete dropdown — их не надо закрывать при retry. Whitelist по <code>aria-role</code> / <code>data-role</code> предотвратит false dismissal.</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 04</div>
+        <h3>FailureEvidence → WS real-time</h3>
+        <p>Сейчас bundle сохраняется в БД, фронт не знает. Событие <code>preview:step:failure-evidence</code> позволит показывать inline-диагностику прямо в редакторе при фейле.</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 05</div>
+        <h3>Pruner A/B режим (shadow)</h3>
+        <p>Запускать pruner параллельно "в тени" рядом с полным кандидат-листом и сравнивать выборки. Если pruner срезал правильный кандидат — логировать precision miss без влияния на результат.</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 06</div>
+        <h3>Recorded Description miss rate метрика</h3>
+        <p>LLM timeout 2500ms + fail-open → тихий деградейд. Счётчик <code>recordedDescription.misses</code> в metrics позволит алертить при деградации LLM-сервиса до его влияния на replay точность.</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 07</div>
+        <h3>locator-config.ts → UI настройки</h3>
+        <p>346-строчный конфиг стратегий уже per-workspace. Следующий шаг — UI в настройках workspace где команда может приоритизировать стратегии без изменений кода (например, отключить vision для медленных CI).</p>
+      </div>
+      <div class="idea-card">
+        <div class="idea-num">Идея 08</div>
+        <h3>Декларативный overlay whitelist</h3>
+        <p>В <code>locator-config.ts</code> добавить <code>parasiticOverlay.ignoreSelectors[]</code> — список CSS-селекторов, которые <em>никогда</em> не закрываются автоматически. Позволит кастомизировать поведение под конкретные сайты.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- footer -->
+  <div style="border-top:1px solid var(--border); padding-top:20px; margin-top:20px; font-size:12px; color:var(--muted); display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+    <span>QAIT Backend · dev branch · Apr 29 – May 2, 2026</span>
+    <span>11 коммитов · 7 новых файлов · ~4 000 строк кода</span>
+  </div>
+
+</div>
+</body>
+</html>

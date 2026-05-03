@@ -50,6 +50,32 @@ export class NetworkTracker {
   // Uses shared domain list from ThirdPartyBlocker for consistency
   private static readonly ANALYTICS_DOMAINS: readonly string[] = THIRD_PARTY_DOMAINS;
 
+  // Same-origin tracker path filter. Modern frameworks (Next.js,
+  // SvelteKit, Remix) often serve their analytics endpoints from
+  // their OWN origin, bypassing the domain blocklist. Examples:
+  //   - /_vercel/insights/event           (Vercel Web Analytics)
+  //   - /_vercel/speed-insights/vitals    (Vercel Speed Insights)
+  //   - /gtm/collect, /gtag/js (self-hosted GTM)
+  //   - /beacon, /telemetry endpoints
+  // Without this filter, every same-origin POST /track returning JSON
+  // 200 falsely elevates `progressSentiment` to 'Significant Change'
+  // because progress-evaluator step 4 reads `successfulApiResponses`.
+  // Audit M2 + audit follow-up.
+  //
+  // CRITICAL false-positive avoidance: bare /track, /event, /metrics,
+  // /collect would match real business endpoints — e-commerce sites
+  // have `/api/track-order/{id}`, calendars have `/api/event/{id}`,
+  // dashboards have `/api/metrics/{report}`. We DO NOT add those.
+  // Only well-known tracker SHAPES that have no business meaning:
+  //   - /_vercel/insights, /_vercel/speed-insights (Vercel)
+  //   - /gtm/, /gtag/js (Google Tag Manager self-hosted)
+  //   - /beacon (W3C Beacon API endpoints — universally analytics)
+  //   - /telemetry (Microsoft / Datadog APM convention)
+  //   - /pixel (1×1 tracking pixels — never legitimate API)
+  // For bare /track / /event / /metrics — leaves them alone; rely on
+  // domain-level blocklist for trackers that route via known vendors.
+  private static readonly TRACKER_PATH_RX = /(?:^|\/)(?:_vercel\/(?:insights|speed-insights)|gtm\/|gtag(?:\/|\.js)|beacon(?:\/|$)|telemetry(?:\/|$)|pixel(?:\/|$))/i;
+
   // Manus Style: Track only dynamic resource types
   private static readonly RELEVANT_RESOURCE_TYPES = ['fetch', 'xhr'];
 
@@ -137,6 +163,18 @@ export class NetworkTracker {
       if (NetworkTracker.ANALYTICS_DOMAINS.some(domain => urlObj.hostname.includes(domain))) {
         this.trackedRequests.delete(url);
         return; // Ignore even POST to analytics
+      }
+      // Same-origin tracker path filter — see TRACKER_PATH_RX comment.
+      // Catches /_vercel/insights/event and other framework analytics
+      // that ride on the user's own domain, bypassing the domain
+      // blocklist above.
+      if (NetworkTracker.TRACKER_PATH_RX.test(urlObj.pathname)) {
+        this.trackedRequests.delete(url);
+        logger.debug('[NETWORK_TRACKER] Skipped same-origin tracker path', {
+          url: url.slice(0, 100),
+          method,
+        });
+        return; // Ignore even successful POST to /track, /_vercel/insights, etc.
       }
     } catch {
       // Invalid URL, continue processing
@@ -273,15 +311,34 @@ export class NetworkTracker {
     // Remove from tracked after processing
     this.trackedRequests.delete(url);
 
-    // P1: Cleanup old tracked requests and captured bodies to prevent memory leak
-    if (this.trackedRequests.size > 1000) {
-      const now = Date.now();
-      for (const [trackedUrl, tracked] of this.trackedRequests.entries()) {
-        if (now - tracked.timestamp > 30000) { // 30 seconds
-          this.trackedRequests.delete(trackedUrl);
-          this.capturedRequestBodies.delete(trackedUrl);
-        }
+    // P1 fix — proactive cleanup. Previously only ran when size > 1000;
+    // now runs each response so memory stays bounded under any test
+    // length. The 30s TTL still applies — recent in-flight requests
+    // are kept for await-network-idle correctness, only stale-and-
+    // already-completed entries get evicted.
+    const now = Date.now();
+    for (const [trackedUrl, tracked] of this.trackedRequests.entries()) {
+      if (now - tracked.timestamp > 30000) { // 30 seconds
+        this.trackedRequests.delete(trackedUrl);
+        this.capturedRequestBodies.delete(trackedUrl);
       }
+    }
+
+    // P1 fix — rotating buffer cap on accumulator arrays. Previously
+    // these grew unbounded for the entire test run. With 100+ iter
+    // tests doing dozens of API calls each, easy to hit 5000+ entries.
+    // Cap = 500 is more than enough for downstream consumers
+    // (StateDiffComputer reads only THIS iteration's slice, not
+    // historical). When over cap, drop the oldest entries.
+    const MAX_BUFFER = 500;
+    if (this.successfulResponses.length > MAX_BUFFER) {
+      this.successfulResponses.splice(0, this.successfulResponses.length - MAX_BUFFER);
+    }
+    if (this.networkErrors.length > MAX_BUFFER) {
+      this.networkErrors.splice(0, this.networkErrors.length - MAX_BUFFER);
+    }
+    if (this.validationErrors.length > MAX_BUFFER) {
+      this.validationErrors.splice(0, this.validationErrors.length - MAX_BUFFER);
     }
   };
 

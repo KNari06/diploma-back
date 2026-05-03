@@ -47,6 +47,16 @@ export interface ChatRequest {
   userId?: string; // Optional userId for testing/dev (when no auth token)
   mode?: 'lite' | 'pro' | 'editor'; // Test execution mode (default: 'lite')
   executionStrategy?: 'standard' | 'exploration'; // Execution strategy (default: 'standard')
+  /**
+   * When present, scopes this chat to a test case. The controller resolves
+   * (user_id, testCaseId) → a row in `test_case_chat_sessions`, lazily
+   * creating it on the first user message. All persistence (history,
+   * auto-title, future embeddings/summaries) goes to the per-test-case
+   * tables — never the workspace-wide chat. When set, the `sessionId`
+   * field is ignored — sessionId for test-case chats is owned by the
+   * backend, not the client.
+   */
+  testCaseId?: string;
 }
 
 export interface ChatResponse {

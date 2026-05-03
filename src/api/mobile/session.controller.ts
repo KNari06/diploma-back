@@ -884,8 +884,10 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Normalize: strip surrounding quotes ("'Search' navigation" → "Search navigation")
-    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+    // Normalize: strip surrounding quotes (handles whole-wrap + balanced inline pairs).
+    // See normalize-description.ts for failure modes the previous regex had.
+    const { normalizeMobileDescription } = await import('@/services/mobile/normalize-description');
+    const description = normalizeMobileDescription(rawDescription);
 
     // Map frontend step kind → mobile runner actionType for element resolution context.
     // The actionType tells the LLM what the user intends to do with the element,
@@ -999,6 +1001,13 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       resolvedVia: lintResult.resolvedVia,
       elementText: lintResult.elementText,
       elementType: lintResult.elementType,
+      // Forward the runner-built compiled plan when it succeeded. Frontend
+      // can persist it onto the IntentStep on save so the next regression
+      // run goes through fast-path (~5ms) instead of re-paying the lint
+      // round-trip. Only forwarded when the plan is meaningful — i.e. the
+      // resolve actually succeeded; on `not_found` / `error` / failed lint
+      // there's no plan to share. Optional field, ignored by older frontends.
+      ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
     });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Lint failed', {
@@ -1042,9 +1051,10 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     const traceSessionId = `mobile-${sessionId}`;
     const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
-    const description = (stepDraft.elementDescription || stepDraft.description || '')
-      .replace(/['"]+([^'"]+)['"]+/g, '$1')
-      .trim();
+    // Normalize description identically to the lint path so trace logs and
+    // dispatch coords agree on the same canonical text.
+    const { normalizeMobileDescription: normalizeForApply } = await import('@/services/mobile/normalize-description');
+    const description = normalizeForApply(stepDraft.elementDescription || stepDraft.description);
     trace.writeMobileApplyRequest({
       stepId: stepDraft.id || `apply_${Date.now()}`,
       stepType: rawStepType,
@@ -1704,10 +1714,28 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
             const centerX = Math.round(bb.x + bb.width / 2);
             const centerY = Math.round(bb.y + bb.height / 2);
 
+            // Forward `intent` AND `coordsConfidence` so the runner's
+            // smartResolve can re-validate when the lint confidence is
+            // below the trust threshold (0.9). Sequential runs accumulate
+            // small drift over many steps — without this each step's
+            // command bypasses the runner's safety net (no-intent → early
+            // passthrough), and a low-confidence lint silently dispatches
+            // to coordinates that may already be stale.
+            // Mirrors the same fix in MobileStepApplyService Path A.
+            const coordsConfidence = typeof lintResult.confidence === 'number'
+              ? lintResult.confidence
+              : undefined;
+            const coordParams: Record<string, unknown> = {
+              x: centerX,
+              y: centerY,
+              intent: description,
+            };
+            if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
+
             const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
 
             if (rawType === 'type' || rawType === 'fill') {
-              commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
+              commands.push({ type: 'tap', params: { ...coordParams } });
               if (step.value) {
                 commands.push({
                   type: 'type_text',
@@ -1719,8 +1747,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                     // and the first characters get dropped — VTE then reads
                     // back stale text and burns two retries typing the same
                     // wrong value.
-                    x: centerX,
-                    y: centerY,
+                    ...coordParams,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
                   },
@@ -1730,7 +1757,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                 }
               }
             } else {
-              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { x: centerX, y: centerY } });
+              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams } });
             }
 
             await client.executeBatchCommands(sessionId, commands);
@@ -1777,10 +1804,38 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           logger.info(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} passed (runSteps fallback)`, {
             stepId: step.id, type: rawType, description, durationMs,
           });
+        } else {
+          const errorMsg = stepResult?.error || 'Step failed';
+          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
+          failedSteps++;
+          if (!isOptional) hardFailed = true;
+          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
+          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
+            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
+          });
+        }
 
-          // Auto-persist compiled plan when the runner (re)built one — without this
-          // every regression run re-pays the LLM cost until the user hits Save.
-          if (stepResult.compiledPlan && intentTestCaseId) {
+        // ── Auto-persist compiled plan ───────────────────────────────
+        // Persist when:
+        //   (a) step succeeded AND a plan was emitted, OR
+        //   (b) step FAILED but resolveVia ∈ {compiled,compiled_fast_path,
+        //       cache} — i.e. the plan was already validated against the
+        //       current tree before this run; the failure was downstream of
+        //       resolution (dispatch, VTE, app crash) and the plan itself is
+        //       still good. Throwing it away would force the next run to
+        //       re-pay full LLM cost for nothing.
+        // We deliberately do NOT persist on failure when resolveVia was a
+        // fresh LLM/vision/thinking pass — locking in a possibly-wrong plan
+        // hurts more than it helps.
+        if (stepResult?.compiledPlan && intentTestCaseId) {
+          const PROVEN: ReadonlySet<string> = new Set(['compiled', 'compiled_fast_path', 'cache']);
+          const planIsProven = !!stepResult.resolvedVia && PROVEN.has(stepResult.resolvedVia);
+          // Runner can mark a plan stale post-dispatch (VTE mismatch /
+          // foreground mismatch). Skip persistence in that case — saving
+          // a "successful dispatch but wrong element" plan locks in the bug.
+          const planIsStale = !!stepResult.planStaleReason;
+          const shouldPersist = !planIsStale && (stepResult.success === true || planIsProven);
+          if (shouldPersist) {
             try {
               const { IntentTestCaseService } = await import(
                 '@/services/testing/ui/preview/intent-test-case.service'
@@ -1801,15 +1856,6 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               });
             }
           }
-        } else {
-          const errorMsg = stepResult?.error || 'Step failed';
-          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
-          failedSteps++;
-          if (!isOptional) hardFailed = true;
-          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
-          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
-            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
-          });
         }
       } catch (stepError) {
         const durationMs = Date.now() - stepStart;

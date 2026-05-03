@@ -4,7 +4,7 @@
  * 1 session per user with TTL auto-cleanup
  */
 
-import { SnapshotCollector } from '@/agent/core/lite/collectors/snapshot-collector';
+import { SnapshotRouter } from './snapshot-router.service';
 import { logger, logPerformance } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { randomUUID } from 'crypto';
@@ -862,7 +862,23 @@ export class PreviewSessionService {
         emitProgress('extracting_elements', 75);
 
         // Collect initial snapshot (skip stability wait — already done above via waitForDOMStability)
-        const snapshot = await SnapshotCollector.collect(page, { skipStabilityWait: true });
+        //
+        // Etap 2 Phase 5 note: this is the ONE preview snapshot that
+        // can NEVER use CDP — the video stream hasn't started yet, so
+        // there's no piggyback session to reuse, and the safety guard
+        // in router falls back to evaluate. This is intentional:
+        //   - Initial snapshot fires exactly once per session, on a
+        //     freshly navigated page with low DOM density (no app
+        //     hydration yet) — evaluate path is ~200-400ms here. Not
+        //     worth the complexity of a "first-time exception" branch.
+        //   - Subsequent ticks (in `getSnapshot`) DO use piggyback
+        //     once the stream is running — that's the hot path where
+        //     speedup matters.
+        const snapshot = await SnapshotRouter.collect(page, {
+          context: 'preview-tick',
+          skipStabilityWait: true,
+          diagId: sessionId,
+        });
         const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
 
         // Compute initial page signature
@@ -1432,6 +1448,25 @@ export class PreviewSessionService {
 
     try {
       logger.info('[PREVIEW_SESSION] Stopping session', { sessionId });
+
+      // Force-cancel any in-flight preview run BEFORE we close the
+      // browser context. Without this, the run loop keeps trying to
+      // page.evaluate against a closed page → throws → unwind path may
+      // leave `activeRuns` populated, blocking every future run for
+      // this session id with "Run already in progress" until process
+      // restart. forceCancelOnSessionStop is a no-op when nothing is
+      // active. Lazy-import to dodge a circular dependency between
+      // session and run services (each pulls the other's API surface
+      // at module-eval time).
+      try {
+        const { PreviewRunService } = await import('./preview-run.service');
+        PreviewRunService.forceCancelOnSessionStop(sessionId);
+      } catch (e) {
+        logger.warn('[PREVIEW_SESSION] forceCancelOnSessionStop threw (non-fatal)', {
+          sessionId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
 
       // Safety-net: close and upload editor trace (idempotent — no-op if already closed)
       try {
@@ -2057,21 +2092,34 @@ export class PreviewSessionService {
     userId: string;
     x: number;
     y: number;
+    /**
+     * When set, populates `rejectReason` on the result instead of just
+     * returning null. Lets the WS handler write a precise reason into the
+     * hover_probe trace ('cross_origin_iframe' vs 'direct_hit' vs
+     * 'no_bounding_box' vs 'no_probe_result') so a stuck recording doesn't
+     * look like 53× identical 'no_interactive_element' rows.
+     */
+    withRejectReason?: boolean;
   }): Promise<{
     tag: string;
     label: string;
     boundingBox: { x: number; y: number; width: number; height: number };
     resolvedVia: string;
+    rejectReason?: undefined;
+  } | {
+    rejectReason: 'no_session' | 'invalid_coords' | 'no_viewport' | 'no_probe_result' | 'cross_origin_iframe' | 'direct_hit_non_interactive' | 'no_bounding_box' | 'error';
   } | null> {
-    const { sessionId, userId, x, y } = params;
+    const { sessionId, userId, x, y, withRejectReason } = params;
     const session = this.getAuthorizedSession(sessionId, userId);
-    if (!session) return null;
+    if (!session) return withRejectReason ? { rejectReason: 'no_session' } : null;
 
     try {
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        return withRejectReason ? { rejectReason: 'invalid_coords' } : null;
+      }
 
       const viewport = session.page.viewportSize();
-      if (!viewport) return null;
+      if (!viewport) return withRejectReason ? { rejectReason: 'no_viewport' } : null;
 
       const clampedX = Math.max(0, Math.min(x, viewport.width - 1));
       const clampedY = Math.max(0, Math.min(y, viewport.height - 1));
@@ -2091,11 +2139,11 @@ export class PreviewSessionService {
         session.recordingLastHover.probedElement = probed;
       }
 
-      if (!probed) return null;
-      if (probed.crossOriginIframe) return null;
+      if (!probed) return withRejectReason ? { rejectReason: 'no_probe_result' } : null;
+      if (probed.crossOriginIframe) return withRejectReason ? { rejectReason: 'cross_origin_iframe' } : null;
       // directHit = no interactive element found — don't highlight plain divs
-      if (probed.resolvedVia === 'directHit') return null;
-      if (!probed.boundingBox) return null;
+      if (probed.resolvedVia === 'directHit') return withRejectReason ? { rejectReason: 'direct_hit_non_interactive' } : null;
+      if (!probed.boundingBox) return withRejectReason ? { rejectReason: 'no_bounding_box' } : null;
 
       // V22 Pkg5+ Patch C: append to hover chain — distinct hover-targets
       // accumulated between two consecutive clicks. Skips noise via:
@@ -2126,7 +2174,7 @@ export class PreviewSessionService {
         sessionId, x, y,
         error: error instanceof Error ? error.message : String(error),
       });
-      return null;
+      return withRejectReason ? { rejectReason: 'error' } : null;
     }
   }
 
@@ -2199,6 +2247,19 @@ export class PreviewSessionService {
     pageSignature: string;
     screenshot?: string;           // Deprecated: use video:frame instead
     changed: boolean;
+    /** V26: Real browser viewport — used by resolver for accurate modal-coverage
+     *  ratio in `buildAllowedSets`. Optional for back-compat. */
+    viewport?: { width: number; height: number };
+    /** V26: per-phase wall-time inside page.evaluate (ms). Surfaced so the
+     *  slow-snapshot warn can show where the bottleneck is. */
+    phaseTimings?: {
+      primaryMs: number;
+      dedupeMs: number;
+      secondaryMs: number;
+      forEachMs: number;
+      tailMs: number;
+      totalMs: number;
+    };
   } | null> {
     const session = this.getAuthorizedSession(sessionId, userId);
     if (!session) return null;
@@ -2232,8 +2293,38 @@ export class PreviewSessionService {
     }
 
     try {
-      const snapshot = await SnapshotCollector.collect(session.page, {
+      // ── Preview snapshot routing (Etap 2 + screencast collision tradeoff) ──
+      //
+      // Two classes of snapshot enter this function:
+      //
+      //   1. ACTION-TRIGGERED (force: true) — user clicked Apply / Lint /
+      //      step:apply. UX expectation: "result fast". Worth the brief
+      //      video stutter for 10× snapshot speedup. Use CDP if flag on.
+      //
+      //   2. PERIODIC TICK (force: false) — the 500ms polling interval
+      //      from preview.handler.ts:1008 firing twice per second to
+      //      keep the editor's interactive-node panel fresh. Always
+      //      runs, even when user just stares at the page. CDP here =
+      //      continuous video stutter (~11-20 FPS on dense pages from
+      //      cdp-screencast-collision.test). Stay on evaluate path —
+      //      user's eyes see smooth video, panel data updates every
+      //      ~500ms (still acceptable), backend cost is the existing
+      //      16s evaluate which doesn't block video (compositor reads
+      //      from frozen layer tree, not from main thread).
+      //
+      // Context selection:
+      //   - 'preview-apply' → CDP eligible (force=true callers)
+      //   - 'preview-tick'  → evaluate (background polling)
+      //
+      // This is a direct empirical decision: see
+      //   src/services/testing/ui/preview/__tests__/cdp-screencast-collision.integration.test.ts
+      // for the FPS-vs-snapshot-duration measurements that drove it.
+      const isActionTriggered = options?.force === true;
+      const snapshot = await SnapshotRouter.collect(session.page, {
+        context: isActionTriggered ? 'preview-apply' : 'preview-tick',
         fullPage: options?.fullPage,
+        diagId: sessionId,
+        lastDomNodeCount: session.pageState?.domNodes?.length,
       });
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();
@@ -2366,6 +2457,13 @@ export class PreviewSessionService {
         pageSignature: session.lastPageSignature,
         screenshot,
         changed,
+        // V26: pass viewport through so resolver can compute accurate
+        // modal-coverage ratio. domAnalysis carries it from snapshot collector.
+        viewport: domAnalysis.viewport,
+        // V26: surface in-page phase timings so the slow-snapshot warning
+        // upstream can call out the real bottleneck (primary querySelectorAll
+        // vs Tier-2 walk vs forEach extract). Optional — old callers ignore.
+        phaseTimings: debugStats?.phaseTimings,
       };
     } catch (error) {
       logger.warn('[PREVIEW_SESSION] Failed to get snapshot', {

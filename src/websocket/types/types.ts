@@ -25,6 +25,21 @@ export interface ClientToServerEvents {
   ) => void;
   'unsubscribe:chat': (data: { sessionId: string }) => void;
 
+  // Per-test-case chat subscription. Keyed by `testCaseId`, NOT a session
+  // id — the per-test-case session is lazy-created on first POST /chat,
+  // so the frontend has no session id to subscribe to when the editor
+  // opens. Server resolves the existing session (if any) at subscribe
+  // time and joins both `chat:tc:<testCaseId>` (always) and
+  // `chat:<sessionId>` (when the session already exists). New emits
+  // from the chat handlers always go to BOTH rooms when `testCaseId` is
+  // known, so the frontend doesn't need to re-subscribe after the first
+  // message creates the session row.
+  'subscribe:chat:testcase': (
+    data: { testCaseId: string },
+    callback?: (response: { ok: boolean; error?: string; sessionId?: string }) => void,
+  ) => void;
+  'unsubscribe:chat:testcase': (data: { testCaseId: string }) => void;
+
   // Preview subscriptions
   'subscribe:preview': (data: { previewSessionId: string }) => void;
   'unsubscribe:preview': (data: { previewSessionId: string }) => void;
@@ -251,6 +266,22 @@ export interface ServerToClientEvents {
     timestamp: string;
   }) => void;
 
+  // Per-step URL mismatch warning. Fires when the live preview URL differs
+  // (after origin+path normalization) from the URL captured at recording
+  // time for that step. Non-fatal — the run continues. Frontend uses this
+  // to show a yellow badge on the step row so the user can spot why a fail
+  // happened: "step recorded on /admin/users, ran on /". The most common
+  // cause is the user clicking around the preview between Apply All and
+  // recording the next batch, leaving step N+1's recorded fingerprint
+  // pointing at a page state that no longer exists at run time.
+  'preview:run:url-mismatch': (data: {
+    previewSessionId: string;
+    stepIndex: number;
+    stepId: string;
+    recordedUrl: string;
+    actualUrl: string;
+  }) => void;
+
   // Mobile editor session has expired (idle for IDLE_TTL_MS, or backend
   // detected the FE↔BE socket has gone away). Frontend should close the
   // editor modal, clear `intentTestCaseId` from the URL, toast the user,
@@ -341,6 +372,40 @@ export interface ServerToClientEvents {
     signal: 'url' | 'form' | 'both';
     url: string;
     suggestedDomain?: string;
+    timestamp: string;
+  }) => void;
+
+  /**
+   * Etap 1D.2 — Step exhausted the full resolver waterfall (compiled plan
+   * failed AND lint/LLM/vision failed). Frontend uses this to surface a
+   * "needs review" badge on the step plus a debug panel showing the
+   * persisted `failureEvidence` bundle.
+   *
+   * Distinct from `preview:step:apply:result { success: false }`:
+   *   - apply:result fires on EVERY failure including transient retries
+   *   - needs-review fires ONLY when the bundle was persisted to the step
+   *   - the bundle is the durable record (survives reload), the WS event
+   *     is just the realtime ping that "a new bundle is available"
+   */
+  'preview:step:needs-review': (data: {
+    previewSessionId: string;
+    stepId: string;
+    intentTestCaseId?: string;
+    /** Compact summary so the UI can show a toast without re-fetching. */
+    summary: {
+      lastError?: string;
+      totalAttempts?: number;
+      pageUrl: string;
+      /**
+       * V26 Batch A: top-level failure category — `wait_for_timeout` |
+       * `fake_success_guard` | `pre_click_label_mismatch` |
+       * `navigate_failed` | `resolver_exhausted` | `apply_threw` | etc.
+       * Lets the dashboard group "stuck steps" without parsing the
+       * full bundle. Optional / forward-compatible — old clients
+       * can ignore unknown values.
+       */
+      originatingStrategy?: string;
+    };
     timestamp: string;
   }) => void;
 
@@ -1289,6 +1354,25 @@ export interface PreviewRunStartRequest {
    * explicitly chooses when an active session is detected before Run.
    */
   authReset?: 'always' | 'never';
+  /**
+   * "Apply New Only" (April 2026): start execution at this step index
+   * instead of step 0, preserving the live preview state. Used when the
+   * user already ran Apply All on steps 0..N-1 and now wants to apply
+   * only the freshly-recorded steps N..end without re-running everything
+   * (faster, no auth wipe, runs against current preview state).
+   *
+   * When set:
+   *   - Backend skips goto(startUrl) — preview stays where it is
+   *   - Backend ignores authReset='always' (forced to 'never')
+   *   - Steps before the index are not executed but ARE saved to DB
+   *     alongside the new ones (single source of truth)
+   *
+   * The frontend pre-flight checks that current preview URL matches the
+   * recorded `pageUrl` of step at this index before sending. Backend
+   * trusts that check — unsafe values still won't crash the run, but
+   * step N may fail with a "page mismatch" badge from per-step URL diag.
+   */
+  startFromIndex?: number;
 }
 
 /**
@@ -1411,6 +1495,30 @@ export interface PreviewStepApplyResultPayload {
   highlight?: PreviewHighlight[];
   attempts?: number;
   timestamp: string;
+  /**
+   * Etap 1D.1 — Plan quality signal.
+   *
+   * Set when the apply produced a compiled plan whose live `count()`
+   * validation could not confirm any locator (every entry has
+   * `validated=false`). Frontend uses this to show a "⚠ unstable
+   * selectors" badge on the step so the user can re-record before
+   * relying on it for regression.
+   *
+   * Absent on the success path of a fully-validated plan, on apply
+   * failures (success=false carries `error` instead), and on apply
+   * paths that don't write a plan (soft-pass / non-targeting actions).
+   */
+  planQuality?: {
+    unverified: boolean;
+    /**
+     * Why the plan got flagged. Human-readable; not parsed by frontend.
+     * Examples:
+     *   - "validation_skipped"   — page was unavailable at build time
+     *   - "all_locators_dead"    — every count() returned 0
+     *   - "all_timeout"          — count() exceeded per-locator budget
+     */
+    reason?: string;
+  };
 }
 
 /**
@@ -2136,6 +2244,24 @@ export const createRoomName = (type: RoomType, id: string): string => {
   }
 
   return `${type}:${id.trim()}`;
+};
+
+/**
+ * Per-test-case chat room.
+ *
+ * Format: `chat:tc:<testCaseId>` — a `chat:` room with a `tc:` prefixed
+ * id. We deliberately do NOT add 'test-case-chat' to RoomType: that
+ * would change the public surface of `createRoomName` and ripple into
+ * many call sites in the test/preview/user code paths that have no
+ * relationship with test-case chat. Keeping the room as a `chat`-typed
+ * room with a sub-prefix means `emitToRoom('chat', ...)` patterns still
+ * work and Socket.IO room semantics are unchanged.
+ */
+export const createTestCaseChatRoomName = (testCaseId: string): string => {
+  if (!testCaseId || typeof testCaseId !== 'string' || testCaseId.trim().length === 0) {
+    throw new Error('Test case room id must be a non-empty string');
+  }
+  return `chat:tc:${testCaseId.trim()}`;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
