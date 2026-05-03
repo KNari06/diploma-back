@@ -108,9 +108,11 @@ export interface LiteElement {
    * marked OK but menu actually closed.
    *
    * PURE ADDITIVE: undefined when attr is missing — every existing
-   * consumer continues to work. Read by hybrid-semantic-weight as a
-   * tiebreaker, by intent-step-lint when step intent mentions
-   * 'open|close|expand|collapse|select|toggle'.
+   * consumer continues to work. Read by element-resolver candidateText
+   * (preview path), progress-evaluator widget-open + flip detection
+   * (LiteEngine path), state-diff fieldsToCheck for change tracking,
+   * post-action verifier probeState, and intent-step-lint when step
+   * intent mentions 'open|close|expand|collapse|select|toggle'.
    */
   dataState?: string;
   /**
@@ -354,11 +356,17 @@ export interface StateDiff {
   newConsoleErrors: string[];
   /** Network errors detected during action (e.g., HTTP 429/5xx). Already time-filtered by caller. */
   newNetworkErrors?: string[];
-  /** Semantic weight (State Change Index) - sum of weights of added/removed elements. Manus Style. */
+  /**
+   * @deprecated Stage 2D: HybridSemanticWeightCalculator is removed.
+   * This field is permanently 0 and read by nothing for decisions.
+   * Kept on shape only for back-compat with legacy auto-fill record
+   * synthesis (lite-engine.ts:2016) and test fixtures. Safe to drop
+   * in a follow-up sweep once those two callsites are migrated.
+   */
   semanticWeight: number;
-  /** Whether change is meaningful (>= 0.1, not noise like ads/counters). */
+  /** True iff progressSentiment is anything other than 'No Effect'. Filled by applyDeweightedSentiment. */
   meaningfulChange: boolean;
-  /** Whether change is significant (>= 0.5, successful state shift). */
+  /** True iff progressSentiment is 'Major Progress' / 'Significant Change' / 'Negative Change'. Filled by applyDeweightedSentiment. */
   significantChange: boolean;
   /** Progress sentiment for AI (Major Progress, Significant Change, Minor Change, No Effect, Negative Change). */
   progressSentiment: ProgressSentiment;
@@ -369,14 +377,15 @@ export interface StateDiff {
 }
 
 /**
- * Progress sentiment for AI communication (Manus Style)
- * Helps AI quickly understand what happened and adjust behavior
+ * Progress sentiment for AI communication. Computed deterministically
+ * by `applyDeweightedSentiment` in `analysis/progress-evaluator.ts`.
+ * See that module for the full decision tree.
  */
 export type ProgressSentiment =
-  | 'Major Progress'        // semanticWeight >= 0.5 OR URL changed OR goal-specific form appeared
-  | 'Significant Change'    // semanticWeight >= 0.5 OR network success without visual changes
-  | 'Minor Change'          // semanticWeight >= 0.1 && < 0.5 (meaningful but not significant)
-  | 'No Effect'             // semanticWeight < 0.1 (noise) AND no URL change AND no network success
+  | 'Major Progress'        // URL changed | widget opened | data-state flip closed→open
+  | 'Significant Change'    // successful mutating API response (no UI change required)
+  | 'Minor Change'          // ≥3 added/removed/changed elements (bulk DOM movement)
+  | 'No Effect'             // nothing meaningful moved (drives consecutiveNoEffectCount)
   | 'Negative Change';      // errors detected (page/console/network/validation)
 
 /**

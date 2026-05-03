@@ -25,7 +25,7 @@ import { FunnelAnalyzer, FunnelPhase } from './analysis/funnel-analyzer';
 import { GoalCompletionEvaluator } from './analysis/goal-completion-evaluator';
 import { GoalDetector } from './analysis/goal-detector';
 import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
-import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
+import { matchesKeyword } from './analysis/keyword-utils';
 import { extractPageCredentials, parseCredentialsFromResponse } from './analysis/page-credentials-extractor';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
 import { applyDeweightedSentiment, buildDeterministicSummary, isGoalRelevantElement } from './analysis/progress-evaluator';
@@ -77,7 +77,6 @@ export class LiteEngine {
   private flowStateDetector: FlowStateDetector; // ✅ Task #21: Multi-step flow tracking
   private currentFlowState: FlowState | null = null; // ✅ Task #21: Current flow state
   private traceWriter: LiteTraceWriter; // ✅ NEW: Always-on JSONL trace for debugging
-  private semanticWeightCalculator: HybridSemanticWeightCalculator; // ✅ NEW: Hybrid semantic weight (Manus Style)
   private pageWatcher: PageWatcher | null = null; // ✅ Phase A: Multi-tab/popup detection
   private startTime: number = 0;
   private adaptiveTimeouts: AdaptiveTimeoutConfig | null = null; // ✅ TASK 7: Adaptive timeouts based on site speed
@@ -228,7 +227,6 @@ export class LiteEngine {
     this.goalCompletionEvaluator = new GoalCompletionEvaluator(config.testId); // ✅ AI-based goal completion evaluator
     this.flowStateDetector = new FlowStateDetector(config.testId, config.goal); // ✅ Task #21: Initialize flow state detector
     this.traceWriter = new LiteTraceWriter({ testId: config.testId }); // ✅ NEW: Initialize trace writer
-    this.semanticWeightCalculator = new HybridSemanticWeightCalculator(config.goal, config.testId); // ✅ NEW: Initialize hybrid semantic weight calculator
 
     // Multi-Agent Brain: Initialize orchestrator if enabled
     if (LITE_ENGINE_FLAGS.enableMultiAgentBrain) {
@@ -1267,11 +1265,6 @@ export class LiteEngine {
     if (LITE_ENGINE_FLAGS.enableGoalExpander) {
       try {
         this.expandedGoal = await GoalExpander.expand(this.config.goal);
-        // Update semantic weight calculator with expanded goal
-        this.semanticWeightCalculator = new HybridSemanticWeightCalculator(
-          this.expandedGoal,
-          this.config.testId
-        );
         logger.info('[L2_INIT] GoalExpander initialized', {
           testId: this.config.testId,
           keywordCount: this.expandedGoal.allKeywords.size,
@@ -1279,8 +1272,16 @@ export class LiteEngine {
           language: this.expandedGoal.language,
         });
       } catch (error) {
+        // Synchronous throw before GoalExpander's internal fallback ran.
+        // Without an explicit assignment here, `this.expandedGoal`
+        // stayed null and silently disabled goal-relevance everywhere
+        // (isGoalRelevantElement, decorative-bulk gate, getTopRanked-
+        // Candidates, target-audit, prompt keyword cues). Fall back
+        // to the same tokenizer GoalExpander would have used.
+        this.expandedGoal = GoalExpander.getFallback(this.config.goal);
         logger.warn('[L2_INIT] GoalExpander failed, using fallback', {
           testId: this.config.testId,
+          fallbackKeywordCount: this.expandedGoal.allKeywords.size,
           error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -3068,7 +3069,6 @@ export class LiteEngine {
         if (LITE_ENGINE_FLAGS.enableFunnelAnalyzer) {
           this.previousFunnelPhase = this.currentFunnelPhase;
           this.currentFunnelPhase = FunnelAnalyzer.analyze(snapshotBefore.url, snapshotBefore.elements);
-          this.semanticWeightCalculator.updateFunnelPhase(this.currentFunnelPhase);
 
           if (FunnelAnalyzer.hasPhaseChanged(this.previousFunnelPhase, this.currentFunnelPhase)) {
             logger.info('[L2_FUNNEL] Phase changed', {
@@ -4182,7 +4182,6 @@ export class LiteEngine {
                 i
               );
               this.expandedGoal = refinedGoal;
-              this.semanticWeightCalculator.updateGoal(refinedGoal);
               this.lastGoalRefinementTime = now;
 
               logger.info('[L2_REFINE] Goal refined for new phase', {
@@ -4944,20 +4943,10 @@ export class LiteEngine {
       });
     }
 
-    // ✅ NEW: Clear semantic weight cache and log stats
-    const semanticStats = this.semanticWeightCalculator.getStats();
-    this.semanticWeightCalculator.clearCache();
+    // Snapshot pruner cleanup. Semantic weight calculator was removed
+    // entirely (Stage 2D) — progress sentiment is now deterministic in
+    // analysis/progress-evaluator.ts; no cache to flush, no stats to log.
     this.snapshotPruner?.clear();
-    logger.info('[LITE_ENGINE] Semantic weight stats', {
-      testId: this.config.testId,
-      cacheHits: semanticStats.cacheStats.hits,
-      cacheMisses: semanticStats.cacheStats.misses,
-      cacheSize: semanticStats.cacheStats.size,
-      aiCalls: semanticStats.aiCalls,
-      aiTimeouts: semanticStats.aiTimeouts,
-      errorElementsDetected: semanticStats.errorElementsDetected,
-      avgLatencyMs: semanticStats.aiCalls > 0 ? Math.round(semanticStats.totalLatencyMs / semanticStats.aiCalls) : 0,
-    });
 
     // ✅ NEW: Add end node to graph and get full graph
     // ✅ FIX: Finalization flag should already be set by emitCompletion, but ensure it here
@@ -5531,7 +5520,6 @@ export class LiteEngine {
    */
   private async hardReload(): Promise<LiteSnapshot> {
     try {
-      this.semanticWeightCalculator.clearCache();
       this.state.clearVisualSignatures();
       this.snapshotPruner?.clear();
     } catch {

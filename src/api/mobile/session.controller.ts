@@ -1753,7 +1753,11 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         if (stepResult?.compiledPlan && intentTestCaseId) {
           const PROVEN: ReadonlySet<string> = new Set(['compiled', 'compiled_fast_path', 'cache']);
           const planIsProven = !!stepResult.resolvedVia && PROVEN.has(stepResult.resolvedVia);
-          const shouldPersist = stepResult.success === true || planIsProven;
+          // Runner can mark a plan stale post-dispatch (VTE mismatch /
+          // foreground mismatch). Skip persistence in that case — saving
+          // a "successful dispatch but wrong element" plan locks in the bug.
+          const planIsStale = !!stepResult.planStaleReason;
+          const shouldPersist = !planIsStale && (stepResult.success === true || planIsProven);
           if (shouldPersist) {
             try {
               const { IntentTestCaseService } = await import(

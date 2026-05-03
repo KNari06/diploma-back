@@ -215,8 +215,6 @@ export const AI_TASK_MODELS = {
   testCaseResolution: AI_MODELS.fast,
   /** Test visualization */
   testVisualization: AI_MODELS.fast,
-  /** Semantic weight classification */
-  semanticWeight: AI_MODELS.fast,
   /** AI helpers (generic) */
   helpers: AI_MODELS.fast,
   /** Credit calculations */

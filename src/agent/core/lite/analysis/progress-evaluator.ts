@@ -47,7 +47,7 @@
 
 import type { LiteElement, ProgressSentiment, StateDiff } from '../lite-types';
 import type { ExpandedGoal } from './goal-expander';
-import { isErrorElement, matchesKeyword } from './hybrid-semantic-weight';
+import { isErrorElement, matchesKeyword } from './keyword-utils';
 
 // Threshold: count of added+removed+changed elements that promotes a
 // "did something" to 'Minor Change'. Hand-picked from observation:

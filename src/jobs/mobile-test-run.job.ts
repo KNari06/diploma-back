@@ -702,6 +702,17 @@ export class MobileTestRunJobHandler {
 
       for (const result of runResult.steps) {
         if (!result.compiledPlan) continue;
+        // Runner can flag a plan as stale post-dispatch (VTE caught text in
+        // wrong field, or foreground mismatch with no relaunch). Skip
+        // persistence — the plan is "successful at dispatch level" but
+        // points at the wrong element. Saving it locks in the bug.
+        if (result.planStaleReason) {
+          logger.debug('[MOBILE-TEST] Skipping plan persist — runner flagged stale', {
+            stepId: result.stepId,
+            reason: result.planStaleReason,
+          });
+          continue;
+        }
         const planIsProven =
           result.resolvedVia !== undefined && PROVEN_RESOLVED_VIA.has(result.resolvedVia);
         if (!result.success && !planIsProven) continue;

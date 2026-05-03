@@ -265,8 +265,13 @@ export class MobileStepApplyService {
     ]);
     const planIsProven = !!stepResult?.resolvedVia
       && PROVEN_RESOLVED_VIA.has(stepResult.resolvedVia);
+    // Runner-flagged stale plan (VTE mismatch / foreground mismatch) —
+    // dispatch reported success but evidence contradicts the resolved
+    // element. Don't carry such a plan onto appliedStep.compiled, otherwise
+    // the next run's fast-path locks in the wrong element.
+    const planIsStale = !!stepResult?.planStaleReason;
     const shouldEmitAppliedStep = success
-      || (!!stepResult?.compiledPlan && planIsProven);
+      || (!!stepResult?.compiledPlan && planIsProven && !planIsStale);
 
     const appliedStep = shouldEmitAppliedStep
       ? {
@@ -283,7 +288,11 @@ export class MobileStepApplyService {
           },
           // Carry the runner-built compiled plan onto the IntentStep. Next run's
           // apply will short-circuit the LLM pipeline if this plan still matches.
-          ...(stepResult!.compiledPlan ? { compiled: stepResult!.compiledPlan } : {}),
+          // Strip the plan when the runner flagged it stale post-dispatch even
+          // though `success === true` — saving it would re-introduce the bug.
+          ...(stepResult!.compiledPlan && !planIsStale
+            ? { compiled: stepResult!.compiledPlan }
+            : {}),
         }
       : undefined;
 
