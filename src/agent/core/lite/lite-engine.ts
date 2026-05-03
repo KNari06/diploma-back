@@ -1117,6 +1117,7 @@ export class LiteEngine {
         stallErrorThreshold: LITE_ENGINE_FLAGS.timeoutGovernorStallErrorThreshold,
         stallOutcomeThreshold: LITE_ENGINE_FLAGS.timeoutGovernorStallOutcomeThreshold,
         stallAccomplishmentIters: LITE_ENGINE_FLAGS.timeoutGovernorStallAccomplishmentIters,
+        blockerPersistMs: LITE_ENGINE_FLAGS.timeoutGovernorBlockerPersistMs,
       });
     }
 
@@ -3995,6 +3996,27 @@ export class LiteEngine {
             // forward; same-site rule still references the test's
             // origin family.
             this.executor.setStartingUrl(this.config.url, this.config.testId);
+            // P0 fix — listener-leak hardening: detach the previous
+            // collectors BEFORE constructing new ones for the switched
+            // page. Without dispose, the old `console` listener stayed
+            // bound to the old page object, accumulating handlers
+            // across every popup/new-tab the test opened. Same risk
+            // applies to NetworkTracker (its stopTracking() is the
+            // equivalent dispose).
+            try {
+              this.consoleCollector.dispose();
+            } catch (err) {
+              logger.debug('[LITE_ENGINE] consoleCollector.dispose on page-switch failed', {
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+            try {
+              this.networkTracker.stopTracking();
+            } catch (err) {
+              logger.debug('[LITE_ENGINE] networkTracker.stopTracking on page-switch failed', {
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
             this.networkTracker = new NetworkTracker(this.page);
             this.consoleCollector = new ConsoleCollector(this.page);
 
@@ -5003,6 +5025,37 @@ export class LiteEngine {
 
     // ✅ HARDENING: Dispose PageWatcher to prevent listener leaks
     this.pageWatcher?.dispose();
+
+    // P0 fix — Console + Network listener leak. Without explicit
+    // dispose at test end the underlying handlers stayed bound to
+    // the page object until Playwright closed it. Test-case-executor
+    // mode reuses pages → handlers accumulated across runs.
+    try {
+      this.consoleCollector?.dispose();
+    } catch (err) {
+      logger.debug('[LITE_ENGINE] consoleCollector.dispose on test-end failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+    try {
+      this.networkTracker?.stopTracking();
+    } catch (err) {
+      logger.debug('[LITE_ENGINE] networkTracker.stopTracking on test-end failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // P2 fix — explicit observer-cache + working-memory clear at test
+    // end. Orchestrator instance is per-test so GC collects it later,
+    // but explicit clear avoids sticky data if a future caller
+    // accidentally reuses the orchestrator.
+    try {
+      this.multiAgentOrchestrator?.clearCache();
+    } catch (err) {
+      logger.debug('[LITE_ENGINE] multiAgentOrchestrator.clearCache on test-end failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
 
     // ✅ NEW: Clear semantic weight cache and log stats
     const semanticStats = this.semanticWeightCalculator.getStats();

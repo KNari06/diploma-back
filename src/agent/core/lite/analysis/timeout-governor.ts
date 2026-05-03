@@ -130,6 +130,14 @@ export interface TimeoutGovernorConfig {
   stallErrorThreshold: number;
   stallOutcomeThreshold: number;
   stallAccomplishmentIters: number;
+  /**
+   * P2 fix — blocker-persist gate threshold. When a known blocker
+   * (e.g. captcha, 2FA, file-upload prompt) has been outstanding for
+   * longer than this duration, fire the `blocker_decision` gate to
+   * trigger an AI deadline-extension narrative. Default 30000ms (30s)
+   * — was hardcoded inline at line 532.
+   */
+  blockerPersistMs: number;
 }
 
 /** Extension log entry */
@@ -528,8 +536,8 @@ export class TimeoutGovernor {
       }
     }
 
-    // Gate 3: Blocker decision — known blocker persisting >30s
-    if (input.currentBlocker && input.blockerDurationMs > 30000) {
+    // Gate 3: Blocker decision — known blocker persisting > blockerPersistMs
+    if (input.currentBlocker && input.blockerDurationMs > this.config.blockerPersistMs) {
       const blockerKey = `blocker_${input.currentBlocker.replace(/\s+/g, '_').toLowerCase()}`;
       if (!this.gatesFired.has(blockerKey)) {
         this.gatesFired.set(blockerKey, 1);

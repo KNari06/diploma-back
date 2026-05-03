@@ -311,15 +311,34 @@ export class NetworkTracker {
     // Remove from tracked after processing
     this.trackedRequests.delete(url);
 
-    // P1: Cleanup old tracked requests and captured bodies to prevent memory leak
-    if (this.trackedRequests.size > 1000) {
-      const now = Date.now();
-      for (const [trackedUrl, tracked] of this.trackedRequests.entries()) {
-        if (now - tracked.timestamp > 30000) { // 30 seconds
-          this.trackedRequests.delete(trackedUrl);
-          this.capturedRequestBodies.delete(trackedUrl);
-        }
+    // P1 fix — proactive cleanup. Previously only ran when size > 1000;
+    // now runs each response so memory stays bounded under any test
+    // length. The 30s TTL still applies — recent in-flight requests
+    // are kept for await-network-idle correctness, only stale-and-
+    // already-completed entries get evicted.
+    const now = Date.now();
+    for (const [trackedUrl, tracked] of this.trackedRequests.entries()) {
+      if (now - tracked.timestamp > 30000) { // 30 seconds
+        this.trackedRequests.delete(trackedUrl);
+        this.capturedRequestBodies.delete(trackedUrl);
       }
+    }
+
+    // P1 fix — rotating buffer cap on accumulator arrays. Previously
+    // these grew unbounded for the entire test run. With 100+ iter
+    // tests doing dozens of API calls each, easy to hit 5000+ entries.
+    // Cap = 500 is more than enough for downstream consumers
+    // (StateDiffComputer reads only THIS iteration's slice, not
+    // historical). When over cap, drop the oldest entries.
+    const MAX_BUFFER = 500;
+    if (this.successfulResponses.length > MAX_BUFFER) {
+      this.successfulResponses.splice(0, this.successfulResponses.length - MAX_BUFFER);
+    }
+    if (this.networkErrors.length > MAX_BUFFER) {
+      this.networkErrors.splice(0, this.networkErrors.length - MAX_BUFFER);
+    }
+    if (this.validationErrors.length > MAX_BUFFER) {
+      this.validationErrors.splice(0, this.validationErrors.length - MAX_BUFFER);
     }
   };
 
