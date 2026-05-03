@@ -808,8 +808,61 @@ export class IntentTestCaseService {
           });
           steps.push(appliedStep);
         } else {
-          // Replace the step entirely with appliedStep
-          steps[stepIndex] = appliedStep;
+          // Replace, but PRESERVE backend-owned metadata that the new apply
+          // legitimately doesn't carry. Without this merge a failed apply
+          // (no compiled emitted), or a planStaleReason apply (compiled
+          // intentionally stripped — see mobile-step-apply.service.ts), or
+          // a vision-coordinates apply (no node → no plan) wipes the
+          // perfectly-good compiled plan that previous successful applies
+          // wrote to DB. Next regression run then re-pays full LLM cost
+          // for a step that already had a working fast-path plan.
+          //
+          // Mirrors the merge logic in update() (lines 365-393) so the
+          // preview-apply path can't degrade what a PATCH would preserve.
+          //
+          // Replace semantics when the new apply DID emit the field — fresh
+          // is always better than stale (newer fingerprint, refreshed
+          // bindingHints from runtime, etc.).
+          const existing = steps[stepIndex];
+          const merged: IntentStep = { ...appliedStep };
+
+          // Compiled plan: three cases
+          //   1. New is missing  → preserve existing (no-info case)
+          //   2. Both present    → keep stronger one (avoid downgrade — see
+          //      shouldUpgradeCompiledPlan; "stronger" means new strategy
+          //      type or higher-ranked primary). Without this guard a
+          //      lint that happened to return only label_exact would
+          //      overwrite a previously-recorded resource_id plan.
+          //   3. Existing missing → replace as usual (fresh wins)
+          if (!appliedStep.compiled && existing.compiled) {
+            merged.compiled = existing.compiled;
+          } else if (appliedStep.compiled && existing.compiled) {
+            // Lazy import to keep this service free of mobile-specific deps
+            // when the test case isn't a mobile one. Tree-shakes for web.
+            const { shouldUpgradeCompiledPlan } = await import('@/services/mobile/mobile-step-apply.service');
+            const upgrade = shouldUpgradeCompiledPlan(
+              existing.compiled as any,
+              appliedStep.compiled as any,
+            );
+            if (!upgrade) {
+              merged.compiled = existing.compiled;
+            }
+          }
+          if (!appliedStep.evidence && existing.evidence) {
+            merged.evidence = existing.evidence;
+          }
+          if (
+            (!appliedStep.bindingHints || Object.keys(appliedStep.bindingHints).length === 0)
+            && existing.bindingHints
+            && Object.keys(existing.bindingHints).length > 0
+          ) {
+            merged.bindingHints = existing.bindingHints;
+          }
+          if (!appliedStep.recordedFingerprint && existing.recordedFingerprint) {
+            merged.recordedFingerprint = existing.recordedFingerprint;
+          }
+
+          steps[stepIndex] = merged;
         }
 
         // Note: auto-wait injection removed here (V8). Auto-waits are now injected:
@@ -891,13 +944,56 @@ export class IntentTestCaseService {
         const steps: IntentStep[] = row.steps_json || [];
         let updated = 0;
 
-        // Merge all enriched steps into the array
+        // Merge all enriched steps into the array.
+        //
+        // Three concerns layered on top of plain replacement:
+        //
+        //   (a) preserve-on-missing: a regression-run apply that intentionally
+        //       strips `compiled` (VTE mismatch with planStaleReason, vision-
+        //       coordinates result with no node-based plan, etc.) must not
+        //       wipe the previous run's working plan.
+        //
+        //   (b) avoid plan downgrade: when both old and new plans exist, keep
+        //       the stronger one (resource_id beats label_exact, etc.). A
+        //       single bad regression run could otherwise replace a stable
+        //       resource_id-keyed plan with a label_exact-only plan that
+        //       breaks on the next localization push.
+        //
+        //   (c) preserve-on-missing for the other backend-owned fields
+        //       (evidence / bindingHints / recordedFingerprint) — same reason.
+        //
+        // Mirrors updateStepFromPreviewApply above so REST apply and
+        // regression run write the same shape to DB.
+        const { shouldUpgradeCompiledPlan } = await import('@/services/mobile/mobile-step-apply.service');
         for (let i = 0; i < steps.length; i++) {
           const enriched = enrichedSteps.get(steps[i].id);
-          if (enriched) {
-            steps[i] = enriched;
-            updated++;
+          if (!enriched) continue;
+          const existing = steps[i];
+          const merged: IntentStep = { ...enriched };
+
+          // Compiled plan upgrade gate.
+          if (!enriched.compiled && existing.compiled) {
+            merged.compiled = existing.compiled;
+          } else if (enriched.compiled && existing.compiled) {
+            const upgrade = shouldUpgradeCompiledPlan(
+              existing.compiled as any,
+              enriched.compiled as any,
+            );
+            if (!upgrade) merged.compiled = existing.compiled;
           }
+          if (!enriched.evidence && existing.evidence) merged.evidence = existing.evidence;
+          if (
+            (!enriched.bindingHints || Object.keys(enriched.bindingHints).length === 0)
+            && existing.bindingHints
+            && Object.keys(existing.bindingHints).length > 0
+          ) {
+            merged.bindingHints = existing.bindingHints;
+          }
+          if (!enriched.recordedFingerprint && existing.recordedFingerprint) {
+            merged.recordedFingerprint = existing.recordedFingerprint;
+          }
+          steps[i] = merged;
+          updated++;
         }
 
         if (updated === 0) {

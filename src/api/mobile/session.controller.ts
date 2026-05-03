@@ -1654,10 +1654,28 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
             const centerX = Math.round(bb.x + bb.width / 2);
             const centerY = Math.round(bb.y + bb.height / 2);
 
+            // Forward `intent` AND `coordsConfidence` so the runner's
+            // smartResolve can re-validate when the lint confidence is
+            // below the trust threshold (0.9). Sequential runs accumulate
+            // small drift over many steps — without this each step's
+            // command bypasses the runner's safety net (no-intent → early
+            // passthrough), and a low-confidence lint silently dispatches
+            // to coordinates that may already be stale.
+            // Mirrors the same fix in MobileStepApplyService Path A.
+            const coordsConfidence = typeof lintResult.confidence === 'number'
+              ? lintResult.confidence
+              : undefined;
+            const coordParams: Record<string, unknown> = {
+              x: centerX,
+              y: centerY,
+              intent: description,
+            };
+            if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
+
             const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
 
             if (rawType === 'type' || rawType === 'fill') {
-              commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
+              commands.push({ type: 'tap', params: { ...coordParams } });
               if (step.value) {
                 commands.push({
                   type: 'type_text',
@@ -1669,8 +1687,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                     // and the first characters get dropped — VTE then reads
                     // back stale text and burns two retries typing the same
                     // wrong value.
-                    x: centerX,
-                    y: centerY,
+                    ...coordParams,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
                   },
@@ -1680,7 +1697,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                 }
               }
             } else {
-              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { x: centerX, y: centerY } });
+              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams } });
             }
 
             await client.executeBatchCommands(sessionId, commands);
