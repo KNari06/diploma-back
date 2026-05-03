@@ -9,6 +9,9 @@ const MAX_CONTEXTS_THRESHOLD = 15;
 
 export class QueueMonitor {
   private intervalId: NodeJS.Timeout | null = null;
+  /** Edge-trigger for the RAM guard log so we don't spam every check
+   *  tick while memory stays above the threshold. */
+  private ramGuardActive = false;
 
   start(worker: Worker, queue: Queue): void {
     if (this.intervalId) return;
@@ -61,10 +64,19 @@ export class QueueMonitor {
     const min = env.TEST_RUN_CONCURRENCY_MIN;
     const max = env.TEST_RUN_CONCURRENCY_MAX;
 
-    // RAM guard — drop to min if memory is too high
+    // RAM guard — drop to min if memory is too high. Edge-triggered:
+    // log once on activation and once on release. Without this we'd spam
+    // a warn every SCALE_CHECK_INTERVAL_MS while memory stays high.
     if (memPercent > env.SCALE_MAX_MEMORY_PERCENT) {
-      logger.warn(`[QueueMonitor] RAM guard triggered (${memPercent.toFixed(1)}%), holding at min concurrency`);
+      if (!this.ramGuardActive) {
+        this.ramGuardActive = true;
+        logger.warn(`[QueueMonitor] RAM guard ON (${memPercent.toFixed(1)}%) — holding at min concurrency`);
+      }
       return min;
+    }
+    if (this.ramGuardActive) {
+      this.ramGuardActive = false;
+      logger.info(`[QueueMonitor] RAM guard OFF (${memPercent.toFixed(1)}%) — resuming normal scaling`);
     }
 
     // Tiered scaling based on queue depth
