@@ -397,23 +397,6 @@ export const LITE_ENGINE_FLAGS = {
    *   - Vision escalation when isDOMWeak
    */
   enableHybridExecutor: false,
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // STAGE 2: LITE ENGINE DE-WEIGHTING
-  // ═══════════════════════════════════════════════════════════════════════════
-  /**
-   * Replace HybridSemanticWeightCalculator (hand-tuned numeric weights
-   * with thresholds 0.5/0.1, magic multipliers 1.5/1.2/0.6, per-iteration
-   * AI audit) with deterministic signals from StateDiff.
-   *
-   * When true: progressSentiment + Goal-Oriented Summary computed by
-   *   `analysis/progress-evaluator.ts` (pure synchronous functions).
-   *   Saves a gemini-flash-lite call per iteration. No magic thresholds.
-   *
-   * When false (default): legacy HybridSemanticWeightCalculator path
-   *   continues unchanged. Roll out via env LITE_ENGINE_DEWEIGHTED=1.
-   */
-  enableDeweightedProgress: process.env.LITE_ENGINE_DEWEIGHTED === '1',
 } as const;
 
 /**

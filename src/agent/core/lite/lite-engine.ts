@@ -28,7 +28,7 @@ import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
 import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
 import { extractPageCredentials, parseCredentialsFromResponse } from './analysis/page-credentials-extractor';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
-import { applyDeweightedSentiment, buildDeterministicSummary } from './analysis/progress-evaluator';
+import { applyDeweightedSentiment, buildDeterministicSummary, isGoalRelevantElement } from './analysis/progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateDriftAuditor } from './analysis/state-drift-auditor';
 import { StateValidator } from './analysis/state-validator';
@@ -477,24 +477,17 @@ export class LiteEngine {
       elementName: targetElement.name?.slice(0, 30),
     });
 
-    // Get top candidates ranked by composite score (legacy) or
-    // 4-bucket boolean (deweighted). When deweighted, the function
-    // may return up to HARD_CAP=10 — score field carries bucket index.
+    // Get top candidates via 4-bucket boolean rank. May return up to
+    // HARD_CAP=10 elements; score field carries the bucket index (0..3).
     const topCandidates = this.getTopRankedCandidates(snapshot, command.action, 5);
 
-    // Tell TargetAudit which scoring scheme it's looking at — without
-    // this, the LLM misreads bucket score=3 as "low confidence"
-    // (legacy scores went 5–15). See target-audit.ts H2 legend.
-    const scoringMode: 'legacy' | 'deweighted' =
-      LITE_ENGINE_FLAGS.enableDeweightedProgress ? 'deweighted' : 'legacy';
-
-    // Ask AI to pick correct ref
+    // Ask AI to pick correct ref. TargetAudit defaults scoringMode to
+    // 'deweighted' so the prompt prints the bucket-score legend.
     const auditResult = await TargetAudit.audit(
       command,
       topCandidates,
       this.expandedGoal,
       this.currentFunnelPhase,
-      { scoringMode },
     );
 
     if (auditResult.correctedRef && auditResult.correctedRef !== command.ref) {
@@ -636,115 +629,52 @@ export class LiteEngine {
       }
     });
 
-    // Two ranking strategies gated by enableDeweightedProgress.
+    // 3-bucket boolean rank for L4 ref-correction candidates.
     //
-    // Legacy (default): composite score
-    //   heuristic (0..1, 13 hand-tuned rules) × funnel (0.6/1.0/1.2)
-    //   × zIndex (1.0/1.1/1.2) × goalRelevance (1.0/1.5)
-    //   Decisive: top-K by float score. Magic constants throughout.
+    //   bucket 3: top-most + goal-relevant (strongest candidate)
+    //   bucket 2: top-most only             (visible but generic)
+    //   bucket 1: goal-relevant but covered (covering overlay may be unrelated)
+    //   bucket 0: neither                   (last resort)
     //
-    // Deweighted: 3-level boolean bucket
-    //   bucket = (isTopMostAtCenter ? 2 : 0)
-    //          + (goalRelevant ? 1 : 0)
-    //   Tied candidates kept in original snapshot order. The actual
-    //   ranking happens inside TargetAudit (LLM call) — this function
-    //   only PRE-FILTERS the candidate set so the LLM doesn't get all
-    //   500 elements. Buckets 3..0 → highest-confidence "I should be
-    //   asked about" goes first.
+    // The actual ranking inside the bucket happens in TargetAudit (LLM
+    // call). This function only PRE-FILTERS so the LLM doesn't get all
+    // 500 elements. On dense pages many candidates collide in bucket 3;
+    // we return ALL of bucket 3 up to HARD_CAP=10 (matches target-audit
+    // prompt cap) so the LLM never misses the right node behind a
+    // stable-sort DOM-order tie.
     //
-    // No `score` field: legacy callers accept the type via
-    // `breakdown` being optional in RankedCandidate. The score is
-    // synthesised as the bucket index (3..0) for shape compatibility
-    // with TargetAudit + tracing.
-    if (LITE_ENGINE_FLAGS.enableDeweightedProgress) {
-      const scored: RankedCandidate[] = eligible.map(el => {
-        const isTopMost = el.isTopMostAtCenter === true;
-        const goalRelevant = this.checkElementRelevance(el);
-        // Bucket 3: top-most + goal-relevant. Strongest candidate.
-        // Bucket 2: top-most only. Visible but generic.
-        // Bucket 1: goal-relevant but covered. May still be right
-        //           target if covering layer is unrelated overlay.
-        // Bucket 0: neither. Last resort.
-        const bucket = (isTopMost ? 2 : 0) + (goalRelevant ? 1 : 0);
-        return {
-          ref: el.ref,
-          name: el.name || '',
-          tag: el.tag,
-          score: bucket,
-          breakdown: {
-            heuristic: goalRelevant ? 1 : 0,
-            funnelMultiplier: 1,
-            zIndexBoost: isTopMost ? 1 : 0,
-            goalRelevance: goalRelevant ? 1 : 0,
-          },
-        };
-      });
-      // Stable sort by bucket DESC. Keep insertion order on ties so
-      // upstream snapshot order is preserved (DOM source order is a
-      // reasonable secondary signal for "which one is more visible
-      // first" without weights).
-      const sorted = scored
-        .map((c, idx) => ({ c, idx }))
-        .sort((a, b) => b.c.score - a.c.score || a.idx - b.idx)
-        .map(x => x.c);
-
-      // Fix 1 — densly-laid-page rescue. With only 4 buckets, many
-      // candidates collide in the max bucket on real pages (juz40
-      // toolbar: 8+ icons all top-most and goal-relevant). Slicing to
-      // `count=5` after a stable sort means we silently keep the first
-      // 5 in DOM order — and the right one might be #6. Instead:
-      //   - if max bucket fits within the LLM's token budget (HARD_CAP)
-      //     return ALL of it so the LLM never misses the right node
-      //   - otherwise pad down from next bucket until `count` met
-      // HARD_CAP=10 chosen to match `target-audit.ts` Fix 1 prompt cap
-      // (we expand `slice(0, 5)` → `slice(0, 10)` there too).
-      const HARD_CAP = 10;
-      if (sorted.length === 0) return sorted;
-      const maxBucketScore = sorted[0].score;
-      const inMaxBucket = sorted.filter(c => c.score === maxBucketScore);
-      if (inMaxBucket.length >= count) {
-        return inMaxBucket.slice(0, HARD_CAP);
-      }
-      // Max bucket smaller than `count` — padding down preserves at
-      // least `count` candidates while still front-loading the best
-      // bucket. Capped at HARD_CAP so prompts don't blow up on pages
-      // where buckets are evenly distributed.
-      return sorted.slice(0, Math.min(Math.max(count, inMaxBucket.length), HARD_CAP));
-    }
-
-    // Legacy path — exact prior behaviour. Composite score with
-    // hand-tuned multipliers.
+    // Tied candidates keep insertion (DOM source) order — reasonable
+    // secondary signal without numeric weights.
     const scored: RankedCandidate[] = eligible.map(el => {
-      const heuristicResult = this.semanticWeightCalculator.calculateHeuristic(el);
-      const heuristicWeight = heuristicResult.weight;
-
-      const elementCategory = FunnelAnalyzer.categorizeElement(el);
-      const funnelMultipliers = FunnelAnalyzer.getMultipliers(this.currentFunnelPhase);
-      const funnelMultiplier = funnelMultipliers[elementCategory] ?? 1.0;
-
-      const zIndexBoost = el.isTopMostAtCenter ? 1.2 : (el.computedZIndex ?? 0) > 0 ? 1.1 : 1.0;
-      const goalRelevance = this.checkElementRelevance(el) ? 1.5 : 1.0;
-
-      const score = heuristicWeight * funnelMultiplier * zIndexBoost * goalRelevance;
-
+      const isTopMost = el.isTopMostAtCenter === true;
+      const goalRelevant = this.checkElementRelevance(el);
+      const bucket = (isTopMost ? 2 : 0) + (goalRelevant ? 1 : 0);
       return {
         ref: el.ref,
         name: el.name || '',
         tag: el.tag,
-        score,
+        score: bucket,
         breakdown: {
-          heuristic: heuristicWeight,
-          funnelMultiplier,
-          zIndexBoost,
-          goalRelevance,
+          heuristic: goalRelevant ? 1 : 0,
+          funnelMultiplier: 1,
+          zIndexBoost: isTopMost ? 1 : 0,
+          goalRelevance: goalRelevant ? 1 : 0,
         },
       };
     });
+    const sorted = scored
+      .map((c, idx) => ({ c, idx }))
+      .sort((a, b) => b.c.score - a.c.score || a.idx - b.idx)
+      .map(x => x.c);
 
-    // Sort by score descending, take top N
-    return scored
-      .sort((a, b) => b.score - a.score)
-      .slice(0, count);
+    const HARD_CAP = 10;
+    if (sorted.length === 0) return sorted;
+    const maxBucketScore = sorted[0].score;
+    const inMaxBucket = sorted.filter(c => c.score === maxBucketScore);
+    if (inMaxBucket.length >= count) {
+      return inMaxBucket.slice(0, HARD_CAP);
+    }
+    return sorted.slice(0, Math.min(Math.max(count, inMaxBucket.length), HARD_CAP));
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -4159,79 +4089,34 @@ export class LiteEngine {
           this.config.goal // ✅ NEW: Goal for dynamic semantic weight priority
         );
 
-        // 10.1 Enrich diff with sentiment + Goal-Oriented Summary.
+        // 10.1 Enrich diff with sentiment + Goal-Oriented Summary —
+        // deterministic synchronous path.
         //
-        // Two paths gated by LITE_ENGINE_FLAGS.enableDeweightedProgress:
+        // Reads ONLY structural StateDiff fields (urlChanged, errors,
+        // addedElements, successfulApiResponses, changedElements with
+        // dataState flips for Radix/shadcn/Vaul). No LLM, no weights,
+        // no per-iteration timeout. See analysis/progress-evaluator.ts.
         //
-        //   (a) DEFAULT — legacy HybridSemanticWeightCalculator.enrichWithAI:
-        //       hand-tuned numeric heuristics + per-iteration gemini-flash-
-        //       lite call (5s timeout, falls back to baseDiff on failure).
-        //       Decisive thresholds: totalWeight >= 0.5, >= 0.1.
-        //
-        //   (b) DEWEIGHTED — pure synchronous deterministic evaluator
-        //       (analysis/progress-evaluator.ts). Reads ONLY structural
-        //       StateDiff fields (urlChanged, errors, addedElements,
-        //       successfulApiResponses). No LLM, no weights, no per-
-        //       iteration timeout. Sentiment matches boolean signals;
-        //       goal-relevance is deterministic keyword token-match.
-        //
-        // FAILURE SEMANTICS (subtle):
-        //   Legacy enrichWithAI throw/timeout → enrichedDiff = baseDiff →
-        //   progressSentiment defaults to 'No Effect' from
-        //   state-diff.ts:119 → consecutiveNoEffectCount increments →
-        //   max 5 consecutive aborts the run. So legacy is biased toward
-        //   "abort early on any AI hiccup." The deweighted path
-        //   eliminates this bias because computeProgressSentiment cannot
-        //   throw / time out.
-        const removedElements = snapshotBefore.elements.filter(el => baseDiff.removedRefs.includes(el.ref));
-        let enrichedDiff: StateDiff;
-        let goalOrientedSummary: string | null = null;
-
-        if (LITE_ENGINE_FLAGS.enableDeweightedProgress) {
-          // (b) Pure deterministic path. No await — synchronous.
-          // Compute sentiment from base structural signals and embed it
-          // back into the diff so downstream callsites (4046/4084/4156/
-          // 4173/4179) read the same `progressSentiment` shape.
-          // Pass expandedGoal so:
-          //   - decorative-bulk gate (Fix 2 in progress-evaluator.ts)
-          //     can demote pure decorative flood (e.g. clicking
-          //     Reviews/FAQ when goal is unrelated) to 'No Effect'.
-          //   - data-state flip detection (Fix C1) elevates Radix
-          //     Dialog/Popover/Menu opens to Major Progress.
-          //   - meaningfulChange / significantChange are set
-          //     consistently with sentiment (Fix C2/C3 — without this,
-          //     state-diff.ts:formatForAI prints "(Meaningful: false,
-          //     Significant: false)" even on Major Progress and
-          //     poisons the prompt).
-          enrichedDiff = applyDeweightedSentiment(baseDiff, this.expandedGoal ?? null);
-          goalOrientedSummary = buildDeterministicSummary(enrichedDiff, this.expandedGoal ?? null);
-          // `removedElements` is only consumed by enrichWithAI (legacy
-          // category enrichment). Pure path doesn't need it; keep var
-          // to preserve identical lexical scope for the rest of the
-          // iteration block (validator, state diff persistence, etc.).
-          void removedElements;
-        } else {
-          // (a) Legacy path — exact prior behaviour.
-          try {
-            const AI_ENRICHMENT_TIMEOUT_MS = 5000;
-            const enrichedResult = await Promise.race([
-              this.semanticWeightCalculator.enrichWithAI(baseDiff, removedElements),
-              new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('AI enrichment timeout')), AI_ENRICHMENT_TIMEOUT_MS)
-              ),
-            ]);
-            enrichedDiff = enrichedResult;
-            goalOrientedSummary = this.semanticWeightCalculator.buildGoalOrientedSummary(enrichedResult);
-          } catch (enrichmentError) {
-            logger.warn('[LITE_ENGINE] AI enrichment failed, using base diff', {
-              testId: this.config.testId,
-              iteration: i,
-              error: enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError),
-            });
-            enrichedDiff = baseDiff;
-            goalOrientedSummary = null;
-          }
-        }
+        // Side benefits over the previous AI-enrichment approach:
+        //   - No 5s timeout window per iteration.
+        //   - No false-abort on Gemini rate-limit (legacy fell back to
+        //     `'No Effect'` → consecutiveNoEffectCount++ → 5 strikes
+        //     killed otherwise-fine runs).
+        //   - meaningfulChange / significantChange set truthful from
+        //     sentiment (Fix C2/C3) so state-diff.formatForAI doesn't
+        //     poison prompts with "(Meaningful: false, Significant:
+        //     false)" on Major Progress.
+        //   - Radix/shadcn data-state flips elevate to Major Progress
+        //     (Fix C1) — closes the canonical "menu opened, agent
+        //     thinks nothing happened" failure mode.
+        //   - Decorative-bulk gate demotes pure-noise floods (Reviews
+        //     tab clicked on "buy iPhone" goal) to 'No Effect' so the
+        //     stuck counter actually triggers.
+        const enrichedDiff = applyDeweightedSentiment(baseDiff, this.expandedGoal ?? null);
+        const goalOrientedSummary: string | null = buildDeterministicSummary(
+          enrichedDiff,
+          this.expandedGoal ?? null,
+        );
 
         // ✅ Store for next iteration prompt (Secret Sauce for Core Brain)
         this.lastGoalOrientedSummary = goalOrientedSummary;
@@ -4528,18 +4413,20 @@ export class LiteEngine {
 
         // ═══════════════════════════════════════════════════════════════════════
         // ═══════════════════════════════════════════════════════════════════════
-        // WORKSTREAM C: Record focused semantic metrics (goal-relevant + high-weight count)
+        // WORKSTREAM C: Record focused semantic metrics (goal-relevant elements)
         // ═══════════════════════════════════════════════════════════════════════
+        // Deterministic replacement for the legacy `calculateHeuristic`
+        // weight threshold (>=0.5 / >=0.8). Reads `isGoalRelevantElement`
+        // (token-match against expandedGoal keywords on name/aria/title/
+        // iconLabel/labelText/firstTextFragment/placeholder).
+        // `highWeightCount` = goal-relevant elements (used by "no growth"
+        // stuck detection); `goalRelevantElements` = same set's labels.
         let highWeightCount = 0;
         const goalRelevantElements = snapshotAfter.elements
           .filter(el => {
-            // Get weight from HybridSemanticWeightCalculator (uses L2 ExpandedGoal)
-            const heuristic = this.semanticWeightCalculator.calculateHeuristic(el);
-            // Count high-weight elements (>=0.8) for "no growth" stuck detection
-            if (heuristic.weight >= 0.8) {
-              highWeightCount++;
-            }
-            return heuristic.weight >= 0.5; // Only include elements with >= 50% weight (significant)
+            if (!isGoalRelevantElement(el, this.expandedGoal ?? null)) return false;
+            highWeightCount++;
+            return true;
           })
           .map(el => el.name || el.ref);
 

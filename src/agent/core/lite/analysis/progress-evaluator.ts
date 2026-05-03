@@ -2,10 +2,11 @@
  * Deterministic Progress Evaluator (Stage 2 — de-weighting LiteEngine)
  *
  * Replaces the numeric-weight portion of HybridSemanticWeightCalculator
- * with deterministic boolean signals from `StateDiff`. The legacy
- * calculator is kept side-by-side and selected via
- * `LITE_ENGINE_FLAGS.enableDeweightedProgress` so rollout can be flagged
- * and reverted without touching call-sites.
+ * with deterministic boolean signals from `StateDiff`. This module is
+ * the single source of truth for progress sentiment in LiteEngine —
+ * no flag, no fallback to weighted path. HybridSemanticWeightCalculator
+ * is still constructed for L2 keyword expansion / funnel phase tracking
+ * but its `enrichWithAI` is no longer in the iteration loop.
  *
  * Why this module exists:
  *   - HybridSemanticWeightCalculator made decisions based on totalWeight

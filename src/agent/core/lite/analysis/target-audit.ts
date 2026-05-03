@@ -64,10 +64,10 @@ export class TargetAudit {
    * @param candidates Top ranked candidate elements
    * @param expandedGoal Expanded goal from GoalExpander
    * @param funnelPhase Current funnel phase
-   * @param options.scoringMode 'legacy' = composite-float scores 0..15;
-   *   'deweighted' = bucket scores 0/1/2/3 (Stage 2). Drives the
-   *   prompt's score legend so the LLM doesn't misread a `3.00` bucket
-   *   score as "barely above noise".
+   * @param options.scoringMode Default 'deweighted' (Stage 2). Bucket
+   *   scores 0/1/2/3 → score legend in the prompt explains the scale.
+   *   'legacy' kept for backward compatibility with non-Lite callers
+   *   (composite float scores 0..15).
    * @returns Audit result with potential correction
    */
   static async audit(
@@ -78,7 +78,7 @@ export class TargetAudit {
     options: { scoringMode?: 'legacy' | 'deweighted' } = {},
   ): Promise<AuditResult> {
     const startTime = Date.now();
-    const scoringMode = options.scoringMode ?? 'legacy';
+    const scoringMode = options.scoringMode ?? 'deweighted';
 
     logger.info('[TARGET_AUDIT] Starting L4 audit', {
       proposedRef: command.ref?.slice(0, 20),
