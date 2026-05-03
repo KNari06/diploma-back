@@ -1246,17 +1246,30 @@ export async function autoBootAndInstall(
     // since the app is installed and launchable either way.
     if (installedPackage) {
       try {
+        // Audit fix (Bug #3): bumped 30s → 60s. `pm clear --user N` on a
+        // multi-MB app with cold filesystem caches can take 5-15s; cold
+        // `am start` on multi-user adds another 10-20s for first-launch
+        // dex optimization. 30s was the smallest budget in this helper —
+        // matches the 60s used elsewhere in installAppOnSession.
         await client.executeBatchCommands(sessionId, [
           { type: 'close_app', params: { packageName: installedPackage, hard: true } },
           { type: 'launch_app', params: { packageName: installedPackage } },
-        ], { timeoutMs: 30_000 });
+        ], { timeoutMs: 60_000 });
         logger.info('[MOBILE_AUTO_BOOT] App wiped + launched on warmup', {
           projectId,
           sessionId,
           packageName: installedPackage,
         });
       } catch (err) {
-        logger.warn('[MOBILE_AUTO_BOOT] Wipe+launch failed (non-fatal)', {
+        // Audit fix (Bug #2): on wipe+launch failure the app is in an
+        // undefined state (data-wiped but not relaunched, or worse). The
+        // install side-effect at the end of installAppOnSession already
+        // CLEARED the pending-install flag, so the next warmup would hit
+        // the cached fast path and again skip the launch — silently
+        // wedged. Re-set the pending flag so the next warmup forces a
+        // full install + launch path.
+        await setPendingInstall(appStoragePath);
+        logger.warn('[MOBILE_AUTO_BOOT] Wipe+launch failed — re-flagged pending install for next warmup', {
           projectId,
           sessionId,
           packageName: installedPackage,
@@ -1342,7 +1355,23 @@ async function installAppOnSession(
 
   // If the same APK is already installed (Redis knows), just relaunch — skip download + install.
   // BUT: respect the pending-install flag which means we can't trust Redis state.
-  if (!hasPendingInstall && warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
+  //
+  // Audit fix (Bug #4): also bail out of the cached fast path when the
+  // caller explicitly supplied a DIFFERENT packageName than what's cached.
+  // Previous logic took `appPackageOverride || warmup.installedPackage` as
+  // the cached package and tried to launch it — but if override='com.foo'
+  // and cached='com.bar', launch_app(com.foo) hits a not-installed package
+  // and warmup proceeds in a broken state. Falling through forces a full
+  // install of the requested package.
+  const cachedMismatch = !!(appPackageOverride
+    && warmup?.installedPackage
+    && appPackageOverride !== warmup.installedPackage);
+  if (
+    !hasPendingInstall
+    && !cachedMismatch
+    && warmup?.appStoragePath === mobileApp.storagePath
+    && warmup?.installedPackage
+  ) {
     const cachedPackage = appPackageOverride || warmup.installedPackage;
     logger.debug('[MOBILE_SESSION] Same APK already installed (Redis), relaunching', {
       sessionId,
@@ -1357,6 +1386,14 @@ async function installAppOnSession(
       ], { timeoutMs: 60_000 });
     }
     return cachedPackage;
+  }
+  if (cachedMismatch) {
+    logger.info('[MOBILE_SESSION] Cached package differs from override — forcing full install', {
+      sessionId,
+      projectId,
+      cached: warmup?.installedPackage,
+      override: appPackageOverride,
+    });
   }
 
   // If Redis expired but we know the package name, check the DEVICE directly.
@@ -1459,6 +1496,21 @@ async function installAppOnSession(
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName } },
     ], { timeoutMs: 60_000 });
+  }
+
+  // Audit fix (Bug #1): install completed but packageName resolution failed.
+  // This is rare (usually `pm list packages -3` diff after install picks it up)
+  // but happens with side-loaded splits. Without a warning the caller's
+  // `if (installedPackage)` guard silently skips the wipe-and-launch step
+  // that's the whole point of `skipLaunch:true` flows. Loud-fail so it shows
+  // up in logs and the caller can fall through to a defensive launch.
+  if (!packageName) {
+    logger.warn('[MOBILE_SESSION] Install succeeded but packageName resolution failed — caller will skip post-install hooks', {
+      sessionId,
+      projectId,
+      hadExplicitPackage: !!explicitPackage,
+      hadDetected: !!detected,
+    });
   }
 
   // Update Redis with the installed package so future warmups know what's on the emulator
