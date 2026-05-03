@@ -151,7 +151,23 @@ export class MobileStepApplyService {
           const coordsConfidence = typeof lintResult.confidence === 'number'
             ? lintResult.confidence
             : undefined;
-          const coordParams: Record<string, unknown> = { x: centerX, y: centerY };
+          // Pass `intent` (the normalized description) alongside the
+          // coordinates so the runner's smartResolve can re-validate the
+          // target if `coordsConfidence < 0.9`. Without intent, smartResolve
+          // takes the early-return passthrough branch (no-intent → no
+          // re-resolve possible) and dispatches the bare coordinates blindly
+          // — which is wrong when 200-700ms have elapsed between lint and
+          // dispatch (HTTP roundtrip + lint compute) and the screen has
+          // shifted (animation finished, snackbar dismissed, app pushed a
+          // dialog). With intent + low confidence the runner re-fetches a
+          // fresh tree and re-resolves, correcting the coords. With intent
+          // + high confidence (≥ 0.9) it still passthroughs — no perf hit
+          // on the happy path.
+          const coordParams: Record<string, unknown> = {
+            x: centerX,
+            y: centerY,
+            intent: description,
+          };
           if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
 
           const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
