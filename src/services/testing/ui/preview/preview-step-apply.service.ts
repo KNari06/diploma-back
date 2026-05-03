@@ -78,6 +78,19 @@ function shouldUpgradeCompiledPlan(
   // Empty / invalid candidate — never replace.
   if (!candidate.locatorPlan || candidate.locatorPlan.length === 0) return false;
 
+  // Defense-in-depth: never persist a candidate whose recorded page URL
+  // differs from the existing one. The caller (V22 fast-path upgrade) is
+  // already guarded by a navigation check, but if some future caller forgets
+  // to gate this we'd silently corrupt the plan and trip every downstream
+  // URL guard with `url_mismatch`.
+  const existingHost = (() => {
+    try { return existing.context?.pageUrl ? new URL(existing.context.pageUrl).host : ''; } catch { return ''; }
+  })();
+  const candidateHost = (() => {
+    try { return candidate.context?.pageUrl ? new URL(candidate.context.pageUrl).host : ''; } catch { return ''; }
+  })();
+  if (existingHost && candidateHost && existingHost !== candidateHost) return false;
+
   const existingStrategies = new Set(existing.locatorPlan.map(e => e.strategy));
   const candidateStrategies = new Set(candidate.locatorPlan.map(e => e.strategy));
 
@@ -4498,7 +4511,20 @@ export class PreviewStepApplyService {
                 // rebuild falls through to the old plan, so this path can
                 // NEVER turn a successful step into a failure.
                 let upgradedCompiled = stepDraft.compiled;
-                if (compiledRef) {
+                // CRITICAL: skip the rebuild if navigation happened during the action.
+                // After a click that triggers navigation (e.g. OpenID Connect → SSO),
+                // `page.url()` is the destination page, not the page the step was
+                // recorded on. The session's domNodes also reflect the post-nav DOM.
+                // Looking up `compiledRef` there returns either nothing or a stale
+                // ref re-bound to a wholly unrelated post-nav element, and we'd
+                // persist a corrupted plan whose `context.pageUrl` points at the
+                // destination — every subsequent run would fail `compiledUrlStale`
+                // and the URL guard in lint with `url_mismatch`. The upgrade is a
+                // soft, never-load-bearing optimization — bail out when unsafe.
+                const postActionUrl = page.url();
+                const navigationOccurred = !!currentPageUrl
+                  && normalizeUrlForComparison(currentPageUrl) !== normalizeUrlForComparison(postActionUrl);
+                if (compiledRef && !navigationOccurred) {
                   try {
                     const sess = sessionService.getSession(previewSessionId);
                     const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
@@ -4506,7 +4532,7 @@ export class PreviewStepApplyService {
                       const candidatePlan = await LocatorPlanBuilder.buildCompiledPlan({
                         step: stepDraft,
                         resolvedNode: liveNode,
-                        pageUrl: page.url(),
+                        pageUrl: postActionUrl,
                         pageTitle: await page.title().catch(() => undefined),
                         pageSignature: sess?.lastPageSignature,
                         page,
@@ -4530,6 +4556,13 @@ export class PreviewStepApplyService {
                       error: upgradeErr instanceof Error ? upgradeErr.message : String(upgradeErr),
                     });
                   }
+                } else if (navigationOccurred) {
+                  logger.debug('[PREVIEW_APPLY] Compiled plan upgrade skipped — navigation occurred mid-action', {
+                    previewSessionId,
+                    stepId: stepDraft.id,
+                    fromUrl: currentPageUrl,
+                    toUrl: postActionUrl,
+                  });
                 }
 
                 // Update step with success evidence
