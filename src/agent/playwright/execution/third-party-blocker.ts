@@ -186,6 +186,15 @@ export const THIRD_PARTY_DOMAINS: readonly string[] = [
   'assets.adobedtm.com',
   'cloudflareinsights.com',
   'static.cloudflareinsights.com',
+  // Vercel Analytics — most common same-origin tracker on the modern
+  // React/Next.js web. Both the CDN (va.vercel-scripts.com) and the
+  // ingestion endpoint (vitals.vercel-insights.com) need blocking;
+  // additionally /_vercel/insights/* on the SAME origin is handled by
+  // the path-based filter in network-tracker.ts.
+  'vercel-insights.com',
+  'vitals.vercel-insights.com',
+  'va.vercel-scripts.com',
+  'vercel-analytics.com',
   'yandex.ru',
   'yandex.net',
   'metrica.yandex.ru',

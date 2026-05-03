@@ -50,6 +50,32 @@ export class NetworkTracker {
   // Uses shared domain list from ThirdPartyBlocker for consistency
   private static readonly ANALYTICS_DOMAINS: readonly string[] = THIRD_PARTY_DOMAINS;
 
+  // Same-origin tracker path filter. Modern frameworks (Next.js,
+  // SvelteKit, Remix) often serve their analytics endpoints from
+  // their OWN origin, bypassing the domain blocklist. Examples:
+  //   - /_vercel/insights/event           (Vercel Web Analytics)
+  //   - /_vercel/speed-insights/vitals    (Vercel Speed Insights)
+  //   - /gtm/collect, /gtag/js (self-hosted GTM)
+  //   - /beacon, /telemetry endpoints
+  // Without this filter, every same-origin POST /track returning JSON
+  // 200 falsely elevates `progressSentiment` to 'Significant Change'
+  // because progress-evaluator step 4 reads `successfulApiResponses`.
+  // Audit M2 + audit follow-up.
+  //
+  // CRITICAL false-positive avoidance: bare /track, /event, /metrics,
+  // /collect would match real business endpoints — e-commerce sites
+  // have `/api/track-order/{id}`, calendars have `/api/event/{id}`,
+  // dashboards have `/api/metrics/{report}`. We DO NOT add those.
+  // Only well-known tracker SHAPES that have no business meaning:
+  //   - /_vercel/insights, /_vercel/speed-insights (Vercel)
+  //   - /gtm/, /gtag/js (Google Tag Manager self-hosted)
+  //   - /beacon (W3C Beacon API endpoints — universally analytics)
+  //   - /telemetry (Microsoft / Datadog APM convention)
+  //   - /pixel (1×1 tracking pixels — never legitimate API)
+  // For bare /track / /event / /metrics — leaves them alone; rely on
+  // domain-level blocklist for trackers that route via known vendors.
+  private static readonly TRACKER_PATH_RX = /(?:^|\/)(?:_vercel\/(?:insights|speed-insights)|gtm\/|gtag(?:\/|\.js)|beacon(?:\/|$)|telemetry(?:\/|$)|pixel(?:\/|$))/i;
+
   // Manus Style: Track only dynamic resource types
   private static readonly RELEVANT_RESOURCE_TYPES = ['fetch', 'xhr'];
 
@@ -137,6 +163,18 @@ export class NetworkTracker {
       if (NetworkTracker.ANALYTICS_DOMAINS.some(domain => urlObj.hostname.includes(domain))) {
         this.trackedRequests.delete(url);
         return; // Ignore even POST to analytics
+      }
+      // Same-origin tracker path filter — see TRACKER_PATH_RX comment.
+      // Catches /_vercel/insights/event and other framework analytics
+      // that ride on the user's own domain, bypassing the domain
+      // blocklist above.
+      if (NetworkTracker.TRACKER_PATH_RX.test(urlObj.pathname)) {
+        this.trackedRequests.delete(url);
+        logger.debug('[NETWORK_TRACKER] Skipped same-origin tracker path', {
+          url: url.slice(0, 100),
+          method,
+        });
+        return; // Ignore even successful POST to /track, /_vercel/insights, etc.
       }
     } catch {
       // Invalid URL, continue processing

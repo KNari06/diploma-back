@@ -16,6 +16,7 @@ import {
   LAYER3_FALLBACK_PATTERNS,
 } from '@/agent/utils/selectors/modal-detection';
 import { LITE_ENGINE_FLAGS } from '@/config/testing/intelligent-test-limits';
+import { isNavigationSafe, logUrlSafetyDecision } from '@/utils/security/url-safety';
 import type { Locator, Page } from 'playwright';
 import { VisualAnchorManager } from '../analysis/visual-anchor-manager';
 import { ShadowDOMHandler } from './shadow-dom-handler';
@@ -85,6 +86,21 @@ export class ActionExecutor {
   // Set at the start of each execute() call for iframe support
   private currentContext: Page | import('playwright').Frame;
 
+  /**
+   * Starting URL of the test, used as the trust anchor for `goto`
+   * navigation safety. Populated by setStartingUrl() called from
+   * lite-engine after config is read. Optional: when undefined,
+   * `goto` allows any http(s) URL (preserves prior behaviour for
+   * non-LiteEngine consumers of ActionExecutor that don't have the
+   * concept of a starting origin).
+   *
+   * Used by `case 'goto'` to compute eTLD+1 same-site / OAuth-allow
+   * decisions via `isNavigationSafe`. See utils/security/url-safety.ts.
+   */
+  private startingUrl?: string;
+  /** Test ID for safety-decision audit log entries. */
+  private testId?: string;
+
   // ✅ FIX: Configurable timeouts for different action types
   private readonly DEFAULT_TIMEOUT = 10000; // 10s for most actions (increased from 5s)
   private readonly NAVIGATION_TIMEOUT = 15000; // 15s for actions that may trigger navigation
@@ -96,6 +112,22 @@ export class ActionExecutor {
   constructor(page: Page) {
     this.page = page;
     this.currentContext = page;
+  }
+
+  /**
+   * Configure the navigation safety anchor. Call this once after
+   * construction (LiteEngine does it from `runLoop` setup) to enable
+   * goto-origin allowlist enforcement. Without this call, `goto`
+   * proceeds for any http(s) URL — back-compat for non-Lite consumers.
+   *
+   * Re-callable: a re-call updates the anchor. The anchor is a TRUST
+   * boundary; do not derive it from `page.url()` at runtime (that's
+   * what an attacker would have moved the page to). Always derive from
+   * the user's configured `LiteEngineConfig.url`.
+   */
+  setStartingUrl(url: string, testId?: string): void {
+    this.startingUrl = url;
+    this.testId = testId;
   }
 
   /**
@@ -540,6 +572,22 @@ export class ActionExecutor {
 
       case 'goto':
         if (!cmd.url) throw new Error('goto requires url');
+        // Origin allowlist guard. Only enforced when setStartingUrl()
+        // has been called by LiteEngine — non-Lite callers (whose
+        // ActionExecutor doesn't have a trust anchor) keep prior
+        // behaviour: any http(s) URL allowed. See
+        // utils/security/url-safety.ts for tier rules.
+        if (this.startingUrl) {
+          const safety = isNavigationSafe(cmd.url, this.startingUrl);
+          logUrlSafetyDecision(safety, 'goto', this.testId);
+          if (!safety.allowed) {
+            // Throw rather than silently no-op so the agent loop can
+            // see the failure, log it as an action error, and
+            // potentially try a different strategy. Includes tier
+            // tag in the message so traces surface the reason class.
+            throw new Error(`goto blocked by url-safety: ${safety.reason} [${safety.tier}]`);
+          }
+        }
         // Use 'load' to ensure JS hydration completes (SPA frameworks),
         // fallback to 'domcontentloaded' only on timeout errors
         try {
