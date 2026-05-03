@@ -216,6 +216,49 @@ describe('CDP vs evaluate — symmetry on auth-form fixture', () => {
     expect(ids).toContain('data-action-i');
   }, PER_TEST_TIMEOUT_MS);
 
+  it('dataState (Radix/shadcn/Vaul) — collected symmetrically by both paths', async () => {
+    // Radix UI / shadcn / Vaul encode toggle state as data-state.
+    // Without it, resolver can't tell open trigger from closed →
+    // canonical fake-success on already-opened dropdown clicks.
+    // PURE ADDITIVE: existing fields untouched; this only verifies
+    // the new field appears on both paths and stays absent when
+    // the attribute is missing.
+    await page.setContent(`
+      <button id="opened-trigger" data-state="open" aria-haspopup="menu">Open menu</button>
+      <button id="closed-trigger" data-state="closed" aria-haspopup="menu">Closed menu</button>
+      <div role="tab" id="active-tab" data-state="active">Active tab</div>
+      <div role="tab" id="inactive-tab" data-state="inactive">Inactive tab</div>
+      <button id="plain-button">No data-state</button>
+    `);
+    const cdpSnap = await CdpSnapshotService.collect(page);
+    const evalSnap = await SnapshotCollector.collect(page);
+
+    const findById = (snap: { elements: Array<{ htmlId?: string; dataState?: string }> }, id: string) =>
+      snap.elements.find((e) => e.htmlId === id);
+
+    for (const id of ['opened-trigger', 'closed-trigger', 'active-tab', 'inactive-tab', 'plain-button']) {
+      const cdpEl = findById(cdpSnap, id);
+      const evalEl = findById(evalSnap, id);
+      expect(cdpEl).toBeDefined();
+      expect(evalEl).toBeDefined();
+      // Symmetry contract — same value (or both undefined).
+      expect(cdpEl?.dataState).toBe(evalEl?.dataState);
+    }
+
+    // Concrete value assertions — guards against silent drop on
+    // either path. If either path reads the wrong attribute or
+    // mis-trims, this fails.
+    expect(findById(cdpSnap, 'opened-trigger')?.dataState).toBe('open');
+    expect(findById(cdpSnap, 'closed-trigger')?.dataState).toBe('closed');
+    expect(findById(cdpSnap, 'active-tab')?.dataState).toBe('active');
+    expect(findById(cdpSnap, 'inactive-tab')?.dataState).toBe('inactive');
+    // Critical: plain button has NO data-state → must be undefined,
+    // not '' / false / null. Existing consumers rely on
+    // `if (el.dataState === 'open')` etc.
+    expect(findById(cdpSnap, 'plain-button')?.dataState).toBeUndefined();
+    expect(findById(evalSnap, 'plain-button')?.dataState).toBeUndefined();
+  }, PER_TEST_TIMEOUT_MS);
+
   it('context derivation: form/nav/modal containers populate `context` field', async () => {
     // hybrid-semantic-weight reads `el.context` for LLM scoring.
     // Without it, dense-page candidate ranking diverges.

@@ -1511,6 +1511,16 @@ type ClickPreState = {
   targetAriaPressed: string | null;
   targetAriaExpanded: string | null;
   targetAriaChecked: string | null;
+  /**
+   * Radix UI / shadcn / Vaul `data-state` on the click target BEFORE the
+   * click fires. Critical for Radix-stack precision: many primitives
+   * (Dialog, Popover, DropdownMenu, Collapsible) flip data-state without
+   * mirroring to aria-expanded — without this we'd report `signal: 'focus'`
+   * (weak) on a real success, and the fake-success guard would FAIL the
+   * step. With it: dataState 'closed'→'open' becomes a `signal: 'aria'`
+   * (strong) and the click is recognised.
+   */
+  targetDataState: string | null;
   targetDisabled: boolean;
   pageCount: number; // browser-context tab count for new-tab detection
   // V24: overlay/popup signature captured BEFORE click. Used by parasitic-overlay
@@ -1588,6 +1598,7 @@ async function captureClickPreState(
     targetAriaPressed: null,
     targetAriaExpanded: null,
     targetAriaChecked: null,
+    targetDataState: null,
     targetDisabled: false,
     pageCount,
     overlayPreSig: '',

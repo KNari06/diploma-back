@@ -1731,6 +1731,16 @@ export class SnapshotCollector {
               ? ariaCurrentRaw
               : undefined;
 
+            // Radix/shadcn/Vaul/headless: data-state="open|closed|active|...".
+            // PURE ADDITIVE — undefined when attribute missing. Length-cap
+            // 30 chars (Radix values are short keywords, anything longer
+            // is pathological JSON or accidental). Trim whitespace only;
+            // do NOT lowercase — some libs use camelCase ("forceMount").
+            const dataStateRaw = getCleanAttr(el, 'data-state');
+            const dataState = dataStateRaw && dataStateRaw.length > 0 && dataStateRaw.length < 30
+              ? dataStateRaw
+              : undefined;
+
             // V22 Pkg1: aria-valuenow / aria-valuetext (slider/spinbutton/progress)
             const ariaValueNowRaw = getCleanAttr(el, 'aria-valuenow');
             let ariaValueNow: number | undefined;
@@ -2449,6 +2459,8 @@ export class SnapshotCollector {
               ariaChecked,
               // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state
               ariaCurrent,
+              // Radix/shadcn/Vaul data-state — undefined when absent.
+              dataState,
               ariaValueNow,
               ariaValueText,
               // V22 Pkg1: Select option semantic key + IconButton child testid lift

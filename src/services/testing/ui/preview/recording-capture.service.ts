@@ -53,6 +53,20 @@ export interface ProbedElement {
   ariaExpanded?: boolean;
   ariaPressed?: boolean;
   /**
+   * Radix UI / shadcn / Vaul `data-state` value at click time. Examples:
+   * 'open' / 'closed' (Dialog, Popover, DropdownMenu, Collapsible),
+   * 'active' / 'inactive' (Tabs, Accordion item),
+   * 'on' / 'off' (Toggle, ToggleGroup),
+   * 'checked' / 'unchecked' (Checkbox, RadioGroup item).
+   * Captured separately from aria-expanded because Radix primitives
+   * do NOT consistently mirror data-state to aria. Without this:
+   * - inferClickActionType records generic 'click' instead of 'open'
+   * - state-reflected verify times out → step marked failed
+   * - resolver can't disambiguate already-open trigger from closed one
+   * Length-cap < 30 chars (Radix values are short keywords).
+   */
+  dataState?: string;
+  /**
    * V22: aria-invalid — validation state at recording time. Critical for
    * negative-test recording (user records "submit form with empty email →
    * red error border"). Without it the resolver can't tell apart a clean
@@ -1479,6 +1493,16 @@ const PROBE_AT_POINT_FN = `
   // The attribute is boolean-like but stored as string — keep raw value
   // ('page' | 'step' | 'true' | ...) so resolver can do exact compare.
 
+  // Radix/shadcn/Vaul data-state — captured pre-handler-fire (target is
+  // resolved BEFORE click handler runs). Length-cap 30 chars; trim only,
+  // no lowercase (Radix uses camelCase keywords like 'forceMount'). Values
+  // we know about: open/closed/active/inactive/on/off/checked/unchecked.
+  // Symmetric with snapshot-collector.ts:1740 + cdp-snapshot.service.ts:611
+  // — divergence here = silent fingerprint mismatch on Radix sites.
+  var dataStateRaw = target.getAttribute('data-state');
+  var dataStateAttr = (dataStateRaw && dataStateRaw.length > 0 && dataStateRaw.length < 30)
+    ? dataStateRaw : undefined;
+
   // V22 Pkg1 — Fix 2: aria-valuenow / aria-valuetext. Slider, SpinButton,
   // ProgressBar carry their current value via these ARIA attrs (or via
   // <input type="number/range">.value). Without them, "set slider to 50%"
@@ -2022,6 +2046,8 @@ const PROBE_AT_POINT_FN = `
     // V22 Pkg1 — extracted above. Each is undefined when not applicable so
     // bindingHints/fingerprint stay sparse (no zero-value noise).
     ariaCurrent: ariaCurrentAttr,
+    // Radix/shadcn data-state — undefined when attribute absent.
+    dataState: dataStateAttr,
     ariaValueNow: ariaValueNum,
     ariaValueText: ariaValueTextAttr,
     dataValue: dataValueAttr,
@@ -2159,6 +2185,14 @@ const PROBE_FOCUSED_FN = `
     try { if (target.matches && target.matches(':invalid')) ai = true; } catch (e) {}
   }
 
+  // Radix/shadcn data-state — symmetric with PROBE_AT_POINT_FN. Captured
+  // on focused-element path so blur events on Radix fields (combobox value
+  // commit) record the post-blur state. Non-fingerprint use only here:
+  // focused path doesn't infer click intent, so dataState lands on the
+  // probed element for builders/extractors to read.
+  var fdsRaw = target.getAttribute('data-state');
+  var focusedDataState = (fdsRaw && fdsRaw.length > 0 && fdsRaw.length < 30) ? fdsRaw : undefined;
+
   // Detect multiline: textarea, contenteditable, or role=textbox with aria-multiline
   var isMultiline = tag === 'textarea'
     || target.getAttribute('contenteditable') === 'true'
@@ -2217,6 +2251,7 @@ const PROBE_FOCUSED_FN = `
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
     ariaInvalid: ai,
+    dataState: focusedDataState,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -2681,6 +2716,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
           var rect = walk.getBoundingClientRect();
           var ae = walk.getAttribute('aria-expanded');
           var ap = walk.getAttribute('aria-pressed');
+          // Radix/shadcn data-state — symmetric with PROBE_AT_POINT_FN /
+          // PROBE_FOCUSED_FN. Re-probe path runs on ancestor walk-up; the
+          // wrapping <button data-state="open"> still carries the right
+          // value at the moment the user clicked.
+          var wdsRaw = walk.getAttribute('data-state');
+          var walkDataState = (wdsRaw && wdsRaw.length > 0 && wdsRaw.length < 30) ? wdsRaw : undefined;
           // V22: aria-invalid for re-probe path (see PROBE_AT_POINT for rationale).
           var aiAttr = walk.getAttribute('aria-invalid');
           var ai = aiAttr === 'true' ? true : aiAttr === 'false' ? false : undefined;
@@ -2707,6 +2748,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
             ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
             ariaInvalid: ai,
+            dataState: walkDataState,
             isMultiline: isMultiline || undefined,
             boundingBox: {
               x: Math.round(rect.x),
@@ -2952,6 +2994,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.ariaValueNow !== undefined) ariaState.valueNow = element.ariaValueNow;
     if (element.ariaValueText) ariaState.valueText = element.ariaValueText;
     if (Object.keys(ariaState).length > 0) hints.ariaState = ariaState;
+    // Radix/shadcn data-state at recording time. Top-level (parallel to
+    // ariaState) because data-state is a single string keyword that doesn't
+    // fit the boolean schema, AND many Radix primitives set data-state
+    // WITHOUT mirroring to aria-expanded — so consumers must read both
+    // independently rather than treating data-state as a boolean alias.
+    if (element.dataState) hints.dataState = element.dataState;
     // V22 Pkg1: data-value / child icon testid.
     if (element.dataValue) hints.dataValue = element.dataValue;
     if (element.childTestId) hints.childTestId = element.childTestId;
@@ -3031,6 +3079,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.ariaValueNow !== undefined) ariaState.valueNow = element.ariaValueNow;
     if (element.ariaValueText) ariaState.valueText = element.ariaValueText;
     if (Object.keys(ariaState).length > 0) fp.ariaState = ariaState;
+    // Radix/shadcn data-state — see BindingHints.dataState rationale.
+    // Stored on the persisted fingerprint so heal-time scoring (and the
+    // post-action verifier) can compare recorded state to live state.
+    if (element.dataState) fp.dataState = element.dataState;
     // V22 Pkg1: data-value / child icon testid.
     if (element.dataValue) fp.dataValue = element.dataValue;
     if (element.childTestId) fp.childTestId = element.childTestId;
@@ -3090,6 +3142,23 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     // Expandable: open/close based on aria-expanded
     if (elementBefore.ariaExpanded === false) return 'open';
     if (elementBefore.ariaExpanded === true) return 'close';
+
+    // Radix/shadcn fallback: many primitives (Dialog, Popover,
+    // DropdownMenu) do NOT mirror state to aria-expanded. Without
+    // this branch a click on a Radix dropdown trigger gets recorded
+    // as generic 'click' → replay can't use the state-reflected
+    // verifier and a bug-fix retry treats it as element-mismatch
+    // rather than state-changed-since-recording.
+    //
+    // Strict: only 'open' / 'closed' map to open/close. 'active' /
+    // 'inactive' (Tabs) and 'on' / 'off' (Toggle) and 'checked' /
+    // 'unchecked' (Checkbox/Radio) are intentionally NOT mapped here:
+    //   - tabs are select-semantic, not open-semantic
+    //   - toggle/checkbox already covered by the aria-pressed branch
+    //     below or by native input.checked
+    // Mapping wider strings would over-claim 'open' on tab clicks.
+    if (elementBefore.dataState === 'closed') return 'open';
+    if (elementBefore.dataState === 'open') return 'close';
 
     // Toggle: aria-pressed
     if (elementBefore.ariaPressed === false || elementBefore.ariaPressed === true) return 'toggle';

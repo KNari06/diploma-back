@@ -97,6 +97,11 @@ function buildNodeSnapshot(node: InteractiveNode | undefined | null): Record<str
     ariaValueNow: node.ariaValueNow,
     ariaValueText: node.ariaValueText,
     ariaHasPopup: node.ariaHasPopup,
+    // Radix/shadcn data-state — diagnostic visibility on resolver decisions
+    // for headless-React stacks. Without this in the audit log, "wrong-element"
+    // post-mortems on Radix sites can't tell apart 'state changed since
+    // recording' from 'wrong element picked'.
+    dataState: node.dataState,
     ariaActiveDescendant: node.ariaActiveDescendant,
     // icons / framework
     isIconButton: node.isIconButton,

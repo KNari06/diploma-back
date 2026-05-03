@@ -608,6 +608,14 @@ function buildLiteElementFromNode(args: {
     ariaLabel: attrs.get('aria-label') || undefined,
     title: attrs.get('title') || undefined,
     ariaCurrent: attrs.get('aria-current') || undefined,
+    // Radix/shadcn/Vaul data-state — symmetric with collector
+    // (snapshot-collector.ts ~line 1740). PURE ADDITIVE: undefined when
+    // absent; length-cap 30 chars to mirror collector. Trim only,
+    // do NOT lowercase (Radix uses camelCase like 'forceMount').
+    dataState: ((): string | undefined => {
+      const raw = (attrs.get('data-state') || '').trim();
+      return raw.length > 0 && raw.length < 30 ? raw : undefined;
+    })(),
     ariaValueText: attrs.get('aria-valuetext') || undefined,
     dataValue: attrs.get('data-value') || undefined,
     bsToggle: attrs.get('data-bs-toggle') || undefined,
@@ -2199,6 +2207,7 @@ export class CdpSnapshotService {
       childTestId?: string;
       iconClasses?: string;
       iconLabel?: string;
+      nearText?: string;
     };
 
     const results: Array<DomWalkResult | null> = await page.evaluate((refs: string[]) => {
@@ -2218,31 +2227,51 @@ export class CdpSnapshotService {
       const DECORATIVE: Record<string, 1> = {
         img: 1, svg: 1, i: 1, picture: 1, use: 1, path: 1, br: 1, hr: 1,
       };
+      // Byte-for-byte port of snapshot-collector.ts:2329
+      // (extractFirstTextFragment). Iterative DFS with visited<30 cap;
+      // do NOT use recursive call (deep DOMs blow the stack and burn
+      // unbounded CPU). MAX_LEN = 80, decorative-leaf set matches
+      // collector exactly.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const extractFirstFragment = (node: any): string | undefined => {
         try {
+          const MAX_LEN = 80;
+          // 1) Direct text-node child first.
           for (let ci = 0; ci < node.childNodes.length; ci++) {
             const ch = node.childNodes[ci];
             if (ch.nodeType === TEXT_NODE) {
               const t = (ch.nodeValue || '').replace(/\s+/g, ' ').trim();
-              if (t.length >= 2 && t.length <= 80) return t;
+              if (t.length >= 2 && t.length <= MAX_LEN) return t;
             }
           }
-          // Recurse into non-decorative children.
+          // 2) Iterative DFS — visited < 30 cap matches collector.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const stack: any[] = [];
-          for (let ci2 = node.childNodes.length - 1; ci2 >= 0; ci2--) {
-            const ch2 = node.childNodes[ci2];
-            if (ch2.nodeType === ELEMENT_NODE) stack.push(ch2);
+          for (let ci = node.childNodes.length - 1; ci >= 0; ci--) {
+            const ch = node.childNodes[ci];
+            if (ch.nodeType === ELEMENT_NODE) stack.push(ch);
           }
-          while (stack.length > 0) {
+          let visited = 0;
+          while (stack.length > 0 && visited < 30) {
+            visited++;
             const cur = stack.pop();
-            const tag = cur.tagName?.toLowerCase();
-            if (tag && DECORATIVE[tag]) continue;
-            const r = extractFirstFragment(cur);
-            if (r) return r;
+            const tagLc = (cur.tagName || '').toLowerCase();
+            if (tagLc && DECORATIVE[tagLc]) continue;
+            // Direct text under this child? Take it.
+            for (let cci = 0; cci < cur.childNodes.length; cci++) {
+              const cch = cur.childNodes[cci];
+              if (cch.nodeType === TEXT_NODE) {
+                const t = (cch.nodeValue || '').replace(/\s+/g, ' ').trim();
+                if (t.length >= 2 && t.length <= MAX_LEN) return t;
+              }
+            }
+            // No direct text — push element-children for DFS.
+            for (let cci = cur.childNodes.length - 1; cci >= 0; cci--) {
+              const cch = cur.childNodes[cci];
+              if (cch.nodeType === ELEMENT_NODE) stack.push(cch);
+            }
           }
-        } catch { /* DOM mutation race — fall through */ }
+        } catch { /* best-effort */ }
         return undefined;
       };
 
@@ -2296,58 +2325,127 @@ export class CdpSnapshotService {
               if (t) return t;
             }
           }
-          // Wrapping <label>
+          // Wrapping <label>. Collector uses `el.closest('label')` (no
+          // depth limit). Mirror that exactly — depth-limited walk
+          // missed wrapping labels on Bootstrap/Material deep DOMs.
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let cur: any = el.parentElement;
-          for (let d = 0; d < 4 && cur; d++) {
-            if (cur.tagName?.toLowerCase() === 'label') {
-              // Strip the input itself before reading text.
-              const clone = cur.cloneNode(true);
-              clone.querySelectorAll('input, textarea, select').forEach((c: { remove: () => void }) => c.remove());
-              const t = (clone.textContent || '').trim().slice(0, 100);
-              if (t) return t;
-              break;
+          const wrappingLabel: any = el.closest && el.closest('label');
+          if (wrappingLabel) {
+            const clone = wrappingLabel.cloneNode(true);
+            clone.querySelectorAll('input, textarea, select').forEach((c: { remove: () => void }) => c.remove());
+            const t = (clone.textContent || '').trim();
+            if (t) return t.slice(0, 100);
+          }
+          // 4. Implicit label via form-group / field container.
+          // Mirrors snapshot-collector.ts:707 (the 4th strategy).
+          // Without this, Bootstrap/Ant/Material inputs lose labelText.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const formGroup: any = el.closest && el.closest('.form-group, .form-field, .field, .input-group, .form-control, [data-field]');
+          if (formGroup) {
+            const labelEl = formGroup.querySelector('label, .label, [class*="label"]');
+            if (labelEl && !labelEl.contains(el)) {
+              const text = (labelEl.textContent || '').trim();
+              if (text) return text.slice(0, 100);
             }
-            cur = cur.parentElement;
           }
         } catch { /* DOM race — fall through */ }
         return undefined;
       };
 
-      // nearestRowText: walk up to <tr>/[role=row]/li[role=option],
-      // concat sibling cell text excluding self subtree.
+      // nearestRowText — byte-for-byte port of snapshot-collector.ts:1858.
+      // CRITICAL invariants (audit findings):
+      //   - selector list MUST include `li.list-row, li.list-item`
+      //   - cells via `td, th, [role=cell], [role=gridcell]` first; only
+      //     fall back to `rowAnc.children` when no semantic cells found
+      //   - skip cells that CONTAIN el (not just remove by ref)
+      //   - separator is U+241F (Information Separator One), NOT ' | ' —
+      //     downstream consumers split on '␟'; mismatch = wrong
+      //     fingerprint match in fingerprint scoring
+      //   - per-cell text NFC-normalized (cross-OS recording symmetry)
+      //   - per-cell length 2..80 BEFORE push (drops noisy 1-char or
+      //     enormous cells)
+      //   - max 4 cells pushed; max 8 cells iterated; .slice(0, 200)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const INVISIBLE_RE_NRT = /[​-‏‪-‮⁠-⁩﻿]/g;
+      const normLiveText = (s: string | undefined | null): string | undefined => {
+        if (s === undefined || s === null) return undefined;
+        if (s.length === 0) return '';
+        let out = s;
+        try { out = out.normalize('NFC'); } catch { /* best-effort */ }
+        return out.replace(INVISIBLE_RE_NRT, '').replace(/\s+/g, ' ').trim();
+      };
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const getNearestRowText = (el: any): string | undefined => {
         try {
+          const rowAnc = el.closest && el.closest('tr, [role="row"], li[role="option"], li.list-row, li.list-item');
+          if (!rowAnc || rowAnc === el) return undefined;
+          const cellNodes = rowAnc.querySelectorAll('td, th, [role="cell"], [role="gridcell"]');
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          let row: any = el.parentElement;
-          for (let d = 0; d < 6 && row; d++) {
-            const tag = row.tagName?.toLowerCase();
-            const role = row.getAttribute('role');
-            if (tag === 'tr' || role === 'row' || (tag === 'li' && role === 'option')) {
+          const cellList: any[] = cellNodes.length > 0
+            ? Array.prototype.slice.call(cellNodes, 0, 8)
+            : Array.prototype.slice.call(rowAnc.children, 0, 8);
+          const cellTexts: string[] = [];
+          for (let ci = 0; ci < cellList.length && cellTexts.length < 4; ci++) {
+            const cellEl = cellList[ci];
+            // Skip cells that CONTAIN our element (collector's invariant).
+            if (cellEl.contains && cellEl.contains(el)) continue;
+            const raw = cellEl.innerText != null ? cellEl.innerText : cellEl.textContent;
+            const t = normLiveText(raw) || '';
+            if (t.length >= 2 && t.length <= 80) cellTexts.push(t);
+          }
+          // U+241F separator — symmetric with probe + heal extractors.
+          if (cellTexts.length > 0) return cellTexts.join('␟').slice(0, 200);
+          return undefined;
+        } catch { return undefined; }
+      };
+
+      // ── getReadableElementText — copied byte-for-byte from
+      // snapshot-collector.ts:2296. innerText preserves visual
+      // whitespace between block-level children (textContent glues).
+      // Used by getNearText below; do NOT diverge.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const getReadableElementText = (node: any): string => {
+        try {
+          const raw = (typeof node.innerText === 'string' && node.innerText.trim().length > 0)
+            ? node.innerText
+            : (node.textContent || '');
+          return raw.replace(/\s+/g, ' ').trim();
+        } catch {
+          return (node.textContent || '').replace(/\s+/g, ' ').trim();
+        }
+      };
+
+      // ── nearText — byte-for-byte copy of snapshot-collector.ts:2622.
+      // Walks ≤4 ancestors looking for tr/li/article/section or
+      // [role=row|listitem|article] or .card/.item/.row; subtracts
+      // own text from container text. CRITICAL: uses .replace() (FIRST
+      // occurrence), NOT split.join() — symmetry with collector.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const getNearText = (el: any): string | undefined => {
+        try {
+          const ownText = (getReadableElementText(el) || '').slice(0, 30);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          let container: any = el.parentElement;
+          for (let depth = 0; depth < 4 && container; depth++) {
+            const tag = container.tagName?.toLowerCase();
+            const role = container.getAttribute('role') || '';
+            if (tag === 'tr' || tag === 'li' || tag === 'article' || tag === 'section'
+                || role === 'row' || role === 'listitem' || role === 'article'
+                || container.classList.contains('card')
+                || container.classList.contains('item')
+                || container.classList.contains('row')) {
               break;
             }
-            row = row.parentElement;
+            container = container.parentElement;
           }
-          if (!row) return undefined;
-          // Read row textContent without our subtree.
-          const clone = row.cloneNode(true);
-          // Remove the analogue of `el` from clone — match by ref.
-          const ourRef = el.getAttribute('data-agent-ref');
-          if (ourRef) {
-            const dup = clone.querySelector(`[data-agent-ref="${cssEscape(ourRef)}"]`);
-            if (dup) dup.remove();
-          }
-          const cells = clone.children
-            ? Array.from(clone.children) as Array<{ textContent?: string }>
-            : [];
-          const parts: string[] = [];
-          for (const cell of cells.slice(0, 4)) {
-            const t = (cell.textContent || '').trim().slice(0, 50);
-            if (t) parts.push(t);
-          }
-          const joined = parts.join(' | ').slice(0, 200);
-          return joined.length >= 3 ? joined : undefined;
+          if (!container) return undefined;
+          const containerText = getReadableElementText(container).slice(0, 120);
+          if (!containerText || containerText === ownText) return undefined;
+          // .replace() — FIRST occurrence only. Collector does this too;
+          // split.join() (replaces ALL) would diverge on rows where
+          // ownText appears multiple times in row's other cells.
+          const context = containerText.replace(ownText, '').replace(/\s+/g, ' ').trim();
+          return context.length > 3 ? context.slice(0, 80) : undefined;
         } catch { return undefined; }
       };
 
@@ -2434,54 +2532,132 @@ export class CdpSnapshotService {
       // element has no aria-label/title (i.e., truly descriptor-poor).
       // Used by locator-plan-builder strategy 6 (iconLabel CSS attr
       // selector) and by candidateText for LLM resolver scoring.
+      // computeIconLabel — byte-for-byte port of snapshot-collector.ts:2117
+      // (the iconChildLabel waterfall). MUST stay symmetric across all
+      // 9 fallback tiers — diverging here causes locator-plan-builder
+      // strategy 6 to produce different selectors on CDP path vs eval
+      // path → wrong-element clicks on icon-only buttons.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const computeIconLabel = (el: any): string | undefined => {
         try {
           const ariaLabel = el.getAttribute('aria-label');
           const titleAttr = el.getAttribute('title');
-          if (ariaLabel || titleAttr) return undefined; // not descriptor-poor
-          // <img alt>
+          if (ariaLabel || titleAttr) return undefined;
+          let iconChildLabel: string | undefined;
+          // 1) <img alt>
           const img = el.querySelector('img[alt]');
           if (img) {
             const alt = (img.getAttribute('alt') || '').trim();
-            if (alt.length > 0 && alt.length <= 100) return alt;
+            if (alt.length > 0 && alt.length <= 100) iconChildLabel = alt;
           }
-          const svg = el.querySelector('svg');
-          if (svg) {
-            // <title>
-            const svgTitle = svg.querySelector('title');
-            if (svgTitle) {
-              const t = (svgTitle.textContent || '').trim();
-              if (t.length > 0 && t.length <= 100) return t;
-            }
-            // <desc>
-            const svgDesc = svg.querySelector('desc');
-            if (svgDesc) {
-              const t = (svgDesc.textContent || '').trim();
-              if (t.length > 0 && t.length <= 100) return t;
-            }
-            // <use href="#icon-folder"> — sprite reference
-            const useEl = svg.querySelector('use');
-            if (useEl) {
-              const href = useEl.getAttribute('href') || useEl.getAttribute('xlink:href') || '';
-              const iconRef = href.replace(/^#/, '').replace(/^icon[-_]/, '').replace(/[-_]/g, ' ').trim();
-              if (iconRef.length > 0 && iconRef.length <= 50) return iconRef;
+          // 2-4) <svg> <title> / <desc> / <use href>
+          if (!iconChildLabel) {
+            const svg = el.querySelector('svg');
+            if (svg) {
+              const svgTitle = svg.querySelector('title');
+              if (svgTitle) {
+                const t = (svgTitle.textContent || '').trim();
+                if (t.length > 0 && t.length <= 100) iconChildLabel = t;
+              }
+              if (!iconChildLabel) {
+                const svgDesc = svg.querySelector('desc');
+                if (svgDesc) {
+                  const t = (svgDesc.textContent || '').trim();
+                  if (t.length > 0 && t.length <= 100) iconChildLabel = t;
+                }
+              }
+              if (!iconChildLabel) {
+                const useEl = svg.querySelector('use');
+                if (useEl) {
+                  const href = useEl.getAttribute('href') || useEl.getAttribute('xlink:href') || '';
+                  const iconRef = href.replace(/^#/, '').replace(/^icon[-_]/, '').replace(/[-_]/g, ' ').trim();
+                  if (iconRef.length > 0 && iconRef.length <= 50) iconChildLabel = iconRef;
+                }
+              }
             }
           }
-          // data-lucide / data-feather / data-icon / data-iconify-name
-          const iconHolder = el.querySelector('[data-lucide], [data-feather], [data-icon], [data-iconify-name]')
-            || (el.matches?.('[data-lucide], [data-feather], [data-icon], [data-iconify-name]') ? el : null);
-          if (iconHolder) {
-            const raw = iconHolder.getAttribute('data-lucide')
-              || iconHolder.getAttribute('data-feather')
-              || iconHolder.getAttribute('data-icon')
-              || iconHolder.getAttribute('data-iconify-name')
-              || '';
-            const cleaned = raw.replace(/[-_:]/g, ' ').trim();
-            if (cleaned.length > 0 && cleaned.length <= 50) return cleaned;
+          // 5) data-lucide / data-feather / data-icon / data-iconify-name
+          // CRITICAL: split(':').pop() strips Iconify set prefix
+          // ('mdi:folder' -> 'folder'), THEN replace separators.
+          // Plain replace(/[-_:]/g) loses the set name as a token.
+          if (!iconChildLabel) {
+            const iconHolder = el.querySelector('[data-lucide], [data-feather], [data-icon], [data-iconify-name]')
+              || (el.matches && el.matches('[data-lucide], [data-feather], [data-icon], [data-iconify-name]') ? el : null);
+            if (iconHolder) {
+              const raw = (
+                iconHolder.getAttribute('data-lucide')
+                || iconHolder.getAttribute('data-feather')
+                || iconHolder.getAttribute('data-icon')
+                || iconHolder.getAttribute('data-iconify-name')
+                || ''
+              ).trim();
+              const normalized = raw.split(':').pop()!.replace(/^icon[-_]/, '').replace(/[-_]/g, ' ').trim();
+              if (normalized.length > 0 && normalized.length <= 50) iconChildLabel = normalized;
+            }
           }
-        } catch { /* best-effort */ }
-        return undefined;
+          // 6) V15: prefixed icon classes (lucide-X, mdi-X, fa-X, etc.)
+          if (!iconChildLabel) {
+            const svgOrI = el.querySelector('svg, i');
+            const classStr = (svgOrI && svgOrI.getAttribute('class')) || el.getAttribute('class') || '';
+            if (classStr) {
+              const prefixed = classStr.match(/\b(?:lucide|heroicon[s]?|tabler|mdi|bi|ri|ti|bx|ph|fa|fas|far|fal|fad|fab|icon)[-_:]([a-z0-9]+(?:[-_][a-z0-9]+)*)/i);
+              if (prefixed && prefixed[1]) {
+                const name = prefixed[1].replace(/[-_]/g, ' ').trim();
+                if (name.length > 0 && name.length <= 50) iconChildLabel = name;
+              }
+              // 7) Suffix `-icon` / prefix `icon-` class
+              if (!iconChildLabel) {
+                const suffixed = classStr.match(/\b([a-z]+)[-_]icon\b|\bicon[-_]([a-z]+)\b/i);
+                const name = ((suffixed && (suffixed[1] || suffixed[2])) || '').toLowerCase().trim();
+                if (name.length > 0 && name.length <= 50 && name !== 'icon') iconChildLabel = name;
+              }
+              // 8) V23: namespaced classes (`prefix_MidSegment_hash`)
+              if (!iconChildLabel) {
+                const namespaced = classStr.match(/\b([a-z]{2,})_([A-Za-z][A-Za-z0-9_]{2,40})_[a-z0-9]{5,}\b/);
+                const namespacePrefix = namespaced && namespaced[1];
+                const midSegment = namespaced && namespaced[2];
+                const hasCamelOrSnake = midSegment ? (/[A-Z]/.test(midSegment) || /_/.test(midSegment)) : false;
+                const genericPrefixRx = /^(jss|sc|css|emotion|makeStyles|styled)$/i;
+                if (midSegment && namespacePrefix && !genericPrefixRx.test(namespacePrefix) && hasCamelOrSnake) {
+                  const layoutSkipRx = /^(root|wrapper|container|content|label|box|inner|outer|main|body|header|footer|sidebar|panel|section)$/i;
+                  if (!layoutSkipRx.test(midSegment)) {
+                    const name = midSegment
+                      .replace(/([a-z])([A-Z])/g, '$1 $2')
+                      .replace(/_/g, ' ')
+                      .toLowerCase()
+                      .trim();
+                    if (name.length >= 3 && name.length <= 50) iconChildLabel = name;
+                  }
+                }
+              }
+            }
+          }
+          // 9) Last-resort: <img src> filename (slug-shaped only).
+          if (!iconChildLabel) {
+            try {
+              const imgEl = (el.tagName.toLowerCase() === 'img'
+                ? el
+                : el.querySelector('img[src]'));
+              if (imgEl) {
+                const src = (imgEl.getAttribute('src') || '').trim();
+                if (src && src.indexOf('data:') !== 0) {
+                  const cleanPath = src.split('?')[0].split('#')[0];
+                  const file = (cleanPath.split('/').pop() || '').toLowerCase();
+                  const m = file.match(/^([a-z][a-z0-9_-]{1,29})\.(?:svg|png|jpe?g|webp|gif|ico)$/);
+                  if (m && m[1]) {
+                    const stem = m[1];
+                    const digitCount = (stem.match(/\d/g) || []).length;
+                    const looksHashed = digitCount >= 4 || /^[a-f0-9]{8,}$/.test(stem);
+                    if (!looksHashed) {
+                      iconChildLabel = stem.replace(/[-_]/g, ' ').trim();
+                    }
+                  }
+                }
+              }
+            } catch { /* best-effort */ }
+          }
+          return iconChildLabel;
+        } catch { return undefined; }
       };
 
       // ── iconClasses — filtered icon-related class names ──
@@ -2524,16 +2700,20 @@ export class CdpSnapshotService {
           out.push(null);
           continue;
         }
+        const isIconBtn = computeIsIconButton(el);
         const result: DomWalkResult = {
           firstTextFragment: extractFirstFragment(el),
-          isIconButton: computeIsIconButton(el),
+          isIconButton: isIconBtn,
           labelText: getLabelText(el),
           nearestRowText: getNearestRowText(el),
-          // Q1 audit additions — same DOM walk, no extra round-trip.
           isTopMostAtCenter: computeIsTopMostAtCenter(el),
           childTestId: computeChildTestId(el),
           iconClasses: computeIconClasses(el),
-          iconLabel: computeIconLabel(el),
+          // Collector gates iconLabel on isIconButton — mirror that
+          // gate here. Without it, regular labelled `<a>` with nested
+          // `<svg><title>` would get a spurious iconLabel on CDP path.
+          iconLabel: isIconBtn ? computeIconLabel(el) : undefined,
+          nearText: getNearText(el),
         };
         out.push(result);
       }
@@ -2572,6 +2752,7 @@ export class CdpSnapshotService {
       if (result.childTestId) el.childTestId = result.childTestId;
       if (result.iconClasses) el.iconClasses = result.iconClasses;
       if (result.iconLabel) el.iconLabel = result.iconLabel;
+      if (result.nearText) el.nearText = result.nearText;
     }
   }
 

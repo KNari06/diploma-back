@@ -105,6 +105,17 @@ export interface InteractiveNode {
   /** aria-checked for custom checkboxes/switches */
   ariaChecked?: boolean | 'mixed';
   /**
+   * Radix UI / shadcn / Vaul / many headless React libs encode toggle state
+   * via `data-state="open|closed|active|inactive|on|off|checked|unchecked"`.
+   * Some Radix primitives (Dialog, Popover, DropdownMenu) do NOT mirror it
+   * to `aria-expanded` — without this signal verifier reports the click
+   * had no effect even when the menu actually opened (canonical fake-success
+   * symptom). Length-capped at 30 chars to stay defensive against
+   * pathological values; raw casing preserved (Radix uses camelCase like
+   * 'forceMount'). Mirror of LiteElement.dataState.
+   */
+  dataState?: string;
+  /**
    * V22 Pkg1: aria-current — for Pagination current page, Stepper active
    * step, Breadcrumbs last crumb. Raw value: 'page' | 'step' | 'true' | etc.
    */
@@ -448,6 +459,18 @@ export interface BindingHints {
     valueNow?: number;
     valueText?: string;
   };
+  /**
+   * Radix/shadcn/Vaul `data-state` at recording time. Captured separately
+   * from `ariaState` because (a) it doesn't fit the boolean schema (raw
+   * string keyword), and (b) it can be set INDEPENDENTLY of aria-* — many
+   * Radix primitives don't mirror to aria. Used by the click-effect
+   * verifier (post-action-verify state-reflected phase) to recognise
+   * Radix open/close transitions; used by `inferClickActionType` to
+   * record the right step type ('open' vs 'click') when aria-expanded
+   * is missing. Read by element-resolver candidateText / scene summary
+   * for LLM disambiguation between already-open and closed triggers.
+   */
+  dataState?: string;
   /**
    * V22 Pkg1: data-value / `<option value>` — semantic key for select
    * options / list items / chips, distinct from their display label.
@@ -903,6 +926,15 @@ export interface TargetFingerprint {
     valueNow?: number;
     valueText?: string;
   };
+  /**
+   * Radix/shadcn/Vaul `data-state` recorded at click time. Mirror of
+   * `BindingHints.dataState`. NOT an identity-uniqueness gate (multiple
+   * elements can share data-state="open"); used as a soft signal:
+   * (1) heal-time tiebreaker when 2 candidates have equal id-quality,
+   * (2) input to "did this click do anything?" verifier — recorded
+   * 'closed' → live 'open' is a confirmed open transition.
+   */
+  dataState?: string;
   /** V22 Pkg1: data-value / `<option value>` — semantic key. */
   dataValue?: string;
   /** V22 Pkg1: data-testid of the single direct icon child (svg/i/img). */

@@ -496,6 +496,13 @@ function buildExtractScript(maxNodes: number): string {
       ariaPressed: (el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-pressed') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
       ariaSelected: (el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-selected') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined),
       ariaChecked: (el.getAttribute('aria-checked') || '').replace(/["']/g, '').trim() === 'true' ? true : ((el.getAttribute('aria-checked') || '').replace(/["']/g, '').trim() === 'mixed' ? 'mixed' : ((el.getAttribute('aria-checked') || '').replace(/["']/g, '').trim() === 'false' ? false : undefined)),
+      // Radix/shadcn/Vaul data-state. Symmetric with snapshot-collector
+      // and CDP-snapshot. Length-cap < 30 chars; trim only (preserve
+      // camelCase 'forceMount'). undefined when attribute absent.
+      dataState: ((): string | undefined => {
+        const raw = (el.getAttribute('data-state') || '').replace(/["']/g, '').trim();
+        return raw.length > 0 && raw.length < 30 ? raw : undefined;
+      })(),
 
       // Validation state
       required: el.hasAttribute('required') || (el.getAttribute('aria-required') || '').replace(/["']/g, '').trim() === 'true',

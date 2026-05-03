@@ -99,6 +99,21 @@ export interface LiteElement {
    */
   ariaCurrent?: string;
   /**
+   * Radix UI / shadcn / Vaul / many headless libs encode toggle state as
+   * `data-state="open|closed|active|inactive|on|off|checked|unchecked"`.
+   * Sometimes WITHOUT a corresponding aria-* (Radix bugs, Motion wrappers,
+   * custom integrations). Without this signal, resolver can't tell an
+   * already-opened dropdown trigger from a closed one — the canonical
+   * fake-success: click "open" trigger, focus changes nothing, step
+   * marked OK but menu actually closed.
+   *
+   * PURE ADDITIVE: undefined when attr is missing — every existing
+   * consumer continues to work. Read by hybrid-semantic-weight as a
+   * tiebreaker, by intent-step-lint when step intent mentions
+   * 'open|close|expand|collapse|select|toggle'.
+   */
+  dataState?: string;
+  /**
    * V22 Pkg1: aria-valuenow / aria-valuetext — Slider, SpinButton,
    * ProgressBar current value. Number for valuenow (parsed); valuetext is
    * the human-readable form when present.
@@ -121,6 +136,15 @@ export interface LiteElement {
    * href / icon-library data-attrs. See ProbedElement.iconLabel.
    */
   iconLabel?: string;
+  /**
+   * V22 Pkg2: Web Component / Angular custom-element ancestor tag
+   * (must contain `-`). Walked up to depth 6. Read by intent-step-lint
+   * and preview-step-apply for cross-fingerprint matching when raw
+   * tag names differ between recording and replay (Angular wrappers
+   * like `<app-excel-btn>` regenerate their _nghost-* attrs but the
+   * tag stays stable).
+   */
+  customElementTag?: string;
   /** V22 Pkg2: Bootstrap data-bs-toggle marker. */
   bsToggle?: string;
   /** V22 Pkg2: Bootstrap data-bs-target selector. */
@@ -135,6 +159,15 @@ export interface LiteElement {
   rowClickable?: boolean;
   /** V22 Pkg5: sibling-cell text inside nearest row container. */
   nearestRowText?: string;
+  /**
+   * Row context text for disambiguation: text from nearest row-like
+   * container (tr/li/article/section/[role=row|listitem|article]/.card/
+   * .item/.row), MINUS own element text. Used by candidate-pruner-llm,
+   * step-blocker-diagnosis, preview-step-apply (fingerprint hints) for
+   * "delete Anna Lee" disambiguation when many identical buttons exist.
+   * Mirrors snapshot-collector.ts:2622 walk (4-level cap, 80-char cap).
+   */
+  nearText?: string;
   /** V22 Pkg5: nth-of-type index among same-class siblings (2..10). */
   siblingIndex?: number;
   // NOTE: `disabled` boolean is already declared on LiteElement above
