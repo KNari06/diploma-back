@@ -1765,9 +1765,35 @@ async function verifyClickHadEffect(
         return { signal: 'none' as const };
       }, pre);
     } catch {
-      // Page navigating mid-eval — that itself is an effect.
+      // page.evaluate threw. Could mean ANY of:
+      //   • The page is mid-navigation (execution context destroyed because
+      //     the document is being unloaded — this is the case the original
+      //     code assumed).
+      //   • SPA / React re-rendered hard enough to briefly drop the eval
+      //     context even though the URL didn't change (Radix popover unmount,
+      //     listbox close, modal close — all observed in production).
+      //   • Frame detached, page closed, browser process throttled, etc.
+      //
+      // Old behaviour blindly returned `signal: 'url'`, which is a STRONG
+      // signal that bypasses the fake-success guard. That meant any wrong
+      // click that destroyed enough DOM to throw an evaluate would be marked
+      // as "navigation success" with no URL change — the canonical
+      // fake-success on popup-close. Probe the actual URL via Playwright's
+      // own `page.url()` (no in-page eval needed) and only claim 'url' when
+      // we can prove navigation happened. Otherwise drop to a 'detach' /
+      // 'dom' signal so the post-click guard can actually do its job.
       pre.cleanupDownloadListener?.();
-      return { effected: true, signal: 'url' };
+      try {
+        const liveUrl = page.url();
+        if (liveUrl && liveUrl !== pre.url) {
+          return { effected: true, signal: 'url' };
+        }
+      } catch { /* page closed — fall through */ }
+      // Eval threw and URL is unchanged. Treat as a DOM-shake signal — it
+      // IS an effect (something destroyed our eval context) but it isn't
+      // a navigation. 'detach' is in the WEAK set, so the fake-success
+      // guard can still reject this if fingerprint doesn't match.
+      return { effected: true, signal: 'detach' };
     }
     if (pageResult.signal !== 'none') {
       pre.cleanupDownloadListener?.();
