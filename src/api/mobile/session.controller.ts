@@ -879,8 +879,10 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Normalize: strip surrounding quotes ("'Search' navigation" → "Search navigation")
-    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+    // Normalize: strip surrounding quotes (handles whole-wrap + balanced inline pairs).
+    // See normalize-description.ts for failure modes the previous regex had.
+    const { normalizeMobileDescription } = await import('@/services/mobile/normalize-description');
+    const description = normalizeMobileDescription(rawDescription);
 
     // Map frontend step kind → mobile runner actionType for element resolution context.
     // The actionType tells the LLM what the user intends to do with the element,
@@ -994,6 +996,13 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       resolvedVia: lintResult.resolvedVia,
       elementText: lintResult.elementText,
       elementType: lintResult.elementType,
+      // Forward the runner-built compiled plan when it succeeded. Frontend
+      // can persist it onto the IntentStep on save so the next regression
+      // run goes through fast-path (~5ms) instead of re-paying the lint
+      // round-trip. Only forwarded when the plan is meaningful — i.e. the
+      // resolve actually succeeded; on `not_found` / `error` / failed lint
+      // there's no plan to share. Optional field, ignored by older frontends.
+      ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
     });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Lint failed', {
@@ -1037,9 +1046,10 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     const traceSessionId = `mobile-${sessionId}`;
     const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
-    const description = (stepDraft.elementDescription || stepDraft.description || '')
-      .replace(/['"]+([^'"]+)['"]+/g, '$1')
-      .trim();
+    // Normalize description identically to the lint path so trace logs and
+    // dispatch coords agree on the same canonical text.
+    const { normalizeMobileDescription: normalizeForApply } = await import('@/services/mobile/normalize-description');
+    const description = normalizeForApply(stepDraft.elementDescription || stepDraft.description);
     trace.writeMobileApplyRequest({
       stepId: stepDraft.id || `apply_${Date.now()}`,
       stepType: rawStepType,

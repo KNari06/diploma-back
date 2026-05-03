@@ -929,6 +929,24 @@ export function buildCandidateText(node: InteractiveNode): string {
   else if (node.ariaExpanded === false) stateHints.push('collapsed');
   if (node.ariaChecked === true || node.checked === true) stateHints.push('checked');
   else if (node.ariaChecked === 'mixed') stateHints.push('indeterminate');
+  // Radix/shadcn/Vaul `data-state` — many primitives don't mirror to
+  // aria-* attributes. Resolver must see this so "click open menu" vs
+  // "close open menu" disambiguation works. Skip when value is
+  // already conveyed by aria-* hints above.
+  const ds = (node as { dataState?: string }).dataState;
+  if (ds) {
+    const isDup = (
+      (ds === 'open' && node.ariaExpanded === true)
+      || (ds === 'closed' && node.ariaExpanded === false)
+      || (ds === 'checked' && (node.ariaChecked === true || node.checked === true))
+      || (ds === 'unchecked' && (node.ariaChecked === false || node.checked === false))
+      || (ds === 'on' && node.ariaPressed === true)
+      || (ds === 'off' && node.ariaPressed === false)
+      || (ds === 'active' && node.ariaSelected === true)
+      || (ds === 'inactive' && node.ariaSelected === false)
+    );
+    if (!isDup) stateHints.push(`state=${ds}`);
+  }
   // V22: invalid state — recorded "click on invalid email field with red border"
   // must match a live invalid input, not a freshly-cleared valid one.
   if ((node as any).invalid === true) stateHints.push('invalid');

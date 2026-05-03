@@ -1212,6 +1212,13 @@ function buildTargetFingerprint(node: InteractiveNode): TargetFingerprint {
     arrowDir: (node as any).arrowDir,
     // V22 Pkg4: iconLabel pass-through.
     iconLabel: (node as any).iconLabel,
+    // Stage 1: Radix/shadcn `data-state` recorded for fingerprint match.
+    // Stored as a top-level field (not inside ariaState) because it's a
+    // string keyword that doesn't fit the boolean schema, AND can be
+    // set independently of aria-* (Radix Dialog/Popover do not mirror).
+    // Used by quickFingerprintCheck at replay as soft signal — NOT a
+    // uniqueness gate (multiple elements can share data-state="open").
+    dataState: (node as any).dataState,
     // Etap 1B.2 — Angular routerLink + formControlName. Persisted into
     // the fingerprint so quickFingerprintCheck at replay can score
     // identity drift (rename of `formcontrolname="email"` → `email-input`

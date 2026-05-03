@@ -13,6 +13,7 @@
 import type { LiteElement, NetworkSuccess, NetworkValidationError, StateDiff } from '../../lite-types';
 import type { ExpandedGoal } from '../goal-expander';
 import {
+  applyDeweightedSentiment,
   buildDeterministicSummary,
   computeProgressSentiment,
   isGoalRelevantElement,
@@ -206,6 +207,205 @@ describe('computeProgressSentiment — priority order', () => {
       makeDiff({ addedElements: decorative }),
       null,
     )).toBe('Minor Change');
+  });
+
+  // ── Audit Scenario 1: Reviews "iPhone" content keyword false-positive ──
+  it('Scenario 1: review divs containing goal text are NOT actionable → still No Effect', () => {
+    // "buy iPhone" goal, user clicks Reviews tab. Review cards mount
+    // as plain <div> elements whose name contains "iPhone" — naive
+    // text-match would misclassify them as goal-relevant.
+    const goal = makeGoal(['buy', 'iphone']);
+    const reviewCards = [1, 2, 3, 4, 5].map((i) => makeEl({
+      tag: 'div', ref: `r${i}`,
+      name: `Great iPhone! Bought it last week, very happy review #${i}`,
+    }));
+    expect(computeProgressSentiment(
+      makeDiff({ addedElements: reviewCards }),
+      goal,
+    )).toBe('No Effect');
+  });
+
+  it('Scenario 1: actual interactive button containing goal text → Minor Change', () => {
+    // Counterpart: a real <button>iPhone 15 Pro</button> in a list of
+    // products MUST be detected as actionable. Stricter predicate
+    // accepts native interactive tags + ARIA-button roles.
+    const goal = makeGoal(['iphone']);
+    const products = [
+      makeEl({ tag: 'div', ref: 'card1', name: 'iPhone description' }),
+      makeEl({ tag: 'div', ref: 'card2', name: 'iPhone price' }),
+      makeEl({ tag: 'button', ref: 'buy1', name: 'Buy iPhone 15 Pro' }),
+    ];
+    expect(computeProgressSentiment(
+      makeDiff({ addedElements: products }),
+      goal,
+    )).toBe('Minor Change');
+  });
+
+  // ── Audit C1: Radix data-state flip → Major Progress ──
+  it('Fix C1: data-state closed→open in changedElements → Major Progress', () => {
+    // Radix DropdownMenu trigger flips data-state without aria-expanded.
+    expect(computeProgressSentiment(makeDiff({
+      changedElements: [
+        { ref: 'trig1', field: 'dataState', before: 'closed', after: 'open' },
+      ],
+    }))).toBe('Major Progress');
+  });
+
+  it('Fix C1: data-state inactive→active (Tabs) → Major Progress', () => {
+    expect(computeProgressSentiment(makeDiff({
+      changedElements: [
+        { ref: 'tab1', field: 'dataState', before: 'inactive', after: 'active' },
+      ],
+    }))).toBe('Major Progress');
+  });
+
+  it('Fix C1: data-state open→closed (closing) is NOT major progress', () => {
+    // Closing is not "progress" — let bulk-gate / lower rules decide.
+    // Single change → totalMoves=1 → 'No Effect'.
+    expect(computeProgressSentiment(makeDiff({
+      changedElements: [
+        { ref: 'trig1', field: 'dataState', before: 'open', after: 'closed' },
+      ],
+    }))).toBe('No Effect');
+  });
+
+  // ── Audit H4: widget-open list now covers Radix menu/combobox/listbox ──
+  it('Fix H4: new role=menu in addedElements → Major Progress', () => {
+    expect(computeProgressSentiment(makeDiff({
+      addedElements: [makeEl({ tag: 'div', role: 'menu', ref: 'm1' })],
+    }))).toBe('Major Progress');
+  });
+
+  it('Fix H4: new role=menuitem (Portal-rendered DropdownMenu items) → Major Progress', () => {
+    expect(computeProgressSentiment(makeDiff({
+      addedElements: [
+        makeEl({ tag: 'div', role: 'menuitem', ref: 'mi1' }),
+        makeEl({ tag: 'div', role: 'menuitem', ref: 'mi2' }),
+      ],
+    }))).toBe('Major Progress');
+  });
+
+  it('Fix H4: new role=combobox (Radix Select) → Major Progress', () => {
+    expect(computeProgressSentiment(makeDiff({
+      addedElements: [makeEl({ tag: 'div', role: 'combobox', ref: 'c1' })],
+    }))).toBe('Major Progress');
+  });
+
+  it('Fix H4: new role=listbox + role=option (Listbox open) → Major Progress', () => {
+    expect(computeProgressSentiment(makeDiff({
+      addedElements: [
+        makeEl({ tag: 'div', role: 'listbox', ref: 'lb' }),
+        makeEl({ tag: 'div', role: 'option', ref: 'o1' }),
+      ],
+    }))).toBe('Major Progress');
+  });
+
+  // ── Audit M5: visible=false widget should NOT trigger Major Progress ──
+  it('Audit M5: hidden <input> from Stripe iframe → does NOT fire widget gate', () => {
+    // Stripe / reCaptcha inject hidden inputs / forms. Without the
+    // visible filter, every page with these injects fires Major
+    // Progress on every iteration — false-positive that resets stuck
+    // count and prevents legitimate aborts.
+    expect(computeProgressSentiment(makeDiff({
+      addedElements: [
+        makeEl({ tag: 'input', ref: 'hidden1', visible: false }),
+        makeEl({ tag: 'form', ref: 'hidden2', visible: false }),
+      ],
+    }))).toBe('No Effect');
+  });
+});
+
+describe('applyDeweightedSentiment — C2/C3 flag truthfulness', () => {
+  it('Major Progress sets meaningful=true and significant=true', () => {
+    const result = applyDeweightedSentiment(makeDiff({ urlChanged: true, urlAfter: 'https://app/done' }));
+    expect(result.progressSentiment).toBe('Major Progress');
+    expect(result.meaningfulChange).toBe(true);
+    expect(result.significantChange).toBe(true);
+  });
+
+  it('Significant Change sets meaningful=true and significant=true', () => {
+    const result = applyDeweightedSentiment(makeDiff({
+      successfulApiResponses: [{ url: '/api/save', status: 201, method: 'POST' } as NetworkSuccess],
+    }));
+    expect(result.progressSentiment).toBe('Significant Change');
+    expect(result.meaningfulChange).toBe(true);
+    expect(result.significantChange).toBe(true);
+  });
+
+  it('Minor Change sets meaningful=true but significant=false', () => {
+    const result = applyDeweightedSentiment(makeDiff({
+      addedElements: [
+        makeEl({ tag: 'span', ref: 'a' }),
+        makeEl({ tag: 'div', ref: 'b' }),
+        makeEl({ tag: 'p', ref: 'c' }),
+      ],
+    }));
+    expect(result.progressSentiment).toBe('Minor Change');
+    expect(result.meaningfulChange).toBe(true);
+    expect(result.significantChange).toBe(false);
+  });
+
+  it('Negative Change sets BOTH flags true (something happened, even if bad)', () => {
+    // Errors are still "meaningful" — state-validator and downstream
+    // need to know SOMETHING happened, just badly.
+    const result = applyDeweightedSentiment(makeDiff({ newPageErrors: ['Boom'] }));
+    expect(result.progressSentiment).toBe('Negative Change');
+    expect(result.meaningfulChange).toBe(true);
+    expect(result.significantChange).toBe(true);
+  });
+
+  it('No Effect sets both false (matches base default)', () => {
+    const result = applyDeweightedSentiment(makeDiff());
+    expect(result.progressSentiment).toBe('No Effect');
+    expect(result.meaningfulChange).toBe(false);
+    expect(result.significantChange).toBe(false);
+  });
+
+  it('preserves all other StateDiff fields', () => {
+    const base = makeDiff({
+      urlChanged: true,
+      urlAfter: 'https://app/x',
+      addedElements: [makeEl({ tag: 'span', ref: 'a' })],
+      removedRefs: ['b', 'c'],
+    });
+    const result = applyDeweightedSentiment(base);
+    expect(result.urlAfter).toBe('https://app/x');
+    expect(result.addedElements).toBe(base.addedElements);
+    expect(result.removedRefs).toEqual(['b', 'c']);
+  });
+});
+
+describe('isGoalRelevantElement — H3: title/iconLabel coverage', () => {
+  it('matches goal keyword in el.title (icon button tooltip)', () => {
+    const goal = makeGoal(['add', 'cart']);
+    expect(isGoalRelevantElement(
+      makeEl({ tag: 'button', name: '', title: 'Add to cart' }),
+      goal,
+    )).toBe(true);
+  });
+
+  it('matches goal keyword in el.iconLabel (Lucide / FA icon)', () => {
+    const goal = makeGoal(['delete', 'trash']);
+    expect(isGoalRelevantElement(
+      makeEl({ tag: 'button', name: '', iconLabel: 'trash' }),
+      goal,
+    )).toBe(true);
+  });
+
+  it('matches goal keyword in el.labelText (form input wrap)', () => {
+    const goal = makeGoal(['email']);
+    expect(isGoalRelevantElement(
+      makeEl({ tag: 'input', name: '', labelText: 'Email address' }),
+      goal,
+    )).toBe(true);
+  });
+
+  it('matches goal keyword in el.placeholder (input)', () => {
+    const goal = makeGoal(['search']);
+    expect(isGoalRelevantElement(
+      makeEl({ tag: 'input', name: '', placeholder: 'Search products' }),
+      goal,
+    )).toBe(true);
   });
 
   it('is pure / synchronous (no Promise return)', () => {

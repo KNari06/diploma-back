@@ -118,9 +118,11 @@ export class MobileStepApplyService {
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
     const stepType = STEP_TYPE_MAP[rawStepType] || rawStepType;
 
-    // Normalize description: strip surrounding quotes (users often type "Login" etc.)
-    const rawDescription = stepDraft.elementDescription || stepDraft.description || '';
-    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+    // Normalize description: strip surrounding quotes (handles whole-wrap +
+    // balanced inline pairs). See normalize-description.ts for the failure
+    // modes of the previous one-shot regex.
+    const { normalizeMobileDescription } = await import('./normalize-description');
+    const description = normalizeMobileDescription(stepDraft.elementDescription || stepDraft.description);
 
     const applyStart = Date.now();
 

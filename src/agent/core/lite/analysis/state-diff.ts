@@ -75,6 +75,14 @@ export class StateDiffComputer {
           'ariaChecked', 'ariaExpanded', 'ariaPressed', 'ariaSelected',
           // Validation state changes
           'invalid', 'required', 'readOnly',
+          // Stage 1 wiring: Radix UI / shadcn / Vaul / Headless UI all
+          // encode toggle state as data-state. Many primitives (Dialog,
+          // Popover, DropdownMenu, Collapsible) do NOT mirror to
+          // aria-expanded — without tracking data-state here, StateDiff
+          // misses widget transitions on the entire shadcn ecosystem.
+          // Caught by Stage 2 audit C1: collected in snapshot but invisible
+          // to LiteEngine progress logic. Symmetric with the ARIA list.
+          'dataState',
         ];
 
         fieldsToCheck.forEach((field) => {

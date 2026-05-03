@@ -27,7 +27,7 @@ import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
 import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
 import { extractPageCredentials, parseCredentialsFromResponse } from './analysis/page-credentials-extractor';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
-import { buildDeterministicSummary, computeProgressSentiment } from './analysis/progress-evaluator';
+import { applyDeweightedSentiment, buildDeterministicSummary } from './analysis/progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateDriftAuditor } from './analysis/state-drift-auditor';
 import { StateValidator } from './analysis/state-validator';
@@ -437,15 +437,24 @@ export class LiteEngine {
       elementName: targetElement.name?.slice(0, 30),
     });
 
-    // Get top candidates ranked by composite score
+    // Get top candidates ranked by composite score (legacy) or
+    // 4-bucket boolean (deweighted). When deweighted, the function
+    // may return up to HARD_CAP=10 — score field carries bucket index.
     const topCandidates = this.getTopRankedCandidates(snapshot, command.action, 5);
+
+    // Tell TargetAudit which scoring scheme it's looking at — without
+    // this, the LLM misreads bucket score=3 as "low confidence"
+    // (legacy scores went 5–15). See target-audit.ts H2 legend.
+    const scoringMode: 'legacy' | 'deweighted' =
+      LITE_ENGINE_FLAGS.enableDeweightedProgress ? 'deweighted' : 'legacy';
 
     // Ask AI to pick correct ref
     const auditResult = await TargetAudit.audit(
       command,
       topCandidates,
       this.expandedGoal,
-      this.currentFunnelPhase
+      this.currentFunnelPhase,
+      { scoringMode },
     );
 
     if (auditResult.correctedRef && auditResult.correctedRef !== command.ref) {
@@ -4115,13 +4124,18 @@ export class LiteEngine {
           // Compute sentiment from base structural signals and embed it
           // back into the diff so downstream callsites (4046/4084/4156/
           // 4173/4179) read the same `progressSentiment` shape.
-          // Pass expandedGoal so the decorative-bulk gate (Fix 2 in
-          // progress-evaluator.ts) can demote pure decorative flood
-          // (e.g. clicking Reviews/FAQ when goal is unrelated) to
-          // 'No Effect' instead of 'Minor Change'. Without goal,
-          // gate is bypassed and threshold-based 'Minor Change' wins.
-          const sentiment = computeProgressSentiment(baseDiff, this.expandedGoal ?? null);
-          enrichedDiff = { ...baseDiff, progressSentiment: sentiment };
+          // Pass expandedGoal so:
+          //   - decorative-bulk gate (Fix 2 in progress-evaluator.ts)
+          //     can demote pure decorative flood (e.g. clicking
+          //     Reviews/FAQ when goal is unrelated) to 'No Effect'.
+          //   - data-state flip detection (Fix C1) elevates Radix
+          //     Dialog/Popover/Menu opens to Major Progress.
+          //   - meaningfulChange / significantChange are set
+          //     consistently with sentiment (Fix C2/C3 — without this,
+          //     state-diff.ts:formatForAI prints "(Meaningful: false,
+          //     Significant: false)" even on Major Progress and
+          //     poisons the prompt).
+          enrichedDiff = applyDeweightedSentiment(baseDiff, this.expandedGoal ?? null);
           goalOrientedSummary = buildDeterministicSummary(enrichedDiff, this.expandedGoal ?? null);
           // `removedElements` is only consumed by enrichWithAI (legacy
           // category enrichment). Pure path doesn't need it; keep var
@@ -4269,10 +4283,19 @@ export class LiteEngine {
         // ═══════════════════════════════════════════════════════════════════════
         // WORKSTREAM 4: Set recovery point on progress
         // ═══════════════════════════════════════════════════════════════════════
+        // Audit H5: previously `outcome === 'state_changed'` could fire
+        // on a decorative-bulk iteration (5 div elements added → diff
+        // hasVisualChange=true → outcome='state_changed') WHILE Fix 2
+        // pinned progressSentiment='No Effect'. That created an
+        // inconsistency: recovery point set + consecutiveNoEffectCount++
+        // on the same iteration. Gate recovery on sentiment too: only
+        // record a recovery point if the deweighted/legacy progress
+        // signal also agrees something useful happened.
         const hasProgress =
-          enrichedDiff.progressSentiment === 'Major Progress' ||
-          enrichedDiff.urlChanged ||
-          outcome === 'state_changed';
+          (enrichedDiff.progressSentiment === 'Major Progress'
+            || enrichedDiff.urlChanged
+            || outcome === 'state_changed')
+          && enrichedDiff.progressSentiment !== 'No Effect';
 
         if (hasProgress) {
           this.setRecoveryPointForCurrentState(snapshotAfter, i);

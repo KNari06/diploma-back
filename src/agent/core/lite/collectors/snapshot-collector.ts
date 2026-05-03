@@ -3383,6 +3383,36 @@ export class SnapshotCollector {
         if (el.ariaExpanded === false) line += ' [COLLAPSED]';
         if (el.ariaPressed) line += ' [PRESSED]';
         if (el.ariaSelected) line += ' [SELECTED]';
+        // Stage 1 wiring (audit gap): Radix UI / shadcn / Vaul / Headless
+        // UI encode toggle state as `data-state` and many primitives
+        // (Dialog, Popover, DropdownMenu, Collapsible, Tabs item) do NOT
+        // mirror to aria-* attributes. Without this hint LLM agent can't
+        // tell an already-OPEN dropdown trigger from a CLOSED one →
+        // canonical fake-success when agent clicks "open" trigger that
+        // simply closes itself.
+        //
+        // Skip when value already reflected by an aria-* marker above
+        // (avoid duplicate hints that confuse the LLM):
+        //   - dataState='open' AND ariaExpanded=true → skip (redundant)
+        //   - dataState='checked' AND ariaChecked=true → skip
+        //
+        // Show ALL other values — Radix-specific keywords like
+        // 'forceMount', 'submitting', 'instant' carry meaning we
+        // don't try to interpret here.
+        if (el.dataState) {
+          const s = el.dataState;
+          const dupExpanded = (s === 'open' && el.ariaExpanded === true)
+            || (s === 'closed' && el.ariaExpanded === false);
+          const dupChecked = (s === 'checked' && (el.ariaChecked === true || el.checked === true))
+            || (s === 'unchecked' && (el.ariaChecked === false || el.checked === false));
+          const dupPressed = (s === 'on' && el.ariaPressed === true)
+            || (s === 'off' && el.ariaPressed === false);
+          const dupSelected = (s === 'active' && el.ariaSelected === true)
+            || (s === 'inactive' && el.ariaSelected === false);
+          if (!dupExpanded && !dupChecked && !dupPressed && !dupSelected) {
+            line += ` [STATE=${s}]`;
+          }
+        }
         if (el.iframeSource) line += ' [IFRAME]';
         // SECURITY: Do not include raw input values in logs/prompts/traces.
         // This avoids leaking emails, passwords, OTPs, or other sensitive data.

@@ -80,6 +80,28 @@ const BULK_MOVE_THRESHOLD = 3;
  *   - 'No Effect': nothing else moved. Drives consecutiveNoEffectCount
  *     in lite-engine.ts:4046.
  */
+/**
+ * Map a sentiment to its (meaningfulChange, significantChange) pair.
+ *
+ * Stage 2 audit C2/C3: state-diff.ts:formatForAI feeds these booleans
+ * directly into the LLM prompt as `(Meaningful: false, Significant: false)`.
+ * Leaving them at base defaults (always false) when the deweighted path
+ * sets sentiment='Major Progress' poisons the prompt. This mapping
+ * mirrors the legacy semantics:
+ *   - meaningful = anything other than 'No Effect'
+ *   - significant = 'Major Progress' or 'Significant Change'
+ * Matches HybridSemanticWeightCalculator's behaviour (totalWeight >= 0.1
+ * → meaningful, >= 0.5 → significant) at the categorical level.
+ */
+function flagsForSentiment(sentiment: ProgressSentiment): { meaningful: boolean; significant: boolean } {
+  if (sentiment === 'No Effect') return { meaningful: false, significant: false };
+  if (sentiment === 'Minor Change') return { meaningful: true, significant: false };
+  // Major Progress / Significant Change / Negative Change all count
+  // as significant — Negative because validators care that something
+  // happened (even if bad), not just that the run failed silently.
+  return { meaningful: true, significant: true };
+}
+
 export function computeProgressSentiment(
   diff: StateDiff,
   goal: ExpandedGoal | null = null
@@ -95,11 +117,28 @@ export function computeProgressSentiment(
   // 2. URL change — highest-confidence positive. Any nav = Major.
   if (diff.urlChanged) return 'Major Progress';
 
-  // 3. Structural openings (form / dialog / new input). Detected by
-  //    presence — no scoring. Replaces the legacy "totalWeight >= 0.5
-  //    AND tag === 'input'" branch with the broader, more accurate
-  //    "any of these widget types just appeared" predicate.
+  // 3a. Structural openings — new widget root just mounted. Detected
+  //     by presence of the right tag/role in addedElements. NO scoring,
+  //     NO LLM. The whitelist covers the practical universe of "widget
+  //     opened" semantics across React UI stacks:
+  //
+  //       Native HTML:  form / dialog / input / textarea / select
+  //       ARIA dialog:  role=dialog | alertdialog (Radix Dialog,
+  //                     Headless UI Dialog, custom modals)
+  //       ARIA menu:    role=menu | menuitem (Radix DropdownMenu,
+  //                     ContextMenu — items mount via Portal so they
+  //                     show up in addedElements, not changedElements)
+  //       ARIA select:  role=combobox | listbox | option (Radix Select,
+  //                     Headless UI Listbox, Combobox — option list
+  //                     also Portal-rendered)
+  //       ARIA tooltip: role=tooltip (HoverCard, Tooltip)
+  //
+  //     `el.visible !== false` filter (audit M5): hidden <input> /
+  //     <form> injected by Stripe / reCaptcha / tracking scripts must
+  //     NOT trigger Major Progress. Both undefined and true visible
+  //     count as "real". Off-screen-but-visible is still real.
   const opensWidget = diff.addedElements.some((el) => {
+    if (el.visible === false) return false;
     const tag = el.tag;
     const role = (el.role || '').toLowerCase();
     return tag === 'form'
@@ -108,9 +147,48 @@ export function computeProgressSentiment(
       || tag === 'textarea'
       || tag === 'select'
       || role === 'dialog'
-      || role === 'alertdialog';
+      || role === 'alertdialog'
+      || role === 'menu'
+      || role === 'menuitem'
+      || role === 'combobox'
+      || role === 'listbox'
+      || role === 'option'
+      || role === 'tooltip';
   });
   if (opensWidget) return 'Major Progress';
+
+  // 3b. data-state flip on EXISTING element — Radix Dialog/Popover/
+  //     DropdownMenu/Select toggle the trigger's data-state from
+  //     'closed' → 'open' (or 'inactive' → 'active' for Tabs) WITHOUT
+  //     mounting new widget roots in the same DOM region. The portal
+  //     mounts (rule 3a) usually catches this, but some Radix
+  //     primitives (Collapsible, AccordionTrigger) toggle inline
+  //     content visibility instead — only data-state changes.
+  //
+  //     Symmetry with state-diff.ts:78 fieldsToCheck which now
+  //     includes 'dataState'. Without rule 3b, those changes count as
+  //     1 changedElements move → fall through to bulk gate at ≥3 →
+  //     `consecutiveNoEffectCount` increments on a real "menu opened"
+  //     event.
+  //
+  //     Recognise canonical "opening" transitions only. Going from
+  //     'open' → 'closed' is a CLOSE, not progress; we don't elevate
+  //     that to Major (it falls through to bulk-movement rule below).
+  const dataStateOpened = diff.changedElements.some((change) => {
+    if (change.field !== 'dataState') return false;
+    const before = String(change.before ?? '').toLowerCase();
+    const after = String(change.after ?? '').toLowerCase();
+    // 'closed' → 'open': Radix Dialog, Popover, DropdownMenu, Select,
+    //                    HoverCard, Collapsible, AccordionItem.
+    // 'inactive' → 'active': Radix Tabs (clicking a tab).
+    // 'off' → 'on': Radix Toggle / ToggleGroup item activation.
+    // 'unchecked' → 'checked': Radix Checkbox / RadioGroup item.
+    return (before === 'closed' && after === 'open')
+      || (before === 'inactive' && after === 'active')
+      || (before === 'off' && after === 'on')
+      || (before === 'unchecked' && after === 'checked');
+  });
+  if (dataStateOpened) return 'Major Progress';
 
   // 4. Successful mutating API call — server confirmed even without UI.
   if (diff.successfulApiResponses && diff.successfulApiResponses.length > 0) {
@@ -143,9 +221,52 @@ export function computeProgressSentiment(
     //     stays as 'Minor Change'. Pure decorative falls through
     //     to 'No Effect'.
     if (goal && diff.addedElements.length >= BULK_MOVE_THRESHOLD) {
-      const anyGoalRelevant = diff.addedElements.some((el) => isGoalRelevantElement(el, goal));
+      // Audit Scenario 1 fix — content-keyword false-positive on Reviews.
+      //
+      // Naive text-match leaks: clicking "Reviews" tab on goal="buy
+      // iPhone" floods 30 review-card divs, each containing the word
+      // "iPhone" in its body — `isGoalRelevantElement` returns true
+      // for every one → Fix 2 bypassed → bulk gate stays Minor Change
+      // → agent thinks decorative section is progress.
+      //
+      // Stricter predicate for the bulk gate ONLY: require the matched
+      // element to ALSO be interactive (clickable widget/role), not a
+      // text-bearing layout div. The summary path (line ~290 below)
+      // still uses the broad predicate because it's a hint string for
+      // the LLM, not a control-flow gate.
+      //
+      // Interactive predicate matches snapshot-collector's Tier-1
+      // selector intent: native interactive tags + ARIA roles that
+      // indicate clickability. Skips `tooltip`/`option` because they
+      // appear in dense lists where every option matches goal text
+      // (same Reviews-style false-positive).
+      const isActionableGoalRelevant = (el: LiteElement): boolean => {
+        if (!isGoalRelevantElement(el, goal)) return false;
+        const tag = el.tag;
+        const role = (el.role || '').toLowerCase();
+        return tag === 'button'
+          || tag === 'a'
+          || tag === 'input'
+          || tag === 'textarea'
+          || tag === 'select'
+          || tag === 'form'
+          || tag === 'dialog'
+          || role === 'button'
+          || role === 'link'
+          || role === 'menuitem'
+          || role === 'tab'
+          || role === 'checkbox'
+          || role === 'radio'
+          || role === 'switch'
+          || role === 'combobox'
+          || role === 'searchbox'
+          || role === 'textbox'
+          || role === 'dialog'
+          || role === 'alertdialog';
+      };
+      const anyActionableGoalRelevant = diff.addedElements.some(isActionableGoalRelevant);
       const anyError = diff.addedElements.some(isErrorElement);
-      if (!anyGoalRelevant && !anyError) {
+      if (!anyActionableGoalRelevant && !anyError) {
         // Decorative-only bulk → treat as no-effect. This drives
         // consecutiveNoEffectCount and the 5-strike abort that
         // protects the user from runaway iterations on the wrong
@@ -160,6 +281,34 @@ export function computeProgressSentiment(
 }
 
 /**
+ * Apply deweighted sentiment computation to a base StateDiff and return
+ * a fully enriched diff with `progressSentiment`, `meaningfulChange`,
+ * `significantChange` set consistently.
+ *
+ * Audit C2/C3 fix: legacy `enrichWithAI` updated all three fields
+ * together — the deweighted path was only updating `progressSentiment`
+ * leaving `meaningful`/`significant` at base `false`, which leaked into
+ * `state-diff.ts:formatForAI` prompt section as `(Meaningful: false,
+ * Significant: false)` even on Major Progress. This wrapper closes
+ * that contract.
+ *
+ * Pure synchronous — same I/O profile as `computeProgressSentiment`.
+ */
+export function applyDeweightedSentiment(
+  baseDiff: StateDiff,
+  goal: ExpandedGoal | null = null,
+): StateDiff {
+  const sentiment = computeProgressSentiment(baseDiff, goal);
+  const { meaningful, significant } = flagsForSentiment(sentiment);
+  return {
+    ...baseDiff,
+    progressSentiment: sentiment,
+    meaningfulChange: meaningful,
+    significantChange: significant,
+  };
+}
+
+/**
  * Detect "this is a goal-relevant element" deterministically.
  *
  * Used by both buildDeterministicSummary and rankCandidatesForAudit.
@@ -168,7 +317,27 @@ export function computeProgressSentiment(
  */
 export function isGoalRelevantElement(el: LiteElement, goal: ExpandedGoal | null): boolean {
   if (!goal) return false;
-  const haystack = `${el.name || ''} ${el.ariaLabel || ''} ${el.firstTextFragment || ''}`.trim();
+  // Audit H3: include title / iconLabel / labelText / placeholder so
+  // icon-only buttons (Element Plus toolbar, AntD IconButton, MUI
+  // IconButton) and labelled inputs are recognised as goal-relevant.
+  // Without these, an icon button whose only text is `title="Add to
+  // cart"` lands in the wrong bucket and L4 audit can promote a
+  // generic CTA over it.
+  //
+  // Skipped intentionally:
+  //   - el.context (parent text — too broad, would over-trigger on
+  //     row siblings)
+  //   - el.nearText (deliberately picks UP context, opposite of what
+  //     we want for "is THIS element relevant")
+  const haystack = [
+    el.name,
+    el.ariaLabel,
+    el.firstTextFragment,
+    el.title,
+    el.iconLabel,
+    el.labelText,
+    el.placeholder,
+  ].filter(Boolean).join(' ').trim();
   if (!haystack) return false;
   // Stop on first match — set is small (typically 5-15 keywords).
   for (const kw of goal.allKeywords) {

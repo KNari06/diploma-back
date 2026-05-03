@@ -959,6 +959,24 @@ export async function quickFingerprintCheck(
       if ((element as any).dataValue === (fingerprint as any).dataValue) matches++;
     }
 
+    // ── Stage 1: Radix/shadcn data-state ──
+    // Symmetric with locator-plan-builder.ts:1222 — fp.dataState was
+    // recorded but had no consumer at match-time (silent no-op of the
+    // class documented in .claude/rules/wrong-element-debugging.md).
+    // Soft signal: state can drift between recording and replay (a
+    // dropdown that was 'closed' at record can be 'open' at replay
+    // because a previous step opened it). Half match instead of
+    // hard yes/no — present-on-both with same value = 1, present-on-
+    // both with different value = 0.5 (still same element, just
+    // different state). Absent on live but recorded = 0.
+    if ((fingerprint as any).dataState) {
+      total++;
+      const fpDs = (fingerprint as any).dataState as string;
+      const liveDs = (element as any).dataState as string | undefined;
+      if (liveDs === fpDs) matches++;
+      else if (liveDs) matches += 0.5; // both have dataState → likely same widget, just different state
+    }
+
     // ── V22 Pkg1: childTestId (lifted from icon child) ──
     if ((fingerprint as any).childTestId) {
       total++;

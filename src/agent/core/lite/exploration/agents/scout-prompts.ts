@@ -147,6 +147,14 @@ function formatSnapshotForScout(snapshot: any): string {
       if (el.type) parts.push(`type=${el.type}`);
       if (el.disabled) parts.push('[disabled]');
       if (el.ariaExpanded) parts.push(`[expanded=${el.ariaExpanded}]`);
+      // Radix/shadcn/Vaul `data-state` — see snapshot-collector format()
+      // for the same rationale. Skip when redundant with ariaExpanded.
+      if (el.dataState && !(
+        (el.dataState === 'open' && el.ariaExpanded === true)
+        || (el.dataState === 'closed' && el.ariaExpanded === false)
+      )) {
+        parts.push(`[state=${el.dataState}]`);
+      }
       if (el.isInsideActiveModal) parts.push('[in-modal]');
       if (el.context) parts.push(`ctx="${el.context}"`);
       lines.push('  ' + parts.join(' '));
