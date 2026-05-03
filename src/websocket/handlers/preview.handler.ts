@@ -1902,6 +1902,47 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       }
 
+      // Failed-but-plan-is-proven persistence.
+      //
+      // The mobile apply service forwards `appliedStep` even on failure if
+      // the runner emitted a compiled plan AND resolveVia was a "proven"
+      // strategy (compiled_fast_path / cache) — meaning the plan already
+      // matched the current tree, the failure was downstream of resolution.
+      // Persist that plan so the next run keeps fast-path coverage instead
+      // of re-paying full LLM cost. failureEvidence path below handles the
+      // "needs review" flow separately; this branch is purely about not
+      // losing valid compiled plans.
+      if (
+        !result.success
+        && intentTestCaseId
+        && result.appliedStep
+        && (result.appliedStep as { compiled?: unknown }).compiled
+        && !result.appliedStep.failureEvidence
+      ) {
+        try {
+          const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+          if (!PreviewRunService.isRunning(previewSessionId)) {
+            const { IntentTestCaseService } = await import('@/services/testing/ui/preview/intent-test-case.service');
+            await IntentTestCaseService.updateStepFromPreviewApply({
+              intentTestCaseId,
+              appliedStep: result.appliedStep,
+              userId: ensuredUserId,
+            });
+            logger.info('[WebSocket] Persisted proven-plan from failed apply', {
+              socketId: socket.id,
+              intentTestCaseId,
+              stepId: result.appliedStep.id,
+            });
+          }
+        } catch (provenPersistError) {
+          logger.warn('[WebSocket] Failed to persist proven-plan from failed apply', {
+            socketId: socket.id,
+            intentTestCaseId,
+            error: provenPersistError instanceof Error ? provenPersistError.message : String(provenPersistError),
+          });
+        }
+      }
+
       // Etap 1D.2 — failure persistence + needs-review WS event.
       //
       // When apply fully failed AND the collector built a failureEvidence

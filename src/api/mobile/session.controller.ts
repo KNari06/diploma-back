@@ -1717,10 +1717,34 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           logger.info(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} passed (runSteps fallback)`, {
             stepId: step.id, type: rawType, description, durationMs,
           });
+        } else {
+          const errorMsg = stepResult?.error || 'Step failed';
+          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
+          failedSteps++;
+          if (!isOptional) hardFailed = true;
+          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
+          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
+            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
+          });
+        }
 
-          // Auto-persist compiled plan when the runner (re)built one — without this
-          // every regression run re-pays the LLM cost until the user hits Save.
-          if (stepResult.compiledPlan && intentTestCaseId) {
+        // ── Auto-persist compiled plan ───────────────────────────────
+        // Persist when:
+        //   (a) step succeeded AND a plan was emitted, OR
+        //   (b) step FAILED but resolveVia ∈ {compiled,compiled_fast_path,
+        //       cache} — i.e. the plan was already validated against the
+        //       current tree before this run; the failure was downstream of
+        //       resolution (dispatch, VTE, app crash) and the plan itself is
+        //       still good. Throwing it away would force the next run to
+        //       re-pay full LLM cost for nothing.
+        // We deliberately do NOT persist on failure when resolveVia was a
+        // fresh LLM/vision/thinking pass — locking in a possibly-wrong plan
+        // hurts more than it helps.
+        if (stepResult?.compiledPlan && intentTestCaseId) {
+          const PROVEN: ReadonlySet<string> = new Set(['compiled', 'compiled_fast_path', 'cache']);
+          const planIsProven = !!stepResult.resolvedVia && PROVEN.has(stepResult.resolvedVia);
+          const shouldPersist = stepResult.success === true || planIsProven;
+          if (shouldPersist) {
             try {
               const { IntentTestCaseService } = await import(
                 '@/services/testing/ui/preview/intent-test-case.service'
@@ -1741,15 +1765,6 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               });
             }
           }
-        } else {
-          const errorMsg = stepResult?.error || 'Step failed';
-          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
-          failedSteps++;
-          if (!isOptional) hardFailed = true;
-          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
-          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
-            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
-          });
         }
       } catch (stepError) {
         const durationMs = Date.now() - stepStart;

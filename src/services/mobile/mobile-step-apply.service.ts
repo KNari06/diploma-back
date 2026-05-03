@@ -249,7 +249,24 @@ export class MobileStepApplyService {
     const stepResult = result.steps?.[0];
     const success = stepResult?.success ?? false;
 
-    const appliedStep = success
+    // On failure we still want to forward `appliedStep` when the runner
+    // emitted a compiled plan AND it was a "proven" plan — i.e. resolveVia
+    // was compiled_fast_path or cache, meaning the plan already matched the
+    // current tree before the run started; the failure happened downstream
+    // of resolution (dispatch / VTE / app crash) and the plan is still
+    // worth persisting. Without this, every failed run discards a
+    // perfectly-good plan and the next run re-pays full LLM cost.
+    // We do NOT forward fresh LLM plans on failure — that would risk
+    // locking in an incorrect element pick.
+    const PROVEN_RESOLVED_VIA: ReadonlySet<string> = new Set([
+      'compiled', 'compiled_fast_path', 'cache',
+    ]);
+    const planIsProven = !!stepResult?.resolvedVia
+      && PROVEN_RESOLVED_VIA.has(stepResult.resolvedVia);
+    const shouldEmitAppliedStep = success
+      || (!!stepResult?.compiledPlan && planIsProven);
+
+    const appliedStep = shouldEmitAppliedStep
       ? {
           id: intentStep.id,
           type: stepType,
