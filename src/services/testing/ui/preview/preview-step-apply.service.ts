@@ -1668,6 +1668,10 @@ async function captureClickPreState(
         targetAriaPressed: targetEl ? targetEl.getAttribute('aria-pressed') : null,
         targetAriaExpanded: targetEl ? targetEl.getAttribute('aria-expanded') : null,
         targetAriaChecked: targetEl ? targetEl.getAttribute('aria-checked') : null,
+        // Radix/shadcn data-state — see ClickPreState.targetDataState.
+        // Captured here as raw string-or-null so the post-click verifier
+        // can compare with strict equality (===) like sibling aria-* fields.
+        targetDataState: targetEl ? targetEl.getAttribute('data-state') : null,
         targetDisabled: targetEl
           ? (targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true')
           : false,
@@ -1772,6 +1776,12 @@ async function verifyClickHadEffect(
           if (targetEl.getAttribute('aria-pressed') !== prev.targetAriaPressed) return { signal: 'aria' as const };
           if (targetEl.getAttribute('aria-expanded') !== prev.targetAriaExpanded) return { signal: 'aria' as const };
           if (targetEl.getAttribute('aria-checked') !== prev.targetAriaChecked) return { signal: 'aria' as const };
+          // Radix/shadcn/Vaul data-state diff — strong signal of widget
+          // state change. Reuses 'aria' enum tag deliberately (rather than
+          // adding 'state' to ClickEffectSignal): downstream consumers
+          // already classify 'aria' as a STRONG signal that bypasses the
+          // fake-success guard's weak-signal branch.
+          if (targetEl.getAttribute('data-state') !== prev.targetDataState) return { signal: 'aria' as const };
           const nowDisabled = targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true';
           if (nowDisabled !== prev.targetDisabled) return { signal: 'aria' as const };
         }

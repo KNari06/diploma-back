@@ -27,6 +27,7 @@ import { GoalExpander, type ExpandedGoal } from './analysis/goal-expander';
 import { HybridSemanticWeightCalculator, matchesKeyword } from './analysis/hybrid-semantic-weight';
 import { extractPageCredentials, parseCredentialsFromResponse } from './analysis/page-credentials-extractor';
 import { PlanProgressEvaluator } from './analysis/plan-progress-evaluator';
+import { buildDeterministicSummary, computeProgressSentiment } from './analysis/progress-evaluator';
 import { StateDiffComputer } from './analysis/state-diff';
 import { StateDriftAuditor } from './analysis/state-drift-auditor';
 import { StateValidator } from './analysis/state-validator';
@@ -586,7 +587,84 @@ export class LiteEngine {
       }
     });
 
-    // Calculate composite score for each element
+    // Two ranking strategies gated by enableDeweightedProgress.
+    //
+    // Legacy (default): composite score
+    //   heuristic (0..1, 13 hand-tuned rules) × funnel (0.6/1.0/1.2)
+    //   × zIndex (1.0/1.1/1.2) × goalRelevance (1.0/1.5)
+    //   Decisive: top-K by float score. Magic constants throughout.
+    //
+    // Deweighted: 3-level boolean bucket
+    //   bucket = (isTopMostAtCenter ? 2 : 0)
+    //          + (goalRelevant ? 1 : 0)
+    //   Tied candidates kept in original snapshot order. The actual
+    //   ranking happens inside TargetAudit (LLM call) — this function
+    //   only PRE-FILTERS the candidate set so the LLM doesn't get all
+    //   500 elements. Buckets 3..0 → highest-confidence "I should be
+    //   asked about" goes first.
+    //
+    // No `score` field: legacy callers accept the type via
+    // `breakdown` being optional in RankedCandidate. The score is
+    // synthesised as the bucket index (3..0) for shape compatibility
+    // with TargetAudit + tracing.
+    if (LITE_ENGINE_FLAGS.enableDeweightedProgress) {
+      const scored: RankedCandidate[] = eligible.map(el => {
+        const isTopMost = el.isTopMostAtCenter === true;
+        const goalRelevant = this.checkElementRelevance(el);
+        // Bucket 3: top-most + goal-relevant. Strongest candidate.
+        // Bucket 2: top-most only. Visible but generic.
+        // Bucket 1: goal-relevant but covered. May still be right
+        //           target if covering layer is unrelated overlay.
+        // Bucket 0: neither. Last resort.
+        const bucket = (isTopMost ? 2 : 0) + (goalRelevant ? 1 : 0);
+        return {
+          ref: el.ref,
+          name: el.name || '',
+          tag: el.tag,
+          score: bucket,
+          breakdown: {
+            heuristic: goalRelevant ? 1 : 0,
+            funnelMultiplier: 1,
+            zIndexBoost: isTopMost ? 1 : 0,
+            goalRelevance: goalRelevant ? 1 : 0,
+          },
+        };
+      });
+      // Stable sort by bucket DESC. Keep insertion order on ties so
+      // upstream snapshot order is preserved (DOM source order is a
+      // reasonable secondary signal for "which one is more visible
+      // first" without weights).
+      const sorted = scored
+        .map((c, idx) => ({ c, idx }))
+        .sort((a, b) => b.c.score - a.c.score || a.idx - b.idx)
+        .map(x => x.c);
+
+      // Fix 1 — densly-laid-page rescue. With only 4 buckets, many
+      // candidates collide in the max bucket on real pages (juz40
+      // toolbar: 8+ icons all top-most and goal-relevant). Slicing to
+      // `count=5` after a stable sort means we silently keep the first
+      // 5 in DOM order — and the right one might be #6. Instead:
+      //   - if max bucket fits within the LLM's token budget (HARD_CAP)
+      //     return ALL of it so the LLM never misses the right node
+      //   - otherwise pad down from next bucket until `count` met
+      // HARD_CAP=10 chosen to match `target-audit.ts` Fix 1 prompt cap
+      // (we expand `slice(0, 5)` → `slice(0, 10)` there too).
+      const HARD_CAP = 10;
+      if (sorted.length === 0) return sorted;
+      const maxBucketScore = sorted[0].score;
+      const inMaxBucket = sorted.filter(c => c.score === maxBucketScore);
+      if (inMaxBucket.length >= count) {
+        return inMaxBucket.slice(0, HARD_CAP);
+      }
+      // Max bucket smaller than `count` — padding down preserves at
+      // least `count` candidates while still front-loading the best
+      // bucket. Capped at HARD_CAP so prompts don't blow up on pages
+      // where buckets are evenly distributed.
+      return sorted.slice(0, Math.min(Math.max(count, inMaxBucket.length), HARD_CAP));
+    }
+
+    // Legacy path — exact prior behaviour. Composite score with
+    // hand-tuned multipliers.
     const scored: RankedCandidate[] = eligible.map(el => {
       const heuristicResult = this.semanticWeightCalculator.calculateHeuristic(el);
       const heuristicWeight = heuristicResult.weight;
@@ -4004,34 +4082,73 @@ export class LiteEngine {
           this.config.goal // ✅ NEW: Goal for dynamic semantic weight priority
         );
 
-        // 10.1 ✅ FIX P1: Enrich with AI (async) with timeout and fallback
-        // This improves semantic weight accuracy for ambiguous elements (buttons, links, headers)
+        // 10.1 Enrich diff with sentiment + Goal-Oriented Summary.
+        //
+        // Two paths gated by LITE_ENGINE_FLAGS.enableDeweightedProgress:
+        //
+        //   (a) DEFAULT — legacy HybridSemanticWeightCalculator.enrichWithAI:
+        //       hand-tuned numeric heuristics + per-iteration gemini-flash-
+        //       lite call (5s timeout, falls back to baseDiff on failure).
+        //       Decisive thresholds: totalWeight >= 0.5, >= 0.1.
+        //
+        //   (b) DEWEIGHTED — pure synchronous deterministic evaluator
+        //       (analysis/progress-evaluator.ts). Reads ONLY structural
+        //       StateDiff fields (urlChanged, errors, addedElements,
+        //       successfulApiResponses). No LLM, no weights, no per-
+        //       iteration timeout. Sentiment matches boolean signals;
+        //       goal-relevance is deterministic keyword token-match.
+        //
+        // FAILURE SEMANTICS (subtle):
+        //   Legacy enrichWithAI throw/timeout → enrichedDiff = baseDiff →
+        //   progressSentiment defaults to 'No Effect' from
+        //   state-diff.ts:119 → consecutiveNoEffectCount increments →
+        //   max 5 consecutive aborts the run. So legacy is biased toward
+        //   "abort early on any AI hiccup." The deweighted path
+        //   eliminates this bias because computeProgressSentiment cannot
+        //   throw / time out.
         const removedElements = snapshotBefore.elements.filter(el => baseDiff.removedRefs.includes(el.ref));
         let enrichedDiff: StateDiff;
         let goalOrientedSummary: string | null = null;
-        try {
-          // ✅ FIX P1: Add 5s timeout to prevent iteration blocking
-          const AI_ENRICHMENT_TIMEOUT_MS = 5000;
-          const enrichedResult = await Promise.race([
-            this.semanticWeightCalculator.enrichWithAI(baseDiff, removedElements),
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('AI enrichment timeout')), AI_ENRICHMENT_TIMEOUT_MS)
-            ),
-          ]);
-          enrichedDiff = enrichedResult;
 
-          // 10.2 ✅ NEW: Build Goal-Oriented Summary (Secret Sauce for Core Brain)
-          goalOrientedSummary = this.semanticWeightCalculator.buildGoalOrientedSummary(enrichedResult);
-        } catch (enrichmentError) {
-          logger.warn('[LITE_ENGINE] AI enrichment failed, using base diff', {
-            testId: this.config.testId,
-            iteration: i,
-            error: enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError),
-          });
-          // ✅ FIX P1: Fallback to base diff if AI enrichment fails or times out
-          enrichedDiff = baseDiff;
-          // Goal-oriented summary not available without enrichment
-          goalOrientedSummary = null;
+        if (LITE_ENGINE_FLAGS.enableDeweightedProgress) {
+          // (b) Pure deterministic path. No await — synchronous.
+          // Compute sentiment from base structural signals and embed it
+          // back into the diff so downstream callsites (4046/4084/4156/
+          // 4173/4179) read the same `progressSentiment` shape.
+          // Pass expandedGoal so the decorative-bulk gate (Fix 2 in
+          // progress-evaluator.ts) can demote pure decorative flood
+          // (e.g. clicking Reviews/FAQ when goal is unrelated) to
+          // 'No Effect' instead of 'Minor Change'. Without goal,
+          // gate is bypassed and threshold-based 'Minor Change' wins.
+          const sentiment = computeProgressSentiment(baseDiff, this.expandedGoal ?? null);
+          enrichedDiff = { ...baseDiff, progressSentiment: sentiment };
+          goalOrientedSummary = buildDeterministicSummary(enrichedDiff, this.expandedGoal ?? null);
+          // `removedElements` is only consumed by enrichWithAI (legacy
+          // category enrichment). Pure path doesn't need it; keep var
+          // to preserve identical lexical scope for the rest of the
+          // iteration block (validator, state diff persistence, etc.).
+          void removedElements;
+        } else {
+          // (a) Legacy path — exact prior behaviour.
+          try {
+            const AI_ENRICHMENT_TIMEOUT_MS = 5000;
+            const enrichedResult = await Promise.race([
+              this.semanticWeightCalculator.enrichWithAI(baseDiff, removedElements),
+              new Promise<never>((_, reject) =>
+                setTimeout(() => reject(new Error('AI enrichment timeout')), AI_ENRICHMENT_TIMEOUT_MS)
+              ),
+            ]);
+            enrichedDiff = enrichedResult;
+            goalOrientedSummary = this.semanticWeightCalculator.buildGoalOrientedSummary(enrichedResult);
+          } catch (enrichmentError) {
+            logger.warn('[LITE_ENGINE] AI enrichment failed, using base diff', {
+              testId: this.config.testId,
+              iteration: i,
+              error: enrichmentError instanceof Error ? enrichmentError.message : String(enrichmentError),
+            });
+            enrichedDiff = baseDiff;
+            goalOrientedSummary = null;
+          }
         }
 
         // ✅ Store for next iteration prompt (Secret Sauce for Core Brain)

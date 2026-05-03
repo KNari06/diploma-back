@@ -149,7 +149,7 @@ PROPOSED ELEMENT:
 - score: ${proposedCandidate?.score?.toFixed(2) || 'N/A'}
 
 TOP CANDIDATES (sorted by score):
-${candidates.slice(0, 5).map((c, i) =>
+${candidates.map((c, i) =>
   `${i + 1}. ref="${c.ref}" name="${c.name}" tag=${c.tag} score=${c.score.toFixed(2)}`
 ).join('\n')}
 
@@ -174,7 +174,12 @@ RULES:
           model: AI_TASK_MODELS.targetAudit,
           temperature: 0,
           response_format: { type: 'json_object' },
-          max_tokens: 200,
+          // 250 tokens covers JSON output for up to 10 candidates plus
+          // a short reason. Was 200 (sized for 5). The output schema
+          // is fixed-size (isCorrect / correctedRef / reason / confidence)
+          // — the +50 is purely for `reason` headroom when the model
+          // describes a specific candidate among 10 instead of 5.
+          max_tokens: 250,
         }
       );
 
