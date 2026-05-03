@@ -120,6 +120,7 @@ export class SnapshotRouter {
         useCdpForBackground: flags.useCdpForBackground,
         useCdpForAi: flags.useCdpForAi,
         useCdpForPreview: flags.useCdpForPreview,
+        useCdpForPreviewPoll: flags.useCdpForPreviewPoll,
       },
       shadow: {
         useCdpForBackground_shadow: flags.useCdpForBackground_shadow,
@@ -127,14 +128,15 @@ export class SnapshotRouter {
         useCdpForPreviewTick_shadow: flags.useCdpForPreviewTick_shadow,
         shadowSamplingRate: flags.shadowSamplingRate,
       },
-      // Note: preview-tick is ALWAYS evaluate (no flag escape) per
-      // screencast-collision invariant. No env var can flip it.
-      previewTickPolicy: 'ALWAYS evaluate (preview-poll group, no CDP)',
+      previewTickPolicy: flags.useCdpForPreviewPoll
+        ? 'CDP (with fallback to evaluate) — useCdpForPreviewPoll=true'
+        : 'evaluate (default) — flip SNAPSHOT_USE_CDP_PREVIEW_POLL=true to switch',
       // env vars actually read
       env: {
         SNAPSHOT_USE_CDP_BACKGROUND: process.env.SNAPSHOT_USE_CDP_BACKGROUND ?? '(unset)',
         SNAPSHOT_USE_CDP_AI: process.env.SNAPSHOT_USE_CDP_AI ?? '(unset)',
         SNAPSHOT_USE_CDP_PREVIEW: process.env.SNAPSHOT_USE_CDP_PREVIEW ?? '(unset)',
+        SNAPSHOT_USE_CDP_PREVIEW_POLL: process.env.SNAPSHOT_USE_CDP_PREVIEW_POLL ?? '(unset)',
         SNAPSHOT_USE_CDP_BACKGROUND_SHADOW: process.env.SNAPSHOT_USE_CDP_BACKGROUND_SHADOW ?? '(unset)',
         SNAPSHOT_USE_CDP_PREVIEW_SHADOW: process.env.SNAPSHOT_USE_CDP_PREVIEW_SHADOW ?? '(unset)',
         SNAPSHOT_USE_CDP_PREVIEW_TICK_SHADOW: process.env.SNAPSHOT_USE_CDP_PREVIEW_TICK_SHADOW ?? '(unset)',
@@ -270,6 +272,7 @@ export class SnapshotRouter {
     const productionAlreadyOnCdp =
       (context === 'background-regression' && flags.useCdpForBackground)
       || (riskGroupForContext(context) === 'preview' && flags.useCdpForPreview)
+      || (riskGroupForContext(context) === 'preview-poll' && flags.useCdpForPreviewPoll)
       || (riskGroupForContext(context) === 'ai' && flags.useCdpForAi);
 
     // Shadow eligibility: the per-group "_shadow" flag must be on. The
@@ -587,11 +590,14 @@ export class SnapshotRouter {
       case 'preview':
         return flags.useCdpForPreview ? 'cdp_with_fallback' : 'evaluate';
       case 'preview-poll':
-        // Hard-pinned to evaluate. The 500ms periodic tick fires
-        // independently of user activity; running CDP on it would
-        // continuously stutter the screencast video. No flag escape
-        // hatch — this is a UX invariant, not a tunable.
-        return 'evaluate';
+        // Previously hard-pinned to evaluate (raw CDP newSession
+        // conflicted with screencast and froze video). Etap 2 rewrote
+        // the CDP path to reuse Playwright's managed channel, removing
+        // the collision. Flag default stays OFF — flipping it on routes
+        // the periodic 500ms tick through CDP, which fires regardless
+        // of user activity, so per-call regressions compound quickly.
+        // Validate FPS stability before flipping in any environment.
+        return flags.useCdpForPreviewPoll ? 'cdp_with_fallback' : 'evaluate';
     }
   }
 }

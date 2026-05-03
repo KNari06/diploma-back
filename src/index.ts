@@ -1180,6 +1180,42 @@ app.get(`/api/${env.API_VERSION}/system/status`, (req: express.Request, res: exp
 });
 
 /**
+ * [DEBUG-shift] Temporary file logger — frontend posts JSON debug events
+ * here, we append them as one line per event to /tmp/qai-debug-shift.log so
+ * the user can `cat` them in one place. Auth-free, debug-only; remove with
+ * the rest of the [DEBUG-shift] tagged code once the layout-shift issue is
+ * diagnosed.
+ */
+app.options(`/api/${env.API_VERSION}/_debug/shift-log`, (req: express.Request, res: express.Response) => {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  }
+  res.status(204).end();
+});
+app.post(`/api/${env.API_VERSION}/_debug/shift-log`, express.json({ limit: '64kb' }), async (req: express.Request, res: express.Response) => {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+    const logsDir = path.resolve(process.cwd(), 'logs');
+    await fs.mkdir(logsDir, { recursive: true });
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...(req.body || {}) }) + '\n';
+    await fs.appendFile(path.join(logsDir, 'qai-debug-shift.log'), line);
+    res.status(204).end();
+  } catch {
+    res.status(500).end();
+  }
+});
+
+/**
  * @swagger
  * /health:
  *   get:

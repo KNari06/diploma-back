@@ -200,6 +200,19 @@ function fieldEquals(field: keyof LiteElement, av: unknown, bv: unknown): boolea
   if ((av === undefined || av === null) && (bv === undefined || bv === null)) {
     return true;
   }
+  // Boolean-falsy normalisation: collectors disagree on how to encode
+  // "no" — evaluate-side uses `value || undefined` (false → undefined),
+  // CDP-side writes literal `false`. Both representations describe the
+  // same state, and every consumer (resolver, lint, apply) reads these
+  // via truthy checks, so `false`, `undefined` and `null` are equivalent
+  // at the consumption layer. Without this normalisation the divergence
+  // logger drowns in noise — every non-required input across 100+ nodes
+  // gets flagged for `required`/`readOnly`/`invalid`/`isInsideActiveModal`/
+  // `isSlotted`. Real divergences (one side `true`, the other not) still
+  // surface because we only collapse the falsy bucket.
+  const aFalsy = av === false || av === undefined || av === null;
+  const bFalsy = bv === false || bv === undefined || bv === null;
+  if (aFalsy && bFalsy) return true;
   // strict equality for primitives — booleans, strings, numbers
   return av === bv;
 }

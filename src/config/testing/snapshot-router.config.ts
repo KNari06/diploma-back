@@ -110,6 +110,22 @@ export interface SnapshotRouterFlags {
    */
   useCdpForPreview: boolean;
   /**
+   * CDP primary for the **preview-poll group** (the periodic 500ms
+   * preview-tick that feeds the live editor's element overlay /
+   * autocomplete). HISTORICAL CONTEXT:
+   *   Originally hard-pinned to evaluate because raw `context.newCDPSession`
+   *   conflicted with the screencast CDP session and froze video. After
+   *   Etap 2 the CDP-snapshot path was rewritten to reuse Playwright's
+   *   managed CDP channel instead of spawning new sessions, so the
+   *   collision is gone — but flipping this flag still has UX impact
+   *   (CDP runs every ~500ms while the editor is open) and shadow logs
+   *   showed field-level divergence (`isInsideActiveModal`, `isSlotted`,
+   *   `required`, `readOnly`, `invalid`).
+   *   Default OFF. Flip only after `useCdpForPreview` is stable AND
+   *   shadow divergence on those 5 fields is resolved.
+   */
+  useCdpForPreviewPoll: boolean;
+  /**
    * CDP primary for autonomous-AI contexts (lite-action, lite-verification,
    * lite-recovery, lite-engine, pipeline-observe, exploration-*).
    * Middle-risk group: snapshot is consumed by the AI agent rather than
@@ -169,6 +185,7 @@ export const SNAPSHOT_ROUTER_FLAGS: SnapshotRouterFlags = {
   useCdpForPreview_shadow: envBool('SNAPSHOT_USE_CDP_PREVIEW_SHADOW', false),
   useCdpForPreviewTick_shadow: envBool('SNAPSHOT_USE_CDP_PREVIEW_TICK_SHADOW', false),
   useCdpForPreview: envBool('SNAPSHOT_USE_CDP_PREVIEW', false),
+  useCdpForPreviewPoll: envBool('SNAPSHOT_USE_CDP_PREVIEW_POLL', false),
   useCdpForAi: envBool('SNAPSHOT_USE_CDP_AI', false),
   denseThreshold: envNumber('SNAPSHOT_DENSE_THRESHOLD', 2000, 0, 100_000),
   shadowSamplingRate: envNumber('SNAPSHOT_SHADOW_SAMPLING_RATE', 1, 0, 1),
@@ -185,11 +202,14 @@ export const SNAPSHOT_ROUTER_FLAGS: SnapshotRouterFlags = {
  *      the editor).
  *   3. Preview last (live screencast contention risk + visible to
  *      users, so it ramps only after both above are stable).
- *   4. Preview-poll — the 500ms periodic DOM tick. Empirically
- *      measured (cdp-screencast-collision.test): CDP on this path
- *      causes continuous video stutter (~11-20 FPS) on dense pages
- *      because the tick fires twice per second regardless of user
- *      activity. Hard-pinned to evaluate path; never CDP.
+ *   4. Preview-poll — the 500ms periodic DOM tick. Was hard-pinned
+ *      to evaluate (raw CDP newSession conflicted with screencast).
+ *      After Etap 2 the CDP path was rewritten to reuse Playwright's
+ *      managed channel, so the collision is gone. Now gated by its
+ *      own flag (`useCdpForPreviewPoll`, default OFF). Ramp LAST:
+ *      the tick fires every ~500ms regardless of user activity, so
+ *      any per-call regression compounds quickly. Re-validate FPS
+ *      stability before flipping.
  */
 export type SnapshotRiskGroup = 'background' | 'ai' | 'preview' | 'preview-poll';
 
