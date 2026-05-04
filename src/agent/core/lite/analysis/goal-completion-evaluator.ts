@@ -19,7 +19,11 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 
 const EVALUATOR_TIMEOUT_MS = 8000;
 const EVALUATOR_MODEL = AI_TASK_MODELS.goalDetection;
-const EVALUATOR_MAX_TOKENS = 350;
+// 400 (was 350) — accounts for new STATE CHANGES block + NOTATION HINTS
+// + ELEMENT FIELD CHANGES section that surface Radix data-state flips.
+// Output schema unchanged (isDone/confidence/reason); only prompt
+// length grew, but reason field has more context to draw from now.
+const EVALUATOR_MAX_TOKENS = 400;
 
 export class GoalCompletionEvaluator {
   private testId: string;
@@ -45,6 +49,24 @@ export class GoalCompletionEvaluator {
       const beforeSummary = this.buildSnapshotSummary(snapshotBefore, 20);
       const afterSummary = this.buildSnapshotSummary(snapshotAfter, 20);
 
+      // Compact diff of changed element fields (cap 10) — exposes
+      // Radix/shadcn data-state flips (closed→open, inactive→active)
+      // and aria toggles to the LLM judge. Without this block,
+      // silent widget transitions (Tab activation without DOM
+      // mount/unmount) are invisible to goal completion check.
+      const changedFieldsSnippet = diff.changedElements
+        .slice(0, 10)
+        .map((c) => `  - ${c.field}: ${String(c.before ?? '_')} -> ${String(c.after ?? '_')}`)
+        .join('\n');
+
+      // Stage 2: progressSentiment / meaningfulChange / significantChange
+      // are now truthful in the deweighted path AND set to safe defaults
+      // ('No Effect', false, false) in the legacy path on enrichment
+      // failure. Pass them through verbatim — model is instructed below
+      // to treat 'Major Progress' / true flags as STRONG positive
+      // signals (but not sufficient: full goal completion still required).
+      const sentimentLine = `- Progress sentiment: ${diff.progressSentiment} (meaningful=${diff.meaningfulChange}, significant=${diff.significantChange})`;
+
       const prompt = `You are a Goal Completion Judge. Determine if the user's goal has been achieved by comparing page state BEFORE and AFTER the last action.
 
 GOAL: ${goal}
@@ -64,7 +86,16 @@ STATE CHANGES:
 - Elements added: ${diff.addedElements.length}
 - Elements removed: ${diff.removedRefs.length}
 - Title changed: ${snapshotBefore.title !== snapshotAfter.title ? `"${snapshotBefore.title}" -> "${snapshotAfter.title}"` : 'no'}
+${sentimentLine}
+${diff.changedElements.length > 0 ? `\nELEMENT FIELD CHANGES (top 10 of ${diff.changedElements.length}):\n${changedFieldsSnippet}` : ''}
 ${heuristicHints.length > 0 ? `\nDETECTED SIGNALS:\n${heuristicHints.map(h => `- ${h}`).join('\n')}` : ''}
+
+NOTATION HINTS for "Key elements" listings:
+- [STATE=open] / [STATE=active] / [STATE=on] — Radix/shadcn widget is OPEN (dropdown, dialog, popover, tab, toggle)
+- [STATE=closed] / [STATE=inactive] / [STATE=off] — widget is CLOSED
+- [EXPANDED] / [COLLAPSED] / [CHECKED] / [SELECTED] — ARIA equivalents
+- [INSIDE_MODAL] — element is inside an active modal/dialog overlay
+- [INVALID] / [DISABLED] — input cannot be used / failed validation
 
 Respond JSON:
 {
@@ -79,6 +110,9 @@ Rules:
 - For login/register: intermediate = verification, 2FA, reset password, complete profile — NOT done
 - For checkout: success = order confirmed/thank-you page
 - For search: success = search results visible
+- For "open dialog/menu/dropdown" goals: success = a [STATE=open] / [STATE=active] marker appeared on the trigger, OR a new [INSIDE_MODAL] block exists, OR a data-state field changed closed->open / inactive->active in ELEMENT FIELD CHANGES
+- For "close" goals: success = the corresponding [STATE=open] disappeared / data-state went open->closed
+- Progress sentiment is a HINT, not a verdict: 'Major Progress' supports isDone=true only if other criteria also match
 - If page shows errors (invalid, failed, denied) = NOT done
 - Be STRICT: when unsure, isDone=false`;
 
@@ -175,11 +209,74 @@ Rules:
       hints.push('Error indicators detected on current page');
     }
 
+    // Stage 1+2: Radix/shadcn data-state transitions. Detected from
+    // diff.changedElements where field='dataState'. Surfaces as:
+    //   - "Dialog/menu opened" — closed→open or inactive→active
+    //   - "Dialog/menu closed" — open→closed or active→inactive
+    // Helps judge confirm goals like "open settings", "close drawer",
+    // "switch to tab X" without relying solely on element-add/remove
+    // signals (Radix Tabs do NOT mount/unmount on activation).
+    const dataStateOpens = diff.changedElements.filter((c) => {
+      if (c.field !== 'dataState') return false;
+      const before = String(c.before ?? '').toLowerCase();
+      const after = String(c.after ?? '').toLowerCase();
+      return (before === 'closed' && after === 'open')
+        || (before === 'inactive' && after === 'active')
+        || (before === 'off' && after === 'on')
+        || (before === 'unchecked' && after === 'checked');
+    });
+    if (dataStateOpens.length > 0) {
+      hints.push(`${dataStateOpens.length} widget(s) opened/activated (Radix data-state flip)`);
+    }
+
+    const dataStateCloses = diff.changedElements.filter((c) => {
+      if (c.field !== 'dataState') return false;
+      const before = String(c.before ?? '').toLowerCase();
+      const after = String(c.after ?? '').toLowerCase();
+      return (before === 'open' && after === 'closed')
+        || (before === 'active' && after === 'inactive');
+    });
+    if (dataStateCloses.length > 0) {
+      hints.push(`${dataStateCloses.length} widget(s) closed/deactivated (Radix data-state flip)`);
+    }
+
+    // ARIA-modal appearance — even without data-state, a freshly-mounted
+    // role=dialog or aria-modal=true element is a strong "opened" signal.
+    const newDialogs = diff.addedElements.filter((el) => {
+      const role = (el.role || '').toLowerCase();
+      return el.tag === 'dialog' || role === 'dialog' || role === 'alertdialog';
+    });
+    if (newDialogs.length > 0) {
+      const names = newDialogs.map((d) => d.name || d.ariaLabel || '(unnamed)').slice(0, 3);
+      hints.push(`Dialog(s) appeared: ${names.join(', ')}`);
+    }
+
+    // Menu / listbox / combobox additions — Radix Portal-rendered menus,
+    // Headless UI Select option lists. Same "widget opened" semantic as
+    // dialog but triggered by different role values.
+    const newMenus = diff.addedElements.filter((el) => {
+      const role = (el.role || '').toLowerCase();
+      return role === 'menu' || role === 'listbox' || role === 'combobox';
+    });
+    if (newMenus.length > 0) {
+      hints.push(`Menu/listbox/combobox appeared (${newMenus.length})`);
+    }
+
     return hints;
   }
 
   /**
    * Build compact snapshot summary (top N elements) for the AI prompt.
+   *
+   * Includes state markers so the LLM judge can recognise Radix/shadcn
+   * widget state without reading raw `data-state` values:
+   *   - [STATE=...] for data-state when not redundant with aria-*
+   *   - [EXPANDED] / [COLLAPSED] / [CHECKED] / [SELECTED] for aria-*
+   *   - [INSIDE_MODAL] for elements inside the active overlay
+   *   - [INVALID] / [DISABLED] for form state
+   *
+   * Markers stay terse (square brackets, no spaces) to keep the
+   * summary line under ~80 chars per element.
    */
   private buildSnapshotSummary(snapshot: LiteSnapshot, maxElements: number): string {
     const elements = snapshot.elements
@@ -188,7 +285,39 @@ Rules:
       .map(el => {
         const type = el.type ? `[${el.type}]` : '';
         const name = el.name || el.placeholder || el.ariaLabel || '';
-        return `${el.tag}${type}: ${name}`.trim();
+        const markers: string[] = [];
+
+        // ARIA state markers (priority over data-state when value matches).
+        if (el.ariaExpanded === true) markers.push('[EXPANDED]');
+        else if (el.ariaExpanded === false) markers.push('[COLLAPSED]');
+        if (el.ariaChecked === true || el.checked === true) markers.push('[CHECKED]');
+        if (el.ariaSelected === true) markers.push('[SELECTED]');
+        if (el.ariaPressed === true) markers.push('[PRESSED]');
+
+        // Stage 1: Radix/shadcn data-state. Skip when redundant with
+        // aria-* markers above (avoid duplicate hints that confuse the
+        // judge). Same dedup rules as snapshot-collector.format().
+        const ds = (el as { dataState?: string }).dataState;
+        if (ds) {
+          const isDup = (
+            (ds === 'open' && el.ariaExpanded === true)
+            || (ds === 'closed' && el.ariaExpanded === false)
+            || (ds === 'checked' && (el.ariaChecked === true || el.checked === true))
+            || (ds === 'unchecked' && (el.ariaChecked === false || el.checked === false))
+            || (ds === 'on' && el.ariaPressed === true)
+            || (ds === 'off' && el.ariaPressed === false)
+            || (ds === 'active' && el.ariaSelected === true)
+            || (ds === 'inactive' && el.ariaSelected === false)
+          );
+          if (!isDup) markers.push(`[STATE=${ds}]`);
+        }
+
+        if (el.isInsideActiveModal) markers.push('[INSIDE_MODAL]');
+        if (el.invalid === true) markers.push('[INVALID]');
+        if (el.disabled === true) markers.push('[DISABLED]');
+
+        const markerStr = markers.length > 0 ? ` ${markers.join('')}` : '';
+        return `${el.tag}${type}: ${name}${markerStr}`.trim();
       })
       .filter(s => s.length > 3);
 
@@ -196,7 +325,11 @@ Rules:
   }
 
   /**
-   * Build transition summary for prompt injection and tracing.
+   * Build transition summary for prompt injection (next iteration's
+   * Core Brain reads `lastTransitionSummary`) and tracing.
+   *
+   * Includes `progressSentiment` so the next iteration's brain knows
+   * what the previous step's outcome was without re-deriving it.
    */
   private buildTransitionSummary(
     before: LiteSnapshot,
@@ -210,8 +343,9 @@ Rules:
     const titlePart = before.title !== after.title
       ? `Title: "${before.title}" -> "${after.title}"`
       : `Title unchanged: "${after.title}"`;
+    const sentimentPart = `Progress: ${diff.progressSentiment}`;
     const hintsPart = hints.length > 0 ? hints.join('; ') : 'no strong signals';
-    return `${urlPart}; ${titlePart}; ${hintsPart}`;
+    return `${urlPart}; ${titlePart}; ${sentimentPart}; ${hintsPart}`;
   }
 
   /**

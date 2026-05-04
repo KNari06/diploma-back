@@ -38,6 +38,12 @@ export interface ProbedElement {
   role?: string;
   type?: string;
   text?: string;
+  /**
+   * V26: First text fragment as a single DOM unit. See
+   * `InteractiveNode.firstTextFragment` for the rationale — Angular Material
+   * card pattern et al. Symmetric with snapshot-collector's extractor.
+   */
+  firstTextFragment?: string;
   ariaLabel?: string;
   labelText?: string;
   placeholder?: string;
@@ -46,6 +52,20 @@ export interface ProbedElement {
   checked?: boolean;
   ariaExpanded?: boolean;
   ariaPressed?: boolean;
+  /**
+   * Radix UI / shadcn / Vaul `data-state` value at click time. Examples:
+   * 'open' / 'closed' (Dialog, Popover, DropdownMenu, Collapsible),
+   * 'active' / 'inactive' (Tabs, Accordion item),
+   * 'on' / 'off' (Toggle, ToggleGroup),
+   * 'checked' / 'unchecked' (Checkbox, RadioGroup item).
+   * Captured separately from aria-expanded because Radix primitives
+   * do NOT consistently mirror data-state to aria. Without this:
+   * - inferClickActionType records generic 'click' instead of 'open'
+   * - state-reflected verify times out → step marked failed
+   * - resolver can't disambiguate already-open trigger from closed one
+   * Length-cap < 30 chars (Radix values are short keywords).
+   */
+  dataState?: string;
   /**
    * V22: aria-invalid — validation state at recording time. Critical for
    * negative-test recording (user records "submit form with empty email →
@@ -229,6 +249,20 @@ export interface ProbedElement {
    */
   vueScopeId?: string;
   /**
+   * Etap 1B.2 — Angular `routerLink` directive value. Declarative SPA
+   * navigation target authored by the developer; survives origin/proxy
+   * rewrites and route reorganisations more reliably than `href`. Builder
+   * emits a STRUCTURAL-tier `[routerlink="X"]` strategy when present.
+   */
+  routerLink?: string;
+  /**
+   * Etap 1B.2 — Angular reactive-forms `formControlName`. Authored
+   * identifier for a form input (`<input formcontrolname="email">`).
+   * Survives i18n and layout refactors. Builder emits an IDENTITY-tier
+   * `[formcontrolname="X"]` strategy when present.
+   */
+  formControlName?: string;
+  /**
    * V22: Nearest ARIA landmark (banner / navigation / main / complementary /
    * search / contentinfo / form). Computed from `target.closest('[role=...]')`
    * or implicit landmarks (`<header>`, `<nav>`, `<main>`, etc.). Crucial for
@@ -291,6 +325,27 @@ export interface ProbedElement {
     ariaLabel?: string;
     className?: string;
   }>;
+  /**
+   * V26 #1+#2: full hit-test stack (top→bottom paint order) at the click
+   * coordinates, captured via `document.elementsFromPoint(px, py)`. Up to
+   * 8 entries, each in compact form `tag[role=X]#id.firstClass`. Pure
+   * diagnostic — does NOT influence which element the recorder picked
+   * as `target`. Used by post-mortem audit and the wrong-element widget
+   * to answer "what else was on top of where the user clicked?".
+   */
+  hitStack?: string[];
+  /**
+   * V26 #1+#2: probe ambiguity verdict — heuristic flags that mark
+   * recordings the resolver may struggle to replay reliably. Computed
+   * from the `hitStack` above. Domain (extensible — treat unknown as
+   * generic warning):
+   *   - `multiple_interactive_top`  — 2+ interactive elements stacked
+   *   - `iframe_at_top`             — iframe at hit point (replay limit)
+   *   - `canvas_at_top`             — no DOM identity, vision needed
+   *   - `overlay_above_target`      — modal/backdrop above target
+   *   - `deep_stack`                — 6+ elements at one pixel
+   */
+  probeAmbiguity?: string[];
 }
 
 /** Typing buffer stored on session */
@@ -466,6 +521,99 @@ const PROBE_AT_POINT_FN = `
   }
   if (!el) return null;
 
+  // V26 #1+#2: Hit-test diagnostics. Captures the FULL elementsFromPoint
+  // stack at click coordinates (top→bottom paint order) plus a "probe
+  // ambiguity" verdict — so post-mortem of wrong-element bugs can answer
+  // "what else was layered on top of where the user clicked?" without
+  // re-running.
+  //
+  // elementsFromPoint (plural) returns the full hit-test stack including
+  // overlays / backdrops / sticky bars / dropdowns that elementFromPoint
+  // (singular) silently flattens to a single answer. Diagnostic only --
+  // does NOT change which element we pick. Recorded into the trace as
+  // hitStackDiag so a later read can spot:
+  //   - target was covered by a tooltip / drag-ghost at click time
+  //   - multiple overlapping buttons in same spot (z-index race)
+  //   - iframe at the top of the stack (recorder hit limitation)
+  //   - opacity-0 modal still hit-tested (animation race)
+  var __hitStack = [];
+  try {
+    // Same px/py as the singular call — we want THE SAME hit context.
+    // Cap at 8 entries: deeper stacks are noise, top of pile is what
+    // matters. Each entry: tag/role/id/class snippet — never raw element
+    // refs (those don't serialize back through page.evaluate).
+    var __stackRaw = (typeof document.elementsFromPoint === 'function')
+      ? document.elementsFromPoint(px, py)
+      : [];
+    for (var __si = 0; __si < __stackRaw.length && __hitStack.length < 8; __si++) {
+      var __sel = __stackRaw[__si];
+      if (!__sel || !__sel.tagName) continue;
+      var __sTag = __sel.tagName.toLowerCase();
+      var __sRole = __sel.getAttribute && (__sel.getAttribute('role') || '');
+      var __sId = __sel.getAttribute && (__sel.getAttribute('id') || '');
+      var __sCls = __sel.getAttribute && (__sel.getAttribute('class') || '');
+      // Compact form: tag[role=X]#id.firstClass — keeps payload small
+      // when shipped to the trace. Trim each piece defensively.
+      var __sigil = __sTag
+        + (__sRole ? '[role=' + __sRole.slice(0, 20) + ']' : '')
+        + (__sId ? '#' + __sId.slice(0, 30) : '')
+        + (__sCls ? '.' + __sCls.split(/\\s+/)[0].slice(0, 30) : '');
+      __hitStack.push(__sigil);
+    }
+  } catch (__hitErr) {
+    // elementsFromPoint can throw in exotic frames / detached docs.
+    // Diagnostic is best-effort, never block the probe.
+    __hitStack = [];
+  }
+
+  // Ambiguity verdict — heuristics that flag clicks the resolver
+  // probably can't replay reliably. Surfaced into the recorded
+  // step so a later batch audit ("which steps recorded with
+  // ambiguous probe?") doesn't need code spelunking.
+  var __probeAmbiguity = [];
+  try {
+    // Many overlapping interactive elements at this exact pixel
+    // (>= 3 in stack, top-3 contain interactive tags) — z-index race.
+    var __interactiveTopCount = 0;
+    for (var __ai = 0; __ai < Math.min(3, __hitStack.length); __ai++) {
+      var __ent = __hitStack[__ai];
+      if (/^(button|a|input|select|textarea|summary)\\b/.test(__ent)
+        || /\\[role=(button|link|tab|menuitem|option|checkbox|radio)/.test(__ent)) {
+        __interactiveTopCount++;
+      }
+    }
+    if (__interactiveTopCount >= 2) {
+      __probeAmbiguity.push('multiple_interactive_top');
+    }
+    // Top of stack is iframe — recorder cannot probe inside it
+    // (cross-origin or same-origin both opaque to elementFromPoint).
+    if (__hitStack.length > 0 && /^iframe\\b/.test(__hitStack[0])) {
+      __probeAmbiguity.push('iframe_at_top');
+    }
+    // Top of stack is canvas — no DOM identity, replay will need vision.
+    if (__hitStack.length > 0 && /^canvas\\b/.test(__hitStack[0])) {
+      __probeAmbiguity.push('canvas_at_top');
+    }
+    // Backdrop / overlay sitting above target — z-index from a closed
+    // animation or a modal that's mid-fade. Class regex catches the
+    // common library names.
+    for (var __bi = 0; __bi < Math.min(3, __hitStack.length); __bi++) {
+      var __bent = __hitStack[__bi];
+      if (/\\.(cdk-overlay-backdrop|modal-backdrop|MuiBackdrop|ant-modal-mask|el-overlay)/.test(__bent)) {
+        __probeAmbiguity.push('overlay_above_target');
+        break;
+      }
+    }
+    // Deep-stack signal — anything > 6 layers at one pixel is unusually
+    // dense (sticky header + nav + sidebar + cards + cell + …). Worth
+    // logging because target-walk priorities may drift on next render.
+    if (__hitStack.length >= 6) {
+      __probeAmbiguity.push('deep_stack');
+    }
+  } catch (__amberr) {
+    /* heuristics best-effort — never block probe */
+  }
+
   // V22 Pkg7+: in-probe text normalizer. NFC + invisible-char strip +
   // whitespace collapse. Mirrors normalizeText() in text-normalizer.util.ts
   // — symmetry contract: the same canonicalization runs at probe-time
@@ -487,6 +635,54 @@ const PROBE_AT_POINT_FN = `
       .replace(INVISIBLE_CHARS_RE_PROBE, '')
       .replace(/\\s+/g, ' ')
       .trim();
+  }
+
+  // V26: First-text-fragment extractor — symmetric with snapshot-collector.
+  // Finds the FIRST single DOM unit (text node OR child element with leaf
+  // text) so the recorded fingerprint can store it for the locator builder
+  // to emit getByText(titleOnly) strategies on Angular Material / Vue
+  // card patterns where the title and description live in DIFFERENT
+  // children. Implementation MUST stay byte-equivalent to the collector
+  // version in src/agent/core/lite/collectors/snapshot-collector.ts --
+  // without symmetry, recorded fingerprints and live snapshots disagree.
+  function extractFirstTextFragment(node) {
+    try {
+      var TEXT_NODE = 3, ELEMENT_NODE = 1, MAX_LEN = 80;
+      var DECORATIVE = { img: 1, svg: 1, i: 1, picture: 1, use: 1, path: 1, br: 1, hr: 1 };
+      // 1) Direct text child
+      for (var ci = 0; ci < node.childNodes.length; ci++) {
+        var ch = node.childNodes[ci];
+        if (ch.nodeType === TEXT_NODE) {
+          var t = (ch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+          if (t.length >= 2 && t.length <= MAX_LEN) return t;
+        }
+      }
+      // 2) Element children DFS, skip decorative leaves
+      var stack = [];
+      for (var ci2 = node.childNodes.length - 1; ci2 >= 0; ci2--) {
+        var ch2 = node.childNodes[ci2];
+        if (ch2.nodeType === ELEMENT_NODE) stack.push(ch2);
+      }
+      var visited = 0;
+      while (stack.length > 0 && visited < 30) {
+        visited++;
+        var cur = stack.pop();
+        var tagLc = (cur.tagName || '').toLowerCase();
+        if (DECORATIVE[tagLc]) continue;
+        for (var cci = 0; cci < cur.childNodes.length; cci++) {
+          var cch = cur.childNodes[cci];
+          if (cch.nodeType === TEXT_NODE) {
+            var tt = (cch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+            if (tt.length >= 2 && tt.length <= MAX_LEN) return tt;
+          }
+        }
+        for (var cci2 = cur.childNodes.length - 1; cci2 >= 0; cci2--) {
+          var cch2 = cur.childNodes[cci2];
+          if (cch2.nodeType === ELEMENT_NODE) stack.push(cch2);
+        }
+      }
+    } catch (e) { /* best-effort */ }
+    return undefined;
   }
 
   // ── Pass 1: Collect ancestor chain (up to 12 ancestors) ──────────────
@@ -1268,12 +1464,44 @@ const PROBE_AT_POINT_FN = `
     }
   }
 
+  // Etap 1B.2 — Angular routerLink + formControlName.
+  // routerLink: declarative SPA navigation directive — more stable than
+  // href across origin/proxy rewrites and auth redirects.
+  // formControlName: reactive-forms identity, authored once, survives
+  // i18n and layout refactors.
+  // Both attribute names are read lowercase: getAttribute is case-
+  // insensitive in HTML but Angular emits lowercase anyway, keeping
+  // recorder symmetric with snapshot-collector.
+  var routerLinkAttr = target.getAttribute('routerlink');
+  if (routerLinkAttr !== null && routerLinkAttr.length > 0 && routerLinkAttr.length < 200) {
+    routerLinkAttr = routerLinkAttr.slice(0, 100);
+  } else {
+    routerLinkAttr = undefined;
+  }
+  var formControlNameAttr = target.getAttribute('formcontrolname');
+  if (formControlNameAttr !== null && formControlNameAttr.length > 0 && formControlNameAttr.length < 80) {
+    // Cap defensively (form control names are short identifiers).
+    formControlNameAttr = formControlNameAttr.slice(0, 60);
+  } else {
+    formControlNameAttr = undefined;
+  }
+
   // V22 Pkg1 — Fix 5: aria-current (page|step|date|true|location|time).
   // Pagination/Stepper/Breadcrumbs disambiguation: lets resolver tell apart
   // "click current page" from neighbouring page buttons that share text/role.
   var ariaCurrentAttr = target.getAttribute('aria-current') || undefined;
   // The attribute is boolean-like but stored as string — keep raw value
   // ('page' | 'step' | 'true' | ...) so resolver can do exact compare.
+
+  // Radix/shadcn/Vaul data-state — captured pre-handler-fire (target is
+  // resolved BEFORE click handler runs). Length-cap 30 chars; trim only,
+  // no lowercase (Radix uses camelCase keywords like 'forceMount'). Values
+  // we know about: open/closed/active/inactive/on/off/checked/unchecked.
+  // Symmetric with snapshot-collector.ts:1740 + cdp-snapshot.service.ts:611
+  // — divergence here = silent fingerprint mismatch on Radix sites.
+  var dataStateRaw = target.getAttribute('data-state');
+  var dataStateAttr = (dataStateRaw && dataStateRaw.length > 0 && dataStateRaw.length < 30)
+    ? dataStateRaw : undefined;
 
   // V22 Pkg1 — Fix 2: aria-valuenow / aria-valuetext. Slider, SpinButton,
   // ProgressBar carry their current value via these ARIA attrs (or via
@@ -1782,6 +2010,19 @@ const PROBE_AT_POINT_FN = `
     // V22 Pkg7+: normalize so re-renders with NFD-encoded characters or
     // copied-text zero-width contamination still produce equal fingerprints.
     text: ((normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80) || undefined),
+    // V26: First text fragment as a single DOM unit. Stored ONLY when it
+    // differs from text -- otherwise builder would generate a redundant
+    // locator. See extractFirstTextFragment for symmetry-with-collector.
+    firstTextFragment: (function() {
+      var raw = extractFirstTextFragment(target);
+      if (!raw) return undefined;
+      var normed = normProbeText(raw);
+      if (!normed || normed.length < 2) return undefined;
+      var fullText = (normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80);
+      if (normed === fullText) return undefined;
+      if (fullText && normed === fullText.slice(0, normed.length)) return undefined;
+      return normed.slice(0, 80);
+    })(),
     ariaLabel: normProbeText(target.getAttribute('aria-label')) || undefined,
     labelText: labelText,
     placeholder: normProbeText(target.getAttribute('placeholder')) || undefined,
@@ -1805,6 +2046,8 @@ const PROBE_AT_POINT_FN = `
     // V22 Pkg1 — extracted above. Each is undefined when not applicable so
     // bindingHints/fingerprint stay sparse (no zero-value noise).
     ariaCurrent: ariaCurrentAttr,
+    // Radix/shadcn data-state — undefined when attribute absent.
+    dataState: dataStateAttr,
     ariaValueNow: ariaValueNum,
     ariaValueText: ariaValueTextAttr,
     dataValue: dataValueAttr,
@@ -1824,6 +2067,9 @@ const PROBE_AT_POINT_FN = `
     siblingIndex: siblingIndexAttr,
     disabled: disabledAttr,
     arrowDir: arrowDirAttr,
+    // Etap 1B.2 — Angular routerLink + formControlName (probed above).
+    routerLink: routerLinkAttr,
+    formControlName: formControlNameAttr,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -1837,7 +2083,14 @@ const PROBE_AT_POINT_FN = `
     // and the resolver can lean on it for any resolvedVia. Earlier gating
     // to directHit/cssClass left icon targets (cursorPointer/nativeTag)
     // without ancestor context exactly when they needed it most.
-    ancestorChain: ancestorChain
+    ancestorChain: ancestorChain,
+    // V26 #1+#2: hit-test diagnostics — captured at the top of this
+    // function from elementsFromPoint(). Always present on click probes
+    // even when target resolved cleanly via priority pass — lets a
+    // post-mortem diff "happy probe" vs "wrong-element bug" recordings
+    // by their hit-stack alone.
+    hitStack: __hitStack,
+    probeAmbiguity: __probeAmbiguity
   };
 })
 `;
@@ -1861,6 +2114,48 @@ const PROBE_FOCUSED_FN = `
       .replace(INVISIBLE_CHARS_RE_PROBE, '')
       .replace(/\\s+/g, ' ')
       .trim();
+  }
+
+  // V26: First-text-fragment extractor — symmetric copy of the
+  // PROBE_AT_POINT_FN version above. See snapshot-collector for the
+  // canonical implementation; this one mirrors it byte-for-byte so
+  // recorded fingerprints (point + focus) and live snapshots all agree.
+  function extractFirstTextFragment(node) {
+    try {
+      var TEXT_NODE = 3, ELEMENT_NODE = 1, MAX_LEN = 80;
+      var DECORATIVE = { img: 1, svg: 1, i: 1, picture: 1, use: 1, path: 1, br: 1, hr: 1 };
+      for (var ci = 0; ci < node.childNodes.length; ci++) {
+        var ch = node.childNodes[ci];
+        if (ch.nodeType === TEXT_NODE) {
+          var t = (ch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+          if (t.length >= 2 && t.length <= MAX_LEN) return t;
+        }
+      }
+      var stack = [];
+      for (var ci2 = node.childNodes.length - 1; ci2 >= 0; ci2--) {
+        var ch2 = node.childNodes[ci2];
+        if (ch2.nodeType === ELEMENT_NODE) stack.push(ch2);
+      }
+      var visited = 0;
+      while (stack.length > 0 && visited < 30) {
+        visited++;
+        var cur = stack.pop();
+        var tagLc = (cur.tagName || '').toLowerCase();
+        if (DECORATIVE[tagLc]) continue;
+        for (var cci = 0; cci < cur.childNodes.length; cci++) {
+          var cch = cur.childNodes[cci];
+          if (cch.nodeType === TEXT_NODE) {
+            var tt = (cch.nodeValue || '').replace(/\\s+/g, ' ').trim();
+            if (tt.length >= 2 && tt.length <= MAX_LEN) return tt;
+          }
+        }
+        for (var cci2 = cur.childNodes.length - 1; cci2 >= 0; cci2--) {
+          var cch2 = cur.childNodes[cci2];
+          if (cch2.nodeType === ELEMENT_NODE) stack.push(cch2);
+        }
+      }
+    } catch (e) { /* best-effort */ }
+    return undefined;
   }
 
   var target = el;
@@ -1889,6 +2184,14 @@ const PROBE_FOCUSED_FN = `
   if (ai === undefined && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
     try { if (target.matches && target.matches(':invalid')) ai = true; } catch (e) {}
   }
+
+  // Radix/shadcn data-state — symmetric with PROBE_AT_POINT_FN. Captured
+  // on focused-element path so blur events on Radix fields (combobox value
+  // commit) record the post-blur state. Non-fingerprint use only here:
+  // focused path doesn't infer click intent, so dataState lands on the
+  // probed element for builders/extractors to read.
+  var fdsRaw = target.getAttribute('data-state');
+  var focusedDataState = (fdsRaw && fdsRaw.length > 0 && fdsRaw.length < 30) ? fdsRaw : undefined;
 
   // Detect multiline: textarea, contenteditable, or role=textbox with aria-multiline
   var isMultiline = tag === 'textarea'
@@ -1919,6 +2222,18 @@ const PROBE_FOCUSED_FN = `
     // display:none children that would otherwise leak into hints.text.
     // V22 Pkg7+: normProbeText normalizes for fingerprint stability.
     text: ((normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80) || undefined),
+    // V26: First text fragment as a single DOM unit. See PROBE_AT_POINT_FN
+    // for rationale; same predicate (only set when it differs from full text).
+    firstTextFragment: (function() {
+      var raw = extractFirstTextFragment(target);
+      if (!raw) return undefined;
+      var normed = normProbeText(raw);
+      if (!normed || normed.length < 2) return undefined;
+      var fullText = (normProbeText(target.innerText != null ? target.innerText : target.textContent) || '').slice(0, 80);
+      if (normed === fullText) return undefined;
+      if (fullText && normed === fullText.slice(0, normed.length)) return undefined;
+      return normed.slice(0, 80);
+    })(),
     ariaLabel: normProbeText(target.getAttribute('aria-label')) || undefined,
     labelText: labelText,
     placeholder: normProbeText(target.getAttribute('placeholder')) || undefined,
@@ -1926,10 +2241,17 @@ const PROBE_FOCUSED_FN = `
     ref: target.getAttribute('data-agent-ref') || undefined,
     title: normProbeText(target.getAttribute('title')) || undefined,
     alt: target.getAttribute('alt') || undefined,
+    // Etap 1B.2 — Angular formControlName for focused field identity.
+    // routerLink not probed here: focused element is an input, not a link.
+    formControlName: (function () {
+      var v = target.getAttribute('formcontrolname');
+      return v && v.length > 0 && v.length < 80 ? v.slice(0, 60) : undefined;
+    })(),
     checked: (tag === 'input' && (target.type === 'checkbox' || target.type === 'radio')) ? target.checked : undefined,
     ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
     ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
     ariaInvalid: ai,
+    dataState: focusedDataState,
     isMultiline: isMultiline || undefined,
     containerText: containerText,
     boundingBox: {
@@ -2028,6 +2350,27 @@ export class RecordingCaptureService {
         if (result.tag === 'webview' && result.resolvedVia === 'directHit') {
           return { tag: 'webview', unsupportedHost: 'webview', crossOriginIframe: false };
         }
+        // V26 #1+#2: emit warning ONLY when probe flagged ambiguity.
+        // Quiet on the 99% happy path (no log spam) — visible signal
+        // when the recorder caught a click that the resolver may struggle
+        // to replay (z-index race, iframe / canvas at top, modal above
+        // target, deep stack). Surfaces in logs WITHOUT writing to trace
+        // / DB — minimum-cost diagnostic.
+        try {
+          const flags = (result as any).probeAmbiguity as string[] | undefined;
+          if (flags && flags.length > 0) {
+            logger.warn('[RECORDING] Probe ambiguity detected at click point', {
+              x,
+              y,
+              targetTag: result.tag,
+              targetRole: result.role,
+              targetText: result.text ? result.text.slice(0, 60) : undefined,
+              resolvedVia: result.resolvedVia,
+              ambiguity: flags,
+              hitStack: ((result as any).hitStack as string[] | undefined)?.slice(0, 6),
+            });
+          }
+        } catch { /* logging is best-effort, never block the probe return */ }
         return result;
       }
 
@@ -2373,6 +2716,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
           var rect = walk.getBoundingClientRect();
           var ae = walk.getAttribute('aria-expanded');
           var ap = walk.getAttribute('aria-pressed');
+          // Radix/shadcn data-state — symmetric with PROBE_AT_POINT_FN /
+          // PROBE_FOCUSED_FN. Re-probe path runs on ancestor walk-up; the
+          // wrapping <button data-state="open"> still carries the right
+          // value at the moment the user clicked.
+          var wdsRaw = walk.getAttribute('data-state');
+          var walkDataState = (wdsRaw && wdsRaw.length > 0 && wdsRaw.length < 30) ? wdsRaw : undefined;
           // V22: aria-invalid for re-probe path (see PROBE_AT_POINT for rationale).
           var aiAttr = walk.getAttribute('aria-invalid');
           var ai = aiAttr === 'true' ? true : aiAttr === 'false' ? false : undefined;
@@ -2399,6 +2748,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
             ariaExpanded: ae === 'true' ? true : ae === 'false' ? false : undefined,
             ariaPressed: ap === 'true' ? true : ap === 'false' ? false : undefined,
             ariaInvalid: ai,
+            dataState: walkDataState,
             isMultiline: isMultiline || undefined,
             boundingBox: {
               x: Math.round(rect.x),
@@ -2644,6 +2994,12 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.ariaValueNow !== undefined) ariaState.valueNow = element.ariaValueNow;
     if (element.ariaValueText) ariaState.valueText = element.ariaValueText;
     if (Object.keys(ariaState).length > 0) hints.ariaState = ariaState;
+    // Radix/shadcn data-state at recording time. Top-level (parallel to
+    // ariaState) because data-state is a single string keyword that doesn't
+    // fit the boolean schema, AND many Radix primitives set data-state
+    // WITHOUT mirroring to aria-expanded — so consumers must read both
+    // independently rather than treating data-state as a boolean alias.
+    if (element.dataState) hints.dataState = element.dataState;
     // V22 Pkg1: data-value / child icon testid.
     if (element.dataValue) hints.dataValue = element.dataValue;
     if (element.childTestId) hints.childTestId = element.childTestId;
@@ -2701,6 +3057,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.title) fp.title = element.title;
     if (element.alt) fp.alt = element.alt;
     if (element.text) fp.text = element.text;
+    // V26: first DOM-unit text fragment — locator builder uses this to
+    // emit `getByText(titleOnly)` strategies that actually match Angular
+    // Material / Vue card patterns where text is split across children.
+    if (element.firstTextFragment) fp.firstTextFragment = element.firstTextFragment;
     if (element.elementId) fp.elementId = element.elementId;
     if (element.cssClass) fp.cssClass = element.cssClass;
     if (element.ariaControls) fp.ariaControls = element.ariaControls;
@@ -2719,6 +3079,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.ariaValueNow !== undefined) ariaState.valueNow = element.ariaValueNow;
     if (element.ariaValueText) ariaState.valueText = element.ariaValueText;
     if (Object.keys(ariaState).length > 0) fp.ariaState = ariaState;
+    // Radix/shadcn data-state — see BindingHints.dataState rationale.
+    // Stored on the persisted fingerprint so heal-time scoring (and the
+    // post-action verifier) can compare recorded state to live state.
+    if (element.dataState) fp.dataState = element.dataState;
     // V22 Pkg1: data-value / child icon testid.
     if (element.dataValue) fp.dataValue = element.dataValue;
     if (element.childTestId) fp.childTestId = element.childTestId;
@@ -2778,6 +3142,23 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     // Expandable: open/close based on aria-expanded
     if (elementBefore.ariaExpanded === false) return 'open';
     if (elementBefore.ariaExpanded === true) return 'close';
+
+    // Radix/shadcn fallback: many primitives (Dialog, Popover,
+    // DropdownMenu) do NOT mirror state to aria-expanded. Without
+    // this branch a click on a Radix dropdown trigger gets recorded
+    // as generic 'click' → replay can't use the state-reflected
+    // verifier and a bug-fix retry treats it as element-mismatch
+    // rather than state-changed-since-recording.
+    //
+    // Strict: only 'open' / 'closed' map to open/close. 'active' /
+    // 'inactive' (Tabs) and 'on' / 'off' (Toggle) and 'checked' /
+    // 'unchecked' (Checkbox/Radio) are intentionally NOT mapped here:
+    //   - tabs are select-semantic, not open-semantic
+    //   - toggle/checkbox already covered by the aria-pressed branch
+    //     below or by native input.checked
+    // Mapping wider strings would over-claim 'open' on tab clicks.
+    if (elementBefore.dataState === 'closed') return 'open';
+    if (elementBefore.dataState === 'open') return 'close';
 
     // Toggle: aria-pressed
     if (elementBefore.ariaPressed === false || elementBefore.ariaPressed === true) return 'toggle';

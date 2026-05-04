@@ -397,6 +397,9 @@ ${urlLine}- Available actions: ${input.observation.availableActions.join(', ') |
 - Form: ${input.observation.formAnalysis ? `${input.observation.formAnalysis.fields.length} fields, submit="${input.observation.formAnalysis.submitButtonText || 'unknown'}"` : 'none'}
 - Error state: ${input.observation.errorState || 'none'}
 - Modal: ${input.observation.modalInfo || 'none'}${formRefsHint}
+- Open widgets: ${input.observation.openWidgets && input.observation.openWidgets.length > 0
+  ? input.observation.openWidgets.map(w => `${w.kind}=${w.ref}("${w.label.slice(0, 40)}")`).join(', ')
+  : 'none'}
 ${impactSection}${spatialSection}${networkStateSection}${expectationSection}${tableSection}${listSection}${loadingContextSection}${overlapSection}${transitionSection}${workingMemorySection}
 ═══ TOOL COST & RISK MATRIX ═══
 Before choosing an action, consider its cost and risk:
@@ -458,6 +461,7 @@ Rules:
 - "riskLevel": "low" (scroll/hover/wait/fill), "medium" (click/select/press), "high" (goto/submit with side effects)
 - "confidence": 0-1. Lower if obstacles present, history shows failures, or expectation mismatch${structuredStrategyRules}
 - If goal is achieved: set "done": true
+- **OPEN-WIDGET AWARENESS**: When "Open widgets" lists a widget whose role/label matches the goal (e.g. goal "open settings menu" + open widget kind=menu label contains "settings"), the goal is ALREADY satisfied — set "done": true. Do NOT instruct Actor to click a trigger that would TOGGLE-CLOSE an already-open widget (Radix/shadcn dropdowns, Vaul drawers and similar primitives toggle on click). When a widget IS open and goal requires interacting with its contents (e.g. "select option X from settings menu"), instruct Actor to interact with the option directly, not to click the trigger again.
 - If blocked and need HUMAN INPUT: set "blockedInfo" with structured classification.
   Use this ONLY when automation cannot proceed without a real person.
   Common blockers that REQUIRE a human:

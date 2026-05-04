@@ -433,6 +433,27 @@ export class EditorTraceService {
     });
   }
 
+  /**
+   * Etap 1D.1 — emitted when an apply succeeded but the persisted compiled
+   * plan could not be validated against the live page (every locator has
+   * `validated=false`). Surfaces the same signal that goes to the WS
+   * `apply:result.planQuality` so post-mortem traces can see flaky steps
+   * without joining server logs.
+   */
+  writePlanQuality(data: {
+    stepId: string;
+    unverified: boolean;
+    reason?: string;
+    /** Where in the apply pipeline the unverified plan was generated. */
+    path: 'user_confirmed' | 'compiled_fast_path_upgrade' | 'lint_resolve_post_verify';
+  }): void {
+    this.writer.write({
+      stage: 'apply',
+      eventType: 'plan_quality',
+      payload: data,
+    });
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // EDITOR ACTION (AI) EVENTS
   // ─────────────────────────────────────────────────────────────────────────
@@ -773,6 +794,10 @@ export class EditorTraceService {
     stepId: string;
     attempt: number;
     strategy: string;
+    /** Etap 1A — locator tier classification for diagnostics. */
+    tier?: string;
+    /** Etap 1A — `count()` from build-time validation. */
+    plannedMatchCount?: number;
     value: string;
     confidence?: number;
     timeoutMs: number;

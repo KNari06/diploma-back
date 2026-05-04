@@ -236,10 +236,16 @@ export const LITE_ENGINE_FLAGS = {
   /**
    * PR2: Run SafetyInterceptor (Critic Phase 1 deterministic checks) on the
    * skip path. When true, hallucinated refs and forbidden actions are caught
-   * even when the AI Critic is bypassed. Default OFF for safe rollout —
-   * flip in a separate PR after staging soak.
+   * even when the AI Critic is bypassed.
+   *
+   * Default flipped to TRUE (P0 fix): without this gate, `criticSkipForLowRisk`
+   * skips not just the AI Critic call but also deterministic pre-flight
+   * checks for stale/hallucinated refs and forbidden actions on
+   * `low-risk + confidence ≥0.9` strategies. SafetyInterceptor is a
+   * pure-function <1ms check — there is no perf reason to leave it off.
+   * If a problem surfaces, set this back to false via env override.
    */
-  enableSafetyInterceptorOnSkip: false,
+  enableSafetyInterceptorOnSkip: true,
   /** Enable critic override — apply structured override commands instead of just logging */
   enableCriticOverride: true,
   /** Preserve accumulated context when falling back to monolithic */
@@ -278,6 +284,13 @@ export const LITE_ENGINE_FLAGS = {
   prunerCacheTtlMs: 15_000,
   /** Maximum pruner cache entries */
   prunerCacheMaxEntries: 10,
+  /**
+   * P2 fix — minimum refs the LLM pruner must keep, else fall back to
+   * legacy full element list. Was hardcoded to 5 inline. 5 is enough
+   * for a small dialog (close + primary + secondary + 2 fields); much
+   * lower means the pruner over-aggressively dropped real candidates.
+   */
+  prunerMinKeepRefs: 5,
   /** Enable fullPage snapshot collection in main iteration loop (see beyond viewport) */
   enableFullPageSnapshot: true,
 
@@ -338,6 +351,14 @@ export const LITE_ENGINE_FLAGS = {
   timeoutGovernorStallOutcomeThreshold: 4,
   /** 0 new accomplishments for this many iterations → stall */
   timeoutGovernorStallAccomplishmentIters: 5,
+  /**
+   * P2 fix — known blocker (captcha/2FA/file-upload prompt) persisting
+   * for this duration triggers the `blocker_decision` AI deadline gate.
+   * Was hardcoded to 30000 inline; lifted to config so staging can
+   * tune. 30s default tested empirically — shorter fires too early on
+   * legitimately slow user input (2FA SMS code).
+   */
+  timeoutGovernorBlockerPersistMs: 30_000,
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PIPELINE V2: COLLABORATIVE AGENT TEAM (Planner → Executor → Reviewer)

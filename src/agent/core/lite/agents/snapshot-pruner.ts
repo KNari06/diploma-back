@@ -208,11 +208,14 @@ export class SnapshotPruner {
       }
     }
 
-    // Safety: if LLM kept too few, fall back to legacy
-    if (keepRefs.size < 5) {
+    // Safety: if LLM kept too few, fall back to legacy.
+    // P2 fix — threshold lifted to LITE_ENGINE_FLAGS.prunerMinKeepRefs
+    // (was hardcoded 5 inline). Tunable per-deploy without rebuild.
+    if (keepRefs.size < LITE_ENGINE_FLAGS.prunerMinKeepRefs) {
       logger.warn('[SNAPSHOT_PRUNER] LLM kept too few elements, falling back', {
         kept: keepRefs.size,
         total: input.elements.length,
+        minRequired: LITE_ENGINE_FLAGS.prunerMinKeepRefs,
       });
       return null;
     }

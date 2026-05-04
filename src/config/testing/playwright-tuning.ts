@@ -130,6 +130,58 @@ export const STEP_READINESS_CONFIG = {
     autoWaitThresholdMs: 800,
     maxRetries: 2,
   },
+
+  /**
+   * V2 (smart-waiter) mode.
+   * 'off'    — only V1 runs (current behaviour).
+   * 'shadow' — V1 runs as primary, V2 runs in parallel for diff logging only.
+   * 'primary'— V2 is authoritative, V1 is dead path.
+   * Override: STEP_READINESS_V2_MODE
+   */
+  v2Mode: ((): 'off' | 'shadow' | 'primary' => {
+    const raw = (process.env.STEP_READINESS_V2_MODE ?? '').toLowerCase().trim();
+    if (raw === 'shadow' || raw === 'primary') return raw;
+    return 'off';
+  })(),
+
+  /**
+   * V2 tuning. Cheap, single-pass, deadline-respecting.
+   * No additive phases — one budget, soft-OR escape at 70%.
+   */
+  v2: {
+    /** Background replay budget. preview uses defaults.maxWaitMs (5s). */
+    backgroundMaxWaitMs: envNum(process.env.STEP_READINESS_V2_BG_MAX_MS, 7_000),
+    /** Quiet window for pageStable consensus, by prev action class. */
+    quietMs: {
+      navigation: 500,   // click/open/close/toggle/press/hover/scroll/upload/drag/navigate
+      input: 300,        // type/select
+      assertion: 150,    // assert/hover (light)
+      default: 300,
+    },
+    /** Hard cap per individual Playwright check (isVisible/isEnabled/count). */
+    perCheckCapMs: 500,
+    /** Polling interval for actionability (level 1+2). */
+    pollIntervalMs: 80,
+    /** Bbox stability — coords must not move more than this (px) within quiet window. */
+    bboxJitterPx: 1,
+    /** Delay between two bbox reads. Less than this = stability check is meaningless. */
+    bboxRecheckDelayMs: 60,
+    /** Identity check: fingerprint compared on element only when level1 ✓. */
+    identity: {
+      /** Strong fields — match means strong identity. */
+      strongFields: ['elementId', 'testIdAttr', 'name', 'href', 'svgIcon', 'routerLink'] as const,
+      /** Weak fields — used as fallback if strong unavailable. */
+      weakFields: ['ariaLabel', 'labelText', 'placeholder', 'text', 'role', 'tag'] as const,
+    },
+    /**
+     * Soft-OR escape: after this fraction of budget, pageStable gate is dropped
+     * and identity downgrades from strong to weak. Prevents "never settled" on
+     * SaaS pages with permanent background polling.
+     */
+    softEscapeRatio: 0.7,
+    /** Default for autoWaitApplied flag. */
+    autoWaitThresholdMs: 800,
+  },
 } as const;
 
 // ─── Element Resolver ─────────────────────────────────────────────────────────
@@ -157,17 +209,36 @@ export const ELEMENT_RESOLVER_CONFIG = {
     /** Time the circuit stays open before half-open probe (ms) */
     cooldownMs: 60_000,
     /**
-     * Per-call LLM selection timeout (ms).
+     * Per-call LLM selection timeout (ms) — OUTER (total) budget.
      *
-     * Was 7000 — too tight on busy Gemini API days where Flash Lite
-     * latency floats up to 8-12s for prompts in the 25-30 KB range
-     * (we feed ~60 candidates × scene + apply-rules prompt which sits
-     * around 29 KB). 7s aborted requests that would have answered at
-     * 8-9s, cascading into degraded fallback. Bumped to 14000 to give
-     * the loaded API enough room while still shorter than Playwright's
-     * 15s default action timeout.
+     * V26: bumped 10000 → 15000 so both providers can use their full
+     * `perProviderTimeoutMs` (7s + 7s = 14s) without the outer
+     * pre-empting the fallback. Previously 10s left only ~3s for
+     * the fallback when the primary used its full 7s, defeating the
+     * point of having a fallback during outages.
+     *
+     * Why this size: Gemini Flash Lite latency floats 8-12s on busy
+     * days for 25-30 KB prompts (~60 candidates + scene + apply-rules
+     * sits around 29 KB). Per-provider 7s is tight enough to NOT wait
+     * for the long tail (we'd rather try the other provider) but
+     * generous enough to catch p90. 15s outer = 2 × 7s + 1s slack
+     * for prepare/post phases. Still shorter than Playwright's 15s
+     * default action timeout (calls happen before the action so we're
+     * not racing against the action timeout itself).
      */
-    timeoutMs: 10_000,
+    timeoutMs: 15_000,
+    /**
+     * V26: Per-provider budget. Wall-clock for ONE provider attempt
+     * before we give up and try the fallback. Both Gemini and OpenAI
+     * each get this much; total worst-case = 2 × perProviderTimeoutMs.
+     *
+     * Why: when Gemini is degraded (May 2026 outage), the old logic
+     * burned the entire 10s budget on Gemini, then refused fallback
+     * because `controller.signal.aborted === true`. Fix: each provider
+     * gets its own AbortController scoped to perProviderTimeoutMs.
+     * Outer `timeoutMs` is the absolute hard cap.
+     */
+    perProviderTimeoutMs: 7_000,
   },
 
   /** LLM result cache */

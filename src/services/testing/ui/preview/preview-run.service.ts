@@ -20,6 +20,7 @@ import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
+import { runV1WithShadow } from './step-readiness-v2.service';
 import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
@@ -1314,7 +1315,25 @@ export class PreviewRunService {
       // V13: Switch dialog handler to replay mode — use pre-installed actions from recorded dialog steps
       sessionService.setDialogMode(previewSessionId, userId, 'replay');
 
-      // Skip compiled shortcut for remaining steps if first compiled plan failed (likely stale after deploy)
+      // V26: Per-run compiled-plan failure budget instead of "skip all
+      // after first failure". The original logic was:
+      //   - one compiled fail → skip compiled for ALL remaining steps
+      // That helped against post-deploy regressions (every plan stale at
+      // once) but punished single-step failures: a card with a fragile
+      // text-only locator would disable compiled for the whole rest of
+      // the run, forcing every later step through the LLM resolver even
+      // when their plans were perfectly valid (e.g. juz40 step 10 had
+      // working compiled for "Папкалар" but never got tried because
+      // step 8's MAT-SMART card failed).
+      //
+      // New rule: count failures, only kill compiled when 3+ in a row
+      // OR 5+ across the whole run — the deploy-regression signature.
+      // Single bad plans cost ~3s each (locator timeout) but let the
+      // good ones still take the fast path.
+      let compiledFailuresInRow = 0;
+      let compiledFailuresTotal = 0;
+      const MAX_COMPILED_FAILS_IN_ROW = 3;
+      const MAX_COMPILED_FAILS_TOTAL = 5;
       let skipCompiledForRemaining = false;
 
       // ─── Step execution loop ───────────────────────────────────────────
@@ -1720,13 +1739,44 @@ export class PreviewRunService {
             skipCompiled: skipCompiledForRemaining,
           }), signal);
 
-          // If compiled plan was tried and failed, skip compiled for remaining steps
-          // (plans likely stale after deploy — don't waste 3s timeout per step)
-          if (result.compiledFailed && !skipCompiledForRemaining) {
-            skipCompiledForRemaining = true;
-            logger.info('[PreviewRun] Compiled plan failed — skipping compiled for remaining steps', {
-              previewSessionId, stepIndex: originalStepIndex, stepId: step.id,
-            });
+          // V26: per-step counter instead of global kill switch.
+          // Single fail = +1, success on a tried-compiled = reset the
+          // streak (it was a one-off bad plan, not a deploy regression).
+          // Hit 3-in-row OR 5-total → assume deploy regression, switch
+          // off compiled for the rest of the run as before.
+          if (result.compiledFailed) {
+            compiledFailuresInRow++;
+            compiledFailuresTotal++;
+            if (
+              !skipCompiledForRemaining
+              && (compiledFailuresInRow >= MAX_COMPILED_FAILS_IN_ROW
+                  || compiledFailuresTotal >= MAX_COMPILED_FAILS_TOTAL)
+            ) {
+              skipCompiledForRemaining = true;
+              logger.info('[PreviewRun] Compiled plan failure budget exhausted — disabling compiled for remaining steps', {
+                previewSessionId,
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                failuresInRow: compiledFailuresInRow,
+                failuresTotal: compiledFailuresTotal,
+              });
+            } else if (!skipCompiledForRemaining) {
+              logger.debug('[PreviewRun] Compiled plan failed — counting toward budget', {
+                previewSessionId,
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                failuresInRow: compiledFailuresInRow,
+                failuresTotal: compiledFailuresTotal,
+                budgetInRow: MAX_COMPILED_FAILS_IN_ROW,
+                budgetTotal: MAX_COMPILED_FAILS_TOTAL,
+              });
+            }
+          } else if (result.success) {
+            // Success on this step — reset the in-row streak (a single
+            // bad plan elsewhere shouldn't be held against this success).
+            // Total counter stays — many failures across the whole run
+            // is still the deploy-regression signal we want to catch.
+            compiledFailuresInRow = 0;
           }
           let retried = false;
 
@@ -2068,15 +2118,28 @@ export class PreviewRunService {
                     });
                   }
                 } catch { /* non-fatal */ }
-                const lookahead = await raceAbort(waitForStepReadiness(session.page, nextStep, {
-                  maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                  settleMs: adaptiveSettle,
-                  autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
-                  prevActionType: step.type,
-                  prevUrl: trackedUrl,
-                  recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                  tracer: lookaheadTracer,
-                }), signal);
+                const lookahead = await raceAbort(
+                  runV1WithShadow(
+                    () => waitForStepReadiness(session.page, nextStep, {
+                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                      settleMs: adaptiveSettle,
+                      autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                      prevActionType: step.type,
+                      prevUrl: trackedUrl,
+                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                      tracer: lookaheadTracer,
+                    }),
+                    session.page,
+                    nextStep,
+                    {
+                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                      prevActionType: step.type,
+                      prevUrl: trackedUrl,
+                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                    },
+                  ),
+                  signal,
+                );
 
                 // Track actual settle time per action category for adaptive threshold
                 if (lookahead.waited > 0) {
@@ -2397,14 +2460,27 @@ export class PreviewRunService {
                 if (i < stepsToExecute.length - 1 && !skipLookaheadRetry && !runState.cancelled) {
                   const nextStep = stepsToExecute[i + 1];
                   try {
-                    await raceAbort(waitForStepReadiness(session.page, nextStep, {
-                      maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                      settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
-                      autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
-                      prevActionType: step.type,
-                      prevUrl: trackedUrl,
-                      recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                    }), signal);
+                    await raceAbort(
+                      runV1WithShadow(
+                        () => waitForStepReadiness(session.page, nextStep, {
+                          maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                          settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                          autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                          prevActionType: step.type,
+                          prevUrl: trackedUrl,
+                          recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                        }),
+                        session.page,
+                        nextStep,
+                        {
+                          maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                          prevActionType: step.type,
+                          prevUrl: trackedUrl,
+                          recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                        },
+                      ),
+                      signal,
+                    );
                   } catch (laError) {
                     if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                     // Lookahead failure is non-fatal — apply DOM stability fallback
@@ -2458,14 +2534,27 @@ export class PreviewRunService {
                   if (i < stepsToExecute.length - 1 && !skipLookaheadFinal && !runState.cancelled) {
                     const nextStep = stepsToExecute[i + 1];
                     try {
-                      await raceAbort(waitForStepReadiness(session.page, nextStep, {
-                        maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
-                        settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
-                        autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
-                        prevActionType: step.type,
-                        prevUrl: trackedUrl,
-                        recordedDelayMs: nextStep.evidence?.interStepDelayMs,
-                      }), signal);
+                      await raceAbort(
+                        runV1WithShadow(
+                          () => waitForStepReadiness(session.page, nextStep, {
+                            maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                            settleMs: STEP_READINESS_CONFIG.defaults.settleMs,
+                            autoWaitThresholdMs: STEP_READINESS_CONFIG.defaults.autoWaitThresholdMs,
+                            prevActionType: step.type,
+                            prevUrl: trackedUrl,
+                            recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                          }),
+                          session.page,
+                          nextStep,
+                          {
+                            maxWaitMs: STEP_READINESS_CONFIG.defaults.maxWaitMs,
+                            prevActionType: step.type,
+                            prevUrl: trackedUrl,
+                            recordedDelayMs: nextStep.evidence?.interStepDelayMs,
+                          },
+                        ),
+                        signal,
+                      );
                     } catch (laError) {
                       if (laError instanceof DOMException && laError.name === 'AbortError') throw laError;
                       await waitForDOMStability(session.page, STEP_READINESS_CONFIG.defaults.maxWaitMs, STEP_READINESS_CONFIG.domStableThresholdMs.default).catch(() => {});

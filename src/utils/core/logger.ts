@@ -314,6 +314,56 @@ try {
   console.error('Failed to create v25-debug.log transport:', error);
 }
 
+// ── Etap 2 CDP snapshot diagnostic log ──────────────────────────────
+// Tag-filtered file mirror of all Etap 2 logging. Why a separate file:
+//   1. Dev console gets clipped under load — long debug lines from
+//      preview-tick (~2/sec) push earlier diagnostic lines off the
+//      visible buffer before the operator can read them.
+//   2. `combined.log` is prod-only AND mixes tags from across the
+//      whole codebase; finding the SNAPSHOT_ROUTER thread is a chore.
+//   3. `error.log` only catches errors, missing the info-level `source:
+//      'cdp'` confirmation that's most useful during ramp-up.
+// This transport ALWAYS writes (dev + prod), level=debug, NO field
+// truncation (we want full phase timings + shape stats). Tag filter
+// keeps file small. Kill switch: rm logs/etap2-cdp.log.
+try {
+  const ETAP2_TAGS = [
+    '[SNAPSHOT_ROUTER]',
+    '[SNAPSHOT_HEALTH]',
+    '[SNAPSHOT_SHADOW_DIVERGENCE]',
+    '[CDP_SNAPSHOT]',
+  ];
+  const etap2Filter = winston.format((info) => {
+    const msg = typeof info.message === 'string' ? info.message : String(info.message);
+    return ETAP2_TAGS.some((tag) => msg.includes(tag)) ? info : false;
+  });
+
+  const etap2LogTransport = new winston.transports.File({
+    filename: path.join(logsDir, 'etap2-cdp.log'),
+    level: 'debug',
+    maxsize: 20 * 1024 * 1024, // 20MB — enough for ~24h of dense-page
+                                // ramp-up testing including Phase 5b
+                                // diagnostic dumps.
+    maxFiles: 3,
+    format: winston.format.combine(
+      etap2Filter(),
+      winston.format.timestamp(),
+      // SKIP truncateLargeFields — `[CDP_SNAPSHOT] Collected` carries
+      // full phase timings + runtime stats that we WANT readable
+      // post-mortem. Tag filter already bounds total volume.
+      winston.format.json(),
+    ),
+  });
+
+  etap2LogTransport.on('error', (error) => {
+    console.error('Error writing to etap2-cdp.log:', error);
+  });
+
+  transports.push(etap2LogTransport);
+} catch (error) {
+  console.error('Failed to create etap2-cdp.log transport:', error);
+}
+
 // Add additional file transports in production
 if (env.NODE_ENV === 'production') {
   try {

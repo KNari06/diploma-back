@@ -17,6 +17,7 @@ import { EditorTraceService } from './editor-trace.service';
 import { evaluateEvidenceShortcut } from './evidence-shortcut.utils';
 import { logIntentResolveLint } from './intent-resolve-audit';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { isDynamicId } from './dynamic-id.util';
 import { getPreviewSessionService } from './preview-session.service';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
@@ -1052,12 +1053,16 @@ export class IntentStepLintService {
     // Log per-phase right when it finishes — independent of return path so
     // huge-page regressions are visible even when the step ultimately passes.
     if (snapshotMs > 1000) {
+      // V26: phase timings come straight from snapshot.phaseTimings (added
+      // by getSnapshot, sourced from in-page performance.now() markers).
+      // Defensive: optional, old callers without the field still log fine.
       logger.warn('[INTENT_LINT_TIMING] snapshot collect was slow', {
         previewSessionId,
         snapshotMs,
         domNodeCount: domNodes.length,
         url: snapshot.url,
         forceFreshSnapshot,
+        phaseTimings: (snapshot as any).phaseTimings,
       });
     }
 
@@ -1087,33 +1092,86 @@ export class IntentStepLintService {
     // ═══════════════════════════════════════════════════════════════════════════
     const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'wait_for_email']);
     if (!NON_TARGETING_FOR_URL_GUARD.has(stepDraft.type)) {
-      const recordedUrl = stepDraft.compiled?.context?.pageUrl || stepDraft.evidence?.pageUrl;
+      // Priority order matters. `evidence.pageUrl` is set by the recorder at
+      // capture time (the URL the user was actually on when they clicked) and
+      // never moves. `compiled.context.pageUrl` is rebuilt every time the
+      // compiled plan is rebuilt, and a click that triggers navigation will
+      // bake the *destination* URL into the plan if the rebuild happens
+      // post-action. We prefer `evidence.pageUrl` as the recorder's truth.
+      const recordedUrl = stepDraft.evidence?.pageUrl || stepDraft.compiled?.context?.pageUrl;
       if (recordedUrl) {
         const recordedNorm = normalizeUrlForComparison(recordedUrl);
         const currentNorm = normalizeUrlForComparison(snapshot.url);
         if (recordedNorm && currentNorm && recordedNorm !== currentNorm) {
-          logger.info('[INTENT_LINT] URL guard tripped — step recorded on different page', {
-            previewSessionId,
-            stepId: stepDraft.id,
-            recordedUrl,
-            currentUrl: snapshot.url,
-            recordedNorm,
-            currentNorm,
-            source: stepDraft.compiled?.context?.pageUrl ? 'compiled' : 'evidence',
-          });
-          return {
-            status: 'not_found',
-            message: `Шаг записан для страницы ${recordedNorm}, сейчас открыто ${currentNorm}. Проверьте, что предыдущие шаги привели на нужную страницу — возможно, навигация не сработала.`,
-            confidence: 0,
-            candidates: [],
-            highlight: [],
-            // Carry the URL pair for the editor UI / audit log so the user
-            // sees exactly which navigation failed instead of a generic
-            // "describe better" hint.
-            // Reusing degradedReason so existing UI paths surface it.
-            degradedMode: false,
-            degradedReason: 'url_mismatch' as any,
-          } as LintResult;
+          // Escape hatch: if the recorder captured a strong identity signal
+          // (id / testId / href / name) and that exact element is alive on the
+          // current page, the URL mismatch is misleading — recording context
+          // got corrupted (e.g. compiled plan rebuilt on the navigation
+          // destination) but the element we want is right here. Let the
+          // resolver run; identity fast-path will pick it deterministically.
+          const fp = stepDraft.recordedFingerprint;
+          let identityRescue = false;
+          let rescueReason = '';
+          if (fp) {
+            // Match against the live snapshot only — id/testId/href/name are
+            // already exposed on InteractiveNode by the collector. Any single
+            // unique match is enough.
+            const id = fp.elementId;
+            const testId = (fp as any).testIdAttr;
+            const href = (fp as any).href;
+            const name = (fp as any).name;
+            if (id && !isDynamicId(id)) {
+              const hits = domNodes.filter(n => (n as any).id === id);
+              if (hits.length === 1) { identityRescue = true; rescueReason = 'id'; }
+            }
+            if (!identityRescue && testId) {
+              const hits = domNodes.filter(n => (n as any).testIdAttr === testId);
+              if (hits.length === 1) { identityRescue = true; rescueReason = 'testId'; }
+            }
+            if (!identityRescue && href) {
+              const hits = domNodes.filter(n => (n as any).href === href);
+              if (hits.length === 1) { identityRescue = true; rescueReason = 'href'; }
+            }
+            if (!identityRescue && name) {
+              const hits = domNodes.filter(n => (n as any).htmlName === name);
+              if (hits.length === 1) { identityRescue = true; rescueReason = 'name'; }
+            }
+          }
+
+          if (identityRescue) {
+            logger.info('[INTENT_LINT] URL guard suppressed by identity rescue — element is live on current page despite URL mismatch', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              recordedUrl,
+              currentUrl: snapshot.url,
+              rescueReason,
+            });
+            // Fall through into normal resolver path; identity fast-path
+            // picks it up deterministically.
+          } else {
+            logger.info('[INTENT_LINT] URL guard tripped — step recorded on different page', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              recordedUrl,
+              currentUrl: snapshot.url,
+              recordedNorm,
+              currentNorm,
+              source: stepDraft.evidence?.pageUrl ? 'evidence' : 'compiled',
+            });
+            return {
+              status: 'not_found',
+              message: `Шаг записан для страницы ${recordedNorm}, сейчас открыто ${currentNorm}. Проверьте, что предыдущие шаги привели на нужную страницу — возможно, навигация не сработала.`,
+              confidence: 0,
+              candidates: [],
+              highlight: [],
+              // Carry the URL pair for the editor UI / audit log so the user
+              // sees exactly which navigation failed instead of a generic
+              // "describe better" hint.
+              // Reusing degradedReason so existing UI paths surface it.
+              degradedMode: false,
+              degradedReason: 'url_mismatch' as any,
+            } as LintResult;
+          }
         }
       }
     }

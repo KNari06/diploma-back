@@ -175,6 +175,12 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.text = truncateText(element.name);
   }
 
+  // V26: Pass through firstTextFragment for builder/resolver to use as a
+  // single-DOM-node text locator (Angular Material card pattern, etc.).
+  if (element.firstTextFragment) {
+    node.firstTextFragment = truncateText(element.firstTextFragment);
+  }
+
   // Add placeholder
   if (element.placeholder) {
     node.placeholder = truncateText(element.placeholder);
@@ -267,6 +273,15 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   }
   if (element.ariaChecked !== undefined) {
     node.ariaChecked = element.ariaChecked;
+  }
+  // Radix/shadcn data-state — symmetry partner of probe / collector.
+  // Without this assignment, snapshot collector populates dataState on
+  // collected elements but probed elements (recorded steps) have it
+  // dropped here → fingerprint compare reads recordedFp.dataState=undefined
+  // vs live el.dataState='open' → false "page state changed since
+  // recording" diagnosis on every Radix replay.
+  if (element.dataState) {
+    node.dataState = element.dataState;
   }
 
   // V22 Pkg1: Pagination/Stepper/Slider/SpinButton state + Select value + IconButton child lift

@@ -330,10 +330,24 @@ Available actions:
 - hover: { "action": "hover", "ref": "e4" }
 - wait: { "action": "wait" }
 
+Element-marker reference (per-line in AVAILABLE ELEMENTS):
+- [EXPANDED] / [COLLAPSED] — aria-expanded toggles
+- [CHECKED] / [SELECTED] / [PRESSED] — aria/native selection state
+- [STATE=open] / [STATE=closed] / [STATE=active] / [STATE=on] / [STATE=off]
+  — Radix UI / shadcn / Vaul data-state attribute. Treat [STATE=open] / [STATE=active] /
+  [STATE=on] as "this widget/trigger is ALREADY open or active".
+- [DISABLED] / [INVALID] / [READONLY] — input cannot or should not be acted on.
+
 Rules:
 - Pick the SINGLE best element for the strategy
 - Use exact ref values from the elements list
 - For credential fields, set "isSensitive": true
+- **TOGGLE-REGRESSION GUARD**: If the strategy says "open <X>" / "show <X>" / "expand <X>"
+  and the candidate element already shows [STATE=open], [STATE=active], [STATE=on], or
+  [EXPANDED] — DO NOT click it. Clicking such a trigger TOGGLES it closed
+  (Radix/shadcn/Vaul behaviour). Instead respond with { "action": "wait" } and
+  reasoning: "target already in goal state — Strategist should mark done next iteration".
+  Inverse for "close" / "collapse" goals: skip clicks on [STATE=closed]/[COLLAPSED] triggers.
 - Return ONLY valid JSON`;
   }
 }

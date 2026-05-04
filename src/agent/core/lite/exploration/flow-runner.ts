@@ -26,6 +26,7 @@ import { ActionExecutor } from '../execution/action-executor';
 import { NetworkTracker } from '../collectors/network-tracker';
 import { GoalDetector } from '../analysis/goal-detector';
 import { SnapshotCollector } from '../collectors/snapshot-collector';
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { OverlayDismisser } from './overlay-dismisser';
 import { VisualStability } from '../collectors/visual-stability';
 
@@ -1376,7 +1377,7 @@ export class FlowRunner {
         await VisualStability.waitForPageReady(page, { timeout: 3000 });
       } catch { /* non-fatal */ }
 
-      const snapshot = await SnapshotCollector.collect(page, { fullPage: true });
+      const snapshot = await SnapshotRouter.collect(page, { context: 'exploration-flow', fullPage: true });
 
       // Collect known pages from blackboard (prevents Scout from re-discovering surveyed pages)
       const knownPages = this.blackboard?.tree?.getAllNodes?.()?.map((n: any) => n.url) ?? [];
@@ -1524,7 +1525,7 @@ export class FlowRunner {
         // Non-fatal
       }
 
-      const snapshot = await SnapshotCollector.collect(page, { fullPage: true });
+      const snapshot = await SnapshotRouter.collect(page, { context: 'exploration-flow', fullPage: true });
       const formattedSnapshot = SnapshotCollector.format(snapshot);
 
       const prompt = buildBranchDetectionPrompt({

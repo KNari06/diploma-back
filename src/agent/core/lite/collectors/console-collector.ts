@@ -19,6 +19,16 @@ export class ConsoleCollector {
   private readonly MAX_ERRORS = 100; // Limit stored errors to prevent memory issues
   private isCollecting: boolean = false;
 
+  // P0 fix: Named handler so we can `page.off('console', handler)` to
+  // remove the listener at dispose time. Previously this was an inline
+  // arrow that could not be detached → on every page-switch in
+  // lite-engine.ts (where ConsoleCollector is reconstructed against the
+  // new page) the OLD listener stayed attached to the old page until
+  // the page was closed, leaking handlers + memory across long-running
+  // tests with multiple navigations.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private consoleHandler: (msg: ConsoleMessage) => void = (msg) => this.handleConsoleMessage(msg);
+
   constructor(page: Page) {
     this.page = page;
     this.startCollecting();
@@ -30,12 +40,34 @@ export class ConsoleCollector {
   private startCollecting(): void {
     if (this.isCollecting) return;
 
-    this.page.on('console', (msg: ConsoleMessage) => {
-      this.handleConsoleMessage(msg);
-    });
+    this.page.on('console', this.consoleHandler);
 
     this.isCollecting = true;
     logger.debug('[CONSOLE_COLLECTOR] Started collecting console messages');
+  }
+
+  /**
+   * Stop collecting and detach the listener. Idempotent — safe to call
+   * multiple times. Call this BEFORE replacing the ConsoleCollector
+   * instance with a new one (e.g. on tab/popup switch in LiteEngine)
+   * or on test teardown.
+   *
+   * Without this, the previous handler remains bound to the previous
+   * page object, accumulating across navigations.
+   */
+  dispose(): void {
+    if (!this.isCollecting) return;
+    try {
+      this.page.off('console', this.consoleHandler);
+    } catch (err) {
+      // Page may already be closed — fail-soft; goal is to drop the
+      // reference, not enforce it.
+      logger.debug('[CONSOLE_COLLECTOR] dispose: page.off failed (likely already closed)', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+    this.isCollecting = false;
+    logger.debug('[CONSOLE_COLLECTOR] Disposed (listener detached)');
   }
 
   /**

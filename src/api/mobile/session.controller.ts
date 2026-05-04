@@ -357,20 +357,25 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // Try pool first (instant claim of a pre-booted emulator); fall back to
     // createSession only if the pool is disabled / exhausted / unreachable.
     // Mirrors the 3-tier pattern used by mobile-test-run.job.ts.
+    //
+    // ownerId scopes the runner's Android multi-user so each backend user
+    // sees only their own apps on a shared redroid container. See
+    // qait-mobile-runner/docs/multi-user-known-risks.md.
     let session: Awaited<ReturnType<typeof client.createSession>>;
     try {
-      session = await client.claimSession(platform);
+      session = await client.claimSession(platform, { ownerId: userId });
       logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
         projectId,
         sessionId: session.sessionId,
         platform,
+        ownerId: userId,
       });
     } catch (poolErr) {
       logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
         projectId,
         error: poolErr instanceof Error ? poolErr.message : String(poolErr),
       });
-      session = await client.createSession(platform);
+      session = await client.createSession(platform, { ownerId: userId });
     }
 
     // Emulator is up — nudge the loader past the "preparing env" stage.
@@ -879,8 +884,10 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    // Normalize: strip surrounding quotes ("'Search' navigation" → "Search navigation")
-    const description = rawDescription.replace(/['"]+([^'"]+)['"]+/g, '$1').trim();
+    // Normalize: strip surrounding quotes (handles whole-wrap + balanced inline pairs).
+    // See normalize-description.ts for failure modes the previous regex had.
+    const { normalizeMobileDescription } = await import('@/services/mobile/normalize-description');
+    const description = normalizeMobileDescription(rawDescription);
 
     // Map frontend step kind → mobile runner actionType for element resolution context.
     // The actionType tells the LLM what the user intends to do with the element,
@@ -994,6 +1001,13 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
       resolvedVia: lintResult.resolvedVia,
       elementText: lintResult.elementText,
       elementType: lintResult.elementType,
+      // Forward the runner-built compiled plan when it succeeded. Frontend
+      // can persist it onto the IntentStep on save so the next regression
+      // run goes through fast-path (~5ms) instead of re-paying the lint
+      // round-trip. Only forwarded when the plan is meaningful — i.e. the
+      // resolve actually succeeded; on `not_found` / `error` / failed lint
+      // there's no plan to share. Optional field, ignored by older frontends.
+      ...(lintResult.compiledPlan ? { compiled: lintResult.compiledPlan } : {}),
     });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Lint failed', {
@@ -1037,9 +1051,10 @@ export async function applySession(req: Request, res: Response): Promise<void> {
     const traceSessionId = `mobile-${sessionId}`;
     const trace = EditorTraceService.getOrCreate(traceSessionId, req.user!.id);
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
-    const description = (stepDraft.elementDescription || stepDraft.description || '')
-      .replace(/['"]+([^'"]+)['"]+/g, '$1')
-      .trim();
+    // Normalize description identically to the lint path so trace logs and
+    // dispatch coords agree on the same canonical text.
+    const { normalizeMobileDescription: normalizeForApply } = await import('@/services/mobile/normalize-description');
+    const description = normalizeForApply(stepDraft.elementDescription || stepDraft.description);
     trace.writeMobileApplyRequest({
       stepId: stepDraft.id || `apply_${Date.now()}`,
       stepType: rawStepType,
@@ -1194,19 +1209,74 @@ export async function autoBootAndInstall(
       };
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      const session = await client.createSession(platform);
+      const session = await client.createSession(platform, { ownerId: userId });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID
       bootingData.sessionId = sessionId;
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      logger.info('[MOBILE_AUTO_BOOT] Emulator created', { projectId, sessionId });
+      logger.info('[MOBILE_AUTO_BOOT] Emulator created', { projectId, sessionId, ownerId: userId });
     }
 
-    // Install the app
+    // Install the app, but DO NOT launch it yet — we want the very
+    // first frame the user sees in the preview to be the cold-launch
+    // UI of a freshly data-wiped app. Auto-launching here and then
+    // wiping would leak ~1-2s of stale UI (prior session's logged-in
+    // state, last-visited screen, etc.) into the preview before the
+    // wipe lands.
     emit('installing', 'Installing app...', sessionId);
-    await installAppOnSession(client, sessionId, projectId, userId);
+    const installedPackage = await installAppOnSession(
+      client, sessionId, projectId, userId, undefined, { skipLaunch: true },
+    );
+
+    // Wipe app data, then launch fresh. The preview now sees exactly
+    // one transition: home screen → first-launch app UI. No stale data
+    // ever reaches the user.
+    //
+    // - close_app(hard:true) → runner runs `pm clear --user N` which
+    //   wipes /data/user/N/<pkg> (SharedPreferences, accounts, caches,
+    //   DBs) and revokes runtime permissions (auto-re-granted by the
+    //   runner per the session's permission policy). Idempotent
+    //   regardless of whether the app is currently running, since
+    //   `pm clear` implicitly force-stops.
+    // - launch_app → cold start, lands on the app's first-run UI.
+    //
+    // Best-effort: a wipe-and-launch failure shouldn't block 'ready'
+    // since the app is installed and launchable either way.
+    if (installedPackage) {
+      try {
+        // Audit fix (Bug #3): bumped 30s → 60s. `pm clear --user N` on a
+        // multi-MB app with cold filesystem caches can take 5-15s; cold
+        // `am start` on multi-user adds another 10-20s for first-launch
+        // dex optimization. 30s was the smallest budget in this helper —
+        // matches the 60s used elsewhere in installAppOnSession.
+        await client.executeBatchCommands(sessionId, [
+          { type: 'close_app', params: { packageName: installedPackage, hard: true } },
+          { type: 'launch_app', params: { packageName: installedPackage } },
+        ], { timeoutMs: 60_000 });
+        logger.info('[MOBILE_AUTO_BOOT] App wiped + launched on warmup', {
+          projectId,
+          sessionId,
+          packageName: installedPackage,
+        });
+      } catch (err) {
+        // Audit fix (Bug #2): on wipe+launch failure the app is in an
+        // undefined state (data-wiped but not relaunched, or worse). The
+        // install side-effect at the end of installAppOnSession already
+        // CLEARED the pending-install flag, so the next warmup would hit
+        // the cached fast path and again skip the launch — silently
+        // wedged. Re-set the pending flag so the next warmup forces a
+        // full install + launch path.
+        await setPendingInstall(appStoragePath);
+        logger.warn('[MOBILE_AUTO_BOOT] Wipe+launch failed — re-flagged pending install for next warmup', {
+          projectId,
+          sessionId,
+          packageName: installedPackage,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     emit('ready', 'Emulator ready', sessionId);
     logger.info('[MOBILE_AUTO_BOOT] App installed, emulator ready', { projectId, sessionId });
@@ -1251,7 +1321,8 @@ async function installAppOnSession(
   projectId: string,
   userId: string,
   appPackageOverride?: string,
-): Promise<void> {
+  opts?: { skipLaunch?: boolean },
+): Promise<string | undefined> {
   // Nudge the UI past "preparing env" as soon as install logic starts.
   emitWarmupProgress(userId, 'launching_browser', 25);
 
@@ -1260,7 +1331,7 @@ async function installAppOnSession(
 
   if (!mobileApp?.storagePath) {
     logger.debug('[MOBILE_SESSION] No mobile app configured for project, skipping install', { projectId });
-    return;
+    return undefined;
   }
 
   // Check Redis for what's currently installed on this emulator
@@ -1284,17 +1355,45 @@ async function installAppOnSession(
 
   // If the same APK is already installed (Redis knows), just relaunch — skip download + install.
   // BUT: respect the pending-install flag which means we can't trust Redis state.
-  if (!hasPendingInstall && warmup?.appStoragePath === mobileApp.storagePath && warmup?.installedPackage) {
+  //
+  // Audit fix (Bug #4): also bail out of the cached fast path when the
+  // caller explicitly supplied a DIFFERENT packageName than what's cached.
+  // Previous logic took `appPackageOverride || warmup.installedPackage` as
+  // the cached package and tried to launch it — but if override='com.foo'
+  // and cached='com.bar', launch_app(com.foo) hits a not-installed package
+  // and warmup proceeds in a broken state. Falling through forces a full
+  // install of the requested package.
+  const cachedMismatch = !!(appPackageOverride
+    && warmup?.installedPackage
+    && appPackageOverride !== warmup.installedPackage);
+  if (
+    !hasPendingInstall
+    && !cachedMismatch
+    && warmup?.appStoragePath === mobileApp.storagePath
+    && warmup?.installedPackage
+  ) {
+    const cachedPackage = appPackageOverride || warmup.installedPackage;
     logger.debug('[MOBILE_SESSION] Same APK already installed (Redis), relaunching', {
       sessionId,
       projectId,
-      package: warmup.installedPackage,
+      package: cachedPackage,
+      skipLaunch: opts?.skipLaunch === true,
     });
     emitWarmupProgress(userId, 'extracting_elements', 75);
-    await client.executeBatchCommands(sessionId, [
-      { type: 'launch_app', params: { packageName: appPackageOverride || warmup.installedPackage } },
-    ], { timeoutMs: 60_000 });
-    return;
+    if (!opts?.skipLaunch) {
+      await client.executeBatchCommands(sessionId, [
+        { type: 'launch_app', params: { packageName: cachedPackage } },
+      ], { timeoutMs: 60_000 });
+    }
+    return cachedPackage;
+  }
+  if (cachedMismatch) {
+    logger.info('[MOBILE_SESSION] Cached package differs from override — forcing full install', {
+      sessionId,
+      projectId,
+      cached: warmup?.installedPackage,
+      override: appPackageOverride,
+    });
   }
 
   // If Redis expired but we know the package name, check the DEVICE directly.
@@ -1312,11 +1411,14 @@ async function installAppOnSession(
           sessionId,
           projectId,
           package: knownPackage,
+          skipLaunch: opts?.skipLaunch === true,
         });
         emitWarmupProgress(userId, 'extracting_elements', 75);
-        await client.executeBatchCommands(sessionId, [
-          { type: 'launch_app', params: { packageName: knownPackage } },
-        ], { timeoutMs: 60_000 });
+        if (!opts?.skipLaunch) {
+          await client.executeBatchCommands(sessionId, [
+            { type: 'launch_app', params: { packageName: knownPackage } },
+          ], { timeoutMs: 60_000 });
+        }
 
         // Restore Redis cache so next warmup skips too
         if (warmup) {
@@ -1330,7 +1432,7 @@ async function installAppOnSession(
         // from appPackageOverride when mobileApp.packageName was null).
         await persistPackageName(projectId, userId, mobileApp, knownPackage);
 
-        return;
+        return knownPackage;
       }
     } catch (err) {
       logger.debug('[MOBILE_SESSION] Device package check failed, proceeding with install', {
@@ -1386,11 +1488,29 @@ async function installAppOnSession(
   // Always issue an explicit launch_app — never rely on install's auto-launch.
   // Gives us one deterministic code path regardless of whether we knew the
   // package name up front.
-  if (packageName) {
+  // Skipped when caller passes `skipLaunch: true` (warmup pipeline does
+  // its own clear_app_data + launch_app to guarantee the user only ever
+  // sees the freshly-launched, data-wiped app — see `warmupSession`).
+  if (packageName && !opts?.skipLaunch) {
     emitWarmupProgress(userId, 'extracting_elements', 75);
     await client.executeBatchCommands(sessionId, [
       { type: 'launch_app', params: { packageName } },
     ], { timeoutMs: 60_000 });
+  }
+
+  // Audit fix (Bug #1): install completed but packageName resolution failed.
+  // This is rare (usually `pm list packages -3` diff after install picks it up)
+  // but happens with side-loaded splits. Without a warning the caller's
+  // `if (installedPackage)` guard silently skips the wipe-and-launch step
+  // that's the whole point of `skipLaunch:true` flows. Loud-fail so it shows
+  // up in logs and the caller can fall through to a defensive launch.
+  if (!packageName) {
+    logger.warn('[MOBILE_SESSION] Install succeeded but packageName resolution failed — caller will skip post-install hooks', {
+      sessionId,
+      projectId,
+      hadExplicitPackage: !!explicitPackage,
+      hadDetected: !!detected,
+    });
   }
 
   // Update Redis with the installed package so future warmups know what's on the emulator
@@ -1417,6 +1537,8 @@ async function installAppOnSession(
     projectId,
     packageName: packageName || '(auto-launched by runner)',
   });
+
+  return packageName;
 }
 
 /**
@@ -1644,10 +1766,28 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
             const centerX = Math.round(bb.x + bb.width / 2);
             const centerY = Math.round(bb.y + bb.height / 2);
 
+            // Forward `intent` AND `coordsConfidence` so the runner's
+            // smartResolve can re-validate when the lint confidence is
+            // below the trust threshold (0.9). Sequential runs accumulate
+            // small drift over many steps — without this each step's
+            // command bypasses the runner's safety net (no-intent → early
+            // passthrough), and a low-confidence lint silently dispatches
+            // to coordinates that may already be stale.
+            // Mirrors the same fix in MobileStepApplyService Path A.
+            const coordsConfidence = typeof lintResult.confidence === 'number'
+              ? lintResult.confidence
+              : undefined;
+            const coordParams: Record<string, unknown> = {
+              x: centerX,
+              y: centerY,
+              intent: description,
+            };
+            if (coordsConfidence !== undefined) coordParams.coordsConfidence = coordsConfidence;
+
             const commands: Array<{ type: string; params: Record<string, unknown> }> = [];
 
             if (rawType === 'type' || rawType === 'fill') {
-              commands.push({ type: 'tap', params: { x: centerX, y: centerY } });
+              commands.push({ type: 'tap', params: { ...coordParams } });
               if (step.value) {
                 commands.push({
                   type: 'type_text',
@@ -1659,8 +1799,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                     // and the first characters get dropped — VTE then reads
                     // back stale text and burns two retries typing the same
                     // wrong value.
-                    x: centerX,
-                    y: centerY,
+                    ...coordParams,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
                   },
@@ -1670,7 +1809,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                 }
               }
             } else {
-              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { x: centerX, y: centerY } });
+              commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams } });
             }
 
             await client.executeBatchCommands(sessionId, commands);
@@ -1717,10 +1856,38 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
           logger.info(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} passed (runSteps fallback)`, {
             stepId: step.id, type: rawType, description, durationMs,
           });
+        } else {
+          const errorMsg = stepResult?.error || 'Step failed';
+          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
+          failedSteps++;
+          if (!isOptional) hardFailed = true;
+          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
+          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
+            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
+          });
+        }
 
-          // Auto-persist compiled plan when the runner (re)built one — without this
-          // every regression run re-pays the LLM cost until the user hits Save.
-          if (stepResult.compiledPlan && intentTestCaseId) {
+        // ── Auto-persist compiled plan ───────────────────────────────
+        // Persist when:
+        //   (a) step succeeded AND a plan was emitted, OR
+        //   (b) step FAILED but resolveVia ∈ {compiled,compiled_fast_path,
+        //       cache} — i.e. the plan was already validated against the
+        //       current tree before this run; the failure was downstream of
+        //       resolution (dispatch, VTE, app crash) and the plan itself is
+        //       still good. Throwing it away would force the next run to
+        //       re-pay full LLM cost for nothing.
+        // We deliberately do NOT persist on failure when resolveVia was a
+        // fresh LLM/vision/thinking pass — locking in a possibly-wrong plan
+        // hurts more than it helps.
+        if (stepResult?.compiledPlan && intentTestCaseId) {
+          const PROVEN: ReadonlySet<string> = new Set(['compiled', 'compiled_fast_path', 'cache']);
+          const planIsProven = !!stepResult.resolvedVia && PROVEN.has(stepResult.resolvedVia);
+          // Runner can mark a plan stale post-dispatch (VTE mismatch /
+          // foreground mismatch). Skip persistence in that case — saving
+          // a "successful dispatch but wrong element" plan locks in the bug.
+          const planIsStale = !!stepResult.planStaleReason;
+          const shouldPersist = !planIsStale && (stepResult.success === true || planIsProven);
+          if (shouldPersist) {
             try {
               const { IntentTestCaseService } = await import(
                 '@/services/testing/ui/preview/intent-test-case.service'
@@ -1741,15 +1908,6 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               });
             }
           }
-        } else {
-          const errorMsg = stepResult?.error || 'Step failed';
-          stepResults.push({ stepId: step.id, success: false, error: errorMsg, durationMs });
-          failedSteps++;
-          if (!isOptional) hardFailed = true;
-          sendEvent({ type: 'step_result', stepId: step.id, stepIndex: i, status: 'fail', error: errorMsg, durationMs, optional: isOptional });
-          logger.warn(`[MOBILE_SESSION] Step ${i + 1}/${steps.length} failed${isOptional ? ' (optional — continuing)' : ''}`, {
-            stepId: step.id, type: rawType, description, error: errorMsg, durationMs, optional: isOptional,
-          });
         }
       } catch (stepError) {
         const durationMs = Date.now() - stepStart;

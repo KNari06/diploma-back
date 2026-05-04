@@ -250,12 +250,14 @@ export class MobileTestRunJobHandler {
         } catch { /* non-fatal */ }
       };
 
-      // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s)
+      // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s).
+      // Pass `ownerId: userId` so the runner switches to this user's
+      // dedicated Android multi-user — apps from other owners are hidden.
       try {
-        const claimed = await client.claimSession(platform);
+        const claimed = await client.claimSession(platform, { ownerId: userId });
         sessionId = claimed.sessionId;
         sessionSource = 'pool';
-        logger.info('[MOBILE-TEST] Pool session claimed', { testId, sessionId, platform });
+        logger.info('[MOBILE-TEST] Pool session claimed', { testId, sessionId, platform, ownerId: userId });
       } catch (poolErr) {
         // Pool exhausted, disabled, or runner unreachable — try next
         logger.debug('[MOBILE-TEST] Pool claim failed, trying warmup', {
@@ -280,13 +282,14 @@ export class MobileTestRunJobHandler {
         // Explicit heads-up: cold starts can take up to a minute, so users
         // see "Booting emulator…" instead of a long silent pause after 10%.
         emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
-        const session = await client.createSession(platform);
+        const session = await client.createSession(platform, { ownerId: userId });
         sessionId = session.sessionId;
         sessionSource = 'cold';
         logger.info('[MOBILE-TEST] Session created (cold start)', {
           testId,
           sessionId,
           platform,
+          ownerId: userId,
         });
       }
 
@@ -664,8 +667,20 @@ export class MobileTestRunJobHandler {
    * Persist freshly-built compiled plans from a completed run onto the
    * IntentTestCase.steps_json. Idempotent, non-fatal, mutex-safe.
    *
-   * Only steps that (a) succeeded and (b) produced a compiledPlan are
-   * written. Original step fields (description, value, options, user-set
+   * Persistence rules (revised):
+   *   1. Step succeeded AND has a compiledPlan → persist (canonical case).
+   *   2. Step FAILED but the resolve went through compiled_fast_path or
+   *      cache → persist. Reason: those resolves only succeed when an
+   *      already-validated plan still matches the current tree. The plan
+   *      itself is not the cause of the failure (some downstream step in
+   *      dispatch / VTE / app crash failed instead). Throwing the plan
+   *      away here forces the next regression run to re-pay full LLM cost
+   *      even though the plan is fine.
+   *   3. Step failed and resolveVia was a fresh LLM/vision/thinking pass →
+   *      do NOT persist. We don't know whether the LLM picked the right
+   *      element or not, so we won't lock in a possibly-wrong plan.
+   *
+   * Original step fields (description, value, options, user-set
    * bindingHints) are preserved via spread; runner-emitted evidence is
    * attached under a `runtime` namespace to match the shape
    * MobileStepApplyService already writes for apply.
@@ -683,8 +698,27 @@ export class MobileTestRunJobHandler {
 
       const enrichedSteps = new Map<string, IntentStep>();
 
+      // resolvedVia values that mean "this plan was already proven against
+      // the current tree before the run started". Safe to persist on failure
+      // because the plan is independently validated.
+      const PROVEN_RESOLVED_VIA = new Set<string>(['compiled', 'compiled_fast_path', 'cache']);
+
       for (const result of runResult.steps) {
-        if (!result.success || !result.compiledPlan) continue;
+        if (!result.compiledPlan) continue;
+        // Runner can flag a plan as stale post-dispatch (VTE caught text in
+        // wrong field, or foreground mismatch with no relaunch). Skip
+        // persistence — the plan is "successful at dispatch level" but
+        // points at the wrong element. Saving it locks in the bug.
+        if (result.planStaleReason) {
+          logger.debug('[MOBILE-TEST] Skipping plan persist — runner flagged stale', {
+            stepId: result.stepId,
+            reason: result.planStaleReason,
+          });
+          continue;
+        }
+        const planIsProven =
+          result.resolvedVia !== undefined && PROVEN_RESOLVED_VIA.has(result.resolvedVia);
+        if (!result.success && !planIsProven) continue;
         const original = originalById.get(result.stepId);
         if (!original) continue;
 

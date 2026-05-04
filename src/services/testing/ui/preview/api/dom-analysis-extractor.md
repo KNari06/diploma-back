@@ -5,7 +5,7 @@
 
 ## Overview
 
-Transforms a `LiteSnapshot` (raw page collection from `agent/core/lite/collectors/snapshot-collector.ts`) into a normalized `InteractiveNode[]` for the resolver/lint candidate set, and into `DomAnalysisData` for persistent storage in `intelligent_page_visits.dom_analysis`. Strips sensitive data (no values, only `hasValue` flags), truncates long text, populates ARIA state, validation flags, hierarchy hints and visual properties.
+Transforms a `LiteSnapshot` (raw page collection — produced by `agent/core/lite/collectors/snapshot-collector.ts` today, optionally via the CDP-based pipeline behind [`SnapshotRouter`](snapshot-router.md) (Etap 2) on opt-in) into a normalized `InteractiveNode[]` for the resolver/lint candidate set, and into `DomAnalysisData` for persistent storage in `intelligent_page_visits.dom_analysis`. Strips sensitive data (no values, only `hasValue` flags), truncates long text, populates ARIA state, validation flags, hierarchy hints and visual properties.
 
 **Symmetry contract:** `extractInteractiveNodes()` and `recording-capture.service.ts`'s `PROBE_AT_POINT_FN` MUST use the same Tier-1/Tier-2 selection rules, the same dynamic-id regex, and the same text normalization. Breaking this symmetry causes silent wrong-element bugs (recording sees X, resolver doesn't). See [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md).
 
@@ -85,6 +85,7 @@ Grouped by purpose. All fields are optional unless marked.
 | `title` | `string?` | `title` attribute (tooltips; critical for icon-only). |
 | `placeholder` | `string?` | `placeholder` attribute. |
 | `alt` | `string?` | (V23) `<img alt>` — accessible name for image targets. Used by V23 scoring as additional accessible-name source. |
+| `firstTextFragment` | `string?` | (V26) Single DOM-unit text (first text node or leaf-text element), 2–80 chars. Stored only when it differs from full `text`. **Symmetric with `recording-capture.service.ts`** — extractors must stay byte-equivalent. |
 | `isIconButton` | `boolean?` | Button has only icon child(ren). |
 | `iconLabel` | `string?` | Semantic icon name (SVG `<title>`, sprite ref, `data-lucide`, FontAwesome class, …). |
 | `svgIcon` | `string?` | Angular Material registry name (e.g. `chevron-left-outline`). |
@@ -125,6 +126,8 @@ Grouped by purpose. All fields are optional unless marked.
 | `invalid` | `boolean?` | `aria-invalid` or `:invalid`. |
 | `hasValue` | `boolean?` | **Privacy-safe flag** — value not stored. |
 | `dataValue` | `string?` | `data-value` / `<option value>`. |
+| `formControlName` | `string?` | (V26, Angular) reactive-forms control name. Pass-through; consumed by locator-plan-builder strategy. Currently passed as `(node as any).formControlName` until promoted to typed field. |
+| `routerLink` | `string?` | (V26, Angular) `routerLink` directive. Same pass-through caveat. |
 
 ### Hierarchy & container
 | Field | Type | Meaning |
@@ -254,6 +257,10 @@ Delegated to [dynamic-id.util.ts](../dynamic-id.util.ts). Patterns include:
 | `MAX_TEXT_LENGTH` | 100 | Text/label truncation. |
 | `MAX_PARENT_CHAIN_LENGTH` | 6 | Ancestor depth cap. |
 | `DOM_ANALYSIS_VERSION` | `'2.0'` | Schema version. |
+
+## `DomAnalysisData` extension (V26)
+
+`DomAnalysisData` now also carries `viewport?: { width: number; height: number }` from the snapshot — used by element-resolver's `buildAllowedSets()` for accurate modal-coverage calculation on long scrollable pages. Backward-compatible (consumers that ignore the field continue to work).
 
 ## Invariants
 

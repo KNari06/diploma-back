@@ -181,6 +181,17 @@ function formatSnapshotForPrompt(snapshot: any): string {
       if (el.required) parts.push('[required]');
       if (el.checked) parts.push('[checked]');
       if (el.ariaExpanded) parts.push(`[expanded=${el.ariaExpanded}]`);
+      // Radix/shadcn `data-state` for explore-time entry-point ranking.
+      // Cartographer needs to see "this menu trigger is already open"
+      // to skip it as a goal-progressing click. Skip when redundant
+      // with ariaExpanded (most aria-* implementations on dropdowns
+      // do mirror to data-state, so duplication is common).
+      if (el.dataState && !(
+        (el.dataState === 'open' && el.ariaExpanded === true)
+        || (el.dataState === 'closed' && el.ariaExpanded === false)
+      )) {
+        parts.push(`[state=${el.dataState}]`);
+      }
       if (el.isInsideActiveModal) parts.push('[in-modal]');
       if (el.context) parts.push(`context="${el.context}"`);
       lines.push('  ' + parts.join(' '));

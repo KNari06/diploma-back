@@ -91,15 +91,16 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
     stepDraft: PreviewIntentStep      // incomplete step (may have only description)
     pageRef?: string                   // optional: page context
     includeAlternatives?: boolean      // if true, ask for candidates
+    auditTrigger?: 'find_button'      // V25 — explicit user-action context for audit log
   }
   ```
 - **Server steps:**
   1. Validate user
   2. Rate limit check (lint bucket)
   3. Import `IntentStepLintService` dynamically
-  4. Call `lintStepWithAI()` with `forceFreshSnapshot: true` (explicit user moment)
+  4. Call `lintStepWithAI()` with `forceFreshSnapshot: true` (explicit user moment), forwarding `auditTrigger`
   5. If status=`needs_clarification`: store candidates in `pendingClarifications` map, emit `preview:step:clarify` event (if includeAlternatives=true)
-  6. Always emit `preview:step:lint:result` with status, message, candidates (if requested), highlight, interpretation
+  6. Always emit `preview:step:lint:result` with status, message, candidates (if requested), highlight, interpretation, **`suggestion?` (V25 — coaching hint for AMBIGUOUS state, spreads only when present)**
 - **Response event:** `preview:step:lint:result`, optionally `preview:step:clarify`
 - **Side-effects:** Fresh DOM collect (~170ms); LLM call for semantic matching; populates clarification cache
 - **Gotchas:** `includeAlternatives=true` triggers both clarify event AND lint:result with candidates; `includeAlternatives=false` emits candidates=[] even on needs_clarification (user must click Show Alternatives to get candidates)
@@ -144,13 +145,14 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
   3. Normalize step options (timeout, replaceContent, pressEnter)
   4. Check for confirmed selection from clarify flow; if found, pass to apply service
   5. Call `PreviewStepApplyService.applyStep()` (executes step on live page)
-  6. On success: emit `preview:step:apply:result` immediately
-  7. If `intentTestCaseId` provided: auto-persist appliedStep to DB via `IntentTestCaseService`
-  8. Async (setImmediate): collect fresh snapshot; if DOM changed, emit `preview:page` to room with updated domNodes
-  9. Clean up confirmed selection from map (only after success)
-- **Response event:** `preview:step:apply:result`, then async `preview:page` if DOM changed
-- **Side-effects:** Playwright action on live page; updates recording URL baseline (for nav step dedup); DB persist if intentTestCaseId provided; dedups page snapshots by signature
-- **Gotchas:** Blocks during active run (PreviewRunService check); confirmed selection deleted only on success (allows retry); page emit dedups by signature (second-level dedup after per-socket check)
+  6. On success: emit `preview:step:apply:result` immediately. **(V26)** also clears any stale `failureEvidence` on the step before persistence.
+  7. **On failure (V26):** if a `StepFailureEvidence` bundle is attached AND `intentTestCaseId` provided AND no run is active — persist the bundle to DB and emit `preview:step:needs-review` to the room. Skipped during batch apply to avoid spam.
+  8. If `intentTestCaseId` provided: auto-persist sanitized `appliedStep` to DB via `IntentTestCaseService`.
+  9. Async (setImmediate): collect fresh snapshot; if DOM changed, emit `preview:page` to room with updated domNodes
+  10. Clean up confirmed selection from map (only after success)
+- **Response event:** `preview:step:apply:result`, optionally `preview:step:needs-review` (V26 on failure), then async `preview:page` if DOM changed
+- **Side-effects:** Playwright action on live page; updates recording URL baseline (for nav step dedup); DB persist if intentTestCaseId provided; dedups page snapshots by signature; **(V26)** failure-evidence persistence + needs-review broadcast
+- **Gotchas:** Blocks during active run (PreviewRunService check); confirmed selection deleted only on success (allows retry); page emit dedups by signature (second-level dedup after per-socket check); needs-review event only fires when no run is active.
 
 #### `mobile:step:apply`
 - **Direction:** client→server
@@ -264,6 +266,22 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
   - Coalesces multiple wheel events per tick into ONE Playwright call with summed deltas
   - Recording accumulates scroll separately: debounce flushes Type step, merges consecutive scrolls within 3s window
 - **Gotchas:** Coalesce means Playwright call is 1 tick delayed; recording debounce is 500ms (independent of coalesce)
+
+#### `preview:mouse:probe` (V26)
+- **Direction:** client→server
+- **Trigger:** UI requests an on-demand element probe at coordinates (decoupled from hover state — used by inspector / debug overlays).
+- **Payload (in):**
+  ```typescript
+  { previewSessionId: string; x: number; y: number }
+  ```
+- **Server steps:**
+  1. Validate session ownership.
+  2. Rate-limit via the same mouse bucket as other mouse events.
+  3. Call `RecordingCaptureService.probeForRecording(page, x, y)`.
+  4. Emit `preview:mouse:probe:result` with the `ProbedElement` (same shape returned by hover probe).
+- **Response event:** `preview:mouse:probe:result` — `{ previewSessionId, x, y, element, timestamp }`.
+- **Side-effects:** none beyond the probe `page.evaluate`.
+- **Gotchas:** uses the mouse rate-limit bucket; never blocks recording state.
 
 ---
 
@@ -492,6 +510,54 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
 
 ---
 
+### Session Inspection (V26)
+
+#### `preview:session:inspect`
+- **Direction:** client→server
+- **Trigger:** UI pre-Run check — does the live preview already have an authenticated session? Powers the "Active session detected" banner.
+- **Payload (in):** `{ previewSessionId: string }`
+- **Server steps:**
+  1. Validate ownership.
+  2. Read same-origin cookies + sessionStorage + localStorage **counts only** (no values, privacy-safe).
+  3. Emit `preview:session:inspect:result` with `{ cookieCount, sessionStorageKeyCount, localStorageKeyCount }`.
+- **Response event:** `preview:session:inspect:result`
+- **Side-effects:** none (read-only).
+- **Gotchas:** no throttle bucket; rate-limited via generic auth/validation.
+
+---
+
+### Recording Upload (V26)
+
+The recording upload flow now has client→server response events to complete the prompt initiated by the server.
+
+#### `preview:recording:upload:resolve`
+- **Direction:** client→server
+- **Trigger:** User picks a file in response to a server-initiated `preview:recording:upload:prompt`.
+- **Payload (in):** `{ previewSessionId, stepId, file: { handle, metadata } }`
+- **Server steps:** download → `setFiles()` workflow → emit upload step capture.
+
+#### `preview:recording:upload:cancel`
+- **Direction:** client→server
+- **Trigger:** User dismisses the upload chooser.
+- **Payload (in):** `{ previewSessionId, stepId }`
+- **Server steps:** cleanup; no step captured.
+
+---
+
+### Dialog & Auth (V26)
+
+#### `preview:dialog:response`
+- **Direction:** client→server
+- **Trigger:** Generic dialog confirmation flow (alert/confirm bypass).
+- **Payload (in):** internal — see source. Consumed by alert/confirm bypass logic.
+
+#### `preview:auth:dismiss`
+- **Direction:** client→server
+- **Trigger:** User dismisses the login-wall detection banner.
+- **Side-effects:** logged for audit; non-fatal (warn on handler error).
+
+---
+
 ## Server → Client Events (Broadcast/Push)
 
 ### State & Snapshots
@@ -510,7 +576,12 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
 | `preview:step:lint:result` | `preview:step:lint` | `{ status, message, confidence, candidates[], highlight[], interpretation?, applyDisabled?, suggestion?, timestamp }` |
 | `preview:step:clarify` | `preview:step:lint` (includeAlternatives=true) | `{ previewSessionId, stepId, candidates[], interpretation, message, timestamp }` |
 | `preview:step:apply:result` | `preview:step:apply` | `{ success, error?, appliedStep?, timestamp }` |
+| `preview:step:needs-review` (V26) | apply failure with `failureEvidence` and no active run | `{ previewSessionId, stepId, intentTestCaseId, summary: { lastError, totalAttempts, pageUrl, originatingStrategy }, timestamp }` |
 | `mobile:step:apply:result` | `mobile:step:apply` | `{ success, error?, appliedStep?, timestamp }` |
+| `preview:mouse:probe:result` (V26) | `preview:mouse:probe` | `{ previewSessionId, x, y, element, timestamp }` |
+| `preview:session:inspect:result` (V26) | `preview:session:inspect` | `{ previewSessionId, cookieCount, sessionStorageKeyCount, localStorageKeyCount }` |
+| `preview:recording:upload:prompt` (V26) | server requests file from user | `{ previewSessionId, stepId, accept?, multiple? }` |
+| `preview:recording:upload:warning` (V26) | upload flow degraded | `{ previewSessionId, stepId, reason: 'no_file_selected' \| 'capture_failed' \| 'listener_setup_failed' }` |
 | `preview:page:action:result` | `preview:page:*` (refresh, back, forward) | `{ action, success, error?, timestamp }` |
 
 ### Recording

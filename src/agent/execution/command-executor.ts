@@ -7,12 +7,13 @@ import type { IntentPlaywrightCommand } from '@/services/testing/ui/preview/inte
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import type { CompiledStepPlan, IntentStep, LocatorEntry, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, type LookaheadResult } from '@/services/testing/ui/preview/step-readiness.service';
+import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2.service';
 import { evaluateEvidenceShortcut } from '@/services/testing/ui/preview/evidence-shortcut.utils';
 import { waitForHoverEffect } from '@/services/testing/ui/wait-phases/hover-effect-settle';
 import { smartStepWait } from '@/services/testing/ui/smart-step-wait.service';
 import type { IntentActionType } from '@/services/testing/ui/preview/preview.types';
 import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
-import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
+import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import { PlaywrightActionType, PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Frame, Locator, Page } from 'playwright';
@@ -2679,17 +2680,25 @@ export class CommandExecutor {
               };
 
               try {
-                const lookahead: LookaheadResult = await waitForStepReadiness(
+                const lookahead: LookaheadResult = await runV1WithShadow(
+                  () => waitForStepReadiness(
+                    this.page,
+                    nextStepForLookahead,
+                    {
+                      maxWaitMs: 10000,
+                      settleMs: 3000,
+                      autoWaitThresholdMs: 2000,
+                      prevActionType,
+                      prevUrl: urlBeforeStep,
+                    }
+                  ),
                   this.page,
                   nextStepForLookahead,
                   {
-                    maxWaitMs: 10000,
-                    settleMs: 3000,
-                    autoWaitThresholdMs: 2000,
-                    // Pass context for dynamic behaviour — no hardcoded delays
+                    maxWaitMs: STEP_READINESS_CONFIG.v2.backgroundMaxWaitMs,
                     prevActionType,
                     prevUrl: urlBeforeStep,
-                  }
+                  },
                 );
 
                 // Update runtime meta if significant wait occurred

@@ -375,6 +375,40 @@ export interface ServerToClientEvents {
     timestamp: string;
   }) => void;
 
+  /**
+   * Etap 1D.2 — Step exhausted the full resolver waterfall (compiled plan
+   * failed AND lint/LLM/vision failed). Frontend uses this to surface a
+   * "needs review" badge on the step plus a debug panel showing the
+   * persisted `failureEvidence` bundle.
+   *
+   * Distinct from `preview:step:apply:result { success: false }`:
+   *   - apply:result fires on EVERY failure including transient retries
+   *   - needs-review fires ONLY when the bundle was persisted to the step
+   *   - the bundle is the durable record (survives reload), the WS event
+   *     is just the realtime ping that "a new bundle is available"
+   */
+  'preview:step:needs-review': (data: {
+    previewSessionId: string;
+    stepId: string;
+    intentTestCaseId?: string;
+    /** Compact summary so the UI can show a toast without re-fetching. */
+    summary: {
+      lastError?: string;
+      totalAttempts?: number;
+      pageUrl: string;
+      /**
+       * V26 Batch A: top-level failure category — `wait_for_timeout` |
+       * `fake_success_guard` | `pre_click_label_mismatch` |
+       * `navigate_failed` | `resolver_exhausted` | `apply_threw` | etc.
+       * Lets the dashboard group "stuck steps" without parsing the
+       * full bundle. Optional / forward-compatible — old clients
+       * can ignore unknown values.
+       */
+      originatingStrategy?: string;
+    };
+    timestamp: string;
+  }) => void;
+
   // Fires when the external-navigation trap reverts a cross-origin main-frame
   // navigation that wasn't user-initiated (e.g. a JS-driven location.href to
   // a payment gateway, a button.onclick redirect, a form submit). The trap
@@ -1461,6 +1495,30 @@ export interface PreviewStepApplyResultPayload {
   highlight?: PreviewHighlight[];
   attempts?: number;
   timestamp: string;
+  /**
+   * Etap 1D.1 — Plan quality signal.
+   *
+   * Set when the apply produced a compiled plan whose live `count()`
+   * validation could not confirm any locator (every entry has
+   * `validated=false`). Frontend uses this to show a "⚠ unstable
+   * selectors" badge on the step so the user can re-record before
+   * relying on it for regression.
+   *
+   * Absent on the success path of a fully-validated plan, on apply
+   * failures (success=false carries `error` instead), and on apply
+   * paths that don't write a plan (soft-pass / non-targeting actions).
+   */
+  planQuality?: {
+    unverified: boolean;
+    /**
+     * Why the plan got flagged. Human-readable; not parsed by frontend.
+     * Examples:
+     *   - "validation_skipped"   — page was unavailable at build time
+     *   - "all_locators_dead"    — every count() returned 0
+     *   - "all_timeout"          — count() exceeded per-locator budget
+     */
+    reason?: string;
+  };
 }
 
 /**

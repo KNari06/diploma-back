@@ -299,9 +299,14 @@ Return JSON:
   }
 
   /**
-   * Fallback when AI is unavailable
+   * Fallback when AI is unavailable. Public so callers can recover
+   * when `expand()` itself throws synchronously before its internal
+   * fallback path runs (rare but possible — e.g. injection of an
+   * un-stringifiable goal arg). Without public access, the caller's
+   * catch-block left `expandedGoal` as null, silently degrading
+   * `isGoalRelevantElement` to always-false for the rest of the run.
    */
-  private static getFallback(goal: string): ExpandedGoal {
+  static getFallback(goal: string): ExpandedGoal {
     const tokens = this.tokenize(goal);
 
     // Basic negative keywords (common dead-ends)

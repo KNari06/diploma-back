@@ -80,7 +80,7 @@ export class MobileRunnerClient {
 
   async createSession(
     platform: MobilePlatform,
-    config?: MobileSessionConfig,
+    config?: MobileSessionConfig & { ownerId?: string },
   ): Promise<MobileSessionResponse> {
     return this.request<MobileSessionResponse>('POST', '/api/sessions', {
       body: { platform, ...config },
@@ -132,9 +132,12 @@ export class MobileRunnerClient {
    *
    * On 503/404 the caller should fall back to createSession() (cold start).
    */
-  async claimSession(platform: MobilePlatform): Promise<MobileSessionResponse> {
+  async claimSession(
+    platform: MobilePlatform,
+    opts?: { ownerId?: string },
+  ): Promise<MobileSessionResponse> {
     return this.request<MobileSessionResponse>('POST', '/api/sessions/claim', {
-      body: { platform },
+      body: { platform, ...(opts?.ownerId ? { ownerId: opts.ownerId } : {}) },
       timeoutMs: 20_000, // Pool may wait up to 15s for idle session
       noRetry: true, // 503 means pool exhausted — don't retry, fall back to cold start
     });

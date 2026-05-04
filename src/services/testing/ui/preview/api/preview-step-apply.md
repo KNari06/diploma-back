@@ -58,6 +58,7 @@ static async applyStep(params: {
   - `fastPathSettled?: boolean` — `wait_for` took fast-path (URL already changed).
   - `waitForBranch?: 'fast_path' | 'runtime_settle' | 'runtime_changed' | 'slow_path' | 'no_matcher'`.
   - **`decisionTrace?: StepDecisionTrace` (V23)** — structured postmortem trace populated on every return path. Primary diagnostic surface; see schema below.
+  - **`planQuality?: { unverified: boolean; reason?: string }` (V25)** — when a compiled plan was written but its validation failed (all locators dead, validation skipped, no validated matches), this flag tells callers the plan exists but should not be trusted as evidence on the next apply.
 - **Side-effects:**
   - Playwright actions on the live page.
   - WS emits: `preview:loading` (navigate progress), session state on tab switches and dialogs.
@@ -65,6 +66,9 @@ static async applyStep(params: {
   - **`decisionTrace` aggregation (V23):** mutated throughout every code path (compiled / identity / evidence / lint / LLM / overlay / click-effect). Initialized at action entry, populated by each stage, returned on `ApplyResult.decisionTrace`. Structured logging contract — not a WS emit.
   - Updates session `contextData` (for `store` meta-steps).
   - May auto-switch active tab if `step.tabIndex` differs (V15).
+  - **LLM cache invalidation on rejection (V25):** when a pre-click or post-click guard rejects the resolver pick, two caches are invalidated for that pageUrl/intent: `invalidateTokensForText(recordedText)` (stable-tokens) and `invalidatePrunerForRef({ rejectedRef, pageUrl, intentText })` (candidate pruner). Logged but not surfaced in `ApplyResult`. Rationale: cached output that produced a wrong pick once should be re-derived next run.
+  - **Fingerprint backfill on success (V26):** on successful click (compiled or LLM path), stable identity fields are copied from the live node into `appliedStep.recordedFingerprint` **only when the recorded slot is empty** (never overwrites). Backfilled fields: `firstTextFragment`, `href`, `elementId`, `testIdAttr`, `name`, `alt`, `svgIcon`, `iconLabel`, `customElementTag`, `cssClass`, `ariaControls`, `vueScopeId`, `childTestId`, `nearestLandmark`, `title`, `containerTitles`. Logged as `[PREVIEW_APPLY] Backfilled missing identity fields`. Rationale: keep authored steps catching up to recorder fidelity over time.
+  - **Failure evidence (V26):** failure paths route through `_buildFailureResult()` which calls `collectFailureEvidence()` and attaches a `StepFailureEvidence` bundle to the trace. Persisted by the WS handler if `intentTestCaseId` is set (see [preview-handler.md](preview-handler.md) `preview:step:needs-review`).
 - **Throws:** `Error` on session not found, DOM selection failure, action timeout, unrecoverable Playwright error.
 - **Key steps:**
   1. **Scratchpad interpolation** — resolve `{{key}}` placeholders from session `contextData`.
@@ -88,6 +92,9 @@ static async applyStep(params: {
   - **Fake-success trap:** weak signal (`focus`/`none`/`newtab`) + fingerprint mismatch + recorded fingerprint → FAIL even if action succeeded.
   - **Soft-pass on no-effect (V23):** when a manually-added step (no recorded fingerprint) executes against a plausible candidate but produces no observable effect, the action is accepted as success and `decisionTrace.softPassedOnNoEffect = true`. Prevents stalling on idempotent / already-in-state actions; trace flag lets postmortem audit the relaxed acceptance.
   - **Substring text-field tolerance (V23):** in fuzzy text-field matching the candidate scoring now allows morphological variants (3-char substring or prefix overlap) before falling back to Damerau-Levenshtein. Affects RU/KZ/multilingual sites where stem variation previously dropped valid candidates.
+  - **`LocatorPlanBuilder.buildCompiledPlan()` is async (V26).** Every call site now uses `await`. Treat this as a breaking signature change for anyone building plans outside this service.
+  - **Recorded fingerprint is authoritative; backfill never overwrites (V26).** Only empty slots are filled.
+  - **Plan-quality flag (V25).** If `planQuality.unverified === true`, callers should rebuild the plan rather than treat it as evidence on the next run.
 
 ---
 
@@ -109,6 +116,7 @@ Structured payload returned in `ApplyResult.decisionTrace`. Every resolver path,
 | `clickEffectSignal` | Post-action effect (`url` / `dialog` / `aria` / `focus` / `detach` / `dom` / `newtab` / `none`). |
 | `softPassedOnNoEffect` | `true` when V23 soft-pass accepted an action with no observable effect (manual-add only). |
 | `timing` | Phase breakdown: `{ readinessMs, resolveMs, actionMs, postVerifyMs, totalMs }`. |
+| `failureBundle` | (V26) `StepFailureEvidence` attached on failure paths via `_buildFailureResult()` + `collectFailureEvidence()`. Powers `preview:step:needs-review` WS event and DB persistence. |
 
 ---
 
@@ -154,6 +162,36 @@ Structured payload returned in `ApplyResult.decisionTrace`. Every resolver path,
   - State-verifiable: `dblclick`, `contextmenu`, `drag_and_drop`, `toggle`, `check`, `uncheck`, `open`, `close`.
 - **Pre-action wait:** `smartStepWait(phase: 'pre')` unless `disableStabilityChecks`.
 - **Post-action settle:** implicit in Playwright; some actions use `noWaitAfter: true` + 1s buffer (V15.3).
+
+### `shouldUpgradeCompiledPlan(existing, candidate): boolean`
+
+- **Visibility:** private static.
+- **Purpose:** returns `true` if the freshly-built `candidate` plan is stronger than `existing` — i.e., adds new strategy types or has a higher-priority primary strategy (per `STRATEGY_RANK`).
+
+### `derivePlanQuality(compiled): { unverified, reason? } | undefined`
+
+- **Visibility:** private static.
+- **Purpose:** derives the `planQuality` field. Returns `undefined` on happy path; `{ unverified: true, reason }` when validation was skipped, all locators were dead, or no validated locators remain. Possible `reason` values: `'validation_skipped'`, `'all_locators_dead'`, `'no_validated_locators'`.
+
+### `buildBindingHintsFromNode(node): BindingHints`
+
+- **Visibility:** private static.
+- **Purpose:** builds a full `BindingHints` object (15+ fields) from a live resolved `InteractiveNode`. Includes Angular-specific fields (`routerLink`, `formControlName` — Etap 1B.2), ARIA state snapshot (`ariaExpanded`, `ariaPressed`, `checked`, etc.), and full spatial context (`containerTitles`, `nearestLandmark`, `siblingIndex`, etc.). Mirrors V22 recorder hint symmetry for manually-added steps.
+
+### `buildSyntheticFingerprintFromNode(node): TargetFingerprint`
+
+- **Visibility:** private static.
+- **Purpose:** synthesizes a `recordedFingerprint` from a live LLM-resolved node (for manually-added steps that have no recorder-captured fingerprint). Only called when the node has stable identity fields.
+
+### `dismissParasiticOverlay(page, step, locatorContext): Promise<boolean>`
+
+- **Visibility:** private async (Etap 1A.5).
+- **Purpose:** conditionally dismisses lightweight overlays (cookie banners, tooltip-style blocker) that appear between readiness check and action. Returns `true` if an overlay was dismissed.
+
+### `_buildFailureResult(opts): ApplyResult`
+
+- **Visibility:** private static (V26 Batch A).
+- **Purpose:** centralized failure-result factory. Calls `collectFailureEvidence()`, attaches a `StepFailureEvidence` bundle, sets `decisionTrace.failureBundle`. Used by every failure path to ensure uniform evidence capture. `originatingStrategy` enum identifies which resolver stage failed.
 
 ### `captureClickPreState(page, step): Promise<ClickPreState>`
 

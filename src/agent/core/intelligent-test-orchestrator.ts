@@ -38,6 +38,7 @@ import { GraphBuilder } from '../utils/visualization/graph-builder.service'; // 
 import { TestProgressEmitter } from '../utils/visualization/progress-emitter';
 import { MainLoopService } from './main-loop.service'; // Main testing loop service (analyze → generate → execute → decide)
 import { SnapshotCollector } from './lite/collectors/snapshot-collector'; // Snapshot collector for DOM analysis
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { DomAnalysisExtractorService } from '@/services/testing/ui/preview/dom-analysis-extractor.service'; // DOM analysis extractor for step editor linting
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1518,7 +1519,7 @@ export class IntelligentTestOrchestrator {
     // ✅ NEW: Capture DOM analysis for step editor linting
     let domAnalysis;
     try {
-      const snapshot = await SnapshotCollector.collect(this.page, { fullPage: true });
+      const snapshot = await SnapshotRouter.collect(this.page, { context: 'legacy-orchestrator', fullPage: true });
       domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       logger.debug('[INTELLIGENT_ORCHESTRATOR] DOM analysis captured for step editor', {
         nodeCount: domAnalysis.interactiveNodes.length,

@@ -26,6 +26,7 @@ import type {
     InteractiveNode,
     LintCandidate,
     ResolutionMeta,
+    StepFailureEvidence,
     TargetFingerprint,
     UrlMatcher,
 } from './preview.types';
@@ -77,6 +78,19 @@ function shouldUpgradeCompiledPlan(
   // Empty / invalid candidate — never replace.
   if (!candidate.locatorPlan || candidate.locatorPlan.length === 0) return false;
 
+  // Defense-in-depth: never persist a candidate whose recorded page URL
+  // differs from the existing one. The caller (V22 fast-path upgrade) is
+  // already guarded by a navigation check, but if some future caller forgets
+  // to gate this we'd silently corrupt the plan and trip every downstream
+  // URL guard with `url_mismatch`.
+  const existingHost = (() => {
+    try { return existing.context?.pageUrl ? new URL(existing.context.pageUrl).host : ''; } catch { return ''; }
+  })();
+  const candidateHost = (() => {
+    try { return candidate.context?.pageUrl ? new URL(candidate.context.pageUrl).host : ''; } catch { return ''; }
+  })();
+  if (existingHost && candidateHost && existingHost !== candidateHost) return false;
+
   const existingStrategies = new Set(existing.locatorPlan.map(e => e.strategy));
   const candidateStrategies = new Set(candidate.locatorPlan.map(e => e.strategy));
 
@@ -91,6 +105,72 @@ function shouldUpgradeCompiledPlan(
   if (candidateRank > existingRank) return true;
 
   return false;
+}
+
+/**
+ * Etap 1D.1 — Derive `planQuality` for the apply result from the compiled
+ * plan that was just persisted. Returns `undefined` when the plan is fine
+ * (validation confirmed at least one locator) so the WS payload stays
+ * minimal on the happy path.
+ *
+ * `unverified` is set by `LocatorPlanBuilder.buildCompiledPlan` when:
+ *   - validation phase ran but every entry came back validated=false
+ *     (page navigated mid-build, all `count()` returned 0/timeout); OR
+ *   - validation was skipped entirely (no `page` available, e.g. plan
+ *     rebuilt from a stored artifact in a test harness).
+ *
+ * The reason string is best-effort — frontend doesn't parse it, only
+ * displays. Server logs the same field for metric aggregation.
+ */
+function derivePlanQuality(
+  compiled: CompiledStepPlan | undefined,
+): { unverified: boolean; reason?: string } | undefined {
+  if (!compiled) return undefined;
+  if (!compiled.unverified) return undefined;
+  // validatedAt missing => validation phase didn't run (e.g. page absent).
+  // validatedAt present + unverified => validation ran but produced no live
+  // matches — typically a re-rendering page or a fresh-replay scenario.
+  if (!compiled.validatedAt) {
+    return { unverified: true, reason: 'validation_skipped' };
+  }
+  const allDead = compiled.locatorPlan.every((l) => l.matchCount === 0);
+  if (allDead) return { unverified: true, reason: 'all_locators_dead' };
+  return { unverified: true, reason: 'no_validated_locators' };
+}
+
+/**
+ * May 2026 — Runtime confirmation of compiled plan stability.
+ *
+ * `LocatorPlanBuilder.buildCompiledPlan` flags a plan as `unverified=true`
+ * when its build-time `count()` probe couldn't confirm any locator on the
+ * live page. That probe is fragile by design — a click that navigates,
+ * a popover that closes mid-build, a re-rendering Angular page, all
+ * legitimately race the validation and produce false positives.
+ *
+ * When the apply that just finished demonstrates that the element WAS
+ * found AND the action produced an observable effect (verifyClickHadEffect
+ * positive, or non-click action verified), runtime success is strictly
+ * stronger evidence than the build-time probe — and we clear the flag
+ * IN PLACE on the plan object. The cleared plan then flows through to
+ * `step.compiled` and ultimately the DB via run-loop's batch persist,
+ * so the editor's "⚠ unstable" badge (which reads `compiled.unverified`)
+ * stops showing on steps that demonstrably work.
+ *
+ * Mutates the input — the plan was just constructed in the same apply
+ * call, no other reader has it yet. Idempotent: noop if already cleared
+ * or if there was no plan to confirm.
+ *
+ * Callers MUST only invoke this on the success-path (after action ran
+ * and post-verification passed). Failure paths return early before
+ * reaching here, so the flag stays as evidence for next-run diagnostics.
+ */
+function clearUnverifiedOnRuntimeMatch(
+  compiled: CompiledStepPlan | undefined,
+): void {
+  if (!compiled) return;
+  if (compiled.unverified !== true) return;
+  compiled.unverified = false;
+  compiled.runtimeConfirmedAt = new Date().toISOString();
 }
 
 /**
@@ -164,6 +244,12 @@ function buildBindingHintsFromNode(node: InteractiveNode): BindingHints {
   if ((node as any).disabled !== undefined) (hints as any).disabled = (node as any).disabled;
   if ((node as any).arrowDir) (hints as any).arrowDir = (node as any).arrowDir;
 
+  // Etap 1B.2 — Angular routerLink + formControlName. Surface to LLM
+  // resolver so the prompt can use these as "this exact form input"
+  // identity hints when text/role drift across renders.
+  if ((node as any).routerLink) (hints as any).routerLink = (node as any).routerLink;
+  if ((node as any).formControlName) (hints as any).formControlName = (node as any).formControlName;
+
   // V22: ARIA state at resolve-time. Records whether the resolved live
   // element was expanded/pressed/checked/invalid/current/etc. so the next
   // resolve treats those state hints as expectations (e.g. "click submit
@@ -224,6 +310,12 @@ function buildSyntheticFingerprintFromNode(node: InteractiveNode): TargetFingerp
   if (node.title) fp.title = node.title;
   if ((node as any).alt) fp.alt = (node as any).alt;
   if (node.text) fp.text = node.text;
+  // V26: First text fragment as a single DOM unit (Angular Material card
+  // pattern fix). Symmetric with collector + recorder. Without this line
+  // synthetic fingerprints carried no fragment, so card-shaped targets
+  // resolved through LLM never gained a stable text-locator on their
+  // next compiled-plan rebuild.
+  if ((node as any).firstTextFragment) fp.firstTextFragment = (node as any).firstTextFragment;
   // node.id is the live DOM id; only persist when it isn't a framework-
   // generated counter (mat-radio-3, mui-12, :r0:, etc.) so identity match
   // doesn't lock onto an unstable token. The probe path applies the same
@@ -1237,6 +1329,20 @@ interface ApplyResult {
    * took. Use `jq '.payload.decisionTrace' run.jsonl` for inspection.
    */
   decisionTrace?: StepDecisionTrace;
+  /**
+   * Etap 1D.1 — Plan quality signal for the frontend. Set when a compiled
+   * plan was written but its build-time validation could not confirm any
+   * locator (`compiled.unverified === true`). Forwarded to the WS apply
+   * result payload so the editor can show an "unstable selectors" badge.
+   *
+   * Absent when the apply path didn't write a plan (soft-pass / non-
+   * targeting / compiled-fast-path that didn't upgrade), and on hard
+   * failures (success=false carries `error` instead).
+   */
+  planQuality?: {
+    unverified: boolean;
+    reason?: string;
+  };
 }
 
 /**
@@ -1453,6 +1559,16 @@ type ClickPreState = {
   targetAriaPressed: string | null;
   targetAriaExpanded: string | null;
   targetAriaChecked: string | null;
+  /**
+   * Radix UI / shadcn / Vaul `data-state` on the click target BEFORE the
+   * click fires. Critical for Radix-stack precision: many primitives
+   * (Dialog, Popover, DropdownMenu, Collapsible) flip data-state without
+   * mirroring to aria-expanded — without this we'd report `signal: 'focus'`
+   * (weak) on a real success, and the fake-success guard would FAIL the
+   * step. With it: dataState 'closed'→'open' becomes a `signal: 'aria'`
+   * (strong) and the click is recognised.
+   */
+  targetDataState: string | null;
   targetDisabled: boolean;
   pageCount: number; // browser-context tab count for new-tab detection
   // V24: overlay/popup signature captured BEFORE click. Used by parasitic-overlay
@@ -1530,6 +1646,7 @@ async function captureClickPreState(
     targetAriaPressed: null,
     targetAriaExpanded: null,
     targetAriaChecked: null,
+    targetDataState: null,
     targetDisabled: false,
     pageCount,
     overlayPreSig: '',
@@ -1599,6 +1716,10 @@ async function captureClickPreState(
         targetAriaPressed: targetEl ? targetEl.getAttribute('aria-pressed') : null,
         targetAriaExpanded: targetEl ? targetEl.getAttribute('aria-expanded') : null,
         targetAriaChecked: targetEl ? targetEl.getAttribute('aria-checked') : null,
+        // Radix/shadcn data-state — see ClickPreState.targetDataState.
+        // Captured here as raw string-or-null so the post-click verifier
+        // can compare with strict equality (===) like sibling aria-* fields.
+        targetDataState: targetEl ? targetEl.getAttribute('data-state') : null,
         targetDisabled: targetEl
           ? (targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true')
           : false,
@@ -1679,9 +1800,35 @@ async function verifyClickHadEffect(
         return { signal: 'none' as const };
       }, pre);
     } catch {
-      // Page navigating mid-eval — that itself is an effect.
+      // page.evaluate threw. Could mean ANY of:
+      //   • The page is mid-navigation (execution context destroyed because
+      //     the document is being unloaded — this is the case the original
+      //     code assumed).
+      //   • SPA / React re-rendered hard enough to briefly drop the eval
+      //     context even though the URL didn't change (Radix popover unmount,
+      //     listbox close, modal close — all observed in production).
+      //   • Frame detached, page closed, browser process throttled, etc.
+      //
+      // Old behaviour blindly returned `signal: 'url'`, which is a STRONG
+      // signal that bypasses the fake-success guard. That meant any wrong
+      // click that destroyed enough DOM to throw an evaluate would be marked
+      // as "navigation success" with no URL change — the canonical
+      // fake-success on popup-close. Probe the actual URL via Playwright's
+      // own `page.url()` (no in-page eval needed) and only claim 'url' when
+      // we can prove navigation happened. Otherwise drop to a 'detach' /
+      // 'dom' signal so the post-click guard can actually do its job.
       pre.cleanupDownloadListener?.();
-      return { effected: true, signal: 'url' };
+      try {
+        const liveUrl = page.url();
+        if (liveUrl && liveUrl !== pre.url) {
+          return { effected: true, signal: 'url' };
+        }
+      } catch { /* page closed — fall through */ }
+      // Eval threw and URL is unchanged. Treat as a DOM-shake signal — it
+      // IS an effect (something destroyed our eval context) but it isn't
+      // a navigation. 'detach' is in the WEAK set, so the fake-success
+      // guard can still reject this if fingerprint doesn't match.
+      return { effected: true, signal: 'detach' };
     }
     if (pageResult.signal !== 'none') {
       pre.cleanupDownloadListener?.();
@@ -1703,6 +1850,12 @@ async function verifyClickHadEffect(
           if (targetEl.getAttribute('aria-pressed') !== prev.targetAriaPressed) return { signal: 'aria' as const };
           if (targetEl.getAttribute('aria-expanded') !== prev.targetAriaExpanded) return { signal: 'aria' as const };
           if (targetEl.getAttribute('aria-checked') !== prev.targetAriaChecked) return { signal: 'aria' as const };
+          // Radix/shadcn/Vaul data-state diff — strong signal of widget
+          // state change. Reuses 'aria' enum tag deliberately (rather than
+          // adding 'state' to ClickEffectSignal): downstream consumers
+          // already classify 'aria' as a STRONG signal that bypasses the
+          // fake-success guard's weak-signal branch.
+          if (targetEl.getAttribute('data-state') !== prev.targetDataState) return { signal: 'aria' as const };
           const nowDisabled = targetEl.hasAttribute('disabled') || targetEl.getAttribute('aria-disabled') === 'true';
           if (nowDisabled !== prev.targetDisabled) return { signal: 'aria' as const };
         }
@@ -2926,6 +3079,165 @@ async function executeAction(
  */
 export class PreviewStepApplyService {
   /**
+   * V26 Batch A — Single failure-result builder for the whole apply path.
+   *
+   * Why this exists: applyStep historically had ~29 different `return {
+   * success: false, ... }` sites — wait_for timeouts, select-no-match,
+   * upload-no-file, navigate failures, fake-success rejections, etc. Only
+   * the final resolver-exhaustion path bothered to attach
+   * `failureEvidence`, so 95% of user-visible failures shipped to the UI
+   * with a bare error string and no diagnostic bundle.
+   *
+   * Centralizing here means:
+   *   1. Every failure that goes through this helper gets the same
+   *      page-state evidence (URL, title, node count, recorded
+   *      fingerprint presence) for the UI's "needs review" panel.
+   *   2. Adding a new field to the bundle is one diff, not 29.
+   *   3. The collector's try/catch is in ONE place — every caller is
+   *      shielded from collector throws.
+   *
+   * Constraints:
+   *   - Best-effort. Caller MUST be able to fail even if collector
+   *     throws — never re-throw, swallow + log.
+   *   - Don't override decisionTrace / highlight / etc. when caller
+   *     already populated them; pass-through.
+   *   - `skipBundle: true` for early failures where `page` may be
+   *     unusable (session expired, page closed) — return result with
+   *     no bundle but same shape.
+   *
+   * Not yet covered: per-attempt failure tracking. We don't yet thread
+   * each compiled-locator / lint-candidate failure into `attempts[]` —
+   * that needs the resolver loop to record per-attempt diagnostics. For
+   * now, `attempts` defaults to a single synthetic record built from the
+   * caller-provided context (originatingStrategy + matched flag).
+   */
+  private static async _buildFailureResult(opts: {
+    previewSessionId: string;
+    stepDraft: IntentStep;
+    page: Page | null;
+    error: string;
+    /**
+     * Where in the apply pipeline did this failure originate. Surfaced
+     * in the bundle so the dashboard can group/filter by failure mode
+     * instead of staring at 29 indistinguishable "step failed" rows.
+     */
+    originatingStrategy:
+      | 'wait_for_timeout'
+      | 'wait_for_email_failed'
+      | 'select_no_match'
+      | 'upload_no_file'
+      | 'navigate_failed'
+      | 'click_action_threw'
+      | 'fake_success_guard'
+      | 'pre_click_label_mismatch'
+      | 'resolver_exhausted'
+      | 'session_invalid'
+      | 'apply_threw'
+      | 'other';
+    /** Caller-provided count of attempts so far (default 1). */
+    attempts?: number;
+    /** Optional decisionTrace if caller already built one. */
+    decisionTrace?: StepDecisionTrace;
+    /** Optional highlight overlay (resolved candidates that we tried). */
+    highlight?: ApplyResult['highlight'];
+    /** Optional resolvedCandidates → seeds the attempts[] array in bundle. */
+    resolvedCandidates?: LintCandidate[];
+    /** Skip page-state collection (session/page is gone — collector would throw). */
+    skipBundle?: boolean;
+    /** Extra fields to merge into final ApplyResult (e.g. urlChanged, retried). */
+    extra?: Partial<ApplyResult>;
+  }): Promise<ApplyResult> {
+    const {
+      previewSessionId,
+      stepDraft,
+      page,
+      error,
+      originatingStrategy,
+      attempts = 1,
+      decisionTrace,
+      highlight,
+      resolvedCandidates,
+      skipBundle,
+      extra,
+    } = opts;
+
+    let failureBundle: StepFailureEvidence | undefined;
+    if (!skipBundle && page) {
+      try {
+        const { collectFailureEvidence } = await import('./failure-collector.service');
+        // sessionService is the module factory — calling getSession by ref
+        // is enough; helper is a static method so we can't use the
+        // applyStep-local `sessionService` const. Recreate factory here.
+        const sessSvc = getPreviewSessionService();
+        const sess = sessSvc.getSession(previewSessionId);
+        const interactiveNodeCount = sess?.pageState?.domNodes?.length;
+        // Synthetic attempts[] from resolved candidates (if any). When
+        // caller had no candidates (validation failure, session error)
+        // emit a single record marked with the originating strategy so
+        // the bundle is never empty.
+        const attemptRecords = (resolvedCandidates ?? []).length > 0
+          ? resolvedCandidates!.map((c) => ({
+              strategy: 'lint_candidate',
+              matched: !!c.ref,
+              failureKind: originatingStrategy,
+              value: c.ref ? `[data-agent-ref="${c.ref}"]` : undefined,
+            }))
+          : [{
+              strategy: originatingStrategy,
+              matched: false,
+              failureKind: originatingStrategy,
+            }];
+        failureBundle = await collectFailureEvidence({
+          step: stepDraft,
+          page,
+          totalAttempts: attempts,
+          originatingStrategy,
+          lastError: error,
+          attempts: attemptRecords,
+          interactiveNodeCount,
+        });
+      } catch (collectorErr) {
+        logger.warn('[PREVIEW_APPLY] Failure collector threw — skipping bundle', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          originatingStrategy,
+          error: collectorErr instanceof Error ? collectorErr.message : String(collectorErr),
+        });
+      }
+    }
+
+    // Merge logic: caller's `extra` may carry an appliedStep variant
+    // (e.g. navigate path stamps `compiled` onto stepDraft). We must
+    // PRESERVE that AND attach failureEvidence on top — losing either
+    // breaks downstream (no compiled = re-LLM next run; no bundle =
+    // silent failure to user). Resolve by deep-merging:
+    //   extra.appliedStep ?? stepDraft  → base
+    //   + failureEvidence on top         → final
+    const baseAppliedStep =
+      (extra && (extra as any).appliedStep)
+        ? (extra as any).appliedStep
+        : stepDraft;
+    const appliedStepWithFailure = failureBundle
+      ? { ...baseAppliedStep, failureEvidence: failureBundle }
+      : (extra && (extra as any).appliedStep ? baseAppliedStep : undefined);
+
+    // Strip appliedStep from extra so the spread below doesn't clobber
+    // our merged version — and retain everything else verbatim.
+    const extraWithoutAppliedStep = extra ? { ...extra } : {};
+    delete (extraWithoutAppliedStep as any).appliedStep;
+
+    return {
+      success: false,
+      error,
+      attempts,
+      ...(decisionTrace ? { decisionTrace } : {}),
+      ...(highlight ? { highlight } : {}),
+      ...extraWithoutAppliedStep,
+      ...(appliedStepWithFailure ? { appliedStep: appliedStepWithFailure } : {}),
+    };
+  }
+
+  /**
    * Apply a step in the preview session
    * Tries top candidates with limited retries
    * V3: If selectedRef is provided (from user clarification), use it directly
@@ -3161,9 +3473,26 @@ export class PreviewStepApplyService {
           });
         }
 
+        // V26 Batch A: navigate/wait/scroll failures used to ship a bare
+        // error string. Now we attach failureEvidence on failure so the UI
+        // shows page state at the moment things broke.
+        if (!result.success) {
+          return await PreviewStepApplyService._buildFailureResult({
+            previewSessionId,
+            stepDraft,
+            page,
+            error: result.error || `${stepDraft.type} failed`,
+            originatingStrategy: stepDraft.type === 'navigate' ? 'navigate_failed' : 'other',
+            attempts: 1,
+            extra: {
+              appliedStep: { ...stepDraft, compiled },
+              urlChanged: result.urlChanged,
+              url: page.url(),
+            },
+          });
+        }
         return {
-          success: result.success,
-          error: result.error,
+          success: true,
           appliedStep: {
             ...stepDraft,
             compiled,
@@ -3281,16 +3610,24 @@ export class PreviewStepApplyService {
             waitForUrlBefore: urlBefore,
           };
         } catch (error) {
-          return {
-            success: false,
+          // V26 Batch A: was silent failure — returns error string with no
+          // failureEvidence. UI sees "wait_for failed" with no page state.
+          // Now collects screenshot/HTML/console at the moment of timeout.
+          return await PreviewStepApplyService._buildFailureResult({
+            previewSessionId,
+            stepDraft,
+            page,
             error: error instanceof Error ? error.message : 'wait_for failed',
-            urlChanged: urlBefore !== page.url(),
-            url: page.url(),
+            originatingStrategy: 'wait_for_timeout',
             attempts: 1,
-            waitForBranch: slowPathBranch,
-            waitForChangedFrom: matcher?.changedFrom,
-            waitForUrlBefore: urlBefore,
-          };
+            extra: {
+              urlChanged: urlBefore !== page.url(),
+              url: page.url(),
+              waitForBranch: slowPathBranch,
+              waitForChangedFrom: matcher?.changedFrom,
+              waitForUrlBefore: urlBefore,
+            },
+          });
         }
       }
 
@@ -3795,6 +4132,7 @@ export class PreviewStepApplyService {
                 resolvedNode,
                 pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
+                page,
               });
             } catch (compileError) {
               logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for user-confirmed selection', {
@@ -3839,6 +4177,31 @@ export class PreviewStepApplyService {
             compiled, // NEW: compiled execution plan
           };
 
+          // user_confirmed path: we just clicked the user-picked element
+          // successfully, so the plan that targets that node is by-construction
+          // valid at runtime even if its build-time count() raced navigation.
+          // Mutate the plan to clear `unverified` BEFORE deriving WS-payload
+          // planQuality and BEFORE the run-loop persists `step.compiled` to
+          // DB — this is what makes the editor's "unstable" badge stop
+          // showing on next session.
+          clearUnverifiedOnRuntimeMatch(compiled);
+          const planQuality = derivePlanQuality(compiled);
+          if (planQuality?.unverified) {
+            logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              reason: planQuality.reason,
+              path: 'user_confirmed',
+            });
+            try {
+              EditorTraceService.get(previewSessionId)?.writePlanQuality({
+                stepId: stepDraft.id,
+                unverified: true,
+                reason: planQuality.reason,
+                path: 'user_confirmed',
+              });
+            } catch { /* trace is advisory */ }
+          }
           return {
             success: true,
             appliedStep: updatedStep,
@@ -3849,6 +4212,7 @@ export class PreviewStepApplyService {
               type: 'success',
             }],
             attempts: 1,
+            planQuality,
           };
         }
 
@@ -4216,7 +4580,20 @@ export class PreviewStepApplyService {
                 // rebuild falls through to the old plan, so this path can
                 // NEVER turn a successful step into a failure.
                 let upgradedCompiled = stepDraft.compiled;
-                if (compiledRef) {
+                // CRITICAL: skip the rebuild if navigation happened during the action.
+                // After a click that triggers navigation (e.g. OpenID Connect → SSO),
+                // `page.url()` is the destination page, not the page the step was
+                // recorded on. The session's domNodes also reflect the post-nav DOM.
+                // Looking up `compiledRef` there returns either nothing or a stale
+                // ref re-bound to a wholly unrelated post-nav element, and we'd
+                // persist a corrupted plan whose `context.pageUrl` points at the
+                // destination — every subsequent run would fail `compiledUrlStale`
+                // and the URL guard in lint with `url_mismatch`. The upgrade is a
+                // soft, never-load-bearing optimization — bail out when unsafe.
+                const postActionUrl = page.url();
+                const navigationOccurred = !!currentPageUrl
+                  && normalizeUrlForComparison(currentPageUrl) !== normalizeUrlForComparison(postActionUrl);
+                if (compiledRef && !navigationOccurred) {
                   try {
                     const sess = sessionService.getSession(previewSessionId);
                     const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
@@ -4224,9 +4601,10 @@ export class PreviewStepApplyService {
                       const candidatePlan = await LocatorPlanBuilder.buildCompiledPlan({
                         step: stepDraft,
                         resolvedNode: liveNode,
-                        pageUrl: page.url(),
+                        pageUrl: postActionUrl,
                         pageTitle: await page.title().catch(() => undefined),
                         pageSignature: sess?.lastPageSignature,
+                        page,
                       });
                       if (shouldUpgradeCompiledPlan(stepDraft.compiled, candidatePlan)) {
                         logger.info('[PREVIEW_APPLY] Upgraded compiled plan on fast-path success', {
@@ -4247,6 +4625,13 @@ export class PreviewStepApplyService {
                       error: upgradeErr instanceof Error ? upgradeErr.message : String(upgradeErr),
                     });
                   }
+                } else if (navigationOccurred) {
+                  logger.debug('[PREVIEW_APPLY] Compiled plan upgrade skipped — navigation occurred mid-action', {
+                    previewSessionId,
+                    stepId: stepDraft.id,
+                    fromUrl: currentPageUrl,
+                    toUrl: postActionUrl,
+                  });
                 }
 
                 // Update step with success evidence
@@ -4289,6 +4674,72 @@ export class PreviewStepApplyService {
                       }
                     }
                   } catch { /* synthesis is non-fatal */ }
+                } else if (
+                  // V26: Mirror the lint-path backfill on the compiled
+                  // fast-path. Recorded fingerprints captured by older
+                  // recorder versions don't have the new V26 identity
+                  // fields (firstTextFragment, href, etc.) — without
+                  // backfill they only get populated by re-recording
+                  // by hand. Same gate (click + has recordedFp + has
+                  // compiledRef), same predicate (only fill missing
+                  // slots, never overwrite recorded values).
+                  stepDraft.type === 'click'
+                  && stepDraft.recordedFingerprint
+                  && compiledRef
+                ) {
+                  try {
+                    const sess = sessionService.getSession(previewSessionId);
+                    const liveNode = sess?.pageState?.domNodes?.find(n => n.ref === compiledRef);
+                    if (liveNode) {
+                      const fp = stepDraft.recordedFingerprint;
+                      const live = liveNode as any;
+                      const backfill: Partial<TargetFingerprint> = {};
+                      const fillIfMissing = <K extends keyof TargetFingerprint>(
+                        key: K,
+                        liveKey: string = key as string,
+                      ): void => {
+                        const v = live[liveKey];
+                        if (fp[key] === undefined && v !== undefined && v !== null && v !== '') {
+                          (backfill as any)[key] = v;
+                        }
+                      };
+                      fillIfMissing('firstTextFragment');
+                      fillIfMissing('href');
+                      if (fp.elementId === undefined && live.id && !live.isDynamicId) {
+                        backfill.elementId = live.id;
+                      }
+                      fillIfMissing('testIdAttr');
+                      fillIfMissing('name');
+                      fillIfMissing('alt');
+                      fillIfMissing('svgIcon');
+                      fillIfMissing('iconLabel');
+                      fillIfMissing('customElementTag');
+                      fillIfMissing('cssClass');
+                      fillIfMissing('ariaControls');
+                      fillIfMissing('vueScopeId');
+                      fillIfMissing('childTestId');
+                      fillIfMissing('nearestLandmark');
+                      fillIfMissing('title');
+                      if (
+                        (!fp.containerTitles || fp.containerTitles.length === 0)
+                        && Array.isArray(live.containerTitles)
+                        && live.containerTitles.length > 0
+                      ) {
+                        backfill.containerTitles = live.containerTitles.slice(0, 3);
+                      }
+                      if (Object.keys(backfill).length > 0) {
+                        updatedStep = {
+                          ...updatedStep,
+                          recordedFingerprint: { ...fp, ...backfill },
+                        };
+                        logger.info('[PREVIEW_APPLY] Backfilled missing identity fields on compiled fast-path', {
+                          previewSessionId,
+                          stepId: stepDraft.id,
+                          backfilledKeys: Object.keys(backfill),
+                        });
+                      }
+                    }
+                  } catch { /* backfill is non-fatal */ }
                 }
 
                 // V23: compiled fast-path success — pull live node info into
@@ -4315,6 +4766,32 @@ export class PreviewStepApplyService {
                   decisionTrace.chosen = { ref: compiledRef };
                 }
                 setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+                // compiled fast-path upgrade: we got here ONLY because the
+                // compiled plan just successfully matched, clicked, and
+                // (for non-nav clicks) passed verifyClickHadEffect. That's
+                // direct runtime proof of plan stability — beats build-time
+                // count() which races click→navigation on click steps.
+                // Clear `unverified` on the plan that will be persisted (also
+                // covers the `compiled === upgradedCompiled` case where the
+                // upgrade was skipped due to navigation).
+                clearUnverifiedOnRuntimeMatch(upgradedCompiled);
+                const planQuality = derivePlanQuality(upgradedCompiled);
+                if (planQuality?.unverified) {
+                  logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
+                    previewSessionId,
+                    stepId: stepDraft.id,
+                    reason: planQuality.reason,
+                    path: 'compiled_fast_path_upgrade',
+                  });
+                  try {
+                    EditorTraceService.get(previewSessionId)?.writePlanQuality({
+                      stepId: stepDraft.id,
+                      unverified: true,
+                      reason: planQuality.reason,
+                      path: 'compiled_fast_path_upgrade',
+                    });
+                  } catch { /* trace is advisory */ }
+                }
                 return {
                   success: true,
                   appliedStep: updatedStep,
@@ -4322,6 +4799,7 @@ export class PreviewStepApplyService {
                   url: page.url(),
                   attempts: 1,
                   decisionTrace,
+                  planQuality,
                 };
               }
             }
@@ -4936,21 +5414,29 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
-            return {
-              success: false,
+            // V26 Batch A: pre-click label-mismatch guard — same evidence
+            // collection as the post-click fake-success guards above.
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
               error: `[wrong-element] Resolver wanted to click "${chosenLabelForGuard.slice(0, 60)}" for step targeting "${recordedLabelForGuard.slice(0, 60)}" — labels share no meaningful words. Click aborted to avoid side-effects. Refine the step description, or re-record so a structural fingerprint anchors the target.`,
+              originatingStrategy: 'pre_click_label_mismatch',
               attempts,
+              decisionTrace,
               highlight: [{
                 ref: candidate.ref,
                 boundingBox: candidate.boundingBox,
                 type: 'error' as const,
               }],
-              chosenRef: candidate.ref,
-              chosenLabel: chosenLabelForGuard,
-              chosenBoundingBox: candidate.boundingBox,
-              resolverPath: lintResult.resolverPath,
-              decisionTrace,
-            };
+              resolvedCandidates: [candidate],
+              extra: {
+                chosenRef: candidate.ref,
+                chosenLabel: chosenLabelForGuard,
+                chosenBoundingBox: candidate.boundingBox,
+                resolverPath: lintResult.resolverPath,
+              },
+            });
           }
         }
         // Suppress unused-variable lint when guard didn't fire.
@@ -5246,6 +5732,7 @@ export class PreviewStepApplyService {
                 pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
                 pageSignature,
+                page,
               });
               logger.debug('[PREVIEW_APPLY] Compiled plan generated', {
                 stepId: stepDraft.id,
@@ -5583,23 +6070,32 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
-            return {
-              success: false,
+            // V26 Batch A: fake-success rejection — was silent (no bundle).
+            // Now collects evidence so the dashboard can show the wrong
+            // element + page state to the user.
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the recorded target had id="${stepDraft.recordedFingerprint?.elementId || stepDraft.recordedFingerprint?.testIdAttr}". The click only triggered a ${clickEffectSignal || 'no'} change, not a real navigation/dialog/state update — almost certainly a fake-success. Refine the step description or check that the recorded id still exists on the page.`,
+              originatingStrategy: 'fake_success_guard',
               attempts,
+              decisionTrace,
               highlight: [{
                 ref: candidate.ref,
                 boundingBox: candidate.boundingBox,
                 type: 'error' as const,
               }],
-              clickEffectSignal,
-              chosenRef: candidate.ref,
-              chosenLabel,
-              chosenBoundingBox: candidate.boundingBox,
-              fingerprintMatch,
-              resolverPath: lintResult.resolverPath,
-              decisionTrace,
-            };
+              resolvedCandidates: [candidate],
+              extra: {
+                clickEffectSignal,
+                chosenRef: candidate.ref,
+                chosenLabel,
+                chosenBoundingBox: candidate.boundingBox,
+                fingerprintMatch,
+                resolverPath: lintResult.resolverPath,
+              },
+            });
           }
 
           // Label-based fallback guard for steps recorded BEFORE
@@ -5903,23 +6399,31 @@ export class PreviewStepApplyService {
                 });
               }
             } catch { /* never break apply on cache cleanup */ }
-            return {
-              success: false,
+            // V26 Batch A: label-mismatch fake-success rejection — same
+            // bundle treatment as the fingerprint-mismatch sibling above.
+            return await PreviewStepApplyService._buildFailureResult({
+              previewSessionId,
+              stepDraft,
+              page,
               error: `[wrong-element] Resolver clicked "${chosenLabel || candidate.ref}" but the step targets "${recordedLabel.slice(0, 60)}". The click only triggered a ${clickEffectSignal || 'no'} change, and the labels share no meaningful words — almost certainly a fake-success. Re-record the step so a structural fingerprint is captured, or refine the step description.`,
+              originatingStrategy: 'fake_success_guard',
               attempts,
+              decisionTrace,
               highlight: [{
                 ref: candidate.ref,
                 boundingBox: candidate.boundingBox,
                 type: 'error' as const,
               }],
-              clickEffectSignal,
-              chosenRef: candidate.ref,
-              chosenLabel,
-              chosenBoundingBox: candidate.boundingBox,
-              fingerprintMatch,
-              resolverPath: lintResult.resolverPath,
-              decisionTrace,
-            };
+              resolvedCandidates: [candidate],
+              extra: {
+                clickEffectSignal,
+                chosenRef: candidate.ref,
+                chosenLabel,
+                chosenBoundingBox: candidate.boundingBox,
+                fingerprintMatch,
+                resolverPath: lintResult.resolverPath,
+              },
+            });
           }
           // Synthesize a `recordedFingerprint` for manually-added click
           // steps. By this point both guards (identity-mismatch + weak,
@@ -5952,10 +6456,127 @@ export class PreviewStepApplyService {
                 signal: clickEffectSignal,
               });
             }
+          } else if (
+            // V26: Backfill MISSING identity fields onto an EXISTING recorded
+            // fingerprint when the LLM resolver successfully found the step's
+            // target. Without this, fingerprints captured by older recorder
+            // versions (or recorded before each new identity field was added
+            // to the probe) never gained the new fields — the only path to
+            // populate them was re-recording the click by hand.
+            //
+            // Fix: when LLM picks a node and post-action verifies (we're in
+            // the success branch), copy every identity-bearing field from the
+            // live node onto the recorded fingerprint — but ONLY where the
+            // recorded value is missing. Never overwrite: the recorded value
+            // is the authoritative one (the human-confirmed target at record
+            // time); we're just filling in fields the recorder didn't yet
+            // know how to capture.
+            //
+            // What we INCLUDE (stable identity that helps future resolution):
+            //   firstTextFragment, href, elementId, testIdAttr, name, alt,
+            //   svgIcon, iconLabel, customElementTag, cssClass, ariaControls,
+            //   vueScopeId, childTestId, nearestLandmark, containerTitles
+            //
+            // What we EXCLUDE (state-dependent or page-layout dependent —
+            // copying these would let a stale snapshot poison the recorded
+            // identity across runs):
+            //   boundingBox, text, ariaState, disabled, siblingIndex,
+            //   arrowDir, ancestorSummary, dataValue, role, tag
+            stepDraft.type === 'click'
+            && stepDraft.recordedFingerprint
+            && !softPassedOnNoEffect
+            && candidate.node
+          ) {
+            const fp = stepDraft.recordedFingerprint;
+            const liveNode = candidate.node as any;
+            const backfill: Partial<TargetFingerprint> = {};
+
+            // Helper: only set when recorded slot is empty AND live has value.
+            // Keeps the "recorded is authoritative" invariant explicit.
+            const fillIfMissing = <K extends keyof TargetFingerprint>(
+              key: K,
+              liveKey: string = key as string,
+            ): void => {
+              const liveVal = liveNode[liveKey];
+              if (fp[key] === undefined && liveVal !== undefined && liveVal !== null && liveVal !== '') {
+                (backfill as any)[key] = liveVal;
+              }
+            };
+
+            // Identity-bearing single-value fields.
+            fillIfMissing('firstTextFragment');
+            fillIfMissing('href');
+            // node.id (live) → fp.elementId (canonical name on fingerprint).
+            // Skip framework-generated IDs — same gate as the recorder/synthetic
+            // path so identity match doesn't lock onto an unstable token.
+            if (fp.elementId === undefined && liveNode.id && !liveNode.isDynamicId) {
+              backfill.elementId = liveNode.id;
+            }
+            fillIfMissing('testIdAttr');
+            fillIfMissing('name');
+            fillIfMissing('alt');
+            fillIfMissing('svgIcon');
+            fillIfMissing('iconLabel');
+            fillIfMissing('customElementTag');
+            fillIfMissing('cssClass');
+            fillIfMissing('ariaControls');
+            fillIfMissing('vueScopeId');
+            fillIfMissing('childTestId');
+            fillIfMissing('nearestLandmark');
+            fillIfMissing('title');
+
+            // containerTitles is an array — only fill when recorded array is
+            // missing/empty AND live has at least one entry.
+            if (
+              (!fp.containerTitles || fp.containerTitles.length === 0)
+              && Array.isArray(liveNode.containerTitles)
+              && liveNode.containerTitles.length > 0
+            ) {
+              backfill.containerTitles = liveNode.containerTitles.slice(0, 3);
+            }
+
+            if (Object.keys(backfill).length > 0) {
+              appliedStep = {
+                ...updatedStep,
+                recordedFingerprint: { ...fp, ...backfill },
+              };
+              logger.info('[PREVIEW_APPLY] Backfilled missing identity fields on recorded fingerprint', {
+                previewSessionId,
+                stepId: stepDraft.id,
+                backfilledKeys: Object.keys(backfill),
+                signal: clickEffectSignal,
+              });
+            }
           }
 
           // V23: finalize trace timing for the success path.
           setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+          // lint_resolve_post_verify: `verified === true` here means the
+          // resolver-picked element was actually clicked AND
+          // verifyClickHadEffect returned a positive signal. That's runtime
+          // proof that whatever the compiled plan now describes (built from
+          // the same node) does the right thing — beats build-time count()
+          // which races navigation. Soft-pass path skips compile entirely
+          // (`softPassedOnNoEffect` → no `compiled` write), so this branch
+          // only runs on real success.
+          if (verified) clearUnverifiedOnRuntimeMatch(compiled);
+          const planQuality = derivePlanQuality(compiled);
+          if (planQuality?.unverified) {
+            logger.warn('[PREVIEW_APPLY] Plan flagged unverified', {
+              previewSessionId,
+              stepId: stepDraft.id,
+              reason: planQuality.reason,
+              path: 'lint_resolve_post_verify',
+            });
+            try {
+              EditorTraceService.get(previewSessionId)?.writePlanQuality({
+                stepId: stepDraft.id,
+                unverified: true,
+                reason: planQuality.reason,
+                path: 'lint_resolve_post_verify',
+              });
+            } catch { /* trace is advisory */ }
+          }
           return {
             success: true,
             appliedStep,
@@ -5981,6 +6602,7 @@ export class PreviewStepApplyService {
             stateChange,
             compiledFailed: compiledWasTried,
             decisionTrace,
+            planQuality,
           };
         }
 
@@ -5997,9 +6619,59 @@ export class PreviewStepApplyService {
 
       // All attempts failed
       setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+
+      // Etap 1D.2 — collect failure evidence bundle. Best-effort: any
+      // throw from the collector is swallowed so the failure return
+      // path never gets blocked by diagnostic code. The bundle is then
+      // attached to the appliedStep so callers (WS handler, run loop)
+      // can persist it to DB and emit `preview:step:needs-review`.
+      let failureBundle;
+      try {
+        const { collectFailureEvidence } = await import('./failure-collector.service');
+        const sess = sessionService.getSession(previewSessionId);
+        const interactiveNodeCount = sess?.pageState?.domNodes?.length;
+        // We don't have per-candidate failure tracking at the apply
+        // loop level today — `lastError` is the single error string
+        // accumulated across all candidates. Building synthetic attempt
+        // records with `failureKind: 'fallthrough'` etc. would lie
+        // about reality. Pass minimal entries — strategy + matched flag
+        // — and let `lastError` + `totalAttempts` carry the real signal.
+        // Per-candidate attempt detail is a follow-up that needs the
+        // resolver loop to record per-attempt failures.
+        const attemptRecords = resolvedCandidates.map((c) => ({
+          strategy: 'lint_candidate',
+          matched: !!c.ref,
+          failureKind: 'unknown',
+          value: c.ref ? `[data-agent-ref="${c.ref}"]` : undefined,
+        }));
+        failureBundle = await collectFailureEvidence({
+          step: stepDraft,
+          page,
+          totalAttempts: attempts,
+          originatingStrategy: 'resolver_exhausted',
+          lastError,
+          attempts: attemptRecords,
+          interactiveNodeCount,
+        });
+      } catch (collectorErr) {
+        logger.warn('[PREVIEW_APPLY] Failure collector threw — skipping bundle', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          error: collectorErr instanceof Error ? collectorErr.message : String(collectorErr),
+        });
+      }
+
+      // Stamp the bundle onto the applied step so the WS handler can
+      // persist it. Only attach when we have a bundle — happy path
+      // (success) clears `failureEvidence` to undefined separately.
+      const appliedStepWithFailure = failureBundle
+        ? { ...stepDraft, failureEvidence: failureBundle }
+        : undefined;
+
       return {
         success: false,
         error: lastError || 'All candidates failed',
+        appliedStep: appliedStepWithFailure,
         highlight: resolvedCandidates.map(c => ({
           ref: c.ref,
           boundingBox: c.boundingBox,
@@ -6015,9 +6687,52 @@ export class PreviewStepApplyService {
       });
 
       setTraceTiming({ totalMs: Date.now() - traceTimingStart });
+
+      // Etap 1D.2 — also collect a bundle for thrown failures (page
+      // crash, frame detached, navigation race, etc.). These are the
+      // most diagnostically interesting failures — losing them would
+      // defeat the whole point of the collector. Same best-effort
+      // pattern as the structured-failure path above: any throw from
+      // the collector itself is swallowed.
+      //
+      // We re-resolve `page` + `session` here because outer-catch is
+      // outside the inner try where they're declared. The page may be
+      // gone (closed/crashed — that's often what threw in the first
+      // place); collector handles `page.url()` / `page.title()` throws
+      // best-effort, so we don't need to pre-validate.
+      let throwBundle;
+      try {
+        const { collectFailureEvidence } = await import('./failure-collector.service');
+        const sess = getPreviewSessionService();
+        const session = sess.getSession(previewSessionId);
+        const page = sess.getPage(previewSessionId, userId);
+        const interactiveNodeCount = session?.pageState?.domNodes?.length;
+        if (page) {
+          throwBundle = await collectFailureEvidence({
+            step: stepDraft,
+            page,
+            totalAttempts: 0,
+            originatingStrategy: 'apply_threw',
+            lastError: error instanceof Error ? error.message : String(error),
+            // No attempts log — exception was thrown before per-candidate
+            // iteration could record one. Empty array is correct here:
+            // it tells the UI "step crashed before we got to selectors".
+            attempts: [],
+            interactiveNodeCount,
+          });
+        }
+      } catch (collectorErr) {
+        logger.warn('[PREVIEW_APPLY] Failure collector threw on outer catch — skipping bundle', {
+          previewSessionId,
+          stepId: stepDraft.id,
+          error: collectorErr instanceof Error ? collectorErr.message : String(collectorErr),
+        });
+      }
+
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Apply failed',
+        appliedStep: throwBundle ? { ...stepDraft, failureEvidence: throwBundle } : undefined,
         decisionTrace,
       };
     }

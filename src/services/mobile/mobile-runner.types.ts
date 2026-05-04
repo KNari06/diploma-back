@@ -166,6 +166,17 @@ export interface MobileStepResult {
   durationMs: number;
   /** Freshly-built compiled plan from this run. Persist onto the IntentStep. */
   compiledPlan?: MobileCompiledPlan;
+  /**
+   * Set by the runner when the plan must NOT be persisted, even if
+   * `success === true` and `compiledPlan` is present. Reasons:
+   *   - 'vte_mismatch': VTE caught the typed text in a sibling field, so
+   *     the plan that pointed at it is locking in a wrong element.
+   *   - 'foreground_mismatch': plan was built against the wrong app's tree.
+   * Backend persist sites (mobile-step-apply.service.ts,
+   * mobile-test-run.job.ts persistCompiledPlansFromRun, session.controller.ts
+   * runTestCaseOnSession auto-persist) check this and skip writes.
+   */
+  planStaleReason?: 'vte_mismatch' | 'foreground_mismatch';
   /** Error evidence collected during/after this step */
   evidence?: {
     logErrors?: string[];
