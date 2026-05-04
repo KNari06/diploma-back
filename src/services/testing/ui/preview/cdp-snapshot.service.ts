@@ -868,6 +868,32 @@ export class CdpSnapshotService {
       // shortcut would break for every step on every replay.
       const refAssignStart = Date.now();
       await this.assignAgentRefs(page, elements);
+      // Defense: assignAgentRefs's internal compaction operates on a
+      // per-document sub-array (`byDoc.get(0)`) which, despite the
+      // comment in that method, is NOT the same Array reference as
+      // `elements` when `__docIndex` is absent (the common single-doc
+      // case). The sub-array's length gets truncated, but `elements`
+      // itself keeps every entry — including ones whose `findElement()`
+      // returned null and got `ref: ''`. Without this filter those
+      // empty-ref elements survive into the LiteSnapshot, where they
+      // confuse downstream consumers (`new Map(elements.map(e =>
+      // [e.ref, e]))` collapses them to a single key, identity rescue
+      // can match them to recorded fingerprints with empty href, etc).
+      // Surfaced via shadow-mode divergence logs (`onlyInCdp: ["", ...]`).
+      // Keep filter here even when the per-doc compactor works — it's
+      // O(n) and idempotent on already-clean arrays.
+      const beforeFilter = elements.length;
+      for (let i = elements.length - 1; i >= 0; i--) {
+        if (!elements[i].ref) elements.splice(i, 1);
+      }
+      const droppedEmptyRefs = beforeFilter - elements.length;
+      if (droppedEmptyRefs > 0) {
+        logger.debug('[CDP_SNAPSHOT] Dropped elements with empty ref after assignAgentRefs', {
+          diagId: options.diagId,
+          dropped: droppedEmptyRefs,
+          remaining: elements.length,
+        });
+      }
       const refAssignMs = Date.now() - refAssignStart;
 
       // Phase 3c-Node: ancestry walks over DS parentIndex (no extra

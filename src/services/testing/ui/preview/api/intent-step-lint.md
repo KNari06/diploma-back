@@ -81,7 +81,7 @@ Main entry. Calls `resolveElement()` (LLM + vision); falls back to rule-based on
 - **Throws:** never.
 - **Key steps:**
   1. Non-targeting actions → `'resolved'` early.
-  2. **URL guard:** step recorded on URL A, lint on URL B → `'not_found'` "wrong page" (avoids showing random links).
+  2. **URL guard:** step recorded on URL A, lint on URL B → `'not_found'` "wrong page" (avoids showing random links). **Identity rescue escape hatch (V26):** if a TIER-1 signal (`elementId`, `testIdAttr`, `href`, or `htmlName`) has a unique live match, the URL guard is suppressed and identity fast-path fires instead — prevents false `not_found` when compiled plan baked a destination URL post-action. Source of truth: `evidence.pageUrl` preferred over `compiled.context.pageUrl` (evidence is capture-time, compiled can drift).
   3. **Evidence shortcut:** `lastSuccessRef` cached, still visible, action-type compatible → `'resolved'`, conf `0.95` (zero-cost).
   4. **`resolveElement()`** → candidates or `needs_clarification`.
   5. Resolver degraded → `lintStepWithRuleBasedFallback()` with real cause.

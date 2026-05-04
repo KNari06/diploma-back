@@ -39,16 +39,18 @@ Element resolution and auto-healing serve all three.
 | [../../../../websocket/handlers/preview.handler.ts](../../../../websocket/handlers/preview.handler.ts) | [api/preview-handler.md](api/preview-handler.md) | All `preview:*` WS events — recording, mouse/keyboard, navigation, apply, devtools, video. |
 | [intent-test-case.service.ts](intent-test-case.service.ts) | — | CRUD for intent test cases (steps + metadata). Import/export. |
 | [intent-step-converter.service.ts](intent-step-converter.service.ts) | — | `IntentStep` ↔ Playwright commands (used by background replay). |
-| [snapshot-router.service.ts](snapshot-router.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2 / WIP) Routes snapshot collection between legacy `evaluate` and new CDP path. Default = evaluate. |
+| [snapshot-router.service.ts](snapshot-router.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2) Routes snapshot collection between legacy `evaluate` and CDP path. `useCdpForPreviewPoll` flag added; dense-gate removed. |
 | [cdp-snapshot.service.ts](cdp-snapshot.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2 / WIP) CDP-based snapshot pipeline — skeleton, most phases TODO. |
-| [snapshot-diff.util.ts](snapshot-diff.util.ts) | [api/snapshot-router.md](api/snapshot-router.md) | Shadow-mode validator: field-level diff between evaluate and CDP snapshots. |
+| [snapshot-diff.util.ts](snapshot-diff.util.ts) | [api/snapshot-router.md](api/snapshot-router.md) | Shadow-mode validator: field-level diff between evaluate and CDP snapshots. Boolean-falsy normalization added. |
+| [candidate-pruner-llm.service.ts](candidate-pruner-llm.service.ts) | [api/candidate-pruner-llm.md](api/candidate-pruner-llm.md) | LLM pre-filter: narrows ~60 candidates to ~15 before resolver. Fail-open, identity-rescue, cross-script matching. |
+| [step-readiness-v2.service.ts](step-readiness-v2.service.ts) | [api/step-readiness-v2.md](api/step-readiness-v2.md) | Smart waiter V2: 3-level readiness (existence→actionability→identity) with soft-escape at 70% budget. Shadow mode via `runV1WithShadow`. |
 
 ### Supporting services
 
 | File | Purpose |
 |---|---|
 | [html-context.service.ts](html-context.service.ts) | Builds compact page-structure context (scene summary) for LLM prompts. |
-| [preview-video-stream.service.ts](preview-video-stream.service.ts) | CDP screencast for live video. Owns the only allowed CDP session. |
+| [preview-video-stream.service.ts](preview-video-stream.service.ts) | CDP screencast for live video. Owns the **screencast** CDP session — do NOT piggyback `CdpSnapshotService` on it (100% freeze measured). |
 | [preview-devtools-collector.service.ts](preview-devtools-collector.service.ts) | Console / Network / HTML / Accessibility tabs in the editor. |
 | [editor-trace.service.ts](editor-trace.service.ts) | JSONL traces for every step capture/apply. Used for postmortem debugging. |
 | [editor-trace-upload.ts](editor-trace-upload.ts) | Upload trace bundles to storage when user reports a problem. |
@@ -64,7 +66,9 @@ Element resolution and auto-healing serve all three.
 | [text-normalizer.util.ts](text-normalizer.util.ts) | Unicode/whitespace normalization for label matching. |
 | [implicit-role.util.ts](implicit-role.util.ts) | Maps `<button>`, `<a href>` etc. to ARIA roles. |
 | [dynamic-id.util.ts](dynamic-id.util.ts) | Detects framework-generated IDs (`el-id-`, `radix-`, `:rN:`, `mui-`, UUID, …) — skipped in fingerprints. |
-| [intent-resolve-audit.ts](intent-resolve-audit.ts) | Audit log for resolver decisions (debugging). |
+| [intent-resolve-audit.ts](intent-resolve-audit.ts) | Audit log for resolver decisions: `logIntentResolveApply`, `logIntentResolveLint`, `buildChosenSnapshot`. Fire-and-forget JSONL to `logs/intent_resolve.log`. |
+| [failure-collector.service.ts](failure-collector.service.ts) | Builds `StepFailureEvidence` bundle when apply exhausts all strategies. Called only from `_buildFailureResult()` in preview-step-apply. |
+| [recorded-description-llm.service.ts](recorded-description-llm.service.ts) | Generates natural-language element descriptions at record time via LLM (`generateRecordedDescription`). Cached; fail-open (returns undefined). Used as a soft hint by the resolver. |
 | [preview.types.ts](preview.types.ts) | All shared types: `IntentStep`, `ProbedElement`, `BindingHints`, `LocatorPlan`, WS payloads, trace events. |
 | [index.ts](index.ts) | Barrel export. |
 
@@ -253,7 +257,7 @@ If apply fails after action: auto-heal path
 
 1. **Recording ↔ Run mutual exclusion.** `PreviewRunService.isRunning()` blocks new captures. Starting a run stops recording.
 2. **WS handler must always respond.** Even on validation failure, emit a `:result` with `{ error }`. No silent returns.
-3. **No raw CDP sessions.** `preview-video-stream.service.ts` owns the only allowed one. Use `page.accessibility.snapshot()`, `page.content()` — never `context.newCDPSession()` from this folder.
+3. **CDP sessions — measured trade-off (Etap 2, May 2026).** `preview-video-stream.service.ts` owns the screencast session — never piggyback on it (`existingCdpSession` != screencast session; piggyback causes 100% video freeze, empirically measured). `CdpSnapshotService` opens its **own** session and detaches in `finally` — this is allowed and causes only brief FPS drop (~11 FPS during dense snapshot, recovers immediately). For DevTools/a11y outside Etap 2 still use `page.accessibility.snapshot()` / `page.content()`. Calling `Accessibility.enable` on any session in preview still freezes video. See [critical-patterns.md](../../../../../.claude/rules/critical-patterns.md) §2.
 4. **`waitUntil: 'load'` everywhere in apply/run/replay.** Don't introduce `domcontentloaded`.
 5. **Recorder probe and snapshot collector must use the same criteria.** If the recorder captures an element, the resolver must be able to see it. Symmetry break = wrong-element bug. Both sides use the same dynamic-id regex (`dynamic-id.util.ts`) and the same Tier-1/Tier-2 selection rules.
 6. **`node.id` and `node.testIdAttr` must be populated by the collector** (not just declared on the type). They drive the identity fast-path.

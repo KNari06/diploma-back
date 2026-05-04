@@ -95,6 +95,9 @@ static async applyStep(params: {
   - **`LocatorPlanBuilder.buildCompiledPlan()` is async (V26).** Every call site now uses `await`. Treat this as a breaking signature change for anyone building plans outside this service.
   - **Recorded fingerprint is authoritative; backfill never overwrites (V26).** Only empty slots are filled.
   - **Plan-quality flag (V25).** If `planQuality.unverified === true`, callers should rebuild the plan rather than treat it as evidence on the next run.
+  - **`runtimeConfirmedAt` clears `unverified` (V26).** `clearUnverifiedOnRuntimeMatch()` is called on 3 success paths (user-confirmed, compiled fast-path, lint-resolve post-verify). It sets `compiled.runtimeConfirmedAt` timestamp and drops `compiled.unverified = false`, meaning subsequent runs skip the "plan might be stale" rebuild. Plan upgrade is skipped if `page.url()` differs from `currentPageUrl` (cross-origin redirect guard).
+  - **`shouldUpgradeCompiledPlan()` host check (V26).** Rejects candidate if `pageUrl.host` differs from existing plan's host — prevents silent plan corruption after cross-origin redirect during action.
+  - **`verifyClickHadEffect()` navigation fallback (May 2026).** When `page.evaluate()` throws (context destroyed), now probes `page.url()` directly: emits `'url'` signal only if URL actually changed; falls back to `'detach'` if URL unchanged. Prevents false-positive nav claims from SPA re-renders that destroy the evaluation context.
 
 ---
 
@@ -163,10 +166,15 @@ Structured payload returned in `ApplyResult.decisionTrace`. Every resolver path,
 - **Pre-action wait:** `smartStepWait(phase: 'pre')` unless `disableStabilityChecks`.
 - **Post-action settle:** implicit in Playwright; some actions use `noWaitAfter: true` + 1s buffer (V15.3).
 
+### `clearUnverifiedOnRuntimeMatch(step): void`
+
+- **Visibility:** private static (V26).
+- **Purpose:** marks a compiled plan as runtime-confirmed by setting `compiled.unverified = false` and `compiled.runtimeConfirmedAt = new Date().toISOString()`. Called on 3 success paths. No-op if plan is missing.
+
 ### `shouldUpgradeCompiledPlan(existing, candidate): boolean`
 
 - **Visibility:** private static.
-- **Purpose:** returns `true` if the freshly-built `candidate` plan is stronger than `existing` — i.e., adds new strategy types or has a higher-priority primary strategy (per `STRATEGY_RANK`).
+- **Purpose:** returns `true` if the freshly-built `candidate` plan is stronger than `existing` — i.e., adds new strategy types or has a higher-priority primary strategy (per `STRATEGY_RANK`). Also returns `false` if `candidate.pageUrl.host` differs from `existing.pageUrl.host` (cross-origin corruption guard).
 
 ### `derivePlanQuality(compiled): { unverified, reason? } | undefined`
 

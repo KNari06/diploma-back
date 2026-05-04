@@ -20,7 +20,7 @@ Identity fast-path and evidence shortcut short-circuit expensive LLM calls when 
 ### Functions
 - `resolveElement(params): Promise<LintResult>` — main entry.
 - `buildAllowedSets(nodes, actionType): AllowedSetResult` — sync structural filter.
-- `buildCandidateText(node): string` — semantic textualization for LLM batch.
+- `buildCandidateText(node): string` — semantic textualization for LLM batch. **V26:** includes `dataState` field — Radix/shadcn/Vaul `data-state` attribute (`open`, `closed`, `checked`, `unchecked`, `on`, `off`, `active`, `inactive`), deduplicated against equivalent `aria-*` values to avoid redundant hints.
 - `sanitizeIntent(step): string` — normalize + redact intent.
 - **`getEffectiveLabel(node): string` (V23)** — canonical label resolution; consolidates 12 identity sources in priority order: `labelText` → `ariaLabel` → `title` → `alt` → `text` → `placeholder` → `iconLabel` → `svgIcon` → `childTestId` → `dataValue` → `dataRowKey` → `customElementTag`. Imported and used by `preview-step-apply.service.ts` and `intent-step-lint.service.ts` so trace labels and candidate display stay consistent across services.
 
@@ -319,4 +319,5 @@ Common pitfalls: optimism bias (0.85 when evidence is 0.6); using adjacency to o
 ## Related
 
 - [preview-step-apply.md](preview-step-apply.md), [intent-step-lint.md](intent-step-lint.md), [dom-analysis-extractor.md](dom-analysis-extractor.md), [locator-plan-builder.md](locator-plan-builder.md).
+- [candidate-pruner-llm.md](candidate-pruner-llm.md) — Stage 4.5 pre-filter service.
 - [.claude/rules/wrong-element-debugging.md](../../../../../../.claude/rules/wrong-element-debugging.md).

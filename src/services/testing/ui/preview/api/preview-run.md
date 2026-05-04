@@ -95,7 +95,7 @@
      - Per-step URL-mismatch check.
      - Interpolate `{{email.otp}}`, etc.
      - `applyStep()` with abort signal + URL-based cache policy (disableCaching if URL changed since last step).
-     - On success: emit `'pass'`, update tracked URL, lookahead wait for next step (7-layer).
+     - On success: emit `'pass'`, update tracked URL, lookahead wait for next step (7-layer via `runV1WithShadow()` — runs V1 and V2 step-readiness in parallel, logs divergence, returns V1 result; V2 result is diagnostic only).
      - On failure: deterministic retry (settle 1.5s, re-execute); if still fails, LLM diagnosis + selector wait + retry once.
      - On cancel: emit remaining as `'skipped'` and break.
      - On timeout: set flag, abort, break.

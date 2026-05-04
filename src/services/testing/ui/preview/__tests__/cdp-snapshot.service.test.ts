@@ -437,7 +437,11 @@ describe('CdpSnapshotService.collect', () => {
       });
       const page = makeMockPage({
         cdp,
-        evaluateResults: [['e0'], [null], [null]],
+        // Two interactives expected (button + dialog after May 2026 symmetry
+        // fix), so assignAgentRefs receives two requests. Both refs must be
+        // non-empty — May 2026 hardening drops elements left with `ref: ''`
+        // (e.g. when findElement returned null because of off-viewport bbox).
+        evaluateResults: [['e0', 'e1'], [null], [null]],
       });
 
       const snapshot = await CdpSnapshotService.collect(page as never);
