@@ -163,18 +163,81 @@ function compareElementFields(a: LiteElement, b: LiteElement): Array<{ field: ke
     ...(Object.keys(a) as Array<keyof LiteElement>),
     ...(Object.keys(b) as Array<keyof LiteElement>),
   ]);
+  // Pass tag through so role-equality can account for tag-vs-WAI-ARIA
+  // differences (evaluate path writes raw tag, CDP path writes the
+  // accessibility role). Both encodings describe the same element —
+  // see fieldEquals for the equivalence rules.
+  const tag = (a.tag || b.tag || '').toLowerCase();
   for (const field of fieldNames) {
     if (ELEMENT_FIELDS_SKIP.has(field)) continue;
     const av = a[field];
     const bv = b[field];
-    if (!fieldEquals(field, av, bv)) {
+    if (!fieldEquals(field, av, bv, tag)) {
       diffs.push({ field, a: av, b: bv });
     }
   }
   return diffs;
 }
 
-function fieldEquals(field: keyof LiteElement, av: unknown, bv: unknown): boolean {
+/**
+ * WAI-ARIA implicit role equivalences for the most common HTML tags
+ * (May 2026). Used by `fieldEquals` to treat `role: 'a'` (raw tag from
+ * evaluate-path) as equal to `role: 'link'` (computed AX role from
+ * CDP-path), since both describe the same element from different angles.
+ *
+ * Key = lowercased tag; value = set of strings any of which counts as
+ * the canonical role for that tag. We include the tag itself so the
+ * raw-tag side always matches; the WAI-ARIA name is what CDP emits.
+ *
+ * Limitations:
+ *   - <input> needs `type` to disambiguate (button/checkbox/textbox/...).
+ *     We list all common semantic roles for the bare 'input' entry,
+ *     accepting one false negative class: a CHECKBOX <input> on one
+ *     side vs a TEXTBOX <input> on the other would be treated as
+ *     equivalent. Acceptable: collectors operate on the same DOM node,
+ *     so the type attribute is identical — the only way they'd disagree
+ *     on role is via the tag-vs-axRole encoding gap, which is exactly
+ *     what we're collapsing.
+ *   - <a> without href has no implicit role; both sides should write
+ *     'a'. We don't bother encoding that — set lookup short-circuits.
+ */
+const ROLE_EQUIVALENCE_BY_TAG: Record<string, ReadonlySet<string>> = {
+  a: new Set(['a', 'link']),
+  button: new Set(['button']),
+  input: new Set(['input', 'textbox', 'button', 'checkbox', 'radio', 'slider']),
+  textarea: new Set(['textarea', 'textbox']),
+  select: new Set(['select', 'combobox', 'listbox']),
+  img: new Set(['img', 'image']),
+  nav: new Set(['nav', 'navigation']),
+  main: new Set(['main']),
+  header: new Set(['header', 'banner']),
+  footer: new Set(['footer', 'contentinfo']),
+  aside: new Set(['aside', 'complementary']),
+  form: new Set(['form']),
+  dialog: new Set(['dialog']),
+  output: new Set(['output', 'status']),
+  meter: new Set(['meter']),
+  progress: new Set(['progress', 'progressbar']),
+  fieldset: new Set(['fieldset', 'group']),
+  menu: new Set(['menu']),
+  menuitem: new Set(['menuitem']),
+  area: new Set(['area', 'link']),
+  // Headings: every h1..h6 maps to 'heading' in WAI-ARIA.
+  h1: new Set(['h1', 'heading']),
+  h2: new Set(['h2', 'heading']),
+  h3: new Set(['h3', 'heading']),
+  h4: new Set(['h4', 'heading']),
+  h5: new Set(['h5', 'heading']),
+  h6: new Set(['h6', 'heading']),
+};
+
+function rolesEquivalentForTag(tag: string, av: string, bv: string): boolean {
+  const equivalences = ROLE_EQUIVALENCE_BY_TAG[tag];
+  if (!equivalences) return false;
+  return equivalences.has(av) && equivalences.has(bv);
+}
+
+function fieldEquals(field: keyof LiteElement, av: unknown, bv: unknown, tag?: string): boolean {
   // bounds — pixel tolerance
   if (field === 'bounds') {
     if (!av && !bv) return true;
@@ -213,6 +276,22 @@ function fieldEquals(field: keyof LiteElement, av: unknown, bv: unknown): boolea
   const aFalsy = av === false || av === undefined || av === null;
   const bFalsy = bv === false || bv === undefined || bv === null;
   if (aFalsy && bFalsy) return true;
+  // Role-encoding normalisation: evaluate path writes raw tag (e.g. `'a'`,
+  // `'input'`), CDP path writes WAI-ARIA accessibility role (e.g. `'link'`,
+  // `'textbox'`). Both encodings describe the same element. Resolver
+  // tolerates either form (CLICK_ALLOWED_ROLES uses ARIA names, tag-based
+  // matching covers raw tags in parallel — see element-resolver.service.ts).
+  // Without this normalisation every native `<a>` / `<button>` / `<input>`
+  // shows up as `role:` divergence, drowning out real role mismatches.
+  if (
+    field === 'role'
+    && tag
+    && typeof av === 'string'
+    && typeof bv === 'string'
+    && rolesEquivalentForTag(tag, av.toLowerCase(), bv.toLowerCase())
+  ) {
+    return true;
+  }
   // strict equality for primitives — booleans, strings, numbers
   return av === bv;
 }
