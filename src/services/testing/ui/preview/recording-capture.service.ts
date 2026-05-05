@@ -2518,7 +2518,39 @@ export class RecordingCaptureService {
       if (result) return result;
 
       // Try child frames
-      return await this.probeFocusedInChildFrames(page);
+      const fromChild = await this.probeFocusedInChildFrames(page);
+      if (fromChild) return fromChild;
+
+      // V27 — root cause #1 of documentolog regression:
+      // First-keystroke race. Browser fires `keydown` before `focus` settles
+      // on the input that was just clicked (or auto-focused on navigation).
+      // `document.activeElement === document.body` for ~30-80 ms after
+      // navigation/click → main-frame probe returns null → recorded type
+      // step lands in the DB with no fingerprint and no bindingHints, and
+      // every subsequent Run is forced through the LLM path with only the
+      // step description ("email") to go on. That's exactly how the
+      // documentolog Step 0 ended up clicking <span>"Русский".
+      //
+      // One short retry (60 ms) catches the common race without making
+      // typing perceptibly slower. We do NOT loop further — if focus is
+      // still on body after 60 ms, the user genuinely typed without a
+      // focused control (e.g. body keyboard listener) and the caller will
+      // emit a step with `recordedFingerprint: undefined` as before so
+      // the FE can warn.
+      await new Promise((r) => setTimeout(r, 60));
+      const retry = await page.evaluate(`${PROBE_FOCUSED_FN}()`) as ProbedElement | null;
+      if (retry) {
+        logger.info('[RECORDING] probeFocusedElement recovered after retry', {
+          tag: retry.tag,
+          ref: retry.ref,
+        });
+        return retry;
+      }
+      const retryChild = await this.probeFocusedInChildFrames(page);
+      if (retryChild) return retryChild;
+
+      logger.warn('[RECORDING] probeFocusedElement returned null after retry — type step will lack fingerprint', {});
+      return null;
     } catch (error) {
       logger.debug('[RECORDING] Probe focused element failed', {
         error: error instanceof Error ? error.message : String(error),
