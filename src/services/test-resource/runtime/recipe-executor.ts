@@ -29,6 +29,7 @@ import { CommandExecutor } from '@/agent/execution/command-executor';
 import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import type { RecipeExecutor } from '@/services/test-resource/resource-supervisor';
+import { interpolateRecipeSecrets } from './recipe-redaction';
 
 /**
  * Build a RecipeExecutor implementation backed by CommandExecutor.
@@ -47,11 +48,17 @@ export function createCommandExecutorRecipeRunner(): RecipeExecutor {
       recipe: unknown[];
       userId: string;
       projectId: string;
+      secrets?: Record<string, string>;
     }): Promise<void> {
-      const steps = params.recipe as IntentStep[];
-      if (!Array.isArray(steps) || steps.length === 0) {
+      const rawSteps = params.recipe as IntentStep[];
+      if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
         throw new Error('Recipe is empty or not an array');
       }
+
+      // Resolve secrets BEFORE conversion to commands — the converter
+      // reads `step.value` to populate Playwright fill/type actions and
+      // wouldn't know about `{{_secret_*}}` semantics.
+      const steps = interpolateRecipeSecrets(rawSteps, params.secrets);
 
       // startUrl for the converter is the page's current URL — we're
       // healing IN PLACE, not opening a new tab. The converter uses

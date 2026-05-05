@@ -90,6 +90,15 @@ export interface ClientToServerEvents {
     ttlSeconds?: number;
     /** If true AND creating, upsert workspace default for the scope. */
     setAsDefault?: boolean;
+    /**
+     * Optional IntentStep[] captured during the recording session that led
+     * to this save. When supplied, the backend redacts password values into
+     * the encrypted resource envelope (replacing them with `{{_secret_*}}`
+     * placeholders) and stores the rest as the resource's heal recipe so
+     * the supervisor can replay the login on session loss. Empty / missing =
+     * legacy behaviour: no recipe → `refresh_method: 'manual'`.
+     */
+    recipe?: Array<Record<string, unknown>>;
   }) => void;
 
   // Preview interactive control (mouse/keyboard)

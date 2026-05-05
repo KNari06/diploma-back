@@ -307,7 +307,26 @@ export class WorkspaceService {
     'platforms',
     'api_testing',
     'settings',
+    // dev_base_url / prod_base_url are top-level columns kept for backward
+    // compatibility with `settings.baseUrls`. They were previously dropped
+    // here, so updates from the public API silently no-op'd while
+    // `settings.baseUrls` got rewritten — leaving the two views of "the
+    // workspace's URLs" out of sync. Whitelisting them lets the controller
+    // keep both halves consistent in a single round-trip.
+    'dev_base_url',
+    'prod_base_url',
   ]);
+
+  /**
+   * Map of camelCase request keys → snake_case DB columns. Lets callers send
+   * `{ devBaseUrl, prodBaseUrl }` (consistent with the auth/onboarding API
+   * shape) without us silently dropping them as unknown columns.
+   */
+  private static readonly COLUMN_ALIASES: Record<string, string> = {
+    devBaseUrl: 'dev_base_url',
+    prodBaseUrl: 'prod_base_url',
+    apiTesting: 'api_testing',
+  };
 
   static async updateWorkspace(workspaceId: string, updates: any): Promise<any> {
     try {
@@ -315,8 +334,9 @@ export class WorkspaceService {
       // Supabase "column not found" errors (e.g. frontend sending `description`).
       const sanitised: Record<string, any> = {};
       for (const key of Object.keys(updates)) {
-        if (WorkspaceService.UPDATABLE_COLUMNS.has(key)) {
-          sanitised[key] = updates[key];
+        const dbKey = WorkspaceService.COLUMN_ALIASES[key] ?? key;
+        if (WorkspaceService.UPDATABLE_COLUMNS.has(dbKey)) {
+          sanitised[dbKey] = updates[key];
         }
       }
 

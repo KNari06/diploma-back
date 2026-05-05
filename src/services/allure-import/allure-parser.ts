@@ -35,6 +35,18 @@ const MAX_ENTRY_BYTES = 50 * 1024 * 1024;
 /** Maximum text size for documentation files sent to KB. */
 const MAX_DOC_TEXT_BYTES = 2 * 1024 * 1024; // 2 MB
 
+/**
+ * Cap on TOTAL uncompressed bytes for one ZIP. Multer caps the *compressed*
+ * upload at 100 MB, but a malicious ZIP can have a 1:10000+ ratio (zip-bomb
+ * pattern: 100 MB compressed → 1 TB uncompressed of repeated zeros). Without
+ * this guard the worker happily decompresses entry-by-entry and OOMs.
+ *
+ * 500 MB of uncompressed data is a generous cap for a real Allure report
+ * (typical reports are 5–50 MB once unpacked); anything over that is either
+ * a bomb or content we couldn't usefully process anyway.
+ */
+const MAX_TOTAL_UNCOMPRESSED_BYTES = 500 * 1024 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,12 +137,39 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
   // ── 2. Build classifier inputs ────────────────────────────────────────────
   const classifierInputs: ClassifierInput[] = [];
   const entryBufferMap = new Map<string, Buffer>(); // normalised path → buffer
+  let totalUncompressedBytes = 0;
 
   for (const entry of entries) {
     if (entry.isDirectory) continue;
 
     const entryPath = entry.entryName.replace(/\\/g, '/');
     const filename = path.basename(entryPath);
+
+    // Defensive size check BEFORE decompressing. adm-zip exposes the
+    // uncompressed size via `header.size`; if it claims this single entry
+    // alone would blow MAX_ENTRY_BYTES we skip without ever touching its
+    // bytes. Catches the worst zip-bomb case (one entry expanding to GBs)
+    // without paying the decompression cost.
+    const declaredSize = entry.header?.size ?? 0;
+    if (declaredSize > MAX_ENTRY_BYTES) {
+      logger.warn('[AllureParser] Skipping over-sized ZIP entry', {
+        entryPath,
+        declaredSize,
+        cap: MAX_ENTRY_BYTES,
+      });
+      continue;
+    }
+
+    // Hard cap on cumulative uncompressed bytes — see MAX_TOTAL_UNCOMPRESSED_BYTES
+    // doc for rationale (zip-bomb DoS guard). Stop the whole parse with a
+    // clear error so the caller marks the import failed rather than silently
+    // truncating to a partial report.
+    if (totalUncompressedBytes + declaredSize > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+      throw new Error(
+        `ZIP exceeds maximum uncompressed size of ${Math.round(MAX_TOTAL_UNCOMPRESSED_BYTES / 1024 / 1024)} MB ` +
+        `(reached at "${entryPath}"). Refusing to process — possible zip bomb.`,
+      );
+    }
 
     // Read raw buffer (lazily — adm-zip decompresses on demand)
     let buf: Buffer;
@@ -141,6 +180,24 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
       continue;
     }
 
+    // Real (post-decompress) size — counted toward the cap. We re-check
+    // here because `header.size` is just metadata; a malicious archive
+    // could lie about it.
+    if (buf.length > MAX_ENTRY_BYTES) {
+      logger.warn('[AllureParser] Decompressed entry exceeded per-file cap, dropping', {
+        entryPath,
+        actualSize: buf.length,
+      });
+      continue;
+    }
+    totalUncompressedBytes += buf.length;
+    if (totalUncompressedBytes > MAX_TOTAL_UNCOMPRESSED_BYTES) {
+      throw new Error(
+        `ZIP exceeds maximum uncompressed size of ${Math.round(MAX_TOTAL_UNCOMPRESSED_BYTES / 1024 / 1024)} MB ` +
+        `(reached after "${entryPath}"). Refusing to process — possible zip bomb.`,
+      );
+    }
+
     entryBufferMap.set(entryPath, buf);
 
     // Attempt to decode as text for the classifier
@@ -148,6 +205,11 @@ export async function parseAllureZip(zipBuffer: Buffer): Promise<AllureParsedDat
 
     classifierInputs.push({ path: entryPath, filename, textContent });
   }
+
+  logger.info('[AllureParser] ZIP unpacked', {
+    entriesAccepted: entryBufferMap.size,
+    totalUncompressedMB: Math.round(totalUncompressedBytes / 1024 / 1024),
+  });
 
   // ── 3. Classify all files ─────────────────────────────────────────────────
   const classified = await classifyAllureFiles(classifierInputs);

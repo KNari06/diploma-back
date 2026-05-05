@@ -140,7 +140,13 @@ function encryptEnvelope(sensitive: Record<string, unknown>): EncryptedEnvelope 
   return envelope;
 }
 
-/** Reverse of encryptEnvelope. Fields that fail to decrypt are dropped + logged. */
+/**
+ * Reverse of encryptEnvelope. A decrypt failure is an INTEGRITY error,
+ * not a soft drop — silently returning a partial shape would feed the
+ * adapter an invalid resource and produce misleading "not logged in"
+ * style failures downstream. Fail loudly so the caller can mark the
+ * resource broken or surface a re-record CTA.
+ */
 function decryptEnvelope(
   envelope: EncryptedEnvelope | null | undefined,
   resourceId: string,
@@ -148,20 +154,25 @@ function decryptEnvelope(
   if (!envelope) return {};
   const out: Record<string, unknown> = {};
   for (const [k, cipher] of Object.entries(envelope)) {
+    let plain: string;
     try {
-      const plain = decryptString(cipher);
-      // Best-effort JSON parse — adapters that stored non-JSON get the raw string.
-      try {
-        out[k] = JSON.parse(plain);
-      } catch {
-        out[k] = plain;
-      }
+      plain = decryptString(cipher);
     } catch (err) {
-      logger.warn('[TEST_RESOURCE] Failed to decrypt envelope field', {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('[TEST_RESOURCE] Envelope decrypt failed — resource is corrupt', {
         resourceId,
         field: k,
-        error: err instanceof Error ? err.message : String(err),
+        error: msg,
       });
+      throw new Error(
+        `Resource ${resourceId} sensitive field "${k}" failed to decrypt — re-record or rotate keys`,
+      );
+    }
+    // Best-effort JSON parse — adapters that stored non-JSON get the raw string.
+    try {
+      out[k] = JSON.parse(plain);
+    } catch {
+      out[k] = plain;
     }
   }
   return out;
@@ -244,6 +255,17 @@ export async function createResource(
   const projectId = assertNonEmpty(input.projectId, 'projectId');
   const name = assertNonEmpty(input.name, 'name');
   const adapter = requireResourceAdapter(input.kind);
+
+  // Symmetric with updateResource: TTL must be a positive integer or
+  // omitted. ttlSeconds=0 silently produced a permanently-stale resource
+  // (expires_at == captured_at → isFresh always false).
+  if (
+    input.ttlSeconds !== undefined &&
+    input.ttlSeconds !== null &&
+    (!Number.isInteger(input.ttlSeconds) || input.ttlSeconds <= 0)
+  ) {
+    throw new Error('ttlSeconds must be a positive integer or null');
+  }
 
   // Merge sensitive into config for validation — adapters validate the
   // whole shape, the service then splits.
@@ -408,12 +430,26 @@ export async function updateResource(
   // Config/sensitive updates flow through the adapter so shape stays valid.
   if (patch.config !== undefined || patch.sensitive !== undefined) {
     const currentSensitive = decryptEnvelope(row.sensitive, row.id);
-    const mergedConfig = {
+    // Apply patches with explicit-null-clears semantics: a patch key set
+    // to null OR undefined (as a property) means "remove this field" so
+    // the UI can drop a stored secret (e.g. delete `totpSecret`) without
+    // re-supplying every other sensitive field.
+    const mergedConfig: Record<string, unknown> = {
       ...(row.config ?? {}),
       ...currentSensitive,
-      ...(patch.config ?? {}),
-      ...(patch.sensitive ?? {}),
     };
+    const applyPatch = (patchObj: Record<string, unknown> | undefined): void => {
+      if (!patchObj) return;
+      for (const [k, v] of Object.entries(patchObj)) {
+        if (v === null || v === undefined) {
+          delete mergedConfig[k];
+        } else {
+          mergedConfig[k] = v;
+        }
+      }
+    };
+    applyPatch(patch.config);
+    applyPatch(patch.sensitive);
     const adapter = requireResourceAdapter(row.kind);
     const validation = adapter.validate({
       config: mergedConfig,
@@ -430,6 +466,9 @@ export async function updateResource(
       normalized,
     );
     update.config = publicConfig;
+    // Explicitly write null when there are no sensitive fields left so
+    // the column reflects "no secrets" instead of retaining stale
+    // ciphertexts from a previous version.
     update.sensitive = encryptEnvelope(sensitivePlain);
 
     // If new sensitive state was written, refresh captured_at/expires_at
@@ -851,7 +890,27 @@ export async function resolveDefaultResourceId(params: {
 
   // Prefer exact domain over pattern match.
   const exact = data.find((r: any) => r.domain && extractDomain(key.url ?? null) === r.domain);
-  return (exact ?? data[0]).resource_id;
+  const candidate = (exact ?? data[0]).resource_id as string;
+
+  // Defense-in-depth: even though workspace_resource_defaults is filtered
+  // by user_id above, verify the resolved resource itself is owned by the
+  // same user before returning it. RLS is the primary guard, but a stale
+  // default row (e.g. created via service-role) could otherwise cross-bind
+  // a resource owned by another tenant. Cheap single-row check.
+  const { data: ownerCheck } = await supabaseAdmin
+    .from('test_resources')
+    .select('id')
+    .eq('id', candidate)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (!ownerCheck) {
+    logger.warn(
+      '[TEST_RESOURCE] Default points to resource not owned by caller — ignoring',
+      { userId, projectId, kind: key.kind, candidate },
+    );
+    return null;
+  }
+  return candidate;
 }
 
 export async function setDefaultResource(params: {

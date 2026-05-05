@@ -38,6 +38,20 @@ export interface LiteElement {
   /** True when the raw id was filtered out as framework-generated. Locator-plan-builder skips id-strategy when true. */
   isDynamicId?: boolean;
   /**
+   * Raw `el.textContent.trim()` text — the unprocessed visible text of
+   * the element. Distinct from `name` (which is the WAI-ARIA accessible
+   * name cascade: aria-labelledby > aria-label > label > placeholder >
+   * title > text). For native semantic elements (`<button>`, `<a>`)
+   * `text === name` most of the time; for div-buttons / icon-buttons
+   * AX returns `name=""` while raw text is the source of truth for
+   * resolver matching. Capped at ~100 chars.
+   *
+   * Populated by both snapshot-collector (preview path) and
+   * CdpSnapshotService (CDP path) so the regression-side adapter can
+   * map to InteractiveNode.text without falling back to `name` only.
+   */
+  text?: string;
+  /**
    * V26: First non-empty text fragment from a single DOM child (not the
    * concatenated full innerText). Set when extraction logic finds a Text
    * leaf or short element child whose text is meaningfully different from
@@ -220,6 +234,24 @@ export interface LiteElement {
   hasAriaHaspopup?: boolean;
   /** Resolved href for <a> elements (absolute URL) */
   href?: string;
+
+  /**
+   * Etap 1B.2 — Angular routerLink directive value. Read from the
+   * `routerlink` attribute (HTML attrs are case-insensitive — the
+   * CDP/DOMSnapshot decoder lowercases keys, so the attribute name
+   * here is also lowercase). Symmetric with the evaluate-side
+   * snapshot-collector (line 2492) and the recorder probe — drift
+   * here breaks identity matching at replay on Angular apps.
+   * Capped at 100 chars (DS source 200 max).
+   */
+  routerLink?: string;
+  /**
+   * Etap 1B.2 — Angular reactive-forms `formControlName` directive
+   * value. Strong identity signal for inputs in Angular forms where
+   * `name`/`id` are auto-generated. Read from `formcontrolname`
+   * attribute (lowercased like routerLink). Capped at 60 chars.
+   */
+  formControlName?: string;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // V8: Visual properties for LLM element matching

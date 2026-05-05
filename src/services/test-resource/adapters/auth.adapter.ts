@@ -102,8 +102,13 @@ export const authAdapter: ResourceAdapter<AuthConfig, AuthSensitive> = {
 
   /**
    * Inject cached login state into the live browser context. Cookies go
-   * via `addCookies()`, localStorage via an in-page `evaluate()` followed
-   * by a reload so the app sees the state on its next render.
+   * via `addCookies()`; localStorage via an in-page `evaluate()` after a
+   * navigation to the origin. The caller (test-executor) does its own
+   * `navigateToUrl(testUrl)` AFTER apply returns — that navigation acts
+   * as the effective reload, so the app re-mounts and reads the freshly
+   * seeded storage on render. We deliberately do NOT issue an extra
+   * `page.reload()` here — it would add a wasted network round-trip per
+   * test for no observable benefit.
    *
    * Idempotent: re-applying overwrites — if the runner retries, no cookie
    * duplication.
@@ -111,14 +116,15 @@ export const authAdapter: ResourceAdapter<AuthConfig, AuthSensitive> = {
   async apply(ctx, resource) {
     const state = resource.sensitive.storageState;
     if (!state) {
-      // Empty profile — caller should have triggered capture/heal first.
-      // Leaving this as a warning because the adapter itself can't do
-      // anything useful without state; the supervisor decides whether to
-      // refuse the run.
-      logger.warn('[AUTH_ADAPTER] apply called with no storageState', {
-        resourceId: resource.id,
-      });
-      return;
+      // Empty profile is a hard error at apply time. Reaching this branch
+      // means the resource is `active` (otherwise the applier would have
+      // tried to heal first) yet has no actual session payload — that is
+      // either a corrupt write or a service bug. Failing here surfaces a
+      // clear "re-record" CTA instead of letting the test run without auth
+      // and fail later with a misleading "login button not found" error.
+      throw new Error(
+        `Auth resource "${resource.name}" has no storageState — re-record the login`,
+      );
     }
 
     if (!ctx.context) {

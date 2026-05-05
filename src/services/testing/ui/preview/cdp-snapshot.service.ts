@@ -38,7 +38,7 @@
  *     (preview piggyback path, Week 5).
  */
 
-import type { CDPSession, Page } from 'playwright';
+import type { CDPSession, Frame, Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import type { LiteElement, LiteSnapshot, ObstacleFact, TransientStateInfo } from '@/agent/core/lite/lite-types';
 import {
@@ -499,6 +499,24 @@ function buildLiteElementFromNode(args: {
   axNode: unknown;
   dsNodeIndex: number;
   docIndex: number;
+  /**
+   * Resolved document URL for the DS document this node belongs to.
+   * Required for matching CDP DocumentSnapshot to a Playwright `Frame`
+   * during Phase 3.5 ref assignment — the only reliable bridge between
+   * the two APIs (Playwright doesn't expose CDP frameId; URL is what
+   * both sides agree on). Empty string for the main frame is fine —
+   * Phase 3.5 short-circuits docIndex=0 to `page.mainFrame()` directly.
+   */
+  docUrl?: string;
+  /**
+   * Direct-child text content for this DS node, accumulated from
+   * `nodes.textValue` (text leaves whose parentIndex points at this
+   * node). Distinct from AX `name` — `text` is the raw visible string,
+   * `name` is the WAI-ARIA cascade. Both are needed: `text` for
+   * resolver matching on icon-poor div-buttons, `name` for accessible
+   * name fingerprint match.
+   */
+  rawText?: string;
 }): LiteElement {
   const { tagName, attrs, bounds, styles, axNode } = args;
 
@@ -563,6 +581,11 @@ function buildLiteElementFromNode(args: {
     ref: '',
     role,
     name: axName,
+    // Raw visible text (DS textValue → trimmed, capped at ~100 chars)
+    // — see args.rawText doc for the AX-name-vs-raw-text rationale.
+    // Undefined when no direct text child exists (icon-only buttons,
+    // empty containers); resolver consumers must tolerate this.
+    text: args.rawText && args.rawText.length > 0 ? args.rawText : undefined,
     tag: tagName,
     visible,
     // Identity fields — see Q5 block above. `id` is stable-only
@@ -624,6 +647,21 @@ function buildLiteElementFromNode(args: {
     ariaActiveDescendant: attrs.get('aria-activedescendant') || undefined,
     dataRowKey: attrs.get('data-row-key') || undefined,
     href: tagName === 'a' ? attrs.get('href') || undefined : undefined,
+    // Etap 1B.2 — Angular routerLink + formControlName. Symmetric with
+    // snapshot-collector.ts:2492-2499 and PROBE_AT_POINT_FN. Same length
+    // gates: drop pathologically long values (cap-at-source 200/80) but
+    // preserve typical paths/names by slicing to 100/60. HTML attrs are
+    // case-insensitive — DS decoder lowercases keys, so 'routerlink' and
+    // 'formcontrolname' are the canonical lookup keys here regardless of
+    // how the source HTML wrote them ('routerLink' / 'RouterLink' / etc).
+    routerLink: ((): string | undefined => {
+      const v = attrs.get('routerlink');
+      return v && v.length > 0 && v.length < 200 ? v.slice(0, 100) : undefined;
+    })(),
+    formControlName: ((): string | undefined => {
+      const v = attrs.get('formcontrolname');
+      return v && v.length > 0 && v.length < 80 ? v.slice(0, 60) : undefined;
+    })(),
     // ARIA boolean states — DS attributes are strings ('true'/'false');
     // normalise to boolean | undefined so downstream consumers don't
     // re-parse.
@@ -651,12 +689,29 @@ function buildLiteElementFromNode(args: {
     borderRadius: styles?.borderRadius || undefined,
   };
 
+  // iframeSource — public field on LiteElement that consumers can use
+  // to detect "this node lives in an iframe". Mirrors the legacy
+  // background-collector's `containerTitles: ["iframe: <url>"]` hint
+  // but typed and structured. Only populated for non-main docs so
+  // single-frame pages don't get noise. Survives the strip pass
+  // because it's a real LiteElement field (unlike __docIndex).
+  if (args.docIndex !== 0 && args.docUrl) {
+    el.iframeSource = args.docUrl;
+  }
+
   // Stash internal indexes for ancestry / shadow walks in Phase 3c.
   // Stripped before LiteSnapshot leaves the service.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (el as any).__dsNodeIndex = args.dsNodeIndex;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (el as any).__docIndex = args.docIndex;
+  // Document URL — only stashed for non-main frames; Phase 3.5 uses it
+  // to find the matching Playwright Frame for per-frame ref assignment.
+  // Stripped before LiteSnapshot leaves the service alongside __docIndex.
+  if (args.docUrl) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (el as any).__docUrl = args.docUrl;
+  }
 
   return el;
 }
@@ -983,16 +1038,19 @@ export class CdpSnapshotService {
         totalMs,
       };
 
-      // Strip internal stash (`__dsNodeIndex`, `__docIndex`) before
-      // returning — they were used by Phase 3c-Node and Phase 5 walks
-      // and must not leak into consumers (LiteElement type doesn't
-      // expose them, but they exist on the object via `as any` casts).
+      // Strip internal stash (`__dsNodeIndex`, `__docIndex`, `__docUrl`)
+      // before returning — they were used by Phase 3c-Node, Phase 5
+      // walks, and Phase 3.5 per-frame ref assignment, and must not
+      // leak into consumers (LiteElement type doesn't expose them,
+      // but they exist on the object via `as any` casts).
       // Cleanup is in-place: same array, no allocation.
       for (const el of elements) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         delete (el as any).__dsNodeIndex;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         delete (el as any).__docIndex;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        delete (el as any).__docUrl;
       }
 
       const snapshot: LiteSnapshot = {
@@ -1267,6 +1325,11 @@ export class CdpSnapshotService {
       if (!doc?.nodes) continue;
       const nodes = doc.nodes;
       const layout = doc.layout ?? {};
+      // documentURL is a StringIndex into the `strings` table. For
+      // main frame it equals the page URL; for iframes it's the iframe
+      // src (or about:blank for empty iframes). Used by Phase 3.5 to
+      // route per-frame evaluate to the right Playwright Frame.
+      const docUrl: string = docIdx === 0 ? '' : getStr(doc.documentURL);
 
       // layout.nodeIndex maps layout-row → DS node index. We need the
       // inverse: DS node index → layout row, so we can read bounds /
@@ -1275,6 +1338,36 @@ export class CdpSnapshotService {
       const layoutNodeIndex: number[] = Array.isArray(layout.nodeIndex) ? layout.nodeIndex : [];
       for (let i = 0; i < layoutNodeIndex.length; i++) {
         layoutByNodeIdx.set(layoutNodeIndex[i], i);
+      }
+
+      // Direct-text accumulator: walk DS textValue array and build a
+      // map { parentNodeIndex → concatenated direct-child text, capped
+      // at 100 chars }. Mirrors the Phase 3c-Node textByParent gather
+      // (line ~2089), but built per-doc here so iframe text reaches
+      // LiteElement.text. AX `name` would not capture this on
+      // descriptor-poor div-buttons (`<div><span>Save</span></div>`)
+      // — without raw text the resolver loses the only matchable
+      // string for half the buttons on icon-heavy SPAs.
+      const textByParentIdx = new Map<number, string>();
+      const tv = nodes.textValue;
+      if (tv && Array.isArray(tv.index) && Array.isArray(tv.value)) {
+        const indexes: number[] = tv.index;
+        const values: number[] = tv.value;
+        const parentIdx: number[] = Array.isArray(nodes.parentIndex) ? nodes.parentIndex : [];
+        for (let i = 0; i < indexes.length; i++) {
+          const textNodeIdx = indexes[i];
+          const parent = parentIdx[textNodeIdx];
+          if (typeof parent === 'number' && parent >= 0) {
+            const existing = textByParentIdx.get(parent) ?? '';
+            if (existing.length < 100) {
+              const chunk = getStr(values[i]).trim();
+              if (chunk.length > 0) {
+                const next = (existing.length > 0 ? existing + ' ' : '') + chunk;
+                textByParentIdx.set(parent, next.slice(0, 100));
+              }
+            }
+          }
+        }
       }
 
       const nodeCount = Array.isArray(nodes.nodeName) ? nodes.nodeName.length : 0;
@@ -1318,7 +1411,8 @@ export class CdpSnapshotService {
 
         elements.push(buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
-          dsNodeIndex: i, docIndex: docIdx,
+          dsNodeIndex: i, docIndex: docIdx, docUrl,
+          rawText: textByParentIdx.get(i),
         }));
       }
 
@@ -1369,7 +1463,8 @@ export class CdpSnapshotService {
 
         elements.push(buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
-          dsNodeIndex: i, docIndex: docIdx,
+          dsNodeIndex: i, docIndex: docIdx, docUrl,
+          rawText: textByParentIdx.get(i),
         }));
         tier1Indexes.add(i);
       }
@@ -1398,7 +1493,8 @@ export class CdpSnapshotService {
 
         elements.push(buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
-          dsNodeIndex: i, docIndex: docIdx,
+          dsNodeIndex: i, docIndex: docIdx, docUrl,
+          rawText: textByParentIdx.get(i),
         }));
         tier2Added++;
       }
@@ -1453,9 +1549,12 @@ export class CdpSnapshotService {
   private static async assignAgentRefs(page: Page, elements: LiteElement[]): Promise<void> {
     if (elements.length === 0) return;
 
-    // Group elements by document. Cross-origin iframes need their own
-    // evaluate against their own page context. Today most pages have
-    // only one document; the loop is a no-op cost for single-doc.
+    // Group elements by document. Each DS document corresponds to a
+    // distinct execution context: main frame at docIdx=0, then one per
+    // iframe (same-origin AND cross-origin — DS gives all of them).
+    // Same-origin iframes accept frame.evaluate; cross-origin reject
+    // with "evaluate" disallowed and we drop those elements (the
+    // post-collect filter in collect() removes them by empty ref).
     const byDoc = new Map<number, LiteElement[]>();
     for (const el of elements) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1466,18 +1565,122 @@ export class CdpSnapshotService {
       byDoc.set(key, list);
     }
 
-    // For now: single evaluate against main frame only. Iframe-aware
-    // ref assignment is part of the iframe project (separate plan in
-    // memory). When we cross that bridge, this loop becomes a per-
-    // frame evaluate via `page.frames().find(...)`. Today's collector
-    // also skips iframes, so we're at parity.
-    const mainFrameElements = byDoc.get(0) ?? elements;
-    if (mainFrameElements.length === 0) return;
+    // Per-document ref assignment. main frame always docIdx=0 (DS
+    // contract). For iframes we look up the matching Playwright Frame
+    // by URL — Playwright doesn't expose CDP frameId directly, but
+    // both sides agree on the document URL. Multiple frames sharing
+    // the same URL are rare (server-rendered iframe gallery); when it
+    // happens we pick the first match and accept best-effort.
+    //
+    // URL normalization: Chromium and Playwright sometimes report the
+    // same iframe with cosmetic differences — trailing slash on root
+    // (`https://x.com` vs `https://x.com/`), upper-case in host
+    // (`Example.COM` from a server-rendered src vs `example.com` from
+    // Playwright). Strict equality misses these; normalize both sides
+    // to host-lowercase + path-default-slash before compare. We DO
+    // NOT touch query/hash because some sites use them as iframe
+    // identifiers (cache-busting `?v=N` etc — equality is the right
+    // signal there). Fallback to raw equality if URL parser fails on
+    // either side (data: URIs, malformed src — rare but possible).
+    const normalizeFrameUrl = (rawUrl: string): string => {
+      if (!rawUrl) return rawUrl;
+      try {
+        const u = new URL(rawUrl);
+        // Empty path → '/'. Other paths kept as-is (no implicit
+        // trailing-slash strip — `/foo/` and `/foo` are distinct
+        // routes for many SPA routers).
+        const path = u.pathname || '/';
+        return `${u.protocol}//${u.host.toLowerCase()}${path}${u.search}${u.hash}`;
+      } catch {
+        return rawUrl;
+      }
+    };
+    for (const [docIdx, docElements] of byDoc.entries()) {
+      if (docElements.length === 0) continue;
 
-    // Build fingerprint payload. Each entry contains the fields the
-    // in-page lookup needs to find the right element AMONG candidates
-    // matching tag+role+id+testId. We pass them upfront so the
-    // evaluate doesn't re-query attributes we've already decoded.
+      // Resolve target Frame for this document.
+      let frame: Frame | null = null;
+      let frameDescriptor = 'main';
+      if (docIdx === 0) {
+        frame = page.mainFrame();
+      } else {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const docUrl = (docElements[0] as any).__docUrl as string | undefined;
+        if (docUrl && docUrl !== 'about:blank') {
+          const normalisedDocUrl = normalizeFrameUrl(docUrl);
+          frame = page.frames().find((f) => {
+            if (f.isDetached()) return false;
+            const frameUrl = f.url();
+            // Cheap fast-path: raw equality first. Only normalize when
+            // raw fails — saves URL-parse round-trips on the common
+            // case where both sides agree exactly.
+            return frameUrl === docUrl
+              || normalizeFrameUrl(frameUrl) === normalisedDocUrl;
+          }) ?? null;
+          frameDescriptor = `iframe@${docUrl.slice(0, 60)}`;
+        }
+        if (!frame) {
+          // No matching live Playwright frame (cross-origin frame that
+          // detached, navigated, or just ungettable from outside). The
+          // elements stay with empty refs; collect()'s defense filter
+          // drops them. Log once per ref-assignment cycle so operators
+          // notice stale-iframe drift on their site.
+          logger.debug('[CDP_SNAPSHOT] Skipping iframe ref assignment — no matching Playwright frame', {
+            docIdx,
+            docUrl,
+            droppedElements: docElements.length,
+          });
+          continue;
+        }
+      }
+
+      let refsByIndex: string[];
+      try {
+        refsByIndex = await this.runRefAssignmentInFrame(frame, docElements);
+      } catch (err) {
+        // Cross-origin frame, frame detached mid-eval, or context
+        // destroyed by navigation. Same outcome as null-frame: leave
+        // the elements with empty refs and let the post-collect filter
+        // drop them. Cross-origin is the canonical case here.
+        logger.debug('[CDP_SNAPSHOT] Frame ref assignment failed (likely cross-origin)', {
+          docIdx,
+          frameDescriptor,
+          droppedElements: docElements.length,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+
+      // Compact in place: assign refs and drop entries whose findElement
+      // returned null in-page (empty ref). The same loop as before, just
+      // applied to whichever per-doc array we processed.
+      let writeIdx = 0;
+      for (let i = 0; i < docElements.length; i++) {
+        const ref = refsByIndex[i] ?? '';
+        if (!ref) continue;
+        docElements[i].ref = ref;
+        docElements[writeIdx++] = docElements[i];
+      }
+      docElements.length = writeIdx;
+      // NOTE: docElements is a *new* Array (built by `byDoc.set` above),
+      // not a view into `elements`. Truncating it does NOT remove the
+      // empty-ref entries from the caller's `elements` array. The
+      // outer collect() routine has a post-pass that filters
+      // `elements` by !ref to enforce the contract (see "Defense"
+      // comment block where assignAgentRefs is called).
+    }
+  }
+
+  /**
+   * Run the in-page ref-assignment evaluate against a specific Frame.
+   * Same algorithm for main and iframe — only the execution context
+   * (which `document` / `window` it sees) differs. Extracted from the
+   * legacy single-frame implementation when iframe support landed.
+   */
+  private static async runRefAssignmentInFrame(
+    frame: Frame,
+    docElements: LiteElement[],
+  ): Promise<string[]> {
     type RefAssignmentRequest = {
       tag: string;
       role: string;
@@ -1497,7 +1700,7 @@ export class CdpSnapshotService {
       bboxH: number;
     };
 
-    const requests: RefAssignmentRequest[] = mainFrameElements.map((el) => ({
+    const requests: RefAssignmentRequest[] = docElements.map((el) => ({
       tag: el.tag,
       role: el.role || '',
       type: el.type || '',
@@ -1531,7 +1734,7 @@ export class CdpSnapshotService {
     // `Element`, `CSS` are all browser globals. Node TypeScript doesn't
     // know them; we use `any` casts at the boundary rather than wider
     // lib options (would pollute the whole file with browser types).
-    const refsByIndex: string[] = await page.evaluate((reqs: RefAssignmentRequest[]) => {
+    return frame.evaluate((reqs: RefAssignmentRequest[]) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const win = (globalThis as any).window;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1625,7 +1828,12 @@ export class CdpSnapshotService {
           continue;
         }
 
-        // Allocate fresh ref from monotonic counter.
+        // Allocate fresh ref from monotonic counter. Per-frame
+        // counters are isolated (each iframe has its own window) so
+        // refs from different frames can collide on raw value (`e1`
+        // in main + `e1` in iframe). Caller is responsible for any
+        // cross-frame disambiguation needed by downstream consumers
+        // (e.g. iframe-aware adapter for self-heal Phase 3).
         const fresh = `e${win.__agentRefCounter++}`;
         win.__agentFingerprintMap.set(key, fresh);
         el.setAttribute('data-agent-ref', fresh);
@@ -1634,24 +1842,6 @@ export class CdpSnapshotService {
 
       return out;
     }, requests);
-
-    // Apply assigned refs back to elements. Empty string = element
-    // disappeared in-page after DS captured it. We DROP these
-    // elements from the LiteElement[] (consumers can't target them
-    // anyway — no ref means no Playwright locator).
-    let writeIdx = 0;
-    for (let i = 0; i < mainFrameElements.length; i++) {
-      const ref = refsByIndex[i] ?? '';
-      if (!ref) continue;
-      mainFrameElements[i].ref = ref;
-      mainFrameElements[writeIdx++] = mainFrameElements[i];
-    }
-    mainFrameElements.length = writeIdx;
-
-    // Sync back into the original `elements` array — this works
-    // because mainFrameElements is the same Array reference for the
-    // single-document case (byDoc.get(0) returned the original list).
-    // For multi-doc this is a no-op; iframe support is separate.
   }
 
   /**

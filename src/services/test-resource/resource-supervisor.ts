@@ -25,7 +25,7 @@
 import type { BrowserContext, Page, Response as PlaywrightResponse } from 'playwright';
 import { logger } from '@/utils/core/logger';
 import { requireResourceAdapter } from './adapter-registry';
-import { captureState, markBroken } from './test-resource.service';
+import { captureState, loadDecrypted, markBroken } from './test-resource.service';
 import { withResourceMutex } from './resource-mutex';
 import type { DecryptedResource } from './types';
 import type { AppliedBinding as AppliedBindingFromApplier } from './resource-applier';
@@ -42,6 +42,13 @@ export interface RecipeExecutor {
     recipe: unknown[];
     userId: string;
     projectId: string;
+    /**
+     * Plaintext secrets keyed by `_secret_*` (from the decrypted resource
+     * sensitive envelope). Step values containing `{{_secret_<key>}}` are
+     * interpolated against this map at replay time. Optional — recipes
+     * without redacted values pass through unchanged.
+     */
+    secrets?: Record<string, string>;
   }): Promise<void>;
 }
 
@@ -63,10 +70,13 @@ export interface SupervisorConfig {
 // Detection patterns
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Match `/login`, `/signin`, `/sign-in`, `/auth`, `/oauth/*` paths regardless
-// of query string. Kept conservative — we don't want to misfire on product
-// pages that happen to have "login" in the name (use word boundaries).
-const LOGIN_URL_RE = /\/(login|signin|sign[-_]?in|auth|oauth|sso)(\/|$|\?)/i;
+// Match dedicated auth routes only. The path's LAST segment must be one
+// of the login keywords — this rules out `/auth/users`, `/oauth/clients`,
+// `/login/help` and other interior occurrences that aren't auth-loss
+// pages. We still trigger on `/login`, `/login/`, `/auth?return_to=...`,
+// `/sso/saml/init` etc. via the trailing `(\/?($|\?|#))` group.
+const LOGIN_URL_RE =
+  /\/(login|signin|sign[-_]?in|auth|oauth|sso|logon)(\/?($|\?|#))/i;
 
 /** Tracks the last navigation response's status so we can spot 401s. */
 export class NavigationStatusTracker {
@@ -99,10 +109,16 @@ export class NavigationStatusTracker {
 // Detection
 // ═══════════════════════════════════════════════════════════════════════════
 
+interface CheapSignal {
+  matched: boolean;
+  /** Trustworthy on its own (skip DOM probe). 401/403 is decisive. */
+  decisive: boolean;
+}
+
 /**
  * Detect if the current page looks like an auth-loss state. Pure + fast:
- *   (a) URL matches login pattern
- *   (b) last navigation response was 401 / 403
+ *   (a) URL matches login pattern (NOT decisive — too easy to false-positive)
+ *   (b) last navigation response was 401 / 403 (decisive)
  *
  * DOM probing (password-input detection) is intentionally NOT done here —
  * it would slow every inter-step call. Supervisor calls this first as a
@@ -112,38 +128,45 @@ export function looksLikeAuthLoss(
   page: Page,
   statusTracker: NavigationStatusTracker,
 ): boolean {
+  return cheapSignal(page, statusTracker).matched;
+}
+
+function cheapSignal(
+  page: Page,
+  statusTracker: NavigationStatusTracker,
+): CheapSignal {
+  const s = statusTracker.lastNavigationStatus();
+  if (s === 401 || s === 403) return { matched: true, decisive: true };
   try {
     const url = page.url();
-    if (url && LOGIN_URL_RE.test(url)) return true;
+    if (url && LOGIN_URL_RE.test(url)) return { matched: true, decisive: false };
   } catch {
     /* page may be closing; treat as no-signal */
   }
-  const s = statusTracker.lastNavigationStatus();
-  if (s === 401 || s === 403) return true;
-  return false;
+  return { matched: false, decisive: false };
 }
 
 /**
- * Slow-path confirmation before triggering a heal. Runs a small DOM probe
- * for a password input. Gives us one more false-positive filter (e.g.
- * pages that have `/login` in the URL but are marketing content).
+ * Slow-path confirmation before triggering a heal. URL match alone is no
+ * longer enough — many SPAs route through `/auth/...` interior paths or
+ * have legitimate `/login` marketing pages. We require a visible password
+ * input to confirm an auth-loss state. 401/403 from the status tracker is
+ * decisive on its own (caller passes `decisive=true` to skip the probe).
  */
-async function confirmAuthLoss(page: Page): Promise<boolean> {
+async function confirmAuthLoss(page: Page, decisive: boolean): Promise<boolean> {
+  if (decisive) return true;
   try {
     const hasPwd = await page
       .locator('input[type="password"]:visible')
       .first()
       .count()
       .then((n) => n > 0);
-    if (hasPwd) return true;
+    return hasPwd;
   } catch {
-    /* page may be transient */
+    // Page is transient (closing / navigating). Don't heal on a guess —
+    // the supervisor runs every step, we'll re-check shortly.
+    return false;
   }
-  // If we got here via URL/status but there's no password field, default
-  // to YES — the signals were strong and the DOM probe can race page
-  // loads. False positives on heal are cheap (one replay); false
-  // negatives corrupt the test.
-  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -166,8 +189,9 @@ export async function checkAndHealIfNeeded(
   // a non-auth resource kind (environment, etc).
   if (!cfg.authResource) return false;
 
-  if (!looksLikeAuthLoss(cfg.page, statusTracker)) return false;
-  if (!(await confirmAuthLoss(cfg.page))) return false;
+  const signal = cheapSignal(cfg.page, statusTracker);
+  if (!signal.matched) return false;
+  if (!(await confirmAuthLoss(cfg.page, signal.decisive))) return false;
 
   logger.warn('[RESOURCE_SUPERVISOR] Auth loss detected — healing', {
     resourceId: cfg.authResource.id,
@@ -175,7 +199,67 @@ export async function checkAndHealIfNeeded(
     lastStatus: statusTracker.lastNavigationStatus(),
   });
 
+  // Capture our pre-mutex view so the critical section can detect that a
+  // sibling test already healed and skip the recipe replay. expiresAt is
+  // the most reliable freshness watermark — captureState bumps it on every
+  // successful heal, so a strictly-newer value (or the absence-to-presence
+  // flip for static resources) means somebody beat us to it.
+  const staleSnapshotExpiresAt = cfg.authResource.expiresAt?.getTime() ?? null;
+
   await withResourceMutex(cfg.authResource.id, async () => {
+    // Re-read inside the lock. If the previous mutex holder just healed,
+    // the row's expires_at jumped forward — replaying the recipe again
+    // would mean N concurrent regression tests doing N sequential logins
+    // (rate-limit / lockout territory) for one shared session loss.
+    const fresh = await loadDecrypted(cfg.authResource!.id, cfg.userId);
+    const freshExpiresAt = fresh?.expiresAt
+      ? new Date(fresh.expiresAt).getTime()
+      : null;
+    const someoneElseHealed =
+      fresh != null &&
+      fresh.status === 'active' &&
+      // Either they bumped expires_at past ours, or our view had no TTL
+      // and they wrote one (stale → active transition).
+      ((staleSnapshotExpiresAt != null &&
+        freshExpiresAt != null &&
+        freshExpiresAt > staleSnapshotExpiresAt) ||
+        (staleSnapshotExpiresAt == null && freshExpiresAt != null));
+
+    if (someoneElseHealed && fresh) {
+      // Reapply the freshly-captured state into THIS test's context so the
+      // next step runs authenticated, then return — recipe replay skipped.
+      const adapter = requireResourceAdapter(fresh.kind);
+      try {
+        await adapter.apply(
+          {
+            userId: cfg.userId,
+            projectId: cfg.projectId,
+            page: cfg.page,
+            context: cfg.context,
+            runVariables: cfg.runVariables ?? new Map(),
+          },
+          fresh,
+        );
+        // Update the held snapshot so subsequent supervisor iterations
+        // compare against the now-fresh view.
+        cfg.authResource = fresh;
+        logger.info('[RESOURCE_SUPERVISOR] Sibling already healed — reapplied fresh state', {
+          resourceId: fresh.id,
+        });
+        return;
+      } catch (err) {
+        // Reapply failed — fall through to a real heal so we don't leave
+        // this test running with stale cookies.
+        logger.warn(
+          '[RESOURCE_SUPERVISOR] Reapply of sibling-healed state failed — falling back to recipe',
+          {
+            resourceId: fresh.id,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+      }
+    }
+
     await healAuthInPlace(cfg);
   });
 
@@ -214,6 +298,12 @@ async function healAuthInPlace(cfg: SupervisorConfig): Promise<void> {
       recipe: resource.recipe,
       userId: cfg.userId,
       projectId: cfg.projectId,
+      // Plaintext secrets pulled from the decrypted resource. Recipe values
+      // like `{{_secret_step123}}` resolve against this map; non-secret
+      // recipes (no placeholders) ignore it. Cast through unknown because
+      // adapters store typed sensitive fields (e.g. AuthSensitive) but the
+      // executor only cares about string values for interpolation.
+      secrets: resource.sensitive as unknown as Record<string, string>,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

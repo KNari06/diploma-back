@@ -177,12 +177,17 @@ export async function uploadAllure(req: Request, res: Response): Promise<void> {
     }
 
     // ── 4. Resolve import options from request body ───────────────────────
+    // Multipart fields arrive as strings; pass `defaultStartUrl` straight
+    // through so the type-level `normaliseDefaultStartUrl` helper validates
+    // + canonicalises in one place. Empty values (string "" / undefined)
+    // resolve to `null` and the service skips the start_url write.
     const options = resolveImportOptions({
       importTestCases:   parseBoolField(req.body.importTestCases,   true),
       autoCreateModules: parseBoolField(req.body.autoCreateModules, true),
       autoCreateFlows:   parseBoolField(req.body.autoCreateFlows,   true),
       deduplicateTests:  parseBoolField(req.body.deduplicateTests,  true),
       saveDocsToKB:      parseBoolField(req.body.saveDocsToKB,      true),
+      defaultStartUrl:   typeof req.body.defaultStartUrl === 'string' ? req.body.defaultStartUrl : undefined,
     });
 
     const importId = randomUUID();
@@ -267,11 +272,36 @@ export async function getImportStatus(req: Request, res: Response): Promise<void
       return;
     }
 
-    const { data, error } = await supabaseAdmin
-      .from('allure_imports')
-      .select('id, workspace_id, status, stats, error_message, created_at, completed_at')
-      .eq('id', importId)
-      .maybeSingle();
+    // `hierarchy` may not exist in the DB yet (pre-migration deployments).
+    // Selecting it returns null rather than failing the whole query as long
+    // as the column was added in 20260504_allure_imports_hierarchy.sql; if
+    // for some reason the column is still missing, the fallback handler
+    // below catches the "column ... does not exist" error and retries
+    // without it so legacy environments keep working.
+    // Initial select includes the optional `hierarchy` column. The TS type
+    // returned by .select() is non-narrowable to "field may not exist", so
+    // we widen the local binding with `as any` and let the runtime fallback
+    // (below) handle pre-migration deployments.
+    let data: Record<string, unknown> | null = null;
+    let error: { message?: string } | null = null;
+    {
+      const r = await supabaseAdmin
+        .from('allure_imports')
+        .select('id, workspace_id, status, stats, error_message, hierarchy, created_at, completed_at')
+        .eq('id', importId)
+        .maybeSingle();
+      data = (r.data as unknown) as Record<string, unknown> | null;
+      error = r.error;
+    }
+    if (error && /hierarchy/i.test(error.message ?? '') && /(column|does not exist|not found)/i.test(error.message ?? '')) {
+      const retry = await supabaseAdmin
+        .from('allure_imports')
+        .select('id, workspace_id, status, stats, error_message, created_at, completed_at')
+        .eq('id', importId)
+        .maybeSingle();
+      data = (retry.data as unknown) as Record<string, unknown> | null;
+      error = retry.error;
+    }
 
     if (error) {
       logger.warn('[AllureImportController] Status check DB error', {
@@ -287,7 +317,8 @@ export async function getImportStatus(req: Request, res: Response): Promise<void
       return;
     }
 
-    if (!(await verifyWorkspaceReadAccess(data.workspace_id, userId))) {
+    const workspaceId = data.workspace_id as string | undefined;
+    if (!workspaceId || !(await verifyWorkspaceReadAccess(workspaceId, userId))) {
       res.status(404).json({ success: false, error: 'Import not found' });
       return;
     }
@@ -297,6 +328,11 @@ export async function getImportStatus(req: Request, res: Response): Promise<void
       importId,
       status: data.status,
       stats: data.stats,
+      // Persisted hierarchy snapshot — frontend reads this when the WS
+      // completion event was missed (network blip, dialog re-opened later,
+      // polling fallback). Null/undefined for in-flight or pre-migration
+      // imports — caller treats those as "no tree to render".
+      hierarchy: data.hierarchy ?? null,
       errorMessage: data.error_message ?? null,
       createdAt: data.created_at,
       completedAt: data.completed_at ?? null,
@@ -333,7 +369,7 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
     // 1. Fetch the import record
     const { data: importRecord, error: importError } = await supabaseAdmin
       .from('allure_imports')
-      .select('id, project_id, workspace_id, status, stats, error_message, file_name, created_at, completed_at')
+      .select('id, project_id, user_id, workspace_id, status, stats, error_message, file_name, created_at, completed_at')
       .eq('id', importId)
       .maybeSingle();
 
@@ -352,21 +388,35 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
     }
 
     // 2. Fetch test cases created during this import window
-    //    Match by project_id + created_at between import start and completion.
-    //    Workspace membership was already verified above, so we don't re-filter
-    //    by user_id (which would exclude tests created by other teammates).
+    //
+    //    Match by project_id + user_id + created_at BETWEEN start..end. The
+    //    user_id filter is critical: without it any test case created by a
+    //    teammate in the same project during the import window would leak
+    //    into "this user's import details" — a real privacy/correctness bug
+    //    we hit when two teammates import in parallel. The current approach
+    //    has a small false-negative (a teammate's parallel import in the
+    //    same project won't include the importing user's manual creates),
+    //    which is the safe direction. A future migration adding
+    //    `intent_test_cases.import_id` would let us filter exactly.
+    //
+    //    Cap of 500 is also intentional — we don't want to ship a 10 MB
+    //    response for a 5000-test-case import. Frontend gets a banner when
+    //    the count is hit so the user knows the table isn't the full set.
     const projectId = importRecord.project_id;
+    const importUserId = (importRecord as { user_id?: string }).user_id ?? userId;
     const importStart = importRecord.created_at;
     const importEnd = importRecord.completed_at ?? new Date().toISOString();
+    const TEST_CASE_HARD_LIMIT = 500;
 
     const { data: testCases, error: tcError } = await supabaseAdmin
       .from('intent_test_cases')
       .select('id, name, description, steps_json, flow_id, tags, priority, status, created_at, test_flows(name, module_id, test_modules(name))')
       .eq('project_id', projectId)
+      .eq('user_id', importUserId)
       .gte('created_at', importStart)
       .lte('created_at', importEnd)
       .order('created_at', { ascending: true })
-      .limit(500);
+      .limit(TEST_CASE_HARD_LIMIT);
 
     if (tcError) {
       logger.warn('[AllureImportController] Failed to fetch test cases for import', {
@@ -395,6 +445,15 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
       createdAt: tc.created_at,
     }));
 
+    // Surface truncation so the frontend can show "showing first N of M"
+    // when the cap was hit. Stats already carry the real testsImported
+    // count, but the array length is what the table renders, and the gap
+    // between the two is otherwise invisible to the user.
+    const totalImported = (importRecord.stats as { testsImported?: number } | null)?.testsImported ?? 0;
+    const truncated =
+      mappedTestCases.length === TEST_CASE_HARD_LIMIT &&
+      totalImported > TEST_CASE_HARD_LIMIT;
+
     res.status(200).json({
       success: true,
       import: {
@@ -407,6 +466,9 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
         completedAt: importRecord.completed_at ?? null,
       },
       testCases: mappedTestCases,
+      testCaseLimit: TEST_CASE_HARD_LIMIT,
+      truncated,
+      totalCount: totalImported,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -129,24 +129,63 @@ async function updateImportRecord(
     error_message?: string;
     file_name?: string;
     file_size?: number;
+    /**
+     * Optional hierarchy snapshot. Stored alongside stats so the REST
+     * status endpoint can return the Module/Flow/TestCase tree without
+     * relying on the WebSocket completion event (which can be missed if
+     * the user closes the dialog at the wrong moment, or the socket
+     * dropped). Skipped for legacy DBs where the column doesn't exist —
+     * the supabase error is logged but never thrown.
+     */
+    hierarchy?: AllureImportResultHierarchy;
   },
 ): Promise<void> {
+  // Build the patch dynamically so we don't write `hierarchy: null` when the
+  // caller didn't supply one (failed imports, mid-flight failures): leaving
+  // the column untouched is the right behaviour for those rows.
+  const patch: Record<string, unknown> = {
+    status: update.status,
+    stats: update.stats,
+    error_message: update.error_message ?? null,
+    file_name: update.file_name ?? null,
+    file_size: update.file_size ?? null,
+    completed_at: new Date().toISOString(),
+  };
+  if (update.hierarchy !== undefined) {
+    patch.hierarchy = update.hierarchy;
+  }
+
   const { error } = await supabaseAdmin
     .from('allure_imports')
-    .update({
-      status: update.status,
-      stats: update.stats,
-      error_message: update.error_message ?? null,
-      file_name: update.file_name ?? null,
-      file_size: update.file_size ?? null,
-      completed_at: new Date().toISOString(),
-    })
+    .update(patch)
     .eq('id', importId);
 
   if (error) {
+    // If the `hierarchy` column doesn't exist yet (old DB without the
+    // 20260504 migration applied) Supabase returns "column ... does not
+    // exist". Retry once without that field so the rest of the update
+    // (status/stats) still lands.
+    const msg = error.message ?? '';
+    if (update.hierarchy !== undefined && /hierarchy/i.test(msg) && /(column|does not exist|not found)/i.test(msg)) {
+      logger.warn('[AllureImport] hierarchy column missing — retrying without it', {
+        importId,
+      });
+      delete patch.hierarchy;
+      const retry = await supabaseAdmin
+        .from('allure_imports')
+        .update(patch)
+        .eq('id', importId);
+      if (retry.error) {
+        logger.warn('[AllureImport] Failed to update import record (retry)', {
+          importId,
+          error: retry.error.message,
+        });
+      }
+      return;
+    }
     logger.warn('[AllureImport] Failed to update import record', {
       importId,
-      error: error.message,
+      error: msg,
     });
   }
 }
@@ -299,11 +338,17 @@ export async function processAllureImport(
           );
 
           // Create test case (create() does not support tags/priority)
+          // `defaultStartUrl` is null when the user didn't supply one — pass
+          // `undefined` (not `null`) so the service falls through to its own
+          // default branch (`start_url = null`) instead of writing a literal
+          // "null" string. Identical end state, but the explicit `undefined`
+          // documents intent and matches the function signature.
           const created = await IntentTestCaseService.create({
             projectId: mapped.createParams.projectId,
             userId: mapped.createParams.userId,
             name: mapped.createParams.name,
             description: mapped.createParams.description || undefined,
+            startUrl: options.defaultStartUrl ?? undefined,
             steps: mapped.createParams.steps,
             flowId: mapped.createParams.flowId,
             status: mapped.createParams.status,
@@ -328,11 +373,19 @@ export async function processAllureImport(
                 priority: mapped.createParams.priority,
               });
             } catch (updateErr) {
-              // Non-fatal — test case was created successfully, just without tags/priority
+              // Non-fatal — the test case itself was created. We surface the
+              // failure both in the per-import error log AND `stats.errors`
+              // so the user sees it in the results panel ("warnings"
+              // section) instead of having tags/priority silently dropped
+              // with no UI indication.
+              const errMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
               logger.warn('[AllureImport] Could not update tags/priority for test case', {
                 testCaseId: created.id,
-                error: updateErr instanceof Error ? updateErr.message : String(updateErr),
+                error: errMsg,
               });
+              stats.errors.push(
+                `Tags/priority not saved for "${created.name}": ${errMsg}`,
+              );
             }
           }
 
@@ -446,6 +499,9 @@ export async function processAllureImport(
     stats,
     file_name: jobData.originalFileName,
     file_size: jobData.originalFileSize,
+    // Snapshot the tree alongside stats so the REST endpoint can return it
+    // even if the user missed the WS completion event.
+    hierarchy,
   });
 
   await removeAllureObject(storageKey);
@@ -610,11 +666,15 @@ async function processCsvPdfImport(
           const description = descParts.join('\n\n');
 
           // Create test case
+          // CSV/PDF imports also benefit from a default start URL — symmetric
+          // with the ZIP path above. See note there for why we pass `undefined`
+          // instead of `null` when the option is unset.
           const created = await IntentTestCaseService.create({
             projectId,
             userId,
             name: tc.name,
             description: description || undefined,
+            startUrl: options.defaultStartUrl ?? undefined,
             steps,
             ...(flowId && { flowId }),
             status: 'draft',
@@ -634,10 +694,17 @@ async function processCsvPdfImport(
                 priority,
               });
             } catch (updateErr) {
+              // Mirror of the ZIP-path handling above: surface in
+              // stats.errors so the user sees the warning in the results
+              // panel instead of silently losing tags/priority.
+              const errMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
               logger.warn('[AllureCsvPdfImport] Could not update tags/priority', {
                 testCaseId: created.id,
-                error: updateErr instanceof Error ? updateErr.message : String(updateErr),
+                error: errMsg,
               });
+              stats.errors.push(
+                `Tags/priority not saved for "${created.name}": ${errMsg}`,
+              );
             }
           }
 
@@ -716,6 +783,9 @@ async function processCsvPdfImport(
     stats,
     file_name: jobData.originalFileName,
     file_size: jobData.originalFileSize,
+    // Mirror of the ZIP-path behaviour — REST status returns the tree even
+    // if the WS completion event was missed.
+    hierarchy,
   });
   await removeAllureObject(storageKey);
 

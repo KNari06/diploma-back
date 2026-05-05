@@ -338,17 +338,70 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     // ═══════════════════════════════════════════════════════════════════════
     if (testData.resourceBindings && testData.resourceBindings.length > 0) {
       try {
+        // Pre-run heal hook. If a binding is stale at start (e.g. cookies
+        // expired between enqueue and pickup, or a previous run hadn't
+        // captured yet) we replay the recipe BEFORE the test so it doesn't
+        // fail on step 1 with "session lost" + then rely on the in-step
+        // supervisor to bail it out. Same recipe runner the supervisor
+        // uses — keeps behaviour identical between pre-run and mid-run heal.
+        const preRunRecipeRunner = createCommandExecutorRecipeRunner();
+        const preRunHealHook = async (resource: import('@/services/test-resource').DecryptedResource): Promise<void> => {
+          if (resource.kind !== 'auth') {
+            // Only auth has a heal recipe today. Other kinds will get
+            // their own healHook flavours — for now leave them to the
+            // service-level markBroken path.
+            throw new Error(
+              `pre-run healHook only supports auth, got kind=${resource.kind}`,
+            );
+          }
+          if (!Array.isArray(resource.recipe) || resource.recipe.length === 0) {
+            throw new Error(
+              `Auth "${resource.name}" is stale and has no recipe to replay`,
+            );
+          }
+          await preRunRecipeRunner.run({
+            page: page!,
+            context: context!,
+            recipe: resource.recipe,
+            userId: testData.userId ?? '',
+            projectId: testData.projectId,
+            // Plaintext secrets for `{{_secret_*}}` interpolation in the
+            // recipe. The applier loads + decrypts before invoking this
+            // hook, so `resource.sensitive` is plaintext at this point.
+            secrets: resource.sensitive as unknown as Record<string, string>,
+          });
+          // Snapshot fresh state via the adapter and persist via service.
+          const adapter = (
+            await import('@/services/test-resource/adapter-registry')
+          ).requireResourceAdapter('auth');
+          if (!adapter.capture) {
+            throw new Error('auth adapter has no capture()');
+          }
+          const captured = await adapter.capture({
+            userId: testData.userId ?? '',
+            projectId: testData.projectId,
+            page: page!,
+            context: context!,
+            runVariables: new Map(),
+          });
+          const { captureState } = await import(
+            '@/services/test-resource/test-resource.service'
+          );
+          await captureState(
+            resource.id,
+            testData.userId ?? '',
+            { config: captured.config, sensitive: captured.sensitive },
+            { heal: true },
+          );
+        };
+
         resourceApply = await applyBindingsToContext({
           userId: testData.userId ?? '',
           projectId: testData.projectId,
           context,
           page,
           bindings: testData.resourceBindings,
-          // Pre-run heal path: the supervisor isn't wired yet (no step
-          // loop running). For the MVP we let stale auth resources fall
-          // through to markBroken rather than replay a recipe with no
-          // executor — the supervisor between steps will heal on the
-          // first live loss anyway.
+          healHook: preRunHealHook,
         });
         logger.info('[PLAYWRIGHT] Test resources applied', {
           testId: testData.testId,
@@ -867,10 +920,31 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   description: intentMeta?.elementDescription,
                   url: activePage.url(),
                   bugScreenshotUrl,
+                  // Full enriched meta with healing provenance / readiness
+                  // trace / network verdict — same shape as step_completed.
+                  runtimeMeta: enrichedMeta,
                   errors: {
                     console: updatedStepErrors.consoleErrors.length,
                     network: updatedStepErrors.networkErrors.length,
                     ui: updatedStepErrors.uiErrors.length,
+                    // See note on consoleSample/networkSample/uiSample
+                    // shapes at the equivalent block elsewhere in this
+                    // file — same fields, same 200-char cap.
+                    consoleSample: updatedStepErrors.consoleErrors.slice(-3).map((e) => ({
+                      message: String(e.message || '').slice(0, 200),
+                      source: e.source,
+                      line: e.line,
+                    })),
+                    networkSample: updatedStepErrors.networkErrors.slice(-3).map((e) => ({
+                      method: e.method,
+                      url: e.url,
+                      status: e.status,
+                      error: e.error,
+                    })),
+                    uiSample: updatedStepErrors.uiErrors.slice(-3).map((e) => ({
+                      text: String(e.text || '').slice(0, 200),
+                      selector: e.selector,
+                    })),
                   },
                 },
               });
@@ -1015,10 +1089,33 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     networkEvidence: validation4xxErrors.map(e => ({
                       method: e.method, url: e.url, status: e.status,
                     })),
+                    description: intentMeta?.elementDescription,
+                    url: activePage.url(),
+                    // Full enriched runtime meta — same shape as
+                    // step_completed payload. Pulls in healing provenance,
+                    // resolution path, readiness trace, blocker diagnosis,
+                    // network verdict, etc. Critical for offline bug-report
+                    // generation that reads JSONL directly.
+                    runtimeMeta: enrichedMeta,
                     errors: {
                       console: updatedStepErrors.consoleErrors.length,
                       network: updatedStepErrors.networkErrors.length,
                       ui: updatedStepErrors.uiErrors.length,
+                      consoleSample: updatedStepErrors.consoleErrors.slice(-3).map((e) => ({
+                        message: String(e.message || '').slice(0, 200),
+                        source: e.source,
+                        line: e.line,
+                      })),
+                      networkSample: updatedStepErrors.networkErrors.slice(-3).map((e) => ({
+                        method: e.method,
+                        url: e.url,
+                        status: e.status,
+                        error: e.error,
+                      })),
+                      uiSample: updatedStepErrors.uiErrors.slice(-3).map((e) => ({
+                        text: String(e.text || '').slice(0, 200),
+                        selector: e.selector,
+                      })),
                     },
                   },
                 });
@@ -1088,6 +1185,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             }
 
             // Log step_completed to replay trace
+            // May 2026 — payload widened to surface every StepRuntimeMeta
+            // field already collected by CommandExecutor / SelfHealing.
+            // Earlier versions cherry-picked a handful (source / resolutionPath /
+            // healConfidence) and the rest stayed in-memory only — that
+            // hid healing provenance, fingerprint match details, network
+            // verdict, slow APIs, root cause from the trace JSONL the bug
+            // analyzer reads. Spreading the whole `meta` keeps fields
+            // forward-compatible without per-field touch-ups.
             replayTrace.write({
               eventType: isSoftFailure ? 'step_soft_failed' : 'step_completed', step: currentStepIndex, totalSteps,
               payload: {
@@ -1096,16 +1201,51 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 url: activePage.url(),
                 softFailure: isSoftFailure || undefined,
                 softFailureError: isSoftFailure ? stepResult.error : undefined,
-                source: meta?.source, resolutionPath: meta?.resolutionPath,
-                usedStrategy: meta?.usedLocatorStrategy, confidence: meta?.confidenceTier,
-                healed: meta?.source === 'self_heal', healConfidence: meta?.healConfidence,
+                // Full runtime-meta dump — see StepRuntimeMeta in
+                // preview.types.ts for the complete field list
+                // (resolutionPath, healedFrom/To/WhatChanged,
+                // compiledExpired, pageSignatureMatched, autoWaitApplied,
+                // rootCause, networkVerdict, networkEvidence, slowApiCalls,
+                // readinessTrace, blockerDiagnosis, retryAttempts,
+                // failedReason, failureExplanation, etc).
+                runtimeMeta: meta,
+                // Convenience flat fields kept for downstream parsers
+                // that already grep on these names — duplicates `meta`
+                // but no extra IO.
+                source: meta?.source,
+                resolutionPath: meta?.resolutionPath,
+                usedStrategy: meta?.usedLocatorStrategy,
+                confidence: meta?.confidenceTier,
+                healed: meta?.source === 'self_heal',
+                healConfidence: meta?.healConfidence,
                 retryAttempts: meta?.retryAttempts,
-                readinessTrace: meta?.readinessTrace,
-                blockerDiagnosis: meta?.blockerDiagnosis,
                 errors: {
                   console: stepErrors.consoleErrors.length,
                   network: stepErrors.networkErrors.length,
                   ui: stepErrors.uiErrors.length,
+                  // Up to 3 most-recent of each — enough to triage
+                  // without bloating the JSONL on noisy pages.
+                  // ConsoleError shape (intelligent-testing.types.ts:127):
+                  // { message, source?, line?, timestamp }. UiError shape:
+                  // { text, selector?, timestamp }. We dump up to 3 of
+                  // each; the bug analyzer reads these to build "console
+                  // exceptions during this step" / "DOM error banners
+                  // shown" sections of the report.
+                  consoleSample: stepErrors.consoleErrors.slice(-3).map((e) => ({
+                    message: String(e.message || '').slice(0, 200),
+                    source: e.source,
+                    line: e.line,
+                  })),
+                  networkSample: stepErrors.networkErrors.slice(-3).map((e) => ({
+                    method: e.method,
+                    url: e.url,
+                    status: e.status,
+                    error: e.error,
+                  })),
+                  uiSample: stepErrors.uiErrors.slice(-3).map((e) => ({
+                    text: String(e.text || '').slice(0, 200),
+                    selector: e.selector,
+                  })),
                 },
               },
             });
@@ -1337,10 +1477,36 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 compiledStrategies: (command as any).intentMeta?.compiled?.locatorPlan?.map((l: any) => l.strategy),
                 bindingHints: (command as any).intentMeta?.bindingHints,
                 networkEvidence: finalMeta.networkEvidence,
+                // Full StepRuntimeMeta — healing provenance, readiness
+                // trace, slow APIs, blocker diagnosis. The flat `source`/
+                // `resolutionPath` above are duplicated for grep-friendly
+                // existing tooling; new code should read `runtimeMeta.*`.
+                runtimeMeta: finalMeta,
                 errors: {
                   console: stepErrors.consoleErrors.length,
                   network: stepErrors.networkErrors.length,
                   ui: stepErrors.uiErrors.length,
+                  // ConsoleError shape (intelligent-testing.types.ts:127):
+                  // { message, source?, line?, timestamp }. UiError shape:
+                  // { text, selector?, timestamp }. We dump up to 3 of
+                  // each; the bug analyzer reads these to build "console
+                  // exceptions during this step" / "DOM error banners
+                  // shown" sections of the report.
+                  consoleSample: stepErrors.consoleErrors.slice(-3).map((e) => ({
+                    message: String(e.message || '').slice(0, 200),
+                    source: e.source,
+                    line: e.line,
+                  })),
+                  networkSample: stepErrors.networkErrors.slice(-3).map((e) => ({
+                    method: e.method,
+                    url: e.url,
+                    status: e.status,
+                    error: e.error,
+                  })),
+                  uiSample: stepErrors.uiErrors.slice(-3).map((e) => ({
+                    text: String(e.text || '').slice(0, 200),
+                    selector: e.selector,
+                  })),
                 },
               },
             });
