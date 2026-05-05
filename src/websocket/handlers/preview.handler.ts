@@ -410,6 +410,11 @@ async function closeFieldSession(
       // — see TargetFingerprint vs BindingHints in preview.types.ts.
       bindingHints: fs.bindingHints,
       recordedFingerprint: fs.recordedFingerprint,
+      // Forward the input's `type` attribute (e.g. 'password', 'email') so
+      // downstream consumers like preview:save-login can redact / move
+      // sensitive values into the encrypted resource envelope. Pure
+      // metadata — never affects replay.
+      ...(fs.elementType ? { recordedInputType: fs.elementType } : {}),
       evidence: {
         pageUrl: fs.pageUrl,
       },
@@ -6165,6 +6170,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     domain?: string;
     ttlSeconds?: number;
     setAsDefault?: boolean;
+    /**
+     * Optional IntentStep[] captured during the "Record New Login" flow.
+     * When present, the handler walks the steps, moves any password-typed
+     * `value` into the encrypted resource envelope under a generated
+     * `_secret_<id>` key, and replaces the in-step value with a
+     * `{{_secret_<id>}}` placeholder. RecipeExecutor interpolates it back
+     * at heal time. Steps with no sensitive content pass through unchanged.
+     * Empty / missing array = no recipe stored (heal won't be possible).
+     */
+    recipe?: Array<Record<string, unknown>>;
   }) => {
     const emitResult = (payload: {
       success: boolean;
@@ -6196,7 +6211,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
-      const { previewSessionId, resourceId, name, description, domain, ttlSeconds, setAsDefault } = data || {};
+      const { previewSessionId, resourceId, name, description, domain, ttlSeconds, setAsDefault, recipe: rawRecipe } = data || {};
       if (!previewSessionId) {
         emitResult({ success: false, error: 'Missing previewSessionId' });
         return;
@@ -6276,12 +6291,47 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         return;
       }
 
+      // ─────────────────────────────────────────────────────────────────────
+      // Recipe redaction (Step A of recipe-active heal).
+      //
+      // The FE passes the user-recorded `editorSteps` as `recipe` so heal can
+      // replay the login flow. Type-steps targeting `<input type="password">`
+      // (and other secret-kind inputs the recorder tagged via
+      // `recordedInputType`) carry plaintext in `step.value` — the helper
+      // below moves those values into the encrypted resource envelope and
+      // leaves a `{{_secret_<key>}}` placeholder in the step. RecipeExecutor
+      // interpolates back at replay (Step D).
+      //
+      // Single source of truth: `redactRecipeForResource` lives in
+      // `runtime/recipe-redaction.ts` so the regex / key shape stays in
+      // sync with `interpolateRecipeSecrets` on the read side.
+      // ─────────────────────────────────────────────────────────────────────
+      const { redactRecipeForResource } = await import(
+        '@/services/test-resource/runtime/recipe-redaction'
+      );
+      const { recipe: redactedRecipe, sensitive: recipeSensitive } =
+        redactRecipeForResource(rawRecipe);
+      // Merge any redacted secrets into the captured sensitive envelope.
+      // createResource / captureState encrypts the merged map field-by-field.
+      if (Object.keys(recipeSensitive).length > 0) {
+        captured.sensitive = { ...captured.sensitive, ...recipeSensitive };
+      }
+
       const testResourceService = await import('@/services/test-resource/test-resource.service');
       try {
         if (resourceId) {
           // Update path: re-capture into an existing resource. The service
           // helper takes positional args and returns void — we re-read
           // through loadDecrypted to echo the updated row to the caller.
+          // Note: when the caller supplies a recipe we ALSO call updateResource
+          // to persist the new recipe array — captureState only touches
+          // config/sensitive/freshness, never `recipe`.
+          if (redactedRecipe.length > 0) {
+            await testResourceService.updateResource(resourceId, ensuredUserId, {
+              recipe: redactedRecipe,
+              refreshMethod: 'ui_recipe',
+            });
+          }
           await testResourceService.captureState(
             resourceId,
             ensuredUserId,
@@ -6328,7 +6378,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             config: captured.config,
             sensitive: captured.sensitive,
             ttlSeconds: ttlSeconds ?? 7 * 24 * 60 * 60,
-            refreshMethod: 'manual',
+            // When a recipe was recorded, refresh_method is `ui_recipe` so
+            // the supervisor will replay it on auth loss; otherwise stay on
+            // `manual` (legacy: user re-records via preview).
+            refreshMethod: redactedRecipe.length > 0 ? 'ui_recipe' : 'manual',
+            recipe: redactedRecipe.length > 0 ? redactedRecipe : undefined,
           });
 
           // Optional default upsert — mirrors the REST controller's logic

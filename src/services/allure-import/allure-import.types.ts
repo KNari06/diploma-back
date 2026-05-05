@@ -283,6 +283,20 @@ export interface AllureImportOptions {
   deduplicateTests?: boolean;
   /** Save documentation attachments to Knowledge Base. Default: true */
   saveDocsToKB?: boolean;
+  /**
+   * Default starting URL applied to every test case created from this import.
+   *
+   * Allure reports never carry an app URL (their `links[].url` field is for
+   * issue trackers / TMS, not the system under test), so without this hint
+   * every imported test case lands with `start_url = null` and the user
+   * can't run it until they edit each one. The frontend pre-fills this
+   * field from the workspace's onboarding URL so the common case ("import
+   * for the same app the workspace was set up against") is one-click.
+   *
+   * Optional. Empty string is treated as "not set" — service must NOT
+   * write `""` to `intent_test_cases.start_url`, only a real URL or null.
+   */
+  defaultStartUrl?: string;
 }
 
 /**
@@ -295,6 +309,33 @@ export interface ResolvedAllureImportOptions {
   autoCreateFlows: boolean;
   deduplicateTests: boolean;
   saveDocsToKB: boolean;
+  /**
+   * `null` when the user did not provide a URL (or provided an empty/invalid
+   * one). Service must skip the `start_url` write in that case so created
+   * test cases match the legacy behaviour.
+   */
+  defaultStartUrl: string | null;
+}
+
+/**
+ * Normalises a user-provided URL string for storage. Lenient on purpose —
+ * the onboarding form already asserts validity at write time, but we don't
+ * want the import to hard-fail on a missing scheme. Returns `null` for
+ * anything we can't parse (caller treats as "not set").
+ */
+function normaliseDefaultStartUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const parsed = new URL(withScheme);
+    if (!parsed.hostname) return null;
+    return parsed.toString().replace(/\/$/, ''); // canonicalise; drop trailing slash
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -309,6 +350,7 @@ export function resolveImportOptions(
     autoCreateFlows:   opts.autoCreateFlows   ?? true,
     deduplicateTests:  opts.deduplicateTests  ?? true,
     saveDocsToKB:      opts.saveDocsToKB      ?? true,
+    defaultStartUrl:   normaliseDefaultStartUrl(opts.defaultStartUrl),
   };
 }
 

@@ -359,6 +359,7 @@ export class IntentTestCaseService {
               }
 
               let preserved = 0;
+              let invalidatedCompiled = 0;
               mergedSteps = mergedSteps.map(step => {
                 const existing = existingById.get(step.id);
                 if (!existing) return step;
@@ -366,15 +367,72 @@ export class IntentTestCaseService {
                 let changed = false;
                 const merged = { ...step };
 
-                if (!step.compiled && existing.compiled) {
+                // V27 — Description-change compiled invalidation for fill-class
+                // actions.
+                //
+                // Without this, the "Save without Apply" workflow can leave a
+                // poisoned compiled plan in the DB even after the user fixed
+                // the description:
+                //   1. user creates manual-add type step "email"
+                //   2. first Apply on a half-loaded page picks <span>"Русский",
+                //      compiled.targetFingerprint = {tag:"span",text:"Русский"}
+                //   3. user notices and edits description → "email поле для ввода"
+                //   4. user hits Save (skips Apply) → frontend's
+                //      `toIntentStepForSave` strips compiled because the step
+                //      is `intentStepDirty: true` → PATCH arrives without compiled
+                //   5. THIS merge block kicks in, restores the poisoned compiled
+                //      from the DB → Save persists "new description + old
+                //      poisoned compiled" pair
+                //   6. Apply All reads the DB and runs the poisoned compiled
+                //      as compiled-shortcut (fast path skips LLM)
+                //
+                // Fix: when description changes for a fill action (type), drop
+                // the cached compiled. Next Apply will rebuild it from a fresh
+                // resolver decision. Cost is one extra LLM resolve per
+                // description-edit on a type step (~500ms, cached after first
+                // hit), bought against permanent DB poisoning.
+                //
+                // Scoped to `type` only because:
+                //   - type's failure mode (poisoned span/anchor) is the
+                //     observed bug; click's resolver has wider candidate
+                //     latitude (button/a/div/span/svg are all legitimate
+                //     click targets) so a description-edit on click rarely
+                //     wants to repoint at a different element.
+                //   - bindingHints are kept either way — they bias the
+                //     resolver toward the recorded target type and the user
+                //     manually maintains them through the same edit UI.
+                const descriptionChanged =
+                  typeof step.description === 'string'
+                  && typeof existing.description === 'string'
+                  && step.description !== existing.description;
+                const isFillActionForInvalidation = step.type === 'type';
+                const dropCompiledForDescChange =
+                  descriptionChanged && isFillActionForInvalidation && !!existing.compiled;
+
+                if (!step.compiled && existing.compiled && !dropCompiledForDescChange) {
                   merged.compiled = existing.compiled;
                   changed = true;
+                } else if (dropCompiledForDescChange) {
+                  // Explicit: do NOT carry the old compiled forward. Next
+                  // Apply will rebuild via the resolver waterfall.
+                  invalidatedCompiled++;
                 }
                 if (!step.evidence && existing.evidence) {
                   merged.evidence = existing.evidence;
                   changed = true;
                 }
-                if (!step.bindingHints && existing.bindingHints) {
+                // V27 — bindingHints also drop on description change for
+                // `type`. They're the resolver's hint set; if they were
+                // backfilled from a wrong element (pre-V27 backfill gate),
+                // they would still bias the resolver toward the wrong target
+                // even after compiled and recordedFingerprint are gone.
+                // Manual-add bindingHints (placeholder/name from user input)
+                // are stored on the FE side and re-sent in the PATCH payload
+                // anyway — so the loss here is bounded to backfill-derived
+                // ones.
+                const dropBindingHintsForDescChange =
+                  descriptionChanged && isFillActionForInvalidation && !!existing.bindingHints;
+                if (!step.bindingHints && existing.bindingHints && !dropBindingHintsForDescChange) {
                   merged.bindingHints = existing.bindingHints;
                   changed = true;
                 }
@@ -387,7 +445,20 @@ export class IntentTestCaseService {
                 // frontend-driven PATCH would otherwise wipe a synthesized
                 // fingerprint. Preserve it from DB just like compiled /
                 // evidence / bindingHints — same backend-owned policy.
-                if (!step.recordedFingerprint && existing.recordedFingerprint) {
+                //
+                // V27 — same description-change invalidation as `compiled`
+                // above. If the user edits a type step's description, the
+                // SYNTHETIC fingerprint stored from the prior Apply may be
+                // pointing at a wrong element (the very thing the edit is
+                // trying to fix). Drop it so the next Apply re-anchors via
+                // the resolver waterfall. Genuine recorder fingerprints are
+                // dropped too — but for `type` the recorder also wouldn't
+                // have captured a meaningful identity (typing into an input
+                // doesn't probe the input itself, only the keystroke target),
+                // so the loss is symmetric with the manual-add case.
+                const dropFingerprintForDescChange =
+                  descriptionChanged && isFillActionForInvalidation && !!existing.recordedFingerprint;
+                if (!step.recordedFingerprint && existing.recordedFingerprint && !dropFingerprintForDescChange) {
                   merged.recordedFingerprint = existing.recordedFingerprint;
                   changed = true;
                 }
@@ -400,6 +471,13 @@ export class IntentTestCaseService {
                 logger.info('[INTENT_TEST_CASE] Preserved backend fields from DB during update', {
                   id,
                   preservedCount: preserved,
+                  totalSteps: mergedSteps.length,
+                });
+              }
+              if (invalidatedCompiled > 0) {
+                logger.info('[INTENT_TEST_CASE] Invalidated compiled plans for description-changed fill steps', {
+                  id,
+                  invalidatedCount: invalidatedCompiled,
                   totalSteps: mergedSteps.length,
                 });
               }

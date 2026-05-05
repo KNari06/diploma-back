@@ -18,16 +18,27 @@ Before modifying any code, check what ELSE uses the same resource:
 rg "resourceName" src/ --type ts
 ```
 
-## 2. NEVER create raw CDP sessions
+## 2. CDP sessions in preview — measured trade-off (Etap 2, May 2026)
 
-Video screencast uses its own CDP session. Creating new CDP sessions (`context.newCDPSession(page)`) or calling `Accessibility.enable` WILL conflict and freeze video.
+**Background/regression contexts:** `context.newCDPSession(page)` is fine — no screencast, no conflict.
+
+**Preview contexts (live editor with screencast):** empirically tested in `cdp-screencast-collision.integration.test.ts`:
+- **Separate CDP session** (what Etap 2 opens): sparse pages → no impact; dense pages (~90ms snapshot) → brief FPS drop to ~11 during snapshot, recovers immediately to 60 FPS. Acceptable trade-off vs 16s evaluate freeze.
+- **Piggyback on screencast session** (reuse `video-stream`'s session): **100% video freeze — WORSE than separate session.** Do NOT do this.
+- Calling `Accessibility.enable` on a separate session: still freezes video (old pattern, still banned).
+
+**Rule for Etap 2 code:** `CdpSnapshotService` opens its own session and detaches in `finally`. Never reuse `preview-video-stream.service.ts`'s session. For DevTools/a11y outside Etap 2, use Playwright built-in APIs:
 
 ```typescript
-// WRONG — conflicts with video screencast
-const cdp = await context.newCDPSession(page);
-await cdp.send('Accessibility.enable');
+// WRONG — piggyback or accessibility.enable on any session in preview
+const cdp = videoStreamSession; // 100% freeze
+await cdp.send('Accessibility.enable'); // also wrong — freezes video
 
-// CORRECT — use Playwright built-in APIs
+// CORRECT — Etap 2: own session, own lifecycle
+const cdp = await context.newCDPSession(page);
+try { /* snapshot */ } finally { await cdp.detach(); }
+
+// CORRECT — DevTools outside Etap 2
 const snapshot = await page.accessibility.snapshot();
 const html = await page.content();
 ```

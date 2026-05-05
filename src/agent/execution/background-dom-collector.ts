@@ -11,7 +11,10 @@
  * - Compatible with LLM-based element resolution
  */
 
+import type { LiteElement } from '@/agent/core/lite/lite-types';
+import { SNAPSHOT_ROUTER_FLAGS } from '@/config/testing/snapshot-router.config';
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
+import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { logger } from '@/utils/core/logger';
 import type { Page } from 'playwright';
 
@@ -552,6 +555,52 @@ export async function collectInteractiveNodes(page: Page, maxNodes?: number): Pr
     // Step 1: Wait for network idle (SPAs may still be fetching data)
     await waitForPageStability(page);
 
+    // May 2026 — when SNAPSHOT_USE_CDP_BACKGROUND is on, route through
+    // SnapshotRouter to get the CDP-collected snapshot (12× faster on
+    // sparse pages, canonical AX role, includes iframe nodes the
+    // legacy evaluate path silently skipped).
+    //
+    // NB: cleanupTemporaryRefs + waitForPageStability stay OUTSIDE the
+    // flag check — both paths need them. The SnapshotRouter does NOT
+    // wait for SPA idle on its own; if we skip the wait we'd snapshot
+    // a half-rendered page. The legacy evaluate path has the same
+    // contract (caller waits, collector reads) — keep parity.
+    if (SNAPSHOT_ROUTER_FLAGS.useCdpForBackground) {
+      try {
+        const snapshot = await SnapshotRouter.collect(page, {
+          context: 'background-regression',
+          // SnapshotRouter has its own stability gate that runs before
+          // CDP collection. We've already waited above; tell it to
+          // skip its internal wait so we don't double-pay the cost.
+          skipStabilityWait: true,
+          lastDomNodeCount: undefined,
+        });
+
+        const nodes = adaptLiteElementsToInteractiveNodes(snapshot.elements);
+        const elapsed = Date.now() - startTime;
+
+        logger.info('[BACKGROUND_DOM_COLLECTOR] Collected interactive nodes (CDP path)', {
+          nodeCount: nodes.length,
+          source: 'cdp_via_router',
+          elapsedMs: elapsed,
+        });
+
+        return nodes;
+      } catch (cdpError) {
+        // CDP path failed — fall through to the legacy evaluate path.
+        // Keeps regression replays running even if CDP regresses on
+        // some site (cross-origin iframe edge case, AX domain
+        // unavailable on older Chromium, etc.). We log loud once so
+        // operators see the fallback in production logs.
+        logger.warn('[BACKGROUND_DOM_COLLECTOR] CDP path failed, falling back to evaluate', {
+          error: cdpError instanceof Error ? cdpError.message : String(cdpError),
+        });
+        // Fall through.
+      }
+    }
+
+    // Legacy evaluate path — used by default and as fallback when CDP
+    // path errored above.
     // Step 2: Collect from main frame
     const mainNodes = await page.evaluate(buildExtractScript(limit)) as InteractiveNode[];
 
@@ -566,6 +615,7 @@ export async function collectInteractiveNodes(page: Page, maxNodes?: number): Pr
       mainFrameNodes: mainNodes.length,
       iframeNodes: iframeNodes.length,
       elapsedMs: elapsed,
+      source: 'evaluate_legacy',
     });
 
     return nodes;
@@ -575,6 +625,148 @@ export async function collectInteractiveNodes(page: Page, maxNodes?: number): Pr
     });
     return [];
   }
+}
+
+/**
+ * May 2026 — Adapter from CDP-side `LiteElement` to legacy
+ * `InteractiveNode`. The two types describe the same concept (a single
+ * interactive element on a page) but settled on slightly different
+ * field names through historical accident:
+ *
+ *   `LiteElement.bounds`   ↔  `InteractiveNode.boundingBox`
+ *   `LiteElement.htmlId`   ↔  `InteractiveNode.id`
+ *   `LiteElement.htmlName` ↔  `InteractiveNode.name`
+ *
+ * Everything else is one-to-one. We could unify the types eventually
+ * but that's a large cross-cutting change; this adapter lets us flip
+ * background regression to CDP without a typescript-wide rename.
+ *
+ * Iframe ref scheme — preserved for self-heal compatibility:
+ * the legacy collector formed iframe refs as
+ *   `iframe-{frameId}-bg-{N}`
+ * where `frameId = frame.name() || frame.url().slice(-20)`.
+ * `self-healing.service.ts:271` greps that exact pattern with
+ *   `^iframe-(.+?)-bg-`
+ * to extract the frameId for `page.frames().find(...)`. If we passed
+ * raw CDP refs (`e1` / `e2` per-frame) the regex wouldn't match and
+ * Phase 3 iframe healing would silently die. We keep the legacy shape
+ * by re-prefixing iframe-side LiteElements here. Main-frame elements
+ * keep their `eN` ref untouched — downstream consumers don't care
+ * about the literal prefix.
+ */
+function adaptLiteElementsToInteractiveNodes(elements: LiteElement[]): InteractiveNode[] {
+  const out: InteractiveNode[] = [];
+  // Per-iframe counter so the rewritten refs are unique within their
+  // frame namespace and stable across the same snapshot. We keep
+  // counters keyed by iframeSource (URL) — the same key the iframe
+  // bucket uses on the recorder side.
+  const iframeCounters = new Map<string, number>();
+
+  for (const el of elements) {
+    let outRef = el.ref;
+    if (el.iframeSource) {
+      const frameId = el.iframeSource.slice(-20);
+      const next = (iframeCounters.get(el.iframeSource) ?? 0) + 1;
+      iframeCounters.set(el.iframeSource, next);
+      outRef = `iframe-${frameId}-bg-${next}`;
+    }
+
+    const node: InteractiveNode = {
+      ref: outRef,
+      tag: el.tag,
+      role: el.role || undefined,
+      type: el.type,
+      inputType: el.type, // legacy field — same source as `type`
+      // Resolver matches by raw text first (`<button>Save</button>`),
+      // accessible-name cascade second (icon-only with aria-label).
+      // Prefer `el.text` when CDP captured direct text; fall back to
+      // AX `name` for icon-poor / aria-only widgets. Without this
+      // fallback, native `<button>Save</button>` on the resolver side
+      // would see `text=undefined` because AX writes "Save" into
+      // `name` and the raw text into `el.text`.
+      text: el.text || el.name || undefined,
+      firstTextFragment: el.firstTextFragment,
+      labelText: el.labelText,
+      ariaLabel: el.ariaLabel,
+      title: el.title,
+      isIconButton: el.isIconButton,
+      iconClasses: el.iconClasses,
+      // Field-name renames — the only structural difference between types.
+      name: el.htmlName,
+      placeholder: el.placeholder,
+      id: el.htmlId,
+      testIdAttr: el.testIdAttr,
+      autocomplete: el.autocomplete,
+      // Field exists on LiteElement but legacy collector also exposed
+      // it; pass through so resolver's input-type logic keeps working.
+      boundingBox: el.bounds,
+      // Legacy collector hard-codes isInteractive=true for everything
+      // it returns — we mirror that contract.
+      isVisible: el.visible,
+      isInteractive: true,
+      isDisabled: el.disabled,
+      isTopMostAtCenter: el.isTopMostAtCenter,
+      isInsideActiveModal: el.isInsideActiveModal,
+      isDynamicId: el.isDynamicId,
+      // ARIA state.
+      checked: el.checked,
+      ariaExpanded: el.ariaExpanded,
+      ariaPressed: el.ariaPressed,
+      ariaSelected: el.ariaSelected,
+      ariaChecked: el.ariaChecked,
+      dataState: el.dataState,
+      ariaCurrent: el.ariaCurrent,
+      ariaValueNow: el.ariaValueNow,
+      ariaValueText: el.ariaValueText,
+      dataValue: el.dataValue,
+      childTestId: el.childTestId,
+      iconLabel: el.iconLabel,
+      customElementTag: el.customElementTag,
+      href: el.href,
+      bsToggle: el.bsToggle,
+      bsTarget: el.bsTarget,
+      ariaHasPopup: el.ariaHasPopup,
+      ariaActiveDescendant: el.ariaActiveDescendant,
+      dataRowKey: el.dataRowKey,
+      rowClickable: el.rowClickable,
+      nearestRowText: el.nearestRowText,
+      siblingIndex: el.siblingIndex,
+      disabled: el.disabled,
+      arrowDir: el.arrowDir,
+      // Validation.
+      required: el.required,
+      readOnly: el.readOnly,
+      invalid: el.invalid,
+      hasValue: el.hasValue,
+      // Hierarchy.
+      parentRefChain: el.parentRefChain,
+      containerRef: el.containerRef,
+      containerTitles: el.iframeSource
+        // Mirror legacy iframe annotation so candidate-pruner-llm and
+        // step-blocker-diagnosis still see the "this lives inside an
+        // iframe" hint they rely on.
+        ? [`iframe: ${el.iframeSource}`, ...(el.containerTitles ?? [])]
+        : el.containerTitles,
+      // Phase 4 interactivity.
+      frameworkClickable: el.frameworkClickable,
+      isContentEditable: el.isContentEditable,
+      tabIndex: el.tabIndex,
+      hasAriaHaspopup: el.hasAriaHaspopup,
+      hasOnclick: el.hasOnclick,
+      // Disambiguation hints used by candidate-pruner-llm /
+      // intent-step-lint scoring on dense pages.
+      nearText: el.nearText,
+      // Etap 1B.2 — Angular routerLink + formControlName, now captured
+      // in CDP collector's Phase 3c-DS (cdp-snapshot.service.ts) so
+      // Angular reactive-forms / router-driven apps keep their
+      // strongest identity fingerprints when CDP path is used.
+      routerLink: el.routerLink,
+      formControlName: el.formControlName,
+    };
+    out.push(node);
+  }
+
+  return out;
 }
 
 /**

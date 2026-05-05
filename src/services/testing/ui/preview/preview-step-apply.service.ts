@@ -5764,28 +5764,9 @@ export class PreviewStepApplyService {
             topSimilarity: lintResult.topSimilarity,
           };
 
-          // V2: Auto-populate bindingHints from resolved node
-          const enrichedBindingHints = candidate.node
-            ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(candidate.node) }
-            : stepDraft.bindingHints;
-
-          // Update step evidence with resolutionMeta and enriched bindingHints
-          const updatedStep: IntentStep = {
-            ...stepDraft,
-            bindingHints: enrichedBindingHints,
-            evidence: {
-              ...stepDraft.evidence,
-              lastSuccessRef: candidate.ref,
-              confidence: candidate.confidence,
-              resolutionMeta,
-              capturedAt: new Date().toISOString(), // V15.6: staleness guard
-            },
-            compiled, // NEW: compiled execution plan
-          };
-
-          // Audit: which element did the resolver actually click? Compare
-          // against the recorded fingerprint so a 'pass' on the wrong target
-          // (fake-success) becomes diagnosable from logs alone.
+          // V27 — Compute fingerprintMatch FIRST so the backfill gate below
+          // can consult it. Audit fields (chosenLabel etc.) are also needed
+          // by trace below; computing here keeps the original audit contract.
           let chosenLabel: string | undefined;
           let chosenTagLive: string | undefined;
           let chosenIdLive: string | null | undefined;
@@ -5831,6 +5812,87 @@ export class PreviewStepApplyService {
           if (typeof clickEffectSignal !== 'undefined') {
             decisionTrace.clickEffectSignal = clickEffectSignal;
           }
+
+          // V27 — Backfill safety gate (root cause #2 of documentolog regression).
+          //
+          // Until V27 we rewrote `bindingHints` and `compiled` from the
+          // resolved node *unconditionally*. That meant a single fake-success
+          // (e.g. LLM picks <span>"Русский" for a `type:"email"` step, click
+          // succeeds with weak/none signal, fingerprint mismatched but
+          // recorded fingerprint absent so the fake-success guard couldn't
+          // fire) corrupted the saved step in the DB on the very first Run —
+          // and every subsequent Run reused the corrupted plan.
+          //
+          // The gate below restricts `bindingHints` / `compiled` writeback to
+          // outcomes we are confident about. We keep `evidence.lastSuccessRef`
+          // and `resolutionMeta` either way (those are diagnostic and short-
+          // TTL — `capturedAt` lets the next run reject stale refs anyway).
+          //
+          // Trust criteria (must hold to backfill):
+          //   1. Action was verified (`verified === true`) AND not on the
+          //      manual-add soft-pass path (`!softPassedOnNoEffect` — soft
+          //      pass intentionally suppresses compiled to avoid the same
+          //      trap, so we don't backfill bindingHints either).
+          //   2. Click effect signal is "strong" — not 'none' / 'newtab' /
+          //      'focus'. Those are the canonical fake-success symptoms.
+          //      `undefined` (non-click action like type/select) is allowed
+          //      because verifyActionEffect already proved the effect via
+          //      live inputValue / aria-state read.
+          //   3. Fingerprint comparison is NOT a hard `mismatch`. `match` and
+          //      `unknown` proceed (`unknown` is normal when the original
+          //      record had no identifying fingerprint — see root cause #1).
+          //
+          // When any criterion fails, we keep the existing `bindingHints` and
+          // `compiled` untouched. The step still reports success to the user
+          // (this code path runs only after verified=true propagated into
+          // the success branch); the DB just no longer absorbs a wrong
+          // identity that would corrupt every subsequent Run.
+          const isWeakSignal_v27 =
+            clickEffectSignal === 'none'
+            || clickEffectSignal === 'newtab'
+            || clickEffectSignal === 'focus';
+          const safeToBackfill_v27 =
+            verified === true
+            && !softPassedOnNoEffect
+            && !isWeakSignal_v27
+            && fingerprintMatch !== 'mismatch';
+
+          if (!safeToBackfill_v27 && candidate.node) {
+            logger.info('[PREVIEW_APPLY] Skipped bindingHints/compiled backfill — untrusted apply', {
+              stepId: stepDraft.id,
+              verified,
+              softPassedOnNoEffect,
+              clickEffectSignal,
+              fingerprintMatch,
+              candidateRef: candidate.ref,
+              candidateTag: candidate.node.tag,
+              candidateRole: candidate.node.role,
+            });
+          }
+
+          // V2: Auto-populate bindingHints from resolved node — gated.
+          const enrichedBindingHints_v27 = (candidate.node && safeToBackfill_v27)
+            ? { ...stepDraft.bindingHints, ...buildBindingHintsFromNode(candidate.node) }
+            : stepDraft.bindingHints;
+          // Compiled plan only persists on a trusted apply.
+          const compiledForUpdate_v27 = safeToBackfill_v27 ? compiled : stepDraft.compiled;
+
+          // Build updatedStep with gated bindingHints/compiled. Evidence
+          // (lastSuccessRef, resolutionMeta, capturedAt) is always written —
+          // it's diagnostic and TTL-stamped, so a stale ref can't corrupt
+          // future runs.
+          const updatedStep: IntentStep = {
+            ...stepDraft,
+            bindingHints: enrichedBindingHints_v27,
+            evidence: {
+              ...stepDraft.evidence,
+              lastSuccessRef: candidate.ref,
+              confidence: candidate.confidence,
+              resolutionMeta,
+              capturedAt: new Date().toISOString(), // V15.6: staleness guard
+            },
+            compiled: compiledForUpdate_v27,
+          };
 
           // Diagnostic: capture user intent → resolved element pair so
           // bisecting wrong-element regressions doesn't require a re-run.
@@ -6425,23 +6487,53 @@ export class PreviewStepApplyService {
               },
             });
           }
-          // Synthesize a `recordedFingerprint` for manually-added click
-          // steps. By this point both guards (identity-mismatch + weak,
-          // label-mismatch + weak) have already let the click through, so
+          // Synthesize a `recordedFingerprint` for manually-added steps.
+          // By this point both guards (identity-mismatch + weak, label-
+          // mismatch + weak) have already let the action through, AND the
+          // V27 backfill gate has confirmed verified+strong+!mismatch — so
           // the resolved node is the trusted ground truth. Anchor the step
           // structurally so subsequent runs can use the identity fast-path
           // and the fake-success guard — exactly the protections recorded
           // steps get for free. Only writes when the field is missing, so
           // it never overwrites a real recorder fingerprint.
           //
-          // Click-only on purpose: type / select / hover have their own
-          // post-action verification semantics and don't need this anchor.
-          // Click is also the action class where wrong-element bugs show up.
+          // V27 — extended from click-only to type/select/check/uncheck/
+          // toggle. Rationale: when V27 dropped the
+          // `compiled?.targetFingerprint` echo as an identity-fast-path
+          // input (see element-resolver.service.ts), manual-add fill-class
+          // steps lost their fast-path entirely (no recorded fingerprint
+          // ever gets written; click was the only synth-target). Trusted
+          // synthetic recordedFingerprint here gives those steps the same
+          // structural anchor the click path already has, via the SAFE
+          // channel (gated by the V27 trust criteria below) instead of
+          // the unsafe compiled-echo path that caused the documentolog
+          // poisoning.
+          //
+          // Trust criteria mirror the V27 backfill gate exactly: only
+          // proceed when the apply was verified, signal was strong, and
+          // fingerprint comparison wasn't a hard mismatch. Otherwise we
+          // leave the step without a synthetic anchor — next Apply will
+          // run the resolver fresh, which is the right behaviour for an
+          // untrusted action.
+          //
+          // hover and other purely-visual actions are still excluded —
+          // their post-action verification can't tell us whether we
+          // actually hit the right element.
+          const SYNTH_FP_ACTIONS = new Set(['click', 'type', 'select', 'check', 'uncheck', 'toggle']);
+          const isWeakSignalForSynth =
+            clickEffectSignal === 'none'
+            || clickEffectSignal === 'newtab'
+            || clickEffectSignal === 'focus';
+          const trustedForSynth =
+            verified === true
+            && !softPassedOnNoEffect
+            && !isWeakSignalForSynth
+            && fingerprintMatch !== 'mismatch';
           let appliedStep = updatedStep;
           if (
-            stepDraft.type === 'click'
+            SYNTH_FP_ACTIONS.has(stepDraft.type)
             && !stepDraft.recordedFingerprint
-            && !softPassedOnNoEffect  // V23: same rationale as compiled-plan guard above
+            && trustedForSynth
             && candidate.node
           ) {
             const synthetic = buildSyntheticFingerprintFromNode(candidate.node);
@@ -6452,8 +6544,10 @@ export class PreviewStepApplyService {
               logger.info('[PREVIEW_APPLY] Synthesized recordedFingerprint for manual step', {
                 previewSessionId,
                 stepId: stepDraft.id,
+                stepType: stepDraft.type,
                 fpKeys: Object.keys(synthetic).slice(0, 10),
                 signal: clickEffectSignal,
+                fingerprintMatch,
               });
             }
           } else if (

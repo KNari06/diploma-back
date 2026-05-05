@@ -2409,6 +2409,13 @@ export class SnapshotCollector {
                 el.getAttribute('title') ||
                 el.getAttribute('placeholder') ||
                 v26FullReadable.slice(0, 50) || '',
+              // Raw visible text — symmetric with CdpSnapshotService.
+              // Distinct from `name` (which is the AX accessible-name
+              // cascade with aria-label / title / placeholder fallbacks).
+              // Populated independently so background-collector adapter
+              // and any future consumer can prefer raw text without
+              // accidentally getting an aria-label.
+              text: v26FullReadable.length > 0 ? v26FullReadable.slice(0, 100) : undefined,
               firstTextFragment: v26FirstFragmentToStore,
               // Identity fields — populated for the resolver's identity
               // fast-path. Read from the live DOM, NOT computed from labels,

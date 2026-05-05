@@ -46,6 +46,12 @@ interface MockPage {
   viewportSize: jest.Mock;
   evaluate: jest.Mock;
   context: jest.Mock;
+  // May 2026 — Phase 3.5 assignAgentRefs now routes per-document via
+  // frame.evaluate. Single-doc tests still use the main frame, which
+  // we proxy to page.evaluate so existing evaluateResults queues drive
+  // both paths without rewrites.
+  mainFrame: jest.Mock;
+  frames: jest.Mock;
 }
 
 function makeMockCdp(handlers: Record<string, unknown>): MockCdp {
@@ -72,17 +78,32 @@ function makeMockPage(opts: {
   evaluateResults?: unknown[];
 }): MockPage {
   const evaluateQueue = [...(opts.evaluateResults ?? [])];
+  // Single shared evaluate fn — main-frame.evaluate and page.evaluate
+  // pull from the same queue so tests written before per-frame routing
+  // (single-doc tests with linear evaluateResults) keep working.
+  const sharedEvaluate = jest.fn(async () => {
+    if (evaluateQueue.length === 0) return [];
+    return evaluateQueue.shift();
+  });
+  const mainFrameStub = {
+    evaluate: sharedEvaluate,
+    isDetached: jest.fn(() => false),
+    url: jest.fn(() => opts.url ?? 'https://example.com'),
+    name: jest.fn(() => ''),
+  };
   return {
     url: jest.fn(() => opts.url ?? 'https://example.com'),
     title: jest.fn(async () => opts.title ?? 'Test Page'),
     viewportSize: jest.fn(() => opts.viewport ?? { width: 1280, height: 720 }),
-    evaluate: jest.fn(async () => {
-      if (evaluateQueue.length === 0) return [];
-      return evaluateQueue.shift();
-    }),
+    evaluate: sharedEvaluate,
     context: jest.fn(() => ({
       newCDPSession: jest.fn(async () => opts.cdp ?? makeMockCdp({})),
     })),
+    mainFrame: jest.fn(() => mainFrameStub),
+    // Tests that exercise iframe ref assignment override frames() per
+    // case; default returns just the main frame so single-doc tests
+    // see no extra evaluate noise.
+    frames: jest.fn(() => [mainFrameStub]),
   };
 }
 
@@ -437,7 +458,11 @@ describe('CdpSnapshotService.collect', () => {
       });
       const page = makeMockPage({
         cdp,
-        evaluateResults: [['e0'], [null], [null]],
+        // Two interactives expected (button + dialog after May 2026 symmetry
+        // fix), so assignAgentRefs receives two requests. Both refs must be
+        // non-empty — May 2026 hardening drops elements left with `ref: ''`
+        // (e.g. when findElement returned null because of off-viewport bbox).
+        evaluateResults: [['e0', 'e1'], [null], [null]],
       });
 
       const snapshot = await CdpSnapshotService.collect(page as never);
@@ -698,10 +723,15 @@ describe('CdpSnapshotService.collect', () => {
           ['e0'], [{ invalid: false }], [{ firstTextFragment: 'Submit' }],
         ],
       });
-      // Override evaluate so the 4th call (Phase 5b) hangs forever.
+      // Override BOTH page.evaluate and main-frame.evaluate so the 4th
+      // call (Phase 5b overlay) hangs forever. May 2026: Phase 3.5 ref
+      // assignment now routes through `frame.evaluate`, so we need to
+      // hijack the shared queue at both entry points; otherwise the
+      // counter only increments on page.evaluate calls and Phase 5b is
+      // never reached as call #4.
       let callCount = 0;
       const original = page.evaluate;
-      page.evaluate = jest.fn(async (...args: unknown[]) => {
+      const wrap = jest.fn(async (...args: unknown[]) => {
         callCount++;
         if (callCount === 4) {
           // Hang forever — would block the whole pipeline without the
@@ -711,6 +741,8 @@ describe('CdpSnapshotService.collect', () => {
         }
         return original(...(args as [never, never]));
       });
+      page.evaluate = wrap;
+      page.mainFrame().evaluate = wrap;
 
       const t0 = Date.now();
       const snapshot = await CdpSnapshotService.collect(page as never);

@@ -1266,6 +1266,14 @@ export interface IntentStep {
    */
   recordedFingerprint?: TargetFingerprint;
   /**
+   * Type attribute of the focused input at recording time (e.g. 'password',
+   * 'email'). Carried purely as metadata so downstream consumers can decide
+   * to redact / sensitive-store the `value` (e.g. preview:save-login moves
+   * password values into the resource sensitive envelope). Never influences
+   * resolver / replay behaviour. Omit for non-input steps.
+   */
+  recordedInputType?: string;
+  /**
    * Expected outcome for this step (V11: negative test support)
    * - 'success': Step should complete without errors (default)
    * - 'error': Step is a negative test — expects 4xx / validation error / error toast

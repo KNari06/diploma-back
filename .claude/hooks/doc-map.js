@@ -32,6 +32,9 @@ const SERVICE_MAP = [
   ["src/services/testing/ui/preview/snapshot-router.service.ts",    "src/services/testing/ui/preview/api/snapshot-router.md"],
   ["src/services/testing/ui/preview/cdp-snapshot.service.ts",       "src/services/testing/ui/preview/api/snapshot-router.md"],
   ["src/services/testing/ui/preview/snapshot-diff.util.ts",         "src/services/testing/ui/preview/api/snapshot-router.md"],
+  // V26 new services with own docs
+  ["src/services/testing/ui/preview/candidate-pruner-llm.service.ts", "src/services/testing/ui/preview/api/candidate-pruner-llm.md"],
+  ["src/services/testing/ui/preview/step-readiness-v2.service.ts",    "src/services/testing/ui/preview/api/step-readiness-v2.md"],
 ];
 
 // folder prefix → folder-level CLAUDE.md

@@ -335,13 +335,25 @@ function resolveGroup(filename: string, aiCategory?: string): DocGroup {
   return 'documentation';
 }
 
-function groupLabel(group: DocGroup, importDateLabel: string): string {
+/**
+ * Build a stable, unique-per-import label for a doc group.
+ *
+ * Previously the label was just `"<Group> — <YYYY-MM-DD>"`, which collided
+ * for any user running two imports on the same day: the second import saw
+ * the first import's KB document name already present and silently skipped
+ * the entire group. Adding a short importId suffix makes each run distinct
+ * while keeping the human-readable date for KB browsing.
+ */
+function groupLabel(group: DocGroup, importDateLabel: string, importId: string): string {
+  // 8-char prefix is enough to avoid collisions for the per-day KB list and
+  // short enough not to dominate the visible name.
+  const idShort = (importId || '').replace(/-/g, '').slice(0, 8) || 'unknown';
   const labels: Record<DocGroup, string> = {
-    test_log:      `Allure Test Logs — ${importDateLabel}`,
-    api_response:  `Allure API Responses — ${importDateLabel}`,
-    page_snapshot: `Allure Page Snapshots — ${importDateLabel}`,
-    env_config:    `Allure Environment — ${importDateLabel}`,
-    documentation: `Allure Documentation — ${importDateLabel}`,
+    test_log:      `Allure Test Logs — ${importDateLabel} #${idShort}`,
+    api_response:  `Allure API Responses — ${importDateLabel} #${idShort}`,
+    page_snapshot: `Allure Page Snapshots — ${importDateLabel} #${idShort}`,
+    env_config:    `Allure Environment — ${importDateLabel} #${idShort}`,
+    documentation: `Allure Documentation — ${importDateLabel} #${idShort}`,
   };
   return labels[group];
 }
@@ -450,7 +462,7 @@ export async function processAllureDocumentation(
 
   // ── 4. Process each group → chunk → embed → insert ───────────────────────
   for (const [group, groupDocs] of groups) {
-    const kbFileName = groupLabel(group, importDateLabel);
+    const kbFileName = groupLabel(group, importDateLabel, importId);
 
     // Skip if this logical document was already imported in a previous run
     if (existingFiles.has(kbFileName)) {

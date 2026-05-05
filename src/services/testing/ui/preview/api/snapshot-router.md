@@ -27,8 +27,8 @@
 - `diffSnapshots(a, b): SnapshotDiffReport` — pure utility for shadow-mode validation.
 
 ### Types
-- `SnapshotRouterFlags` — `{ useCdpForBackground_shadow, useCdpForBackground, useCdpForPreview_shadow, useCdpForPreview, denseThreshold }` (all booleans default `false`; `denseThreshold = 2000`).
-- `SnapshotRouterContext` — `'preview-tick' | 'preview-apply' | 'background-regression' | 'lite-engine' | 'unknown'`.
+- `SnapshotRouterFlags` — `{ useCdpForBackground_shadow, useCdpForBackground, useCdpForPreview_shadow, useCdpForPreview, useCdpForPreviewPoll, denseThreshold }` (all booleans default `false`; `denseThreshold = 2000`; `useCdpForPreviewPoll` added May 2026 for the 500ms periodic-tick route).
+- `SnapshotRouterContext` — 13 values: `'preview-tick' | 'preview-apply' | 'preview-poll' | 'background-regression' | 'lite-engine' | 'lite-action' | 'lite-verification' | 'lite-recovery' | 'pipeline-observe' | 'exploration-survey' | 'exploration-flow' | 'exploration-dismiss' | 'page-interactive-check' | 'legacy-orchestrator' | 'unknown'`.
 - `CdpSnapshotError` — typed failure for fallback decisions: `'page_gone' | 'cdp_payload_too_large' | 'ax_domain_unavailable' | 'cdp_send_failed' | 'malformed_response'`.
 - `SnapshotDiffReport` — top-level diffs (url, title, activeModalRef, viewport) + element identity mismatches (`onlyInA`, `onlyInB`) + per-element field divergences + histogram of divergent field names + match verdict.
 
@@ -42,22 +42,32 @@ Returns one of three sources:
 
 ### Decision rules
 - `context === 'background-regression'` AND `useCdpForBackground` flag true → `cdp_with_fallback`.
-- `context === 'preview-apply'` AND `useCdpForPreview` flag true AND `lastDomNodeCount >= denseThreshold` → `cdp_with_fallback`.
+- `context === 'preview-apply'` AND `useCdpForPreview` flag true → `cdp_with_fallback`. (**dense-page gate removed May 2026** — `denseThreshold` is deprecated and kept only as shadow-sampling throttle, not a routing gate.)
+- `context` maps to `preview-poll` risk group AND `useCdpForPreviewPoll` flag true → `cdp_with_fallback`. (Env var: `SNAPSHOT_USE_CDP_PREVIEW_POLL`.)
+- `context === 'legacy-orchestrator'` maps to `'ai'` risk group.
 - Otherwise → `'evaluate'`.
 
 ### Shadow mode
-When `useCdpForBackground_shadow` (background) OR `useCdpForPreview_shadow` (preview + dense page) is true, run **both** paths concurrently via `Promise.allSettled`. Production returns the evaluate result; CDP runs only to feed `diffSnapshots()` divergence log. CDP failure never affects production.
+When `useCdpForBackground_shadow` (background) OR `useCdpForPreview_shadow` (preview) is true, run **both** paths concurrently via `Promise.allSettled`. Production returns the evaluate result; CDP runs only to feed `diffSnapshots()` divergence log. CDP failure never affects production. **Dense-page gate removed** — shadow now runs on ALL pages when the flag is on (only sampling rate `denseThreshold` throttles how often).
 
 ## CDP coordination & invariants
 
-- **Never opens a duplicate CDP session for preview.** When the caller provides `existingCdpSession`, `CdpSnapshotService` reuses it (Week 5 — preview piggyback). Otherwise it opens its own and detaches it in `finally` to avoid leaks. This honours the project-wide invariant in [.claude/rules/critical-patterns.md](../../../../../../.claude/rules/critical-patterns.md): **only `preview-video-stream.service.ts` owns the screencast CDP session.**
+- **Screencast-collision measured trade-off (Etap 2).** `CdpSnapshotService` opens its own `CDPSession` via `context.newCDPSession(page)` and detaches it in `finally`. Empirical results from `cdp-screencast-collision.integration.test.ts`:
+  - Sparse pages (snapshot <16ms): no FPS impact.
+  - Dense pages (snapshot ~90ms): brief drop to ~11 FPS during snapshot, recovers to 60 FPS immediately after.
+  - Piggyback on `preview-video-stream`'s screencast session: **100% freeze — worse than a separate session.** Therefore `existingCdpSession` option is NOT for the screencast session — it's reserved for a future dedicated snapshot session (Week 5, TBD).
+  - **Calling `Accessibility.enable`** on any session in preview still freezes video — still banned.
+  - The old "NEVER create CDP sessions" rule has been revised: separate sessions are fine for background/regression; for preview the trade-off is acceptable for apply/lint paths, but `preview-poll` (500ms periodic tick) requires extra FPS validation before enabling (`useCdpForPreviewPoll` flag stays OFF until validated).
+  - See [.claude/rules/critical-patterns.md](../../../../../../.claude/rules/critical-patterns.md) §2 for the updated rule.
 - **Refs (`data-agent-ref`) are written to the DOM** and reuse `window.__agentRefCounter` + `window.__agentFingerprintMap` — same mechanism as today's collector, so evidence shortcuts survive across the new path.
 - **Phase timings** attached to the snapshot as `__cdpPhaseTimings` (mirrors `__debugStats`).
 - **Symmetry contract:** the fingerprint key shape and `firstTextFragment` extraction MUST stay byte-equivalent with `snapshot-collector.ts` and [recording-capture.md](recording-capture.md). Drift = wrong-element bugs at apply time.
 
 ## Configuration
 
-[snapshot-router.config.ts](../../../../../config/testing/snapshot-router.config.ts) — `const`-based feature flags (no env vars yet — early-stage rollout uses code-as-source-of-truth to avoid staging misconfiguration; env wrappers are a follow-up).
+[snapshot-router.config.ts](../../../../../config/testing/snapshot-router.config.ts) — `const`-based feature flags. Env-var overrides now wired for the preview-poll route (`SNAPSHOT_USE_CDP_PREVIEW_POLL`); others still code-as-source-of-truth.
+
+**`denseThreshold` status:** field retained in config but no longer gates routing decisions. Only limits shadow-mode sampling rate (default: shadow on 100% of calls regardless of node count).
 
 ## Wiring (current call sites)
 
@@ -73,6 +83,7 @@ When `useCdpForBackground_shadow` (background) OR `useCdpForPreview_shadow` (pre
 3. **Payload limit.** DOMSnapshot >20MB rejected → fallback. Edge cases: deeply nested SVG, huge inlined stylesheets.
 4. **Accessibility domain availability.** `Accessibility.getFullAXTree` may not exist on older Chromium builds → DS-only mapping fallback (manual role compute, lossy WAI-ARIA cascade). Warns once per build.
 5. **Iframe support incomplete.** DS captures cross-origin iframes, but ref assignment only handles main frame. Multi-doc ref collision avoidance deferred to a separate iframe project.
+6. **Boolean-falsy normalization in `diffSnapshots()`.** `false`, `undefined`, and `null` are now collapsed to the same "falsy" state when diffing boolean fields. Prevents noisy divergence reports for fields that legitimately default differently between evaluate and CDP paths.
 
 ## Related
 

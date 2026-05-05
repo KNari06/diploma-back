@@ -2127,7 +2127,15 @@ export class PreviewSessionService {
       const { RecordingCaptureService } = await import(
         '@/services/testing/ui/preview/recording-capture.service'
       );
-      const probed = await RecordingCaptureService.probeForRecording(session.page, clampedX, clampedY);
+      // 2s hard timeout: if page.evaluate inside probeForRecording hangs (page
+      // crash, unresponsive renderer), probeInFlight in the WS handler would
+      // stay true indefinitely, freezing hover highlight for the session.
+      // Timer is always cleared to prevent accumulation under high-frequency hover.
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const probed = await Promise.race([
+        RecordingCaptureService.probeForRecording(session.page, clampedX, clampedY),
+        new Promise<null>((resolve) => { timeoutHandle = setTimeout(() => resolve(null), 2000); }),
+      ]).finally(() => clearTimeout(timeoutHandle));
 
       // V18: Cache full probe result for click handler reuse.
       // Guard: only store if recordingLastHover coords are close to this probe's input coords

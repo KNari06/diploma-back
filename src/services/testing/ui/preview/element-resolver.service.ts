@@ -372,16 +372,55 @@ export function buildAllowedSets(
       });
     }
 
-    // Rule 3b: Type must target text-like editable fields only → soft penalty (LLM decides)
+    // Rule 3b: Type must target text-like editable fields only.
+    // V27 — Hard-exclude tags that physically cannot accept text:
+    //   <span>, <a>, <li>, <td>, <th>, <button>, <div>(non-textbox-role,
+    //   non-contenteditable), <p>, <h1..6>, <img>, <svg>.
+    // documentolog.com regression: with bindingHints absent the LLM picked a
+    // language-link <span>"Русский" for a `type:"email"` action; the click
+    // succeeded as a no-op and the bad node was backfilled into the saved
+    // step's bindingHints/compiled, corrupting every subsequent Run.
+    // Remaining incompatible-but-plausible tags (e.g. <button> with
+    // role=textbox) stay soft so the LLM can still rescue weird custom
+    // controls.
     if (!excluded && actionType === 'type' && !isFillCompatibleTextField(node)) {
-      isSoft = true;
-      nodeRules.push({
-        ruleId: 'type.incompatible_field_type',
-        version: 'v3',
-        action: 'penalize',
-        evidence: `tag=${node.tag}, type=${node.type || node.inputType || 'unknown'} — soft penalty, LLM decides`,
-        affectedRefs: [node.ref],
-      });
+      const tagLc = node.tag.toLowerCase();
+      // V27 — physically incompatible tags for `type` action.
+      // Excludes <label> too: clicking a label focuses its associated <input>,
+      // but typing a value into the <label> element itself is a no-op that
+      // would corrupt the saved step's bindingHints with the label text.
+      // Tavtology with isFillCompatibleTextField (which already rejects
+      // role!=textbox + !contentEditable) is intentional — kept as a
+      // safety belt against future drift in that helper.
+      const isHardIncompatibleForType =
+        (tagLc === 'span' || tagLc === 'a' || tagLc === 'li'
+          || tagLc === 'td' || tagLc === 'th' || tagLc === 'p'
+          || tagLc === 'img' || tagLc === 'svg' || tagLc === 'label'
+          || /^h[1-6]$/.test(tagLc))
+        && node.role !== 'textbox'
+        && node.role !== 'searchbox'
+        && node.role !== 'combobox'
+        && !node.isContentEditable;
+
+      if (isHardIncompatibleForType) {
+        excluded = true;
+        nodeRules.push({
+          ruleId: 'type.hard_incompatible_tag',
+          version: 'v27',
+          action: 'exclude',
+          evidence: `tag=${node.tag} cannot physically accept text input (no contenteditable, no textbox role) — hard excluded for action=type`,
+          affectedRefs: [node.ref],
+        });
+      } else {
+        isSoft = true;
+        nodeRules.push({
+          ruleId: 'type.incompatible_field_type',
+          version: 'v3',
+          action: 'penalize',
+          evidence: `tag=${node.tag}, type=${node.type || node.inputType || 'unknown'} — soft penalty, LLM decides`,
+          affectedRefs: [node.ref],
+        });
+      }
     }
 
     // Rule 4: State-aware action checks → soft penalty (LLM decides)
@@ -3362,6 +3401,66 @@ export async function resolveElement(params: {
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
   const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport);
   const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
+
+  // V27 — Empty-fillable guard for type/fill/clear actions (root cause #3
+  // of documentolog regression).
+  //
+  // Discovered by analysing the saved corrupted plan for stepIndex=0:
+  //   description="email", value="bekhop2006@gmail.com", action="type"
+  //   compiled.context.pageSignature: ".../login...|6|e1,e2,e3,e4,e5,e6"
+  //   compiled.targetFingerprint: { tag:"span", text:"Русский", ... }
+  //
+  // The page had only 6 nodes when the first apply ran — the React login
+  // form (Email / Password / Войти button) had not yet hydrated. The only
+  // visible interactive elements were the language switcher and footer
+  // links. With NO <input> on the page, hardAllowed for action=type was
+  // empty. Rule 5 dropped <span>"Русский" into softAllowed (V27 since
+  // promotes it to hard-exclude, but the LLM still ran on whatever was
+  // left). The model returned the closest-named soft candidate, click
+  // succeeded as a no-op fill on the span, post-apply backfill rewrote
+  // bindingHints + compiled with the span's identity. Every subsequent
+  // Run reuses the corrupted plan.
+  //
+  // The fix: never run the resolver for a fill-class action on a page
+  // with zero fillable elements. Return `not_found` with a coaching
+  // message so the run-loop's wait-and-retry has a clear signal that
+  // this is a readiness problem, not a wrong-element problem.
+  //
+  // We count BOTH allowed sets (hard + soft) — soft includes
+  // contenteditable / role=textbox custom widgets that legitimately
+  // accept text. The check is "does any node on this page accept
+  // text?", not "do we have a high-quality candidate?".
+  if (stepDraft.type === 'type') {
+    const fillableInAllowed = [...hardAllowed, ...softAllowed].some((n) => {
+      const tagL = (n.tag || '').toLowerCase();
+      if (tagL === 'input' || tagL === 'textarea') return true;
+      if (n.role === 'textbox' || n.role === 'searchbox' || n.role === 'combobox') return true;
+      if (n.isContentEditable) return true;
+      return false;
+    });
+    if (!fillableInAllowed) {
+      logger.warn('[ELEMENT_RESOLVER] No fillable element on page for fill-class action', {
+        previewSessionId,
+        action: stepDraft.type,
+        description: (stepDraft.description || '').slice(0, 80),
+        domNodeCount: domNodes.length,
+        hardCount: hardAllowed.length,
+        softCount: softAllowed.length,
+      });
+      return {
+        status: 'not_found',
+        message:
+          'No input/textarea/contenteditable element on the page yet. The form may not have rendered. Re-run the step after the page finishes loading.',
+        confidence: 0,
+        candidates: [],
+        highlight: [],
+        needsAiFallback: false,
+        _ruleTrace: ruleTrace,
+        _hardAllowedCount: hardAllowed.length,
+        _softAllowedCount: softAllowed.length,
+      };
+    }
+  }
   
   // Diagnostic fields for trace logging
   // Mutable so the V25 pruner block downstream can attach `_pruneMs` /
@@ -3401,11 +3500,44 @@ export async function resolveElement(params: {
   // hard fake-success that audit fields (fingerprintMatch=mismatch) catch
   // post-hoc but the resolver itself missed.
   //
-  // Both `recordedFingerprint` (canonical) and `compiled?.targetFingerprint`
-  // (legacy fallback) are checked. We require the live element to be in
-  // the allowed set so disabled / off-screen / aria-hidden matches still
-  // get filtered out.
-  const identityFp = stepDraft.recordedFingerprint || stepDraft.compiled?.targetFingerprint;
+  // V27 — Identity fast-path uses ONLY `recordedFingerprint`, not the
+  // `compiled?.targetFingerprint` echo.
+  //
+  // History: the `|| compiled?.targetFingerprint` fallback was added in
+  // April 2026 as a one-time migration aid for legacy recorded steps
+  // saved before `recordedFingerprint` joined the schema. Every modern
+  // recording writes `recordedFingerprint` directly; manual-add steps
+  // never had it (by design — there's no recorder to probe).
+  //
+  // Why removed: `compiled.targetFingerprint` is a self-echo of a
+  // previous resolver decision, not ground truth. Using it for identity
+  // fast-path closes a self-reinforcement loop:
+  //   1. manual-add Apply on a half-loaded page picks <span>"Русский"
+  //   2. backfill writes compiled.targetFingerprint = {tag:"span",text:"Русский"}
+  //   3. on the next Apply, identity fast-path matches that fingerprint
+  //      against the live `<span>"Русский"` and re-confirms the wrong
+  //      element with high confidence
+  //   4. step is poisoned forever — every Run reinforces the wrong target
+  // (See documentolog Step 0 incident, May 2026.)
+  //
+  // After V27: manual-add steps that survive a TRUSTED Apply gain a
+  // SYNTHETIC `recordedFingerprint` written by `buildSyntheticFingerprintFromNode`
+  // (now extended to type/select/check actions, not just click). That
+  // synthetic value is the legitimate channel for manual-add identity —
+  // it's gated by the V27 backfill safety guard, so a fake-success can't
+  // poison it the way it could poison `compiled.targetFingerprint`.
+  //
+  // Net effect of dropping the fallback:
+  //   - recorded steps: no change (recordedFingerprint always present)
+  //   - manual-add post-trusted-Apply: identity fast-path works via
+  //     synthetic recordedFingerprint
+  //   - manual-add pre-first-Apply OR with poisoned compiled: skips
+  //     identity fast-path → runs LLM resolve → can recover from the
+  //     poison instead of cementing it
+  //
+  // We require the live element to be in the allowed set so disabled /
+  // off-screen / aria-hidden matches still get filtered out.
+  const identityFp = stepDraft.recordedFingerprint;
   if (identityFp && allAllowed.length > 0) {
     // Diagnostic: log id/testId distribution among live allAllowed candidates
     // so a "fast-path didn't fire even though recordedId exists" run can be
