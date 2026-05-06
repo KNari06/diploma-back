@@ -793,6 +793,24 @@ const confirmedSelections = new Map<string, ConfirmedSelection>();
 // Cleanup old clarifications and selections (older than 5 minutes)
 const CLARIFICATION_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * Synchronous in-flight guard for `preview:run:start`.
+ *
+ * `PreviewRunService.activeRuns` only protects after `runStepsOnPreview()` has
+ * reached the line that sets it — which is past `await getByIdInternal()` and
+ * platform routing. If multiple `preview:run:start` events land on the socket
+ * within the same tick (Socket.IO reconnect-replay, fast double-click,
+ * StrictMode double-effect), they all pass through the async preamble in
+ * parallel and only one of them actually sets the lock; the rest race past it
+ * before throwing. We saw 12 `run_end` events for one user click as a result.
+ *
+ * This Set is set/cleared synchronously around the entire handler body so a
+ * second event for the same `previewSessionId` is rejected immediately, before
+ * any await. Cleared in `finally` so a normal completion (or an error) frees
+ * the slot for the next legitimate run.
+ */
+const previewRunStartInFlight = new Set<string>();
+
 const clarificationCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [key, value] of pendingClarifications) {
@@ -4029,6 +4047,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
+      // CDP-based pre-check: ask navigation history index BEFORE attempting
+      // page.goBack(). This is the only reliable way to distinguish "no history"
+      // from "back worked via SPA pushState without URL change" — Playwright's
+      // goBack() returns null in BOTH cases. Fail-open ({canBack:true}) on any
+      // CDP error so a transient failure can't dead-button the user.
+      const capability = await sessionService.getNavigationHistoryCapability(previewSessionId, ensuredUserId);
+      if (!capability.canBack) {
+        emitPageActionResult(socket, previewSessionId, 'back', false, 'No history to go back or session not found');
+        return;
+      }
+
       // Flush pending scroll+typing before navigation — preserve step order
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
         await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'back');
@@ -4105,6 +4134,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
+
+      // CDP pre-check (see goBack handler above for rationale). Fail-open on error.
+      const capability = await sessionService.getNavigationHistoryCapability(previewSessionId, ensuredUserId);
+      if (!capability.canForward) {
+        emitPageActionResult(socket, previewSessionId, 'forward', false, 'No history to go forward or session not found');
+        return;
+      }
 
       // Flush pending scroll+typing before navigation — preserve step order
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -4725,6 +4761,30 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
    * Executes all saved steps sequentially in existing preview session
    */
   socket.on('preview:run:start', async (data) => {
+    // Synchronous guard — must run before any await so a second concurrent
+    // event for the same session is rejected before it can race past us into
+    // PreviewRunService. Held until either:
+    //   (a) the run is kicked off AND PreviewRunService.activeRuns has
+    //       taken over the lock (released in the .finally() chained on
+    //       runSavedSteps below), or
+    //   (b) we exit the handler before kicking off (validation fail / sync
+    //       throw) — released in the outer finally via `kickedOff` flag.
+    // Releasing in (a) only after the Promise settles guarantees no race
+    // window: PreviewRunService awaits getById/update before reaching its
+    // own activeRuns.set(), and a stale 2nd event arriving in that window
+    // would otherwise slip past both guards.
+    const guardKey = data?.previewSessionId;
+    if (typeof guardKey === 'string' && guardKey.length > 0) {
+      if (previewRunStartInFlight.has(guardKey)) {
+        logger.warn('[WebSocket] preview:run:start ignored — another start is in flight', {
+          previewSessionId: guardKey,
+          socketId: socket.id,
+        });
+        return;
+      }
+      previewRunStartInFlight.add(guardKey);
+    }
+    let kickedOff = false;
     try {
       const userId = getUserId(socket);
       const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset, startFromIndex: clientStartFromIndex } = data;
@@ -5070,19 +5130,32 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         : (safeAuthReset || safeStartFromIndex !== undefined)
           ? { authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
           : undefined;
-      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
-        logger.error('[WebSocket] Preview run failed', {
-          previewSessionId,
-          intentTestCaseId,
-          userId,
-          error: error instanceof Error ? error.message : String(error),
+      kickedOff = true;
+      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions)
+        .catch((error) => {
+          logger.error('[WebSocket] Preview run failed', {
+            previewSessionId,
+            intentTestCaseId,
+            userId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          socket.emit('error', {
+            code: 'RUN_FAILED',
+            message: error instanceof Error ? error.message : 'Run failed',
+            timestamp: new Date().toISOString(),
+          });
+        })
+        .finally(() => {
+          // Run fully settled (success / failure / cancellation). At this
+          // point PreviewRunService.activeRuns has long been released too.
+          // Only now is it safe to allow another preview:run:start for this
+          // session — releasing earlier opens a race window during which a
+          // stale 2nd event could slip past both this Set guard and the
+          // not-yet-set activeRuns lock inside runSavedSteps.
+          if (typeof guardKey === 'string' && guardKey.length > 0) {
+            previewRunStartInFlight.delete(guardKey);
+          }
         });
-        socket.emit('error', {
-          code: 'RUN_FAILED',
-          message: error instanceof Error ? error.message : 'Run failed',
-          timestamp: new Date().toISOString(),
-        });
-      });
     } catch (error) {
       logger.error('[WebSocket] Error in preview:run:start', {
         socketId: socket.id,
@@ -5093,6 +5166,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         message: error instanceof Error ? error.message : 'Internal error',
         timestamp: new Date().toISOString(),
       });
+    } finally {
+      // Release the synchronous guard ONLY when we did not kick off a run.
+      // If we did kick off, the .finally() chained on runSavedSteps owns
+      // the release — releasing here would defeat the whole purpose of the
+      // guard (see kickedOff comment at top of handler).
+      if (!kickedOff && typeof guardKey === 'string' && guardKey.length > 0) {
+        previewRunStartInFlight.delete(guardKey);
+      }
     }
   });
 

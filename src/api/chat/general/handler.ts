@@ -6,7 +6,7 @@ import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
-import { searchKB } from '@/services/kb/kb.service';
+import { getProjectFiles, searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ChatPersistence } from '@/services/utils/chat-persistence';
 import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
@@ -539,7 +539,7 @@ export async function handleGeneralChat(
     || (parsedContext?.workspaceId || parsedContext?.workspace_id);
 
   // Launch all independent fetches in parallel
-  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult, integrationResult] =
+  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult, integrationResult, kbFilesResult] =
     await Promise.allSettled([
       // 1. KB search (non-fatal) — telemetry fields let us attribute feedback later
       searchKB(message, projectId, {
@@ -592,6 +592,15 @@ export async function handleGeneralChat(
             .then(m => m.IntegrationTokenService.getIntegrationSummary(userId!, workspaceId!))
             .catch(() => '')
         : Promise.resolve(''),
+
+      // 7. KB file inventory — names only, fed into system prompt so the
+      // model knows what's available to kb_search before it tries.
+      projectId
+        ? getProjectFiles(projectId).catch((err: Error) => {
+            logger.warn('[GENERAL_CHAT] Failed to load KB file list', { error: err.message });
+            return [] as Array<{ fileName: string }>;
+          })
+        : Promise.resolve([] as Array<{ fileName: string }>),
     ]);
 
   // Check if request was cancelled during parallel loading
@@ -652,6 +661,13 @@ export async function handleGeneralChat(
     integrationContext = integrationResult.value;
   }
 
+  let kbFileNames: string[] = [];
+  if (kbFilesResult.status === 'fulfilled' && Array.isArray(kbFilesResult.value)) {
+    kbFileNames = kbFilesResult.value
+      .map((f) => f?.fileName)
+      .filter((n): n is string => typeof n === 'string' && n.length > 0);
+  }
+
   logger.info('[GENERAL_CHAT] Parallel context loading complete', {
     durationMs: Date.now() - contextStartMs,
     hasKB: !!kbContext,
@@ -693,7 +709,7 @@ export async function handleGeneralChat(
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext);
+  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext, kbFileNames);
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor' && editorPageContext) {

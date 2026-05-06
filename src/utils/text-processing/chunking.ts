@@ -146,6 +146,7 @@ export function chunkText(
 
     const encoder = getEncoder();
     const tokens = encoder.encode(normalizedText);
+    const utf8Decoder = new TextDecoder('utf-8');
 
     const chunks: TextChunk[] = [];
     let startIdx = 0;
@@ -154,8 +155,8 @@ export function chunkText(
       const endIdx = Math.min(startIdx + chunkSize, tokens.length);
       const chunkTokens = tokens.slice(startIdx, endIdx);
 
-      // tiktoken's decode returns string (not Uint8Array)
-      const chunkText = String(encoder.decode(chunkTokens));
+      // tiktoken's decode returns a Uint8Array of UTF-8 bytes; decode to string.
+      const chunkText = utf8Decoder.decode(encoder.decode(chunkTokens));
 
       // Skip empty chunks
       const trimmedChunk = chunkText.trim();
@@ -164,13 +165,12 @@ export function chunkText(
         continue;
       }
 
-      // Calculate actual character positions in original normalized text
-      // We need to decode tokens to get the actual text position
+      // Calculate actual character positions in original normalized text.
       const chunkStartChar = normalizedText.length > 0
-        ? Math.min(startIdx > 0 ? encoder.decode(tokens.slice(0, startIdx)).length : 0, normalizedText.length)
+        ? Math.min(startIdx > 0 ? utf8Decoder.decode(encoder.decode(tokens.slice(0, startIdx))).length : 0, normalizedText.length)
         : 0;
       const chunkEndChar = normalizedText.length > 0
-        ? Math.min(encoder.decode(chunkTokens).length + chunkStartChar, normalizedText.length)
+        ? Math.min(chunkText.length + chunkStartChar, normalizedText.length)
         : normalizedText.length;
 
       chunks.push({
