@@ -2536,7 +2536,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (page && preClickElement) {
                   // Build the candidate list. Prefer chain (multi-level);
                   // fall back to lastHover (single-step legacy path).
-                  const candidates: Array<{ x: number; y: number; timestamp: number; probedElement?: any }> = [];
+                  // chain entries carry `preProbe` from the dwell-watcher in
+                  // session.appendRecordingHoverChain; lastHover entries don't —
+                  // for the legacy path we fail-open on DOM-effect detection.
+                  const candidates: Array<{
+                    x: number;
+                    y: number;
+                    timestamp: number;
+                    probedElement?: any;
+                    preProbe?: import('@/services/testing/ui/preview/hover-effect-probe.util').HoverEffectSnapshot | null;
+                  }> = [];
                   if (chain.length > 0) {
                     for (const c of chain) candidates.push(c);
                   } else {
@@ -2545,6 +2554,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }
                   const cBB = preClickElement.boundingBox;
                   const seenBBoxKeys = new Set<string>();
+                  // Lazy-load the hover-effect util once per click event —
+                  // import is cheap (already cached after first hit) but
+                  // putting it in the loop would be N redundant calls.
+                  const { probeHoverEffect, diffHoverEffect, hasHoverEffect } =
+                    await import('@/services/testing/ui/preview/hover-effect-probe.util');
                   for (let ci = 0; ci < candidates.length; ci++) {
                     const cand = candidates[ci];
                     const timeSinceHover = Date.now() - cand.timestamp;
@@ -2567,34 +2581,96 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     const bboxKey = `${hBB.x}|${hBB.y}|${hBB.width}|${hBB.height}`;
                     if (seenBBoxKeys.has(bboxKey)) continue;
                     seenBBoxKeys.add(bboxKey);
-                    // Patch A: adaptive dwell threshold.
-                    // Popup-trigger signals (aria-haspopup, bsToggle="dropdown",
-                    // class*="dropdown|menu-trigger|has-submenu", or any
-                    // ancestor-summary that hints at a menu container) → 80ms.
-                    // Everything else → 400ms (legacy threshold).
+
+                    // ── Gate 1: minimum dwell of 1000 ms ────────────────────
+                    // Sub-second pauses are cursor sweeps, not intentional hovers.
+                    // Single threshold for everything (popup-trigger or not) —
+                    // adaptive 80/400 ms thresholds were too permissive and
+                    // captured WhatsApp-icon-in-footer-style sweeps.
+                    const minDwell = 1000;
+                    if (timeSinceHover < minDwell) {
+                      if (cTrace) cTrace.writeHoverDecision({
+                        dwellMs: timeSinceHover,
+                        kept: false,
+                        reason: 'dwell_too_short',
+                        bbox: hBB,
+                      });
+                      continue;
+                    }
+
+                    // ── Gate 2a: popup-trigger heuristic ────────────────────
+                    // Cheap signals from the recorded probe data — no extra
+                    // page.evaluate. Captures dropdown/menu/disclosure widgets
+                    // even when the structural diff misses them (e.g. the
+                    // popup renders into a body-level portal outside our
+                    // 3-up subtree).
                     const cls = (hoverElement.cssClass || '') + ' ' + (hoverElement.ancestorSummary || '');
                     const isLikelyPopupTrigger =
                       !!hoverElement.ariaHasPopup
+                      || !!hoverElement.ariaControls
+                      || hoverElement.ariaExpanded !== undefined
+                      || hoverElement.dataState === 'open'
                       || hoverElement.bsToggle === 'dropdown'
                       || hoverElement.bsToggle === 'menu'
+                      || hoverElement.bsToggle === 'collapse'
+                      || hoverElement.tag === 'summary'
                       || /\b(dropdown|menu-trigger|has-submenu|popper-trigger|has-dropdown|nav-item|MuiMenuItem|MuiMenu-)\b/i.test(cls);
-                    const minDwell = isLikelyPopupTrigger ? 80 : 400;
-                    if (timeSinceHover < minDwell) continue;
-                    // Skip generic-label hovers. If the probe couldn't find any
-                    // descriptive name for the target (no aria-label, no text,
-                    // no title, no id, no testId), the recorded step ends up as
-                    // "Hover 'element'" which is useless for replay — the
-                    // resolver has nothing semantic to match against. Most of
-                    // these come from cursor sweeps between meaningful targets
-                    // (e.g. mouse passing over a wrapper div on the way to the
-                    // language flag). Exception: keep the step when the probe
-                    // indicates a popup-trigger (aria-haspopup / dropdown class)
-                    // — there the hover IS the action even without a label.
-                    const probedLabel = RecordingCaptureService.getProbedLabel(hoverElement, 60);
-                    if (!probedLabel && !isLikelyPopupTrigger) continue;
-                    const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
+
+                    // ── Gate 2b: structural DOM-effect probe ────────────────
+                    // post-snapshot of the local subtree (~10 ms).  Diff
+                    // against pre-snapshot (taken at dwell+500 ms by the
+                    // session-service watcher).  No pre = no comparison =
+                    // hadDomEffect false, gate falls back to popup-trigger.
+                    let hoverEffectInfo: {
+                      newInteractive: number;
+                      newVisualInteractive: number;
+                      expandedTriggered: boolean;
+                      dataStateOpened: boolean;
+                    } | null = null;
+                    let hadDomEffect = false;
+                    if (cand.preProbe !== undefined && cand.preProbe !== null) {
+                      const postProbe = await probeHoverEffect(page, cand.x, cand.y);
+                      const diff = diffHoverEffect(cand.preProbe, postProbe);
+                      hadDomEffect = hasHoverEffect(diff);
+                      if (hadDomEffect) hoverEffectInfo = diff;
+                    }
+
+                    // Final gate: keep ONLY when (popup-trigger OR DOM effect).
+                    // Generic labelled hovers without either signal — drop.
+                    // This is the rule that retires the "WhatsApp footer
+                    // sweep gets recorded because it has aria-label" pattern.
+                    if (!isLikelyPopupTrigger && !hadDomEffect) {
+                      if (cTrace) cTrace.writeHoverDecision({
+                        dwellMs: timeSinceHover,
+                        isPopupTrigger: false,
+                        hadDomEffect: false,
+                        kept: false,
+                        reason: 'no_effect_no_popup',
+                        bbox: hBB,
+                      });
+                      continue;
+                    }
+
+                    const hoverStep = RecordingCaptureService.captureHover(
+                      hoverElement,
+                      page.url(),
+                      hoverEffectInfo,
+                    );
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
-                    if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                    if (cTrace) {
+                      cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                      cTrace.writeHoverDecision({
+                        dwellMs: timeSinceHover,
+                        isPopupTrigger: isLikelyPopupTrigger,
+                        hadDomEffect,
+                        newInteractive: hoverEffectInfo?.newInteractive,
+                        newVisualInteractive: hoverEffectInfo?.newVisualInteractive,
+                        expandedTriggered: hoverEffectInfo?.expandedTriggered,
+                        dataStateOpened: hoverEffectInfo?.dataStateOpened,
+                        kept: true,
+                        bbox: hBB,
+                      });
+                    }
                     // Etap 1D.3 — fire-and-forget LLM enrichment.
                     scheduleRecordedDescription(socket, room, previewSessionId, hoverStep, hoverElement);
                   }

@@ -520,6 +520,19 @@ interface InternalSession extends PreviewSession {
     y: number;
     timestamp: number;
     probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement;
+    /**
+     * Hover-effect detector: pre-snapshot of the local subtree taken when the
+     * cursor first dwelt on this target.  Compared against a post-snapshot at
+     * the click handler to decide if the hover caused a real DOM change
+     * (dropdown opened, row affordance appeared, accordion expanded).
+     * Absent when the entry was just appended — populated lazily by the
+     * dwell-watcher in preview.handler.ts.  Type kept loose (Record<string, unknown>)
+     * because preview.types.ts can't import from the util layer without
+     * a circular dep — the handler shape-checks before use.
+     */
+    preProbe?: import('@/services/testing/ui/preview/hover-effect-probe.util').HoverEffectSnapshot | null;
+    /** Timestamp when preProbe was captured — also serves as "probe-already-fired" flag. */
+    preProbeAt?: number;
   }>;
 
   /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
@@ -2965,6 +2978,38 @@ export class PreviewSessionService {
     chain.push(entry);
     // Cap at 4 — multi-level menus rarely exceed 3 (root → submenu → leaf).
     while (chain.length > 4) chain.shift();
+
+    // Hover-effect detector: schedule a PRE-hover snapshot 500 ms after the
+    // entry was created.  Scheduling at 500 ms (not on the move event itself)
+    // means cursor sweeps that move through the element in < 500 ms never
+    // trigger the probe — zero overhead for noise, full coverage for the
+    // intentional hovers (which dwell ≥ 1000 ms downstream).  500 ms also
+    // leaves a 500 ms window before the click-handler's 1000 ms gate, so the
+    // post-snapshot has time to capture any DOM effect that took a moment to
+    // render.  Fire-and-forget — never blocks the hover probe pipeline.
+    if (newBB) {
+      const targetBBox = { x: newBB.x, y: newBB.y, width: newBB.width, height: newBB.height };
+      setTimeout(() => {
+        // Re-resolve session inside the callback — by the time we fire the
+        // session may have been torn down (TTL, manual close, server reload).
+        const liveSession = this.getAuthorizedSession(sessionId, userId);
+        if (!liveSession || !liveSession.recording) return;
+        // Verify entry still in chain — chain.shift() may have evicted us
+        // when 5+ distinct hovers landed during the dwell window.
+        const stillThere = liveSession.recordingHoverChain?.some(e => {
+          const bb = e.probedElement.boundingBox;
+          return bb && bb.x === targetBBox.x && bb.y === targetBBox.y
+            && bb.width === targetBBox.width && bb.height === targetBBox.height;
+        });
+        if (!stillThere) return;
+        // Lazy-load to avoid a cyclic import at module init time.
+        import('./hover-effect-probe.util').then(({ probeHoverEffect }) => {
+          probeHoverEffect(liveSession.page, entry.x, entry.y).then((preProbe) => {
+            this.setRecordingHoverChainPreProbe(sessionId, userId, targetBBox, preProbe);
+          }).catch(() => { /* fail-open — handler treats as no-effect */ });
+        }).catch(() => { /* import error — non-fatal */ });
+      }, 500).unref?.();
+    }
   }
 
   /**
@@ -2976,6 +3021,40 @@ export class PreviewSessionService {
   ): NonNullable<InternalSession['recordingHoverChain']> {
     const session = this.getAuthorizedSession(sessionId, userId);
     return session?.recordingHoverChain ?? [];
+  }
+
+  /**
+   * Hover-effect detector: attach a pre-hover DOM snapshot to a chain entry.
+   * Matched by boundingBox identity (the chain dedupes by bbox so this is the
+   * stable key).  No-op if the entry was already evicted from the chain.
+   *
+   * Why bbox not index: chain.shift() can run between schedule and fire when
+   * a 5th distinct hover lands during the dwell window — index 0 of "now" may
+   * be a different entry than the one we scheduled the probe for.
+   */
+  setRecordingHoverChainPreProbe(
+    sessionId: string,
+    userId: string,
+    targetBBox: { x: number; y: number; width: number; height: number },
+    preProbe: import('@/services/testing/ui/preview/hover-effect-probe.util').HoverEffectSnapshot | null,
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session?.recordingHoverChain) return;
+    for (const entry of session.recordingHoverChain) {
+      const bb = entry.probedElement.boundingBox;
+      if (!bb) continue;
+      if (bb.x === targetBBox.x && bb.y === targetBBox.y
+        && bb.width === targetBBox.width && bb.height === targetBBox.height) {
+        // Only set once — first probe wins.  Later moves over the same element
+        // shouldn't overwrite the baseline (we want pre-DWELL state, not the
+        // most recent one which may already include the effect).
+        if (entry.preProbeAt === undefined) {
+          entry.preProbe = preProbe;
+          entry.preProbeAt = Date.now();
+        }
+        return;
+      }
+    }
   }
 
   /**

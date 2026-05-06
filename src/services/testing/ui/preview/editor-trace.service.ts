@@ -1259,6 +1259,38 @@ export class EditorTraceService {
     this.writer.write({ stage: 'hover', eventType: 'hover_emit', payload: data });
   }
 
+  /**
+   * Recording-time hover gate decision: kept or dropped, and why.
+   * Lets a post-mortem answer "why didn't this hover get recorded?" or
+   * "why did this junk hover slip through?" without re-running the session.
+   * Written for EVERY candidate evaluated at click time — both kept and
+   * dropped — so the count of dropped sweeps is visible in the trace.
+   */
+  writeHoverDecision(data: {
+    /** Time since first dwelt on this element, ms.  Always recorded. */
+    dwellMs: number;
+    /** True if the probed element matched the popup-trigger heuristic. */
+    isPopupTrigger?: boolean;
+    /** True if pre/post DOM-effect probe diff showed a real structural change. */
+    hadDomEffect?: boolean;
+    /** post.interactiveCount - pre.interactiveCount (only when probe ran). */
+    newInteractive?: number;
+    /** post.visualInteractiveCount - pre.visualInteractiveCount (opacity-aware). */
+    newVisualInteractive?: number;
+    /** aria-expanded flipped to true (only when probe ran). */
+    expandedTriggered?: boolean;
+    /** data-state moved into open/active/checked/on (only when probe ran). */
+    dataStateOpened?: boolean;
+    /** Final decision: was the step recorded? */
+    kept: boolean;
+    /** Drop reason — 'dwell_too_short' | 'no_effect_no_popup' | etc. */
+    reason?: string;
+    /** Bounding box for cross-referencing with the actual hover target. */
+    bbox?: { x: number; y: number; width: number; height: number };
+  }): void {
+    this.writer.write({ stage: 'hover', eventType: 'hover_decision', payload: data });
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // ERROR
   // ─────────────────────────────────────────────────────────────────────────

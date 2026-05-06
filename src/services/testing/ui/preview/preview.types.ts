@@ -630,6 +630,30 @@ export interface StepEvidence {
   lastHealedAt?: string;
   /** Flagged for human review after repeated heals */
   needsReview?: boolean;
+  /**
+   * Hover-effect summary captured at recording time.  Set only on hover steps
+   * that passed the structural-effect gate (the recorder confirmed the hover
+   * caused a real DOM change: new interactive appeared, aria-expanded
+   * flipped, or Radix data-state opened).  Replay can re-run the same probe
+   * post-hover and assert the effect still happens — if not, we know we
+   * targeted a different element than the recording.
+   */
+  hoverEffect?: {
+    /** post.interactiveCount - pre.interactiveCount inside target's 3-up subtree. */
+    newInteractive: number;
+    /**
+     * post.visualInteractiveCount - pre.visualInteractiveCount.
+     * Stricter than `newInteractive`: filters out opacity:0 / visibility:hidden
+     * elements.  Catches the row-affordance pattern (opacity:0 button revealed
+     * on hover) which `newInteractive` alone misses because layout-visible
+     * count doesn't change when only opacity transitions.
+     */
+    newVisualInteractive: number;
+    /** Any aria-expanded along target → 3 ancestors flipped to "true". */
+    expandedTriggered: boolean;
+    /** Any data-state along target → 3 ancestors moved into open/active/checked/on. */
+    dataStateOpened: boolean;
+  };
 }
 
 /**
