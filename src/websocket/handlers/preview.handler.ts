@@ -56,7 +56,21 @@ const hoverProbeState = new Map<string, {
 const HOVER_PROBE_THROTTLE_MS = 200;
 
 /** Per-session scroll debounce timers */
-const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout; containerSelector?: string | null }>();
+const recordingScrollTimers = new Map<string, {
+  deltaY: number;
+  deltaX: number;
+  timer: NodeJS.Timeout;
+  containerSelector?: string | null;
+  /**
+   * URL captured at the FIRST wheel event of this debounce window.  Used as
+   * evidence.pageUrl on the eventual scroll step instead of `page.url()`
+   * read inside the timer — by the time the 500 ms debounce fires the page
+   * may have already navigated (auth-wall redirect mid-scroll, A/B
+   * remount).  Storing the first-event URL preserves the "where the user
+   * actually scrolled" semantic.
+   */
+  initialPageUrl?: string;
+}>();
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
@@ -268,7 +282,13 @@ async function flushPendingScroll(
   try {
     const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
     const scrollPage = sessionService.getPage(previewSessionId, userId);
-    const scrollPageUrl = scrollPage?.url();
+    // Prefer the URL captured at the FIRST wheel event of this debounce
+    // window over `page.url()` here.  This flush runs at unpredictable
+    // timing (called before any non-scroll step) and the page may have
+    // navigated mid-scroll — using the live url() would attribute the
+    // scroll to the wrong page.  Falls back to live url() for legacy
+    // entries that don't carry an initialPageUrl yet.
+    const scrollPageUrl = pendingScroll.initialPageUrl || scrollPage?.url();
     if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
 
     let scrollTargetHints: import('@/services/testing/ui/preview/preview.types').BindingHints | null = null;
@@ -2446,6 +2466,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       }
 
+      // Capture pre-click URL BEFORE executing the action.  Click may trigger
+      // a navigation (auth-wall redirect, SPA push), and any step we record
+      // afterwards (hover-before-click, click itself, drag) needs to carry the
+      // URL the user was on WHEN the interaction happened — not where the page
+      // ended up.  Storing in handler scope so the setImmediate block below
+      // (which fires AFTER executeMouseAction settles, possibly post-nav)
+      // can use it without re-reading page.url().
+      const prePagePreClick = sessionService.getPage(previewSessionId, ensuredUserId);
+      const preClickUrl = prePagePreClick?.url();
+
       const result = await sessionService.executeMouseAction({
         sessionId: previewSessionId,
         userId: ensuredUserId,
@@ -2651,9 +2681,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                       continue;
                     }
 
+                    // URL where the hover was actually performed.  Using
+                    // `page.url()` here would return the POST-click URL —
+                    // we're inside `setImmediate` that fires AFTER the click
+                    // already navigated.  Pre-click hover steps must carry
+                    // the URL the user was on when hovering, otherwise
+                    // evidence.pageUrl mismatches the resolver's compiled
+                    // plan url and triggers a false `urlStale` skip.
                     const hoverStep = RecordingCaptureService.captureHover(
                       hoverElement,
-                      page.url(),
+                      preClickUrl,
                       hoverEffectInfo,
                     );
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
@@ -2701,8 +2738,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // previous single-click's id so LLM refinement updates the correct row instead of creating
               // a phantom one that FE would treat as a new step.
               let stepIdForClick = `rec_${Date.now().toString(36)}`;
-              const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
-              const initialPageUrl = currentPage?.url();
+              // Click step URL == URL where the click landed.  We are inside
+              // setImmediate AFTER executeMouseAction settled, so page.url()
+              // here may already be the navigation TARGET (e.g. /tutors → /login
+              // after auth-wall redirect).  Use `preClickUrl` captured in
+              // handler scope BEFORE the click executed — that's the page the
+              // user actually clicked ON, which is what evidence.pageUrl is
+              // meant to record.
+              const initialPageUrl = preClickUrl;
               const hasModifiers = modifiers && (modifiers.shift || modifiers.ctrl || modifiers.meta || modifiers.alt);
 
               const buildClickStep = (el: NonNullable<typeof preClickElement>): PreviewIntentStep => {
@@ -3172,10 +3215,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             } catch { /* non-critical */ }
           }
 
+          // Capture URL at the FIRST wheel event of the debounce window.
+          // Reuse for subsequent events so a 500 ms scroll session that
+          // straddles a navigation still attributes to where it started.
+          // On the timer fire we also update lastUrl so it reflects current.
+          let initialPageUrl = existing?.initialPageUrl;
+          if (initialPageUrl === undefined) {
+            const scrollPageNow = sessionService.getPage(previewSessionId, ensuredUserId);
+            initialPageUrl = scrollPageNow?.url();
+          }
+
           recordingScrollTimers.set(previewSessionId, {
             deltaY: accumulatedDeltaY,
             deltaX: accumulatedDeltaX,
             containerSelector,
+            initialPageUrl,
             timer: setTimeout(async () => {
               try {
                 const scrollState = recordingScrollTimers.get(previewSessionId);
@@ -3192,8 +3246,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const sTrace = EditorTraceService.get(previewSessionId);
 
                 // V13: Capture page URL for evidence (used by auto-wait injection)
+                // Prefer the URL captured at the FIRST wheel event of this
+                // debounce window — page may have navigated during the 500 ms
+                // settle, in which case live url() returns the new page and
+                // the scroll step gets attributed to the wrong location.
                 const scrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
-                const scrollPageUrl = scrollPage?.url();
+                const scrollPageUrl = scrollState?.initialPageUrl || scrollPage?.url();
 
                 // V15: Guard against scroll before page load (race condition)
                 if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
