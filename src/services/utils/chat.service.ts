@@ -255,75 +255,6 @@ export class ChatService {
   }
 
   /**
-   * Get workspace context for personalizing the welcome message
-   */
-  private static async getWorkspaceContext(workspaceId: string): Promise<{
-    workspaceName?: string;
-  } | null> {
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('workspaces')
-        .select('name')
-        .eq('id', workspaceId)
-        .maybeSingle();
-
-      if (error || !data) return null;
-
-      return {
-        workspaceName: data.name && data.name !== 'Untitled' ? data.name : undefined,
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Build the welcome message content
-   */
-  static buildWelcomeMessage(context?: { workspaceName?: string }): string {
-    const projectPart = context?.workspaceName
-      ? ` для **${context.workspaceName}**`
-      : '';
-
-    return `Привет! Я QAIT — твой QA-ассистент${projectPart}.
-Вот что я умею:
-- Тестировать сайты на реальных браузерах/девайсах
-- Тестировать API-эндпоинты
-- Автономно анализировать задачи и проверять их
-- Создавать и запускать регрессионные тесты
-- Всегда иметь базу знаний о проекте
-
-Чем могу помочь?`;
-  }
-
-  /**
-   * Insert a welcome message into a chat session
-   */
-  static async insertWelcomeMessage(sessionId: string, workspaceId: string): Promise<void> {
-    try {
-      const context = await ChatService.getWorkspaceContext(workspaceId);
-      const content = ChatService.buildWelcomeMessage(context || undefined);
-
-      await supabaseAdmin
-        .from('chat_messages')
-        .insert({
-          session_id: sessionId,
-          role: 'ai',
-          content,
-          metadata: { type: 'welcome' },
-          created_at: new Date().toISOString(),
-        });
-
-      logger.info('[CHAT_SERVICE] Welcome message inserted', { sessionId, workspaceId });
-    } catch (error) {
-      logger.warn('[CHAT_SERVICE] Failed to insert welcome message', {
-        error: error instanceof Error ? error.message : String(error),
-        sessionId,
-      });
-    }
-  }
-
-  /**
    * Create a new chat session
    * @param userId - User ID
    * @param workspaceId - Workspace ID
@@ -384,9 +315,6 @@ export class ChatService {
         userId,
         workspaceId,
       });
-
-      // Insert welcome message for the new session
-      await ChatService.insertWelcomeMessage(data.id, workspaceId);
 
       return data.id;
 
