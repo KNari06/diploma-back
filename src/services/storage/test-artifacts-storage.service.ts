@@ -446,15 +446,84 @@ export type TraceType =
   | 'replay';
 
 /**
+ * Sanitize an email for safe use as a single Supabase Storage path segment.
+ * Keep `@`, `.`, `+`, `-`, `_` so the segment stays human-readable
+ * (e.g. `erasylgeso@gmail.com`); replace anything else with `_`.
+ */
+function sanitizeEmailForPath(email: string): string {
+  return email.toLowerCase().replace(/[^a-z0-9._@+-]/g, '_');
+}
+
+/**
+ * In-process cache for userId → email lookup. One Run can flush many trace
+ * files; without this we'd hit `public.users` per upload. TTL is short so
+ * email changes propagate within minutes without restart.
+ */
+const USER_EMAIL_CACHE_TTL_MS = 10 * 60 * 1000;
+const userEmailCache = new Map<string, { email: string | null; expiresAt: number }>();
+
+async function resolveUserEmail(userId: string): Promise<string | null> {
+  const cached = userEmailCache.get(userId);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.email;
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('users')
+      .select('email')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) {
+      logger.debug('[STORAGE] Failed to resolve user email for trace path', {
+        userId,
+        error: error.message,
+      });
+      userEmailCache.set(userId, { email: null, expiresAt: now + USER_EMAIL_CACHE_TTL_MS });
+      return null;
+    }
+
+    const email = (data?.email ?? null) as string | null;
+    userEmailCache.set(userId, { email, expiresAt: now + USER_EMAIL_CACHE_TTL_MS });
+    return email;
+  } catch (err) {
+    logger.debug('[STORAGE] Exception while resolving user email for trace path', {
+      userId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Resolve the user-facing path segment for trace uploads.
+ * Prefers email (`erasylgeso@gmail.com`) so Supabase Storage folders are
+ * readable; falls back to the raw userId if email lookup fails.
+ */
+async function resolveUserPathSegment(userId: string): Promise<string> {
+  if (!isValidUUID(userId)) return userId; // anonymous / non-UUID — caller decides
+  const email = await resolveUserEmail(userId);
+  return email ? sanitizeEmailForPath(email) : userId;
+}
+
+/**
  * Build the Supabase Storage path for a trace log.
  *
  * Structure:
- *   trace-logs/<userSegment>/<YYYY-MM-DD>/<traceType>__<HH-MM-SS>__<shortTestId>.jsonl
+ *   trace-logs/<userSegment>/<traceType>/<YYYY-MM-DD>/<HH-MM-SS>__<shortTestId>.jsonl
  *
- * `userSegment` is the user's UUID for authenticated runs or the literal
- * `anonymous` for non-UUID runs. RLS policies on the `lite-trace-logs` bucket
- * rely on the first two path segments (`trace-logs/<userId>`), so we keep
- * those fixed and add date + typed filename INSIDE the user folder.
+ * `userSegment` is the sanitized user email for authenticated runs (resolved
+ * by `resolveUserPathSegment` in `uploadLiteTraceLogToStorage`), the raw
+ * userId as a fallback when email lookup fails, or the literal `anonymous`
+ * for non-UUID runs. `traceType` is a dedicated folder per source
+ * (editor / preview / draft / replay / lite / api-agent / exploration) so
+ * all logs of one kind sit together across dates.
+ *
+ * Uploads are performed by `supabaseAdmin` (service role), so the bucket's
+ * RLS policies on the first path segments are bypassed for writes. If end
+ * users ever read traces through an RLS-scoped client, the policy on
+ * `lite-trace-logs` must be updated to match the new layout (email + source
+ * folder) instead of `<auth.uid()>` only.
  *
  * `originalFileName` is expected to follow the LiteTraceWriter convention
  * `YYYY-MM-DD_HH-MM-SS_<testId>.jsonl`. If it doesn't match, we fall back
@@ -497,8 +566,11 @@ export function buildTraceStoragePath(
   // upsert:false would throw 409 on retry and orphan the storage object.
   const msSuffix = (now.getUTCMilliseconds() & 0xfff).toString(16).padStart(3, '0');
 
-  const normalizedFileName = `${traceType}__${timePart}__${shortTestId}_${msSuffix}.jsonl`;
-  const storagePath = `trace-logs/${userSegment}/${datePart}/${normalizedFileName}`;
+  // traceType used to be a prefix in the file name; now it's a dedicated
+  // path segment (`trace-logs/<user>/<traceType>/<date>/...`), so we drop it
+  // from the file name to avoid duplication.
+  const normalizedFileName = `${timePart}__${shortTestId}_${msSuffix}.jsonl`;
+  const storagePath = `trace-logs/${userSegment}/${traceType}/${datePart}/${normalizedFileName}`;
 
   return { storagePath, normalizedFileName };
 }
@@ -553,8 +625,9 @@ export async function uploadLiteTraceLogToStorage(
       fileSize: `${Math.round(fileSize / 1024)}KB`,
     });
 
+    const userSegment = await resolveUserPathSegment(userId);
     const { storagePath, normalizedFileName } = buildTraceStoragePath(
-      userId,
+      userSegment,
       traceType,
       fileName,
     );

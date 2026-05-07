@@ -520,6 +520,19 @@ interface InternalSession extends PreviewSession {
     y: number;
     timestamp: number;
     probedElement: import('@/services/testing/ui/preview/recording-capture.service').ProbedElement;
+    /**
+     * Hover-effect detector: pre-snapshot of the local subtree taken when the
+     * cursor first dwelt on this target.  Compared against a post-snapshot at
+     * the click handler to decide if the hover caused a real DOM change
+     * (dropdown opened, row affordance appeared, accordion expanded).
+     * Absent when the entry was just appended — populated lazily by the
+     * dwell-watcher in preview.handler.ts.  Type kept loose (Record<string, unknown>)
+     * because preview.types.ts can't import from the util layer without
+     * a circular dep — the handler shape-checks before use.
+     */
+    preProbe?: import('@/services/testing/ui/preview/hover-effect-probe.util').HoverEffectSnapshot | null;
+    /** Timestamp when preProbe was captured — also serves as "probe-already-fired" flag. */
+    preProbeAt?: number;
   }>;
 
   /** V13: Actual page URL when recording started (more reliable than frontend editorBaseUrl) */
@@ -1258,6 +1271,75 @@ export class PreviewSessionService {
   }
 
   /**
+   * Returns whether the active page can navigate back / forward in history.
+   *
+   * Uses CDP `Page.getNavigationHistory` — this is the only API that gives
+   * the exact navigation index, unlike `window.history.length` which can't
+   * tell back from forward and inflates with every `goto`.
+   *
+   * Opens its OWN short-lived CDPSession (own/use/detach pattern, identical
+   * to `CdpSnapshotService`). Empirically safe with the screencast session
+   * (see `cdp-screencast-collision.integration.test.ts`); never piggybacks
+   * on `preview-video-stream.service.ts`'s session.
+   *
+   * Fail-open: any failure returns `{ canBack: true, canForward: true }` so
+   * the caller still attempts navigation rather than silently blocking it.
+   */
+  async getNavigationHistoryCapability(
+    sessionId: string,
+    userId: string,
+  ): Promise<{ canBack: boolean; canForward: boolean }> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return { canBack: false, canForward: false };
+
+    // V-Phase4 popup fallback: even if the active page has no history,
+    // `goBack()` will close the current tab and activate the previous one
+    // when the user is on a popup. The pre-check must mirror that — otherwise
+    // we'd block `back` for popup users who legitimately want to return.
+    const hasPreviousTab = session.pages.length > 1 && session.activeTabIndex > 0;
+
+    let cdp: import('playwright').CDPSession | null = null;
+    try {
+      // Hard 1s timeout. The CDP call itself is a memory read so this is
+      // generous, but a hung detach (e.g. page just navigated and the target
+      // is being torn down) could otherwise leave the user clicking a dead
+      // button. Fail-open on timeout — see below.
+      const HISTORY_TIMEOUT_MS = 1000;
+      cdp = await Promise.race([
+        session.page.context().newCDPSession(session.page),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('CDP newSession timeout')), HISTORY_TIMEOUT_MS),
+        ),
+      ]);
+      const history = await Promise.race([
+        cdp.send('Page.getNavigationHistory'),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Page.getNavigationHistory timeout')), HISTORY_TIMEOUT_MS),
+        ),
+      ]) as {
+        currentIndex: number;
+        entries: Array<{ id: number; url: string }>;
+      };
+      const idx = history.currentIndex;
+      const total = history.entries?.length ?? 0;
+      return {
+        canBack: idx > 0 || hasPreviousTab,
+        canForward: idx >= 0 && idx < total - 1,
+      };
+    } catch (error) {
+      logger.debug('[PREVIEW_SESSION] getNavigationHistoryCapability failed (fail-open)', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { canBack: true, canForward: true };
+    } finally {
+      if (cdp) {
+        try { await cdp.detach(); } catch { /* non-fatal */ }
+      }
+    }
+  }
+
+  /**
    * Navigate back in browser history
    */
   async goBack(sessionId: string, userId: string): Promise<{
@@ -1283,7 +1365,7 @@ export class PreviewSessionService {
       } catch { /* non-fatal */ }
 
       const response = await session.page.goBack({
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'load',
         timeout: 10000,
       });
 
@@ -1291,7 +1373,13 @@ export class PreviewSessionService {
 
       // goBack returns null both when there's no history AND for SPA navigations
       // (pushState/replaceState don't produce network responses).
-      // Check URL change to distinguish: if URL changed, back worked (SPA case).
+      // The handler's pre-check (`getNavigationHistoryCapability`) already
+      // ruled out the "no history" case before calling us, so when we land
+      // here with `!response && newUrl === previousUrl` it's either:
+      //   (a) popup-tab fallback (handled below — V-Phase4), or
+      //   (b) a successful SPA back where state changed without URL change.
+      // Case (b) we treat as success: the user clicked back, the history
+      // index moved one slot, the page rendered the corresponding state.
       if (!response && newUrl === previousUrl) {
         // V-Phase4: "No history" on this page does NOT necessarily mean the
         // user has nowhere to go. When a site opened a popup (window.open
@@ -1327,8 +1415,21 @@ export class PreviewSessionService {
             };
           }
         }
-        logger.debug('[PREVIEW_SESSION] No history to go back', { sessionId });
-        return null;
+        // SPA back path: URL didn't change but history index did. Force a
+        // snapshot so the UI sees the new DOM state.
+        logger.debug('[PREVIEW_SESSION] goBack — SPA navigation (URL unchanged)', { sessionId, url: newUrl });
+        logPerformance('preview.goBack', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl, via: 'spa_state_only' });
+        setImmediate(() => {
+          this.getSnapshot(sessionId, userId, {
+            force: true, includeDomNodes: true, onlyIfChanged: false,
+          }).catch(() => { /* non-fatal */ });
+        });
+        return {
+          url: newUrl,
+          domVersion: session.domVersion,
+          pageSignature: session.lastPageSignature,
+          changed: false,
+        };
       }
       logPerformance('preview.goBack', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl });
 
@@ -1387,17 +1488,31 @@ export class PreviewSessionService {
       } catch { /* non-fatal */ }
 
       const response = await session.page.goForward({
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'load',
         timeout: 10000,
       });
 
       const newUrl = session.page.url();
 
       // goForward returns null both when no forward history AND for SPA navigations.
-      // Check URL change to distinguish: if URL changed, forward worked (SPA case).
+      // Handler's pre-check already ruled out the no-history branch, so when
+      // we reach here with `!response && newUrl === previousUrl` it's a
+      // successful SPA forward (state changed without URL change). Force a
+      // snapshot so the UI sees the new DOM state.
       if (!response && newUrl === previousUrl) {
-        logger.debug('[PREVIEW_SESSION] No history to go forward', { sessionId });
-        return null;
+        logger.debug('[PREVIEW_SESSION] goForward — SPA navigation (URL unchanged)', { sessionId, url: newUrl });
+        logPerformance('preview.goForward', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl, via: 'spa_state_only' });
+        setImmediate(() => {
+          this.getSnapshot(sessionId, userId, {
+            force: true, includeDomNodes: true, onlyIfChanged: false,
+          }).catch(() => { /* non-fatal */ });
+        });
+        return {
+          url: newUrl,
+          domVersion: session.domVersion,
+          pageSignature: session.lastPageSignature,
+          changed: false,
+        };
       }
       logPerformance('preview.goForward', Date.now() - startMs, { sessionId, from: previousUrl, to: newUrl });
 
@@ -2863,6 +2978,38 @@ export class PreviewSessionService {
     chain.push(entry);
     // Cap at 4 — multi-level menus rarely exceed 3 (root → submenu → leaf).
     while (chain.length > 4) chain.shift();
+
+    // Hover-effect detector: schedule a PRE-hover snapshot 500 ms after the
+    // entry was created.  Scheduling at 500 ms (not on the move event itself)
+    // means cursor sweeps that move through the element in < 500 ms never
+    // trigger the probe — zero overhead for noise, full coverage for the
+    // intentional hovers (which dwell ≥ 1000 ms downstream).  500 ms also
+    // leaves a 500 ms window before the click-handler's 1000 ms gate, so the
+    // post-snapshot has time to capture any DOM effect that took a moment to
+    // render.  Fire-and-forget — never blocks the hover probe pipeline.
+    if (newBB) {
+      const targetBBox = { x: newBB.x, y: newBB.y, width: newBB.width, height: newBB.height };
+      setTimeout(() => {
+        // Re-resolve session inside the callback — by the time we fire the
+        // session may have been torn down (TTL, manual close, server reload).
+        const liveSession = this.getAuthorizedSession(sessionId, userId);
+        if (!liveSession || !liveSession.recording) return;
+        // Verify entry still in chain — chain.shift() may have evicted us
+        // when 5+ distinct hovers landed during the dwell window.
+        const stillThere = liveSession.recordingHoverChain?.some(e => {
+          const bb = e.probedElement.boundingBox;
+          return bb && bb.x === targetBBox.x && bb.y === targetBBox.y
+            && bb.width === targetBBox.width && bb.height === targetBBox.height;
+        });
+        if (!stillThere) return;
+        // Lazy-load to avoid a cyclic import at module init time.
+        import('./hover-effect-probe.util').then(({ probeHoverEffect }) => {
+          probeHoverEffect(liveSession.page, entry.x, entry.y).then((preProbe) => {
+            this.setRecordingHoverChainPreProbe(sessionId, userId, targetBBox, preProbe);
+          }).catch(() => { /* fail-open — handler treats as no-effect */ });
+        }).catch(() => { /* import error — non-fatal */ });
+      }, 500).unref?.();
+    }
   }
 
   /**
@@ -2874,6 +3021,40 @@ export class PreviewSessionService {
   ): NonNullable<InternalSession['recordingHoverChain']> {
     const session = this.getAuthorizedSession(sessionId, userId);
     return session?.recordingHoverChain ?? [];
+  }
+
+  /**
+   * Hover-effect detector: attach a pre-hover DOM snapshot to a chain entry.
+   * Matched by boundingBox identity (the chain dedupes by bbox so this is the
+   * stable key).  No-op if the entry was already evicted from the chain.
+   *
+   * Why bbox not index: chain.shift() can run between schedule and fire when
+   * a 5th distinct hover lands during the dwell window — index 0 of "now" may
+   * be a different entry than the one we scheduled the probe for.
+   */
+  setRecordingHoverChainPreProbe(
+    sessionId: string,
+    userId: string,
+    targetBBox: { x: number; y: number; width: number; height: number },
+    preProbe: import('@/services/testing/ui/preview/hover-effect-probe.util').HoverEffectSnapshot | null,
+  ): void {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session?.recordingHoverChain) return;
+    for (const entry of session.recordingHoverChain) {
+      const bb = entry.probedElement.boundingBox;
+      if (!bb) continue;
+      if (bb.x === targetBBox.x && bb.y === targetBBox.y
+        && bb.width === targetBBox.width && bb.height === targetBBox.height) {
+        // Only set once — first probe wins.  Later moves over the same element
+        // shouldn't overwrite the baseline (we want pre-DWELL state, not the
+        // most recent one which may already include the effect).
+        if (entry.preProbeAt === undefined) {
+          entry.preProbe = preProbe;
+          entry.preProbeAt = Date.now();
+        }
+        return;
+      }
+    }
   }
 
   /**

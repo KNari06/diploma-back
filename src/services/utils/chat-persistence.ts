@@ -24,9 +24,9 @@
  *   - getRecentMessages
  *   - autoGenerateTitle  (kicked off async after first user message)
  *
- * Embeddings, summarization and welcome-message insertion are NOT routed
- * through here yet — they remain global-only on the test-case path. We'll
- * lift them in a later phase when long-tail test-case dialogs warrant it.
+ * Embeddings and summarization are NOT routed through here yet — they
+ * remain global-only on the test-case path. We'll lift them in a later
+ * phase when long-tail test-case dialogs warrant it.
  *
  * Not exposed: anything that mutates session metadata (rename, delete,
  * project association, workspace context) — those go through the type-

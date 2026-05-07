@@ -619,45 +619,7 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       rooms.add(room);
       incrementSubscriptions(socket.id);
 
-      // ✅ ACK immediately after join — before welcome message fetch
-      // This unblocks the frontend to send HTTP POST /api/v1/chat
       ack({ ok: true });
-
-      // Emit welcome message if chat is empty (first time open)
-      try {
-        const trimmedSessionId = sessionId.trim();
-        const { count: userMessageCount } = await supabaseAdmin
-          .from('chat_messages')
-          .select('id', { count: 'exact', head: true })
-          .eq('session_id', trimmedSessionId)
-          .not('metadata->>type', 'eq', 'welcome');
-
-        if (userMessageCount === 0) {
-          const { data: welcomeMsg } = await supabaseAdmin
-            .from('chat_messages')
-            .select('id, role, content, metadata, created_at')
-            .eq('session_id', trimmedSessionId)
-            .eq('metadata->>type', 'welcome')
-            .maybeSingle();
-
-          if (welcomeMsg) {
-            socket.emit('chat:message', {
-              sessionId: trimmedSessionId,
-              messageId: welcomeMsg.id,
-              role: 'assistant' as const,
-              content: welcomeMsg.content,
-              metadata: welcomeMsg.metadata,
-              timestamp: welcomeMsg.created_at,
-            });
-          }
-        }
-      } catch (welcomeError) {
-        logger.warn('[WebSocket] Failed to emit welcome message on subscribe', {
-          socketId: socket.id,
-          sessionId,
-          error: welcomeError instanceof Error ? welcomeError.message : String(welcomeError),
-        });
-      }
     } catch (error) {
       logger.error('[WebSocket] Error in subscribe:chat', {
         socketId: socket.id,

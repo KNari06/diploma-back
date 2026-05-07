@@ -28,16 +28,24 @@ import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
 
 // Note: MEMORY_TOOL_NAMES removed — memory tools now go through SkillRegistry
 
-/** Compute dynamic progress for a tool within the executor's 70-88% range. */
-function computeToolProgress(completedTools: number, estimatedTotal: number): number {
+/**
+ * Compute dynamic progress for a tool within the executor's 70-88% range.
+ * Exported so the monolithic-loop fallback in `general/handler.ts` reports
+ * progress on the same scale as the sub-agent path — keeps the timeline
+ * visually consistent when the pipeline degrades to the legacy loop.
+ */
+export function computeToolProgress(completedTools: number, estimatedTotal: number): number {
   const range = PROGRESS.PIPELINE_TOOL_CEILING - PROGRESS.PIPELINE_TOOL_BASE;
   const total = Math.max(estimatedTotal, 1);
   const fraction = Math.min(completedTools / total, 1);
   return Math.round(PROGRESS.PIPELINE_TOOL_BASE + fraction * range);
 }
 
-/** Convert qa_get_analytics_summary → "get analytics summary" */
-function humanizeToolName(toolName: string): string {
+/**
+ * Convert qa_get_analytics_summary → "get analytics summary".
+ * Exported for the monolithic loop (see computeToolProgress).
+ */
+export function humanizeToolName(toolName: string): string {
   if (!toolName) return 'tool';
   return toolName.replace(/^qa_/, '').replace(/_/g, ' ') || toolName;
 }

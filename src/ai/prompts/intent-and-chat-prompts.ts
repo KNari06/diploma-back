@@ -550,7 +550,17 @@ Ex36: "fix it" / "сделай нормально" (mobileSessionId in context, 
   // RAG / traces / project metadata — also per-call, also dynamic.
   if (context) {
     if (context.documentation && context.documentation.length > 0) {
-      prompt += `\n📚 DOCS: ${context.documentation.slice(0, 3).join('\n')}`;
+      // Each entry is "<filename>\n<expanded content>" from context-enrichment.
+      // Bracket the filename + blank-line separate so the model can attribute
+      // sources unambiguously instead of guessing where one doc ends.
+      const docs = context.documentation.slice(0, 3).map((entry) => {
+        const nl = entry.indexOf('\n');
+        if (nl <= 0) return entry;
+        const title = entry.slice(0, nl);
+        const body = entry.slice(nl + 1);
+        return `[${title}]\n${body}`;
+      });
+      prompt += `\n📚 DOCS:\n${docs.join('\n\n')}`;
     }
     if (context.knownSelectors && Object.keys(context.knownSelectors).length > 0) {
       prompt += `\n🔍 SELECTORS: ${JSON.stringify(context.knownSelectors, null, 2)}`;
@@ -577,7 +587,7 @@ Ex36: "fix it" / "сделай нормально" (mobileSessionId in context, 
  * Used for general conversations with users
  * @param skillDescriptions - Optional skill descriptions for integration tools
  */
-export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string, projectName?: string, integrationContext?: string): string {
+export function buildChatSystemPrompt(skillDescriptions?: string, projectId?: string, projectName?: string, integrationContext?: string, kbFileNames?: string[]): string {
   let prompt = `You are QAIT - an AI QA automation assistant. Have natural conversations about testing like ChatGPT.
 
 MINDSET: Understand CONTEXT, not just keywords.
@@ -662,6 +672,15 @@ The user's uploaded documents (PDF, DOCX, TXT, MD) are automatically searched on
 • When KB context is present — use it to give accurate, product-specific answers. Mention the source document naturally (e.g., "According to your API docs...", "Based on the requirements document...").
 • When KB context is NOT present or insufficient — use the kb_search tool with a focused query to find specific information. Do NOT say "I don't have that information" without trying kb_search first.
 • When kb_search returns no results — tell the user clearly and suggest uploading relevant documents to the Knowledge Base.`;
+
+  // Inventory hint: tells the model what's actually in the KB so it can decide
+  // when to call kb_search vs answer from the auto-injected excerpts. Capped at
+  // 20 names to keep the prompt bounded on big projects.
+  if (kbFileNames && kbFileNames.length > 0) {
+    const shown = kbFileNames.slice(0, 20);
+    const more = kbFileNames.length > shown.length ? ` (+${kbFileNames.length - shown.length} more)` : '';
+    prompt += `\n• Files currently in this project's KB: ${shown.join(', ')}${more}.`;
+  }
 
   // Add memory instructions
   prompt += `\n\n--- MEMORY ---

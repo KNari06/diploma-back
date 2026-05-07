@@ -56,7 +56,21 @@ const hoverProbeState = new Map<string, {
 const HOVER_PROBE_THROTTLE_MS = 200;
 
 /** Per-session scroll debounce timers */
-const recordingScrollTimers = new Map<string, { deltaY: number; deltaX: number; timer: NodeJS.Timeout; containerSelector?: string | null }>();
+const recordingScrollTimers = new Map<string, {
+  deltaY: number;
+  deltaX: number;
+  timer: NodeJS.Timeout;
+  containerSelector?: string | null;
+  /**
+   * URL captured at the FIRST wheel event of this debounce window.  Used as
+   * evidence.pageUrl on the eventual scroll step instead of `page.url()`
+   * read inside the timer — by the time the 500 ms debounce fires the page
+   * may have already navigated (auth-wall redirect mid-scroll, A/B
+   * remount).  Storing the first-event URL preserves the "where the user
+   * actually scrolled" semantic.
+   */
+  initialPageUrl?: string;
+}>();
 const RECORDING_SCROLL_DEBOUNCE_MS = 500;
 /** V10: Time window (ms) within which consecutive scroll steps merge into one */
 const RECORDING_SCROLL_MERGE_WINDOW_MS = 3000;
@@ -268,7 +282,13 @@ async function flushPendingScroll(
   try {
     const { RecordingCaptureService } = await import('@/services/testing/ui/preview/recording-capture.service');
     const scrollPage = sessionService.getPage(previewSessionId, userId);
-    const scrollPageUrl = scrollPage?.url();
+    // Prefer the URL captured at the FIRST wheel event of this debounce
+    // window over `page.url()` here.  This flush runs at unpredictable
+    // timing (called before any non-scroll step) and the page may have
+    // navigated mid-scroll — using the live url() would attribute the
+    // scroll to the wrong page.  Falls back to live url() for legacy
+    // entries that don't carry an initialPageUrl yet.
+    const scrollPageUrl = pendingScroll.initialPageUrl || scrollPage?.url();
     if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
 
     let scrollTargetHints: import('@/services/testing/ui/preview/preview.types').BindingHints | null = null;
@@ -792,6 +812,24 @@ const confirmedSelections = new Map<string, ConfirmedSelection>();
 
 // Cleanup old clarifications and selections (older than 5 minutes)
 const CLARIFICATION_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Synchronous in-flight guard for `preview:run:start`.
+ *
+ * `PreviewRunService.activeRuns` only protects after `runStepsOnPreview()` has
+ * reached the line that sets it — which is past `await getByIdInternal()` and
+ * platform routing. If multiple `preview:run:start` events land on the socket
+ * within the same tick (Socket.IO reconnect-replay, fast double-click,
+ * StrictMode double-effect), they all pass through the async preamble in
+ * parallel and only one of them actually sets the lock; the rest race past it
+ * before throwing. We saw 12 `run_end` events for one user click as a result.
+ *
+ * This Set is set/cleared synchronously around the entire handler body so a
+ * second event for the same `previewSessionId` is rejected immediately, before
+ * any await. Cleared in `finally` so a normal completion (or an error) frees
+ * the slot for the next legitimate run.
+ */
+const previewRunStartInFlight = new Set<string>();
 
 const clarificationCleanupInterval = setInterval(() => {
   const now = Date.now();
@@ -2428,6 +2466,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       }
 
+      // Capture pre-click URL BEFORE executing the action.  Click may trigger
+      // a navigation (auth-wall redirect, SPA push), and any step we record
+      // afterwards (hover-before-click, click itself, drag) needs to carry the
+      // URL the user was on WHEN the interaction happened — not where the page
+      // ended up.  Storing in handler scope so the setImmediate block below
+      // (which fires AFTER executeMouseAction settles, possibly post-nav)
+      // can use it without re-reading page.url().
+      const prePagePreClick = sessionService.getPage(previewSessionId, ensuredUserId);
+      const preClickUrl = prePagePreClick?.url();
+
       const result = await sessionService.executeMouseAction({
         sessionId: previewSessionId,
         userId: ensuredUserId,
@@ -2518,7 +2566,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 if (page && preClickElement) {
                   // Build the candidate list. Prefer chain (multi-level);
                   // fall back to lastHover (single-step legacy path).
-                  const candidates: Array<{ x: number; y: number; timestamp: number; probedElement?: any }> = [];
+                  // chain entries carry `preProbe` from the dwell-watcher in
+                  // session.appendRecordingHoverChain; lastHover entries don't —
+                  // for the legacy path we fail-open on DOM-effect detection.
+                  const candidates: Array<{
+                    x: number;
+                    y: number;
+                    timestamp: number;
+                    probedElement?: any;
+                    preProbe?: import('@/services/testing/ui/preview/hover-effect-probe.util').HoverEffectSnapshot | null;
+                  }> = [];
                   if (chain.length > 0) {
                     for (const c of chain) candidates.push(c);
                   } else {
@@ -2527,6 +2584,11 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                   }
                   const cBB = preClickElement.boundingBox;
                   const seenBBoxKeys = new Set<string>();
+                  // Lazy-load the hover-effect util once per click event —
+                  // import is cheap (already cached after first hit) but
+                  // putting it in the loop would be N redundant calls.
+                  const { probeHoverEffect, diffHoverEffect, hasHoverEffect } =
+                    await import('@/services/testing/ui/preview/hover-effect-probe.util');
                   for (let ci = 0; ci < candidates.length; ci++) {
                     const cand = candidates[ci];
                     const timeSinceHover = Date.now() - cand.timestamp;
@@ -2549,34 +2611,103 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                     const bboxKey = `${hBB.x}|${hBB.y}|${hBB.width}|${hBB.height}`;
                     if (seenBBoxKeys.has(bboxKey)) continue;
                     seenBBoxKeys.add(bboxKey);
-                    // Patch A: adaptive dwell threshold.
-                    // Popup-trigger signals (aria-haspopup, bsToggle="dropdown",
-                    // class*="dropdown|menu-trigger|has-submenu", or any
-                    // ancestor-summary that hints at a menu container) → 80ms.
-                    // Everything else → 400ms (legacy threshold).
+
+                    // ── Gate 1: minimum dwell of 1000 ms ────────────────────
+                    // Sub-second pauses are cursor sweeps, not intentional hovers.
+                    // Single threshold for everything (popup-trigger or not) —
+                    // adaptive 80/400 ms thresholds were too permissive and
+                    // captured WhatsApp-icon-in-footer-style sweeps.
+                    const minDwell = 1000;
+                    if (timeSinceHover < minDwell) {
+                      if (cTrace) cTrace.writeHoverDecision({
+                        dwellMs: timeSinceHover,
+                        kept: false,
+                        reason: 'dwell_too_short',
+                        bbox: hBB,
+                      });
+                      continue;
+                    }
+
+                    // ── Gate 2a: popup-trigger heuristic ────────────────────
+                    // Cheap signals from the recorded probe data — no extra
+                    // page.evaluate. Captures dropdown/menu/disclosure widgets
+                    // even when the structural diff misses them (e.g. the
+                    // popup renders into a body-level portal outside our
+                    // 3-up subtree).
                     const cls = (hoverElement.cssClass || '') + ' ' + (hoverElement.ancestorSummary || '');
                     const isLikelyPopupTrigger =
                       !!hoverElement.ariaHasPopup
+                      || !!hoverElement.ariaControls
+                      || hoverElement.ariaExpanded !== undefined
+                      || hoverElement.dataState === 'open'
                       || hoverElement.bsToggle === 'dropdown'
                       || hoverElement.bsToggle === 'menu'
+                      || hoverElement.bsToggle === 'collapse'
+                      || hoverElement.tag === 'summary'
                       || /\b(dropdown|menu-trigger|has-submenu|popper-trigger|has-dropdown|nav-item|MuiMenuItem|MuiMenu-)\b/i.test(cls);
-                    const minDwell = isLikelyPopupTrigger ? 80 : 400;
-                    if (timeSinceHover < minDwell) continue;
-                    // Skip generic-label hovers. If the probe couldn't find any
-                    // descriptive name for the target (no aria-label, no text,
-                    // no title, no id, no testId), the recorded step ends up as
-                    // "Hover 'element'" which is useless for replay — the
-                    // resolver has nothing semantic to match against. Most of
-                    // these come from cursor sweeps between meaningful targets
-                    // (e.g. mouse passing over a wrapper div on the way to the
-                    // language flag). Exception: keep the step when the probe
-                    // indicates a popup-trigger (aria-haspopup / dropdown class)
-                    // — there the hover IS the action even without a label.
-                    const probedLabel = RecordingCaptureService.getProbedLabel(hoverElement, 60);
-                    if (!probedLabel && !isLikelyPopupTrigger) continue;
-                    const hoverStep = RecordingCaptureService.captureHover(hoverElement, page.url());
+
+                    // ── Gate 2b: structural DOM-effect probe ────────────────
+                    // post-snapshot of the local subtree (~10 ms).  Diff
+                    // against pre-snapshot (taken at dwell+500 ms by the
+                    // session-service watcher).  No pre = no comparison =
+                    // hadDomEffect false, gate falls back to popup-trigger.
+                    let hoverEffectInfo: {
+                      newInteractive: number;
+                      newVisualInteractive: number;
+                      expandedTriggered: boolean;
+                      dataStateOpened: boolean;
+                    } | null = null;
+                    let hadDomEffect = false;
+                    if (cand.preProbe !== undefined && cand.preProbe !== null) {
+                      const postProbe = await probeHoverEffect(page, cand.x, cand.y);
+                      const diff = diffHoverEffect(cand.preProbe, postProbe);
+                      hadDomEffect = hasHoverEffect(diff);
+                      if (hadDomEffect) hoverEffectInfo = diff;
+                    }
+
+                    // Final gate: keep ONLY when (popup-trigger OR DOM effect).
+                    // Generic labelled hovers without either signal — drop.
+                    // This is the rule that retires the "WhatsApp footer
+                    // sweep gets recorded because it has aria-label" pattern.
+                    if (!isLikelyPopupTrigger && !hadDomEffect) {
+                      if (cTrace) cTrace.writeHoverDecision({
+                        dwellMs: timeSinceHover,
+                        isPopupTrigger: false,
+                        hadDomEffect: false,
+                        kept: false,
+                        reason: 'no_effect_no_popup',
+                        bbox: hBB,
+                      });
+                      continue;
+                    }
+
+                    // URL where the hover was actually performed.  Using
+                    // `page.url()` here would return the POST-click URL —
+                    // we're inside `setImmediate` that fires AFTER the click
+                    // already navigated.  Pre-click hover steps must carry
+                    // the URL the user was on when hovering, otherwise
+                    // evidence.pageUrl mismatches the resolver's compiled
+                    // plan url and triggers a false `urlStale` skip.
+                    const hoverStep = RecordingCaptureService.captureHover(
+                      hoverElement,
+                      preClickUrl,
+                      hoverEffectInfo,
+                    );
                     emitRecordingStep(socket, room, sessionService, previewSessionId, ensuredUserId, { step: hoverStep });
-                    if (cTrace) cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                    if (cTrace) {
+                      cTrace.writeStepCaptured(hoverStep, 'hover_before_click');
+                      cTrace.writeHoverDecision({
+                        dwellMs: timeSinceHover,
+                        isPopupTrigger: isLikelyPopupTrigger,
+                        hadDomEffect,
+                        newInteractive: hoverEffectInfo?.newInteractive,
+                        newVisualInteractive: hoverEffectInfo?.newVisualInteractive,
+                        expandedTriggered: hoverEffectInfo?.expandedTriggered,
+                        dataStateOpened: hoverEffectInfo?.dataStateOpened,
+                        kept: true,
+                        bbox: hBB,
+                      });
+                    }
                     // Etap 1D.3 — fire-and-forget LLM enrichment.
                     scheduleRecordedDescription(socket, room, previewSessionId, hoverStep, hoverElement);
                   }
@@ -2607,8 +2738,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
               // previous single-click's id so LLM refinement updates the correct row instead of creating
               // a phantom one that FE would treat as a new step.
               let stepIdForClick = `rec_${Date.now().toString(36)}`;
-              const currentPage = sessionService.getPage(previewSessionId, ensuredUserId);
-              const initialPageUrl = currentPage?.url();
+              // Click step URL == URL where the click landed.  We are inside
+              // setImmediate AFTER executeMouseAction settled, so page.url()
+              // here may already be the navigation TARGET (e.g. /tutors → /login
+              // after auth-wall redirect).  Use `preClickUrl` captured in
+              // handler scope BEFORE the click executed — that's the page the
+              // user actually clicked ON, which is what evidence.pageUrl is
+              // meant to record.
+              const initialPageUrl = preClickUrl;
               const hasModifiers = modifiers && (modifiers.shift || modifiers.ctrl || modifiers.meta || modifiers.alt);
 
               const buildClickStep = (el: NonNullable<typeof preClickElement>): PreviewIntentStep => {
@@ -3078,10 +3215,21 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             } catch { /* non-critical */ }
           }
 
+          // Capture URL at the FIRST wheel event of the debounce window.
+          // Reuse for subsequent events so a 500 ms scroll session that
+          // straddles a navigation still attributes to where it started.
+          // On the timer fire we also update lastUrl so it reflects current.
+          let initialPageUrl = existing?.initialPageUrl;
+          if (initialPageUrl === undefined) {
+            const scrollPageNow = sessionService.getPage(previewSessionId, ensuredUserId);
+            initialPageUrl = scrollPageNow?.url();
+          }
+
           recordingScrollTimers.set(previewSessionId, {
             deltaY: accumulatedDeltaY,
             deltaX: accumulatedDeltaX,
             containerSelector,
+            initialPageUrl,
             timer: setTimeout(async () => {
               try {
                 const scrollState = recordingScrollTimers.get(previewSessionId);
@@ -3098,8 +3246,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
                 const sTrace = EditorTraceService.get(previewSessionId);
 
                 // V13: Capture page URL for evidence (used by auto-wait injection)
+                // Prefer the URL captured at the FIRST wheel event of this
+                // debounce window — page may have navigated during the 500 ms
+                // settle, in which case live url() returns the new page and
+                // the scroll step gets attributed to the wrong location.
                 const scrollPage = sessionService.getPage(previewSessionId, ensuredUserId);
-                const scrollPageUrl = scrollPage?.url();
+                const scrollPageUrl = scrollState?.initialPageUrl || scrollPage?.url();
 
                 // V15: Guard against scroll before page load (race condition)
                 if (!scrollPageUrl || scrollPageUrl === 'about:blank') return;
@@ -4029,6 +4181,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
+      // CDP-based pre-check: ask navigation history index BEFORE attempting
+      // page.goBack(). This is the only reliable way to distinguish "no history"
+      // from "back worked via SPA pushState without URL change" — Playwright's
+      // goBack() returns null in BOTH cases. Fail-open ({canBack:true}) on any
+      // CDP error so a transient failure can't dead-button the user.
+      const capability = await sessionService.getNavigationHistoryCapability(previewSessionId, ensuredUserId);
+      if (!capability.canBack) {
+        emitPageActionResult(socket, previewSessionId, 'back', false, 'No history to go back or session not found');
+        return;
+      }
+
       // Flush pending scroll+typing before navigation — preserve step order
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
         await flushPendingScroll(socket, previewSessionId, ensuredUserId, sessionService, 'back');
@@ -4105,6 +4268,13 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
+
+      // CDP pre-check (see goBack handler above for rationale). Fail-open on error.
+      const capability = await sessionService.getNavigationHistoryCapability(previewSessionId, ensuredUserId);
+      if (!capability.canForward) {
+        emitPageActionResult(socket, previewSessionId, 'forward', false, 'No history to go forward or session not found');
+        return;
+      }
 
       // Flush pending scroll+typing before navigation — preserve step order
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
@@ -4725,6 +4895,30 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
    * Executes all saved steps sequentially in existing preview session
    */
   socket.on('preview:run:start', async (data) => {
+    // Synchronous guard — must run before any await so a second concurrent
+    // event for the same session is rejected before it can race past us into
+    // PreviewRunService. Held until either:
+    //   (a) the run is kicked off AND PreviewRunService.activeRuns has
+    //       taken over the lock (released in the .finally() chained on
+    //       runSavedSteps below), or
+    //   (b) we exit the handler before kicking off (validation fail / sync
+    //       throw) — released in the outer finally via `kickedOff` flag.
+    // Releasing in (a) only after the Promise settles guarantees no race
+    // window: PreviewRunService awaits getById/update before reaching its
+    // own activeRuns.set(), and a stale 2nd event arriving in that window
+    // would otherwise slip past both guards.
+    const guardKey = data?.previewSessionId;
+    if (typeof guardKey === 'string' && guardKey.length > 0) {
+      if (previewRunStartInFlight.has(guardKey)) {
+        logger.warn('[WebSocket] preview:run:start ignored — another start is in flight', {
+          previewSessionId: guardKey,
+          socketId: socket.id,
+        });
+        return;
+      }
+      previewRunStartInFlight.add(guardKey);
+    }
+    let kickedOff = false;
     try {
       const userId = getUserId(socket);
       const { previewSessionId, intentTestCaseId, steps: inlineSteps, startUrl: inlineStartUrl, mobileSessionId: mobileSessionIdFromClient, authReset: clientAuthReset, startFromIndex: clientStartFromIndex } = data;
@@ -5070,19 +5264,32 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         : (safeAuthReset || safeStartFromIndex !== undefined)
           ? { authReset: safeAuthReset, startFromIndex: safeStartFromIndex }
           : undefined;
-      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions).catch((error) => {
-        logger.error('[WebSocket] Preview run failed', {
-          previewSessionId,
-          intentTestCaseId,
-          userId,
-          error: error instanceof Error ? error.message : String(error),
+      kickedOff = true;
+      PreviewRunService.runSavedSteps(previewSessionId, intentTestCaseId, userId, runOptions)
+        .catch((error) => {
+          logger.error('[WebSocket] Preview run failed', {
+            previewSessionId,
+            intentTestCaseId,
+            userId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          socket.emit('error', {
+            code: 'RUN_FAILED',
+            message: error instanceof Error ? error.message : 'Run failed',
+            timestamp: new Date().toISOString(),
+          });
+        })
+        .finally(() => {
+          // Run fully settled (success / failure / cancellation). At this
+          // point PreviewRunService.activeRuns has long been released too.
+          // Only now is it safe to allow another preview:run:start for this
+          // session — releasing earlier opens a race window during which a
+          // stale 2nd event could slip past both this Set guard and the
+          // not-yet-set activeRuns lock inside runSavedSteps.
+          if (typeof guardKey === 'string' && guardKey.length > 0) {
+            previewRunStartInFlight.delete(guardKey);
+          }
         });
-        socket.emit('error', {
-          code: 'RUN_FAILED',
-          message: error instanceof Error ? error.message : 'Run failed',
-          timestamp: new Date().toISOString(),
-        });
-      });
     } catch (error) {
       logger.error('[WebSocket] Error in preview:run:start', {
         socketId: socket.id,
@@ -5093,6 +5300,14 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         message: error instanceof Error ? error.message : 'Internal error',
         timestamp: new Date().toISOString(),
       });
+    } finally {
+      // Release the synchronous guard ONLY when we did not kick off a run.
+      // If we did kick off, the .finally() chained on runSavedSteps owns
+      // the release — releasing here would defeat the whole purpose of the
+      // guard (see kickedOff comment at top of handler).
+      if (!kickedOff && typeof guardKey === 'string' && guardKey.length > 0) {
+        previewRunStartInFlight.delete(guardKey);
+      }
     }
   });
 

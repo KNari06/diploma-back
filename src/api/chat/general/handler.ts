@@ -6,7 +6,7 @@ import { PricingPlansService } from '@/services/core/pricing-plans.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 import { getSummariesForContext, summarizeOldMessages } from '@/services/ai/summarization/chat-summarization.service';
 import { formatPageContextForChat, getPageContext, type PageContext } from '@/services/chat/editor-context.service';
-import { searchKB } from '@/services/kb/kb.service';
+import { getProjectFiles, searchKB } from '@/services/kb/kb.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { ChatPersistence } from '@/services/utils/chat-persistence';
 import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
@@ -26,6 +26,7 @@ import { SubAgentPipeline } from './sub-agents/pipeline';
 import { SUB_AGENT_CONFIG } from './sub-agents/config';
 import { executeTool } from '@/services/skills/tool-executor';
 import { ToolCallTracker } from '@/services/skills/hooks/loop-detection.hook';
+import { humanizeToolName, computeToolProgress } from './sub-agents/agents/executor-agent';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Resolve project ID (Tier 1: session → Tier 2: workspace default)
@@ -299,6 +300,19 @@ export async function handleGeneralChat(
         recentCount: recentMessages.length
       });
 
+      // History deep-dive can take 200-1500ms (embedding + vector search).
+      // Without an emit here the indicator stalls between intent parsing
+      // and the next pipeline event — that's the longest silent window
+      // for return users with long chat histories.
+      emitProcessingStep(
+        chatSessionId,
+        'enriching_context',
+        'Recalling earlier context...',
+        25,
+        undefined,
+        testCaseId,
+      );
+
       try {
         // Ensure embeddings exist before searching — fixes first-request miss where
         // vector search returns empty because embeddings haven't been created yet.
@@ -531,6 +545,19 @@ export async function handleGeneralChat(
 
   const contextStartMs = Date.now();
 
+  // STEP 2 fans out 7 independent fetches (KB / memories / editor / project /
+  // integrations / KB files). On a typical question this is the first 200-800ms
+  // of silence after intent parsing. Emit a single update so the indicator
+  // shows progress instead of freezing on the previous label.
+  emitProcessingStep(
+    chatSessionId,
+    'enriching_context',
+    'Gathering knowledge base, memory and project context...',
+    35,
+    undefined,
+    testCaseId,
+  );
+
   let projectId = typeof context === 'object' ? context?.projectId : undefined;
   const parsedContext = typeof context === 'object' && context !== null && !Array.isArray(context)
     ? context as Record<string, any>
@@ -539,7 +566,7 @@ export async function handleGeneralChat(
     || (parsedContext?.workspaceId || parsedContext?.workspace_id);
 
   // Launch all independent fetches in parallel
-  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult, integrationResult] =
+  const [kbResult, agentMemoryResult, workspaceMemoryResult, editorContextResult, projectResult, integrationResult, kbFilesResult] =
     await Promise.allSettled([
       // 1. KB search (non-fatal) — telemetry fields let us attribute feedback later
       searchKB(message, projectId, {
@@ -592,6 +619,15 @@ export async function handleGeneralChat(
             .then(m => m.IntegrationTokenService.getIntegrationSummary(userId!, workspaceId!))
             .catch(() => '')
         : Promise.resolve(''),
+
+      // 7. KB file inventory — names only, fed into system prompt so the
+      // model knows what's available to kb_search before it tries.
+      projectId
+        ? getProjectFiles(projectId).catch((err: Error) => {
+            logger.warn('[GENERAL_CHAT] Failed to load KB file list', { error: err.message });
+            return [] as Array<{ fileName: string }>;
+          })
+        : Promise.resolve([] as Array<{ fileName: string }>),
     ]);
 
   // Check if request was cancelled during parallel loading
@@ -652,6 +688,13 @@ export async function handleGeneralChat(
     integrationContext = integrationResult.value;
   }
 
+  let kbFileNames: string[] = [];
+  if (kbFilesResult.status === 'fulfilled' && Array.isArray(kbFilesResult.value)) {
+    kbFileNames = kbFilesResult.value
+      .map((f) => f?.fileName)
+      .filter((n): n is string => typeof n === 'string' && n.length > 0);
+  }
+
   logger.info('[GENERAL_CHAT] Parallel context loading complete', {
     durationMs: Date.now() - contextStartMs,
     hasKB: !!kbContext,
@@ -665,6 +708,18 @@ export async function handleGeneralChat(
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2.8: COLLECT AVAILABLE TOOLS (depends on projectId — sequential)
   // ═══════════════════════════════════════════════════════════════════════
+  // Tool inventory load is fast (~30-150ms) but adds another tick of
+  // silence after the parallel-context phase. Reuse `enriching_context`
+  // so the indicator updates the same row instead of stacking.
+  emitProcessingStep(
+    chatSessionId,
+    'enriching_context',
+    'Selecting available tools...',
+    45,
+    undefined,
+    testCaseId,
+  );
+
   let availableTools: any[] = [];
   let skillDescriptions = '';
 
@@ -693,7 +748,7 @@ export async function handleGeneralChat(
   const buildChatSystemPromptWithLogging = functionLogger
     ? withFunctionLogging(buildChatSystemPrompt, 'buildChatSystemPrompt', functionLogger)
     : buildChatSystemPrompt;
-  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext);
+  let systemPrompt = buildChatSystemPromptWithLogging(skillDescriptions, projectId, projectName, integrationContext, kbFileNames);
 
   // Append editor-specific instructions if in editor mode
   if (mode === 'editor' && editorPageContext) {
@@ -1074,6 +1129,25 @@ You can still help with general questions, saved test cases, and test management
 
       logger.info('[GENERAL_CHAT] Tool round', { round: toolRound, messagesCount: messages.length });
 
+      // Emit a "thinking" update only on the very first LLM call of the
+      // fallback. On subsequent rounds we already had tool emits at 70-88%
+      // — re-emitting "Drafting (round N)" at a lower progress would make
+      // the bar regress, which looks like the request stalled.
+      //
+      // Progress 80 sits above most pipeline emits (router=60, planner=68,
+      // executor=70-88) so even when the fallback follows a partially-
+      // completed pipeline run, the indicator only ever moves forward.
+      if (toolRound === 1) {
+        emitProcessingStep(
+          chatSessionId,
+          'agent_thinking',
+          'Drafting response...',
+          80,
+          { round: toolRound },
+          testCaseId,
+        );
+      }
+
       const getChatCompletionWithMessagesWithLogging = functionLogger
         ? withFunctionLogging(getChatCompletionWithMessages, 'getChatCompletionWithMessages', functionLogger)
         : getChatCompletionWithMessages;
@@ -1138,6 +1212,23 @@ You can still help with general questions, saved test cases, and test management
           args: JSON.stringify(toolArgs),
         });
 
+        // Mirror the executor-agent's before/after pair so the timeline
+        // looks the same whether the pipeline or the fallback ran.
+        // Progress uses CUMULATIVE tool count across all rounds (not the
+        // current round's count) so it grows monotonically — going from
+        // round 1 with 88% back down to ~76% in round 2 would look like
+        // the bar reset. The "expected total" budget is conservative
+        // (5 tools) so the first few tools step the bar a little; if
+        // there are more, computeToolProgress just clamps at 88%.
+        emitProcessingStep(
+          chatSessionId,
+          'agent_executing_tool',
+          `Using ${humanizeToolName(toolName)}...`,
+          computeToolProgress(monolithicToolResults.length, 5),
+          { toolName, round: toolRound },
+          testCaseId,
+        );
+
         // Execute through centralized pipeline (routing, hooks, timeout, screenshot handling)
         const skillContext = {
           userId,
@@ -1160,6 +1251,17 @@ You can still help with general questions, saved test cases, and test management
         messages.push(...callResult.messages);
         // Accumulate for quick-actions injection at end of loop
         monolithicToolResults.push(callResult.record);
+
+        emitProcessingStep(
+          chatSessionId,
+          'agent_executing_tool',
+          callResult.toolResult.success
+            ? `${humanizeToolName(toolName)} done`
+            : `${humanizeToolName(toolName)} had an issue`,
+          computeToolProgress(monolithicToolResults.length, 5),
+          { toolName, success: callResult.toolResult.success, durationMs: callResult.record.durationMs },
+          testCaseId,
+        );
 
         logger.info('[GENERAL_CHAT] Tool executed', {
           toolName,
@@ -1307,6 +1409,21 @@ You can still help with general questions, saved test cases, and test management
   if (requestCancelled) {
     return;
   }
+
+  // Pipeline's last emit ('Composing response...') is at 90% but then we
+  // still have credit deduction + DB save + auto-title before res.json
+  // (1.5-4s on slow networks). One last update so the indicator doesn't
+  // freeze on the previous label while the message is being persisted.
+  // Reuses `agent_formatting` so it overwrites the pipeline's row instead
+  // of stacking a new one.
+  emitProcessingStep(
+    chatSessionId,
+    'agent_formatting',
+    'Saving response...',
+    96,
+    undefined,
+    testCaseId,
+  );
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3.5: DEDUCT CREDITS AFTER SUCCESSFUL RESPONSE

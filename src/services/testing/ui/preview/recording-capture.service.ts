@@ -3590,7 +3590,23 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
    * Capture a hover action as an IntentStep.
    * Used when a hover on a different element precedes a click (e.g., dropdown menus).
    */
-  static captureHover(element: ProbedElement, pageUrl?: string): PreviewIntentStep {
+  static captureHover(
+    element: ProbedElement,
+    pageUrl?: string,
+    /**
+     * Optional structural-effect summary from the hover-effect-probe gate.
+     * Present only when the recorder confirmed a real DOM change (new interactive
+     * appeared / aria-expanded flipped / data-state opened).  Persisted in
+     * evidence so replay-time post-action verify can assert the same effect
+     * happened — if not, the resolver knows it picked the wrong target.
+     */
+    hoverEffect?: {
+      newInteractive: number;
+      newVisualInteractive: number;
+      expandedTriggered: boolean;
+      dataStateOpened: boolean;
+    } | null,
+  ): PreviewIntentStep {
     const label = this.getElementLabel(element);
     // V22: Include recordedFingerprint so resolver has identifying data on
     // first apply (mirrors the click-step path in preview.handler.ts).
@@ -3606,6 +3622,10 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
         confidence: 1.0,
         pageUrl,
         capturedAt: new Date().toISOString(), // V15.7: TTL support
+        // Hover-effect detector: only set when the recorder confirmed a real
+        // structural effect.  Lets replay verify "did the hover actually open
+        // anything?" by re-running the same probe at apply time.
+        ...(hoverEffect ? { hoverEffect } : {}),
       },
     };
   }
