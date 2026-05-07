@@ -632,10 +632,13 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
 
     const stats = await ExecutionService.getStats(runId);
 
-    // Include run-level status so frontend can detect cancelled/failed runs
+    // Include run-level status so frontend can detect cancelled/failed runs.
+    // `started_at` / `completed_at` let the live UI show a true elapsed timer
+    // anchored to the server-side start time instead of the moment the user
+    // opened the page.
     const { data: run } = await supabaseAdmin
       .from('regression_runs')
-      .select('status')
+      .select('status, started_at, completed_at')
       .eq('id', runId)
       .maybeSingle();
 
@@ -647,6 +650,8 @@ export async function getRunStats(req: AuthenticatedRequest, res: Response): Pro
       data: {
         ...stats,
         status: normalizedStatus,
+        startedAt: run?.started_at || null,
+        completedAt: run?.completed_at || null,
       },
       timestamp: new Date(),
     });
