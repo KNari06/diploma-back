@@ -72,6 +72,15 @@ export class ReplayTraceWriter {
   private isFileSizeLimitReached: boolean = false;
   private writeQueue: Promise<void> = Promise.resolve();
   private isClosed: boolean = false;
+  /**
+   * Phase 2.5 — pairs of (raw, json-escaped) substrings to mask before
+   * writing the JSONL line. Populated via `setRedactValues`. Empty
+   * means no redaction (cheap fast path). Both forms are needed because
+   * payloads are JSON.stringify'd before write, so a secret containing
+   * special chars (`"`, `\`, control bytes) appears in escaped form on
+   * disk and a raw substring search wouldn't find it.
+   */
+  private redactPairs: Array<{ raw: string; escaped: string }> = [];
 
   constructor(config: ReplayTraceWriterConfig) {
     this.testId = config.testId;
@@ -101,6 +110,48 @@ export class ReplayTraceWriter {
   }
 
   /**
+   * Phase 2.5 — register the secret values we must mask before writing
+   * any line. Idempotent; pass `[]` to disable redaction. Computes the
+   * JSON-escaped form once so the post-stringify replace finds secrets
+   * even when they contain `"` / `\` / control chars (real-world JWTs
+   * with `+` and `/` are fine without escaping; service-account JSON
+   * blobs are not).
+   */
+  public setRedactValues(values: readonly string[]): void {
+    if (!values || values.length === 0) {
+      this.redactPairs = [];
+      return;
+    }
+    // Sort longest-first so a long secret containing a shorter one as a
+    // substring is masked entirely.
+    const sorted = [...values].filter((v) => typeof v === 'string' && v.length >= 4).sort((a, b) => b.length - a.length);
+    this.redactPairs = sorted.map((raw) => {
+      // JSON.stringify("...") → "\"...\"" — slice off the surrounding quotes.
+      const escaped = JSON.stringify(raw).slice(1, -1);
+      return { raw, escaped };
+    });
+  }
+
+  /**
+   * Phase 2.5 — apply registered redactions to a serialised JSONL line.
+   * Replaces both raw and JSON-escaped forms of each secret with `***`.
+   * No-op when nothing registered.
+   */
+  private redactLine(line: string): string {
+    if (this.redactPairs.length === 0) return line;
+    let out = line;
+    for (const { raw, escaped } of this.redactPairs) {
+      if (escaped !== raw && out.includes(escaped)) {
+        out = out.split(escaped).join('***');
+      }
+      if (out.includes(raw)) {
+        out = out.split(raw).join('***');
+      }
+    }
+    return out;
+  }
+
+  /**
    * Write a replay trace event.
    * Non-blocking: queues writes to prevent race conditions.
    */
@@ -125,7 +176,7 @@ export class ReplayTraceWriter {
 
     this.writeQueue = this.writeQueue.then(async () => {
       try {
-        const line = JSON.stringify(completeEvent) + '\n';
+        const line = this.redactLine(JSON.stringify(completeEvent) + '\n');
         const lineSize = Buffer.byteLength(line, 'utf8');
 
         if (this.currentFileSize + lineSize > this.maxFileSizeBytes && !this.isFileSizeLimitReached) {

@@ -70,6 +70,28 @@ export interface UpdateResourceInput {
   recipe?: unknown[];
   status?: ResourceStatus;
   brokenReason?: string | null;
+  /**
+   * Phase 3 — opt-in per-key merge for envelope-wrapped value maps
+   * (currently only `secret.values`). When true and the patch carries
+   * `config.values` (or `sensitive.values`), the supplied entries are
+   * MERGED into the existing decrypted map instead of replacing it.
+   *
+   * This solves the Settings UI "edit just the name" round-trip: the
+   * client doesn't have decrypted values to send, so it sends an empty
+   * `values` object plus name/description; without merge mode, we'd
+   * wipe every secret. With merge mode, an empty `values` patch is a
+   * no-op for the values blob.
+   *
+   * Per-key removal still works: the client sends `{ KEY: null }` to
+   * delete a single secret. Other keys are untouched. Backwards
+   * compatible: when this flag is absent or false, the existing
+   * "replace whole `values` object" behaviour kicks in.
+   *
+   * Currently honoured for `kind === 'secret'`. If/when `data_fixture`
+   * gains a sensitive variant with the same envelope shape, extend
+   * the kind list rather than the flag.
+   */
+  mergeValues?: boolean;
 }
 
 export interface ResourceBinding {
@@ -368,6 +390,50 @@ export async function listResources(
   return rows.map((r) => toSummary(r, counts.get(r.id) ?? 0));
 }
 
+/**
+ * Find resources scoped to a specific hostname (auth-detector silent-reuse).
+ *
+ * Looks at `scope.domain` first (the canonical exact-match field set by
+ * `extractDomain` at create/save time); if a result is needed for url-pattern
+ * defaults too, the workspace_resource_defaults pattern path covers that
+ * separately and isn't replicated here.
+ *
+ * Used by the frontend right after `preview:auth:required` to decide
+ * whether to silently re-apply an existing login (zero matches → show
+ * banner; one match → reuse + toast; many matches → show banner with
+ * pre-selected best candidate, future enhancement).
+ */
+export async function findByDomain(
+  userId: string,
+  projectId: string,
+  kind: ResourceKind,
+  domain: string,
+): Promise<ResourceSummary[]> {
+  const uid = assertNonEmpty(userId, 'userId');
+  const pid = assertNonEmpty(projectId, 'projectId');
+  const k = assertNonEmpty(kind, 'kind') as ResourceKind;
+  const d = assertNonEmpty(domain, 'domain').toLowerCase();
+
+  const { data, error } = await supabaseAdmin
+    .from('test_resources')
+    .select('*')
+    .eq('user_id', uid)
+    .eq('project_id', pid)
+    .eq('kind', k)
+    .eq('scope->>domain', d)
+    .order('last_used_at', { ascending: false, nullsFirst: false })
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    logger.error('[TEST_RESOURCE] findByDomain failed', { error: error.message });
+    return [];
+  }
+
+  const rows = (data ?? []) as ResourceRow[];
+  const counts = await countTestsForResources(rows.map((r) => r.id));
+  return rows.map((r) => toSummary(r, counts.get(r.id) ?? 0));
+}
+
 export async function getResource(
   id: string,
   userId: string,
@@ -386,7 +452,39 @@ export async function getResource(
   if (!data) return null;
 
   const counts = await countTestsForResources([data.id]);
-  return toSummary(data as ResourceRow, counts.get(data.id) ?? 0);
+  const summary = toSummary(data as ResourceRow, counts.get(data.id) ?? 0);
+
+  // Phase 3 — Settings UI needs the names of secrets/fixture keys to render
+  // an editable list, but MUST NOT receive the values. The `secret` adapter
+  // wraps everything under a single envelope field `values`; we decrypt
+  // just enough to extract the inner key set, then drop the values.
+  // Cost: one envelope decrypt per single-resource read. List endpoints
+  // skip this — they don't need it and we don't want N decrypts there.
+  if (summary.kind === 'secret') {
+    try {
+      const row = data as ResourceRow;
+      const decryptedSensitive = decryptEnvelope(row.sensitive ?? null, row.id);
+      const valuesBlob = decryptedSensitive.values;
+      if (valuesBlob && typeof valuesBlob === 'object' && !Array.isArray(valuesBlob)) {
+        summary.decryptedKeyNames = Object.keys(valuesBlob).sort();
+      } else {
+        summary.decryptedKeyNames = [];
+      }
+    } catch (err) {
+      // A decrypt failure here is the same integrity error
+      // `decryptEnvelope` raises elsewhere; for the read path we degrade
+      // to an empty list so the UI can still render (rather than 500).
+      // The corresponding apply path will surface the integrity error
+      // properly — separating concerns by call site.
+      logger.warn('[TEST_RESOURCE] decryptedKeyNames extraction failed', {
+        id: data.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      summary.decryptedKeyNames = [];
+    }
+  }
+
+  return summary;
 }
 
 export async function updateResource(
@@ -438,9 +536,46 @@ export async function updateResource(
       ...(row.config ?? {}),
       ...currentSensitive,
     };
+
+    // Phase 3 — per-key merge for envelope-wrapped value maps. The
+    // Settings UI doesn't have decrypted secret values, so it can only
+    // send the SUBSET of secrets the user touched. With `mergeValues`
+    // the patch's `values: { STRIPE: 'new' }` adds/updates STRIPE
+    // without dropping every other key. `null` removes a single key.
+    // Currently honoured only for `secret`; extend the allowlist below
+    // when another kind grows the same envelope shape.
+    const SUPPORTS_VALUE_MERGE: Set<ResourceKind> = new Set(['secret']);
+    const wantsValuesMerge = patch.mergeValues === true && SUPPORTS_VALUE_MERGE.has(row.kind);
+
     const applyPatch = (patchObj: Record<string, unknown> | undefined): void => {
       if (!patchObj) return;
       for (const [k, v] of Object.entries(patchObj)) {
+        // Special path: merge mode + targeting the canonical `values`
+        // envelope key. We treat the inner object as a delta against
+        // the existing map, not a replacement.
+        if (
+          wantsValuesMerge &&
+          k === 'values' &&
+          v !== null &&
+          v !== undefined &&
+          typeof v === 'object' &&
+          !Array.isArray(v)
+        ) {
+          const existing = (mergedConfig.values && typeof mergedConfig.values === 'object'
+            && !Array.isArray(mergedConfig.values))
+            ? (mergedConfig.values as Record<string, unknown>)
+            : {};
+          const next: Record<string, unknown> = { ...existing };
+          for (const [innerK, innerV] of Object.entries(v as Record<string, unknown>)) {
+            if (innerV === null || innerV === undefined) {
+              delete next[innerK];
+            } else {
+              next[innerK] = innerV;
+            }
+          }
+          mergedConfig[k] = next;
+          continue;
+        }
         if (v === null || v === undefined) {
           delete mergedConfig[k];
         } else {

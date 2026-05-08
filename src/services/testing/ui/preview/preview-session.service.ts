@@ -358,6 +358,17 @@ interface InternalSession extends PreviewSession {
   domVersion: number;             // Monotonically increasing DOM version
   contextVersion: number;         // Version for context updates
   contextData: Record<string, any>; // Context data (env + test variables)
+  /**
+   * Workspace-resource variables exposed by adapters at apply time.
+   * Populated by `preview:apply-resource` when an environment / secret /
+   * data_fixture binding is applied to this session. Lives in a Map
+   * (rather than contextData) because it shadows the existing OTP /
+   * scratchpad namespace and we don't want a binding write to clobber
+   * a wait_for_email entry. Used as the second source by the unified
+   * `resolvePlaceholders` helper (scratchpad wins). May be missing on
+   * legacy sessions — every consumer must treat absence as "no extras".
+   */
+  contextRunVariables?: Map<string, unknown>;
 
   // Recording mode state
   recording: boolean;
@@ -1145,6 +1156,14 @@ export class PreviewSessionService {
       // session_newer_than_evidence check.
       session.createdAt = Date.now();
 
+      // Phase 2.5: drop scratchpad + workspace-resource variables on
+      // reset. Otherwise a saved `secrets.STRIPE` (and its OAuth
+      // sibling `auth` cookies which the new context already lost)
+      // would leak into the fresh context — same session id, different
+      // browser state. Both maps must be torn down with the cookies.
+      session.contextData = {};
+      session.contextRunVariables = undefined;
+
       // Auto-dismiss native dialogs on the new page
       this.attachDialogHandler(newPage, sessionId);
 
@@ -1602,6 +1621,15 @@ export class PreviewSessionService {
       }
       await this.safeCloseBrowserResources(session.browser, session.context, session.page);
 
+      // Free auth-detector per-session state. The detector also clears on
+      // page `close` events, but that listener may not fire on abrupt
+      // teardowns (browser crash, context.close without page close) — so
+      // session stop is the canonical cleanup hook.
+      try {
+        const { clearAuthDetectorSession } = await import('./auth-detector');
+        clearAuthDetectorSession(sessionId);
+      } catch { /* best effort */ }
+
       // Remove from maps
       this.sessions.delete(sessionId);
       this.userToSession.delete(session.userId);
@@ -1672,6 +1700,12 @@ export class PreviewSessionService {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+
+    // Free auth-detector per-session state (see stopSession comment).
+    try {
+      const { clearAuthDetectorSession } = await import('./auth-detector');
+      clearAuthDetectorSession(sessionId);
+    } catch { /* best effort */ }
 
     // Remove from maps atomically (even if cleanup failed)
     this.sessions.delete(sessionId);

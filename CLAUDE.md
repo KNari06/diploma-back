@@ -32,7 +32,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | [src/api/](src/api/) | 50+ REST controllers, grouped by domain. | ⏳ TODO |
 | [src/websocket/](src/websocket/) | Socket.IO server + handlers. Most events live in `handlers/preview.handler.ts`. | ⏳ TODO |
 | [src/services/testing/](src/services/testing/) | Non-preview testing services (regression, plans, results, executions, fixtures, exploration). | — |
-| [src/services/test-resource/](src/services/test-resource/) | Polymorphic test resources (auth/login adapters, future: env/secret/...). | — |
+| [src/services/test-resource/](src/services/test-resource/) | Polymorphic test resources — `auth` (logins), `environment`, `secret` adapters live here; `data_fixture` queued. | ✅ |
 | [src/services/kb/](src/services/kb/) | Knowledge base (skills, patterns) for auto-learn. | — |
 | [src/services/skills/](src/services/skills/) | Skill registry — composable test capabilities. | — |
 | src/services/mobile/ | Mobile runner integration (scrcpy, redroid, a11y agent). | — |
@@ -52,6 +52,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 When you need to… | Open
 ---|---
 …understand preview/replay/recording/auto-healing | [src/services/testing/ui/preview/CLAUDE.md](src/services/testing/ui/preview/CLAUDE.md)
+…add a new resource kind (env/secret/fixture/...) | [src/services/test-resource/CLAUDE.md](src/services/test-resource/CLAUDE.md)
 …change LLM behaviour for element resolution | `preview/element-resolver.service.ts`, `preview/intent-step-lint.service.ts`
 …change a prompt | `src/ai/prompts/*.ts`
 …add/modify a BullMQ job | `src/jobs/<name>.job.ts` and register in `src/worker/index.ts`
@@ -113,6 +114,8 @@ These are codified across the codebase. Also see [.claude/rules/critical-pattern
 6. **CSS selector escaping:** use `CSS.escape()` when interpolating IDs (React 18 `useId()` produces colons that break selectors).
 7. **Element resolution is a 3-stage waterfall:** compiled plan → LLM resolver → smart locator. Never skip a stage.
 8. **DRY before writing new logic:** `rg "<thing>" src/ --type ts` first. There's a high chance it already exists.
+9. **`{{key}}` interpolation goes through `resolvePlaceholders`** ([src/utils/interpolation/resolve-placeholders.ts](src/utils/interpolation/resolve-placeholders.ts)). Three call sites used to do the same `.replace(/\{\{…\}\}/g, …)` against different source maps; that divergence is gone. New variable sources (env / secret / data_fixture / future kinds) are added by passing one more `VariableSource` to the helper, never by writing another regex. Selectors / `elementDescription` are intentionally NOT interpolated — keep it that way.
+10. **Anywhere that EMITS, LOGS, or PERSISTS a step body after interpolation must redact `secrets.*` values.** Helpers: `resolvePlaceholders` (substitution) is paired with `redactSecrets` / `buildStepRedactor` ([src/utils/interpolation/redact-step.ts](src/utils/interpolation/redact-step.ts)) and `executor.redactString` / `executor.redactRuntimeMeta` (for background replay). When you add a new sink (WS event, JSONL writer, DB column, third-party API call, LLM prompt) carrying interpolated `value`/`url`/`assertionText`/`description`, run it through one of these. **DB persistence is the special case:** store the original `{{...}}` placeholder, not the resolved value (see `preserveOriginalStep` in `preview-run.service.ts`). Otherwise re-runs see a stale literal forever.
 
 ---
 

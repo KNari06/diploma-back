@@ -378,9 +378,27 @@ export interface ServerToClientEvents {
   // a new Login resource scoped to this site.
   'preview:auth:required': (data: {
     previewSessionId: string;
-    signal: 'url' | 'form' | 'both';
+    /**
+     * What kind of evidence triggered the emit. The backend picks the
+     * narrowest label that fits — multiple signals may be present in
+     * `triggers` regardless. UI uses this to tailor the banner copy.
+     *   'url'             — only URL/path-based evidence
+     *   'form'            — visible password input (no URL match)
+     *   'both'            — URL + password agree (highest confidence)
+     *   'external_oauth'  — landed on a known OAuth provider host
+     *   'multistep'       — password page reached after a recent email-only
+     *                       step on the same registrable domain
+     *                       (Google-style 2-step flow)
+     *   'backend'         — backend-driven wall (recent 401/403 + secondary
+     *                       signal, no password input present yet)
+     */
+    signal: 'url' | 'form' | 'both' | 'external_oauth' | 'multistep' | 'backend';
     url: string;
     suggestedDomain?: string;
+    /** v3 — confidence score (0..1). Old clients may ignore. */
+    score?: number;
+    /** v3 — diagnostic list of which weights fired. Old clients ignore. */
+    triggers?: string[];
     timestamp: string;
   }) => void;
 

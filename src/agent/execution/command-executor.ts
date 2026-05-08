@@ -1,4 +1,5 @@
 /* eslint-disable no-case-declarations */
+import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { AIExtractService } from '@/services/ai-extract';
 import { SelfHealingService } from '@/services/ai-selector/self-healing.service';
 import { AICostManager } from '@/services/ai/cost/ai-cost-manager.service';
@@ -278,6 +279,16 @@ export class CommandExecutor {
   private replayTrace?: ReplayTraceWriter;
   /** V14: Total steps count for trace events */
   private totalSteps?: number;
+  /**
+   * Phase 2: cached list of secret values for log redaction. Populated
+   * once at run start by `setRunVariables` (called from test-executor
+   * after applyBindingsToContext). Empty when no secret resources are
+   * bound — `redactInLogs` then becomes a cheap no-op.
+   *
+   * We cache the array form (not the Map) because every logger call
+   * iterates it; rebuilding from the Map per call would be wasteful.
+   */
+  private redactValues: readonly string[] = [];
 
   constructor(
     page: Page,
@@ -456,23 +467,28 @@ export class CommandExecutor {
     const selector = this.prepareSelector(command.selector);
     const awaitNavigation = command.awaitNavigation ?? false; // ✅ FIX 3: Navigation flag
 
-    // ✅ NEW: Log detailed command information before execution
+    // ✅ NEW: Log detailed command information before execution.
+    // Phase 2: redact interpolated `{{secrets.X}}` values BEFORE they go
+    // through logger.info — once a real Stripe key lands in JSONL trace
+    // / log files / forwarded log streams it's effectively leaked.
     logger.info('[COMMAND_EXECUTOR] Executing command (FINAL)', {
       action,
       selector: {
         original: command.selector,
         normalized: selector,
       },
-      value,
-      url,
-      description,
+      value: this.redactInLogs(value),
+      url: this.redactInLogs(url),
+      description: this.redactInLogs(description),
       awaitNavigation,
       timeout,
       continueOnError,
       waitFor: command.waitFor,
       assertion: command.assertion ? {
         type: command.assertion.type,
-        expected: command.assertion.expected,
+        // assertion.expected is user-authored copy that may also have
+        // gone through resolvePlaceholders, so mask it too.
+        expected: this.redactInLogs(command.assertion.expected),
         operator: command.assertion.operator,
       } : undefined,
       isIntentCommand,
@@ -3057,6 +3073,82 @@ export class CommandExecutor {
     if (key && value != null) {
       this.extractedData.set(key, value);
     }
+  }
+
+  /**
+   * Phase 2: register the workspace `runVariables` Map so log lines that
+   * happen to embed an interpolated `{{secrets.X}}` value get masked
+   * before they hit logger / WebSocket / trace files.
+   *
+   * Called once per run from test-executor after `applyBindingsToContext`.
+   * Idempotent — passing `undefined` resets the cache. Cheap on the
+   * no-secrets case: `collectSecretValues` returns [] and `redactInLogs`
+   * short-circuits.
+   */
+  setRunVariables(runVariables: Map<string, unknown> | null | undefined): void {
+    this.redactValues = collectSecretValues(runVariables);
+  }
+
+  /**
+   * Apply secret-value redaction to any string we're about to log.
+   * Use this when an interpolated step body (value / url / assertionText)
+   * is being logged in plaintext — the resolver may have substituted a
+   * `{{secrets.X}}` value before this point. No-op when no secrets
+   * are registered.
+   */
+  private redactInLogs<T>(value: T): T {
+    if (typeof value !== 'string' || this.redactValues.length === 0) return value;
+    return redactWithValues(value, this.redactValues) as unknown as T;
+  }
+
+  /**
+   * Public form of `redactInLogs` for callers that hold an executor
+   * reference and want to redact arbitrary strings (e.g. test-executor
+   * builds `replayTrace.write(...)` payloads outside this class but
+   * needs the same secret-value list). Empty list / non-string input
+   * fast-paths to identity.
+   */
+  redactString(value: string): string {
+    if (typeof value !== 'string' || this.redactValues.length === 0) return value;
+    return redactWithValues(value, this.redactValues);
+  }
+
+  /**
+   * Read-only view of the secret values list for callers that want to
+   * pass the array onwards (e.g. ReplayTraceWriter could redact at
+   * write-time given a pre-built list). Returns the same array
+   * reference each call — do not mutate.
+   */
+  getRedactValues(): readonly string[] {
+    return this.redactValues;
+  }
+
+  /**
+   * Phase 2.5 — redact known string fields on a `StepRuntimeMeta` value
+   * before it goes out via `webSocketService.emitTestStepCompleted`.
+   * The fields covered are the ones that historically embed the
+   * interpolated value:
+   *   - `failureExplanation` (LLM-generated; can quote step.value)
+   *   - `healedFrom`, `healedTo`, `healWhatChanged` (raw selector or
+   *     synthesised text strings, sometimes quoting fill values)
+   * Anything else (numeric metrics, booleans, nested arrays of network
+   * evidence) is preserved as-is. Returns the same reference when no
+   * secrets are registered (cheap fast path).
+   */
+  redactRuntimeMeta<T extends Record<string, unknown>>(meta: T | undefined): T | undefined {
+    if (!meta) return meta;
+    if (this.redactValues.length === 0) return meta;
+    const FIELDS = ['failureExplanation', 'healedFrom', 'healedTo', 'healWhatChanged'] as const;
+    let cloned: T | undefined;
+    for (const f of FIELDS) {
+      const v = (meta as Record<string, unknown>)[f];
+      if (typeof v !== 'string') continue;
+      const r = redactWithValues(v, this.redactValues);
+      if (r === v) continue;
+      if (!cloned) cloned = { ...meta };
+      (cloned as Record<string, unknown>)[f] = r;
+    }
+    return cloned ?? meta;
   }
 
   /**

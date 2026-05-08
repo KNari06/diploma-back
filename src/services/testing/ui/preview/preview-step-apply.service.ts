@@ -5,6 +5,8 @@
  */
 
 import { logger } from '@/utils/core/logger';
+import { recordSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
+import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
 import { logIntentResolveApply } from './intent-resolve-audit';
 import { sanitizeUrl } from '@/utils/validation/validation';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -3285,25 +3287,37 @@ export class PreviewStepApplyService {
       };
     }
 
-    // ── Scratchpad: interpolate {{key}} context variable placeholders ──
-    // Resolves cross-step data (OTP codes, stored values, extracted text) before
-    // locator resolution. Same mechanism as preview-run.service.ts but for
-    // single-step applies (editor "Apply" button).
+    // ── Scratchpad + workspace vars: interpolate {{key}} placeholders ──
+    // Resolves cross-step data (OTP codes, stored values, extracted text)
+    // and workspace resources (env / secret / data_fixture variables —
+    // populated when bindings have been applied to the preview session)
+    // before locator resolution. Same source priority as preview-run.
+    // Phase 2.5: collect secret values once per applyStep call so the
+    // intent-resolve-audit log lines (potentially several per apply via
+    // pre-lint + apply + post-verify reject paths) can redact the
+    // post-interpolation step body before persisting it to JSONL.
+    let secretValuesForAudit: readonly string[] = [];
     try {
       const sessionService = getPreviewSessionService();
       const session = sessionService.getSession(previewSessionId);
       const contextData = session?.contextData;
-      if (contextData && Object.keys(contextData).length > 0) {
-        const resolve = (s: string): string => {
-          if (!s.includes('{{')) return s;
-          return s.replace(/\{\{([\w.-]+)\}\}/g, (match, key) => {
-            const replacement = contextData[key];
-            return typeof replacement === 'string' ? replacement : match;
-          });
-        };
+      const runVariables = (session as { contextRunVariables?: Map<string, unknown> } | undefined)?.contextRunVariables;
+      secretValuesForAudit = collectSecretValues(runVariables ?? null);
+      const hasContext = !!contextData && Object.keys(contextData).length > 0;
+      const hasRunVars = !!runVariables && runVariables.size > 0;
+      if (hasContext || hasRunVars) {
+        const sources = [
+          recordSource('contextData', contextData ?? null),
+          ...(hasRunVars
+            ? [{
+                name: 'runVariables',
+                lookup: (k: string) => (runVariables as Map<string, unknown>).get(k),
+              }]
+            : []),
+        ];
         const resolved = { ...stepDraft };
-        if (resolved.value) resolved.value = resolve(resolved.value);
-        if (resolved.assertionText) resolved.assertionText = resolve(resolved.assertionText);
+        if (resolved.value) resolved.value = resolvePlaceholders(resolved.value, sources);
+        if (resolved.assertionText) resolved.assertionText = resolvePlaceholders(resolved.assertionText, sources);
         stepDraft = resolved;
       }
     } catch {
@@ -5912,6 +5926,7 @@ export class PreviewStepApplyService {
               resolverDegraded: lintResult.degradedMode,
               topSimilarity: lintResult.topSimilarity,
               candidatesCount: lintResult.candidates?.length,
+              secretValues: secretValuesForAudit,
             });
           } catch { /* never break apply on diagnostics */ }
 
@@ -6072,6 +6087,7 @@ export class PreviewStepApplyService {
                 resolverDegraded: lintResult.degradedMode,
                 topSimilarity: lintResult.topSimilarity,
                 candidatesCount: lintResult.candidates?.length,
+                secretValues: secretValuesForAudit,
               });
             } catch { /* never break apply on diagnostics */ }
             trace?.writeActionResult({
@@ -6388,6 +6404,7 @@ export class PreviewStepApplyService {
                 resolverDegraded: lintResult.degradedMode,
                 topSimilarity: lintResult.topSimilarity,
                 candidatesCount: lintResult.candidates?.length,
+                secretValues: secretValuesForAudit,
               });
             } catch { /* never break apply on diagnostics */ }
             trace?.writeActionResult({

@@ -20,6 +20,7 @@ import { Router } from 'express';
 import {
   createResource,
   listByProject,
+  findByDomain,
   getResource,
   updateResource,
   deleteResource,
@@ -36,6 +37,7 @@ const router = Router();
 // swallowed by the /:id catch-all.
 router.post('/', createResource);
 router.get('/project/:projectId', listByProject);
+router.get('/by-domain', findByDomain);
 router.get('/resolve', resolveDefault);
 router.put('/default', setDefault);
 router.delete('/default', clearDefault);

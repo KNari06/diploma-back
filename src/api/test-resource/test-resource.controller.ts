@@ -141,6 +141,46 @@ export async function listByProject(req: Request, res: Response): Promise<void> 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/v1/test-resource/by-domain?projectId=...&kind=auth&domain=app.example.com
+//
+// Returns resources of a given `kind` whose `scope.domain` matches the
+// query domain exactly (case-insensitive). Used by the auth-detector
+// silent-reuse path on the frontend: when the editor lands on a known
+// hostname and we already have ONE login for it, we apply it without
+// re-prompting the user.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function findByDomain(req: Request, res: Response): Promise<void> {
+  const userId = requireAuthed(req, res);
+  if (!userId) return;
+
+  const projectId = (req.query.projectId as string | undefined) ?? '';
+  const kind = (req.query.kind as string | undefined) ?? '';
+  const domain = (req.query.domain as string | undefined) ?? '';
+
+  if (!projectId || !kind || !domain) {
+    res.status(400).json({
+      success: false,
+      error: 'projectId, kind, and domain are required query params',
+    });
+    return;
+  }
+
+  try {
+    const resources = await TestResourceService.findByDomain(
+      userId,
+      projectId,
+      kind as ResourceKind,
+      domain,
+    );
+    res.json({ success: true, resources });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(500).json({ success: false, error: msg });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/v1/test-resource/:id
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -1,3 +1,4 @@
+import { mapSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
 import { isDevelopment } from '@/config/environment/env';
 import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
@@ -546,6 +547,18 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         totalSteps: testData.commands.length,
       });
 
+      // Phase 2: register secret values for log redaction. Every secret
+      // bound to this run gets pushed through `redactInLogs` before
+      // landing in `logger.info`. Empty Map = no-op.
+      executor.setRunVariables(resourceApply?.runVariables);
+      // Phase 2.5: same values, but applied at the JSONL trace writer's
+      // post-stringify step. The writer redacts BOTH the raw form and
+      // the JSON-escaped form so secrets containing quotes / control
+      // chars don't slip through escaping. We pass the same array the
+      // executor cached so a single source-of-truth governs both
+      // logger.info and the JSONL line.
+      replayTrace.setRedactValues(executor.getRedactValues());
+
       // Start error collection for background monitoring
       const errorCollector = new ErrorCollectorService(page);
       errorCollector.startCollecting();
@@ -804,18 +817,37 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
           const stepStartedAt = Date.now();
 
           try {
-            // ── Scratchpad: interpolate {{key}} placeholders from extractedData ──
+            // ── Scratchpad + workspace vars: interpolate {{key}} placeholders ──
+            // Source priority (first-defined-wins, see resolvePlaceholders docs):
+            //   1. extractedData — per-run scratchpad (extract / store /
+            //      wait_for_email writes). Always wins so a fresh OTP from
+            //      this run beats a stale workspace variable of the same
+            //      key, which is what users intuit.
+            //   2. runVariables — workspace-level resources (env / secret /
+            //      data_fixture) populated by adapters during
+            //      `applyBindingsToContext`. Empty Map when no bindings.
+            // {{_secret_<stepId>}} placeholders are intentionally left as
+            // literals — they're consumed by `interpolateRecipeSecrets`
+            // inside the recipe-executor, never here.
             const scratchpadData = executor.getExtractedData();
-            if (scratchpadData.size > 0) {
-              const resolveVars = (s: string) => s.replace(/\{\{([\w.-]+)\}\}/g, (m, k) => {
-                const v = scratchpadData.get(k);
-                return typeof v === 'string' ? v : (v != null ? String(v) : m);
-              });
-              if ((command as any).value) (command as any).value = resolveVars((command as any).value);
-              if ((command as any).assertionText) (command as any).assertionText = resolveVars((command as any).assertionText);
-              if ((command as any).url) (command as any).url = resolveVars((command as any).url);
-              // Also resolve in intentMeta fields (for intent-based commands)
-              if ((command as any).intentMeta?.value) (command as any).intentMeta.value = resolveVars((command as any).intentMeta.value);
+            const runVariables = resourceApply?.runVariables;
+            if (scratchpadData.size > 0 || (runVariables && runVariables.size > 0)) {
+              const sources = [
+                mapSource('extractedData', scratchpadData),
+                mapSource('runVariables', runVariables ?? null),
+              ];
+              // PlaywrightCommand is a discriminated union; rather than
+              // type-narrow per branch we adopt the same `as any` style the
+              // pre-refactor code used. resolvePlaceholders is a no-op for
+              // non-string inputs so we don't need to gate by typeof here,
+              // but doing so still avoids unnecessary object reshuffling.
+              const cmd = command as any;
+              if (typeof cmd.value === 'string') cmd.value = resolvePlaceholders(cmd.value, sources);
+              if (typeof cmd.assertionText === 'string') cmd.assertionText = resolvePlaceholders(cmd.assertionText, sources);
+              if (typeof cmd.url === 'string') cmd.url = resolvePlaceholders(cmd.url, sources);
+              if (cmd.intentMeta && typeof cmd.intentMeta.value === 'string') {
+                cmd.intentMeta.value = resolvePlaceholders(cmd.intentMeta.value, sources);
+              }
             }
 
             // Execute command via CommandExecutor
@@ -922,7 +954,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   bugScreenshotUrl,
                   // Full enriched meta with healing provenance / readiness
                   // trace / network verdict — same shape as step_completed.
-                  runtimeMeta: enrichedMeta,
+                  runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
                   errors: {
                     console: updatedStepErrors.consoleErrors.length,
                     network: updatedStepErrors.networkErrors.length,
@@ -961,7 +993,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   stepDescription,
                   success: false,
                   timestamp: new Date().toISOString(),
-                  runtimeMeta: enrichedMeta,
+                  runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
                 });
               } catch (wsError) {
                 logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/network-fail)', {
@@ -1096,7 +1128,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     // resolution path, readiness trace, blocker diagnosis,
                     // network verdict, etc. Critical for offline bug-report
                     // generation that reads JSONL directly.
-                    runtimeMeta: enrichedMeta,
+                    runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
                     errors: {
                       console: updatedStepErrors.consoleErrors.length,
                       network: updatedStepErrors.networkErrors.length,
@@ -1129,7 +1161,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     stepDescription,
                     success: false,
                     timestamp: new Date().toISOString(),
-                    runtimeMeta: enrichedMeta,
+                    runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
                   });
                 } catch (wsError) {
                   logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/validation-fail)', {
@@ -1450,7 +1482,11 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               action,
               description: intentMeta?.elementDescription,
               durationMs: failDurationMs,
-              error: finalError,
+              // Phase 2.5: `finalError` is a Playwright/heal message that
+              // routinely embeds the interpolated value (`Failed to fill
+              // "sk_live_xxx" into …`). Redact before it lands in
+              // logger output.
+              error: executor.redactString(finalError ?? ''),
               rootCause: finalMeta.rootCause,
               failedReason: finalMeta.failedReason,
               source: baseMeta.source,
@@ -1481,7 +1517,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 // trace, slow APIs, blocker diagnosis. The flat `source`/
                 // `resolutionPath` above are duplicated for grep-friendly
                 // existing tooling; new code should read `runtimeMeta.*`.
-                runtimeMeta: finalMeta,
+                runtimeMeta: executor.redactRuntimeMeta(finalMeta),
                 errors: {
                   console: stepErrors.consoleErrors.length,
                   network: stepErrors.networkErrors.length,
@@ -1521,7 +1557,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 stepDescription: intentMeta?.elementDescription || action,
                 success: false,
                 timestamp: new Date().toISOString(),
-                runtimeMeta: finalMeta,
+                runtimeMeta: executor.redactRuntimeMeta(finalMeta),
               });
             } catch (wsError) {
               logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/failure)', {
@@ -1869,7 +1905,10 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         networkLogs,
         errors,
         performance: performanceMetrics, // Web Vitals — stored in test_results.performance
-        error: allSuccess ? undefined : finalError,
+        // Phase 2.5: redact secret values from the final error string
+        // before it propagates to manual-test-run.job (which persists it
+        // to `test_results.error_message` and emits to WS).
+        error: allSuccess ? undefined : (finalError ? executor.redactString(finalError) : undefined),
         videoUrl: uploadedArtifacts.videoUrl,
         videoPath: artifacts.videoPath,
         traceUrl: uploadedArtifacts.traceUrl,

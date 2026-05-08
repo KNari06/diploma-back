@@ -17,6 +17,7 @@
  */
 
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
+import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import * as path from 'path';
 import type { PreviewIntentStep } from '@/websocket/types/types';
 import type { InteractiveNode, LintResult } from './preview.types';
@@ -97,6 +98,17 @@ export class EditorTraceService {
   private writer: LiteTraceWriter;
   private previewSessionId: string;
   private userId: string;
+  /**
+   * Phase 2.5 — lazy provider for the session's `runVariables` Map.
+   * Used to redact `secrets.*` values before they hit JSONL on disk and
+   * the eventual upload to Supabase Storage. Intentionally a getter
+   * (not a snapshot) so newly-applied secret resources DURING a session
+   * are picked up on subsequent writes.
+   *
+   * Set once at session bootstrap via `setRunVariablesProvider`. When
+   * absent, `redact()` is a fast no-op and behaviour matches pre-Phase-2.
+   */
+  private runVariablesProvider?: () => Map<string, unknown> | undefined;
 
   private constructor(previewSessionId: string, userId: string) {
     this.previewSessionId = previewSessionId;
@@ -109,6 +121,52 @@ export class EditorTraceService {
     });
   }
 
+  /**
+   * Wire the run-variables source for redaction. Called once when a
+   * preview session is created; safe to overwrite (later sessions
+   * replace earlier providers). The provider returns the live Map
+   * reference, so adapter writes after this call are still redacted.
+   */
+  setRunVariablesProvider(provider: () => Map<string, unknown> | undefined): void {
+    this.runVariablesProvider = provider;
+  }
+
+  /**
+   * Run a string field through the secret-value redactor. No-op when
+   * no provider is wired (back-compat) or when the run has no secrets.
+   * Stays inline rather than per-field maybe-redact so callers stay
+   * compact; collectSecretValues is cheap on the empty case.
+   */
+  private redact<T>(value: T): T {
+    if (typeof value !== 'string') return value;
+    const map = this.runVariablesProvider?.();
+    if (!map || map.size === 0) return value;
+    const values = collectSecretValues(map);
+    if (values.length === 0) return value;
+    return redactWithValues(value, values) as unknown as T;
+  }
+
+  /**
+   * Walk a `PreviewIntentStep`-shaped object and redact every string
+   * field that's known to carry interpolated user values. Selectors,
+   * IDs, recordedFingerprint, etc. are NOT touched — they're not
+   * substituted at runtime. Returns a shallow copy to avoid mutating
+   * the caller's reference.
+   */
+  private redactStep(step?: PreviewIntentStep): PreviewIntentStep | undefined {
+    if (!step) return step;
+    // Hot path: when no secrets are configured at all, skip the copy.
+    const map = this.runVariablesProvider?.();
+    if (!map || map.size === 0) return step;
+    const values = collectSecretValues(map);
+    if (values.length === 0) return step;
+    const out: PreviewIntentStep = { ...step };
+    if (typeof out.value === 'string') out.value = redactWithValues(out.value, values);
+    if (typeof out.assertionText === 'string') out.assertionText = redactWithValues(out.assertionText, values);
+    if (typeof out.description === 'string') out.description = redactWithValues(out.description, values);
+    return out;
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // STATIC LIFECYCLE
   // ─────────────────────────────────────────────────────────────────────────
@@ -118,6 +176,22 @@ export class EditorTraceService {
     let instance = activeWriters.get(previewSessionId);
     if (!instance) {
       instance = new EditorTraceService(previewSessionId, userId);
+      // Phase 2.5: wire the redaction source. We use a lazy require to
+      // dodge a circular module-eval edge case (preview-session imports
+      // editor-trace transitively via lifecycle hooks). The provider
+      // returns the LIVE Map reference each call so secret resources
+      // applied later in the session are still redacted.
+      instance.setRunVariablesProvider(() => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const sessionMod = require('./preview-session.service');
+          const svc = sessionMod.getPreviewSessionService?.();
+          const session = svc?.getSession?.(previewSessionId);
+          return session?.contextRunVariables;
+        } catch {
+          return undefined;
+        }
+      });
       activeWriters.set(previewSessionId, instance);
     }
     return instance;
@@ -416,20 +490,38 @@ export class EditorTraceService {
   // ─────────────────────────────────────────────────────────────────────────
 
   writeStepApplyRequest(stepDraft: PreviewIntentStep): void {
+    // Phase 2.5: redact `description` before persistence. `value` /
+    // `assertionText` aren't included here today, but redacting
+    // description still matters because users sometimes inline literal
+    // secret-shaped tokens into descriptions ("type Stripe key sk_…").
     this.writer.write({
       stage: 'apply',
       eventType: 'step_apply_request',
-      payload: { stepId: stepDraft.id, type: stepDraft.type, description: stepDraft.description },
+      payload: {
+        stepId: stepDraft.id,
+        type: stepDraft.type,
+        description: this.redact(stepDraft.description),
+      },
     });
   }
 
   writeStepApplyResult(result: {
     success: boolean; error?: string; appliedStep?: PreviewIntentStep;
   }): void {
+    // Phase 2.5: `appliedStep` carries the post-interpolation values;
+    // a plaintext `secrets.X` substitution lands here unless we redact.
+    // The trace is uploaded to Supabase Storage, so leakage persists
+    // across restarts.
     this.writer.write({
       stage: 'apply',
       eventType: 'step_apply_result',
-      payload: result,
+      payload: {
+        ...result,
+        appliedStep: this.redactStep(result.appliedStep),
+        // `error` may include the substituted value too (Playwright
+        // throws like 'Failed to fill "sk_live_xxx" into ...').
+        error: this.redact(result.error),
+      },
     });
   }
 

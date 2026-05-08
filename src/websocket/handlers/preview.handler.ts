@@ -28,6 +28,8 @@ import {
 } from './preview-input-helpers';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
+import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
+import { buildStepRedactor } from '@/utils/interpolation/redact-step';
 import { webSocketService } from '@/websocket/core/websocket.service';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -1903,8 +1905,32 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         confirmedSelections.delete(selectionKey);
       }
 
+      // Phase 2.5: redact `secrets.*` values from the WS payload before
+      // sending to the browser. After `applyStep` finished, `appliedStep`
+      // carries the post-interpolation `value` / `assertionText` — that's
+      // a literal Stripe key sitting in the websocket frame, visible in
+      // DevTools and browser network logs. The redactor walks
+      // value/assertionText/description/url; selectors/refs are
+      // intentionally untouched. No-op when no secrets are bound.
+      const sessionForRedact = (await import('@/services/testing/ui/preview/preview-session.service'))
+        .getPreviewSessionService()
+        .getSession(previewSessionId);
+      const redactObj = buildStepRedactor(sessionForRedact?.contextRunVariables);
+      const secretValues = collectSecretValues(sessionForRedact?.contextRunVariables);
+      // Phase 2.5: buildStepRedactor accepts any StepLike object — no
+      // double-cast needed, the helper is generic enough to walk the
+      // documented field set without trampling other properties.
+      const redactedAppliedStep = result.appliedStep
+        ? redactObj(result.appliedStep)
+        : result.appliedStep;
+      const redactedError = typeof result.error === 'string' && secretValues.length > 0
+        ? redactWithValues(result.error, secretValues)
+        : result.error;
+
       socket.emit('preview:step:apply:result', {
         ...result,
+        error: redactedError,
+        appliedStep: redactedAppliedStep,
         timestamp: new Date().toISOString(),
       });
 
@@ -6280,15 +6306,20 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         emitResult({ success: false, resourceId, error: 'Resource not found or not owned by user' });
         return;
       }
-      if (resource.kind !== 'auth') {
-        // Phase 4 only ships auth; other kinds can't be live-applied to a
-        // preview because they need a test-execution context (env vars,
-        // device emulation, scenario setup, etc.).
+      // Kinds that can be live-applied to a preview session. `auth`
+      // installs cookies/localStorage; `environment` and `secret` write
+      // workspace-level variables to the session's runVariables Map
+      // so subsequent applies/runs interpolate them. Secret values are
+      // never logged anywhere along this path — see `redactSecrets`.
+      // Other kinds (device emulation, scenario setup, ...) need a
+      // dedicated test execution context and aren't supported here.
+      const PREVIEW_APPLY_KINDS = new Set(['auth', 'environment', 'secret']);
+      if (!PREVIEW_APPLY_KINDS.has(resource.kind)) {
         emitResult({
           success: false,
           resourceId,
           resourceName: resource.name,
-          error: `Only auth resources can be applied to a preview (got "${resource.kind}")`,
+          error: `Resource kind "${resource.kind}" cannot be applied to a preview (yet)`,
         });
         return;
       }
@@ -6305,12 +6336,23 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // Cookies arrive cross-origin (Login scope may differ from preview's
       // current page). The external-nav trap would otherwise revert the
       // post-apply reload — tell it this next navigation is user-intended.
-      try {
-        const { markIntentionalGoto } = await import('@/services/testing/ui/preview/external-nav-trap');
-        markIntentionalGoto(previewSessionId, page.url());
-      } catch { /* non-fatal */ }
+      // Only relevant for auth — env/secret/fixture don't reload.
+      if (resource.kind === 'auth') {
+        try {
+          const { markIntentionalGoto } = await import('@/services/testing/ui/preview/external-nav-trap');
+          markIntentionalGoto(previewSessionId, page.url());
+        } catch { /* non-fatal */ }
+      }
 
-      const adapter = requireResourceAdapter('auth');
+      // Reuse the session's existing runVariables Map (populated by prior
+      // applies of environment / secret / fixture) so each adapter call
+      // accumulates rather than overwrites. Initialise lazily.
+      if (!sessionMeta.contextRunVariables) {
+        sessionMeta.contextRunVariables = new Map<string, unknown>();
+      }
+      const runVariables = sessionMeta.contextRunVariables;
+
+      const adapter = requireResourceAdapter(resource.kind);
       try {
         await adapter.apply(
           {
@@ -6318,7 +6360,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             projectId: sessionMeta.projectId,
             page,
             context,
-            runVariables: new Map(),
+            runVariables,
           },
           resource,
         );
@@ -6327,35 +6369,37 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           success: false,
           resourceId,
           resourceName: resource.name,
-          error: `Failed to apply login: ${err instanceof Error ? err.message : String(err)}`,
+          error: `Failed to apply ${resource.kind}: ${err instanceof Error ? err.message : String(err)}`,
         });
         return;
       }
 
-      // Silence the auth-detector for 10s. The upcoming reload fires
-      // framenavigated + load, and cookies aren't visible to the first
-      // render — without this cooldown the detector would re-fire the
-      // overlay in the gap between "reload starts" and "app re-auths".
-      try {
-        const { markApplyCooldown } = await import('@/services/testing/ui/preview/auth-detector');
-        markApplyCooldown(previewSessionId);
-      } catch { /* non-fatal */ }
+      if (resource.kind === 'auth') {
+        // Silence the auth-detector for 10s. The upcoming reload fires
+        // framenavigated + load, and cookies aren't visible to the first
+        // render — without this cooldown the detector would re-fire the
+        // overlay in the gap between "reload starts" and "app re-auths".
+        try {
+          const { markApplyCooldown } = await import('@/services/testing/ui/preview/auth-detector');
+          markApplyCooldown(previewSessionId);
+        } catch { /* non-fatal */ }
 
-      // Reload the current page so the app re-reads cookies/localStorage and
-      // renders in the authenticated state. Skip the reload if we're still
-      // on about:blank — nothing to re-render.
-      try {
-        if (page.url() && page.url() !== 'about:blank') {
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+        // Reload the current page so the app re-reads cookies/localStorage and
+        // renders in the authenticated state. Skip the reload if we're still
+        // on about:blank — nothing to re-render.
+        try {
+          if (page.url() && page.url() !== 'about:blank') {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+          }
+        } catch (err) {
+          // Apply succeeded, reload failed — still report success so the user
+          // can manually navigate. Cookies are injected either way.
+          logger.warn('[WebSocket] apply-resource reload failed (non-fatal)', {
+            previewSessionId,
+            resourceId,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
-      } catch (err) {
-        // Apply succeeded, reload failed — still report success so the user
-        // can manually navigate. Cookies are injected either way.
-        logger.warn('[WebSocket] apply-resource reload failed (non-fatal)', {
-          previewSessionId,
-          resourceId,
-          error: err instanceof Error ? err.message : String(err),
-        });
       }
 
       emitResult({ success: true, resourceId, resourceName: resource.name });
