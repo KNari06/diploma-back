@@ -134,6 +134,21 @@ export interface MobileIntentStep {
    * timelines. Absent on pre-Phase-3 runs; treat as 'main'.
    */
   phase?: 'setup' | 'main' | 'teardown';
+  /**
+   * Persisted compiled locator plan from a prior successful resolve.
+   * The runner's compiled-fast-path reads this field at dispatch time
+   * (qait-mobile-runner intent-step-converter.ts) and skips the LLM /
+   * vision resolvers entirely when the plan still matches the live
+   * tree. Pre-fix this field was preserved at runtime via spread but
+   * not declared on the type, so ts-eyes couldn't see that the
+   * regression dispatch path was correctly forwarding it. Persist via
+   * `IntentTestCaseService.batchUpdateStepsFromRun()` after every run
+   * (see mobile-test-run.job.ts:persistCompiledPlansFromRun) and via
+   * `updateStepFromPreviewApply()` after every editor apply (web's
+   * preview.handler.ts pattern; mobile editor session.controller.ts
+   * needs the same treatment).
+   */
+  compiled?: MobileCompiledPlan;
 }
 
 // ── Step Result ──────────────────────────────────────────────────
@@ -400,6 +415,16 @@ export interface MobileTestJobData {
     resource_id: string;
     required?: boolean;
   }>;
+  /**
+   * Job-level retry counter. Incremented by the worker before re-throwing
+   * to BullMQ on retry-able errors (runner unreachable, transient 503,
+   * Redis hiccup). Mirrors the web TestJobData.retryCount field used by
+   * manual-test-run.job.ts:322-329 to gate `shouldRetry()`. Initial value
+   * is undefined → treated as 0 inside the worker. Capped at
+   * `MOBILE_TEST_MAX_RETRIES` (env, default 1) so a permanently-broken
+   * runner doesn't infinitely retry.
+   */
+  retryCount?: number;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

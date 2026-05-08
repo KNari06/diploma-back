@@ -407,6 +407,68 @@ export class SupabaseService {
     return data;
   }
 
+  /**
+   * Mobile-only counterpart to {@link createTestResult}. Writes to the
+   * forked `mobile_test_results` table (created by
+   * 20260508_mobile_regression_tables.sql).
+   *
+   * Why a separate method:
+   *   - The shared `test_results` table doesn't have the mobile-only
+   *     aggregate columns (`duration`, `steps_total`, `steps_passed`,
+   *     `steps_failed`, `pass_rate`, `metadata`, `user_id`,
+   *     `workspace_id`) and we explicitly chose NOT to add them
+   *     (see migration header). Writing the mobile payload to
+   *     `test_results` would surface PGRST204 "missing column" errors
+   *     on every mobile run.
+   *   - `mobile_test_results.browser` accepts only `mobile-android` /
+   *     `mobile-ios` (TEXT + CHECK). Pass those values; other browsers
+   *     will fail the constraint.
+   *   - `mobile_test_results.status` is TEXT (decoupled from the
+   *     `test_status` enum) so mobile can extend statuses without
+   *     touching the shared enum.
+   *
+   * No artifact-column fallback is needed here — we own the schema and
+   * every column the worker writes is part of the migration.
+   */
+  async createMobileTestResult(resultData: any) {
+    if (!resultData || !resultData.test_id || !resultData.browser) {
+      throw new Error('Invalid mobile test result data: test_id and browser are required');
+    }
+
+    logger.info('[DB] Creating mobile test result', {
+      testId: resultData.test_id,
+      browser: resultData.browser,
+      status: resultData.status,
+    });
+
+    const { data, error } = await this.client
+      .from('mobile_test_results')
+      .insert(resultData)
+      .select()
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[DB] Failed to create mobile test result', {
+        testId: resultData.test_id,
+        browser: resultData.browser,
+        error: error.message,
+        code: (error as any)?.code,
+      });
+      throw error;
+    }
+
+    if (!data) {
+      logger.error('[DB] Mobile test result insert returned no data', {
+        testId: resultData.test_id,
+        browser: resultData.browser,
+      });
+      throw new Error('Mobile test result insert returned no data');
+    }
+
+    logger.info('[DB] Mobile test result created successfully', { resultId: (data as any).id });
+    return data;
+  }
+
   async updateTestResult(id: string, updates: any) {
     // Validate inputs
     if (!id || typeof id !== 'string') {

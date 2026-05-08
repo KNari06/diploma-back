@@ -33,7 +33,7 @@ import { ManualTestService } from '../ui/manualTest.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
 import { IntelligentTestStorageService } from '../results/intelligent-test-storage.service';
 import { env } from '@/config/environment/env';
-import { QueueManager } from '@/config/infrastructure/queues';
+import { QueueManager, mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
@@ -587,7 +587,7 @@ export class RegressionRunService {
      * single-case manual dispatch (no batch) — the job skips the update.
      */
     analyticsExecutionId?: string,
-  ): Promise<{ testId: string }> {
+  ): Promise<{ testId: string; jobId: string }> {
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
       mobile_ios: 'ios',
@@ -777,8 +777,16 @@ export class RegressionRunService {
 
     await QueueManager.addMobileTestRunJob(jobData);
 
+    // BullMQ job id format mirrors QueueManager.addMobileTestRunJob:
+    //   `${testId}-${browser}`  (see queues.ts:717)
+    // Caller uses this to wait for `queue.completed` in the regression
+    // concurrency gate so Test N+1 doesn't dispatch before Test N's
+    // session destroy is finished on the runner side.
+    const jobId = `${testId}-${browser}`;
+
     logger.info('[REGRESSION_RUN] Mobile test dispatched', {
       testId,
+      jobId,
       platform,
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
@@ -791,7 +799,7 @@ export class RegressionRunService {
       appSource: resolvedBuild?.source,
     });
 
-    return { testId };
+    return { testId, jobId };
   }
 
   /**
@@ -1915,7 +1923,32 @@ export class RegressionRunService {
       .eq('run_id', runId);
 
     if (execError) {
+      // Pre-fix this was a silent `return` — left the run row orphan in
+      // 'running' state because nothing thrown reached runPlan's
+      // `.catch()` finalizer at line 1310. Now we explicitly finalize the
+      // run row before bailing out so the regression list / detail view
+      // doesn't show a forever-running run.
       logger.error('[REGRESSION_RUN] Failed to preload executions', { error: execError, runId });
+      try {
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({
+            status: 'failed',
+            completed_at: new Date().toISOString(),
+            summary: {
+              total: testCases.length,
+              error: `Failed to preload executions: ${execError.message ?? 'unknown'}`,
+              completed_at: new Date().toISOString(),
+            },
+          })
+          .eq('id', runId)
+          .in('status', ['pending', 'running']);
+      } catch (finalizeErr) {
+        logger.error('[REGRESSION_RUN] Failed to finalize run after preload failure', {
+          runId,
+          error: finalizeErr,
+        });
+      }
       return;
     }
 
@@ -2028,10 +2061,30 @@ export class RegressionRunService {
     // Override via REGRESSION_MOBILE_MAX_CONCURRENCY. Should be ≤ runner's
     // POOL_ANDROID_SIZE + POOL_IOS_SIZE — otherwise each extra slot forces
     // a ~60s cold-start that ends up slower than serial execution.
+    //
+    // Default is 1 (serial). The previous default of 2 caused regression
+    // runs to dispatch two mobile tests in parallel, both racing the same
+    // emulator. When the runner pool claim fails (e.g.
+    // `pm create-user failed: (no output)` on a redroid that hasn't fully
+    // booted multi-user), both tests fall back to cold-start on the same
+    // device, contend on the ADB shell, and the second `runSteps` HTTP
+    // request gets its socket dropped — surfacing as `Client aborted`
+    // after step 0 in the runner. Editor runs never hit this because
+    // they're always single-test. Operators with a healthy warm pool can
+    // raise this to match `POOL_ANDROID_SIZE + POOL_IOS_SIZE`.
     const MAX_MOBILE_IN_FLIGHT = Math.max(
       1,
-      parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '2', 10),
+      parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '1', 10),
     );
+
+    // Defensive guard: log loudly if any testCaseId is dispatched twice
+    // within a single run. Topological levels + dedup at expansion time
+    // (regression-plan.service.ts:941-947) should make this impossible,
+    // but the user has reported a "tests run again" symptom we couldn't
+    // reproduce from logs. If the backend ever emits a duplicate, this
+    // log + early-return surfaces it without putting an extra job on the
+    // queue. Cheap, defensive, removable once the symptom is understood.
+    const dispatchedTestCaseIds = new Set<string>();
 
     let creditExhausted = false;
     // Fail-fast flag — mirrors `creditExhausted`. Flipped to true the first
@@ -2089,6 +2142,23 @@ export class RegressionRunService {
         // still awaits tests that were dispatched before the trigger, so
         // we don't lose verdicts from in-flight tests.
         if (failFastTriggered) break;
+
+        // Defensive duplicate-dispatch guard. If the topological sort or
+        // plan expansion ever lets the same testCaseId through twice in
+        // one run, log loudly and skip the second dispatch — better to
+        // have a missing run-card than to charge the user twice and
+        // confuse the regression UI with phantom executions.
+        const dispatchKey = `${testCase.testType}:${testCase.testCaseId}`;
+        if (dispatchedTestCaseIds.has(dispatchKey)) {
+          logger.error('[REGRESSION_RUN] DUPLICATE DISPATCH detected — skipping second invocation', {
+            runId,
+            testCaseId: testCase.testCaseId,
+            testType: testCase.testType,
+            level: levelIdx,
+          });
+          continue;
+        }
+        dispatchedTestCaseIds.add(dispatchKey);
 
         const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
 
@@ -2174,6 +2244,12 @@ export class RegressionRunService {
             // Route: mobile tests → mobile runner queue, web tests → Playwright queue
             const isMobile = savedCase.platform?.startsWith('mobile_');
             let testId: string;
+            // Captured from dispatchMobileTest so the concurrency gate below
+            // can also wait on the BullMQ `queue.completed` event, not just
+            // the execution-completion emitter (which fires several seconds
+            // before the worker's `finally` block finishes destroying the
+            // runner session).
+            let mobileJobId: string | null = null;
 
             if (isMobile) {
               // Phase 5: forward git triggerContext so the APK resolver can
@@ -2195,6 +2271,7 @@ export class RegressionRunService {
                 execId,
               );
               testId = mobileResult.testId;
+              mobileJobId = mobileResult.jobId;
             } else {
               const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
               const testResult = await ManualTestService.runTest(testRequest);
@@ -2235,7 +2312,40 @@ export class RegressionRunService {
               // shared CPU/memory, cap them via WEB_WORKER_CONCURRENCY, not
               // here.)
               if (isMobile) {
-                trackInFlight(waitPromise);
+                // The execution-completion emitter fires when the worker
+                // updates `test_executions.status` — but the worker keeps
+                // running for several more seconds inside its `finally`
+                // block (destroySession, persistCompiledPlans, etc.). If we
+                // released the gate here, Test N+1 would dispatch onto the
+                // runner while Test N's session destroy is still in flight,
+                // racing the runner's emulator teardown.
+                //
+                // Compose with `queue.completed` from the BullMQ worker so
+                // the gate stays closed until the mobile worker's `finally`
+                // also finishes. Failure of either side (job not found,
+                // wait timeout) is non-fatal — the gate releases anyway so
+                // a stuck runner doesn't deadlock the whole regression run.
+                const mobileGatePromise = (async (): Promise<string> => {
+                  const status = await waitPromise;
+                  if (mobileJobId) {
+                    try {
+                      const job = await mobileTestRunQueue.getJob(mobileJobId);
+                      if (job) {
+                        // 10-minute cap mirrors executionCompletionEmitter's
+                        // own DEFAULT_TIMEOUT_MS so a frozen runner doesn't
+                        // wedge the gate for longer than the upstream.
+                        await job.waitUntilFinished(mobileTestRunQueueEvents, 600_000);
+                      }
+                    } catch (err) {
+                      logger.warn('[REGRESSION_RUN] BullMQ wait for mobile job failed; releasing gate anyway', {
+                        jobId: mobileJobId,
+                        error: err instanceof Error ? err.message : String(err),
+                      });
+                    }
+                  }
+                  return status;
+                })();
+                trackInFlight(mobileGatePromise);
                 if (inFlight.size >= MAX_MOBILE_IN_FLIGHT) {
                   emitProgress(
                     'test_started',

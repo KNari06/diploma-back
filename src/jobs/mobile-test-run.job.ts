@@ -18,8 +18,8 @@ import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { ExecutionService } from '@/services/testing/executions/execution.service';
 import { logQueueEvent, logger } from '@/utils/core/logger';
+import { shouldRetry, calculateRetryDelay } from '@/utils/core/error-handler';
 import { webSocketService } from '@/websocket/core/websocket.service';
-import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
 import { Job } from 'bullmq';
 import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from '@/services/mobile/mobile-runner.types';
@@ -28,10 +28,32 @@ import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
+import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 
 // ============================================================================
 // JOB HANDLER
 // ============================================================================
+
+/**
+ * Custom error raised when a mobile test is cancelled mid-job.
+ *
+ * Mirrors the web pattern at manual-test-run.job.ts:32-37
+ * (`TestCancelledError`). The web job uses a typed exception so the
+ * outer catch can distinguish "user cancelled" from "everything else
+ * failed" — cancelled tests need a `webSocketService.emitTestCancelled`
+ * event and a graceful return, NOT a `tests.status = failed` flip.
+ *
+ * Pre-fix, mobile's cancellation paths silently `return`-ed without
+ * emitting any WS event. The frontend then had to infer the cancel
+ * had taken effect from the next `regression:run:progress` poll
+ * rather than receiving an explicit lifecycle signal.
+ */
+export class MobileTestCancelledError extends Error {
+  constructor(testId: string, browser: string) {
+    super(`Mobile test ${testId} (${browser}) was cancelled`);
+    this.name = 'MobileTestCancelledError';
+  }
+}
 
 export class MobileTestRunJobHandler {
   /**
@@ -88,7 +110,29 @@ export class MobileTestRunJobHandler {
       // Track 5 (shared resources): raw bindings only — the worker
       // compiles them on its own so plaintext secrets never land in Redis.
       resourceBindings,
+      // `intent_test_cases.id`. Required for `persistCompiledPlansFromRun`
+      // to find the test case row and merge per-step compiled plans back
+      // into `intent_test_cases.steps_json`. Pre-fix the worker passed
+      // `testId` (which is `tests.id`) and the persist silently failed
+      // for every regression run with `Cannot coerce the result to a
+      // single JSON object` — meaning compiled plans were NEVER saved
+      // and every run hit the LLM from scratch on every step.
+      // Optional because the chat dispatch path doesn't set it yet.
+      testCaseId: intentTestCaseId,
+      // Retry counter — undefined on first attempt, incremented by the
+      // worker before re-throwing on retry-able errors. See W5 below.
+      retryCount = 0,
     } = job.data;
+
+    // ── Job-level retry budget ───────────────────────────────────────
+    // Mirrors the web job's MAX_RETRIES constant
+    // (manual-test-run.job.ts:26). Default 1 retry — i.e. up to 2 total
+    // attempts on retry-able errors (network blip to runner, transient
+    // 503, Redis stall). Tunable via env without redeploy. Lower than
+    // web's default because mobile cold-starts cost ~30s each, so a
+    // permanently-broken pool would otherwise burn 2 minutes per
+    // failed regression test before giving up.
+    const MAX_MOBILE_RETRIES = parseInt(process.env.MOBILE_TEST_MAX_RETRIES ?? '1', 10);
 
     // `intentSteps` stays a `let` because Track 5 resource compilation
     // may prepend setup steps to it (see below). Without bindings this is
@@ -105,15 +149,45 @@ export class MobileTestRunJobHandler {
       throw new Error('Missing required parameters: testId or intentSteps');
     }
 
-    // Guard: skip if already finalized
+    // Guard: skip if already finalized.
+    // Mirrors the web job's pattern at manual-test-run.job.ts:85-101.
+    // A BullMQ retry of a stalled job that already finished its real work
+    // (steps executed, status flipped) but stalled in post-processing
+    // would otherwise re-claim a session and re-run all steps. Returning
+    // a no-op here is safe AND idempotent — the test row already says
+    // 'completed' / 'failed' / 'cancelled' / 'timeout'.
+    //
+    // The log line includes job.id and job.attemptsMade so a sudden
+    // spike in "already finalized" log lines is observable and points
+    // at queue health (jobs being retried that shouldn't be).
     if (await this.isTestFinalized(testId)) {
-      logger.info('[MOBILE-TEST] Test already finalized, skipping', { testId, browser });
+      logger.info('[MOBILE-TEST] Test already finalized, skipping job execution', {
+        testId,
+        browser,
+        jobId: job.id,
+        jobAttempts: job.attemptsMade,
+      });
       return;
     }
 
-    // Guard: skip if cancelled
+    // Guard: skip if cancelled. Emit a WS lifecycle event so any
+    // listener that subscribed AFTER the user's cancelRun call (e.g.
+    // a late-mounting analytics consumer) still sees the lifecycle
+    // close. Mirrors the cancellation event emission web does in its
+    // catch block (manual-test-run.job.ts:280-284).
     if (await this.isTestCancelled(testId)) {
-      logger.info('[MOBILE-TEST] Test was cancelled before execution', { testId, browser });
+      logger.info('[MOBILE-TEST] Test was cancelled before execution', {
+        testId,
+        browser,
+        jobId: job.id,
+        jobAttempts: job.attemptsMade,
+      });
+      try {
+        webSocketService.emitTestCancelled(testId, {
+          testId,
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* non-fatal — the test_status flip already happened upstream */ }
       return;
     }
 
@@ -274,6 +348,18 @@ export class MobileTestRunJobHandler {
           sessionId = warmed.sessionId;
           sessionSource = 'warmup';
           logger.info('[MOBILE-TEST] Warmed session claimed', { testId, sessionId, platform });
+        } else if (warmed && warmed.platform !== platform) {
+          // Pre-fix this branch was silent — a warmup existed but for a
+          // different platform (e.g. user warmed mobile_android in the
+          // editor, then ran a mobile_ios regression). The cold-start
+          // tax then applies anyway. Warn so operators can spot wasted
+          // warmups and tune the editor's eager-start heuristics.
+          logger.warn('[MOBILE-TEST] Warmed session discarded — platform mismatch', {
+            testId,
+            warmedSessionId: warmed.sessionId,
+            warmedPlatform: warmed.platform,
+            requestedPlatform: platform,
+          });
         }
       }
 
@@ -293,13 +379,26 @@ export class MobileTestRunJobHandler {
         });
       }
 
-      // ── Phase 3b: Install app (if project has APK/IPA) ───────
-      if (appStoragePath) {
-        // Phase 6: APK install has three distinct sub-steps that each
-        // can take several seconds on a large binary. We surface all three
-        // so the progress bar moves through 13 → 15 → 17% while the job
-        // works — the pre-Phase-6 single 15% emit made a ~30s operation
-        // look like a freeze.
+      // ── Phase 3b: Prepare app via shared MobileAppPrepService ──────
+      // Single primitive shared with the editor warmup
+      // (session.controller.ts:warmupSession). Three branches inside the
+      // service:
+      //   1. Cached fast-path (Redis hit + same APK) → pm clear + relaunch
+      //   2. Device-check fast-path (Redis expired but APK on device) → same
+      //   3. Full install (download → upload → install → launch)
+      // All three end on a freshly-data-wiped, cold-launched app — the
+      // worker no longer paying the full APK download+install cost on every
+      // test when the editor just installed the same APK on the same
+      // emulator. Sharing the primitive also means future warmup
+      // improvements automatically benefit regression.
+      //
+      // NB: the worker resolves storagePath/originalName/packageName at
+      // dispatch time (regression-run.service:dispatchMobileTest) and
+      // passes them via job.data. The service supports overrides so it
+      // uses the dispatch-time-resolved values, not whatever the project's
+      // settings say RIGHT NOW (which could differ if a new APK was
+      // uploaded since this regression run started).
+      if (appStoragePath && projectId) {
         const emitInstallStep = (step: string, pct: number) => {
           try {
             webSocketService.emitTestProgress(testId, {
@@ -316,56 +415,47 @@ export class MobileTestRunJobHandler {
           } catch { /* non-fatal */ }
         };
 
-        logger.info('[MOBILE-TEST] Downloading app from storage', {
-          testId,
-          appStoragePath,
-          appOriginalName,
-        });
         if (!appPackage) {
           logger.warn('[MOBILE-TEST] Project has mobile app binary but no appPackage (package/bundle ID). Skipping install.', {
             testId,
             appStoragePath,
           });
         } else {
-          // (1) Download APK from Supabase Storage
-          emitInstallStep(`Downloading app binary…`, 13);
-          const appBuffer = await MobileAppStorageService.downloadApp(appStoragePath);
-
-          // (2) Upload APK to runner
-          emitInstallStep(`Uploading app to ${platform} runner…`, 15);
-          const uploadResult = await client.uploadApp(
-            appBuffer,
-            appOriginalName || 'app.apk',
-          );
-
-          logger.info('[MOBILE-TEST] App uploaded to runner, installing', {
+          logger.info('[MOBILE-TEST] Preparing app via MobileAppPrepService', {
             testId,
-            runnerPath: uploadResult.path,
-            size: uploadResult.size,
+            appStoragePath,
+            appPackage,
+          });
+          // Map the service's editor-flavoured progress stages to the
+          // worker's existing 13-15-17% step ramp. Stage names are stable
+          // across editor/worker; only the numeric progress and the human
+          // string differ.
+          await MobileAppPrepService.prepApp({
+            client,
+            sessionId,
+            projectId,
+            userId,
+            appPackage,
+            appStoragePathOverride: appStoragePath,
+            appOriginalNameOverride: appOriginalName,
+            onProgress: (stage, _progress) => {
+              switch (stage) {
+                case 'launching_browser':
+                  emitInstallStep(`Preparing app on ${platform} runner…`, 13);
+                  break;
+                case 'loading_page':
+                  emitInstallStep(`Downloading + installing app binary…`, 15);
+                  break;
+                case 'extracting_elements':
+                  emitInstallStep(`Launching ${appPackage}…`, 17);
+                  break;
+                default:
+                  break;
+              }
+            },
           });
 
-          // (3) Install + launch on the emulator/simulator
-          emitInstallStep(`Installing ${appPackage}…`, 17);
-
-          // Install + launch the app on the emulator/simulator via low-level commands
-          await client.executeBatchCommands(sessionId, [
-            {
-              type: 'install_app',
-              params: {
-                apkPath: uploadResult.path,
-                reinstall: true,
-              },
-            },
-            {
-              type: 'launch_app',
-              params: {
-                packageName: appPackage,
-                clearData: true,
-              },
-            },
-          ]);
-
-          logger.info('[MOBILE-TEST] App installed and launched', {
+          logger.info('[MOBILE-TEST] App prepared (installed + hard-reset + launched)', {
             testId,
             appPackage,
           });
@@ -387,17 +477,55 @@ export class MobileTestRunJobHandler {
         });
       } catch { /* non-fatal */ }
 
-      // Check cancellation before long operation
+      // Check cancellation before long operation. Throws so the outer
+      // catch can emit the cancellation WS event uniformly with other
+      // mid-job cancel detection points. Pre-fix this was a silent
+      // return that updated the test status to 'cancelled' but emitted
+      // no lifecycle event — frontend / analytics had to infer the
+      // cancel landed by watching the next progress poll.
       if (await this.isTestCancelled(testId)) {
-        logger.info('[MOBILE-TEST] Test cancelled before step execution', { testId });
-        await this.updateTestStatus(testId, 'cancelled', browser);
-        return;
+        throw new MobileTestCancelledError(testId, browser);
       }
 
-      const runResult = await client.runSteps(sessionId, intentSteps, {
-        screenshotEachStep: true,
-        metadata,
-      });
+      // Mid-run cancellation: poll `tests.status === 'cancelled'` every 2s
+      // and propagate via AbortSignal to the outgoing fetch. Without this
+      // a cancelRun issued AFTER runSteps starts only takes effect once
+      // the runner finishes naturally (steps could still run for minutes).
+      // The signal aborts the fetch → runner's req.on('close') fires →
+      // step loop exits at the next boundary → session mutex released.
+      const runStepsAbort = new AbortController();
+      const cancelPollMs = 2_000;
+      let cancelDetected = false;
+      const cancelPoller = setInterval(async () => {
+        try {
+          if (await this.isTestCancelled(testId)) {
+            cancelDetected = true;
+            runStepsAbort.abort();
+          }
+        } catch { /* polling errors are non-fatal */ }
+      }, cancelPollMs);
+      // Don't keep the worker process alive just for this timer.
+      cancelPoller.unref?.();
+
+      let runResult: MobileRunStepsResponse;
+      try {
+        runResult = await client.runSteps(sessionId, intentSteps, {
+          screenshotEachStep: true,
+          metadata,
+          signal: runStepsAbort.signal,
+        });
+      } catch (err) {
+        clearInterval(cancelPoller);
+        // If the abort came from our cancel poller, surface it as a
+        // typed cancellation so the outer catch emits the right WS event
+        // and updates `tests.status` correctly. Any other AbortError or
+        // network failure bubbles up unchanged.
+        if (cancelDetected) {
+          throw new MobileTestCancelledError(testId, browser);
+        }
+        throw err;
+      }
+      clearInterval(cancelPoller);
 
       logger.info('[MOBILE-TEST] Steps executed', {
         testId,
@@ -405,27 +533,157 @@ export class MobileTestRunJobHandler {
         totalSteps: runResult.totalSteps,
         passedSteps: runResult.passedSteps,
         failedSteps: runResult.failedSteps,
+        skippedSteps: runResult.skippedSteps,
         status: runResult.status,
         durationMs: runResult.durationMs,
       });
+
+      // ── Diagnostic: aborted/timed-out steps ──────────────────────────
+      // The runner pushes per-step results with `error: 'Client aborted'`
+      // or `'Run timed out'` when its `req.on('close')` handler fires
+      // before the response is sent (HTTP socket dropped) or the 30-min
+      // overall budget elapses. Both are runner-internal — neither is
+      // surfaced via a structured field other than the error string.
+      // Logging the count here makes it discoverable in production
+      // telemetry without needing access to runner stdout.
+      const abortedSteps = runResult.steps.filter(
+        (s) => !s.success && (s.error === 'Client aborted' || s.error === 'Run timed out'),
+      );
+      if (abortedSteps.length > 0) {
+        logger.warn('[MOBILE-TEST] Some steps did not execute (aborted or timed out)', {
+          testId,
+          sessionId,
+          abortedCount: abortedSteps.length,
+          totalSteps: runResult.totalSteps,
+          firstAbortReason: abortedSteps[0]?.error,
+          // Position of first aborted step gives a cheap hint about where
+          // the connection dropped. Step 1 aborting = pre-execute-loop;
+          // step N aborting = mid-run.
+          firstAbortIndex: runResult.steps.findIndex(
+            (s) => !s.success && (s.error === 'Client aborted' || s.error === 'Run timed out'),
+          ),
+        });
+      }
+
+      // ── Cross-validate runner aggregate vs per-step truth ─────────────
+      // Defense in depth — the runner's `status` field SHOULD already
+      // agree with per-step results (after the 2026-05-08 fix to
+      // run.routes.ts that flips skip-style aborts/timeouts into
+      // `failed++`). But if the runner ever ships with a regression of
+      // that fix, the worker should catch it here and downgrade the
+      // verdict so the regression doesn't show a false-green. We log
+      // loudly when we have to override the runner.
+      //
+      // Optional steps: a step authored with `options.continueOnError: true`
+      // is contractually allowed to fail without failing the test. The
+      // runner correctly continues past such steps (see run.routes.ts:553)
+      // BUT its aggregate `status` does not special-case them — they count
+      // toward `failed` and flip the run to 'partial' / 'failed'. The
+      // worker therefore computes its own verdict from per-step results
+      // crossed with the original `intentSteps[].options.continueOnError`,
+      // and treats the runner's `status` as advisory.
+      //
+      // `isAutoInjected` (auto-wait, recovery, etc.) is also tolerable —
+      // mirrors run.routes.ts:553's `shouldContinue` rule.
+      const tolerableFailureStepIds = new Set<string>();
+      const knownStepIds = new Set<string>();
+      for (const s of intentSteps) {
+        knownStepIds.add(s.id);
+        if (s.options?.continueOnError === true || s.isAutoInjected === true) {
+          tolerableFailureStepIds.add(s.id);
+        }
+      }
+      const isTolerableFailure = (stepId: string): boolean => {
+        // Auto-injected steps the runner adds itself (not in our intentSteps)
+        // are also tolerable — they're infrastructure helpers, not user steps.
+        if (!knownStepIds.has(stepId)) return true;
+        return tolerableFailureStepIds.has(stepId);
+      };
+      const realFailures = runResult.steps.filter(
+        (s) => !s.success && !isTolerableFailure(s.stepId),
+      );
+      const optionalFailures = runResult.steps.filter(
+        (s) => !s.success && isTolerableFailure(s.stepId),
+      );
+      const allStepsActuallyPassed = realFailures.length === 0;
+      const runnerSaidPassed = runResult.status === 'passed';
+      const aggregateMismatch = runnerSaidPassed && runResult.steps.some((s) => !s.success);
+      if (aggregateMismatch) {
+        logger.error('[MOBILE-TEST] Runner aggregate disagrees with per-step truth — downgrading', {
+          testId,
+          sessionId,
+          runnerStatus: runResult.status,
+          runnerPassedSteps: runResult.passedSteps,
+          runnerFailedSteps: runResult.failedSteps,
+          runnerSkippedSteps: runResult.skippedSteps,
+          actualFailedCount: runResult.steps.filter((s) => !s.success).length,
+        });
+      }
+      if (optionalFailures.length > 0) {
+        logger.info('[MOBILE-TEST] Optional/auto-injected steps failed — not failing the test', {
+          testId,
+          sessionId,
+          optionalFailedCount: optionalFailures.length,
+          optionalFailedStepIds: optionalFailures.map((s) => s.stepId),
+        });
+      }
 
       // Emit step-level progress
       for (let i = 0; i < runResult.steps.length; i++) {
         const stepResult = runResult.steps[i];
         try {
+          // Distinguish "real failure" (dispatch ran, action did not produce
+          // expected outcome) from "skip-style failure" (runner could not
+          // even convert the step — unsupported type, missing required
+          // field) from "soft failure" (step is `options.continueOnError`
+          // OR `isAutoInjected`, so its failure does NOT fail the test).
+          // All three are `success: false`, but the UI should render them
+          // differently:
+          //   * `executed`    — green check
+          //   * `skipped`     — gray "skipped (unsupported step)" badge
+          //   * `soft-failed` — yellow/orange "skipped (optional)" badge
+          //   * `failed`      — red, actionable
+          // The runner signals skip-style via `resolvedVia: 'skipped'`
+          // (see qait-mobile-runner run.routes.ts unsupported-step branch).
+          // Soft-fail is detected here against the same tolerable-set the
+          // verdict computation built earlier (line ~575) so per-step UI
+          // semantics match the run-level verdict.
+          const isSkipped = stepResult.resolvedVia === 'skipped';
+          const isSoftFailure =
+            !stepResult.success
+            && !isSkipped
+            && isTolerableFailure(stepResult.stepId);
+          const runtimeStatus = stepResult.success
+            ? 'executed'
+            : isSkipped
+              ? 'skipped'
+              : isSoftFailure
+                ? 'soft-failed'
+                : 'failed';
           webSocketService.emitTestStepCompleted(testId, {
             testId,
             browser,
             step: i + 1,
             stepDescription: `Step: ${stepResult.stepId}`,
+            // For soft-fails the per-step result remains `success: false`
+            // (the action did fail), but the UI should not flag it as a
+            // failure — `softFailure: true` on runtimeMeta is the signal
+            // the frontend uses to flip badge style without re-deriving
+            // tolerability rules client-side.
             success: stepResult.success,
             timestamp: new Date().toISOString(),
             runtimeMeta: {
               stepId: stepResult.stepId,
-              runtimeStatus: stepResult.success ? 'executed' : 'failed',
+              runtimeStatus,
               executionMs: stepResult.durationMs,
               failedReason: stepResult.error ? 'unknown' : undefined,
               failureExplanation: stepResult.error,
+              resolvedVia: stepResult.resolvedVia,
+              // Soft-fail signal for the frontend. Absent (not `false`) for
+              // hard failures and successes — keeps the field truthy-only
+              // so existing renderers don't accidentally render a "soft"
+              // badge for a hard fail.
+              ...(isSoftFailure ? { softFailure: true } : {}),
               // Advisory warnings from the runner (e.g. install_app's
               // WebView-debuggable probe). Absent when the step had none —
               // do not emit an empty array, so the frontend can do a
@@ -452,13 +710,21 @@ export class MobileTestRunJobHandler {
       // serializes against updateStepFromPreviewApply / updateStepAfterHeal
       // that fire from apply and in-run heal paths.
       await MobileTestRunJobHandler.persistCompiledPlansFromRun(
-        testId,
+        intentTestCaseId,
         intentSteps,
         runResult,
       );
 
       // ── Phase 5: Create test result ───────────────────────────
-      const testPassed = runResult.status === 'passed';
+      // testPassed = no MANDATORY step failed. Optional steps
+      // (`options.continueOnError: true`) and runner-injected helper
+      // steps (`isAutoInjected: true`) are contractually allowed to
+      // fail without failing the test — see `realFailures` /
+      // `tolerableFailureStepIds` above. The runner's aggregate
+      // `runResult.status` is treated as advisory because it does not
+      // special-case optional steps and would flip the test to failed
+      // on any optional failure.
+      const testPassed = allStepsActuallyPassed;
 
       try {
         webSocketService.emitTestProgress(testId, {
@@ -479,7 +745,7 @@ export class MobileTestRunJobHandler {
       await this.updateTestStatus(testId, finalStatus, browser);
 
       // Create test result record
-      const testResultId = await this.createTestResult(testId, browser, runResult, userId, workspaceId);
+      const testResultId = await this.createTestResult(testId, browser, runResult, userId, workspaceId, testPassed);
 
       // ── Phase 5.5: Finalize analytics linkage ────────────────
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
@@ -575,6 +841,32 @@ export class MobileTestRunJobHandler {
         passRate: runResult.passRate,
       });
     } catch (error) {
+      // ── Cancellation: separate codepath from real failure ──────────
+      // A cancelled test is NOT a failure — the user explicitly stopped
+      // it. Marking the test 'failed' would corrupt the regression run
+      // statistics (counted as failed instead of cancelled). Emit the
+      // lifecycle event and return without flipping any status.
+      // Mirrors web's pattern at manual-test-run.job.ts:273-299.
+      if (error instanceof MobileTestCancelledError) {
+        logger.info('[MOBILE-TEST] Test cancelled mid-job', {
+          testId,
+          browser,
+          jobId: job.id,
+        });
+        try {
+          webSocketService.emitTestCancelled(testId, {
+            testId,
+            timestamp: new Date().toISOString(),
+          });
+        } catch { /* non-fatal */ }
+        // tests.status was already set to 'cancelled' by the cancelRun
+        // controller in qai-backend BEFORE this catch fired. Do NOT
+        // call updateTestStatus here — the routes-through-IfNotCancelled
+        // helper would correctly skip the write, but staying explicit
+        // is clearer.
+        return;
+      }
+
       // ── Error handling ──────────────────────────────────────────
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = error instanceof MobileRunnerError ? error.code : 'UNKNOWN';
@@ -584,12 +876,66 @@ export class MobileTestRunJobHandler {
         browser,
         errorCode,
         error: errorMessage,
+        retryCount,
+        maxRetries: MAX_MOBILE_RETRIES,
       });
+
+      // ── Retry gate ────────────────────────────────────────────────
+      // If the error is retry-able AND we have budget, increment the
+      // retry counter and re-throw so BullMQ re-queues the job. The
+      // shared `shouldRetry` matches on ECONNREFUSED, ETIMEDOUT, 5xx
+      // status codes, and 429 — the exact transient classes the mobile
+      // runner-client surfaces (MobileRunnerError with statusCode >= 500
+      // for runner 503s, network errors with `code` set).
+      //
+      // Mirrors the web pattern at manual-test-run.job.ts:322-329. The
+      // effect is two-layer protection: the runner already retries
+      // individual steps on stabilization errors; the worker now also
+      // retries the WHOLE job on transient runner-level failures.
+      // On retry, the next attempt re-claims a session (cold-start
+      // costs ~30s) so MAX_MOBILE_RETRIES defaults to 1 to bound the
+      // worst-case cost.
+      const retryableError = error instanceof MobileRunnerError
+        ? error.statusCode === undefined || error.statusCode === 0 || error.statusCode >= 500 || error.statusCode === 429
+        : true;
+      if (retryableError && shouldRetry(error, retryCount, MAX_MOBILE_RETRIES)) {
+        const delay = calculateRetryDelay(retryCount);
+        logger.info('[MOBILE-TEST] Retrying job', {
+          testId,
+          browser,
+          delay,
+          attempt: retryCount + 1,
+          maxRetries: MAX_MOBILE_RETRIES,
+        });
+        try {
+          await job.updateData({ ...job.data, retryCount: retryCount + 1 });
+        } catch { /* non-fatal — counter increment failed but BullMQ retry still runs */ }
+        // Re-throw triggers BullMQ retry (the queue is configured with
+        // exponential backoff and finite attempts elsewhere in
+        // QueueManager). Doing the rethrow BEFORE the failure-state DB
+        // writes is important — those writes are for the FINAL failure
+        // path, not transient retries.
+        throw new Error(`Mobile test retry ${retryCount + 1}/${MAX_MOBILE_RETRIES}: ${errorMessage}`);
+      }
 
       // Update test status to failed
       try {
         await this.updateTestStatus(testId, 'failed', browser);
       } catch { /* ignore */ }
+
+      // Persist a job-level failure test_results row so the regression UI
+      // can render an artifact-less but informative failure card. Mirrors
+      // web's handleFailedTest at manual-test-run.job.ts:575-598. Best-
+      // effort: failure to write does not propagate (the helper logs and
+      // returns null). The id, when present, also feeds the AI analysis
+      // enqueue below.
+      const failedTestResultId = await MobileTestRunJobHandler.createFailedJobTestResult(
+        testId,
+        browser,
+        error,
+        userId,
+        workspaceId,
+      );
 
       // Same finalizer as the success path, different outcome.
       await MobileTestRunJobHandler.finalizeAnalyticsLinkage({
@@ -606,6 +952,28 @@ export class MobileTestRunJobHandler {
         testId,
         executedResources,
       );
+
+      // Enqueue AI analysis for failure too. Web does this at
+      // manual-test-run.job.ts:628 — failures are the highest-value
+      // signal for bug-detection / pattern matching, exactly the cases
+      // where AI analysis should run. Pre-fix mobile only enqueued AI
+      // on success, so failures got zero post-mortem analysis. Best-
+      // effort: a queue failure should not propagate.
+      if (failedTestResultId) {
+        try {
+          await QueueManager.addAIAnalysisJob(failedTestResultId, testId);
+          logger.debug('[MOBILE-TEST] AI analysis enqueued for failed run', {
+            testId,
+            testResultId: failedTestResultId,
+          });
+        } catch (queueErr) {
+          logger.warn('[MOBILE-TEST] Failed to enqueue AI analysis for failed run', {
+            testId,
+            testResultId: failedTestResultId,
+            error: queueErr instanceof Error ? queueErr.message : String(queueErr),
+          });
+        }
+      }
 
       // Emit failure event
       try {
@@ -686,11 +1054,21 @@ export class MobileTestRunJobHandler {
    * MobileStepApplyService already writes for apply.
    */
   private static async persistCompiledPlansFromRun(
-    testId: string,
+    intentTestCaseId: string | undefined,
     intentSteps: MobileIntentStep[],
     runResult: MobileRunStepsResponse,
   ): Promise<void> {
-    if (!testId || !runResult?.steps?.length) return;
+    if (!runResult?.steps?.length) return;
+    // intentTestCaseId is the `intent_test_cases.id` (NOT `tests.id`).
+    // The chat dispatch path doesn't populate it yet, in which case we
+    // skip the persist — without the test-case PK there's nothing to
+    // merge into. Regression and editor paths always pass it.
+    if (!intentTestCaseId) {
+      logger.debug('[MOBILE-TEST] Skipping compiled-plan persist — no intent_test_cases.id provided', {
+        runStepsCount: runResult.steps.length,
+      });
+      return;
+    }
 
     try {
       const originalById = new Map<string, MobileIntentStep>();
@@ -747,18 +1125,18 @@ export class MobileTestRunJobHandler {
       }
 
       if (enrichedSteps.size === 0) {
-        logger.debug('[MOBILE-TEST] No compiled plans to persist', { testId });
+        logger.debug('[MOBILE-TEST] No compiled plans to persist', { intentTestCaseId });
         return;
       }
 
       const ok = await IntentTestCaseService.batchUpdateStepsFromRun({
-        intentTestCaseId: testId,
+        intentTestCaseId,
         enrichedSteps,
       });
 
       if (ok) {
         logger.info('[MOBILE-TEST] Persisted compiled plans from run', {
-          testId,
+          intentTestCaseId,
           persistedCount: enrichedSteps.size,
           totalSteps: runResult.steps.length,
         });
@@ -766,7 +1144,7 @@ export class MobileTestRunJobHandler {
     } catch (error) {
       // Non-fatal: run already succeeded, test_results will still be created.
       logger.warn('[MOBILE-TEST] Failed to persist compiled plans (non-fatal)', {
-        testId,
+        intentTestCaseId,
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -786,7 +1164,24 @@ export class MobileTestRunJobHandler {
       if (status === 'running') updateData.started_at = new Date().toISOString();
       if (['completed', 'failed'].includes(status)) updateData.completed_at = new Date().toISOString();
 
-      await dbAdminService.updateTest(testId, updateData);
+      // Routes through `updateTestIfNotCancelled` so a cancellation that
+      // landed between the worker's last `isTestCancelled` check and this
+      // write doesn't get clobbered. Returns null when the row was
+      // cancelled in the meantime; we re-check and bail gracefully so
+      // the job doesn't accidentally re-emit a 'completed' / 'failed'
+      // status onto a test the user has already cancelled. Mirrors the
+      // web pattern at manual-test-run.job.ts:358-369.
+      const updated = await dbAdminService.updateTestIfNotCancelled(testId, updateData);
+      if (!updated && status !== 'cancelled') {
+        if (await this.isTestCancelled(testId)) {
+          logger.info('[MOBILE-TEST] Test is cancelled — skipping status update', {
+            testId,
+            status,
+            browser,
+          });
+          return;
+        }
+      }
     } catch (error) {
       logger.error('[MOBILE-TEST] Failed to update test status', {
         testId,
@@ -803,6 +1198,7 @@ export class MobileTestRunJobHandler {
     runResult: MobileRunStepsResponse,
     userId: string,
     workspaceId: string,
+    testPassed: boolean,
   ): Promise<string | null> {
     try {
       // Find last screenshot for the test result (prefer failed step, fallback to last step)
@@ -822,11 +1218,15 @@ export class MobileTestRunJobHandler {
       }));
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const result: any = await dbAdminService.createTestResult({
+      const result: any = await dbAdminService.createMobileTestResult({
         test_id: testId,
         browser,
-        // FIX: 'completed' not 'passed' — consistent with web tests and TestStatus type
-        status: runResult.status === 'passed' ? 'completed' : 'failed',
+        // FIX: 'completed' not 'passed' — consistent with web tests and TestStatus type.
+        // `testPassed` reflects the worker's verdict (real-failure aware:
+        // optional / continueOnError / auto-injected steps are tolerable).
+        // Was: `runResult.status === 'passed'`, which flipped to 'failed' on
+        // any optional-step failure even though the test should pass.
+        status: testPassed ? 'completed' : 'failed',
         screenshot: resultScreenshot,
         // Populate columns that were previously empty for mobile:
         errors: errors.length > 0 ? errors : [],
@@ -862,6 +1262,76 @@ export class MobileTestRunJobHandler {
       logger.error('[MOBILE-TEST] Failed to create test result', {
         testId,
         error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Create a minimal `test_results` row for the JOB-LEVEL failure path —
+   * the runner was unreachable, the session creation failed, the APK
+   * download threw, etc., so there's no `runResult` to persist from.
+   *
+   * Why this exists: pre-fix, mobile only called `createTestResult` on
+   * the success path. A regression that failed before any steps ran
+   * left `test_results` empty for that test, and the frontend's
+   * regression-run drill-down had nothing to render — the user saw a
+   * red "Failed" badge but couldn't click in to learn why. The web job
+   * has solved this for years via `handleFailedTest`
+   * (manual-test-run.job.ts:575-598).
+   *
+   * Best-effort: never throws. Returns the new row id (or null).
+   */
+  private static async createFailedJobTestResult(
+    testId: string,
+    browser: string,
+    error: unknown,
+    userId: string,
+    workspaceId: string,
+  ): Promise<string | null> {
+    try {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorCode = error instanceof MobileRunnerError ? error.code : 'UNKNOWN';
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result: any = await dbAdminService.createMobileTestResult({
+        test_id: testId,
+        browser,
+        status: 'failed',
+        // No screenshot / dom / logs at this stage — the job didn't get
+        // far enough to capture them. Provide a structured `errors` entry
+        // so the regression-run-detail UI can show the failure reason.
+        errors: [{
+          type: 'job_failure',
+          message: errorMessage,
+          code: errorCode,
+          timestamp: new Date().toISOString(),
+        }],
+        logs: [],
+        network_logs: [],
+        completed_at: new Date().toISOString(),
+        duration: 0,
+        steps_total: 0,
+        steps_passed: 0,
+        steps_failed: 0,
+        pass_rate: 0,
+        user_id: userId,
+        workspace_id: workspaceId,
+        metadata: {
+          platform: 'mobile',
+          // Marker so analytics / dashboards can distinguish job-level
+          // failures (runner unreachable, install failed) from per-step
+          // execution failures (tap missed, assertion mismatch).
+          failureLayer: 'job',
+          errorCode,
+          errorMessage,
+        },
+      });
+      return result?.id ?? null;
+    } catch (createErr) {
+      logger.error('[MOBILE-TEST] Failed to create failed-job test_result row', {
+        testId,
+        originalError: error instanceof Error ? error.message : String(error),
+        createError: createErr instanceof Error ? createErr.message : String(createErr),
       });
       return null;
     }
