@@ -30,6 +30,23 @@ function getUserId(req: AuthenticatedRequest): string {
 }
 
 /**
+ * Admin snapshot for audit metadata. Used in delete/addItem/removeItem so the
+ * audit row survives even when getById's user-filter would skip it. The
+ * caller's mutation enforces access; this read just reads name/projectId.
+ */
+async function loadPlanForAudit(
+  planId: string,
+): Promise<{ projectId: string; name: string } | null> {
+  const { data } = await supabaseAdmin
+    .from('regression_plans')
+    .select('project_id, name')
+    .eq('id', planId)
+    .maybeSingle();
+  if (!data) return null;
+  return { projectId: (data as any).project_id, name: (data as any).name };
+}
+
+/**
  * Create a new regression plan
  */
 export async function createPlan(req: AuthenticatedRequest, res: Response): Promise<void> {
@@ -186,14 +203,14 @@ export async function deletePlan(req: AuthenticatedRequest, res: Response): Prom
     const { id } = req.params;
     const userId = getUserId(req);
 
-    // Snapshot for audit before delete
-    const planSnapshot = await RegressionPlanService.getById(id, userId);
+    // Admin snapshot — survives the user_id filter that getById applies.
+    const planSnapshot = await loadPlanForAudit(id);
 
     await RegressionPlanService.delete(id, userId);
 
     res.json({ success: true, message: 'Plan deleted', timestamp: new Date() });
 
-    if (planSnapshot?.projectId) {
+    if (planSnapshot) {
       void WorkspaceAuditService.logForProject({
         projectId: planSnapshot.projectId,
         actorUserId: userId,
@@ -237,8 +254,8 @@ export async function addItem(req: AuthenticatedRequest, res: Response): Promise
     res.json({ success: true, data: item, timestamp: new Date() });
 
     void (async () => {
-      const plan = await RegressionPlanService.getById(id, userId);
-      if (!plan?.projectId) return;
+      const plan = await loadPlanForAudit(id);
+      if (!plan) return;
       await WorkspaceAuditService.logForProject({
         projectId: plan.projectId,
         actorUserId: userId,
@@ -276,8 +293,8 @@ export async function removeItem(req: AuthenticatedRequest, res: Response): Prom
 
     if (planId) {
       void (async () => {
-        const plan = await RegressionPlanService.getById(planId, userId);
-        if (!plan?.projectId) return;
+        const plan = await loadPlanForAudit(planId);
+        if (!plan) return;
         await WorkspaceAuditService.logForProject({
           projectId: plan.projectId,
           actorUserId: userId,

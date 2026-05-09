@@ -11,6 +11,7 @@
 
 import type { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
+import { supabaseAdmin } from '@/db/supabase';
 import * as TestResourceService from '@/services/test-resource/test-resource.service';
 import {
   AUDIT_EVENTS,
@@ -21,6 +22,29 @@ import type {
   ResourceKind,
   ResourcePlatform,
 } from '@/services/test-resource/types';
+
+/**
+ * Admin-only snapshot for audit metadata. Bypasses the per-user filter that
+ * `TestResourceService.getResource` applies — the surrounding mutation
+ * (delete/capture/markBroken) is what enforces access; this read just gets
+ * the row's name/kind/projectId for the audit row body. Returns null only on
+ * genuinely missing rows.
+ */
+async function loadResourceForAudit(
+  id: string,
+): Promise<{ projectId: string; kind: string; name: string } | null> {
+  const { data } = await supabaseAdmin
+    .from('test_resources')
+    .select('project_id, kind, name')
+    .eq('id', id)
+    .maybeSingle();
+  if (!data) return null;
+  return {
+    projectId: (data as any).project_id,
+    kind: (data as any).kind,
+    name: (data as any).name,
+  };
+}
 
 function getUserId(req: Request): string | null {
   const userId = (req as any).user?.id || (req as any).userId;
@@ -265,7 +289,9 @@ export async function deleteResource(req: Request, res: Response): Promise<void>
   const reassignTo = (req.body?.reassignTo as string | undefined) ?? undefined;
 
   try {
-    const snapshot = await TestResourceService.getResource(id, userId);
+    // Snapshot via admin read so audit rows survive the user_id filter.
+    // The actual access check happens inside deleteResource itself.
+    const snapshot = await loadResourceForAudit(id);
 
     const result = await TestResourceService.deleteResource(id, userId, { reassignTo });
     if (!result.deleted) {
@@ -278,7 +304,7 @@ export async function deleteResource(req: Request, res: Response): Promise<void>
       detachedTests: result.detachedTests,
     });
 
-    if (snapshot?.projectId) {
+    if (snapshot) {
       void WorkspaceAuditService.logForProject({
         projectId: snapshot.projectId,
         actorUserId: userId,
@@ -353,11 +379,12 @@ export async function markBroken(req: Request, res: Response): Promise<void> {
 
   const { id } = req.params;
   const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'Unknown';
-  const snapshot = await TestResourceService.getResource(id, userId);
+  // Admin snapshot for audit; markBroken itself enforces access.
+  const snapshot = await loadResourceForAudit(id);
   await TestResourceService.markBroken(id, userId, reason);
   res.json({ success: true });
 
-  if (snapshot?.projectId) {
+  if (snapshot) {
     void WorkspaceAuditService.logForProject({
       projectId: snapshot.projectId,
       actorUserId: userId,

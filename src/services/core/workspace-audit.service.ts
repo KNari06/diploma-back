@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { resolveWorkspaceForProject } from '@/services/core/workspace-access.service';
 import type { Request } from 'express';
 
 // ============================================================================
@@ -108,10 +109,6 @@ export interface CreateAuditLogParams {
 // WORKSPACE AUDIT SERVICE
 // ============================================================================
 
-// Cache: projectId → workspaceId. Audit calls happen on every write so we
-// avoid an extra round-trip on the hot path. Cleared on server restart.
-const projectWorkspaceCache = new Map<string, string>();
-
 /**
  * Extract IP + user-agent from an Express request for audit metadata.
  * Shared so every controller writes the same shape.
@@ -125,46 +122,12 @@ export function getAuditContext(req: Request): { ipAddress?: string; userAgent?:
 
 export class WorkspaceAuditService {
   /**
-   * Resolve workspace_id from a project_id. Most domain controllers (modules,
-   * test cases, regression, manual tests, test resources) only carry projectId
-   * at their call sites, so this is the canonical bridge into the audit log.
-   * Returns null on cache-miss + DB-miss (caller should still proceed without
-   * audit rather than fail the request).
+   * Resolve workspace_id from a project_id. Delegates to the shared cache in
+   * workspace-access.service so audit and access checks share one source of
+   * truth.
    */
   static async resolveWorkspaceFromProject(projectId: string): Promise<string | null> {
-    if (!projectId) return null;
-
-    const cached = projectWorkspaceCache.get(projectId);
-    if (cached) return cached;
-
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('projects')
-        .select('workspace_id')
-        .eq('id', projectId)
-        .maybeSingle();
-
-      if (error) {
-        logger.warn('[WORKSPACE_AUDIT] Failed to resolve workspace for project', {
-          projectId,
-          error: error.message,
-        });
-        return null;
-      }
-
-      const workspaceId = (data as any)?.workspace_id as string | undefined;
-      if (workspaceId) {
-        projectWorkspaceCache.set(projectId, workspaceId);
-        return workspaceId;
-      }
-      return null;
-    } catch (error) {
-      logger.warn('[WORKSPACE_AUDIT] Exception resolving workspace for project', {
-        projectId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return null;
-    }
+    return resolveWorkspaceForProject(projectId);
   }
 
   /**
@@ -292,7 +255,7 @@ export class WorkspaceAuditService {
 
       const { error } = await supabaseAdmin.from('workspace_audit_log').insert({
         workspace_id: workspaceId,
-        actor_user_id: actorUserId,
+        actor_user_id: actorUserId ?? null,
         event_type: eventType,
         target_type: targetType || null,
         target_id: targetId || null,
