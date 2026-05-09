@@ -28,6 +28,11 @@ import {
 } from '@/services/api/jira.service';
 import { supabaseAdmin } from '@/db/supabase';
 import { JiraQaOrchestratorService } from '@/services/integrations/jira-qa-orchestrator.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import type { JiraIssueListItem } from '@/types';
 import { randomUUID } from 'crypto';
 
@@ -596,6 +601,20 @@ export const createIssue = async (req: Request, res: Response): Promise<void> =>
         self: created.self,
       },
     });
+
+    void WorkspaceAuditService.logForUser({
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.JIRA_ISSUE_CREATED,
+      targetType: 'jira_issue',
+      targetId: created.key,
+      metadata: {
+        project_key: String(projectKey).trim(),
+        summary: String(summary).trim(),
+        issue_type: issueType ? String(issueType) : 'Bug',
+        priority: priority ? String(priority) : 'Medium',
+      },
+      ...getAuditContext(req),
+    });
   } catch (error) {
     logger.error('Create Jira issue error:', error);
     res.status(500).json({
@@ -663,6 +682,18 @@ export const updateIssue = async (req: Request, res: Response): Promise<void> =>
       success: true,
       message: 'Issue updated',
     });
+
+    const changedFields = Object.entries({ summary, description, priority })
+      .filter(([, v]) => v !== undefined)
+      .map(([k]) => k);
+    void WorkspaceAuditService.logForUser({
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.JIRA_ISSUE_UPDATED,
+      targetType: 'jira_issue',
+      targetId: String(issueKey).trim(),
+      metadata: { changed_fields: changedFields },
+      ...getAuditContext(req),
+    });
   } catch (error) {
     logger.error('Update Jira issue error:', error);
     res.status(500).json({
@@ -714,6 +745,15 @@ export const updateIssueStatus = async (req: Request, res: Response): Promise<vo
     res.json({
       success: true,
       message: 'Issue status updated',
+    });
+
+    void WorkspaceAuditService.logForUser({
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.JIRA_ISSUE_STATUS_CHANGED,
+      targetType: 'jira_issue',
+      targetId: String(issueKey).trim(),
+      metadata: { new_status: String(status).trim() },
+      ...getAuditContext(req),
     });
   } catch (error) {
     logger.error('Update Jira issue status error:', error);
@@ -775,6 +815,14 @@ export const disconnectJira = async (req: Request, res: Response): Promise<void>
       return;
     }
     res.json({ success: true, message: 'Jira disconnected' });
+
+    void WorkspaceAuditService.logForUser({
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.JIRA_DISCONNECTED,
+      targetType: 'jira_connection',
+      metadata: { cloud_id: cloudId },
+      ...getAuditContext(req),
+    });
   } catch (error) {
     logger.error('Disconnect Jira error:', error);
     res.status(500).json({ success: false, error: 'Failed to disconnect Jira' });

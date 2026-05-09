@@ -30,11 +30,39 @@ export interface MobileSessionResponse {
   device?: Record<string, unknown>;
 }
 
+/**
+ * Where the test session should be hosted from the runner's perspective.
+ * Mirrors `DeviceSource` in qait-mobile-runner.
+ *
+ * - `local-emulator` — locally-spawned AVD or iOS simulator
+ * - `local-physical` — USB-attached real device (Android serial or iPhone UDID)
+ * - `cloud`          — redroid container or remote emulator (host:port)
+ */
+export type MobileDeviceSource = 'local-emulator' | 'local-physical' | 'cloud';
+
+/**
+ * Caller-supplied device-selection hint, forwarded verbatim to the runner.
+ * All fields optional — runner applies its `DEVICE_DEFAULT_SOURCE` policy
+ * when nothing is specified. Phase 2.6: lets the frontend pin a specific
+ * physical iPhone / Android phone for a session.
+ */
+export interface MobileDeviceSelector {
+  source?: MobileDeviceSource;
+  serial?: string;
+}
+
 export interface MobileSessionConfig {
   avdName?: string;
   simulatorName?: string;
   wdaPort?: number;
   snapshotName?: string;
+  /**
+   * Phase 2.6 (physical-device routing). When present, the runner uses
+   * this to pick a specific device instead of falling back to its default
+   * policy. When absent, behaviour is unchanged (runner picks an emulator
+   * or whatever `DEVICE_DEFAULT_SOURCE` says).
+   */
+  deviceSelector?: MobileDeviceSelector;
 }
 
 // ── Action Types (mirror of runner's IntentActionType) ───────────

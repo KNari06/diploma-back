@@ -486,8 +486,34 @@ export class MobileRunnerClient {
         if (!response.ok) {
           const errorBody = await response.text().catch(() => '');
 
-          // Retry on 5xx
-          if (response.status >= 500 && attempt < maxRetries) {
+          // Phase 2.6: structured DeviceError codes from the runner take
+          // priority over the generic CLIENT_ERROR/SERVER_ERROR bucket.
+          // The runner emits `{ code: <DeviceErrorCode>, error: <message> }`
+          // for typed failures (IOS_PHYSICAL_NOT_SUPPORTED, DEVICE_BUSY,
+          // DEVICE_NOT_FOUND, …). Surfacing the code lets frontend show
+          // an actionable message ("operator hasn't enabled physical
+          // iOS") instead of a confusing 501.
+          let runnerCode: string | undefined;
+          let runnerMessage: string | undefined;
+          if (errorBody) {
+            try {
+              const parsed = JSON.parse(errorBody) as { code?: string; error?: string };
+              if (typeof parsed.code === 'string' && parsed.code) {
+                runnerCode = parsed.code;
+              }
+              if (typeof parsed.error === 'string' && parsed.error) {
+                runnerMessage = parsed.error;
+              }
+            } catch {
+              // Body wasn't JSON — fall back to raw text below.
+            }
+          }
+
+          // Retry on 5xx — but ONLY when the error isn't a typed device
+          // failure. A typed `DEVICE_INIT_FAILED` (503) is informational,
+          // not transient; re-firing it just delays the user-visible error.
+          // Bare 5xx (no code) stays in the retry path.
+          if (response.status >= 500 && attempt < maxRetries && !runnerCode) {
             lastError = new MobileRunnerError(
               `Runner returned ${response.status}: ${errorBody}`,
               response.status,
@@ -497,9 +523,13 @@ export class MobileRunnerClient {
           }
 
           throw new MobileRunnerError(
-            `Runner returned ${response.status}: ${errorBody}`,
+            runnerMessage
+              ? `${runnerMessage} (runner code: ${runnerCode ?? 'none'})`
+              : `Runner returned ${response.status}: ${errorBody}`,
             response.status,
-            response.status >= 500 ? 'SERVER_ERROR' : 'CLIENT_ERROR',
+            // Use the runner's typed code when available, otherwise the
+            // bucket. Frontend can branch on this for actionable copy.
+            runnerCode ?? (response.status >= 500 ? 'SERVER_ERROR' : 'CLIENT_ERROR'),
           );
         }
 

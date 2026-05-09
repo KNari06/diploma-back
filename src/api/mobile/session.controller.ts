@@ -161,10 +161,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const { projectId, platform: rawPlatform, appPackage } = req.body as {
+  const { projectId, platform: rawPlatform, appPackage, deviceSelector: rawDeviceSelector } = req.body as {
     projectId?: string;
     platform?: string;
     appPackage?: string;
+    deviceSelector?: unknown;
   };
 
   if (!projectId) {
@@ -174,6 +175,40 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+
+  // Phase 2.6: validate `deviceSelector` if present. Inline validator to
+  // match this file's existing style (no zod). Rejects malformed selectors
+  // up front so the runner doesn't return a confusing INVALID_INPUT 400
+  // through our error pipeline. Both fields are optional but cannot be
+  // wrong-typed when supplied — empty-string serial in particular slips
+  // through `if (selector.serial)` checks downstream.
+  let deviceSelector: { source?: 'local-emulator' | 'local-physical' | 'cloud'; serial?: string } | undefined;
+  if (rawDeviceSelector !== undefined && rawDeviceSelector !== null) {
+    if (typeof rawDeviceSelector !== 'object' || Array.isArray(rawDeviceSelector)) {
+      res.status(400).json({ success: false, error: 'deviceSelector must be an object' });
+      return;
+    }
+    const sel = rawDeviceSelector as { source?: unknown; serial?: unknown };
+    const validSources = ['local-emulator', 'local-physical', 'cloud'] as const;
+    if (sel.source !== undefined && !validSources.includes(sel.source as typeof validSources[number])) {
+      res.status(400).json({
+        success: false,
+        error: `deviceSelector.source must be one of ${validSources.join(', ')}`,
+      });
+      return;
+    }
+    if (sel.serial !== undefined && (typeof sel.serial !== 'string' || sel.serial.trim() === '')) {
+      res.status(400).json({
+        success: false,
+        error: 'deviceSelector.serial must be a non-empty string',
+      });
+      return;
+    }
+    deviceSelector = {
+      source: sel.source as 'local-emulator' | 'local-physical' | 'cloud' | undefined,
+      serial: typeof sel.serial === 'string' ? sel.serial : undefined,
+    };
+  }
 
   logger.info('[MOBILE_SESSION] warmup request', {
     userId,
@@ -361,21 +396,42 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // ownerId scopes the runner's Android multi-user so each backend user
     // sees only their own apps on a shared redroid container. See
     // qait-mobile-runner/docs/multi-user-known-risks.md.
+    //
+    // Phase 2.6: when the caller pinned a `deviceSelector` for a physical
+    // device, the pool path is meaningless — pre-booted emulators can't
+    // be retargeted to a USB phone. Skip pool entirely and go straight
+    // to cold-boot with the selector. Emulator/cloud selectors still try
+    // pool first because the pool's pre-booted devices match those sources.
     let session: Awaited<ReturnType<typeof client.createSession>>;
-    try {
-      session = await client.claimSession(platform, { ownerId: userId });
-      logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
+    const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
+    if (skipPoolForPhysical) {
+      logger.info('[MOBILE_SESSION] Physical device pinned — bypassing pool', {
         projectId,
-        sessionId: session.sessionId,
-        platform,
+        deviceSelector,
+      });
+      session = await client.createSession(platform, {
         ownerId: userId,
+        deviceSelector,
       });
-    } catch (poolErr) {
-      logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
-        projectId,
-        error: poolErr instanceof Error ? poolErr.message : String(poolErr),
-      });
-      session = await client.createSession(platform, { ownerId: userId });
+    } else {
+      try {
+        session = await client.claimSession(platform, { ownerId: userId });
+        logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
+          projectId,
+          sessionId: session.sessionId,
+          platform,
+          ownerId: userId,
+        });
+      } catch (poolErr) {
+        logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
+          projectId,
+          error: poolErr instanceof Error ? poolErr.message : String(poolErr),
+        });
+        session = await client.createSession(platform, {
+          ownerId: userId,
+          deviceSelector,
+        });
+      }
     }
 
     // Emulator is up — nudge the loader past the "preparing env" stage.

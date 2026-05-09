@@ -3,8 +3,14 @@
  * API endpoints for test modules CRUD
  */
 
+import { supabaseAdmin } from '@/db/supabase';
 import { ModuleService } from '@/services/testing/modules/module.service';
 import { PlatformService } from '@/services/testing/platforms/platform.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlatformKey } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
@@ -63,6 +69,21 @@ export async function createModule(req: AuthenticatedRequest, res: Response): Pr
     });
 
     res.json({ success: true, data: module, timestamp: new Date() });
+
+    void WorkspaceAuditService.logForProject({
+      projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.MODULE_CREATED,
+      targetType: 'module',
+      targetId: module.id,
+      metadata: {
+        name: module.name,
+        platform_id: module.platformId,
+        platform_key: module.platformKey,
+        priority: module.priority,
+      },
+      ...getAuditContext(req),
+    });
   } catch (error) {
     logger.error('[MODULES_API] Failed to create module', { error });
     handleError(res, error, 'Failed to create module');
@@ -145,6 +166,21 @@ export async function updateModule(req: AuthenticatedRequest, res: Response): Pr
     });
 
     res.json({ success: true, data: module, timestamp: new Date() });
+
+    if (module.projectId) {
+      const changedFields = Object.entries({ name, description, tags, priority })
+        .filter(([, v]) => v !== undefined)
+        .map(([k]) => k);
+      void WorkspaceAuditService.logForProject({
+        projectId: module.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.MODULE_UPDATED,
+        targetType: 'module',
+        targetId: id,
+        metadata: { name: module.name, changed_fields: changedFields },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[MODULES_API] Failed to update module', { error });
     handleError(res, error, 'Failed to update module');
@@ -159,9 +195,29 @@ export async function deleteModule(req: AuthenticatedRequest, res: Response): Pr
     const { id } = req.params;
     const userId = getUserId(req);
 
+    // Snapshot project_id + name BEFORE delete so we can audit afterwards.
+    const { data: snapshot } = await supabaseAdmin
+      .from('test_modules')
+      .select('project_id, name')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .maybeSingle();
+
     await ModuleService.delete(id, userId);
 
     res.json({ success: true, message: 'Module deleted', timestamp: new Date() });
+
+    if (snapshot?.project_id) {
+      void WorkspaceAuditService.logForProject({
+        projectId: snapshot.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.MODULE_DELETED,
+        targetType: 'module',
+        targetId: id,
+        metadata: { name: (snapshot as any).name },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[MODULES_API] Failed to delete module', { error });
     handleError(res, error, 'Failed to delete module');

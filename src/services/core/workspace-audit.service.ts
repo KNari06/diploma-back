@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import type { Request } from 'express';
 
 // ============================================================================
 // AUDIT EVENT TYPES
@@ -26,10 +27,49 @@ export const AUDIT_EVENTS = {
   CREDITS_PURCHASED: 'credits.purchased',
   CREDITS_MIGRATED: 'credits.migrated',
 
-  // Resource events (optional but recommended)
+  // Test resource events (auth/env/secret/etc.)
   RESOURCE_CREATED: 'resource.created',
   RESOURCE_UPDATED: 'resource.updated',
   RESOURCE_DELETED: 'resource.deleted',
+  RESOURCE_CAPTURED: 'resource.captured',
+  RESOURCE_MARKED_BROKEN: 'resource.marked_broken',
+  RESOURCE_DEFAULT_SET: 'resource.default_set',
+  RESOURCE_DEFAULT_CLEARED: 'resource.default_cleared',
+
+  // Test case events (intent_test_cases)
+  TEST_CASE_CREATED: 'test_case.created',
+  TEST_CASE_UPDATED: 'test_case.updated',
+  TEST_CASE_DELETED: 'test_case.deleted',
+  TEST_CASE_EXECUTED: 'test_case.executed',
+  TEST_CASE_ASSIGNED_TO_FLOW: 'test_case.assigned_to_flow',
+  TEST_CASE_DEPENDENCIES_UPDATED: 'test_case.dependencies_updated',
+
+  // Module events
+  MODULE_CREATED: 'module.created',
+  MODULE_UPDATED: 'module.updated',
+  MODULE_DELETED: 'module.deleted',
+
+  // Manual test (live UI test) events
+  MANUAL_TEST_STARTED: 'manual_test.started',
+  MANUAL_TEST_CANCELLED: 'manual_test.cancelled',
+  MANUAL_TEST_RETRIED: 'manual_test.retried',
+
+  // Regression run events
+  REGRESSION_RUN_STARTED: 'regression.run_started',
+  REGRESSION_RUN_CANCELLED: 'regression.run_cancelled',
+
+  // Regression plan events
+  REGRESSION_PLAN_CREATED: 'regression_plan.created',
+  REGRESSION_PLAN_UPDATED: 'regression_plan.updated',
+  REGRESSION_PLAN_DELETED: 'regression_plan.deleted',
+  REGRESSION_PLAN_ITEM_ADDED: 'regression_plan.item_added',
+  REGRESSION_PLAN_ITEM_REMOVED: 'regression_plan.item_removed',
+
+  // Jira ("tasks") events — actions we initiate against Jira
+  JIRA_ISSUE_CREATED: 'jira.issue_created',
+  JIRA_ISSUE_UPDATED: 'jira.issue_updated',
+  JIRA_ISSUE_STATUS_CHANGED: 'jira.issue_status_changed',
+  JIRA_DISCONNECTED: 'jira.disconnected',
 } as const;
 
 export type AuditEventType = (typeof AUDIT_EVENTS)[keyof typeof AUDIT_EVENTS];
@@ -68,7 +108,163 @@ export interface CreateAuditLogParams {
 // WORKSPACE AUDIT SERVICE
 // ============================================================================
 
+// Cache: projectId → workspaceId. Audit calls happen on every write so we
+// avoid an extra round-trip on the hot path. Cleared on server restart.
+const projectWorkspaceCache = new Map<string, string>();
+
+/**
+ * Extract IP + user-agent from an Express request for audit metadata.
+ * Shared so every controller writes the same shape.
+ */
+export function getAuditContext(req: Request): { ipAddress?: string; userAgent?: string } {
+  return {
+    ipAddress: req.ip || req.headers['x-forwarded-for']?.toString() || undefined,
+    userAgent: req.headers['user-agent'] || undefined,
+  };
+}
+
 export class WorkspaceAuditService {
+  /**
+   * Resolve workspace_id from a project_id. Most domain controllers (modules,
+   * test cases, regression, manual tests, test resources) only carry projectId
+   * at their call sites, so this is the canonical bridge into the audit log.
+   * Returns null on cache-miss + DB-miss (caller should still proceed without
+   * audit rather than fail the request).
+   */
+  static async resolveWorkspaceFromProject(projectId: string): Promise<string | null> {
+    if (!projectId) return null;
+
+    const cached = projectWorkspaceCache.get(projectId);
+    if (cached) return cached;
+
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('projects')
+        .select('workspace_id')
+        .eq('id', projectId)
+        .maybeSingle();
+
+      if (error) {
+        logger.warn('[WORKSPACE_AUDIT] Failed to resolve workspace for project', {
+          projectId,
+          error: error.message,
+        });
+        return null;
+      }
+
+      const workspaceId = (data as any)?.workspace_id as string | undefined;
+      if (workspaceId) {
+        projectWorkspaceCache.set(projectId, workspaceId);
+        return workspaceId;
+      }
+      return null;
+    } catch (error) {
+      logger.warn('[WORKSPACE_AUDIT] Exception resolving workspace for project', {
+        projectId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Resolve a user's workspace for events that aren't naturally scoped by a
+   * project (e.g. Jira issue actions). Picks the most recently joined active
+   * workspace. If the user is a member of multiple, this is lossy by design —
+   * the alternative is forcing every Jira request to carry workspaceId, which
+   * we don't want until the Activity page becomes a hot codepath.
+   */
+  static async resolveWorkspaceForUser(userId: string): Promise<string | null> {
+    if (!userId) return null;
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('workspace_members')
+        .select('workspace_id, created_at')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        logger.warn('[WORKSPACE_AUDIT] Failed to resolve workspace for user', {
+          userId,
+          error: error.message,
+        });
+        return null;
+      }
+      return (data as any)?.workspace_id ?? null;
+    } catch (error) {
+      logger.warn('[WORKSPACE_AUDIT] Exception resolving workspace for user', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Convenience: log an event scoped by user (no project context). Resolves
+   * workspace via `resolveWorkspaceForUser`. Use for actions like Jira issue
+   * mutations that aren't tied to a single QAIT project.
+   */
+  static async logForUser(params: {
+    actorUserId: string;
+    eventType: AuditEventType;
+    targetType?: string;
+    targetId?: string;
+    success?: boolean;
+    metadata?: Record<string, any>;
+    ipAddress?: string;
+    userAgent?: string;
+  }): Promise<void> {
+    const workspaceId = await this.resolveWorkspaceForUser(params.actorUserId);
+    if (!workspaceId) return;
+    await this.log({
+      workspaceId,
+      actorUserId: params.actorUserId,
+      eventType: params.eventType,
+      targetType: params.targetType,
+      targetId: params.targetId,
+      success: params.success,
+      metadata: params.metadata,
+      ipAddress: params.ipAddress,
+      userAgent: params.userAgent,
+    });
+  }
+
+  /**
+   * Convenience: log an event scoped by project. Resolves workspace_id from
+   * `projects.workspace_id`, then delegates to `log()`. Silent on resolution
+   * miss — audit is best-effort and must never block the main flow.
+   */
+  static async logForProject(params: {
+    projectId: string;
+    actorUserId: string | null;
+    eventType: AuditEventType;
+    targetType?: string;
+    targetId?: string;
+    success?: boolean;
+    metadata?: Record<string, any>;
+    ipAddress?: string;
+    userAgent?: string;
+  }): Promise<void> {
+    const workspaceId = await this.resolveWorkspaceFromProject(params.projectId);
+    if (!workspaceId) return;
+
+    await this.log({
+      workspaceId,
+      actorUserId: params.actorUserId,
+      eventType: params.eventType,
+      targetType: params.targetType,
+      targetId: params.targetId,
+      success: params.success,
+      metadata: { ...(params.metadata ?? {}), project_id: params.projectId },
+      ipAddress: params.ipAddress,
+      userAgent: params.userAgent,
+    });
+  }
+
   /**
    * Write an audit log entry
    */

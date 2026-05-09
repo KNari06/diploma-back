@@ -16,6 +16,11 @@ import {
 import { revertDoctorFinding } from '@/services/regression-doctor/revert.service';
 import { FullTestDataService } from '@/services/testing/ui/manual/full-test-data.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { Priority } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
@@ -199,6 +204,23 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       savedTestCaseId: result.savedTestCaseId,
       suggestionsCount: suggestedDependsOn.length,
     });
+
+    void WorkspaceAuditService.logForProject({
+      projectId: result.projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.TEST_CASE_CREATED,
+      targetType: 'test_case',
+      targetId: result.savedTestCaseId,
+      metadata: {
+        name,
+        kind: kind || 'standalone',
+        platform,
+        flow_id: flowId,
+        source_test_id: sourceTestId,
+        steps_count: Array.isArray(steps) ? steps.length : undefined,
+      },
+      ...getAuditContext(req),
+    });
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to save test case', { error });
     handleControllerError(res, error, 'Failed to save test case');
@@ -253,6 +275,30 @@ export async function runRegression(req: AuthenticatedRequest, res: Response): P
     });
 
     logger.info('[REGRESSION_API] Regression run started', { runId: result.runId });
+
+    void (async () => {
+      const { data: row } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('project_id, name')
+        .eq('id', savedTestCaseId)
+        .maybeSingle();
+      if (!row?.project_id) return;
+      await WorkspaceAuditService.logForProject({
+        projectId: row.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_RUN_STARTED,
+        targetType: 'regression_run',
+        targetId: result.runId,
+        metadata: {
+          scope: 'test_case',
+          test_case_id: savedTestCaseId,
+          test_case_name: (row as any).name,
+          test_id: result.testId,
+          trigger: trigger || 'manual',
+        },
+        ...getAuditContext(req),
+      });
+    })();
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to run regression', { error });
     handleControllerError(res, error, 'Failed to run regression');
@@ -408,6 +454,30 @@ export async function runPlan(req: AuthenticatedRequest, res: Response): Promise
       },
       timestamp: new Date(),
     });
+
+    void (async () => {
+      const { data: plan } = await supabaseAdmin
+        .from('regression_plans')
+        .select('project_id, name')
+        .eq('id', planId)
+        .maybeSingle();
+      if (!plan?.project_id) return;
+      await WorkspaceAuditService.logForProject({
+        projectId: plan.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_RUN_STARTED,
+        targetType: 'regression_run',
+        targetId: result.runId,
+        metadata: {
+          scope: 'plan',
+          plan_id: planId,
+          plan_name: (plan as any).name,
+          total_tests: result.totalTests,
+          trigger: 'manual',
+        },
+        ...getAuditContext(req),
+      });
+    })();
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to run plan', { error });
     handleControllerError(res, error, 'Failed to run plan');
@@ -455,6 +525,30 @@ export async function runModule(req: AuthenticatedRequest, res: Response): Promi
       },
       timestamp: new Date(),
     });
+
+    void (async () => {
+      const { data: mod } = await supabaseAdmin
+        .from('test_modules')
+        .select('project_id, name')
+        .eq('id', moduleId)
+        .maybeSingle();
+      if (!mod?.project_id) return;
+      await WorkspaceAuditService.logForProject({
+        projectId: mod.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_RUN_STARTED,
+        targetType: 'regression_run',
+        targetId: result.runId,
+        metadata: {
+          scope: 'module',
+          module_id: moduleId,
+          module_name: (mod as any).name,
+          total_tests: result.totalTests,
+          trigger: 'manual',
+        },
+        ...getAuditContext(req),
+      });
+    })();
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to run module', { error });
     handleControllerError(res, error, 'Failed to run module');
@@ -502,6 +596,32 @@ export async function runFlow(req: AuthenticatedRequest, res: Response): Promise
       },
       timestamp: new Date(),
     });
+
+    void (async () => {
+      // test_flows.module_id → test_modules.project_id
+      const { data: flow } = await supabaseAdmin
+        .from('test_flows')
+        .select('name, module_id, test_modules!inner(project_id)')
+        .eq('id', flowId)
+        .maybeSingle();
+      const projectId = (flow as any)?.test_modules?.project_id;
+      if (!projectId) return;
+      await WorkspaceAuditService.logForProject({
+        projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_RUN_STARTED,
+        targetType: 'regression_run',
+        targetId: result.runId,
+        metadata: {
+          scope: 'flow',
+          flow_id: flowId,
+          flow_name: (flow as any)?.name,
+          total_tests: result.totalTests,
+          trigger: 'manual',
+        },
+        ...getAuditContext(req),
+      });
+    })();
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to run flow', { error });
     handleControllerError(res, error, 'Failed to run flow');
@@ -548,6 +668,21 @@ export async function runByTag(req: AuthenticatedRequest, res: Response): Promis
         message: `Tag run started with ${result.totalTests} tests`,
       },
       timestamp: new Date(),
+    });
+
+    void WorkspaceAuditService.logForProject({
+      projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.REGRESSION_RUN_STARTED,
+      targetType: 'regression_run',
+      targetId: result.runId,
+      metadata: {
+        scope: 'tag',
+        tag,
+        total_tests: result.totalTests,
+        trigger: 'manual',
+      },
+      ...getAuditContext(req),
     });
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to run by tag', { error });
@@ -604,6 +739,21 @@ export async function runByPriority(req: AuthenticatedRequest, res: Response): P
         message: `Priority run started with ${result.totalTests} tests`,
       },
       timestamp: new Date(),
+    });
+
+    void WorkspaceAuditService.logForProject({
+      projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.REGRESSION_RUN_STARTED,
+      targetType: 'regression_run',
+      targetId: result.runId,
+      metadata: {
+        scope: 'priority',
+        priority,
+        total_tests: result.totalTests,
+        trigger: 'manual',
+      },
+      ...getAuditContext(req),
     });
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to run by priority', { error });
@@ -959,6 +1109,21 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
       },
       timestamp: new Date(),
     });
+
+    if (run.project_id) {
+      void WorkspaceAuditService.logForProject({
+        projectId: run.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_RUN_CANCELLED,
+        targetType: 'regression_run',
+        targetId: runId,
+        metadata: {
+          cancelled_tests: cancelledTests,
+          total_tests: testIds.length,
+        },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[REGRESSION_API] Failed to cancel run', { error });
     handleControllerError(res, error, 'Failed to cancel run');

@@ -12,6 +12,11 @@
 import type { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
 import * as TestResourceService from '@/services/test-resource/test-resource.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import type {
   ResourceKind,
   ResourcePlatform,
@@ -107,6 +112,20 @@ export async function createResource(req: Request, res: Response): Promise<void>
     }
 
     res.json({ success: true, resource });
+
+    void WorkspaceAuditService.logForProject({
+      projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.RESOURCE_CREATED,
+      targetType: 'resource',
+      targetId: resource.id,
+      metadata: {
+        kind: resource.kind,
+        name: resource.name,
+        set_as_default: !!setAsDefault,
+      },
+      ...getAuditContext(req),
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     logger.error('[TEST_RESOURCE] create failed', { error: msg });
@@ -213,6 +232,20 @@ export async function updateResource(req: Request, res: Response): Promise<void>
       return;
     }
     res.json({ success: true, resource });
+
+    void WorkspaceAuditService.logForProject({
+      projectId: resource.projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.RESOURCE_UPDATED,
+      targetType: 'resource',
+      targetId: id,
+      metadata: {
+        kind: resource.kind,
+        name: resource.name,
+        changed_fields: Object.keys(req.body ?? {}),
+      },
+      ...getAuditContext(req),
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     res.status(400).json({ success: false, error: msg });
@@ -232,6 +265,8 @@ export async function deleteResource(req: Request, res: Response): Promise<void>
   const reassignTo = (req.body?.reassignTo as string | undefined) ?? undefined;
 
   try {
+    const snapshot = await TestResourceService.getResource(id, userId);
+
     const result = await TestResourceService.deleteResource(id, userId, { reassignTo });
     if (!result.deleted) {
       res.status(404).json({ success: false, error: 'Not found' });
@@ -242,6 +277,24 @@ export async function deleteResource(req: Request, res: Response): Promise<void>
       reassignedTests: result.reassignedTests,
       detachedTests: result.detachedTests,
     });
+
+    if (snapshot?.projectId) {
+      void WorkspaceAuditService.logForProject({
+        projectId: snapshot.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.RESOURCE_DELETED,
+        targetType: 'resource',
+        targetId: id,
+        metadata: {
+          kind: snapshot.kind,
+          name: snapshot.name,
+          reassign_to: reassignTo,
+          reassigned_tests: result.reassignedTests,
+          detached_tests: result.detachedTests,
+        },
+        ...getAuditContext(req),
+      });
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     res.status(400).json({ success: false, error: msg });
@@ -268,6 +321,22 @@ export async function captureState(req: Request, res: Response): Promise<void> {
     await TestResourceService.captureState(id, userId, { config, sensitive }, { heal: !!heal });
     const resource = await TestResourceService.getResource(id, userId);
     res.json({ success: true, resource });
+
+    if (resource?.projectId) {
+      void WorkspaceAuditService.logForProject({
+        projectId: resource.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.RESOURCE_CAPTURED,
+        targetType: 'resource',
+        targetId: id,
+        metadata: {
+          kind: resource.kind,
+          name: resource.name,
+          heal: !!heal,
+        },
+        ...getAuditContext(req),
+      });
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     res.status(400).json({ success: false, error: msg });
@@ -284,8 +353,21 @@ export async function markBroken(req: Request, res: Response): Promise<void> {
 
   const { id } = req.params;
   const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'Unknown';
+  const snapshot = await TestResourceService.getResource(id, userId);
   await TestResourceService.markBroken(id, userId, reason);
   res.json({ success: true });
+
+  if (snapshot?.projectId) {
+    void WorkspaceAuditService.logForProject({
+      projectId: snapshot.projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.RESOURCE_MARKED_BROKEN,
+      targetType: 'resource',
+      targetId: id,
+      metadata: { kind: snapshot.kind, name: snapshot.name, reason },
+      ...getAuditContext(req),
+    });
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -344,6 +426,16 @@ export async function setDefault(req: Request, res: Response): Promise<void> {
       urlPattern: urlPattern ?? null,
     });
     res.json({ success: true });
+
+    void WorkspaceAuditService.logForProject({
+      projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.RESOURCE_DEFAULT_SET,
+      targetType: 'resource',
+      targetId: resourceId,
+      metadata: { kind, platform, url, app_package: appPackage, url_pattern: urlPattern },
+      ...getAuditContext(req),
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
     res.status(400).json({ success: false, error: msg });
@@ -371,4 +463,13 @@ export async function clearDefault(req: Request, res: Response): Promise<void> {
     urlPattern: urlPattern ?? null,
   });
   res.json({ success: true });
+
+  void WorkspaceAuditService.logForProject({
+    projectId,
+    actorUserId: userId,
+    eventType: AUDIT_EVENTS.RESOURCE_DEFAULT_CLEARED,
+    targetType: 'resource',
+    metadata: { kind, platform, url, app_package: appPackage, url_pattern: urlPattern },
+    ...getAuditContext(req),
+  });
 }
