@@ -368,39 +368,68 @@ export class AIAnalysisJobHandler {
   }
 
   /**
-   * Get test result from database
+   * Get test result from either the shared `test_results` table (web)
+   * or the forked `mobile_test_results` table (mobile). The id is unique
+   * within each table but not across them, so we look up sequentially:
+   * web first (the common case — most analyses come from manual-test-run),
+   * mobile as fallback when the id was minted by mobile-test-run.job.ts.
+   *
+   * The nested select shape is identical for both tables — both have
+   * `test_id` FK → `tests(id)` (shared) and the rest of the fields the
+   * analyzer reads (`status`, `errors`, `logs`, `network_logs`, `metadata`,
+   * etc.) overlap. Mobile-only columns (`steps_total`, `pass_rate`, etc.)
+   * are returned via `*` and ignored by the analyzer if absent on the
+   * web shape.
    */
   private static async getTestResult(testResultId: string) {
-    try {
-      const { data, error } = await dbAdminService.supabaseAdmin
-        .from('test_results')
-        .select(`
-          *,
-          tests (
-            id,
-            url,
-            project_id,
-            user_id,
-            options,
-            projects (
-              workspace_id
-            )
-          )
-        `)
-        .eq('id', testResultId)
-        .single();
+    const SELECT = `
+      *,
+      tests (
+        id,
+        url,
+        project_id,
+        user_id,
+        options,
+        projects (
+          workspace_id
+        )
+      )
+    `;
 
-      if (error) {
-        logger.error(`[AI-ANALYSIS] Database error fetching test result ${testResultId}:`, error);
-        throw error;
+    try {
+      // Try shared (web) table first.
+      const web = await dbAdminService.supabaseAdmin
+        .from('test_results')
+        .select(SELECT)
+        .eq('id', testResultId)
+        .maybeSingle();
+
+      if (web.error) {
+        logger.error(`[AI-ANALYSIS] Database error fetching test result ${testResultId} from test_results:`, web.error);
+        // Fall through to mobile lookup — a transient web-table error
+        // shouldn't prevent finding a mobile-table row.
+      } else if (web.data) {
+        return web.data;
       }
 
-      if (!data) {
-        logger.warn(`[AI-ANALYSIS] Test result not found: ${testResultId}`);
+      // Fall back to mobile_test_results.
+      const mobile = await dbAdminService.supabaseAdmin
+        .from('mobile_test_results')
+        .select(SELECT)
+        .eq('id', testResultId)
+        .maybeSingle();
+
+      if (mobile.error) {
+        logger.error(`[AI-ANALYSIS] Database error fetching test result ${testResultId} from mobile_test_results:`, mobile.error);
+        throw mobile.error;
+      }
+
+      if (!mobile.data) {
+        logger.warn(`[AI-ANALYSIS] Test result not found in either table: ${testResultId}`);
         return null;
       }
 
-      return data;
+      return mobile.data;
     } catch (error) {
       logger.error(`[AI-ANALYSIS] Failed to get test result ${testResultId}:`, error);
       return null;

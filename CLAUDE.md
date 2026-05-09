@@ -88,11 +88,42 @@ WS `preview:run:start`
 → stops recording → loop `applyStep()` → emits progress
 → `preview:run:complete`.
 
-### Background replay (regression / scheduled)
-BullMQ enqueue
+### Background replay (regression / scheduled) — web
+POST `/api/v1/regression/run` or `/run-plan`
+→ `RegressionRunService.runSavedTestCase()` / `runPlan()` ([regression-run.service.ts](src/services/testing/regression/regression-run.service.ts))
+→ INSERT `regression_runs` + `tests` + `test_executions`
+→ BullMQ enqueue
 → [manual-test-run.job.ts](src/jobs/manual-test-run.job.ts)
 → `executePlaywrightTestWithRetry()` (fresh browser, NOT preview session)
 → post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
+
+### Background replay (regression / scheduled) — mobile
+Same entry as web; routing diverges at `dispatchMobileTest()`.
+POST `/api/v1/regression/run` or `/run-plan`
+→ `RegressionRunService.runSavedTestCase()` → branch on `intent_test_cases.platform.startsWith('mobile_')`
+→ `dispatchMobileTest()` ([regression-run.service.ts:566+](src/services/testing/regression/regression-run.service.ts))
+→ INSERT `regression_runs` + `tests` + `test_executions`
+→ `QueueManager.addMobileTestJob()` (BullMQ producer)
+→ [mobile-test-run.job.ts](src/jobs/mobile-test-run.job.ts) — `MobileTestRunJobHandler.process()`
+→ `MobileRunnerClient.runSteps(sessionId, intentSteps, { screenshotEachStep:true })` (REST to qait-mobile-runner)
+→ runner returns `RunStepsResult` per-step with screenshot + evidence
+→ `persistCompiledPlansFromRun()` writes compiled plans back to `intent_test_cases.steps_json`
+→ `createTestResult()` inserts into `test_results` with aggregated stats
+→ post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
+
+**Mobile regression diverges from web in five ways:** (1) batch RPC (`runSteps`)
+not per-step apply; (2) hardcoded `screenshotEachStep: true`; (3) NO heal layer
+above the runner — mobile relies solely on the runner's per-step retry +
+stabilization-retry tail; (4) compiled-plan persistence happens explicitly via
+`persistCompiledPlansFromRun()` (web persists differently); (5) sessions claimed
+from a runner-side pool (warmup → cold-start fallback) and released in the
+finally block. See `mobile-test-run.job.ts` for the full lifecycle.
+
+### Scheduled cron
+`src/scheduler/index.ts` ticks every 60s
+→ `TestSchedulerJobHandler.processSchedules()` → `claimDueSchedule()` (atomic)
+→ routes to `RegressionRunService.runPlan() | runModule() | runFlow()`
+→ same web / mobile branches as above.
 
 ### Chat → test creation
 POST `/api/chat/message`

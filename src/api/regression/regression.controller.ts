@@ -1054,44 +1054,125 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
       return;
     }
 
-    // Cancel all running/pending underlying tests
-    const testIds: string[] = run.test_ids || [];
+    // Cancel ordering matters here. Supabase's JS client cannot span a
+    // transaction across tables, so we order writes by user-impact:
+    //
+    //   1. regression_runs.status = cancelled  → UI shows cancelled instantly
+    //   2. Discover in-flight UI tests from test_executions (NOT
+    //      regression_runs.test_ids — that field is empty for some run
+    //      shapes and stale for others)
+    //   3. test_executions.status = cancelled  → execution rows reflect intent
+    //   4. per-test ManualTestService.cancelTest → signals workers to stop.
+    //      Works for both web AND mobile because cancelTest() flips
+    //      `tests.status = 'cancelled'`, which both web's
+    //      manual-test-run.job.ts:checkTestCancelled and mobile's
+    //      mobile-test-run.job.ts:isTestCancelled (running on a 2s poller
+    //      inside runSteps) check on every iteration.
+    //
+    // If any step fails, the user-facing run row is already cancelled and
+    // the cleanup can be retried (the cancel endpoint is idempotent — see
+    // the `.in('status', ['running','pending'])` filters which prevent
+    // double-mutation). Each step has its own try/catch so a transient
+    // failure on one doesn't skip the others.
+
+    // Step 1 — flip the run row first so the UI reflects intent immediately.
+    let runMarkError: unknown;
+    try {
+      await supabaseAdmin
+        .from('regression_runs')
+        .update({
+          status: 'cancelled',
+          completed_at: new Date().toISOString(),
+        })
+        .eq('id', runId)
+        .in('status', ['running', 'pending']);
+    } catch (err) {
+      runMarkError = err;
+      logger.error('[REGRESSION_API] Failed to mark regression_runs as cancelled', { runId, error: err });
+    }
+
+    // Step 2 — discover in-flight UI tests via test_executions. Filter to
+    // running/pending so we don't try to cancel tests that already
+    // succeeded or failed naturally before the user clicked. UI tests
+    // pin their `tests.id` into `result.testId` at dispatch time
+    // (regression-run.service.ts:2247-2256). API tests don't dispatch a
+    // `tests` row and don't need per-test cancel — their executor is
+    // synchronous and either already returned a verdict or threw.
+    //
+    // Pre-fix used `regression_runs.test_ids` which is only populated
+    // for plan/module/flow runs (regression-run.service.ts:2694), and
+    // even then only for web testIds — mobile dispatches via BullMQ
+    // queue and the array can lag. test_executions is the source of
+    // truth: every dispatch creates an exec row, and the worker writes
+    // back via TestCompletionHandler.
+    const inFlightTestIds: string[] = [];
+    try {
+      const { data: execRows } = await supabaseAdmin
+        .from('test_executions')
+        .select('id, test_type, result, status')
+        .eq('run_id', runId)
+        .in('status', ['pending', 'running']);
+      for (const row of execRows ?? []) {
+        if (row.test_type !== 'ui') continue; // API tests have no `tests` row
+        const testId: unknown = (row.result as any)?.testId;
+        if (typeof testId === 'string' && testId) {
+          inFlightTestIds.push(testId);
+        }
+      }
+    } catch (err) {
+      logger.warn('[REGRESSION_API] Failed to discover in-flight UI tests via test_executions', {
+        runId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     let cancelledTests = 0;
 
-    for (const testId of testIds) {
+    // Step 3 — flip executions in bulk. Independent of step 4 so a slow
+    // per-test cancel loop doesn't delay this DB-level update.
+    let executionsMarkError: unknown;
+    try {
+      await supabaseAdmin
+        .from('test_executions')
+        .update({
+          status: 'cancelled',
+          completed_at: new Date().toISOString(),
+          error_message: 'Cancelled by user',
+        })
+        .eq('run_id', runId)
+        .in('status', ['pending', 'running']);
+    } catch (err) {
+      executionsMarkError = err;
+      logger.error('[REGRESSION_API] Failed to mark test_executions as cancelled', { runId, error: err });
+    }
+
+    // Step 4 — per-test cancel. This is the path that signals running
+    // BullMQ workers to stop at their next phase boundary. cancelTest()
+    // updates `tests.status = 'cancelled'` AND tries to remove waiting
+    // jobs from the web testRunQueue. Mobile workers detect the status
+    // flip via the cancellation poller in mobile-test-run.job.ts and
+    // abort the in-flight runSteps fetch via AbortController.
+    for (const testId of inFlightTestIds) {
       try {
         const result = await ManualTestService.cancelTest(testId, userId);
         if (result.success) cancelledTests++;
-      } catch {
-        // Some tests may already be completed — skip them
+      } catch (err) {
+        // Some tests may already be completed — that's fine. Log so a
+        // sudden spike in per-test failures (e.g. all tests fail to
+        // cancel because of an auth issue) is observable.
+        logger.warn('[REGRESSION_API] Per-test cancel failed', {
+          runId,
+          testId,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
-
-    // Cancel all pending/running test_executions
-    await supabaseAdmin
-      .from('test_executions')
-      .update({
-        status: 'cancelled',
-        completed_at: new Date().toISOString(),
-        error_message: 'Cancelled by user',
-      })
-      .eq('run_id', runId)
-      .in('status', ['pending', 'running']);
-
-    // Mark the run as cancelled
-    await supabaseAdmin
-      .from('regression_runs')
-      .update({
-        status: 'cancelled',
-        completed_at: new Date().toISOString(),
-      })
-      .eq('id', runId)
-      .in('status', ['running', 'pending']);
 
     logger.info('[REGRESSION_API] Run cancelled', {
       runId,
       cancelledTests,
-      totalTestIds: testIds.length,
+      totalTestIds: inFlightTestIds.length,
+      runMarkFailed: !!runMarkError,
+      executionsMarkFailed: !!executionsMarkError,
     });
 
     // Invalidate vizoverall cache — run status changed
@@ -1104,8 +1185,8 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
       data: {
         runId,
         cancelledTests,
-        totalTests: testIds.length,
-        message: `Run cancelled. ${cancelledTests}/${testIds.length} tests stopped.`,
+        totalTests: inFlightTestIds.length,
+        message: `Run cancelled. ${cancelledTests}/${inFlightTestIds.length} tests stopped.`,
       },
       timestamp: new Date(),
     });

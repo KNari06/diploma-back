@@ -620,8 +620,36 @@ export interface TestStepCompletedPayload {
   runtimeMeta?: {
     /** Step ID from IntentStep */
     stepId?: string;
-    /** Final status: executed, healed, or failed */
-    runtimeStatus?: 'executed' | 'healed' | 'failed';
+    /**
+     * Final status of the step.
+     *  - 'executed':    dispatched and produced a pass-equivalent result
+     *  - 'healed':      dispatched after a self-heal (web Playwright path only)
+     *  - 'failed':      dispatched, did not produce expected outcome
+     *  - 'skipped':     not dispatched at all (e.g. unsupported step type on
+     *                   the mobile runner). Mobile runner signals this via
+     *                   `resolvedVia: 'skipped'`.
+     *  - 'soft-failed': step failed BUT was authored with
+     *                   `options.continueOnError: true` (or is runner
+     *                   auto-injected) so the failure is tolerable —
+     *                   does not fail the test. UI should render with a
+     *                   distinct "skipped (optional)" badge, not the red
+     *                   failed badge. See `softFailure` field below.
+     */
+    runtimeStatus?: 'executed' | 'healed' | 'failed' | 'skipped' | 'soft-failed';
+    /**
+     * Truthy-only flag that mirrors `runtimeStatus === 'soft-failed'`. Lets
+     * the frontend pick a distinct renderer without re-deriving the rule
+     * from `runtimeStatus`. Absent (not `false`) for hard failures and
+     * successes — keeps existing renderers from accidentally rendering a
+     * "soft" badge for a hard fail when they only check truthiness.
+     */
+    softFailure?: boolean;
+    /**
+     * Mobile-only forwarding of the runner's `resolvedVia` enum so the
+     * frontend can distinguish skip-style outcomes from real-resolve
+     * outcomes without re-deriving from `runtimeStatus`.
+     */
+    resolvedVia?: string;
     /** Source of element resolution */
     source?: 'compiled' | 'resolver' | 'self_heal';
     /** Confidence tier of the resolution */
