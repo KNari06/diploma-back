@@ -1200,7 +1200,7 @@ export async function cancelRun(req: AuthenticatedRequest, res: Response): Promi
         targetId: runId,
         metadata: {
           cancelled_tests: cancelledTests,
-          total_tests: testIds.length,
+          total_tests: inFlightTestIds.length,
         },
         ...getAuditContext(req),
       });
