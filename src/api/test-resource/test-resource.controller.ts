@@ -224,6 +224,47 @@ export async function findByDomain(req: Request, res: Response): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/test-resource/binding-summary
+//
+// Body: { flowIds: string[] }
+// Returns: { success, summaries: { [flowId]: { authName?, envName?,
+//                                              secretNames?, fixtureNames? } } }
+//
+// Bulk lookup used by the test-list UI to render resource badges
+// (`🔐 Admin · 🌍 Staging`) on each flow row without N×lazy-loads.
+// Flows with no preferred test case OR no bindings are simply absent
+// from the response — callers treat absence as "no resources bound".
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function bindingSummary(req: Request, res: Response): Promise<void> {
+  const userId = requireAuthed(req, res);
+  if (!userId) return;
+
+  const rawIds = (req.body && (req.body as { flowIds?: unknown }).flowIds) ?? [];
+  if (!Array.isArray(rawIds)) {
+    res
+      .status(400)
+      .json({ success: false, error: 'flowIds must be an array of strings' });
+    return;
+  }
+  const flowIds = rawIds.filter(
+    (x): x is string => typeof x === 'string' && x.length > 0,
+  );
+  if (flowIds.length === 0) {
+    res.json({ success: true, summaries: {} });
+    return;
+  }
+
+  try {
+    const summaries = await TestResourceService.bindingSummaryByFlows(userId, flowIds);
+    res.json({ success: true, summaries });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(500).json({ success: false, error: msg });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/v1/test-resource/:id
 // ─────────────────────────────────────────────────────────────────────────────
 

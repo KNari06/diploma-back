@@ -6313,7 +6313,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       // never logged anywhere along this path — see `redactSecrets`.
       // Other kinds (device emulation, scenario setup, ...) need a
       // dedicated test execution context and aren't supported here.
-      const PREVIEW_APPLY_KINDS = new Set(['auth', 'environment', 'secret']);
+      const PREVIEW_APPLY_KINDS = new Set(['auth', 'environment', 'secret', 'data_fixture']);
       if (!PREVIEW_APPLY_KINDS.has(resource.kind)) {
         emitResult({
           success: false,

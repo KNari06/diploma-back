@@ -13,6 +13,7 @@ import { registerResourceAdapter } from './adapter-registry';
 import { authAdapter } from './adapters/auth.adapter';
 import { environmentAdapter } from './adapters/environment.adapter';
 import { secretAdapter } from './adapters/secret.adapter';
+import { dataFixtureAdapter } from './adapters/data_fixture.adapter';
 
 export { registerResourceAdapter, getResourceAdapter, requireResourceAdapter, listRegisteredKinds } from './adapter-registry';
 export * as TestResourceService from './test-resource.service';
@@ -38,6 +39,7 @@ export function registerBuiltinResourceAdapters(): void {
   registerResourceAdapter(authAdapter);
   registerResourceAdapter(environmentAdapter);
   registerResourceAdapter(secretAdapter);
-  // Future kinds (data_fixture, device, ...) register here as their
+  registerResourceAdapter(dataFixtureAdapter);
+  // Future kinds (device, network, oauth_token, ...) register here as their
   // adapters ship.
 }

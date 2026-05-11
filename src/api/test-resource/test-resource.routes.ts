@@ -21,6 +21,7 @@ import {
   createResource,
   listByProject,
   findByDomain,
+  bindingSummary,
   getResource,
   updateResource,
   deleteResource,
@@ -33,9 +34,10 @@ import {
 
 const router = Router();
 
-// Collection + default routes first — otherwise "resolve" / "default" are
-// swallowed by the /:id catch-all.
+// Collection + default routes first — otherwise "resolve" / "default" /
+// "binding-summary" are swallowed by the /:id catch-all.
 router.post('/', createResource);
+router.post('/binding-summary', bindingSummary);
 router.get('/project/:projectId', listByProject);
 router.get('/by-domain', findByDomain);
 router.get('/resolve', resolveDefault);

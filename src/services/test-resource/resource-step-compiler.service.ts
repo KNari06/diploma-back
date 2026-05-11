@@ -16,8 +16,8 @@
  *   - network       → 'network' step from config preset / latency / bw / loss
  *   - file          → 'upload' step (runner-side path seeded via uploadFilePath)
  *   - device        → 'geolocation' step when lat/lng set, else skipped
- *   - data_fixture  → skipped on mobile (API seed lives on backend; DB seed
- *                     would need a different primitive — out of scope)
+ *   - data_fixture  → 'store' per entry under `fixtures.<KEY>` scratchpad
+ *                     name; values are plaintext (no encryption for slice 1).
  *   - scenario_setup → NOT expanded here; the bundle's children must be
  *                     bound explicitly (same as web today).
  *
@@ -330,12 +330,11 @@ function compileByKind(
     case 'device':
       return compileDevice(resource);
     case 'data_fixture':
-      // DB-seed fixtures need a primitive we don't have on mobile yet
-      // (no DB-seed action type, no API-caller runtime). Silent on
-      // purpose — a WARN here on every run would be noise once a
-      // customer knowingly binds a data_fixture as "enforced via CI
-      // before the mobile dispatch runs".
-      return [];
+      // Plaintext data map — emit one `store` per entry under a
+      // `fixtures.<KEY>` scratchpad name so steps written as
+      // `${fixtures.EMAIL}` resolve at dispatch time. See
+      // compileDataFixture for the unwrap (`config.data` envelope).
+      return compileDataFixture(resource);
     case 'scenario_setup':
       // scenario_setup is a BUNDLE — on web the adapter orchestrates the
       // child resources. Mobile doesn't implement that orchestration yet,
@@ -491,6 +490,39 @@ function compileKeyValue(
     const scratchpadKey = `${opts.prefix}${key}`;
     steps.push(
       makeStoreStep(scratchpadKey, str, `${resource.kind}:${resource.name}:${key}`),
+    );
+  }
+  return steps;
+}
+
+/**
+ * Data fixture: plaintext key/value map under `config.data`. Emit one
+ * `store` per entry under a `fixtures.<KEY>` scratchpad name so steps
+ * referencing `${fixtures.EMAIL}` resolve at dispatch time.
+ *
+ * The wrapper unwrap (`config.data`) is the difference from
+ * `compileKeyValue` — fixture, environment, and secret all have a
+ * single envelope key in their `config`/`sensitive` payload, but only
+ * fixture is compiled correctly here today. Mobile env/secret support
+ * is tracked separately.
+ */
+function compileDataFixture(resource: DecryptedResource): CompiledResourceStep[] {
+  const config = (resource.config ?? {}) as Record<string, unknown>;
+  const data = config.data;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    logger.warn(
+      '[RESOURCE_STEP_COMPILER] data_fixture has no usable config.data — emitting nothing',
+      { resourceId: resource.id, name: resource.name },
+    );
+    return [];
+  }
+
+  const steps: CompiledResourceStep[] = [];
+  for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+    const str = serialiseForStore(value);
+    if (str === null) continue;
+    steps.push(
+      makeStoreStep(`fixtures.${key}`, str, `data_fixture:${resource.name}:${key}`),
     );
   }
   return steps;

@@ -434,6 +434,172 @@ export async function findByDomain(
   return rows.map((r) => toSummary(r, counts.get(r.id) ?? 0));
 }
 
+/**
+ * Phase 4 — bulk binding summary for a set of flows.
+ *
+ * Used by the test-list UI to render per-flow resource badges
+ * (`🔐 Admin · 🌍 Staging`) without fetching every flow's test cases
+ * individually (which would be N×lazy-loads on a 500-flow project).
+ *
+ * Algorithm:
+ *   1. One query: fetch all `intent_test_cases` where `flow_id IN (...)`
+ *      AND `user_id = uid`, selecting only the columns we need
+ *      (`id, flow_id, status, resource_bindings`).
+ *   2. Per flow, pick the "preferred" test case using the SAME priority
+ *      rule the frontend uses (draft → published → archived → first).
+ *      Kept in lockstep with pickPreferredTestCase in TestSuitesWeb.jsx.
+ *   3. Collect all bound resource ids across all preferred cases into a
+ *      single Set; one second query fetches all those resources at once
+ *      (id, kind, name) using `IN`. No N+1.
+ *   4. Compose per-flow summary: pick the auth name (one per kind today),
+ *      env name, secret names list. Future kinds collapse the same way.
+ *
+ * Returns map keyed by flowId. Flows with no preferred test case OR no
+ * bindings are omitted from the response (caller treats absence as "no
+ * resources bound"). This keeps the payload tight.
+ */
+export async function bindingSummaryByFlows(
+  userId: string,
+  flowIds: string[],
+): Promise<
+  Record<
+    string,
+    { authName?: string; envName?: string; secretNames?: string[]; fixtureNames?: string[] }
+  >
+> {
+  const uid = assertNonEmpty(userId, 'userId');
+  if (!Array.isArray(flowIds) || flowIds.length === 0) return {};
+  // Cap input — defensive guard against accidental "select all flows"
+  // calls that would balloon the IN clause and the resource fetch.
+  const MAX_FLOWS = 500;
+  const trimmedIds = flowIds
+    .filter((f): f is string => typeof f === 'string' && f.length > 0)
+    .slice(0, MAX_FLOWS);
+  if (trimmedIds.length === 0) return {};
+
+  // 1) Fetch all test cases for these flows in one query. We only need
+  // four columns; resource_bindings is JSONB so the row size is small.
+  const { data: tcRows, error: tcErr } = await supabaseAdmin
+    .from('intent_test_cases')
+    .select('id, flow_id, status, resource_bindings')
+    .in('flow_id', trimmedIds)
+    .eq('user_id', uid);
+  if (tcErr) {
+    logger.error('[TEST_RESOURCE] bindingSummary tc query failed', {
+      error: tcErr.message,
+    });
+    return {};
+  }
+  if (!tcRows || tcRows.length === 0) return {};
+
+  // 2) Group by flow + pick preferred per the FE rule.
+  type TC = {
+    id: string;
+    flow_id: string;
+    status: string | null;
+    resource_bindings: Array<{ kind: string; resource_id: string }> | null;
+  };
+  const byFlow = new Map<string, TC[]>();
+  for (const r of (tcRows as TC[])) {
+    if (!r.flow_id) continue;
+    const arr = byFlow.get(r.flow_id) ?? [];
+    arr.push(r);
+    byFlow.set(r.flow_id, arr);
+  }
+  const pickPreferred = (cases: TC[]): TC | null => {
+    if (cases.length === 0) return null;
+    const norm = (s: string | null) => (s || '').toLowerCase();
+    return (
+      cases.find((c) => norm(c.status) === 'draft') ||
+      cases.find((c) => norm(c.status) === 'published') ||
+      cases.find((c) => norm(c.status) === 'archived') ||
+      cases[0]
+    );
+  };
+  const preferredByFlow = new Map<string, TC>();
+  const resourceIdSet = new Set<string>();
+  for (const [flowId, cases] of byFlow) {
+    const preferred = pickPreferred(cases);
+    if (!preferred) continue;
+    const bindings = Array.isArray(preferred.resource_bindings)
+      ? preferred.resource_bindings
+      : [];
+    if (bindings.length === 0) continue;
+    preferredByFlow.set(flowId, preferred);
+    for (const b of bindings) {
+      if (b && typeof b.resource_id === 'string' && b.resource_id) {
+        resourceIdSet.add(b.resource_id);
+      }
+    }
+  }
+  if (preferredByFlow.size === 0 || resourceIdSet.size === 0) return {};
+
+  // 3) Single query: pull (id, kind, name) for every referenced resource.
+  // We require user_id match so a bug in resource_bindings can't expose
+  // a different user's resource names. Status/expiry don't filter here —
+  // a stale binding still shows its name (the test UI should reflect
+  // reality, not hide stale state).
+  const ids = Array.from(resourceIdSet);
+  const { data: resRows, error: resErr } = await supabaseAdmin
+    .from('test_resources')
+    .select('id, kind, name')
+    .in('id', ids)
+    .eq('user_id', uid);
+  if (resErr) {
+    logger.error('[TEST_RESOURCE] bindingSummary resource query failed', {
+      error: resErr.message,
+    });
+    return {};
+  }
+  const resById = new Map<string, { id: string; kind: ResourceKind; name: string }>(
+    (resRows ?? []).map((r) => [
+      (r as { id: string }).id,
+      r as { id: string; kind: ResourceKind; name: string },
+    ]),
+  );
+
+  // 4) Compose per-flow summary.
+  const out: Record<
+    string,
+    { authName?: string; envName?: string; secretNames?: string[]; fixtureNames?: string[] }
+  > = {};
+  for (const [flowId, preferred] of preferredByFlow) {
+    const bindings = Array.isArray(preferred.resource_bindings)
+      ? preferred.resource_bindings
+      : [];
+    const summary: {
+      authName?: string;
+      envName?: string;
+      secretNames?: string[];
+      fixtureNames?: string[];
+    } = {};
+    for (const b of bindings) {
+      const r = b?.resource_id ? resById.get(b.resource_id) : undefined;
+      if (!r) continue;
+      switch (r.kind) {
+        case 'auth':
+          // One auth resource per test (single login identity).
+          if (!summary.authName) summary.authName = r.name;
+          break;
+        case 'environment':
+          // Same: one environment per test.
+          if (!summary.envName) summary.envName = r.name;
+          break;
+        case 'secret':
+          (summary.secretNames ||= []).push(r.name);
+          break;
+        case 'data_fixture':
+          (summary.fixtureNames ||= []).push(r.name);
+          break;
+        default:
+        // Other kinds (device/network/file/...) don't render badges yet.
+      }
+    }
+    if (Object.keys(summary).length > 0) out[flowId] = summary;
+  }
+  return out;
+}
+
 export async function getResource(
   id: string,
   userId: string,
