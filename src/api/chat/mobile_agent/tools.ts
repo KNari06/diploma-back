@@ -1823,7 +1823,7 @@ function toRunnerCommand(step: MobileIntentStep): Record<string, unknown> {
     case 'permission':
     case 'permission_dialog': {
       const opts = step.options as
-        | { permissionAction?: 'allow' | 'deny' | 'allow_always' }
+        | { permissionAction?: 'allow' | 'deny' | 'allow_always' | 'allow_foreground' | 'allow_once' }
         | undefined;
       return {
         type: 'permission_dialog',
