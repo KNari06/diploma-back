@@ -48,6 +48,17 @@ const PREVIEW_VIDEO_CONFIG = {
 
   // Monitoring
   statsIntervalMs: 10000,
+
+  // CDP-idle watchdog (see PreviewVideoStreamService field comment).
+  // Tick interval — keep small so detection is responsive.
+  cdpIdleCheckIntervalMs: 1000,
+  // If no real CDP frame arrived in the last cdpIdleThresholdMs, inject a
+  // screenshot. 5s is the prod-safe value: large enough that any active site
+  // (animations / video / typing) beats it without triggering a synth, small
+  // enough that a user staring at a frozen login page sees the watchdog kick
+  // in before they reach for the Refresh button. 2s would catch more cases
+  // but at 5× the screenshot CPU cost on idle sessions.
+  cdpIdleThresholdMs: 5000,
 };
 
 // ============================================================================
@@ -119,6 +130,10 @@ export class PreviewVideoStreamService {
   // on every frame — on 45fps that's ~90 ops/sec saved.
   private framesEmitted = 0;
   private framesDropped = 0;
+  // DIAG: count raw CDP screencast events received, before any filtering.
+  // If this stays at 0 → CDP itself isn't emitting (page issue / startScreencast failed).
+  // If this grows but framesEmitted doesn't → emit pipeline is dropping them.
+  private framesReceivedFromCdp = 0;
   private frameTimestamps: number[] = new Array(30).fill(0);
   private frameTimestampsIdx = 0;
   private frameTimestampsCount = 0;
@@ -159,6 +174,18 @@ export class PreviewVideoStreamService {
 
   // Stats interval
   private statsInterval: NodeJS.Timeout | null = null;
+
+  // CDP-idle watchdog. CDP screencast does NOT emit frames on statically
+  // rendered pages — it only paints on damage events (mouse move, animation,
+  // navigation). On idle login pages / static dashboards the stream can sit
+  // silent indefinitely after the first injected frame, producing a "white
+  // screen until user moves the mouse" UX. This watchdog samples a screenshot
+  // every CDP_IDLE_INJECT_MS while no real CDP frames are arriving, so the
+  // user sees a fresh image even on idle pages. Stops automatically once CDP
+  // resumes (lastCdpFrameAt becomes recent) and the page becomes interactive
+  // on its own.
+  private cdpIdleWatchdog: NodeJS.Timeout | null = null;
+  private lastCdpFrameAt = 0;
 
   constructor(previewSessionId: string, userId: string, room: string, initialSeq?: number) {
     this.previewSessionId = previewSessionId;
@@ -248,6 +275,14 @@ export class PreviewVideoStreamService {
       this.frameHandler = this.handleScreencastFrame.bind(this);
       this.cdpSession.on('Page.screencastFrame', this.frameHandler);
 
+      // Flip the streaming flag BEFORE startScreencast so the very first
+      // Page.screencastFrame event (which Chrome can deliver during the await
+      // below or on the next microtask) isn't rejected by handleScreencastFrame's
+      // early-exit guard. Without this we lose one real CDP frame on every
+      // session start — visible in the log as "Frame dropped at early-exit
+      // isStreaming:false" immediately followed by "Started streaming".
+      this.isStreaming = true;
+
       // Start screencast
       await this.cdpSession.send('Page.startScreencast', {
         format: PREVIEW_VIDEO_CONFIG.format,
@@ -257,10 +292,14 @@ export class PreviewVideoStreamService {
         everyNthFrame: 1,
       });
 
-      this.isStreaming = true;
-
       // Start stats monitoring
       this.startStatsInterval();
+
+      // Start CDP-idle watchdog so statically-rendered pages
+      // (login forms, idle dashboards) don't sit on a single frame after the
+      // first-frame inject. Without this, sites with zero animations produce
+      // a "white screen until user moves the mouse" UX on every Reset.
+      this.startCdpIdleWatchdog();
 
       logger.info('[PREVIEW_VIDEO] Started streaming', {
         previewSessionId: this.previewSessionId,
@@ -381,8 +420,37 @@ export class PreviewVideoStreamService {
     };
     sessionId: number;
   }): Promise<void> {
+    // DIAG: track CDP-side delivery before any early-exit so we can tell
+    // "CDP stopped sending" apart from "we filtered them out".
+    this.framesReceivedFromCdp++;
+    // Watchdog: mark CDP as alive. Used by the idle-injection loop to decide
+    // whether to keep synthesising frames via screenshot.
+    this.lastCdpFrameAt = Date.now();
+    if (this.framesReceivedFromCdp <= 5 || this.framesReceivedFromCdp % 50 === 0) {
+      logger.info('[PREVIEW_VIDEO] CDP frame received', {
+        previewSessionId: this.previewSessionId,
+        framesReceivedFromCdp: this.framesReceivedFromCdp,
+        framesEmitted: this.framesEmitted,
+        framesDropped: this.framesDropped,
+        isStreaming: this.isStreaming,
+        isStopped: this.isStopped,
+        cdpSessionClosed: this.cdpSessionClosed,
+        isPaused: this.isPaused,
+        pendingFrames: this.pendingFrames,
+        cdpSessionId: params.sessionId,
+        deviceSize: `${params.metadata.deviceWidth}x${params.metadata.deviceHeight}`,
+      });
+    }
+
     // Early exit checks
     if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) {
+      logger.warn('[PREVIEW_VIDEO] Frame dropped at early-exit', {
+        previewSessionId: this.previewSessionId,
+        framesReceivedFromCdp: this.framesReceivedFromCdp,
+        isStreaming: this.isStreaming,
+        isStopped: this.isStopped,
+        cdpSessionClosed: this.cdpSessionClosed,
+      });
       return;
     }
 
@@ -401,6 +469,17 @@ export class PreviewVideoStreamService {
           this.stop().catch(() => {});
           return;
         }
+        // DIAG: any other ack error was previously silently swallowed.
+        // Log it — repeated unhandled errors will halt CDP screencast emission
+        // after a few frames (matches "framesEmitted: 3 then nothing" symptom).
+        logger.warn('[PREVIEW_VIDEO] ACK failed with unhandled error (frame may halt CDP)', {
+          previewSessionId: this.previewSessionId,
+          framesEmittedSoFar: this.framesEmitted,
+          framesDroppedSoFar: this.framesDropped,
+          cdpSessionId: params.sessionId,
+          error: ackError instanceof Error ? ackError.message : String(ackError),
+          errorName: ackError instanceof Error ? ackError.name : 'unknown',
+        });
       }
     }
 
@@ -440,12 +519,25 @@ export class PreviewVideoStreamService {
     // Check backpressure
     if (this.pendingFrames >= PREVIEW_VIDEO_CONFIG.maxPendingFrames) {
       this.framesDropped++;
+      logger.warn('[PREVIEW_VIDEO] Frame dropped: backpressure (pending >= max)', {
+        previewSessionId: this.previewSessionId,
+        pendingFrames: this.pendingFrames,
+        maxPendingFrames: PREVIEW_VIDEO_CONFIG.maxPendingFrames,
+        framesEmitted: this.framesEmitted,
+        framesDropped: this.framesDropped,
+      });
       return;
     }
 
     // Check circuit breaker
     if (this.isPaused) {
       this.framesDropped++;
+      logger.warn('[PREVIEW_VIDEO] Frame dropped: paused (circuit breaker)', {
+        previewSessionId: this.previewSessionId,
+        consecutiveFailures: this.consecutiveFailures,
+        framesEmitted: this.framesEmitted,
+        framesDropped: this.framesDropped,
+      });
       return;
     }
 
@@ -493,6 +585,20 @@ export class PreviewVideoStreamService {
       // Failure - increment circuit breaker
       this.consecutiveFailures++;
       this.framesDropped++;
+
+      // DIAG: log every emit failure — previously only the circuit-breaker trip
+      // was visible. If frames silently fail to emit on a fresh session
+      // (post-Reset), we need to see the very first failure cause, not just
+      // the 5th.
+      logger.warn('[PREVIEW_VIDEO] Frame emit failed', {
+        previewSessionId: this.previewSessionId,
+        seq: this.seq,
+        framesEmitted: this.framesEmitted,
+        framesDropped: this.framesDropped,
+        consecutiveFailures: this.consecutiveFailures,
+        pendingFrames: this.pendingFrames,
+        error: error instanceof Error ? error.message : String(error),
+      });
 
       if (this.consecutiveFailures >= PREVIEW_VIDEO_CONFIG.circuitBreakerThreshold && !this.isPaused) {
         this.isPaused = true;
@@ -585,13 +691,92 @@ export class PreviewVideoStreamService {
         });
       }
 
-      logger.debug('[PREVIEW_VIDEO] Stats', {
+      // DIAG: bumped from debug → info so the periodic stat is visible without
+      // changing log level. Includes framesReceivedFromCdp so we can tell at a
+      // glance whether CDP itself stopped feeding us frames.
+      logger.info('[PREVIEW_VIDEO] Stats', {
         previewSessionId: this.previewSessionId,
         currentFPS,
+        framesReceivedFromCdp: this.framesReceivedFromCdp,
         framesEmitted: this.framesEmitted,
         framesDropped: this.framesDropped,
+        cdpSessionClosed: this.cdpSessionClosed,
+        isPaused: this.isPaused,
+        pendingFrames: this.pendingFrames,
+        gotFirstFrame: this.gotFirstFrame,
       });
     }, PREVIEW_VIDEO_CONFIG.statsIntervalMs);
+  }
+
+  /**
+   * Watchdog for CDP-idle pages. Ticks every cdpIdleCheckIntervalMs.
+   * If no real CDP frame has arrived in cdpIdleThresholdMs AND we already
+   * delivered the first frame (so the user expects a live preview), inject a
+   * fresh screenshot to keep the picture current.
+   *
+   * The first-frame guarantee (scheduleFirstFrameAttempt) handles the initial
+   * blank-screen case. This watchdog handles the steady-state case where the
+   * page never produces paint events on its own (static login form, idle
+   * dashboard). Stops adding load the moment CDP resumes — lastCdpFrameAt
+   * is updated by handleScreencastFrame, so a single real frame within the
+   * threshold window skips that tick's screenshot.
+   */
+  private startCdpIdleWatchdog(): void {
+    if (this.cdpIdleWatchdog) {
+      return;
+    }
+    this.cdpIdleWatchdog = setInterval(() => {
+      if (!this.isStreaming || this.isStopped || this.cdpSessionClosed) {
+        return;
+      }
+      // Wait for the first-frame guarantee to deliver something before we
+      // start synthesising — otherwise we race with scheduleFirstFrameAttempt.
+      if (!this.gotFirstFrame) {
+        return;
+      }
+      // Don't pile up while a previous emit is still in flight.
+      if (this.pendingFrames > 0) {
+        return;
+      }
+      // Don't fight the circuit breaker.
+      if (this.isPaused) {
+        return;
+      }
+      // Skip the screenshot if nobody is watching. Sessions can sit alive on
+      // the backend (up to the 30-min TTL) after the user closes the editor
+      // tab or drops their network connection without a clean unsubscribe.
+      // Without this guard the watchdog would burn ~360 screenshots over the
+      // TTL window for a zombie session no client is rendering. A real
+      // subscriber re-joining the room resumes the watchdog on the next tick
+      // (≤1s lag), which is imperceptible.
+      const roomSize = this.nsp?.adapter.rooms.get(this.room)?.size ?? 0;
+      if (roomSize === 0) {
+        return;
+      }
+      const now = Date.now();
+      // `lastCdpFrameAt === 0` means CDP has never emitted on this stream —
+      // exactly the "static page" case we're trying to rescue. Treat 0 as
+      // "infinitely stale".
+      const sinceCdp = this.lastCdpFrameAt === 0 ? Infinity : now - this.lastCdpFrameAt;
+      if (sinceCdp < PREVIEW_VIDEO_CONFIG.cdpIdleThresholdMs) {
+        return;
+      }
+      // Idle — synthesise a frame. injectFrame() swallows its own errors and
+      // updates seq/framesEmitted on success.
+      this.injectFrame()
+        .then((ok) => {
+          if (ok) {
+            logger.debug('[PREVIEW_VIDEO] Idle watchdog injected frame', {
+              previewSessionId: this.previewSessionId,
+              sinceCdpMs: sinceCdp === Infinity ? null : sinceCdp,
+              framesReceivedFromCdp: this.framesReceivedFromCdp,
+            });
+          }
+        })
+        .catch(() => {
+          /* injectFrame already logs */
+        });
+    }, PREVIEW_VIDEO_CONFIG.cdpIdleCheckIntervalMs);
   }
 
   /**
@@ -627,6 +812,12 @@ export class PreviewVideoStreamService {
     if (this.statsInterval) {
       clearInterval(this.statsInterval);
       this.statsInterval = null;
+    }
+
+    // Clear CDP-idle watchdog
+    if (this.cdpIdleWatchdog) {
+      clearInterval(this.cdpIdleWatchdog);
+      this.cdpIdleWatchdog = null;
     }
 
     // Clear circuit breaker reset timeout
