@@ -659,6 +659,21 @@ export interface CreateRegressionPlanParams {
   tags?: string[];
   automationConfig?: PlanAutomationConfig;
   notificationsEnabled?: boolean;
+  /**
+   * Optional initial items to add to the plan in the same atomic call.
+   *
+   * Behaviour:
+   *   - When omitted/empty, behaves identically to the legacy create
+   *     (FE still uses `addItem` calls afterwards for that path).
+   *   - When provided, items are added IN ORDER after the plan row is
+   *     inserted. If any item insert fails, the plan is rolled back
+   *     (deleted) so the user never ends up with a half-built plan
+   *     visible in the UI.
+   *   - Each item's `planId` is filled in by the service — callers
+   *     omit it. `orderIndex` is auto-assigned by array position when
+   *     not supplied.
+   */
+  items?: Array<Omit<AddPlanItemParams, 'planId'>>;
 }
 
 /**

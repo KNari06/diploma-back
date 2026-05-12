@@ -51,10 +51,29 @@ async function loadPlanForAudit(
  */
 export async function createPlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = req.body;
+    const {
+      projectId,
+      name,
+      description,
+      isDefault,
+      tags,
+      automationConfig,
+      notificationsEnabled,
+      // Optional bulk initial items — when present, plan + items are
+      // created atomically (rollback on any item failure). Frontend
+      // wizard sends this to collapse N round-trips into 1. Other
+      // callsites that add items to an EXISTING plan still use the
+      // dedicated `POST /plans/:id/items` endpoint (addItem below).
+      items,
+    } = req.body;
 
     if (!projectId || !name) {
       res.status(400).json({ success: false, error: 'projectId and name are required' });
+      return;
+    }
+
+    if (items !== undefined && !Array.isArray(items)) {
+      res.status(400).json({ success: false, error: 'items must be an array when provided' });
       return;
     }
 
@@ -69,6 +88,7 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      items,
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
