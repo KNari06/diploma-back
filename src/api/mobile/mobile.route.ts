@@ -19,6 +19,7 @@ import {
   getMobileApp,
   getProjectPermissionPolicy,
   listMobileAppBuilds,
+  patchMobileApp,
   setProjectPermissionPolicy,
   uploadMobileApp,
 } from './mobile.controller';
@@ -78,6 +79,18 @@ router.get(
   '/projects/:projectId/app',
   requireAuth,
   asyncHandler(getMobileApp),
+);
+
+/**
+ * PATCH /api/v1/mobile/projects/:projectId/app
+ * Update only the packageName on the already-uploaded app (no file re-upload).
+ *
+ * Body: { packageName: string }
+ */
+router.patch(
+  '/projects/:projectId/app',
+  requireAuth,
+  asyncHandler(patchMobileApp),
 );
 
 /**

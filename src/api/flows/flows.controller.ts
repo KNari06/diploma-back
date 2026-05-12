@@ -55,6 +55,43 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
 
     const isMobilePlatform = typeof platform === 'string' && platform.startsWith('mobile_');
 
+    // Mobile gate: a mobile flow is unrunnable without an uploaded app AND
+    // a package name (the runner uses both to install + launch). Previously
+    // we only enforced this at editor warm-up time — the flow + initial
+    // test case still got persisted, then the user got redirected to
+    // settings. Reject up-front instead so the project state never gets a
+    // half-configured mobile flow.
+    if (isMobilePlatform) {
+      const { data: projectRow, error: projectErr } = await supabaseAdmin
+        .from('projects')
+        .select('settings')
+        .eq('id', projectId)
+        .single();
+      if (projectErr || !projectRow) {
+        res.status(404).json({ success: false, error: 'Project not found' });
+        return;
+      }
+      const mobileApp = (projectRow.settings as any)?.mobileApp as
+        | { storagePath?: string; packageName?: string }
+        | undefined;
+      if (!mobileApp?.storagePath) {
+        res.status(400).json({
+          success: false,
+          error: 'No mobile app uploaded for this project. Upload an APK/IPA in settings before creating a mobile test case.',
+          code: 'MOBILE_APP_MISSING',
+        });
+        return;
+      }
+      if (!mobileApp.packageName || !String(mobileApp.packageName).trim()) {
+        res.status(400).json({
+          success: false,
+          error: 'The uploaded mobile app has no package name. Set it in settings before creating a mobile test case.',
+          code: 'MOBILE_APP_PACKAGE_NAME_MISSING',
+        });
+        return;
+      }
+    }
+
     // Create flow
     const flow = await FlowService.create({
       moduleId,
