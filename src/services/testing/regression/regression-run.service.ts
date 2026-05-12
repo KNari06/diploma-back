@@ -415,27 +415,34 @@ export class RegressionRunService {
     // 3. steps_json conversion (step editor test cases — converted at runtime)
     if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands) && intentCase.commands.length > 0) {
       commands = intentCase.commands;
-      // Pre-compiled commands path: stitch setup/teardown at the command level.
-      // The converter is IntentStep-aware only, so we convert the extras
-      // separately and bracket the main commands. No-op when the feature
-      // flag is off or both extras are empty — see stitchCommandsForTestCase.
+      // Phase B (May 2026) — stitchCommandsForTestCase is now a pass-through.
+      // setup_steps / teardown_steps deprecated; scenario_setup bindings own
+      // the prologue. Helper call retained so any future restoration is a
+      // single-method change.
       commands = await this.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
       commands = intentCase.graph_ref.steps;
+      // Phase B (May 2026) — pass-through, see comment above.
       commands = await this.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (Array.isArray(intentCase.steps_json) && intentCase.steps_json.length > 0) {
       // Convert intent steps to executable Playwright commands (same path as preview runner).
-      // Normalise main steps through the shared helper BEFORE stitching, so
-      // every downstream consumer — web converter here, mobile runner via
-      // dispatchMobileTest — sees the same IntentStep shape. stitchPhases
-      // itself only normalises extras (setup/teardown); it trusts the main
-      // array the caller passes in. Without this step the web path and the
-      // mobile path would disagree on how raw JSONB becomes IntentStep.
-      const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
-      const normalisedMain = intentCase.steps_json.map((raw: any, i: number) =>
+      // Normalise main steps through the shared helper. Phase B (May 2026) —
+      // stitchPhases removed: setup_steps/teardown_steps columns are
+      // deprecated and always empty in production. The stitch was a no-op
+      // when both extras were empty, so dropping it is byte-identical to
+      // the prior behaviour for every existing test case. scenario_setup
+      // bindings deliver the prologue via runScenarioSetups in test-executor.
+      //
+      // Original code (preserved for Phase C rollback context):
+      //   const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
+      //   const normalisedMain = intentCase.steps_json.map((raw: any, i: number) =>
+      //     normaliseIntentStep(raw, i),
+      //   );
+      //   const { steps: stitchedSteps, counts, didStitch } = stitchPhases(normalisedMain, intentCase);
+      const { normaliseIntentStep } = await import('./intent-step-dispatch.service');
+      const stitchedSteps = intentCase.steps_json.map((raw: any, i: number) =>
         normaliseIntentStep(raw, i),
       );
-      const { steps: stitchedSteps, counts, didStitch } = stitchPhases(normalisedMain, intentCase);
 
       const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
       commands = IntentStepConverterService.convertToCommands(stitchedSteps, targetUrl, intentCase.id);
@@ -444,8 +451,6 @@ export class RegressionRunService {
         stepsCount: intentCase.steps_json.length,
         commandsCount: commands.length,
         stepsWithCompiled: intentCase.steps_json.filter((s: any) => !!s.compiled).length,
-        phaseStitched: didStitch,
-        phaseCounts: counts,
       });
     } else {
       throw new ValidationError(
@@ -462,17 +467,25 @@ export class RegressionRunService {
       );
     }
 
-    // Resolve shared_steps references BEFORE applying parameters
-    const { SharedStepResolverService } = await import('../shared-steps/shared-step-resolver.service');
-    const { commands: resolvedCommands, warnings } =
-      await SharedStepResolverService.resolveCommands(commands, intentCase.project_id);
-
-    if (warnings.length > 0) {
-      logger.warn('[REGRESSION_RUN] Shared step resolution warnings', {
-        intentTestCaseId: intentCase.id,
-        warnings,
-      });
-    }
+    // Phase B (May 2026) — shared_steps resolver is deactivated. The
+    // PlaywrightCommand `action: 'shared_steps'` mechanism never had a
+    // producer (UI, AI, importer) — see audit. scenario_setup resource
+    // bindings are the canonical reuse path. The block below is the
+    // historical call; rolled back here as a one-liner pass-through.
+    // Original code preserved verbatim to ease Phase C rollback if
+    // any unexpected DB row turns up with the dead action type.
+    //
+    //   const { SharedStepResolverService } = await import('../shared-steps/shared-step-resolver.service');
+    //   const { commands: resolvedCommands, warnings } =
+    //     await SharedStepResolverService.resolveCommands(commands, intentCase.project_id);
+    //   if (warnings.length > 0) {
+    //     logger.warn('[REGRESSION_RUN] Shared step resolution warnings', {
+    //       intentTestCaseId: intentCase.id,
+    //       warnings,
+    //     });
+    //   }
+    //   commands = this.applyParameters(resolvedCommands, parameters);
+    const resolvedCommands = commands;
 
     // Apply parameters AFTER resolution (so parent parameters apply to all expanded commands)
     commands = this.applyParameters(resolvedCommands, parameters);
@@ -504,52 +517,52 @@ export class RegressionRunService {
   }
 
   /**
-   * Command-level phase stitching for pre-compiled `commands` and
-   * `graph_ref.steps` replay paths. The steps_json path uses
-   * `stitchPhases` on IntentStep[] BEFORE conversion — richer because
-   * the converter understands all step types. Here we already have
-   * PlaywrightCommand[], so we just convert the setup/teardown
-   * IntentStep[] extras on their own and bracket the main commands.
+   * Command-level phase stitching helper — DEPRECATED in Phase B (May 2026).
    *
-   * No-op when the feature flag is off OR both extras are empty — so
-   * this method is safe to call unconditionally and regressions stay
-   * byte-identical when the flag is off.
+   * Originally bracketed pre-compiled `commands` / `graph_ref.steps` test
+   * cases with setup_steps / teardown_steps converted on the fly. The
+   * extras were always empty in production (no UI writer existed) so this
+   * was a no-op for every test in practice. scenario_setup bindings are
+   * the canonical reuse mechanism now and they run via runScenarioSetups
+   * in the executor, not via this helper.
+   *
+   * Now a pass-through. Original implementation preserved in commented
+   * form for Phase C rollback context.
    */
   private static async stitchCommandsForTestCase(
     mainCommands: any[],
-    intentCase: any,
-    targetUrl: string,
+    _intentCase: any,
+    _targetUrl: string,
   ): Promise<any[]> {
-    const { stitchPhases } = await import('./intent-step-dispatch.service');
-    // Pass an EMPTY main array — we only need the helper to produce the
-    // setup/teardown IntentSteps; main is already in PlaywrightCommand
-    // shape and doesn't round-trip through the converter.
-    const { steps: extras, counts, didStitch } = stitchPhases([], intentCase);
-    if (!didStitch) return mainCommands;
-
-    const setupSteps = extras.filter((s) => s.phase === 'setup');
-    const teardownSteps = extras.filter((s) => s.phase === 'teardown');
-
-    const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
-    const setupCommands = setupSteps.length > 0
-      ? IntentStepConverterService.convertToCommands(setupSteps, targetUrl, intentCase.id)
-      : [];
-    const teardownCommands = teardownSteps.length > 0
-      ? IntentStepConverterService.convertToCommands(teardownSteps, targetUrl, intentCase.id)
-      : [];
-
-    // Main commands inherit an explicit 'main' phase tag so the executor
-    // and report layer treat the boundary consistently (absent = legacy).
-    const taggedMain = mainCommands.map((cmd: any) => ({ ...cmd, phase: 'main' as const }));
-
-    logger.info('[REGRESSION_RUN] Stitched command-level phases', {
-      intentTestCaseId: intentCase.id,
-      setup: setupCommands.length,
-      main: taggedMain.length,
-      teardown: teardownCommands.length,
-      counts,
-    });
-    return [...setupCommands, ...taggedMain, ...teardownCommands];
+    return mainCommands;
+    //
+    // === ORIGINAL IMPLEMENTATION (Phase B deactivation, May 2026) ===
+    //
+    // const { stitchPhases } = await import('./intent-step-dispatch.service');
+    // const { steps: extras, counts, didStitch } = stitchPhases([], intentCase);
+    // if (!didStitch) return mainCommands;
+    //
+    // const setupSteps = extras.filter((s) => s.phase === 'setup');
+    // const teardownSteps = extras.filter((s) => s.phase === 'teardown');
+    //
+    // const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
+    // const setupCommands = setupSteps.length > 0
+    //   ? IntentStepConverterService.convertToCommands(setupSteps, targetUrl, intentCase.id)
+    //   : [];
+    // const teardownCommands = teardownSteps.length > 0
+    //   ? IntentStepConverterService.convertToCommands(teardownSteps, targetUrl, intentCase.id)
+    //   : [];
+    //
+    // const taggedMain = mainCommands.map((cmd: any) => ({ ...cmd, phase: 'main' as const }));
+    //
+    // logger.info('[REGRESSION_RUN] Stitched command-level phases', {
+    //   intentTestCaseId: intentCase.id,
+    //   setup: setupCommands.length,
+    //   main: taggedMain.length,
+    //   teardown: teardownCommands.length,
+    //   counts,
+    // });
+    // return [...setupCommands, ...taggedMain, ...teardownCommands];
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -626,20 +639,27 @@ export class RegressionRunService {
 
     // 3. Extract intent steps from steps_json via the shared IntentStep
     // normaliser (single source of truth for which fields survive the
-    // JSONB round-trip — see intent-step-dispatch.service.ts). Then hand off
-    // to stitchPhases so setup_steps / teardown_steps are prepended and
-    // appended with proper `phase` markers. When the case has no extras,
-    // stitchPhases is a no-op and the mobile job data is byte-identical
-    // to what it was before Phase 3.
-    const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
-    const rawMainSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
+    // JSONB round-trip — see intent-step-dispatch.service.ts).
+    //
+    // Phase B (May 2026) — stitchPhases removed: setup_steps/teardown_steps
+    // were a never-used column duplicate. The compiler in
+    // resource-step-compiler.service.ts already prepends scenario_setup
+    // resource bindings as setup-phase steps before the mobile runner
+    // sees them. No work to do here beyond normalisation.
+    //
+    // Original code (preserved for Phase C rollback context):
+    //   const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    //   const rawMainSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
+    //     normaliseIntentStep(step, index),
+    //   );
+    //   const { steps: stitchedSteps, counts: phaseCounts, didStitch } =
+    //     stitchPhases(rawMainSteps, intentCase);
+    const { normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    const stitchedSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
       normaliseIntentStep(step, index),
     );
-    const { steps: stitchedSteps, counts: phaseCounts, didStitch } =
-      stitchPhases(rawMainSteps, intentCase);
 
-    // Phase 6: apply plan-level parameters to stitched steps (main + setup
-    // + teardown all get the substitution in one pass). Walks every string
+    // Phase 6: apply plan-level parameters to the steps. Walks every string
     // leaf recursively so placeholders in options, bindingHints, etc.
     // resolve too — not just top-level `value`. No-op when `parameters`
     // is empty, preserving pre-Phase-6 behaviour bit-for-bit.
@@ -649,13 +669,6 @@ export class RegressionRunService {
       throw new ValidationError(
         `Mobile test case "${intentCase.name}" has no steps (steps_json is empty)`,
       );
-    }
-
-    if (didStitch) {
-      logger.info('[REGRESSION_RUN] Mobile phases stitched', {
-        intentTestCaseId: intentCase.id,
-        counts: phaseCounts,
-      });
     }
 
     // 3b. Shared resources (Login / Environment / Secret / ...) — Option A.

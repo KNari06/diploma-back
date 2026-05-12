@@ -40,6 +40,7 @@ import {
   type ApplyResult,
 } from '@/services/test-resource';
 import { createCommandExecutorRecipeRunner } from '@/services/test-resource/runtime/recipe-executor';
+import { runScenarioSetups } from '@/services/test-resource/runtime/scenario-setup-runner';
 
 /**
  * Resolve workspaceId from projectId (for AI usage tracking).
@@ -503,6 +504,53 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
 
     const requestTracker = new RequestTracker(page);
     await navigateToUrl(page, testData, requestTracker);
+    await checkTestCancelled(testData.testId);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // scenario_setup runner — execute reusable setup IntentStep[] AFTER
+    // auth/env/secret/fixture have applied AND after the initial nav,
+    // BEFORE any test-body step runs. Mirrors the mobile compiler's
+    // "prepend setup steps before test body" semantics — see
+    // src/services/test-resource/runtime/scenario-setup-runner.ts.
+    //
+    // Topological rank in resource-applier puts scenario_setup last
+    // (rank 4) so by the time we get here:
+    //   • auth has injected storageState — page is logged in.
+    //   • secret/env/fixture have populated runVariables.
+    //   • The page is navigated to testData.url, so setup steps can be
+    //     authored from that visible starting point (no need for an
+    //     explicit goto inside the recipe).
+    //
+    // Failure of a `required: true` scenario_setup binding throws, which
+    // propagates up to the outer try and treats the test as failed
+    // before the body runs — the same way a required auth failure does.
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (testData.resourceBindings && testData.resourceBindings.length > 0 && resourceApply) {
+      try {
+        const setupResult = await runScenarioSetups({
+          page,
+          context,
+          userId: testData.userId ?? '',
+          projectId: testData.projectId,
+          testUrl: testData.url,
+          bindings: testData.resourceBindings,
+          runVariables: resourceApply.runVariables,
+        });
+        if (setupResult.executed.length > 0 || setupResult.skipped.length > 0) {
+          logger.info('[PLAYWRIGHT] scenario_setup runner finished', {
+            testId: testData.testId,
+            executed: setupResult.executed.length,
+            skipped: setupResult.skipped.length,
+          });
+        }
+      } catch (setupErr) {
+        logger.error('[PLAYWRIGHT] Required scenario_setup failed', {
+          testId: testData.testId,
+          error: setupErr instanceof Error ? setupErr.message : String(setupErr),
+        });
+        throw setupErr;
+      }
+    }
     await checkTestCancelled(testData.testId);
 
     // ═══════════════════════════════════════════════════════════════════════════

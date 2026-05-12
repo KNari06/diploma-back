@@ -493,19 +493,18 @@ export interface IntentTestCaseWithSuggestions extends IntentTestCase {
  */
 export type SavedTestCaseWithSuggestions = IntentTestCaseWithSuggestions;
 
-/**
- * Shared step command - references another test case's commands
- * When encountered during execution, the referenced test case's
- * commands are loaded and executed inline in the same browser session.
- *
- * Usage: Insert into a test case's commands array to reuse steps from another test
- * (e.g., login steps shared across checkout, profile, settings flows)
- */
-export interface SharedStepCommand {
-  action: 'shared_steps';
-  test_case_id: string;   // UUID of the referenced intent_test_cases row
-  description?: string;   // Human-readable label (e.g., "Login as student")
-}
+// Phase B (May 2026) — SharedStepCommand type DEPRECATED.
+// The `action: 'shared_steps'` PlaywrightCommand was a planned-never-built
+// mechanism. No producer ever existed; scenario_setup test_resource bindings
+// own the "reuse steps across tests" use case now at the IntentStep layer.
+// Type kept here in commented form so that any historic JSONB row decoder
+// referencing this name can find the original shape during Phase C cleanup.
+//
+//   export interface SharedStepCommand {
+//     action: 'shared_steps';
+//     test_case_id: string;   // UUID of the referenced intent_test_cases row
+//     description?: string;   // Human-readable label (e.g., "Login as student")
+//   }
 
 // ============================================================================
 // PLAN AUTOMATION CONFIG

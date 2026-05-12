@@ -14,7 +14,12 @@ import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { supabaseAdmin } from '@/db/supabase';
 import { generateEmbedding, cosineSimilarity } from '@/services/ai/core/embedding.service';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { SharedStepResolverService } from '@/services/testing/shared-steps/shared-step-resolver.service';
+// Phase B (May 2026) — shared_steps resolver deactivated. See regression-run
+// service for full rationale; this file's `hasSharedSteps` branch (below)
+// was always false in production because nothing emits `action: 'shared_steps'`.
+// Import preserved in comment form to ease Phase C rollback if a stray row
+// surfaces.
+//   import { SharedStepResolverService } from '@/services/testing/shared-steps/shared-step-resolver.service';
 import { logger } from '@/utils/core/logger';
 import type { AICommand } from '@/agent/core/lite/lite-types';
 import type {
@@ -416,24 +421,28 @@ Return JSON: {"isExactMatch": boolean, "confidence": number, "matchedIndex": num
     const steps: PrefilledStep[] = [];
 
     for (const testCase of relatedCases) {
-      let commands = testCase.commands;
+      const commands = testCase.commands;
 
-      // Resolve shared_steps references if present
-      const hasSharedSteps = commands.some((c: any) => c.action === 'shared_steps');
-      if (hasSharedSteps) {
-        try {
-          const resolved = await SharedStepResolverService.resolveCommands(
-            commands,
-            testCase.projectId
-          );
-          commands = resolved.commands;
-        } catch (err) {
-          logger.warn('[RESOLVER] Failed to resolve shared steps, using raw commands', {
-            testCaseId: testCase.id,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
+      // Phase B (May 2026) — shared_steps resolution removed. `hasSharedSteps`
+      // was always false in production (no producer of action='shared_steps'
+      // commands exists anywhere in the codebase). Block preserved here as
+      // a comment for Phase C rollback context.
+      //
+      //   const hasSharedSteps = commands.some((c: any) => c.action === 'shared_steps');
+      //   if (hasSharedSteps) {
+      //     try {
+      //       const resolved = await SharedStepResolverService.resolveCommands(
+      //         commands,
+      //         testCase.projectId
+      //       );
+      //       commands = resolved.commands;
+      //     } catch (err) {
+      //       logger.warn('[RESOLVER] Failed to resolve shared steps, using raw commands', {
+      //         testCaseId: testCase.id,
+      //         error: err instanceof Error ? err.message : String(err),
+      //       });
+      //     }
+      //   }
 
       // Convert PlaywrightCommand → AICommand
       for (let i = 0; i < commands.length; i++) {

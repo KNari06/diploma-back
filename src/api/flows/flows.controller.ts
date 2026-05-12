@@ -101,8 +101,13 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           commands: [],
           steps_json: [],
           preconditions: preconditions || [],
-          setup_steps: [],
-          teardown_steps: [],
+          // Phase A (May 2026) — setup_steps / teardown_steps inline-on-test-case
+          // are being deprecated in favour of `scenario_setup` test_resource
+          // bindings (which compile into the same `phase:'setup'` prologue at
+          // run time but are reusable across many tests). We stop seeding the
+          // empty literals here — the columns still exist and default to `[]`
+          // at the DB level, so no read path breaks. Phase B will drop the
+          // remaining stitchPhases() callsites; Phase C will drop the columns.
           tags: tags || [],
           priority: priority || null,
           expected_result: expectedResult || null,

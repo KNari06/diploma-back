@@ -556,8 +556,12 @@ describe('compileFile / compileDevice / compileOAuthToken', () => {
 // scenario_setup / data_fixture
 // ═══════════════════════════════════════════════════════════════════════════
 
-describe('scenario_setup (bug #9)', () => {
-  it('logs a warn and emits zero steps', async () => {
+describe('scenario_setup', () => {
+  // Empty scenario_setup (no config.steps) should soft-warn and emit zero
+  // steps. This used to be the "not orchestrated" stub; after slice 1 of
+  // setup-blocks we DO orchestrate scenario_setup on mobile, but a setup
+  // with literally no steps remains a soft no-op (with a diagnostic warn).
+  it('warns and emits zero steps when config.steps is empty', async () => {
     const warnSpy = jest
       .spyOn(require('@/utils/core/logger').logger, 'warn')
       .mockImplementation(() => undefined);
@@ -573,10 +577,36 @@ describe('scenario_setup (bug #9)', () => {
     expect(r.steps).toHaveLength(0);
     expect(r.applied).toHaveLength(1);
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining('scenario_setup is not orchestrated on mobile'),
+      expect.stringContaining('scenario_setup has no steps after expansion'),
       expect.any(Object),
     );
     warnSpy.mockRestore();
+  });
+
+  it('emits steps verbatim when config.steps is populated', async () => {
+    mockedModule.loadDecrypted.mockResolvedValueOnce(
+      makeResource({
+        kind: 'scenario_setup',
+        name: 'LoginBundle',
+        config: {
+          platform: 'android',
+          steps: [
+            { type: 'tap', description: 'Email field' },
+            { type: 'type', description: 'Email field', value: 'demo@x.com' },
+          ],
+        },
+      }),
+    );
+    const r = await ResourceStepCompilerService.compileForMobile({
+      bindings: [binding('scenario_setup', 's1')],
+      userId: 'u1',
+      projectId: 'p1',
+      platform: 'android',
+    });
+    expect(r.steps).toHaveLength(2);
+    expect(r.steps[0].type).toBe('tap');
+    expect(r.steps[1].value).toBe('demo@x.com');
+    expect(r.steps.every((s) => s.phase === 'setup')).toBe(true);
   });
 });
 

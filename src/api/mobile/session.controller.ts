@@ -121,6 +121,24 @@ export interface WarmupData {
   installedPackage?: string;
   /** Supabase storage path of the APK currently installed */
   appStoragePath?: string;
+  /**
+   * Audit BUG-1 fix: persist the `deviceSelector` used to BOOT this
+   * session so a later warmup can compare against the new request's
+   * selector and detect "user wants to switch devices."
+   *
+   * If the new request asks for a DIFFERENT serial (or source), we
+   * MUST NOT reuse this cached session — otherwise the user picks
+   * device B in the popover, presses Warmup, and silently keeps
+   * landing on device A. Persisting it here lets the cached-reuse
+   * branch above invalidate the cache when the selectors disagree.
+   *
+   * Optional because legacy entries (pre-fix) won't have it; the
+   * comparison defaults to "no recorded selector → reuse is safe."
+   */
+  deviceSelector?: {
+    source?: 'local-emulator' | 'local-physical' | 'cloud';
+    serial?: string;
+  };
 }
 
 /**
@@ -339,6 +357,57 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           });
           await redisConnection.del(redisKey);
           // Fall through to create a new session below
+        } else if (
+          // Audit BUG-1 fix: when the caller pinned a new
+          // `deviceSelector` that DOESN'T match what booted this
+          // cached session, we must NOT reuse it — otherwise picking
+          // device B in the popover and pressing Warmup silently lands
+          // back on device A. Compare serial + source: a serial
+          // mismatch is the loud "user explicitly chose differently"
+          // case; a source mismatch (e.g. physical vs emulator on the
+          // same project) is the same intent at a coarser granularity.
+          //
+          // Asymmetric: a request WITHOUT a selector (Default) reuses
+          // anything (intentional — "Default" means "I don't care").
+          // A request WITH a selector requires a match.
+          deviceSelector
+          && (
+            (deviceSelector.serial !== undefined
+              && existing.deviceSelector?.serial !== deviceSelector.serial)
+            || (deviceSelector.source !== undefined
+              && existing.deviceSelector?.source !== deviceSelector.source)
+          )
+        ) {
+          logger.info('[MOBILE_SESSION] Selector changed — invalidating cached session', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+            previousSelector: existing.deviceSelector ?? null,
+            requestedSelector: deviceSelector,
+          });
+          // Audit follow-up: drop the Redis pointer FIRST, then destroy
+          // the runner-side session. Reversing the historical order
+          // closes a concurrent-warmup race:
+          //
+          //   A: starts destroy() ───────── del(redisKey) ──> done
+          //   B:                  read(redisKey) → STILL POINTS AT A's
+          //                       being-destroyed session, then issues
+          //                       install/launch on it → 404 from runner.
+          //
+          // With del-first, B reads "no session" and falls through to
+          // create a fresh one. The destroy() then runs best-effort
+          // (errors already swallowed) — at worst we leak a session
+          // that the runner's TTL/unplug-watchdog will reap anyway.
+          await redisConnection.del(redisKey);
+          try {
+            await client.destroySession(existing.sessionId);
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] destroySession during selector-switch failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Fall through to create a new session below
         } else {
           logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
             projectId,
@@ -409,15 +478,23 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // sees only their own apps on a shared redroid container. See
     // qait-mobile-runner/docs/multi-user-known-risks.md.
     //
-    // Phase 2.6: when the caller pinned a `deviceSelector` for a physical
-    // device, the pool path is meaningless — pre-booted emulators can't
-    // be retargeted to a USB phone. Skip pool entirely and go straight
-    // to cold-boot with the selector. Emulator/cloud selectors still try
-    // pool first because the pool's pre-booted devices match those sources.
+    // Phase 2.6: when the caller pinned a `deviceSelector`, the pool
+    // path is only meaningful if NO specific serial was requested.
+    //
+    // Bypass cases:
+    //   1. `source === 'local-physical'` — pre-booted emulators can't
+    //      be retargeted to a USB phone.
+    //   2. ANY `serial` pinned — even for `source === 'local-emulator'`,
+    //      because the pool may have a DIFFERENT emulator pre-booted
+    //      and the runner has no contract to re-acquire a specific
+    //      serial out of the pool. Audit BUG-4: shipping the
+    //      "show emulators in popover" UX without this gate would
+    //      silently use whatever's pre-booted instead of the user's
+    //      explicit pick. Default (no selector) keeps pool fast-path.
     let session: Awaited<ReturnType<typeof client.createSession>>;
     const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
     if (skipPoolForPhysical) {
-      logger.info('[MOBILE_SESSION] Physical device pinned — bypassing pool', {
+      logger.info('[MOBILE_SESSION] Pinned selector — bypassing pool', {
         projectId,
         deviceSelector,
       });
@@ -474,6 +551,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       runnerSocketUrl,
       platform,
       createdAt: new Date().toISOString(),
+      // Audit BUG-1 fix: persist the selector so the next warmup can
+      // detect "user wants a different device" and invalidate the
+      // cache instead of silently reusing the wrong device. Only
+      // stored when a non-default selector was actually used.
+      ...(deviceSelector ? { deviceSelector } : {}),
     };
 
     await redisConnection.set(

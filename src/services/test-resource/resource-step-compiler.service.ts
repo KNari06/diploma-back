@@ -47,6 +47,7 @@ import type {
   ResourceStatus,
 } from './types';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { expandScenarioSetupRecursively } from './runtime/scenario-setup-expander';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Output types — mirror ApplyResult shape so snapshot writers are uniform
@@ -249,7 +250,26 @@ export class ResourceStepCompilerService {
       let compiledSteps: CompiledResourceStep[] = [];
       let compileErr: string | undefined;
       try {
-        compiledSteps = compileByKind(resource);
+        // scenario_setup needs async pre-expansion (nested `use_setup`
+        // references walk the DB). We mutate a SHALLOW COPY of the
+        // resource so the downstream sync `compileByKind` sees a flat
+        // `config.steps` array. The original DB row is untouched —
+        // mutating the loadDecrypted result would silently propagate
+        // resolved steps into the adapter's apply() call too.
+        let resourceForCompile = resource;
+        if (resource.kind === 'scenario_setup') {
+          const flatSteps = await expandScenarioSetupRecursively(
+            resource,
+            userId,
+            new Set<string>(),
+            0,
+          );
+          resourceForCompile = {
+            ...resource,
+            config: { ...resource.config, steps: flatSteps },
+          };
+        }
+        compiledSteps = compileByKind(resourceForCompile);
       } catch (err) {
         compileErr = errMsg(err);
         logger.error('[RESOURCE_STEP_COMPILER] Compile failed', {
@@ -336,15 +356,13 @@ function compileByKind(
       // compileDataFixture for the unwrap (`config.data` envelope).
       return compileDataFixture(resource);
     case 'scenario_setup':
-      // scenario_setup is a BUNDLE — on web the adapter orchestrates the
-      // child resources. Mobile doesn't implement that orchestration yet,
-      // and the children MUST be bound individually to work. We throw a
-      // WARN so a silent no-op doesn't look like "it ran successfully".
-      logger.warn(
-        '[RESOURCE_STEP_COMPILER] scenario_setup is not orchestrated on mobile — bind its child resources individually',
-        { resourceId: resource.id, name: resource.name },
-      );
-      return [];
+      // Reusable IntentStep prologue. `compileScenarioSetup` is called
+      // BEFORE this switch by `compileForMobile` so nested `use_setup`
+      // references are already expanded and persisted on the resource
+      // copy we receive here. By the time we land in this branch the
+      // resource.config.steps is a flat array of plain steps ready to
+      // render. See `expandScenarioSetupRecursively` for the unwrap.
+      return compileScenarioSetup(resource);
     default:
       // Future kinds: fail loud so we notice when schema adds something
       // we haven't mapped.
@@ -526,6 +544,34 @@ function compileDataFixture(resource: DecryptedResource): CompiledResourceStep[]
     );
   }
   return steps;
+}
+
+/**
+ * Scenario setup: pre-recorded sequence of IntentSteps that puts the app
+ * into a known state before the test body runs. The resource arrives here
+ * with `use_setup` references ALREADY expanded by
+ * `expandScenarioSetupRecursively` (async pre-pass) — this function
+ * therefore only emits the steps verbatim, tagging them as setup-phase.
+ *
+ * We deliberately mirror `normaliseRecipeStep` so a single normalisation
+ * contract governs every IntentStep injected into the runner.
+ */
+function compileScenarioSetup(
+  resource: DecryptedResource,
+): CompiledResourceStep[] {
+  const config = (resource.config ?? {}) as Record<string, unknown>;
+  const rawSteps = config.steps;
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0) {
+    logger.warn(
+      '[RESOURCE_STEP_COMPILER] scenario_setup has no steps after expansion — emitting nothing',
+      { resourceId: resource.id, name: resource.name },
+    );
+    return [];
+  }
+
+  return rawSteps.map((raw, index) =>
+    normaliseRecipeStep(raw, resource, index),
+  );
 }
 
 /**
