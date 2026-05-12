@@ -131,8 +131,15 @@ export interface MobileIntentStepOptions {
   otpCode?: string;
   otpExtractPattern?: string;
   otpSenderFilter?: string;
-  // Permission dialog
-  permissionAction?: 'allow' | 'deny' | 'allow_always';
+  // Permission dialog. Modern Android (11+) runtime-permission dialogs show
+  // up to four buttons depending on the permission family:
+  //   - "While using the app" / "Allow"   → allow / allow_foreground
+  //   - "Only this time"                  → allow_once
+  //   - "Allow all the time"              → allow_always (background, location)
+  //   - "Don't allow" / "Deny"            → deny
+  // iOS WDA acceptAlert/dismissAlert collapses the allow_* variants to a
+  // single "tap the first accept button" behaviour.
+  permissionAction?: 'allow' | 'deny' | 'allow_always' | 'allow_foreground' | 'allow_once';
   // Network simulation
   networkPreset?: '2g' | '3g' | '4g' | '5g' | 'wifi' | 'offline';
   networkLatencyMs?: number;
