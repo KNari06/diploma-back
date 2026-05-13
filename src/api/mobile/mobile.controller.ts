@@ -341,13 +341,20 @@ export async function deleteMobileApp(req: Request, res: Response): Promise<void
 // ═══════════════════════════════════════════════════════════════════════════
 // PERMISSION POLICY  (project-level default)
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Type + validator live in `services/mobile/permission-policy.service.ts` —
+// this file used to duplicate them, which made it easy for the shared
+// service and the HTTP handlers to drift (e.g. add 'prompt' to the union
+// in one place but not the other). Single source of truth now.
 
-export type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
-
-const VALID_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
+import {
+  VALID_PERMISSION_POLICIES,
+  type MobilePermissionPolicy,
+} from '@/services/mobile/permission-policy.service';
 
 function isValidPolicy(value: unknown): value is MobilePermissionPolicy {
-  return typeof value === 'string' && (VALID_POLICIES as readonly string[]).includes(value);
+  return typeof value === 'string'
+    && (VALID_PERMISSION_POLICIES as readonly string[]).includes(value);
 }
 
 /**
@@ -392,7 +399,7 @@ export async function setProjectPermissionPolicy(req: Request, res: Response): P
   if (!isValidPolicy(policy)) {
     res.status(400).json({
       success: false,
-      error: `policy must be one of: ${VALID_POLICIES.join(', ')}`,
+      error: `policy must be one of: ${VALID_PERMISSION_POLICIES.join(', ')}`,
     });
     return;
   }

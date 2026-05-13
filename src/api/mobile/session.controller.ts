@@ -28,6 +28,7 @@ import { Request, Response } from 'express';
 // `WarmupData` interface remain exported from this file because the
 // service imports them.
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
+import { applyProjectPolicyToSession } from '@/services/mobile/permission-policy.service';
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -68,36 +69,6 @@ function getRunnerAuth(): string {
  */
 function currentRunnerSocketUrl(): string {
   return env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
-}
-
-type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
-const VALID_PERMISSION_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
-
-/**
- * Resolve the effective permission policy for a session at warmup time.
- *
- * Precedence: test-level override (set later during run) > project default >
- * runner default ('auto_allow'). Since we don't know which test will run
- * during warmup, we seed the session with the project default; per-test
- * overrides can PATCH the runner at run start if they differ.
- *
- * Returns `null` if the stored value is missing or invalid — callers then
- * leave the session on the runner default (avoiding a round-trip).
- */
-async function resolveProjectPermissionPolicy(
-  projectId: string,
-  userId: string,
-): Promise<MobilePermissionPolicy | null> {
-  try {
-    const project = await ProjectService.getProject(projectId, userId);
-    const stored = project?.settings?.mobilePermissionPolicy;
-    if (typeof stored === 'string' && (VALID_PERMISSION_POLICIES as readonly string[]).includes(stored)) {
-      return stored as MobilePermissionPolicy;
-    }
-  } catch {
-    // Swallow — network/db hiccup falls through to the runner default.
-  }
-  return null;
 }
 
 /**
@@ -526,21 +497,18 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // Emulator is up — nudge the loader past the "preparing env" stage.
     emitWarmupProgress(userId, 'launching_browser', 15);
 
-    // Propagate project-level permission policy to the runner. Best-effort:
-    // the runner defaults to 'auto_allow' when the patch fails, which is the
-    // same behaviour a newly-created project gets, so we never block warmup
-    // on this call. Tests may later override the policy at run time.
-    try {
-      const policy = await resolveProjectPermissionPolicy(projectId, userId);
-      if (policy) {
-        await client.setPermissionPolicy(session.sessionId, policy);
-      }
-    } catch (err) {
-      logger.debug('[MOBILE_SESSION] Failed to propagate permission policy (non-fatal)', {
-        sessionId: session.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    // Propagate project-level permission policy to the runner. Delegates
+    // to the shared service so warmup, regression worker, and CI runs
+    // all read from the same precedence chain (project default →
+    // runner default). Non-fatal: any failure logs at debug and leaves
+    // the session on the runner default.
+    await applyProjectPolicyToSession({
+      client,
+      sessionId: session.sessionId,
+      projectId,
+      userId,
+      context: { source: 'warmup' },
+    });
 
     const runnerSocketUrl = currentRunnerSocketUrl();
 

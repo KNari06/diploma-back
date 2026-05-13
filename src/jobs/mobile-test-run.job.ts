@@ -379,6 +379,44 @@ export class MobileTestRunJobHandler {
         });
       }
 
+      // ── Phase 3a: Apply project-level runtime-permission policy ────
+      // Editor warmup applies this during the warmup HTTP handler, but
+      // regression/CI runs reach the runner through this worker WITHOUT
+      // going through warmup. Without this call the user's project-level
+      // setting (auto_allow / auto_deny / manual) silently has no effect
+      // on regression runs — they always got the runner's hard-coded
+      // `auto_allow` default. Applying it after EVERY acquisition path
+      // covers all three cases:
+      //
+      //   - 'pool'    : session was pre-booted by the runner with
+      //                 default `auto_allow`; PATCH overrides it.
+      //   - 'warmup'  : session already received the same PATCH during
+      //                 the editor warmup → PATCH is a no-op (same value).
+      //   - 'cold'    : brand-new session, default `auto_allow`; PATCH
+      //                 overrides if the project picked something else.
+      //
+      // The helper is non-fatal end-to-end: if the project has no policy
+      // stored, or the runner PATCH fails, we leave the session on the
+      // runner default and continue — same behaviour the warmup path has.
+      if (sessionId && projectId) {
+        const { applyProjectPolicyToSession } = await import('@/services/mobile/permission-policy.service');
+        const appliedPolicy = await applyProjectPolicyToSession({
+          client,
+          sessionId,
+          projectId,
+          userId,
+          context: { testId, sessionSource, platform },
+        });
+        if (appliedPolicy) {
+          logger.debug('[MOBILE-TEST] Permission policy applied', {
+            testId,
+            sessionId,
+            sessionSource,
+            policy: appliedPolicy,
+          });
+        }
+      }
+
       // ── Phase 3b: Prepare app via shared MobileAppPrepService ──────
       // Single primitive shared with the editor warmup
       // (session.controller.ts:warmupSession). Three branches inside the

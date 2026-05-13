@@ -23,3 +23,9 @@ export type {
 export { MobileRunnerError } from './mobile-runner.types';
 export { CiRunService } from './ci-run.service';
 export type { CiRunData, CiRunStatus } from './ci-run.service';
+export {
+  resolveProjectPermissionPolicy,
+  applyProjectPolicyToSession,
+  VALID_PERMISSION_POLICIES,
+} from './permission-policy.service';
+export type { MobilePermissionPolicy } from './permission-policy.service';
