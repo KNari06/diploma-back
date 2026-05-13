@@ -1,0 +1,1449 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>QAIT — Mobile Test Orchestration: Design Discussion Document</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --bg-card: #1a2028;
+    --bg-card-hover: #1f2730;
+    --fg: #e6edf3;
+    --fg-muted: #8b949e;
+    --fg-dim: #6e7681;
+    --accent: #58a6ff;
+    --accent-2: #a371f7;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+    --yellow: #e3b341;
+    --border: #30363d;
+    --border-strong: #444c56;
+    --code-bg: #161b22;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.6;
+    font-size: 15px;
+  }
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 48px 32px;
+  }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 24px;
+    margin-bottom: 40px;
+  }
+  h1 {
+    font-size: 28px;
+    margin: 0 0 8px;
+    font-weight: 600;
+  }
+  .subtitle {
+    color: var(--fg-muted);
+    font-size: 14px;
+  }
+  h2 {
+    font-size: 22px;
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+  }
+  h3 {
+    font-size: 17px;
+    margin: 28px 0 12px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h4 {
+    font-size: 15px;
+    margin: 20px 0 8px;
+    color: var(--fg);
+    font-weight: 600;
+  }
+  p { margin: 8px 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SF Mono", Monaco, Consolas, monospace;
+    font-size: 13px;
+    color: #f0883e;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 12px 0;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    color: var(--fg);
+  }
+  .toc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin-bottom: 32px;
+  }
+  .toc h3 {
+    margin-top: 0;
+    color: var(--fg);
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--fg-muted);
+  }
+  .toc ol {
+    margin: 0;
+    padding-left: 20px;
+  }
+  .toc li { margin: 4px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .card.warn { border-left: 3px solid var(--orange); }
+  .card.danger { border-left: 3px solid var(--red); }
+  .card.ok { border-left: 3px solid var(--green); }
+  .card.info { border-left: 3px solid var(--accent); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 13px;
+  }
+  th, td {
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    background: var(--bg-card);
+    color: var(--fg-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+  }
+  td.ok { color: var(--green); }
+  td.bad { color: var(--red); }
+  td.warn { color: var(--orange); }
+
+  .schema {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+    font-family: "SF Mono", Monaco, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.7;
+    overflow-x: auto;
+    white-space: pre;
+    color: #d2a8ff;
+  }
+  .schema .label { color: var(--fg-muted); font-style: italic; }
+  .schema .ok { color: var(--green); }
+  .schema .bad { color: var(--red); }
+  .schema .arrow { color: var(--accent); }
+
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .pill.green { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+  .pill.red { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+  .pill.orange { background: rgba(210, 153, 34, 0.15); color: var(--orange); }
+  .pill.blue { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+  .pill.purple { background: rgba(163, 113, 247, 0.15); color: var(--accent-2); }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 16px 0;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 16px;
+    margin: 16px 0;
+  }
+  @media (max-width: 800px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+
+  .quote {
+    border-left: 3px solid var(--accent);
+    padding: 8px 16px;
+    margin: 16px 0;
+    color: var(--fg-muted);
+    font-style: italic;
+  }
+
+  .file-ref {
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-family: "SF Mono", monospace;
+  }
+
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+
+  .legend {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin: 8px 0 16px;
+  }
+  .legend span::before {
+    content: "■";
+    margin-right: 4px;
+  }
+  .legend .pmclear::before { color: var(--orange); }
+  .legend .scenario::before { color: var(--accent-2); }
+  .legend .test::before { color: var(--green); }
+  .legend .skip::before { color: var(--fg-dim); }
+  .legend .fail::before { color: var(--red); }
+
+  .footer-note {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>QAIT — Mobile Test Orchestration</h1>
+  <div class="subtitle">Design Discussion Document · for team review · status: draft for decision</div>
+</header>
+
+<div class="toc">
+  <h3>Содержание</h3>
+  <ol>
+    <li><a href="#problem">Проблема и контекст</a></li>
+    <li><a href="#current">Что есть в коде сейчас</a></li>
+    <li><a href="#mental-models">Две ментальные модели юзера</a></li>
+    <li><a href="#option-a">Вариант A — Scenarios (изолированные тесты с переиспользуемым прологом)</a></li>
+    <li><a href="#option-b">Вариант B — Sequential Chain (линейная последовательность)</a></li>
+    <li><a href="#option-c">Вариант C — State Cache (scenario + кеш состояния)</a></li>
+    <li><a href="#option-d">Вариант D — Hybrid Test Suite (рекомендуемый)</a></li>
+    <li><a href="#comparison">Сравнительная таблица всех вариантов</a></li>
+    <li><a href="#failure-modes">Failure modes: что ломается и как починить</a></li>
+    <li><a href="#industry">Что делает индустрия</a></li>
+    <li><a href="#ux-mockups">UX-наброски</a></li>
+    <li><a href="#cost-estimates">Оценка работы</a></li>
+    <li><a href="#decision">Что нужно решить команде</a></li>
+    <li><a href="#open-questions">Открытые вопросы</a></li>
+    <li><a href="#addendum">Аддендум — детали из обсуждения</a></li>
+  </ol>
+</div>
+
+<!-- ──────────────────────── PROBLEM ──────────────────────── -->
+<section id="problem">
+<h2>1. Проблема и контекст</h2>
+
+<p>У нас есть mobile-тестирование (Android / iOS / Flutter). Юзеры записывают тест-кейсы и хотят:</p>
+<ul>
+  <li>Запускать их в регрессии последовательно (в коде <code>MAX_MOBILE_IN_FLIGHT=1</code>)</li>
+  <li>Чтобы тест "edit profile" мог стартовать с уже залогиненного состояния — без переписывания логина в каждом тесте</li>
+  <li>Чтобы при поломке одного теста не валилась вся регрессия</li>
+  <li>Чтобы регрессия не занимала час из-за 50 логинов подряд</li>
+</ul>
+
+<p>Это классическая дилемма test orchestration на mobile, где:</p>
+<ul>
+  <li>Нельзя сериализовать app state (как <code>storageState.json</code> на вебе)</li>
+  <li>Каждое приложение имеет дерево навигации с глубиной 3-5 экранов</li>
+  <li>Login занимает 15-30 секунд</li>
+  <li>State приложения не предсказуем после краша или флака</li>
+</ul>
+
+<div class="card warn">
+  <strong>Документ — это не план реализации.</strong> Это сравнение 4 вариантов архитектуры, чтобы команда могла выбрать. Каждый вариант разобран по факту кода — что есть, что надо добавить, что сломается.
+</div>
+</section>
+
+<!-- ──────────────────────── CURRENT ──────────────────────── -->
+<section id="current">
+<h2>2. Что есть в коде сейчас</h2>
+
+<p>Прежде чем рассуждать о вариантах — что мы имеем прямо сейчас:</p>
+
+<h3>2.1 Текущий runtime для каждого теста</h3>
+
+<div class="schema">┌─ Mobile регрессия из 5 тестов ────────────────────────────────────┐
+│                                                                    │
+│   <span class="label">[topologicalSort по dependsOn]  ← regression-run.service.ts:1974</span>
+│                                                                    │
+│   Test 1: <span class="bad">pm clear</span> → launch → scenario_setup → test steps  → release session
+│   Test 2: <span class="bad">pm clear</span> → launch → scenario_setup → test steps  → release session
+│   Test 3: <span class="bad">pm clear</span> → launch → scenario_setup → test steps  → release session
+│   Test 4: <span class="bad">pm clear</span> → launch → scenario_setup → test steps  → release session
+│   Test 5: <span class="bad">pm clear</span> → launch → scenario_setup → test steps  → release session
+│                                                                    │
+│   <span class="label">Каждый тест: serial, full reset, scenario заново каждый раз.</span>
+└────────────────────────────────────────────────────────────────────┘</div>
+
+<h3>2.2 Что код делает (с file:line)</h3>
+
+<table>
+<tr><th>Что</th><th>Где</th><th>Что именно</th></tr>
+<tr>
+  <td>Порядок тестов</td>
+  <td class="file-ref">regression-run.service.ts:1974</td>
+  <td><code>topologicalSort(testCases)</code> по полю <code>dependsOn</code>. <strong>НЕ</strong> user selection order.</td>
+</tr>
+<tr>
+  <td>Concurrency</td>
+  <td class="file-ref">regression-run.service.ts:2088</td>
+  <td><code>MAX_MOBILE_IN_FLIGHT=1</code> по умолчанию (env: <code>REGRESSION_MOBILE_MAX_CONCURRENCY</code>). Serial.</td>
+</tr>
+<tr>
+  <td>App reset</td>
+  <td class="file-ref">mobile-test-run.job.ts:471 + :496</td>
+  <td><code>MobileAppPrepService.prepApp()</code> вызывается для <strong>каждого</strong> теста. Лог: "App prepared (installed + hard-reset + launched)".</td>
+</tr>
+<tr>
+  <td>Scenario prepend</td>
+  <td class="file-ref">mobile-test-run.job.ts:241</td>
+  <td><code>intentSteps = [...compileResult.steps, ...intentSteps]</code> — scenario шаги ставятся первыми, потом шаги теста. Один flat array.</td>
+</tr>
+<tr>
+  <td>Сессия после теста</td>
+  <td class="file-ref">mobile-test-run.job.ts:1046-1051</td>
+  <td>Если <code>sessionSource === 'pool'</code> → <code>releaseSession</code> (девайс остаётся в pool). Если <code>warmup</code> или <code>cold</code> → <code>destroySession</code>.</td>
+</tr>
+<tr>
+  <td>dependsOn skip</td>
+  <td class="file-ref">regression-run.service.ts:2179</td>
+  <td>Если хоть один <code>dependsOn</code>-тест в <code>failedOrSkippedIds</code> → текущий помечается <code>status: 'skipped'</code>, причина "Skipped: prerequisite test(s) failed".</td>
+</tr>
+<tr>
+  <td>AI в регрессии</td>
+  <td class="file-ref">test-executor.ts:268 + :562</td>
+  <td><strong>НЕ</strong> LiteEngine. Это <code>isReplayMode</code> — шаг за шагом replay команд из <code>steps_json</code>. AI вызывается только в self-healing когда команда упала.</td>
+</tr>
+<tr>
+  <td>Рекурсивный scenario</td>
+  <td class="file-ref">scenario-setup-expander.ts:42-97</td>
+  <td>scenario S2 может ссылаться на S1 через <code>use_setup</code>. Backend разворачивает в плоский список. Cycle detection есть.</td>
+</tr>
+<tr>
+  <td>executed_resources</td>
+  <td class="file-ref">execution.service.ts:142 + mobile-test-run.job.ts:1491</td>
+  <td>JSONB per <code>test_executions</code> row. Снимок что применили/скипнули. Пишется в finally после теста.</td>
+</tr>
+</table>
+
+<h3>2.3 Ключевые выводы</h3>
+
+<div class="card ok">
+  <strong>Фундамент готов:</strong> dependsOn-graph работает, scenario_setup с рекурсией работает, session pool существует.
+</div>
+<div class="card warn">
+  <strong>Performance проблема:</strong> 50 тестов с одинаковым login → 50 раз pm clear + 50 раз scenario login. На login 30с → +25 минут на каждую регрессию.
+</div>
+<div class="card warn">
+  <strong>Юзеру не показано:</strong> сейчас в UI нет visual indication, какие тесты требуют какого state. Юзер не понимает разницу между <code>dependsOn</code> (gate) и <code>scenario_setup</code> (prologue).
+</div>
+</section>
+
+<!-- ──────────────────────── MENTAL MODELS ──────────────────────── -->
+<section id="mental-models">
+<h2>3. Две ментальные модели юзера</h2>
+
+<p>Из обсуждения с командой и анализа реальных запросов:</p>
+
+<div class="grid-2">
+  <div class="card">
+    <h4>Модель 1 — "Цепочка"</h4>
+    <p>Юзер думает в терминах user journey:</p>
+    <p><code>login → home → profile → edit → logout</code></p>
+    <p>Каждый тест — это шаг в реальном flow юзера. Они <em>связаны</em>. State течёт.</p>
+    <p><span class="pill blue">Естественно для mobile</span></p>
+  </div>
+  <div class="card">
+    <h4>Модель 2 — "Дерево"</h4>
+    <p>Юзер думает в терминах состояний экранов:</p>
+    <p><code>Home</code> разветвляется на <code>Cart</code>, <code>Profile</code>, <code>Settings</code>. Каждый тест проверяет <em>свою</em> ветку из общей точки.</p>
+    <p><span class="pill purple">Естественно для приложений с навигацией</span></p>
+  </div>
+</div>
+
+<div class="card info">
+  <strong>Обе модели валидны.</strong> Цепочка хороша для линейных flow (onboarding, checkout). Дерево хорошо для приложений с hub-screen (соцсети, маркетплейсы). Реальный продукт имеет и то и другое.
+</div>
+</section>
+
+<!-- ──────────────────────── OPTION A ──────────────────────── -->
+<section id="option-a">
+<h2>4. Вариант A — Scenarios (текущая модель)</h2>
+
+<p><strong>Идея:</strong> каждый тест полностью изолирован. Общий пролог выносится в именованный <code>scenario_setup</code> ресурс. Перед каждым тестом проигрывается заново.</p>
+
+<div class="schema">              📦 Scenario "logged-in"
+              (login + open home)
+              ════════════════════
+                  │  │  │
+            ┌─────┘  │  └──────────┐
+            <span class="arrow">▼</span>        <span class="arrow">▼</span>             <span class="arrow">▼</span>
+       Test "cart"  Test "profile"  Test "settings"
+       <span class="bad">pm clear</span>      <span class="bad">pm clear</span>       <span class="bad">pm clear</span>
+       + scenario  + scenario     + scenario
+       + steps     + steps        + steps
+       ✅          ✅             ❌ (упал на assert)
+                                  → не влияет на другие</div>
+
+<div class="legend">
+  <span class="pmclear">pm clear (reset)</span>
+  <span class="scenario">scenario</span>
+  <span class="test">test steps</span>
+  <span class="fail">failed</span>
+</div>
+
+<h3>4.1 Жизненный цикл</h3>
+
+<pre><code>Регрессия из T1, T2, T3:
+
+T1 (cart):     pm clear → launch → проиграть S1 → open cart    → assert
+T2 (profile):  pm clear → launch → проиграть S1 → open profile → assert
+T3 (settings): pm clear → launch → проиграть S1 → open settings → assert
+
+Total: 3 × (pm clear + launch + scenario S1) + 3 × test steps</code></pre>
+
+<h3>4.2 Что нужно в коде</h3>
+<p><span class="pill green">Готово</span> Backend: <code>scenario_setup</code> adapter, recursive <code>use_setup</code>, mobile compiler. <span class="file-ref">scenario-setup-expander.ts</span></p>
+<p><span class="pill orange">Не готово</span> Frontend: UI для inline preview scenario в редакторе теста, "Extract last N steps to scenario", management dialog.</p>
+
+<h3>4.3 Плюсы / Минусы</h3>
+<table>
+<tr><th>Плюсы</th><th>Минусы</th></tr>
+<tr>
+<td>
+<ul>
+  <li>Полная изоляция — падение одного теста не трогает другие</li>
+  <li>Параллельность возможна в будущем (на 5 девайсах = 5x speed)</li>
+  <li>Тест можно запустить в одиночку (debug, hotfix)</li>
+  <li>DRY: правка scenario чинит все консумеры</li>
+  <li>Известная модель (Mabl flows, Tosca, Maestro subflows)</li>
+</ul>
+</td>
+<td>
+<ul>
+  <li><strong>Performance:</strong> 50 тестов → 50 логинов</li>
+  <li>Глубокие scenarios (создать 5 заказов) дорогие на повторе</li>
+  <li>Юзер должен учиться абстракции "scenario"</li>
+  <li>Терминология "setup" непонятна неинженерам → переименовать в "Scenario"</li>
+</ul>
+</td>
+</tr>
+</table>
+</section>
+
+<!-- ──────────────────────── OPTION B ──────────────────────── -->
+<section id="option-b">
+<h2>5. Вариант B — Sequential Chain</h2>
+
+<p><strong>Идея:</strong> тесты идут строго последовательно. State приложения переходит от теста к тесту. Между ними <strong>нет</strong> reset. Один <code>pm clear</code> в начале.</p>
+
+<div class="schema">┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃   <span class="bad">pm clear</span> → launch app (один раз на всю цепочку)        ┃
+┃     <span class="arrow">↓</span>                                                    ┃
+┃   Test "login"  ──┐ (app state переходит — без reset)     ┃
+┃     <span class="arrow">↓</span> ✅              <span class="arrow">↓</span>                                     ┃
+┃   Test "home"   ──┐                                       ┃
+┃     <span class="arrow">↓</span> ✅              <span class="arrow">↓</span>                                     ┃
+┃   Test "profile" ─┐                                       ┃
+┃     <span class="arrow">↓</span> ❌ failed                                          ┃
+┃   Test "edit"      <span class="label">SKIP (cascade)</span>                        ┃
+┃   Test "logout"    <span class="label">SKIP (cascade)</span>                        ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛</div>
+
+<h3>5.1 Жизненный цикл</h3>
+
+<pre><code>Регрессия из T1..T5 (sequential chain):
+
+[pm clear once]
+T1 (login):   проиграть шаги  → assert  (app в состоянии "Home")
+T2 (home):    проиграть шаги  → assert  (app в состоянии "Profile menu")
+T3 (profile): проиграть шаги  → ❌ FAIL
+T4 (edit):    SKIP — prerequisite failed
+T5 (logout):  SKIP — prerequisite failed
+
+Total: 1 × pm clear + 3 × test steps</code></pre>
+
+<h3>5.2 Что нужно в коде</h3>
+
+<table>
+<tr><th>Изменение</th><th>Где</th><th>Сложность</th></tr>
+<tr>
+  <td>Не делать <code>pm clear</code> между тестами в цепочке</td>
+  <td class="file-ref">mobile-test-run.job.ts:439-501</td>
+  <td>Средняя — добавить флаг "skip prep if continuing chain"</td>
+</tr>
+<tr>
+  <td>Переиспользовать сессию между тестами</td>
+  <td class="file-ref">mobile-test-run.job.ts:1044-1051</td>
+  <td>Низкая — уже есть <code>releaseSession</code>, надо явно claimать ту же</td>
+</tr>
+<tr>
+  <td>Сохранять порядок user selection (не topological)</td>
+  <td class="file-ref">regression-run.service.ts:1974</td>
+  <td>Средняя — новый режим <code>ordering: 'user' | 'dependency'</code></td>
+</tr>
+<tr>
+  <td>Cascade skip всех после first failed в chain</td>
+  <td class="file-ref">regression-run.service.ts:2179</td>
+  <td>Низкая — расширить <code>dependsOn</code> логику</td>
+</tr>
+<tr>
+  <td>Новая абстракция "Chain" / "Suite" в БД</td>
+  <td class="file-ref">supabase-migrations/</td>
+  <td>Высокая — новая таблица + API + UI</td>
+</tr>
+</table>
+
+<h3>5.3 Плюсы / Минусы</h3>
+<table>
+<tr><th>Плюсы</th><th>Минусы</th></tr>
+<tr>
+<td>
+<ul>
+  <li><strong>Performance:</strong> 1 login на 50 тестов</li>
+  <li>Естественная mental model — список действий по порядку</li>
+  <li>Не надо учить новую абстракцию "scenario"</li>
+  <li>Cause-effect виден в логе: "profile упал → 2 skipped"</li>
+</ul>
+</td>
+<td>
+<ul>
+  <li><strong>Cascade failure:</strong> один флак в начале → весь хвост skipped (юзер думает что 5 багов вместо 1)</li>
+  <li>Нельзя запустить один тест в одиночку — нужны все предыдущие</li>
+  <li>Параллельность невозможна (фундаментально)</li>
+  <li>Дублирование login: каждая цепочка пишет login заново</li>
+  <li>Дерево навигации (Home → 3 кнопки) выражается плохо — становится 3 параллельных списка</li>
+  <li>Регрессия "только сломанное" не работает</li>
+  <li>State drift: между T1 и T2 что-то могло произойти случайно (push notification, system dialog) — T2 стартует не там где ожидал</li>
+</ul>
+</td>
+</tr>
+</table>
+
+<div class="card danger">
+  <strong>Главный риск:</strong> cascade failure — известная проблема Selenium IDE и старого Postman chain'а. Cypress, Playwright, Maestro <em>сознательно ушли от этой модели</em> на test isolation именно потому что одно случайное падение делает регрессию бесполезной.
+</div>
+</section>
+
+<!-- ──────────────────────── OPTION C ──────────────────────── -->
+<section id="option-c">
+<h2>6. Вариант C — State Cache (scenario с кешированием состояния)</h2>
+
+<p><strong>Идея:</strong> scenarios как в варианте A, но с оптимизацией: <strong>после первого успешного прогона scenario в регрессии — кешируем app state и переиспользуем для следующих тестов с тем же scenario.</strong></p>
+
+<div class="schema">              📦 Scenario "logged-in"
+              ════════════════════
+                       │
+              ┌────────┴─────────────┐
+              <span class="arrow">▼</span>                      <span class="arrow">▼</span>
+        Первый тест:           Следующие тесты:
+        pm clear               <span class="ok">Кеш-хит:</span>
+        + проиграть scenario   проверить "уже на Home?"
+        + test steps           ✅ да → скип scenario
+        ──────────────         ❌ нет → проиграть scenario
+        💾 кеш state           + test steps
+        (snapshot экрана)</div>
+
+<h3>6.1 Жизненный цикл с кешем</h3>
+
+<pre><code>Регрессия из T1, T2, T3, T4, T5 (все используют scenario "logged-in"):
+
+T1: pm clear → проиграть scenario → ✅ запомнить "state X: logged-in достигнут"
+                                  → проиграть шаги T1 → assert
+T2: проверить "state X достигнут?" → ❌ нет (T1 закончился на /profile, не на /home)
+    → pm clear → проиграть scenario → проиграть шаги T2
+
+Альтернативный сценарий: тесты не меняют core state
+T1: pm clear → scenario → "user is logged in"
+              → шаги T1 (только GET-запросы) → assert
+T2: scenario.validate() = "user is still logged in" ✅ → скип scenario → шаги T2
+T3: scenario.validate() = ✅ → скип scenario → шаги T3
+...</code></pre>
+
+<h3>6.2 Как реализовать validate</h3>
+
+<p>Каждый scenario имеет <strong>validate-шаг</strong> (опционально, добавляется юзером в UI):</p>
+
+<pre><code>Scenario "logged-in":
+  Steps:
+    - tap "Login"
+    - type email
+    - type password
+    - tap "Submit"
+  Validate (опциональный, новое поле):
+    - assert visible: "Welcome, {user.name}"
+    - assert URL contains: "/home"
+
+Перед запуском scenario в следующем тесте:
+  if validate() == true → SKIP scenario steps
+  else → проиграть scenario заново</code></pre>
+
+<h3>6.3 Что нужно в коде</h3>
+
+<table>
+<tr><th>Изменение</th><th>Сложность</th></tr>
+<tr><td>Новое поле <code>validate_steps</code> в <code>test_resources.config</code> для scenario_setup</td><td>Низкая</td></tr>
+<tr><td>В mobile compiler: перед prepend scenario — запустить validate, если ✅ — пропустить scenario steps</td><td>Средняя</td></tr>
+<tr><td>Опциональный <code>pm clear</code>: только если предыдущий тест не из той же regression run</td><td>Средняя</td></tr>
+<tr><td>UI: чекбокс "Skip scenario if already in state" + редактор validate steps</td><td>Средняя</td></tr>
+<tr><td>Telemetry: лог "scenario S1: ✅ skipped (validate passed)" в run-log</td><td>Низкая</td></tr>
+</table>
+
+<h3>6.4 Плюсы / Минусы</h3>
+<table>
+<tr><th>Плюсы</th><th>Минусы</th></tr>
+<tr>
+<td>
+<ul>
+  <li><strong>Best of both:</strong> performance как chain + isolation как scenarios</li>
+  <li>Юзер может отключить кеш чекбоксом если флаки</li>
+  <li>Validate-шаг ловит drift автоматически (Cypress <code>cy.session({validate})</code> паттерн)</li>
+  <li>Падение одного теста не трогает других — но scenario сыграется заново только если validate упадёт</li>
+  <li>Параллельность остаётся возможной</li>
+</ul>
+</td>
+<td>
+<ul>
+  <li>Нужно учить юзера писать validate (но это 1 строка: "assert visible: Home Title")</li>
+  <li>Если validate слабый — кеш врёт ("я залогинен" но cookie протух → тест упадёт на 5-м шаге с непонятной причиной)</li>
+  <li>Между regression runs кеш сбрасывается (новая сессия пула)</li>
+  <li>Нужно решить — кешировать через session pool или через snapshot</li>
+</ul>
+</td>
+</tr>
+</table>
+
+<div class="card info">
+  <strong>Это самый близкий аналог Cypress <code>cy.session({validate})</code>, перенесённый на mobile.</strong> Cypress — единственный инструмент, который успешно решил drift через validate. Все остальные либо игнорируют drift (Mabl, Tosca), либо отказываются от reuse (Maestro).
+</div>
+</section>
+
+<!-- ──────────────────────── OPTION D ──────────────────────── -->
+<section id="option-d">
+<h2>7. Вариант D — Hybrid Test Suite <span class="pill purple">рекомендуемый</span></h2>
+
+<p><strong>Идея:</strong> ввести новую сущность <code>Test Suite</code> с флагом <code>sequential</code>. Юзер сам решает: писать тесты как изолированные (с scenarios) или как цепочку. Внутри suite можно использовать оба подхода.</p>
+
+<div class="schema">┌─────────────────────────────────────────────────────────────────┐
+│ Suite "Onboarding flow"   <span class="pill blue">sequential: true</span>                    │
+├─────────────────────────────────────────────────────────────────┤
+│  <span class="bad">pm clear</span> → launch (один раз)                                 │
+│  <span class="arrow">↓</span>                                                              │
+│  Test "register"  ✅                                            │
+│  Test "verify email" ✅                                         │
+│  Test "complete profile" ❌                                     │
+│  Test "first login"  <span class="label">SKIP</span>                                       │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ Suite "Feature smoke tests"   <span class="pill blue">sequential: false</span>              │
+├─────────────────────────────────────────────────────────────────┤
+│  Каждый тест использует scenario "logged-in"                    │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐    │
+│  │ Test "cart"    │  │ Test "search"  │  │ Test "profile" │    │
+│  │ pm clear       │  │ pm clear       │  │ pm clear       │    │
+│  │ + scenario     │  │ + scenario     │  │ + scenario     │    │
+│  │   (или cache)  │  │   (или cache)  │  │   (или cache)  │    │
+│  │ + steps   ✅   │  │ + steps   ✅   │  │ + steps   ❌   │    │
+│  └────────────────┘  └────────────────┘  └────────────────┘    │
+│  Падение одного НЕ трогает другие.                              │
+└─────────────────────────────────────────────────────────────────┘</div>
+
+<h3>7.1 Что меняется в коде</h3>
+
+<table>
+<tr><th>Слой</th><th>Изменение</th></tr>
+<tr>
+  <td>БД</td>
+  <td>Новая таблица <code>test_suites</code>: <code>id, project_id, name, sequential boolean, ordered_test_ids uuid[], scenario_bindings jsonb</code></td>
+</tr>
+<tr>
+  <td>API</td>
+  <td>CRUD для suites, endpoint для запуска suite целиком</td>
+</tr>
+<tr>
+  <td>Regression dispatch</td>
+  <td>Если тесты в sequential suite — <code>topologicalSort</code> заменяется на <code>ordered_test_ids</code>; <code>pm clear</code> только перед первым</td>
+</tr>
+<tr>
+  <td>Mobile job</td>
+  <td>Новые поля в <code>TestJobData</code>: <code>suiteId</code>, <code>positionInSuite</code>, <code>skipAppPrep</code>. Если <code>skipAppPrep=true</code> — пропустить <code>MobileAppPrepService.prepApp</code></td>
+</tr>
+<tr>
+  <td>Session pool</td>
+  <td>Все тесты suite клеймят одну сессию, отдают только в конце suite</td>
+</tr>
+<tr>
+  <td>Cascade skip</td>
+  <td>Внутри suite: первый failed → все после skipped (как сейчас работает <code>dependsOn</code>, но без явной декларации зависимостей)</td>
+</tr>
+<tr>
+  <td>UI</td>
+  <td>Suite — first-class в дереве <code>/repository</code>. Можно тащить тесты внутрь. Чекбокс "sequential" в настройках suite.</td>
+</tr>
+</table>
+
+<h3>7.2 Сравнение режимов внутри одного UI</h3>
+
+<table>
+<tr><th></th><th>Sequential Suite</th><th>Parallel Suite (default)</th></tr>
+<tr><td>App reset</td><td>1 раз в начале suite</td><td>Перед каждым тестом</td></tr>
+<tr><td>Scenarios</td><td>Опционально (часто не нужны)</td><td>Обязательны если тест не от cold launch</td></tr>
+<tr><td>Cascade на fail</td><td>Все после skipped</td><td>Только явные <code>dependsOn</code> skipped</td></tr>
+<tr><td>Время</td><td>1 × (clear+launch) + N × (steps)</td><td>N × (clear+launch+scenario+steps)</td></tr>
+<tr><td>Параллельность в будущем</td><td>Нет (сама suite на одном девайсе)</td><td>Да (suites параллельно, тесты внутри параллельно)</td></tr>
+<tr><td>Когда использовать</td><td>Onboarding, checkout, end-to-end flow</td><td>Smoke tests, feature regression</td></tr>
+</table>
+
+<h3>7.3 Можно ли добавить State Cache (Вариант C) к Hybrid?</h3>
+
+<p><strong>Да, и это лучший вариант.</strong> Для parallel suite scenarios могут иметь validate-шаг. Если runner запускает несколько тестов одной suite в pool — кеш работает между ними. Для sequential suite кеш не нужен (state уже там по построению).</p>
+
+<div class="card ok">
+  <strong>Финальная рекомендация:</strong> Hybrid Test Suite (D) + опциональный State Cache (C) для parallel suites. Это покрывает все три ментальные модели юзера, даёт performance, сохраняет isolation как fallback.
+</div>
+</section>
+
+<!-- ──────────────────────── COMPARISON ──────────────────────── -->
+<section id="comparison">
+<h2>8. Сравнительная таблица всех вариантов</h2>
+
+<table>
+<tr>
+  <th>Критерий</th>
+  <th>A: Scenarios</th>
+  <th>B: Sequential Chain</th>
+  <th>C: Scenarios + Cache</th>
+  <th>D: Hybrid Suite</th>
+</tr>
+<tr>
+  <td>Изоляция тестов</td>
+  <td class="ok">Высокая</td>
+  <td class="bad">Низкая</td>
+  <td class="ok">Высокая</td>
+  <td class="warn">Зависит от suite</td>
+</tr>
+<tr>
+  <td>Performance (50 тестов)</td>
+  <td class="bad">50 логинов</td>
+  <td class="ok">1 логин</td>
+  <td class="ok">1-3 логина</td>
+  <td class="ok">1-3 логина</td>
+</tr>
+<tr>
+  <td>Cascade failure</td>
+  <td class="ok">Нет</td>
+  <td class="bad">Да — весь хвост</td>
+  <td class="ok">Нет</td>
+  <td class="warn">Только внутри sequential suite</td>
+</tr>
+<tr>
+  <td>Параллельность</td>
+  <td class="ok">Возможна</td>
+  <td class="bad">Невозможна</td>
+  <td class="ok">Возможна</td>
+  <td class="ok">Возможна для parallel suites</td>
+</tr>
+<tr>
+  <td>Тест в одиночку (debug)</td>
+  <td class="ok">Да</td>
+  <td class="bad">Нет</td>
+  <td class="ok">Да</td>
+  <td class="ok">Да</td>
+</tr>
+<tr>
+  <td>Mental model для юзера</td>
+  <td class="warn">Учить scenario</td>
+  <td class="ok">Естественно</td>
+  <td class="warn">Учить scenario+validate</td>
+  <td class="warn">Учить 2 режима, но интуитивно</td>
+</tr>
+<tr>
+  <td>Drift detection</td>
+  <td class="bad">Нет</td>
+  <td class="bad">Нет</td>
+  <td class="ok">Через validate</td>
+  <td class="ok">Через validate в parallel</td>
+</tr>
+<tr>
+  <td>DRY (правка login один раз)</td>
+  <td class="ok">Да</td>
+  <td class="bad">Нет — дубли в цепочках</td>
+  <td class="ok">Да</td>
+  <td class="ok">Да</td>
+</tr>
+<tr>
+  <td>Backend готовность</td>
+  <td class="ok">100%</td>
+  <td class="bad">~40%</td>
+  <td class="warn">~70%</td>
+  <td class="bad">~30%</td>
+</tr>
+<tr>
+  <td>Срок реализации (FE+BE)</td>
+  <td class="ok">1-2 недели</td>
+  <td class="warn">2-3 недели</td>
+  <td class="warn">3-4 недели</td>
+  <td class="bad">5-7 недель</td>
+</tr>
+<tr>
+  <td>Длительная стратегия</td>
+  <td class="warn">Performance потолок</td>
+  <td class="bad">Тупик архитектурный</td>
+  <td class="ok">Хорошо</td>
+  <td class="ok">Лучшее покрытие</td>
+</tr>
+</table>
+</section>
+
+<!-- ──────────────────────── FAILURE MODES ──────────────────────── -->
+<section id="failure-modes">
+<h2>9. Failure modes — что ломается и как починить</h2>
+
+<h3>9.1 Cascade failure (Вариант B)</h3>
+<p><strong>Симптом:</strong> один флакающий тест в середине → 20 skipped тестов. Юзер видит "профиль сломан" + "редактирование сломано" + "logout сломан" — думает что у него 3 бага, на самом деле один.</p>
+<p><strong>Митигация:</strong> в UI явно показывать: "Skipped because 'profile' failed — not a real failure". В regression report — группировать по cause.</p>
+<p><strong>Полное решение:</strong> retry-логика для всей цепочки. Если test упал — повторить с начала suite (дорого, но единственный надёжный fix).</p>
+
+<h3>9.2 Drift между scenario и приложением (Вариант A, C)</h3>
+<p><strong>Симптом:</strong> кто-то поменял UI login flow. Scenario "logged-in" больше не работает. 50 тестов одновременно падают с "element 'email field' not found".</p>
+<p><strong>Митигация:</strong> validate-шаг в конце scenario (Вариант C). Если validate упал — clear лог "scenario broken, fix this first" вместо 50 одинаковых failures.</p>
+<p><strong>Дополнительно:</strong> alert юзеру при сохранении scenario: "Этот scenario используют 12 тестов — проверьте что не сломали".</p>
+
+<h3>9.3 State cache врёт (Вариант C)</h3>
+<p><strong>Симптом:</strong> validate говорит "OK, ты на home", но сессия протухла (cookie expired). Тест T2 стартует, кликает "Add to cart" → редирект на login → fail с непонятной причиной.</p>
+<p><strong>Митигация:</strong> validate должен проверять не только видимость элемента но и функциональность. Пример: вместо "see Welcome text" — проверка "click profile icon → profile screen visible". Тяжелее но надёжнее.</p>
+<p><strong>Fallback:</strong> если 2 теста подряд упали на первом шаге после cache hit — автоматически invalidate cache и проиграть scenario заново.</p>
+
+<h3>9.4 Глубокий scenario неэффективен (Вариант A)</h3>
+<p><strong>Симптом:</strong> Тест "delete order" требует scenario "user has 5 orders". Это 2 минуты setup. На регрессии из 5 тестов order-feature → 10 минут на setup, 30 секунд на сами тесты.</p>
+<p><strong>Митигация в A:</strong> ничего, медленно по построению.</p>
+<p><strong>Митигация в C:</strong> validate "user has at least 5 orders" → если да, скип scenario.</p>
+<p><strong>Митигация в D:</strong> sequential suite "Order management" — создал 5 orders один раз, прогнал все order-тесты подряд.</p>
+
+<h3>9.5 Pool session pollution (Варианты B, C, D)</h3>
+<p><strong>Симптом:</strong> sequential suite закончилась failed, app в непредсказуемом state. Следующая регрессия клеймит ту же сессию из pool — стартует в каком-то модальном окне.</p>
+<p><strong>Митигация:</strong> после failed sequential suite — destroy session, не release. Это уже частично есть в коде (<span class="file-ref">mobile-test-run.job.ts:1046-1051</span>).</p>
+
+<h3>9.6 Push notification / system dialog (все варианты)</h3>
+<p><strong>Симптом:</strong> в середине теста OS показала "App wants to send notifications" overlay. Все последующие клики промахиваются.</p>
+<p><strong>Митигация:</strong> универсальный obstacle handler в runner (mobile-runner-client уровень). Это вне scope этого документа но критично для любого варианта.</p>
+</section>
+
+<!-- ──────────────────────── INDUSTRY ──────────────────────── -->
+<section id="industry">
+<h2>10. Что делает индустрия</h2>
+
+<table>
+<tr><th>Инструмент</th><th>Модель</th><th>Что взять</th></tr>
+<tr>
+  <td>Cypress</td>
+  <td>Test isolation + <code>cy.session({validate})</code></td>
+  <td>Validate-callback паттерн — единственный кто решил drift</td>
+</tr>
+<tr>
+  <td>Playwright</td>
+  <td>Fixtures + <code>storageState.json</code> + project dependencies</td>
+  <td>Двухуровневая модель (мелкие fixtures + крупные projects)</td>
+</tr>
+<tr>
+  <td>Mabl</td>
+  <td>Flows (named, reusable, parameterized)</td>
+  <td>Color-coded collapsible панели в редакторе</td>
+</tr>
+<tr>
+  <td>Testim</td>
+  <td>Groups + Auto Grouping (AI extract)</td>
+  <td>AI auto-suggest extraction общих префиксов</td>
+</tr>
+<tr>
+  <td>Maestro</td>
+  <td>Subflows + isolation default</td>
+  <td>"Each flow should run on reset device" — догма про isolation</td>
+</tr>
+<tr>
+  <td>Octomind</td>
+  <td>Test-as-dependency ("login is dependency of profile")</td>
+  <td>Auto-fill dependencies при создании теста</td>
+</tr>
+<tr>
+  <td>Tricentis Tosca</td>
+  <td>Reusable TestStepBlocks в TestStepLibrary</td>
+  <td>Edit-once-propagate (опасно, но работает)</td>
+</tr>
+<tr>
+  <td>Postman</td>
+  <td>Sequential request chain (по умолчанию)</td>
+  <td>Простота mental model — но это для API, не UI</td>
+</tr>
+<tr>
+  <td>TestRail</td>
+  <td>Preconditions field + Shared Steps</td>
+  <td>Preconditions как отдельная сущность</td>
+</tr>
+<tr>
+  <td>Selenium IDE</td>
+  <td>Sequential test plans</td>
+  <td>Антипаттерн — почему все ушли от этой модели</td>
+</tr>
+</table>
+
+<div class="quote">
+"Each Flow should be runnable on a completely reset device" — Maestro docs. Isolation is gospel even on mobile.
+</div>
+
+<div class="quote">
+"Test isolation is a feature, not a bug" — Cypress philosophy. Drift через <code>validate</code> callback.
+</div>
+
+<p><strong>Сильный сигнал:</strong> ни один AI-first инструмент (Reflect, Octomind, Mabl, Testim) не использует sequential chain как primary model. Все идут в scenarios / fixtures + AI extract.</p>
+</section>
+
+<!-- ──────────────────────── UX MOCKUPS ──────────────────────── -->
+<section id="ux-mockups">
+<h2>11. UX-наброски</h2>
+
+<h3>11.1 Редактор теста с inline scenario preview (Варианты A/C/D)</h3>
+
+<div class="schema">┌─────────────────────────────────────────────────────────────────┐
+│  Test: "Edit profile name"           [Save] [Run]               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  📍 <span class="ok">Starting state:</span> "logged-in user on home screen"          │
+│  ▸ Scenario "logged-in"  · 4 steps  · last modified 2d ago      │
+│                                                                 │
+│  ┌─ Steps ─────────────────────────────────────────────────┐    │
+│  │  1. tap "Profile icon"                                  │    │
+│  │  2. tap "Edit name"                                     │    │
+│  │  3. type "New Name"                                     │    │
+│  │  4. tap "Save"                                          │    │
+│  │  5. assert visible "Profile updated"                    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  🏁 <span class="ok">Expected ending state:</span> "profile screen, name updated"     │
+│                                                                 │
+│  [+ Extract last N steps to scenario]                           │
+└─────────────────────────────────────────────────────────────────┘</div>
+
+<h3>11.2 Развёрнутый scenario (collapsible)</h3>
+
+<div class="schema">  📍 Starting state: "logged-in user on home screen"
+  ▾ <span class="ok">Scenario "logged-in"</span>  · used by 12 tests  · [Edit scenario]
+     │
+     │  <span class="label">— Steps that play before this test —</span>
+     │  1. tap "Login"
+     │  2. type email "{{user.email}}"
+     │  3. type password "{{secrets.password}}"
+     │  4. tap "Submit"
+     │
+     │  <span class="label">— Validate (skip if state already reached) —</span>
+     │  ✓ assert visible "Welcome" within 3s
+     │
+     │  ⚙ Last run: ✅ executed (no cache hit)</div>
+
+<h3>11.3 Suite-режим в repository tree (Вариант D)</h3>
+
+<div class="schema">📁 /repository
+  ├── 📁 Web tests
+  ├── 📁 Mobile tests
+  │    ├── 📦 <span class="pill purple">Suite "Onboarding flow"</span>   sequential · 4 tests
+  │    │     <span class="arrow">└─→</span> register
+  │    │     <span class="arrow">└─→</span> verify email
+  │    │     <span class="arrow">└─→</span> complete profile
+  │    │     <span class="arrow">└─→</span> first login
+  │    │
+  │    ├── 📦 <span class="pill blue">Suite "Profile features"</span>    parallel · 5 tests
+  │    │     ├── view profile        scenario: logged-in
+  │    │     ├── edit name           scenario: logged-in
+  │    │     ├── change avatar       scenario: logged-in
+  │    │     ├── change password     scenario: logged-in
+  │    │     └── delete account      scenario: logged-in
+  │    │
+  │    └── 📦 Standalone tests (no suite)
+  │
+  └── 📁 API tests</div>
+
+<h3>11.4 Regression run log с scenario cache</h3>
+
+<div class="schema">▶ Regression run started · 5 tests · estimated 3m 20s
+
+  T1 "cart"     ⏱ 00:00 → 00:42  ✅ pass
+    └ 📦 scenario "logged-in"  ✅ <span class="ok">executed (8.2s)</span>
+    └ 💾 cache: state "logged-in" stored
+
+  T2 "search"   ⏱ 00:42 → 01:01  ✅ pass
+    └ 📦 scenario "logged-in"  ⏭ <span class="ok">skipped — validate passed (0.5s)</span>
+
+  T3 "profile"  ⏱ 01:01 → 01:18  ✅ pass
+    └ 📦 scenario "logged-in"  ⏭ <span class="ok">skipped — validate passed (0.5s)</span>
+
+  T4 "settings" ⏱ 01:18 → 01:35  ❌ fail
+    └ 📦 scenario "logged-in"  ⏭ skipped
+    └ Step 3 "tap Notifications": element not found
+    └ 💾 cache invalidated (subsequent tests will re-run scenario)
+
+  T5 "logout"   ⏱ 01:35 → 02:10  ✅ pass
+    └ 📦 scenario "logged-in"  ✅ executed (8.1s) — cache miss after T4 failure
+
+Saved 18s vs no-cache mode (3 cache hits × 6s).</div>
+
+<h3>11.5 Suite editor (для D)</h3>
+
+<div class="schema">┌─────────────────────────────────────────────────────────────────┐
+│  Suite "Onboarding flow"                       [Save] [Run all] │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ⚙ Execution mode:                                              │
+│     ⦿ Sequential (one device, state carries between tests)      │
+│     ○ Parallel (each test from fresh state)                     │
+│                                                                 │
+│  📋 Tests in order:                                             │
+│     1. ☰ register             [▶]  [✎]  [✕]                     │
+│     2. ☰ verify email         [▶]  [✎]  [✕]                     │
+│     3. ☰ complete profile     [▶]  [✎]  [✕]                     │
+│     4. ☰ first login          [▶]  [✎]  [✕]                     │
+│                                                                 │
+│  [+ Add test to suite]                                          │
+│                                                                 │
+│  ⚠ Note: in sequential mode, if a test fails, all following     │
+│    tests are skipped. Last successful state is preserved.       │
+└─────────────────────────────────────────────────────────────────┘</div>
+</section>
+
+<!-- ──────────────────────── COST ──────────────────────── -->
+<section id="cost-estimates">
+<h2>12. Оценка работы</h2>
+
+<table>
+<tr>
+  <th>Вариант</th>
+  <th>Backend</th>
+  <th>Frontend</th>
+  <th>Тесты</th>
+  <th>Итого</th>
+</tr>
+<tr>
+  <td>A: Scenarios</td>
+  <td>0 (готово)</td>
+  <td>5-7 дней (inline preview, extract modal, management dialog)</td>
+  <td>2 дня</td>
+  <td><strong>1.5-2 недели</strong></td>
+</tr>
+<tr>
+  <td>B: Sequential Chain</td>
+  <td>5-7 дней (новая абстракция, lifecycle changes)</td>
+  <td>4-5 дней (suite editor, cascade UI)</td>
+  <td>3-4 дня</td>
+  <td><strong>2-3 недели</strong></td>
+</tr>
+<tr>
+  <td>C: Scenarios + Cache</td>
+  <td>4-5 дней (validate-step, cache layer, invalidation)</td>
+  <td>5-7 дней (validate editor, run-log cache indicators)</td>
+  <td>3-4 дня</td>
+  <td><strong>2.5-3 недели</strong></td>
+</tr>
+<tr>
+  <td>D: Hybrid Suite</td>
+  <td>10-12 дней (table, API, dispatch, lifecycle)</td>
+  <td>10-12 дней (suite editor, tree integration, both modes)</td>
+  <td>5-6 дней</td>
+  <td><strong>5-7 недель</strong></td>
+</tr>
+<tr>
+  <td>D + C combined</td>
+  <td>14-17 дней</td>
+  <td>14-17 дней</td>
+  <td>7-9 дней</td>
+  <td><strong>7-9 недель</strong></td>
+</tr>
+</table>
+
+<h3>12.1 Поэтапный план для D (рекомендуемого)</h3>
+
+<table>
+<tr><th>Phase</th><th>Содержание</th><th>Срок</th><th>Шиппится?</th></tr>
+<tr>
+  <td>Phase 1</td>
+  <td>Вариант A — inline preview scenario, management dialog, extract из последних N шагов. Использует существующий backend.</td>
+  <td>1.5-2 недели</td>
+  <td>Да — закрывает текущую UX-дыру</td>
+</tr>
+<tr>
+  <td>Phase 2</td>
+  <td>Вариант C — validate-step для scenarios, кеш через session pool, telemetry в run-log.</td>
+  <td>+2 недели</td>
+  <td>Да — решает performance</td>
+</tr>
+<tr>
+  <td>Phase 3</td>
+  <td>Вариант D — таблица <code>test_suites</code>, sequential mode, suite editor.</td>
+  <td>+3-4 недели</td>
+  <td>Да — закрывает onboarding flow use-case</td>
+</tr>
+<tr>
+  <td>Phase 4 (опц.)</td>
+  <td>AI auto-suggest: "5 тестов начинаются одинаково — extract в scenario?"</td>
+  <td>+1-2 недели</td>
+  <td>Killer feature, не критично</td>
+</tr>
+</table>
+</section>
+
+<!-- ──────────────────────── DECISION ──────────────────────── -->
+<section id="decision">
+<h2>13. Что нужно решить команде</h2>
+
+<div class="card warn">
+  <strong>Главные развилки:</strong>
+</div>
+
+<h3>13.1 Развилка #1 — нужен ли sequential mode вообще?</h3>
+<p>Если "да" → выбираем между B (только sequential) и D (sequential + parallel).</p>
+<p>Если "нет" → выбираем между A (только scenarios) и C (scenarios + cache).</p>
+<p><strong>Влияние:</strong> определяет архитектуру следующих 6-12 месяцев.</p>
+
+<h3>13.2 Развилка #2 — performance vs simplicity</h3>
+<p>State Cache (Вариант C) — даёт 5-10x speed boost но добавляет сложность (validate, invalidation).</p>
+<p>Без него — простой код, но регрессия может быть очень долгой.</p>
+
+<h3>13.3 Развилка #3 — терминология</h3>
+<p>Сейчас в коде <code>scenario_setup</code>. В UI юзер видит "Setup"/"Setup Block".</p>
+<p>Варианты переименования:</p>
+<ul>
+  <li><strong>"Scenario"</strong> — то что юзер выбрал на встрече. Чистое, понятное.</li>
+  <li><strong>"Flow"</strong> — как у Mabl. Хорошо для marketing.</li>
+  <li><strong>"Prologue"</strong> — точнее по смыслу но странно для русского саппорта.</li>
+  <li><strong>"Pre-steps"</strong> — самое буквальное.</li>
+</ul>
+<p>Решение нужно зафиксировать до Phase 1.</p>
+
+<h3>13.4 Развилка #4 — extract from existing tests</h3>
+<p>Минимум: юзер вручную выделяет шаги и нажимает "Extract".</p>
+<p>Максимум: AI смотрит "у вас 5 тестов начинаются одинаково — extract автоматически?"</p>
+<p>Промежуточно: после save теста — diff с другими тестами в проекте, предложить extract если совпадение >80%.</p>
+
+<h3>13.5 Минимальная рекомендация (если ничего другого не решено)</h3>
+
+<div class="card ok">
+  <strong>Что точно надо сделать сейчас:</strong>
+  <ul>
+    <li>Mount <code>RunAsSplitButton</code> с <code>onManageSetups</code> — иначе на пустом проекте нет точки входа</li>
+    <li>Переименовать в UI "Setup" → "Scenario"</li>
+    <li>Inline preview scenarios в редакторе теста (collapsible)</li>
+  </ul>
+  Это <strong>1-1.5 недели</strong>, закрывает текущую дыру, не блокирует выбор архитектуры.
+</div>
+</section>
+
+<!-- ──────────────────────── OPEN QUESTIONS ──────────────────────── -->
+<section id="open-questions">
+<h2>14. Открытые вопросы</h2>
+
+<ol>
+  <li>Хотим ли мы новую сущность <strong>Test Suite</strong> в БД или ограничиваемся существующими сущностями (intent_test_cases + scenarios)?</li>
+  <li>Что делает <code>dependsOn</code> когда есть sequential suite — игнорируется? Складывается с suite ordering?</li>
+  <li>Validate-шаг scenarios — обязательный или опциональный? Если опциональный — что по умолчанию (всегда играть scenario / никогда не играть)?</li>
+  <li>State cache — кешируем через session pool (быстрее, но привязан к одной сессии) или через <code>adb backup</code> snapshot (универсальнее, но 10-100 MB на тест)?</li>
+  <li>Что показываем юзеру при cascade skip в sequential suite — каждый skipped как warning или один collapsed "+ 4 tests skipped"?</li>
+  <li>Если sequential suite упала — повторять ли всю suite автоматически (retry) или нет?</li>
+  <li>Можно ли scenario внутри sequential suite? Если да — играется только перед первым тестом или перед каждым?</li>
+  <li>Где жить новой Suite-сущности в дереве repository — рядом с тестами или в отдельной вкладке?</li>
+  <li>Auto-suggest extract: на какой стадии запускать LLM — каждый save или раз в день фоновой задачей?</li>
+  <li>Web vs Mobile: применяем ту же модель к web или web остаётся на текущей (только scenarios)?</li>
+</ol>
+</section>
+
+<!-- ──────────────────────── ADDENDUM ──────────────────────── -->
+<section id="addendum">
+<h2>15. Аддендум — детали из обсуждения</h2>
+
+<p>Этот раздел собирает важные детали, которые всплывали в обсуждении и которые легко упустить при чтении основной части.</p>
+
+<h3>15.1 Концепция "первый шаг / последний шаг" как entry/exit state</h3>
+
+<p>В обсуждении возникла идея: <em>"первый шаг теста — это его entry state, последний шаг — exit state. Тест B стартует там, где кончился A."</em></p>
+
+<p>Это правильная UX-интуиция, но индустрия не моделирует это напрямую. Вместо этого:</p>
+
+<ul>
+  <li><strong>Entry state</strong> = декларация "я работаю в состоянии X" → реализуется через scenario_setup binding</li>
+  <li><strong>Exit state</strong> = финальный assertion теста → может стать validate для другого scenario через extract</li>
+</ul>
+
+<p>Иначе говоря: твой "последний шаг A" не становится "первым шагом B" напрямую. Он может стать <strong>validate-проверкой</strong> для scenario, который используют оба теста.</p>
+
+<div class="schema">Тест A: ... → последний шаг: assert visible "Cart screen"
+                                              │
+                                              <span class="arrow">↓</span> extract как validate
+                                              │
+                              📦 Scenario "in-cart"
+                              Steps: login + add item to cart
+                              Validate: <span class="ok">assert visible "Cart screen"</span>
+                                              │
+                                              <span class="arrow">↓</span> используется
+                                              │
+Тест B: scenario "in-cart" → шаги B (checkout flow)</div>
+
+<h3>15.2 Drift между scenario и source test</h3>
+
+<p>Когда юзер делает <strong>extract из теста A → scenario S</strong>, в момент извлечения S = последние N шагов A. Через 2 недели:</p>
+
+<ul>
+  <li>Кто-то добавил в тест A шаг "accept cookies"</li>
+  <li>Scenario S остался без него</li>
+  <li>Тест B использует S → может упасть на cookie-banner</li>
+</ul>
+
+<table>
+<tr><th>Инструмент</th><th>Как решает</th></tr>
+<tr><td>Mabl</td><td>Edit-once-propagate — при правке flow обновляются все консумеры (но изменения теста-донора в flow НЕ попадают)</td></tr>
+<tr><td>Tosca</td><td>Reference-based — то же что Mabl, та же проблема</td></tr>
+<tr><td>TestRail</td><td>Shared Steps — те же грабли</td></tr>
+<tr><td>Cypress</td><td><code>cy.session({validate})</code> — единственный кто ловит drift в runtime</td></tr>
+<tr><td><strong>Для нас (рекомендация)</strong></td><td>При save теста-донора показывать diff: "Этот тест отличается от извлечённого из него scenario X на 2 шага. Обновить scenario?"</td></tr>
+</table>
+
+<h3>15.3 AI Auto-Suggest Extract — Testim Auto Grouping pattern</h3>
+
+<p>Testim это <strong>единственный инструмент</strong>, который делает AI-driven extraction. Их паттерн:</p>
+
+<ol>
+  <li>Фоновая задача периодически анализирует все тесты в проекте</li>
+  <li>Ищет повторяющиеся последовательности шагов</li>
+  <li>Предлагает extract в named group</li>
+  <li>После accept — auto-replace во всех найденных местах с diff preview</li>
+</ol>
+
+<p>У нас есть инфраструктура для этого:</p>
+<ul>
+  <li><code>intent_test_cases.steps_json</code> — все шаги всех тестов в БД</li>
+  <li><code>src/services/ai/embeddings/</code> — embedding пайплайн уже работает</li>
+  <li>Можно прогнать pairwise similarity prefix-шагов всех тестов</li>
+</ul>
+
+<p>При сохранении нового теста — сравнить с проектом, если найдены 2+ теста с похожим префиксом → suggest "Extract first 4 steps as scenario? (5 tests would benefit)".</p>
+
+<p><strong>Сложность:</strong> 1-2 недели. Это killer feature, не делается в Phase 1, но архитектурно надо предусмотреть.</p>
+
+<h3>15.4 Validate timing — "before scenario" vs "after scenario"</h3>
+
+<p>В Cypress <code>cy.session({validate})</code> работает в двух точках:</p>
+
+<ol>
+  <li><strong>Before scenario</strong> — "перед тем как играть scenario, проверь — может состояние уже достигнуто?". Если да → скип scenario.</li>
+  <li><strong>After scenario</strong> — "после прогона scenario проверь что состояние действительно достигнуто". Если нет → fail рано, до запуска теста.</li>
+</ol>
+
+<p>В документе варианта C упомянуто только #1 ("skip if validate passed"). <strong>#2 не менее важен</strong> — без него scenario может молча "сыграть" но не привести в нужное состояние, и тест упадёт на первом шаге с непонятной причиной.</p>
+
+<p>Рекомендация: <strong>оба</strong>. UX:</p>
+<pre><code>Scenario "logged-in":
+  Steps: [login flow]
+  Validate (runs both before and after):
+    ✓ assert visible "Home Title"
+    ✓ assert URL contains "/home"
+
+Run-log:
+  T1: Scenario "logged-in" — validate before: ❌ not in state → run steps → validate after: ✅
+  T2: Scenario "logged-in" — validate before: ✅ in state → SKIP steps
+  T3: Scenario "logged-in" — validate before: ❌ → run steps → validate after: ❌
+       → STOP, mark scenario as broken, fail T3 cleanly</code></pre>
+
+<h3>15.5 Почему web-подход (storageState) не работает на mobile</h3>
+
+<p>На вебе Cypress/Playwright сериализуют сессию в <code>storageState.json</code>: cookies + localStorage + IndexedDB. Файл маленький (KB), сериализация — миллисекунды, restore — быстрый.</p>
+
+<p>На mobile это невозможно по техническим причинам:</p>
+
+<table>
+<tr><th>Платформа</th><th>Что хранит state</th><th>Сериализация</th></tr>
+<tr>
+  <td>Android</td>
+  <td><code>/data/data/&lt;package&gt;/</code>: shared_prefs (XML), sqlite, files, cache + activity stack в RAM</td>
+  <td><code>adb backup -f file.ab</code> — 10-100 MB на тест, занимает 5-30 секунд, ломается при app update, не покрывает RAM state</td>
+</tr>
+<tr>
+  <td>iOS</td>
+  <td>App sandbox: NSUserDefaults, CoreData, Keychain</td>
+  <td>Без jailbreak — невозможно. С jailbreak — нестабильно.</td>
+</tr>
+<tr>
+  <td>Flutter</td>
+  <td>Зависит от платформы под Flutter</td>
+  <td>Те же ограничения что Android/iOS</td>
+</tr>
+</table>
+
+<p><strong>Вывод:</strong> вариант "снэпшот state теста A → restore перед тестом B" технически нереализуем для mobile в 2026. Единственный путь — <strong>прогнать setup steps заново</strong> (вариант A) или <strong>не делать pm clear между тестами в suite</strong> (вариант B/D).</p>
+
+<h3>15.6 executed_resources — audit trail для отладки</h3>
+
+<p>У нас в БД уже есть колонка <code>test_executions.executed_resources</code> (JSONB). Сейчас она пишется после каждого теста (<span class="file-ref">mobile-test-run.job.ts:1491</span>).</p>
+
+<p>Для вариантов C/D эта колонка становится <strong>критичной</strong> для отладки:</p>
+
+<pre><code>{
+  "scenarios": [
+    {
+      "id": "uuid-of-logged-in",
+      "name": "logged-in",
+      "status": "skipped_validate_passed",   // executed | skipped_validate_passed | failed_validate
+      "validate_duration_ms": 542,
+      "steps_skipped_count": 4,
+      "cache_source": "previous_test_in_run" // или "session_pool" или "none"
+    }
+  ]
+}</code></pre>
+
+<p>Это позволит юзеру понять "почему этот тест прошёл за 10 секунд а соседний за 45" — увидеть что в первом scenario скипнулся, во втором сыграл.</p>
+
+<h3>15.7 Retry semantics для sequential suite</h3>
+
+<p>Если suite "Onboarding flow" падает на тесте 3 из 4 — что делать?</p>
+
+<table>
+<tr><th>Опция</th><th>Поведение</th><th>Pros / Cons</th></tr>
+<tr>
+  <td>No retry</td>
+  <td>Тесты 4 помечается skipped, suite failed.</td>
+  <td>✅ Простой, ❌ один флак ломает результат</td>
+</tr>
+<tr>
+  <td>Retry from failed test</td>
+  <td>Тест 3 повторяется. Если прошёл — продолжить с 4.</td>
+  <td>✅ Простой fix для флака. ❌ Проблема: тест 3 теперь стартует не из состояния "после теста 2" а из "после неудачной попытки теста 3" — может быть другой state.</td>
+</tr>
+<tr>
+  <td>Retry from start of suite</td>
+  <td>Pm clear + проиграть с самого начала.</td>
+  <td>✅ Гарантирует чистый state. ❌ Дорого: если suite 30 минут — retry стоит 30 минут.</td>
+</tr>
+<tr>
+  <td>Retry only test 3 in isolation</td>
+  <td>Pm clear + проиграть scenario binding теста 3 + сам тест 3.</td>
+  <td>✅ Дёшево. ❌ Работает только если тест 3 имеет scenario binding.</td>
+</tr>
+</table>
+
+<p><strong>Рекомендация:</strong> опция "Retry from start of suite" с лимитом 1 повтор. Это match'ит Maestro Cloud retry. По умолчанию выключено, юзер включает в настройках suite.</p>
+
+<h3>15.8 Web vs Mobile asymmetry</h3>
+
+<p>Web tests сейчас работают по варианту A (scenarios). На вебе:</p>
+<ul>
+  <li><code>storageState.json</code> уже даёт быстрый login без UI (1-2 секунды)</li>
+  <li>Изоляция тестов дёшева — новый browser context за 200ms</li>
+  <li>Параллельность лёгкая — несколько браузеров одновременно</li>
+</ul>
+
+<p>Mobile:</p>
+<ul>
+  <li>Login через UI занимает 15-30 секунд</li>
+  <li>Изоляция через pm clear — 5-10 секунд</li>
+  <li>Параллельность дорогая — нужны отдельные эмуляторы</li>
+</ul>
+
+<p><strong>Это значит:</strong> вариант D (Hybrid Suite) может быть <strong>только для mobile</strong>. На вебе sequential suite не даёт большой выгоды, добавляет сложность. Команде стоит решить осознанно — расходимся ли мы по платформам.</p>
+
+<h3>15.9 Конкретные performance numbers</h3>
+
+<p>Регрессия из 50 тестов, у каждого scenario "logged-in" (30 сек login):</p>
+
+<table>
+<tr><th>Вариант</th><th>App setup</th><th>Scenario plays</th><th>Test steps</th><th>Total (приблизит.)</th></tr>
+<tr>
+  <td>A: Scenarios as-is</td>
+  <td>50 × 8s = 400s</td>
+  <td>50 × 30s = 1500s</td>
+  <td>50 × 20s = 1000s</td>
+  <td><strong>~48 минут</strong></td>
+</tr>
+<tr>
+  <td>B: Sequential Chain</td>
+  <td>1 × 8s = 8s</td>
+  <td>1 × 30s = 30s (login один раз)</td>
+  <td>50 × 20s = 1000s</td>
+  <td><strong>~17 минут</strong></td>
+</tr>
+<tr>
+  <td>C: Scenarios + Cache (hit rate 90%)</td>
+  <td>50 × 8s = 400s</td>
+  <td>5 × 30s + 45 × 1s = 195s</td>
+  <td>50 × 20s = 1000s</td>
+  <td><strong>~27 минут</strong></td>
+</tr>
+<tr>
+  <td>D: Hybrid (1 seq suite + 40 parallel with cache)</td>
+  <td>1 × 8s + 40 × 8s = 328s</td>
+  <td>1 × 30s + 4 × 30s = 150s</td>
+  <td>50 × 20s = 1000s</td>
+  <td><strong>~25 минут</strong></td>
+</tr>
+</table>
+
+<p><strong>Вывод по перфомансу:</strong> sequential chain в чистом виде даёт самый большой выигрыш по времени, но цена — cascade failure и потеря isolation. C даёт почти то же время при сохранении isolation. D балансирует.</p>
+
+<h3>15.10 Что мы НЕ обсудили (на будущее)</h3>
+
+<ul>
+  <li><strong>Parameterized scenarios</strong> — scenario "logged-in" с разными юзерами (admin / regular / banned). Mabl flows это поддерживают через args. Не critical для Phase 1.</li>
+  <li><strong>Conditional scenarios</strong> — "если юзер новый — onboarding, если старый — skip". Появится позже.</li>
+  <li><strong>Cross-platform scenarios</strong> — один scenario для Android и iOS? Сейчас platform-locked, может остаться так.</li>
+  <li><strong>Scenarios as test prerequisites</strong> — в UI показать "этот scenario используют 12 тестов, любое изменение их затронет" как Tosca делает.</li>
+  <li><strong>Visualization graph</strong> — DAG-граф зависимостей tests↔scenarios. Полезно для аудита, но не для повседневного редактирования.</li>
+</ul>
+</section>
+
+<div class="footer-note">
+  Документ для обсуждения. Не план реализации. Все сроки — оценки на основе текущего состояния кода (qai-backend dev branch, qai-frontend dev branch).<br>
+  Аддендум добавлен после внутреннего аудита: пункты 15.1–15.10 закрывают темы, упомянутые в обсуждении но недостаточно развёрнутые в основном тексте.
+</div>
+
+</div>
+</body>
+</html>
