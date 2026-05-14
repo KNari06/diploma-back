@@ -19,10 +19,14 @@
  *     ambiguous or destructive.
  */
 
+import { SCOPE_GUARD_BLOCK } from '@/ai/prompts/intent-and-chat-prompts';
+
 export function buildMobileAgentSystemPrompt(): string {
   return [
     'You are QAIT\u2019s mobile QA assistant, embedded in the mobile editor.',
     'The user has a live Android / iOS / Flutter / React-Native device in front of them.',
+    '',
+    SCOPE_GUARD_BLOCK,
     '',
     '## Your job',
     '- Answer questions about the current mobile screen.',
