@@ -29,6 +29,9 @@ import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
+// Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
+// module so unit tests can exercise them without booting supabase/BullMQ.
+import { sumStepDurations } from './helpers/telemetry';
 
 // ============================================================================
 // JOB HANDLER
@@ -143,6 +146,29 @@ export class MobileTestRunJobHandler {
     // failure). Built after compile; starts undefined so the no-bindings
     // fast path skips writeback entirely.
     let executedResources: Array<Record<string, unknown>> | undefined;
+    // Phase 2 (May 2026) telemetry — per-test wallclock breakdown.
+    // Every field starts null; only populated as the corresponding
+    // phase runs. Written to test_executions in the unified finally
+    // block (`persistTelemetrySnapshot`), so an early-exit failure
+    // path still emits whatever was captured up to the failure point.
+    // See docs/mobile-test-orchestration-plan.md Phase 2 for the spec.
+    const tlm: {
+      sessionClaimMs: number | null;
+      appSetupMs: number | null;
+      scenarioStepsMs: number | null;
+      testStepsMs: number | null;
+      coldStartUsed: boolean | null;
+      scenarioStepCount: number | null;
+      testStepCount: number | null;
+    } = {
+      sessionClaimMs: null,
+      appSetupMs: null,
+      scenarioStepsMs: null,
+      testStepsMs: null,
+      coldStartUsed: null,
+      scenarioStepCount: null,
+      testStepCount: null,
+    };
 
     // Validate
     if (!testId || !intentSteps?.length) {
@@ -213,6 +239,14 @@ export class MobileTestRunJobHandler {
     let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
 
     try {
+      // Phase 2 telemetry: capture user-step count up-front so a test
+      // without resource_bindings still gets `test_step_count`. The
+      // compile branch below overrides `scenarioStepCount` from null
+      // to a real value (possibly 0 if compile produced no prologue).
+      // Order matters: this must happen BEFORE prepend, while
+      // `intentSteps` still represents the user-authored body only.
+      tlm.testStepCount = intentSteps.length;
+
       // ── Track 5: Compile shared resources into setup steps ──
       // MUST run inside the main try block — otherwise a compile throw
       // skips the unified error handler below, leaving `test_executions`
@@ -238,6 +272,14 @@ export class MobileTestRunJobHandler {
         // dispatchMobileTest — compiled steps use mobile-only action
         // types (network / geolocation / upload) not in the web
         // IntentActionType.
+        //
+        // Phase 2 telemetry: record scenario prefix length BEFORE the
+        // prepend so the prefix split for runner durations is exact.
+        // `compileResult.steps.length` is the authoritative scenario
+        // prefix size (Phase 2 spec, "Точки замера"). May be 0 when
+        // bindings produced no compile output — that's still a real
+        // mobile run, hence overriding the earlier null.
+        tlm.scenarioStepCount = compileResult.steps.length;
         if (compileResult.steps.length > 0) {
           intentSteps = [
             ...(compileResult.steps as unknown as typeof intentSteps),
@@ -324,6 +366,12 @@ export class MobileTestRunJobHandler {
         } catch { /* non-fatal */ }
       };
 
+      // Phase 2 telemetry: timer wraps the entire pool->warmup->cold
+      // ladder so cold-start dominated runs surface in `session_claim_ms`.
+      // Date.now() is good enough at millisecond granularity for human-
+      // observable infrastructure wait times.
+      const sessionClaimT0 = Date.now();
+      try {
       // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s).
       // Pass `ownerId: userId` so the runner switches to this user's
       // dedicated Android multi-user — apps from other owners are hidden.
@@ -377,6 +425,15 @@ export class MobileTestRunJobHandler {
           platform,
           ownerId: userId,
         });
+      }
+      } finally {
+        // Phase 2: record claim wallclock regardless of outcome. A
+        // cold-start that succeeded after pool failure has the full
+        // ladder time, which is the honest number to expose. We also
+        // record coldStartUsed here so the value is set even if a
+        // subsequent prepApp throw skips later instrumentation.
+        tlm.sessionClaimMs = Math.max(0, Date.now() - sessionClaimT0);
+        tlm.coldStartUsed = sessionSource === 'cold';
       }
 
       // ── Phase 3a: Apply project-level runtime-permission policy ────
@@ -468,6 +525,12 @@ export class MobileTestRunJobHandler {
           // worker's existing 13-15-17% step ramp. Stage names are stable
           // across editor/worker; only the numeric progress and the human
           // string differ.
+          //
+          // Phase 2 telemetry: capture wallclock of the prepApp call
+          // (pm clear + APK install + cold launch). On throw, leave
+          // tlm.appSetupMs null — the failure means "we don't know how
+          // long success would have taken", which is honest analytics.
+          const appSetupT0 = Date.now();
           await MobileAppPrepService.prepApp({
             client,
             sessionId,
@@ -492,6 +555,7 @@ export class MobileTestRunJobHandler {
               }
             },
           });
+          tlm.appSetupMs = Math.max(0, Date.now() - appSetupT0);
 
           logger.info('[MOBILE-TEST] App prepared (installed + hard-reset + launched)', {
             testId,
@@ -565,6 +629,22 @@ export class MobileTestRunJobHandler {
       }
       clearInterval(cancelPoller);
 
+      // Phase 2 telemetry: split per-step durations into scenario vs
+      // user-test segments. Runner returns `MobileStepResult[]` in the
+      // same order as the request — the first N entries (where N is
+      // `tlm.scenarioStepCount ?? 0`) correspond to the prepended
+      // scenario_setup prologue; the remainder is the user-authored
+      // body. `sumStepDurations` is null-tolerant (missing or
+      // non-number durations coalesce to 0) so a partial run still
+      // emits sane numbers.
+      const scenarioPrefixN = tlm.scenarioStepCount ?? 0;
+      tlm.scenarioStepsMs = sumStepDurations(
+        (runResult.steps || []).slice(0, scenarioPrefixN),
+      );
+      tlm.testStepsMs = sumStepDurations(
+        (runResult.steps || []).slice(scenarioPrefixN),
+      );
+
       logger.info('[MOBILE-TEST] Steps executed', {
         testId,
         sessionId,
@@ -574,6 +654,12 @@ export class MobileTestRunJobHandler {
         skippedSteps: runResult.skippedSteps,
         status: runResult.status,
         durationMs: runResult.durationMs,
+        // Phase 2 telemetry surfaced in logs for quick inspection
+        // without an SQL trip. Matches the columns persisted below.
+        telemetryAppSetupMs: tlm.appSetupMs,
+        telemetryScenarioStepsMs: tlm.scenarioStepsMs,
+        telemetryTestStepsMs: tlm.testStepsMs,
+        telemetrySessionClaimMs: tlm.sessionClaimMs,
       });
 
       // ── Diagnostic: aborted/timed-out steps ──────────────────────────
@@ -1040,6 +1126,16 @@ export class MobileTestRunJobHandler {
 
       throw error;
     } finally {
+      // ── Phase 2 (May 2026): persist telemetry FIRST ──────────────
+      // Runs before session cleanup so a release/destroy error can't
+      // mask the telemetry write. Best-effort: never throws, never
+      // fails the test path (the persist helper swallows + warns).
+      // Captures whatever `tlm` accumulated up to this point — partial
+      // failures still produce partial-but-honest analytics.
+      if (testId) {
+        await MobileTestRunJobHandler.persistTelemetrySnapshot(testId, tlm);
+      }
+
       // ── Cleanup: release pooled session or destroy adhoc/warmed ──
       if (sessionId) {
         try {
@@ -1491,6 +1587,49 @@ export class MobileTestRunJobHandler {
       await ExecutionService.persistExecutedResourcesByTestId(testId, snapshot);
     } catch (err) {
       logger.warn('[MOBILE-TEST] Failed to persist executed_resources snapshot', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Phase 2 (May 2026) — Persist per-test wallclock telemetry into the
+   * `test_executions` row(s) that reference this `testId`. Mirrors
+   * `persistExecutedResourcesSnapshot` shape: best-effort, non-throwing.
+   * A failure here MUST NOT fail the test (analytics enriches the run;
+   * the test's outcome is its source of truth).
+   *
+   * Called from the unified finally block so a successful happy path,
+   * an early-exit failure, and a job-level error all emit whatever was
+   * captured up to the point of failure. Fields that weren't reached
+   * stay null — that's the honest "we don't know" signal for downstream
+   * aggregation.
+   */
+  private static async persistTelemetrySnapshot(
+    testId: string,
+    tlm: {
+      sessionClaimMs: number | null;
+      appSetupMs: number | null;
+      scenarioStepsMs: number | null;
+      testStepsMs: number | null;
+      coldStartUsed: boolean | null;
+      scenarioStepCount: number | null;
+      testStepCount: number | null;
+    },
+  ): Promise<void> {
+    try {
+      await ExecutionService.persistTelemetryByTestId(testId, {
+        app_setup_ms: tlm.appSetupMs,
+        scenario_steps_ms: tlm.scenarioStepsMs,
+        test_steps_ms: tlm.testStepsMs,
+        session_claim_ms: tlm.sessionClaimMs,
+        cold_start_used: tlm.coldStartUsed,
+        scenario_step_count: tlm.scenarioStepCount,
+        test_step_count: tlm.testStepCount,
+      });
+    } catch (err) {
+      logger.warn('[MOBILE-TEST] Failed to persist telemetry snapshot', {
         testId,
         error: err instanceof Error ? err.message : String(err),
       });

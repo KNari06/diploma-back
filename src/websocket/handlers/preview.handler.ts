@@ -1802,7 +1802,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
   socket.on('preview:step:apply', async (data) => {
     try {
       const ensuredUserId = requireUser();
-      if (!ensuredUserId) return;
+      if (!ensuredUserId) {
+        // Invariant #2 (CLAUDE.md): WS handlers must always emit a terminator.
+        // requireUser emits a generic 'error' event, but the FE Apply button
+        // only clears its loading state on preview:step:apply:result.
+        socket.emit('preview:step:apply:result', {
+          success: false,
+          error: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
 
       // V2: Rate limit check
       if (!checkRateLimit(socket.id, 'apply')) {
@@ -4934,12 +4944,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
     // own activeRuns.set(), and a stale 2nd event arriving in that window
     // would otherwise slip past both guards.
     const guardKey = data?.previewSessionId;
+    // Invariant #2 (CLAUDE.md): the FE Run button clears its loading state on
+    // preview:run:completed. Every early exit in this handler must emit a
+    // completion-shaped terminator in addition to the diagnostic 'error' event,
+    // otherwise the button spins forever even after the action succeeded.
+    const emitRunTerminator = (errorMessage: string): void => {
+      socket.emit('preview:run:completed', {
+        previewSessionId: typeof guardKey === 'string' ? guardKey : '',
+        success: false,
+        totalSteps: 0,
+        passedSteps: 0,
+        failedSteps: 0,
+        skippedSteps: 0,
+        cancelled: false,
+        duration: 0,
+        error: errorMessage,
+        timestamp: new Date().toISOString(),
+      });
+    };
     if (typeof guardKey === 'string' && guardKey.length > 0) {
       if (previewRunStartInFlight.has(guardKey)) {
         logger.warn('[WebSocket] preview:run:start ignored — another start is in flight', {
           previewSessionId: guardKey,
           socketId: socket.id,
         });
+        emitRunTerminator('Run already in progress');
         return;
       }
       previewRunStartInFlight.add(guardKey);
@@ -4956,6 +4985,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           message: 'previewSessionId and intentTestCaseId are required',
           timestamp: new Date().toISOString(),
         });
+        emitRunTerminator('previewSessionId and intentTestCaseId are required');
         return;
       }
 
@@ -5050,6 +5080,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             message: 'No steps to run',
             timestamp: new Date().toISOString(),
           });
+          emitRunTerminator('No steps to run');
           return;
         }
 
@@ -5125,6 +5156,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             message: 'No active mobile emulator session. Please wait for the emulator to connect.',
             timestamp: new Date().toISOString(),
           });
+          emitRunTerminator('No active mobile emulator session');
           return;
         }
 
@@ -5147,6 +5179,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           stepIds: steps.map((s: any) => s.id),
         });
 
+        // Mark the run as "kicked off" BEFORE issuing the async runSteps
+        // so the outer try/finally doesn't release the guard while the
+        // run is still in flight on the runner. Mirror of the web path
+        // (line ~5327). Without this, a second `preview:run:start` for
+        // the same session could pass the `previewRunStartInFlight` Set
+        // guard while runSteps is still executing — fix shipped May 2026
+        // after audit found the asymmetry between web (kickedOff=true)
+        // and mobile (kickedOff stayed false) paths.
+        kickedOff = true;
         // Run steps on mobile runner (async)
         mobileClient.runSteps(mobileSessionId, steps, {
           screenshotEachStep: true,
@@ -5213,6 +5254,16 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             error: error instanceof Error ? error.message : 'Mobile run failed',
             timestamp: new Date().toISOString(),
           });
+        }).finally(() => {
+          // Mirror of the web `.finally` at the equivalent point in the
+          // PreviewRunService chain (~line 5346): only now is it safe to
+          // release the in-flight guard. Releasing earlier (in the outer
+          // synchronous `finally`) defeated the guard's purpose — a
+          // second preview:run:start for this session could land while
+          // the previous runSteps was still on the wire.
+          if (typeof guardKey === 'string' && guardKey.length > 0) {
+            previewRunStartInFlight.delete(guardKey);
+          }
         });
 
         return; // Mobile path done — skip web flow below
@@ -5229,6 +5280,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           message: 'Session not owned by user',
           timestamp: new Date().toISOString(),
         });
+        emitRunTerminator('Session not owned by user');
         return;
       }
 
@@ -5242,6 +5294,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           message: 'Run already in progress',
           timestamp: new Date().toISOString(),
         });
+        emitRunTerminator('Run already in progress');
         return;
       }
 
@@ -5304,6 +5357,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             message: error instanceof Error ? error.message : 'Run failed',
             timestamp: new Date().toISOString(),
           });
+          // runSavedSteps emits preview:run:completed from its own finally
+          // on every reachable exit, but a rejection here means the promise
+          // threw before/around that emit — the FE button needs a terminator.
+          emitRunTerminator(error instanceof Error ? error.message : 'Run failed');
         })
         .finally(() => {
           // Run fully settled (success / failure / cancellation). At this
@@ -5326,6 +5383,9 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         message: error instanceof Error ? error.message : 'Internal error',
         timestamp: new Date().toISOString(),
       });
+      if (!kickedOff) {
+        emitRunTerminator(error instanceof Error ? error.message : 'Internal error');
+      }
     } finally {
       // Release the synchronous guard ONLY when we did not kick off a run.
       // If we did kick off, the .finally() chained on runSavedSteps owns

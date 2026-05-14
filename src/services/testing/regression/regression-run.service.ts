@@ -21,6 +21,15 @@ import type {
   NegativeSummary,
 } from '@/types/testing.types';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
+// Phase 4 (May 2026) — mobile concurrency cap decided per-run from env +
+// real-time pool capacity. See concurrency-decision.ts for the policy.
+import {
+  decideMaxMobileInFlight,
+  countMobileTests,
+  dominantMobilePlatform,
+  envCapMobile,
+} from './concurrency-decision';
+import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger, formatError } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
@@ -2085,10 +2094,58 @@ export class RegressionRunService {
     // after step 0 in the runner. Editor runs never hit this because
     // they're always single-test. Operators with a healthy warm pool can
     // raise this to match `POOL_ANDROID_SIZE + POOL_IOS_SIZE`.
-    const MAX_MOBILE_IN_FLIGHT = Math.max(
-      1,
-      parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '1', 10),
-    );
+    // Phase 4 (May 2026): dynamic concurrency cap.
+    //
+    // Pre-Phase-4 this was a static parse of REGRESSION_MOBILE_MAX_CONCURRENCY
+    // with a Math.max(1, ...) floor. That ignored real-time pool capacity
+    // and test count — operators had to manually retune the env var.
+    //
+    // Now: we ask the runner for live pool capacity (cheap REST call,
+    // 5s timeout) and decide a cap that respects:
+    //   - envCap (operator's hard ceiling — never violated)
+    //   - poolIdle (don't dispatch more parallel tests than the runner can claim)
+    //   - testCount + platform (skip parallelism overhead when not useful)
+    //
+    // Falls back to cap=1 on any failure path (runner down, classic mode,
+    // iOS-only, ...), preserving the pre-Phase-4 default behaviour. NEVER
+    // throws — the regression always proceeds, just maybe serially.
+    //
+    // Snapshot-and-go: decision is computed once here and re-used for the
+    // entire run. We deliberately don't recompute mid-run; multiple
+    // regressions sharing the pool would race each other otherwise.
+    //
+    // See docs/mobile-test-orchestration-plan.md Phase 4.
+    let MAX_MOBILE_IN_FLIGHT = 1;
+    try {
+      const decision = await decideMaxMobileInFlight({
+        testCount: countMobileTests(levels),
+        platform: dominantMobilePlatform(levels),
+        runnerClient: getMobileRunnerClient(),
+      });
+      MAX_MOBILE_IN_FLIGHT = decision.cap;
+      logger.info('[REGRESSION_RUN] Mobile concurrency decided', {
+        runId,
+        cap: decision.cap,
+        reason: decision.reason,
+        ...decision.inputs,
+      });
+    } catch (err) {
+      // decideMaxMobileInFlight is documented not-to-throw; if it does,
+      // fall back to the env cap (or 1) so the regression still runs.
+      // Surface so we notice in logs and fix.
+      //
+      // Phase 4 audit (May 2026): use `envCapMobile()` rather than an
+      // inline `Math.max(1, parseInt(...))`. parseInt('abc', 10) → NaN
+      // and Math.max(1, NaN) → NaN, which would silently disable the
+      // `inFlight.size >= cap` gate (NaN >= n is always false) and
+      // dispatch every test in parallel. envCapMobile() validates
+      // Number.isFinite + >=1 and falls back to 1 on garbage env.
+      logger.error('[REGRESSION_RUN] decideMaxMobileInFlight threw — falling back to envCap', {
+        runId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      MAX_MOBILE_IN_FLIGHT = envCapMobile();
+    }
 
     // Defensive guard: log loudly if any testCaseId is dispatched twice
     // within a single run. Topological levels + dedup at expansion time

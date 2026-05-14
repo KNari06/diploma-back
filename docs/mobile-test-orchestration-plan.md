@@ -199,34 +199,379 @@ Manual: на свежем проекте без scenarios — открыть tes
 
 Решения про autoscaling, sequence_group, AI fingerprint cache priority — все требуют данных. Сейчас мы оптимизируем на гипотезах.
 
-### Что собираем
+### Scope clarification
 
-В `regression_runs` уже есть `started_at`, `completed_at`. Добавить:
+- **Mobile-first**: новые колонки nullable. Mobile job заполняет; web/API jobs оставляют NULL до отдельного трека. Это документируется в migration comments.
+- **No new endpoint в Phase 2**: данные пишем в БД, дашборд — ad-hoc SQL. Endpoint вынесен в "Phase 2.5 (optional)" ниже, делаем только если команда явно попросит.
+- **Mobile job уже самый болевой**: web регрессии быстрые (storageState), их telemetry дешевле и менее критично.
 
-**Колонки в `regression_runs`:**
-- `test_count int` — сколько тестов в run
-- `total_duration_ms int` — total wall time
-- `total_app_setup_ms int` — суммарное время `MobileAppPrepService.prepApp` по всем тестам в run
-- `total_scenario_ms int` — суммарное время scenario steps
-- `total_test_steps_ms int` — суммарное время user steps
-- `cold_start_count int` — сколько cold-start было в run
+### Точки замера (с file:line)
 
-**Колонки в `test_executions`:**
-- `app_setup_ms int`
-- `scenario_steps_ms int` (если использовали scenario)
-- `test_steps_ms int`
-- `cold_start_used bool`
+| Метрика | Где замерять | Источник данных |
+|---|---|---|
+| `app_setup_ms` | wrap-around `mobile-test-run.job.ts:471` `MobileAppPrepService.prepApp()` | `performance.now()` до/после |
+| `scenario_steps_ms` | sum of `MobileStepResult.durationMs` для первых `compileResult.steps.length` шагов в `MobileRunStepsResponse.steps[]` | runner per-step timing |
+| `test_steps_ms` | sum of `MobileStepResult.durationMs` для **остальных** шагов | runner per-step timing |
+| `cold_start_used` | `sessionSource === 'cold'` в `mobile-test-run.job.ts:373` | local var |
+| `session_claim_ms` | wrap-around try-pool→try-warmup→cold ladder (`mobile-test-run.job.ts:327-380`) | `performance.now()` до/после ladder |
+| `scenario_step_count` | `compileResult.steps.length` | compile result |
+| `test_step_count` | `intentSteps.length - compileResult.steps.length` | derive |
+| `total_duration_ms` (regression_runs) | `completed_at - started_at` уже доступно, посчитаем при aggregation | DB |
+| `total_app_setup_ms` (regression_runs) | SUM of `app_setup_ms` over `test_executions` of run | aggregation query |
+| `total_scenario_ms` / `total_test_steps_ms` / `cold_start_count` | аналогично | aggregation query |
+| `test_count` | COUNT of `test_executions` for run | aggregation query |
 
-**Endpoint для дашборда:**
-- `GET /admin/regression-metrics?from=...&to=...` — возвращает histogram распределения по test_count, p50/p95/p99 duration, % cold-starts
+### Migration spec
 
-### Анти-цель
+**Файл:** `supabase-migrations/20260516_mobile_telemetry.sql`
 
-**Не пытаться** агрегировать на runtime в красивые dashboards. Это просто СУБД-данные для ad-hoc SQL запросов. Дашборд может появиться позже.
+```sql
+-- ============================================================================
+-- Phase 2: Mobile Regression Telemetry
+-- ============================================================================
+-- Purpose: Capture per-test and per-run wallclock breakdowns so we can
+-- make data-driven decisions about parallelism (Phase 4), scenario
+-- caching (Phase 5), and infrastructure scaling (Phase 7+).
+--
+-- All columns are NULLABLE on purpose:
+--   - Web/API jobs leave them NULL (mobile-only telemetry in Phase 2).
+--   - Legacy rows pre-migration are NULL.
+--   - Reading code MUST coalesce(col, 0) or treat NULL as "unknown".
+--
+-- No DEFAULT 0 because "0 ms" is semantically distinct from "we don't
+-- know" — aggregation queries must distinguish.
+-- ============================================================================
 
-### Verification
+-- ── test_executions: per-test breakdown ──────────────────────────────
+ALTER TABLE test_executions
+  ADD COLUMN IF NOT EXISTS app_setup_ms      INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS scenario_steps_ms INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS test_steps_ms    INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS session_claim_ms  INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS cold_start_used   BOOLEAN NULL,
+  ADD COLUMN IF NOT EXISTS scenario_step_count INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS test_step_count   INTEGER NULL;
 
-- После 2 недель прода — посмотреть `SELECT test_count, percentile_cont(0.95) WITHIN GROUP (ORDER BY total_duration_ms) FROM regression_runs GROUP BY test_count` — есть ли реальные пользователи которые жалуются на performance?
+COMMENT ON COLUMN test_executions.app_setup_ms IS
+  'Phase 2 telemetry: pm clear + relaunch + APK install wallclock. NULL for non-mobile jobs.';
+COMMENT ON COLUMN test_executions.scenario_steps_ms IS
+  'Phase 2 telemetry: sum of MobileStepResult.durationMs for prepended scenario_setup steps. NULL if no scenario binding or non-mobile.';
+COMMENT ON COLUMN test_executions.test_steps_ms IS
+  'Phase 2 telemetry: sum of MobileStepResult.durationMs for user-authored test steps (everything after the scenario prefix). NULL for non-mobile.';
+COMMENT ON COLUMN test_executions.session_claim_ms IS
+  'Phase 2 telemetry: wallclock of the pool→warmup→cold claim ladder. Includes cold-start boot if it fell through. NULL for non-mobile.';
+COMMENT ON COLUMN test_executions.cold_start_used IS
+  'Phase 2 telemetry: TRUE if sessionSource === "cold" (no pool, no warmup). NULL for non-mobile.';
+COMMENT ON COLUMN test_executions.scenario_step_count IS
+  'Phase 2 telemetry: number of scenario steps prepended (= compileResult.steps.length). NULL for non-mobile or no scenario.';
+COMMENT ON COLUMN test_executions.test_step_count IS
+  'Phase 2 telemetry: number of user-authored test steps. NULL for non-mobile.';
+
+-- Index for time-range queries (the most common admin-metrics use case).
+-- WHERE clause keeps the index small — only mobile rows have these values.
+CREATE INDEX IF NOT EXISTS idx_test_executions_telemetry_completed_at
+  ON test_executions (completed_at DESC)
+  WHERE app_setup_ms IS NOT NULL;
+
+-- ── regression_runs: per-run aggregates ──────────────────────────────
+ALTER TABLE regression_runs
+  ADD COLUMN IF NOT EXISTS test_count           INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS total_duration_ms    INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS total_app_setup_ms   INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS total_scenario_ms    INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS total_test_steps_ms INTEGER NULL,
+  ADD COLUMN IF NOT EXISTS cold_start_count     INTEGER NULL;
+
+COMMENT ON COLUMN regression_runs.test_count IS
+  'Phase 2 telemetry: COUNT of test_executions rows in this run.';
+COMMENT ON COLUMN regression_runs.total_duration_ms IS
+  'Phase 2 telemetry: completed_at - started_at in ms. Includes queueing.';
+COMMENT ON COLUMN regression_runs.total_app_setup_ms IS
+  'Phase 2 telemetry: SUM of test_executions.app_setup_ms for this run.';
+COMMENT ON COLUMN regression_runs.total_scenario_ms IS
+  'Phase 2 telemetry: SUM of test_executions.scenario_steps_ms for this run.';
+COMMENT ON COLUMN regression_runs.total_test_steps_ms IS
+  'Phase 2 telemetry: SUM of test_executions.test_steps_ms for this run.';
+COMMENT ON COLUMN regression_runs.cold_start_count IS
+  'Phase 2 telemetry: COUNT of test_executions with cold_start_used = TRUE.';
+
+CREATE INDEX IF NOT EXISTS idx_regression_runs_completed_at_telemetry
+  ON regression_runs (completed_at DESC)
+  WHERE total_duration_ms IS NOT NULL;
+```
+
+**Backfill**: skip. Leave NULL for legacy rows. Aggregation queries `coalesce` or filter `WHERE total_duration_ms IS NOT NULL`.
+
+**Rollout order**: migration first (additive, safe), then code. Old code ignores new columns; new code on old DB fails open (`logger.warn` + skip writes).
+
+### Implementation — per-test capture
+
+**File:** `src/jobs/mobile-test-run.job.ts`
+
+#### 1. Top of handler (~line 213, near existing `sessionSource`)
+
+```typescript
+// Phase 2 telemetry — per-test wallclock. All defaults to null/0 so a
+// failure path that exits early still writes a well-formed row. We
+// commit these into test_executions in the existing finally block at
+// :1491 (next to executed_resources persistence).
+const tlm: {
+  sessionClaimMs: number | null;
+  appSetupMs: number | null;
+  scenarioStepsMs: number | null;
+  testStepsMs: number | null;
+  coldStartUsed: boolean | null;
+  scenarioStepCount: number | null;
+  testStepCount: number | null;
+} = {
+  sessionClaimMs: null,
+  appSetupMs: null,
+  scenarioStepsMs: null,
+  testStepsMs: null,
+  coldStartUsed: null,
+  scenarioStepCount: null,
+  testStepCount: null,
+};
+```
+
+#### 2. Wrap session claim ladder (`:327-380`)
+
+```typescript
+const sessionClaimT0 = performance.now();
+try {
+  // ... existing pool / warmup / cold ladder unchanged ...
+} finally {
+  tlm.sessionClaimMs = Math.round(performance.now() - sessionClaimT0);
+  tlm.coldStartUsed = sessionSource === 'cold';
+}
+```
+
+#### 3. Wrap prepApp (`:471`)
+
+```typescript
+const appSetupT0 = performance.now();
+await MobileAppPrepService.prepApp({ /* existing args */ });
+tlm.appSetupMs = Math.round(performance.now() - appSetupT0);
+```
+
+#### 4. After scenario compile (`:241`) — record counts before runSteps
+
+```typescript
+tlm.scenarioStepCount = compileResult.steps.length;
+tlm.testStepCount = intentSteps.length - compileResult.steps.length;
+```
+
+#### 5. After runSteps returns — slice per-step durations
+
+```typescript
+const stepResults = runResult.steps || []; // MobileStepResult[]
+const scenarioN = tlm.scenarioStepCount ?? 0;
+tlm.scenarioStepsMs = sumStepDurations(stepResults.slice(0, scenarioN));
+tlm.testStepsMs = sumStepDurations(stepResults.slice(scenarioN));
+
+// helper at file bottom (or extract to mobile-test-run.helpers.ts):
+function sumStepDurations(steps: MobileStepResult[]): number {
+  return steps.reduce((acc, s) => acc + (typeof s.durationMs === 'number' ? s.durationMs : 0), 0);
+}
+```
+
+#### 6. Write into test_executions (finally block ~:1491, next to `executed_resources`)
+
+```typescript
+// Phase 2: persist telemetry. Best-effort: any failure here MUST NOT
+// fail the test (logger.warn + swallow). Job retry will re-emit.
+try {
+  await supabaseAdmin
+    .from('test_executions')
+    .update({
+      app_setup_ms: tlm.appSetupMs,
+      scenario_steps_ms: tlm.scenarioStepsMs,
+      test_steps_ms: tlm.testStepsMs,
+      session_claim_ms: tlm.sessionClaimMs,
+      cold_start_used: tlm.coldStartUsed,
+      scenario_step_count: tlm.scenarioStepCount,
+      test_step_count: tlm.testStepCount,
+    })
+    .eq('id', testExecutionId);
+} catch (err) {
+  logger.warn('[MOBILE-TEST] Failed to persist telemetry — non-fatal', {
+    testId, error: err instanceof Error ? err.message : String(err),
+  });
+}
+```
+
+**Retry semantics**: each attempt overwrites with the latest attempt's numbers. BullMQ delivers max 1 attempt currently (mobile-test-run.job: see config). If retries change — document the implication explicitly.
+
+### Implementation — per-run aggregation
+
+**File:** `src/services/testing/results/test-completion-handler.service.ts`
+
+**Point:** inside `recomputeRunStatus()` at `:937` — RIGHT BEFORE the `.update({...})` call. This is the **single funnel** where every regression run is finalized — no other place sets `regression_runs.status = 'completed' | 'failed' | 'cancelled'`.
+
+```typescript
+// Phase 2 telemetry: aggregate per-test rows into per-run totals.
+// We already have unifiedExecutions in scope (loaded above).
+// All sums coalesce NULL → 0 so non-mobile rows just don't contribute.
+//
+// Why here and not in mobile-test-run.job:
+//   - this handler runs for EVERY platform (web/mobile/api) so the
+//     code path is reused
+//   - it's the only ordering-safe point — finalisation is already
+//     guarded by optimistic-lock `.in('status', ['running','pending'])`
+const startedAtMs = run.started_at ? new Date(run.started_at).getTime() : null;
+const completedAtMs = Date.now();
+const totalDurationMs = startedAtMs ? Math.max(completedAtMs - startedAtMs, 0) : null;
+
+// Re-fetch executions WITH telemetry columns (the earlier query at
+// :840 only selects id/status/error_message/created_at to keep that
+// hot path lean).
+const { data: telemetryRows } = await supabaseAdmin
+  .from('test_executions')
+  .select('app_setup_ms, scenario_steps_ms, test_steps_ms, cold_start_used')
+  .eq('run_id', run.id);
+
+const tlmRows = telemetryRows ?? [];
+const sumOrNull = (key: keyof typeof tlmRows[number]) => {
+  const present = tlmRows.filter((r) => r[key] != null);
+  if (present.length === 0) return null;          // pure-web run → leave NULL
+  return present.reduce((acc, r) => acc + (r[key] as number), 0);
+};
+
+const aggregateUpdate = {
+  test_count: tlmRows.length || null,
+  total_duration_ms: totalDurationMs,
+  total_app_setup_ms: sumOrNull('app_setup_ms'),
+  total_scenario_ms: sumOrNull('scenario_steps_ms'),
+  total_test_steps_ms: sumOrNull('test_steps_ms'),
+  cold_start_count: tlmRows.filter((r) => r.cold_start_used === true).length || null,
+};
+
+// Merge into the existing .update payload at :937.
+// (No separate UPDATE — single statement to avoid race with summary update.)
+const { data: updatedRun, error: updateError } = await supabaseAdmin
+  .from('regression_runs')
+  .update({
+    status: persistedStatus,
+    summary,
+    completed_at: new Date().toISOString(),
+    ...aggregateUpdate,                            // ← Phase 2 additions
+  })
+  .eq('id', run.id)
+  .in('status', ['running', 'pending'])
+  .select('id')
+  .maybeSingle();
+```
+
+**Idempotency**: optimistic-lock on `.in('status', ['running','pending'])` already prevents double-write. If a second completion handler races in, it's no-op'd by the lock — our telemetry doesn't double-count.
+
+### Anti-goals (explicit)
+
+- **No dashboard UI in Phase 2.** Data lives in DB. Team uses ad-hoc SQL.
+- **No web/API instrumentation.** Web jobs leave the new columns NULL.
+- **No new endpoint.** See Phase 2.5 below.
+- **No backfill.** Pre-migration rows stay NULL forever.
+- **No per-step persistence.** We aggregate at job level; per-step `MobileStepResult.durationMs` already exists in `executed_resources` shape if needed for forensics.
+
+### Phase 2.5 (optional) — `/admin/regression-metrics` endpoint
+
+**Only build if team asks.** Spec sketch:
+
+- Route: `GET /admin/regression-metrics`
+- Auth: existing admin middleware (`src/middleware/admin.ts` if exists; else **don't** build a new auth model in Phase 2.5 — defer to dedicated auth task)
+- Query params: `from`, `to` (ISO dates), `bucket=daily|weekly`
+- Response shape:
+  ```json
+  {
+    "rangeFrom": "2026-05-01",
+    "rangeTo":   "2026-05-15",
+    "buckets": [
+      { "date": "2026-05-14", "test_count_p50": 8, "test_count_p95": 35,
+        "duration_p50_ms": 240000, "duration_p95_ms": 1450000,
+        "cold_start_rate": 0.18 }
+    ]
+  }
+  ```
+- Cache: 60s in-memory or Redis (data is hourly-grade, not real-time)
+- Rate limit: per-user 60/min (it's admin-only, low traffic)
+
+### Tests
+
+**File:** `src/jobs/__tests__/mobile-test-run-telemetry.test.ts` (new)
+
+Cases:
+1. Successful run with scenario → all timing fields populated, sum invariants hold (`scenario_steps_ms + test_steps_ms` ≈ runner-reported `durationMs`)
+2. Successful run WITHOUT scenario → `scenario_steps_ms = 0`, `scenario_step_count = 0`, `test_steps_ms > 0`
+3. prepApp throws → `app_setup_ms = null` (no false zero), test fails as expected
+4. Telemetry DB write throws → job completes normally (warn logged, no throw)
+5. Cold-start path → `cold_start_used = true`, `session_claim_ms > 0`
+6. `sumStepDurations` unit: missing/non-number durations gracefully coalesce to 0
+
+**File:** `src/services/testing/results/__tests__/test-completion-handler-aggregation.test.ts` (new or extend existing)
+
+Cases:
+1. Run with 3 mobile tests → all 6 aggregate columns populated, equal SUMs
+2. Mixed mobile + web run → mobile sums correct, web rows ignored (NULL skipped)
+3. Pure-web run → `test_count` populated, all `total_*_ms` columns NULL (sumOrNull semantics)
+4. Race condition: two handlers complete same run → optimistic lock blocks second, no double-aggregate
+5. Empty run (zero test_executions) → `test_count = null`, all aggregates NULL
+
+### Documentation updates (mandatory same-PR)
+
+1. **Root CLAUDE.md**: add row to `src/jobs/` line in the "Top-level map" table noting Phase 2 telemetry instrumentation. Append "Phase 2 telemetry" to the recent-baselines section.
+2. **`src/jobs/` CLAUDE.md** (create if missing — folder has > 8 files, qualifies per folder-structure rule): include lifecycle of `mobile-test-run.job` with telemetry capture points.
+3. **`src/services/test-resource/CLAUDE.md`** invariants list: add "Telemetry writes are best-effort — never throw from the test path." Reuses existing CLAUDE.md style.
+4. **Memory:** add a 1-line entry pointing to a new `memory/phase_2_telemetry.md` with the column-list and rollout date.
+
+### Code-quality rules to honour during implementation
+
+Pulled from `.claude/rules/*` — applied to Phase 2 specifically:
+
+- **No N+1**: aggregation query loads `test_executions` once per run (already done by existing `recomputeRunStatus`; we just `select` additional columns). DO NOT loop over executions and re-query per row.
+- **Field verification**: every new column referenced in code MUST exist in `supabase-migrations/`. Migration ships in same PR as code.
+- **Pre-commit**:
+  ```bash
+  npm run type-check
+  npm run lint
+  npx jest --testPathPattern="mobile-test-run-telemetry|test-completion-handler-aggregation" --no-coverage
+  ```
+- **No silent throws**: every catch around telemetry MUST `logger.warn` with structured context (`testId`, `runId`, error message).
+- **No emoji in code/files** (per general.md).
+- **Don't reformat unrelated lines** in `test-completion-handler.service.ts` or `mobile-test-run.job.ts` — surgical edits only.
+- **DRY**: `sumStepDurations` lives once — either as a method inside `mobile-test-run.job.ts` (file-local) or extract to `src/jobs/helpers/telemetry.ts` if a second consumer materialises.
+
+### Risk Analysis (Phase 2 specific)
+
+| Risk | Mitigation |
+|---|---|
+| Telemetry DB write fails → job fails | All persistence wrapped in try/catch + `logger.warn`. **Never throws out of telemetry block.** |
+| Wrong scenario/test split (e.g. scenario expander injects extra steps) | We use `compileResult.steps.length` AS RETURNED by the compiler — same source of truth as the prepend. If compiler changes shape, both `intentSteps` prepend and telemetry split move together. |
+| `MobileStepResult.durationMs` missing on some runner versions | `sumStepDurations` coalesces missing → 0. Aggregate may underestimate; better than NaN. |
+| Aggregation runs BEFORE all per-test rows landed | Existing `recomputeRunStatus` already handles "stuck" detection at `:853`. Our aggregation runs **after** that check — by then all rows are final. |
+| Migration runs on running prod → ADD COLUMN locks | `ADD COLUMN ... NULL` in Postgres is metadata-only (instant). Safe to apply during prod traffic. |
+| New columns leak PII | None of these columns hold strings or step content. Pure numeric/boolean. No leak. |
+| `performance.now()` not available in node | Available since Node 8.5. Our Node version is 18+. Safe. |
+
+### Verification (post-deploy)
+
+1. Open prod DB:
+   ```sql
+   SELECT
+     percentile_cont(0.50) WITHIN GROUP (ORDER BY total_duration_ms) AS p50_ms,
+     percentile_cont(0.95) WITHIN GROUP (ORDER BY total_duration_ms) AS p95_ms,
+     AVG(cold_start_count::float / NULLIF(test_count,0)) AS cold_start_rate
+   FROM regression_runs
+   WHERE total_duration_ms IS NOT NULL
+     AND completed_at > NOW() - INTERVAL '7 days';
+   ```
+2. Spot-check a single run:
+   ```sql
+   SELECT test_count, total_duration_ms, total_app_setup_ms,
+          total_scenario_ms, total_test_steps_ms, cold_start_count
+   FROM regression_runs
+   WHERE id = '<some-run-id>';
+   ```
+   - `total_app_setup_ms + total_scenario_ms + total_test_steps_ms` should be **≤** `total_duration_ms` (difference = pool waits, queueing, network overhead). If it's GREATER — investigate.
+3. After 2 weeks of data → revisit Phase 4/5/7 priorities based on real distribution.
 
 ---
 
@@ -261,38 +606,234 @@ Stress test: запустить 10 регрессий по 20 тестов на 
 
 ## Phase 4 — Dynamic `MAX_IN_FLIGHT` cap (2-3 дня, Backend)
 
+> **Re-actualised May 2026** after Phase 2 (telemetry) + Phase 3 (host-ADB mutex) shipped. Replaces earlier draft (incorrect endpoint name, wrong PoolHealth shape, missed dead-method discovery).
+
+### Prerequisites — verify before starting
+
+This phase is **blocked** until DevOps confirms:
+
+1. ✅ Phase 3 host-ADB mutex deployed to prod (branch `fix/host-adb-mutex` in `qait-mobile-runner` shipped)
+2. ✅ Stress-tested `REGRESSION_MOBILE_MAX_CONCURRENCY=2` for 7 days with 0% `Client aborted` / `pm create-user failed` errors
+3. ✅ (Optional) `POOL_CLAIM_READINESS_PROBE=true` enabled on prod runner
+
+**If any are missing**: ship Phase 4 anyway but keep `envCap=1` in prod env. The code is harmless when capped at 1 (decision function returns 1 in serial mode).
+
 ### Зачем
 
-После Phase 3 — использовать существующий pool из 3 redroid умно. Маленькие регрессии не платят overhead, большие получают 2-3x speedup.
+Сейчас `MAX_MOBILE_IN_FLIGHT` парсится из `REGRESSION_MOBILE_MAX_CONCURRENCY` env var (`regression-run.service.ts:2088-2091`) **один раз** на регрессию. Это slow-rolling tunable:
+- Под-нагрузка → operator вручную поднимает env → wait restart
+- Над-нагрузка (pool exhausted, cold-starts) → нет автоматического back-off
+- Маленькая регрессия (1 тест) → всё равно платит pool claim overhead
 
-### Что делаем
+Phase 4 = заменить static parse на функцию которая учитывает: (a) operator's env cap (hard ceiling), (b) real-time pool capacity from runner, (c) test count.
 
-**Файл:** `src/services/testing/regression/regression-run.service.ts:2088`
+### Что точно есть в коде (recon done May 14 2026)
 
-Заменить static parse на функцию:
+| Что | Где | Состояние |
+|---|---|---|
+| Current cap calculation | `regression-run.service.ts:2088-2091` | `Math.max(1, parseInt(env, 10))` — static, no runtime input |
+| In-flight gate | `regression-run.service.ts:2362` | `if (inFlight.size >= MAX_MOBILE_IN_FLIGHT) await Promise.race(inFlight)` |
+| Runner client method | `mobile-runner-client.ts:162-170` | `getCapacity()` defined — **but never called anywhere** (dead method); returns full `PoolCapacity` shape |
+| Runner endpoint | `qait-mobile-runner/src/api/routes/session.routes.ts:277` | `GET /api/sessions/capacity` — alive, returns `{ pool: { android: {total,idle,busy,resetting,broken}, ios: {...} } | null, adhoc: {...}, mode: 'pool'|'classic' }` |
+| Phase 3 readiness probe | `qait-mobile-runner/src/runner/session-pool.ts:295` | `verifyReadiness()` — opt-in via `POOL_CLAIM_READINESS_PROBE`; affects how "idle" sessions behave at claim time but NOT the capacity counts |
+| Phase 2 telemetry | `regression_runs.cold_start_count` / `test_executions.cold_start_used` | Available for **historical** decisions but not needed for Phase 4 MVP |
+
+### Что меняется
+
+**File:** `src/services/testing/regression/regression-run.service.ts`
+
+#### 1. Replace line `2088-2091`
 
 ```typescript
-const decideMaxInFlight = (testCount: number, poolHealth: PoolHealth): number => {
-  const envCap = parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '1', 10);
-  if (envCap <= 1) return 1;                          // operator forced serial
-  if (poolHealth.warmReady < 2) return 1;             // pool not healthy
-  if (testCount === 1) return 1;                      // overhead не нужен
-  if (testCount <= 5) return Math.min(2, envCap, poolHealth.warmReady);
-  return Math.min(3, envCap, poolHealth.warmReady);
-};
+const MAX_MOBILE_IN_FLIGHT = Math.max(
+  1,
+  parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '1', 10),
+);
 ```
 
-**Pool health check** — лёгкий `GET /pool/status` к runner, возвращает `{warmReady: 0..3}`. Если runner недоступен — fallback `warmReady=0` → serial.
+with an `await`'d call to a new module-level decision function:
 
-### Edge cases
+```typescript
+const MAX_MOBILE_IN_FLIGHT = await decideMaxMobileInFlight({
+  testCount: countMobileTests(levels),    // helper — sum mobile tests across all levels
+  platform: dominantMobilePlatform(levels), // 'android' | 'ios' | 'mixed'
+  runnerClient: mobileRunnerClient,
+});
+logger.info('[REGRESSION_RUN] Mobile concurrency decided', {
+  runId, decided: MAX_MOBILE_IN_FLIGHT, /* + reason from decideMaxMobileInFlight */,
+});
+```
 
-- Pool health check сам fail'ит → fallback serial, лог warn
-- envCap=1 (operator hard-override) → всегда serial
-- iOS платформа → warmReady всегда 0 (нет iOS pool на проде) → serial
+#### 2. New helper `decideMaxMobileInFlight`
 
-### Verification
+**File:** `src/services/testing/regression/concurrency-decision.ts` (new — keep separate for testability without dragging in the full regression service)
 
-Unit-test на `decideMaxInFlight` с 6 сценариями. Integration: запустить регрессию из 10 тестов после Phase 3 → лог "in-flight cap=3" → 10/3 = ~3.3 батча → wall time снижается до 1/3 от serial.
+```typescript
+export interface ConcurrencyInput {
+  testCount: number;
+  platform: 'android' | 'ios' | 'mixed';
+  runnerClient: MobileRunnerClient;
+}
+
+export interface ConcurrencyDecision {
+  cap: number;
+  reason: string;
+  inputs: { envCap: number; poolIdle: number | null; testCount: number; platform: string };
+}
+
+export async function decideMaxMobileInFlight(input: ConcurrencyInput): Promise<ConcurrencyDecision> {
+  const envCap = Math.max(1, parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '1', 10));
+
+  // Hard ceiling — operator's word is final.
+  if (envCap <= 1) return mk(1, 'env-cap=1 (operator force-serial)', envCap, null, input);
+
+  // Single test — overhead of parallelism is wasted.
+  if (input.testCount <= 1) return mk(1, 'testCount<=1', envCap, null, input);
+
+  // iOS-only regression — POOL_IOS_SIZE=0 in prod, no parallelism gains.
+  if (input.platform === 'ios') return mk(1, 'platform=ios (no pool capacity)', envCap, null, input);
+
+  // Probe runner for real-time capacity. 5s timeout (matches existing
+  // getCapacity client timeout). On failure: fail SAFE — serial.
+  let poolIdle: number | null = null;
+  try {
+    const cap = await input.runnerClient.getCapacity();
+    if (cap?.pool?.android) {
+      // For 'mixed' regressions we still cap by android pool — iOS
+      // sessions cold-start regardless (no pool), so the bottleneck
+      // is the android side.
+      poolIdle = cap.pool.android.idle;
+    }
+  } catch (err) {
+    logger.warn('[REGRESSION_RUN] getCapacity failed; falling back to serial', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return mk(1, 'getCapacity-failed', envCap, null, input);
+  }
+
+  if (poolIdle === null) {
+    return mk(1, 'pool-disabled (runner in classic mode)', envCap, null, input);
+  }
+  if (poolIdle < 2) {
+    return mk(1, `poolIdle=${poolIdle} (need >=2 for parallelism)`, envCap, poolIdle, input);
+  }
+
+  // Choose the cap. Tunable constants live behind env vars so DevOps
+  // can adjust without a redeploy. Defaults match earlier draft:
+  //   testCount 2-5  → up to 2
+  //   testCount 6+   → up to 3
+  const smallBatch = parseInt(process.env.REGRESSION_MOBILE_SMALL_BATCH_THRESHOLD || '5', 10);
+  const smallCap   = parseInt(process.env.REGRESSION_MOBILE_SMALL_CAP || '2', 10);
+  const largeCap   = parseInt(process.env.REGRESSION_MOBILE_LARGE_CAP || '3', 10);
+
+  const desired = input.testCount <= smallBatch ? smallCap : largeCap;
+  const cap = Math.min(envCap, poolIdle, desired);
+  return mk(cap, `chosen min(envCap=${envCap}, poolIdle=${poolIdle}, desired=${desired})`, envCap, poolIdle, input);
+}
+
+function mk(cap: number, reason: string, envCap: number, poolIdle: number | null, input: ConcurrencyInput): ConcurrencyDecision {
+  return { cap, reason, inputs: { envCap, poolIdle, testCount: input.testCount, platform: input.platform } };
+}
+```
+
+#### 3. Two tiny helpers in `regression-run.service.ts`
+
+```typescript
+// Both pure, easy to unit-test inline.
+function countMobileTests(levels: TestLevel[]): number {
+  let n = 0;
+  for (const lvl of levels) for (const tc of lvl) if (isMobilePlatform(tc.platform)) n += 1;
+  return n;
+}
+function dominantMobilePlatform(levels: TestLevel[]): 'android' | 'ios' | 'mixed' {
+  let android = 0, ios = 0;
+  for (const lvl of levels) for (const tc of lvl) {
+    if (tc.platform?.startsWith('mobile_android') || tc.platform === 'mobile_flutter') android += 1;
+    if (tc.platform?.startsWith('mobile_ios')) ios += 1;
+  }
+  if (android > 0 && ios === 0) return 'android';
+  if (ios > 0 && android === 0) return 'ios';
+  return 'mixed';
+}
+```
+
+#### 4. Logging shape
+
+Single log line per regression run start:
+```
+[REGRESSION_RUN] Mobile concurrency decided cap=2 reason="chosen min(envCap=3, poolIdle=2, desired=2)" testCount=4 platform=android envCap=3 poolIdle=2
+```
+
+This lets ops grep `Mobile concurrency decided` across a day's logs and see the distribution of caps + reasons. **No new metric column needed** — Phase 2 already captures wallclock; cap decision lives in logs.
+
+### Edge cases (explicit)
+
+| Case | Behaviour |
+|---|---|
+| envCap=1 | Always 1. Hard floor. |
+| testCount=0 (api-only regression) | `countMobileTests` returns 0 → `testCount<=1` branch → cap=1. Mobile gate never fires because no mobile tests dispatched. No-op. |
+| `getCapacity` returns mode='classic' (pool disabled) | `cap.pool === null` → poolIdle=null → cap=1. Logged. |
+| `getCapacity` times out (5s) | Catch → cap=1 + warn. Regression proceeds serially. NOT a failure. |
+| `getCapacity` returns `pool.android.idle=0` (all busy) | poolIdle<2 → cap=1. Logged with reason. |
+| Mixed Android + iOS run | platform='mixed' → uses android pool capacity (iOS cold-starts anyway). |
+| Pool capacity changes mid-run | We snapshot at start. If user releases more capacity during run, we don't pick it up. **Documented as design** — recomputing per-test would race with other regressions on shared pool. |
+| Decision function itself throws (programmer error) | Wrapper around the call: `try { ... } catch { use envCap }`. Decision never breaks the regression. |
+
+### Tests
+
+**File:** `src/services/testing/regression/__tests__/concurrency-decision.test.ts` (new)
+
+Cases (unit, no network):
+1. `envCap=1` → cap=1, reason mentions force-serial
+2. `testCount=1` → cap=1, reason mentions single test
+3. `platform=ios` → cap=1, reason mentions ios
+4. `getCapacity` rejects → cap=1, reason `getCapacity-failed`
+5. `cap.pool === null` (classic mode) → cap=1
+6. `poolIdle=1` → cap=1 (need ≥2)
+7. `poolIdle=3, testCount=4, envCap=3` → cap=2 (smallBatch path)
+8. `poolIdle=3, testCount=20, envCap=3` → cap=3 (largeBatch path)
+9. `poolIdle=10, envCap=2, testCount=20` → cap=2 (envCap is the tightest)
+10. Env vars override `smallBatch`/`smallCap`/`largeCap` constants
+
+Mock `MobileRunnerClient` via a fake with `getCapacity: vi.fn()` (no real HTTP).
+
+**No integration test** — getting the live runner involved would re-test the runner. Phase 4 success criteria measured in prod via the new log line.
+
+### Verification (post-deploy)
+
+1. Bump `REGRESSION_MOBILE_MAX_CONCURRENCY=3` in backend prod env (after Phase 3 stress test passes).
+2. Trigger a regression with 10 tests.
+3. Check logs: `grep "Mobile concurrency decided" → expect cap=3`.
+4. Check Phase 2 telemetry:
+   ```sql
+   SELECT id, total_duration_ms, test_count, cold_start_count
+   FROM regression_runs
+   WHERE completed_at > NOW() - INTERVAL '1 hour' AND test_count >= 10
+   ORDER BY started_at DESC LIMIT 5;
+   ```
+   `total_duration_ms` should drop ~2-3x vs Phase 3 baseline.
+
+### Anti-goals (explicit)
+
+- **No periodic re-decision** within a single regression run. Snapshot-and-go.
+- **No historical-data-driven cap** (e.g. "p95 cold-start rate this week >50% → cap=1"). That's Phase 4.5 if Phase 4 doesn't cover it.
+- **No multi-regression coordination** (e.g. "two regressions running, split the pool"). Each run sees current `poolIdle` and decides independently. Two parallel regressions both see idle=3 in the worst case and both try to take 3 — runner pool claim ladder + Phase 3 mutex absorbs the contention.
+- **No frontend changes.** This is pure backend.
+
+### Documentation updates (same-PR)
+
+- `CLAUDE.md` Mobile flow section: add 1-line note about the decision function in the dispatch pipeline.
+- Memory: 1-line entry in `MEMORY.md` index pointing at `phase_4_dynamic_concurrency.md` (new — with the SQL recipe + log-line grep).
+
+### Estimate
+
+- Decision function + helpers: 3-4 hours
+- Tests: 2-3 hours
+- Docs + memory: 30 min
+- Verify type-check + run tests: 30 min
+- Self-review (audit): 1 hour
+
+**Total: 1 working day**, not 2-3 as in the earlier draft — most of the heavy lifting (Phase 3 mutex, `getCapacity()` method, Phase 2 telemetry) is already in place.
 
 ---
 

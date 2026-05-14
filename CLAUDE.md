@@ -101,6 +101,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 Same entry as web; routing diverges at `dispatchMobileTest()`.
 POST `/api/v1/regression/run` or `/run-plan`
 → `RegressionRunService.runSavedTestCase()` → branch on `intent_test_cases.platform.startsWith('mobile_')`
+→ **Phase 4 (May 2026)** `decideMaxMobileInFlight()` ([concurrency-decision.ts](src/services/testing/regression/concurrency-decision.ts)) chooses the run's in-flight cap from `REGRESSION_MOBILE_MAX_CONCURRENCY` + live runner pool capacity + test count. Falls back to cap=1 (serial) on any failure path. Logged as `[REGRESSION_RUN] Mobile concurrency decided`.
 → `dispatchMobileTest()` ([regression-run.service.ts:566+](src/services/testing/regression/regression-run.service.ts))
 → INSERT `regression_runs` + `tests` + `test_executions`
 → `QueueManager.addMobileTestJob()` (BullMQ producer)
@@ -109,6 +110,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 → runner returns `RunStepsResult` per-step with screenshot + evidence
 → `persistCompiledPlansFromRun()` writes compiled plans back to `intent_test_cases.steps_json`
 → `createTestResult()` inserts into `test_results` with aggregated stats
+→ **Phase 2 telemetry** ([20260516_mobile_telemetry.sql](supabase-migrations/20260516_mobile_telemetry.sql)): per-test wallclock (`app_setup_ms`, `scenario_steps_ms`, `test_steps_ms`, `session_claim_ms`, `cold_start_used`) written into `test_executions` in `mobile-test-run.job.ts` finally block; aggregated into `regression_runs.total_*` by `TestCompletionHandlerService.recomputeRunStatus()` at run finalisation. Best-effort, NEVER fails the test path.
 → post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
 
 **Mobile regression diverges from web in five ways:** (1) batch RPC (`runSteps`)
@@ -147,6 +149,7 @@ These are codified across the codebase. Also see [.claude/rules/critical-pattern
 8. **DRY before writing new logic:** `rg "<thing>" src/ --type ts` first. There's a high chance it already exists.
 9. **`{{key}}` interpolation goes through `resolvePlaceholders`** ([src/utils/interpolation/resolve-placeholders.ts](src/utils/interpolation/resolve-placeholders.ts)). Three call sites used to do the same `.replace(/\{\{…\}\}/g, …)` against different source maps; that divergence is gone. New variable sources (env / secret / data_fixture / future kinds) are added by passing one more `VariableSource` to the helper, never by writing another regex. Selectors / `elementDescription` are intentionally NOT interpolated — keep it that way.
 10. **Anywhere that EMITS, LOGS, or PERSISTS a step body after interpolation must redact `secrets.*` values.** Helpers: `resolvePlaceholders` (substitution) is paired with `redactSecrets` / `buildStepRedactor` ([src/utils/interpolation/redact-step.ts](src/utils/interpolation/redact-step.ts)) and `executor.redactString` / `executor.redactRuntimeMeta` (for background replay). When you add a new sink (WS event, JSONL writer, DB column, third-party API call, LLM prompt) carrying interpolated `value`/`url`/`assertionText`/`description`, run it through one of these. **DB persistence is the special case:** store the original `{{...}}` placeholder, not the resolved value (see `preserveOriginalStep` in `preview-run.service.ts`). Otherwise re-runs see a stale literal forever.
+11. **Telemetry writes are best-effort — NEVER fail the test path.** Phase 2 (May 2026) instrumentation writes per-test wallclock to `test_executions` and per-run aggregates to `regression_runs`. Every write is wrapped in try/catch that `logger.warn`s and swallows. A row that's missing analytics columns is a degraded audit trail, NOT a failed test. New telemetry sinks added by anyone MUST follow the same pattern. Single funnel for the per-run aggregation: `TestCompletionHandlerService.recomputeRunStatus()` — no other code path may write to `regression_runs.total_*_ms` columns.
 
 ---
 

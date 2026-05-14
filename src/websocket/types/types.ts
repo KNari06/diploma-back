@@ -1681,6 +1681,10 @@ export interface PreviewRunCompletedPayload {
   cancelled?: boolean;
   duration: number; // ms
   timestamp: string;
+  // Present on early-exit terminators emitted from preview:run:start when
+  // validation/guards reject the run before kick-off, and on the mobile
+  // runner's .catch branch. Optional so success paths stay terse.
+  error?: string;
 }
 
 // ============================================================================
