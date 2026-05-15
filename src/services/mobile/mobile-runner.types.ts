@@ -30,11 +30,39 @@ export interface MobileSessionResponse {
   device?: Record<string, unknown>;
 }
 
+/**
+ * Where the test session should be hosted from the runner's perspective.
+ * Mirrors `DeviceSource` in qait-mobile-runner.
+ *
+ * - `local-emulator` — locally-spawned AVD or iOS simulator
+ * - `local-physical` — USB-attached real device (Android serial or iPhone UDID)
+ * - `cloud`          — redroid container or remote emulator (host:port)
+ */
+export type MobileDeviceSource = 'local-emulator' | 'local-physical' | 'cloud';
+
+/**
+ * Caller-supplied device-selection hint, forwarded verbatim to the runner.
+ * All fields optional — runner applies its `DEVICE_DEFAULT_SOURCE` policy
+ * when nothing is specified. Phase 2.6: lets the frontend pin a specific
+ * physical iPhone / Android phone for a session.
+ */
+export interface MobileDeviceSelector {
+  source?: MobileDeviceSource;
+  serial?: string;
+}
+
 export interface MobileSessionConfig {
   avdName?: string;
   simulatorName?: string;
   wdaPort?: number;
   snapshotName?: string;
+  /**
+   * Phase 2.6 (physical-device routing). When present, the runner uses
+   * this to pick a specific device instead of falling back to its default
+   * policy. When absent, behaviour is unchanged (runner picks an emulator
+   * or whatever `DEVICE_DEFAULT_SOURCE` says).
+   */
+  deviceSelector?: MobileDeviceSelector;
 }
 
 // ── Action Types (mirror of runner's IntentActionType) ───────────
@@ -103,8 +131,15 @@ export interface MobileIntentStepOptions {
   otpCode?: string;
   otpExtractPattern?: string;
   otpSenderFilter?: string;
-  // Permission dialog
-  permissionAction?: 'allow' | 'deny' | 'allow_always';
+  // Permission dialog. Modern Android (11+) runtime-permission dialogs show
+  // up to four buttons depending on the permission family:
+  //   - "While using the app" / "Allow"   → allow / allow_foreground
+  //   - "Only this time"                  → allow_once
+  //   - "Allow all the time"              → allow_always (background, location)
+  //   - "Don't allow" / "Deny"            → deny
+  // iOS WDA acceptAlert/dismissAlert collapses the allow_* variants to a
+  // single "tap the first accept button" behaviour.
+  permissionAction?: 'allow' | 'deny' | 'allow_always' | 'allow_foreground' | 'allow_once';
   // Network simulation
   networkPreset?: '2g' | '3g' | '4g' | '5g' | 'wifi' | 'offline';
   networkLatencyMs?: number;
@@ -134,6 +169,21 @@ export interface MobileIntentStep {
    * timelines. Absent on pre-Phase-3 runs; treat as 'main'.
    */
   phase?: 'setup' | 'main' | 'teardown';
+  /**
+   * Persisted compiled locator plan from a prior successful resolve.
+   * The runner's compiled-fast-path reads this field at dispatch time
+   * (qait-mobile-runner intent-step-converter.ts) and skips the LLM /
+   * vision resolvers entirely when the plan still matches the live
+   * tree. Pre-fix this field was preserved at runtime via spread but
+   * not declared on the type, so ts-eyes couldn't see that the
+   * regression dispatch path was correctly forwarding it. Persist via
+   * `IntentTestCaseService.batchUpdateStepsFromRun()` after every run
+   * (see mobile-test-run.job.ts:persistCompiledPlansFromRun) and via
+   * `updateStepFromPreviewApply()` after every editor apply (web's
+   * preview.handler.ts pattern; mobile editor session.controller.ts
+   * needs the same treatment).
+   */
+  compiled?: MobileCompiledPlan;
 }
 
 // ── Step Result ──────────────────────────────────────────────────
@@ -358,6 +408,17 @@ export interface MobileTestJobData {
   appStoragePath?: string;
   /** Original filename of the APK/IPA */
   appOriginalName?: string;
+  /**
+   * CI buildNumber for the resolved APK — used as a proxy for Android's
+   * `versionCode` when validating fast-auth snapshots. When this value
+   * differs from the snapshot's `apkVersionCode`, the compiler invalidates
+   * the snapshot and falls back to recipe replay. Undefined for direct-
+   * uploaded APKs (the version gate is permissive in that case — we trust
+   * TTL + runtime restore failure). Not authoritative; replace with a real
+   * APK metadata extraction step at upload time if telemetry shows version
+   * drift is a common cause of failed restores.
+   */
+  appVersionCode?: number;
   // ── CI/CD fields ──────────────────────────────────────────────
   /** CI run ID for tracking grouped test executions */
   ciRunId?: string;
@@ -400,6 +461,16 @@ export interface MobileTestJobData {
     resource_id: string;
     required?: boolean;
   }>;
+  /**
+   * Job-level retry counter. Incremented by the worker before re-throwing
+   * to BullMQ on retry-able errors (runner unreachable, transient 503,
+   * Redis hiccup). Mirrors the web TestJobData.retryCount field used by
+   * manual-test-run.job.ts:322-329 to gate `shouldRetry()`. Initial value
+   * is undefined → treated as 0 inside the worker. Capped at
+   * `MOBILE_TEST_MAX_RETRIES` (env, default 1) so a permanently-broken
+   * runner doesn't infinitely retry.
+   */
+  retryCount?: number;
 }
 
 // ── Error ─────────────────────────────────────────────────────────

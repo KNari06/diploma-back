@@ -242,16 +242,27 @@ export async function cancelAllRunningTestsForChatSession(
  */
 export async function cancelTestJobs(testId: string, browsers: string[]): Promise<void> {
   try {
-    const { testRunQueue } = await import('@/config/infrastructure/queues');
+    const { testRunQueue, mobileTestRunQueue } = await import('@/config/infrastructure/queues');
     let cancelledCount = 0;
 
-    // Cancel jobs for each browser
+    // Cancel jobs for each browser. The jobId format is `${testId}-${browser}`
+    // for BOTH the web testRunQueue and the mobileTestRunQueue (see
+    // queues.ts:717 for the mobile producer). Browser values like
+    // `mobile-android`/`mobile-ios`/`mobile-flutter` indicate a mobile
+    // test; everything else (`chrome`, `firefox`, ...) is web. Pre-fix
+    // this only checked testRunQueue, so a cancel during a mobile run
+    // never removed the waiting BullMQ job — the test would dispatch
+    // anyway when its slot opened. Active mobile jobs are still
+    // cancelled via the worker's `tests.status` poller, but waiting
+    // jobs need to be physically removed here.
     for (const browser of browsers) {
       const jobId = `${testId}-${browser}`;
+      const isMobile = typeof browser === 'string' && browser.startsWith('mobile-');
+      const queue = isMobile ? mobileTestRunQueue : testRunQueue;
 
       try {
         // Get job from queue
-        const job = await testRunQueue.getJob(jobId);
+        const job = await queue.getJob(jobId);
 
         if (job) {
           // Check job state
@@ -264,15 +275,20 @@ export async function cancelTestJobs(testId: string, browsers: string[]): Promis
             logger.info(`[CANCEL_TEST] Removed waiting job: ${jobId}`, {
               testId,
               browser,
+              queue: isMobile ? 'mobile-test-run' : 'test-run',
               state,
             });
           } else if (state === 'active') {
-            // Active jobs will be checked by worker and stopped
-            // Worker checks test status in DB via checkTestCancelled()
-            // No need to update job.data - status in DB is the source of truth
+            // Active jobs will be checked by worker and stopped.
+            // Web worker checks test status in DB via checkTestCancelled().
+            // Mobile worker polls `tests.status` every 2s inside runSteps
+            // (mobile-test-run.job.ts:483-515) and aborts the in-flight
+            // fetch when it sees `cancelled`. No need to mutate job.data —
+            // status in DB is the source of truth for both paths.
             logger.info(`[CANCEL_TEST] Active job will be cancelled by worker: ${jobId}`, {
               testId,
               browser,
+              queue: isMobile ? 'mobile-test-run' : 'test-run',
               state,
               note: 'Worker checks test status in DB',
             });
@@ -287,6 +303,7 @@ export async function cancelTestJobs(testId: string, browsers: string[]): Promis
           logger.debug(`[CANCEL_TEST] Job not found in queue: ${jobId}`, {
             testId,
             browser,
+            queue: isMobile ? 'mobile-test-run' : 'test-run',
           });
         }
       } catch (jobError) {

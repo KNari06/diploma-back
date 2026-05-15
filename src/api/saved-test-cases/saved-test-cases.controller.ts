@@ -9,6 +9,11 @@
 
 import { supabaseAdmin } from '@/db/supabase';
 import { DependencySuggestion, SavedCaseDependencySuggester } from '@/services/testing/flows/saved-case-dependency-suggester.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
@@ -180,6 +185,13 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
   try {
     const { id } = req.params;
     const userId = getUserId(req);
+    // Phase A (May 2026) — `setupSteps` / `teardownSteps` PATCH fields removed.
+    // The inline-per-test-case columns are being deprecated in favour of the
+    // `scenario_setup` test_resource (which yields the same `phase:'setup'`
+    // prologue at run time but is reusable across many tests). The columns
+    // still default to `[]` and read paths still surface them, so existing
+    // clients that omit these fields are unaffected. Any client passing
+    // `setupSteps` or `teardownSteps` now is silently ignored.
     const {
       name,
       description,
@@ -187,8 +199,6 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
       tags,
       priority,
       preconditions,
-      setupSteps,
-      teardownSteps,
       expectedResult,
     } = req.body;
 
@@ -239,8 +249,8 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
     if (tags !== undefined) updates.tags = tags;
     if (priority !== undefined) updates.priority = priority;
     if (preconditions !== undefined) updates.preconditions = preconditions;
-    if (setupSteps !== undefined) updates.setup_steps = setupSteps;
-    if (teardownSteps !== undefined) updates.teardown_steps = teardownSteps;
+    // setupSteps / teardownSteps no longer accepted on PATCH (see destructure
+    // note above). Use scenario_setup bindings via /api/v1/test-resource.
     if (expectedResult !== undefined) updates.expected_result = expectedResult;
 
     if (Object.keys(updates).length === 0) {
@@ -296,6 +306,21 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
       id,
       suggestionsCount: suggestedDependsOn.length,
     });
+
+    if ((data as any).project_id) {
+      void WorkspaceAuditService.logForProject({
+        projectId: (data as any).project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.TEST_CASE_UPDATED,
+        targetType: 'test_case',
+        targetId: id,
+        metadata: {
+          name: (data as any).name,
+          changed_fields: Object.keys(updates),
+        },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[SAVED_TEST_CASES_API] Failed to update saved test case', { error });
     handleControllerError(res, error, 'Failed to update saved test case');
@@ -398,6 +423,18 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
       flowId,
       suggestionsCount: suggestedDependsOn.length,
     });
+
+    if ((data as any).project_id) {
+      void WorkspaceAuditService.logForProject({
+        projectId: (data as any).project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.TEST_CASE_ASSIGNED_TO_FLOW,
+        targetType: 'test_case',
+        targetId: id,
+        metadata: { name: (data as any).name, flow_id: flowId },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[SAVED_TEST_CASES_API] Failed to assign to flow', { error });
     handleControllerError(res, error, 'Failed to assign to flow');
@@ -457,6 +494,16 @@ export async function updateDependencies(req: AuthenticatedRequest, res: Respons
         message: 'Dependencies cleared',
         timestamp: new Date(),
       });
+
+      void WorkspaceAuditService.logForProject({
+        projectId: targetCase.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.TEST_CASE_DEPENDENCIES_UPDATED,
+        targetType: 'test_case',
+        targetId: id,
+        metadata: { dependencies_count: 0, action: 'cleared' },
+        ...getAuditContext(req),
+      });
       return;
     }
 
@@ -512,6 +559,16 @@ export async function updateDependencies(req: AuthenticatedRequest, res: Respons
     logger.info('[SAVED_TEST_CASES_API] Dependencies updated', {
       id,
       dependenciesCount: dependsOn.length,
+    });
+
+    void WorkspaceAuditService.logForProject({
+      projectId: targetCase.project_id,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.TEST_CASE_DEPENDENCIES_UPDATED,
+      targetType: 'test_case',
+      targetId: id,
+      metadata: { dependencies_count: dependsOn.length, action: 'set' },
+      ...getAuditContext(req),
     });
   } catch (error) {
     logger.error('[SAVED_TEST_CASES_API] Failed to update dependencies', { error });

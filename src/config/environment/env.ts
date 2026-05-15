@@ -228,6 +228,53 @@ const envSchema = z.object({
   // matters more than the post-hoc "why did the agent do X" debug surface.
   // WebSocket streaming is unaffected by this flag.
   MOBILE_AGENT_PERSIST_REASONING: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
+  // ──────────────────────────────────────────────────────────────────
+  // Phase 4 (May 2026): mobile regression concurrency cap.
+  //
+  // The cap is decided per-run by `decideMaxMobileInFlight` in
+  // `src/services/testing/regression/concurrency-decision.ts`. Each
+  // env below is a tunable input, not a hard switch.
+  //
+  // IMPORTANT: env values are read via `process.env[name]` inside the
+  // decision module (NaN-safe parser there); the schema registrations
+  // here exist so (a) Zod refuses to start with garbage values and
+  // (b) the env list is discoverable in one place. All defaults
+  // match `readEnvInt` defaults inside concurrency-decision.ts —
+  // changing them in only one place would create silent drift.
+  //
+  // Bump these ONLY after Phase 3 (host-ADB mutex) is live in the
+  // runner — without it, MAX_CONCURRENCY>1 racing the daemon socket
+  // causes the `Client aborted` / `pm create-user failed` regressions
+  // documented at regression-run.service.ts:2079-2087.
+  // ──────────────────────────────────────────────────────────────────
+
+  // Hard ceiling for mobile in-flight tests per regression run.
+  // Default 1 preserves pre-Phase-4 serial behaviour. Raise to 2 after
+  // Phase 3 stress-tested for 7 days with zero race failures.
+  //
+  // No regex constraint here on purpose — we let garbage values through
+  // schema validation so the app still boots on a misconfigured env.
+  // The actual parsing happens in `readEnvInt` inside
+  // `concurrency-decision.ts`, which is NaN-safe (validates
+  // Number.isFinite + >=1, falls back to 1 otherwise). A strict regex
+  // here would turn a typo'd env into a startup crash, which is worse
+  // than silently falling back to safe serial behaviour.
+  REGRESSION_MOBILE_MAX_CONCURRENCY: z.string().optional().default('1'),
+
+  // Test-count threshold separating "small batch" (use SMALL_CAP) from
+  // "large batch" (use LARGE_CAP). testCount <= threshold → SMALL_CAP.
+  // Same parsing strategy as REGRESSION_MOBILE_MAX_CONCURRENCY above —
+  // schema accepts any string, NaN-safe parse happens at use site.
+  REGRESSION_MOBILE_SMALL_BATCH_THRESHOLD: z.string().optional().default('5'),
+
+  // Desired cap for small batches (testCount <= SMALL_BATCH_THRESHOLD).
+  // Final cap = min(MAX_CONCURRENCY, poolIdle, SMALL_CAP).
+  REGRESSION_MOBILE_SMALL_CAP: z.string().optional().default('2'),
+
+  // Desired cap for large batches (testCount > SMALL_BATCH_THRESHOLD).
+  // Final cap = min(MAX_CONCURRENCY, poolIdle, LARGE_CAP).
+  REGRESSION_MOBILE_LARGE_CAP: z.string().optional().default('3'),
 });
 
 // Parse and validate environment variables

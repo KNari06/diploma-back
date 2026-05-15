@@ -49,7 +49,12 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
   const raw = req.body.platform as string | undefined;
   const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = raw && VALID[raw] ? VALID[raw] : 'android';
-  const packageName = req.body.packageName as string | undefined;
+  // packageName is REQUIRED — the runner needs it to install + launch the app.
+  // The UI form validates this too, but we enforce server-side as well so
+  // CI uploads / direct API calls can't bypass it (previously could land
+  // with packageName: undefined and block the editor at warm-up time).
+  const packageNameRaw = req.body.packageName as string | undefined;
+  const packageName = typeof packageNameRaw === 'string' ? packageNameRaw.trim() : '';
 
   // Phase 5: optional git metadata — trimmed, empty strings treated as absent.
   // Shared normaliser keeps this parsing consistent with the CI path.
@@ -61,6 +66,14 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
 
   if (!req.file) {
     res.status(400).json({ success: false, error: 'No file uploaded. Use form field "file".' });
+    return;
+  }
+
+  if (!packageName) {
+    res.status(400).json({
+      success: false,
+      error: 'packageName is required (non-empty string). Android: package id (com.example.app); iOS: bundle ID.',
+    });
     return;
   }
 
@@ -217,6 +230,66 @@ export async function listMobileAppBuilds(req: Request, res: Response): Promise<
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PATCH APP (packageName only)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * PATCH /api/v1/mobile/projects/:projectId/app
+ * Body: { packageName: string }
+ *
+ * Update ONLY the packageName on the already-uploaded `projects.settings.mobileApp`
+ * blob. Use case: APK was uploaded before the packageName input was required, so
+ * the legacy slot has packageName: undefined. Re-uploading the APK just to set
+ * one string is wasteful when the binary itself is fine.
+ *
+ * Does NOT touch versioned `mobile_app_builds` rows — those are immutable
+ * history. The editor's warm-up reads from the legacy slot, so patching it
+ * here is enough to unblock the flow.
+ */
+export async function patchMobileApp(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { projectId } = req.params;
+  const rawPackageName = req.body?.packageName;
+  const packageName = typeof rawPackageName === 'string' ? rawPackageName.trim() : '';
+  if (!packageName) {
+    res.status(400).json({ success: false, error: 'packageName is required (non-empty string)' });
+    return;
+  }
+
+  const project = await ProjectService.getProject(projectId, userId);
+  if (!project) {
+    res.status(404).json({ success: false, error: 'Project not found or access denied' });
+    return;
+  }
+
+  const existing = project.settings?.mobileApp as MobileAppMetadata | undefined;
+  if (!existing) {
+    res.status(404).json({
+      success: false,
+      error: 'No uploaded app to update — upload an APK/IPA first',
+    });
+    return;
+  }
+
+  const updated: MobileAppMetadata = { ...existing, packageName };
+
+  await ProjectService.updateProject(projectId, userId, {
+    settings: {
+      mobileApp: updated as unknown as Record<string, unknown>,
+    },
+  });
+
+  logger.info('[MOBILE_API] App packageName updated', { projectId, packageName });
+
+  res.json({ success: true, mobileApp: updated });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // DELETE APP
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -268,13 +341,20 @@ export async function deleteMobileApp(req: Request, res: Response): Promise<void
 // ═══════════════════════════════════════════════════════════════════════════
 // PERMISSION POLICY  (project-level default)
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Type + validator live in `services/mobile/permission-policy.service.ts` —
+// this file used to duplicate them, which made it easy for the shared
+// service and the HTTP handlers to drift (e.g. add 'prompt' to the union
+// in one place but not the other). Single source of truth now.
 
-export type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
-
-const VALID_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
+import {
+  VALID_PERMISSION_POLICIES,
+  type MobilePermissionPolicy,
+} from '@/services/mobile/permission-policy.service';
 
 function isValidPolicy(value: unknown): value is MobilePermissionPolicy {
-  return typeof value === 'string' && (VALID_POLICIES as readonly string[]).includes(value);
+  return typeof value === 'string'
+    && (VALID_PERMISSION_POLICIES as readonly string[]).includes(value);
 }
 
 /**
@@ -319,7 +399,7 @@ export async function setProjectPermissionPolicy(req: Request, res: Response): P
   if (!isValidPolicy(policy)) {
     res.status(400).json({
       success: false,
-      error: `policy must be one of: ${VALID_POLICIES.join(', ')}`,
+      error: `policy must be one of: ${VALID_PERMISSION_POLICIES.join(', ')}`,
     });
     return;
   }

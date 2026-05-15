@@ -1,0 +1,122 @@
+import {
+  collectSecretValues,
+  redactSecrets,
+  redactWithValues,
+} from '../redact-secrets';
+
+describe('collectSecretValues', () => {
+  it('returns [] when map is null/undefined/empty', () => {
+    expect(collectSecretValues(null)).toEqual([]);
+    expect(collectSecretValues(undefined)).toEqual([]);
+    expect(collectSecretValues(new Map())).toEqual([]);
+  });
+
+  it('only collects keys with secrets. prefix', () => {
+    const m = new Map<string, unknown>([
+      ['secrets.STRIPE', 'sk_test_aaaaaaaaaaaa'],
+      ['env.BASE_URL', 'https://example.com'],
+      ['email.otp', '123456'],
+    ]);
+    expect(collectSecretValues(m)).toEqual(['sk_test_aaaaaaaaaaaa']);
+  });
+
+  it('drops values shorter than MIN_REDACT_LENGTH (4 chars)', () => {
+    const m = new Map<string, unknown>([
+      ['secrets.SHORT', 'ab'],   // 2 chars — skipped
+      ['secrets.MED', 'abcd'],   // 4 chars — kept (boundary)
+      ['secrets.LONG', 'abcdefgh'],
+    ]);
+    const out = collectSecretValues(m);
+    expect(out).toContain('abcd');
+    expect(out).toContain('abcdefgh');
+    expect(out).not.toContain('ab');
+  });
+
+  it('coerces non-string secret values to string', () => {
+    const m = new Map<string, unknown>([
+      ['secrets.PORT', 12345],
+      ['secrets.FLAG', true],
+    ]);
+    const out = collectSecretValues(m);
+    expect(out).toContain('12345');
+    expect(out).toContain('true');
+  });
+
+  it('sorts longest first to prevent substring shadowing', () => {
+    const m = new Map<string, unknown>([
+      ['secrets.A', 'abcd'],
+      ['secrets.B', 'abcdefgh'],
+    ]);
+    expect(collectSecretValues(m)).toEqual(['abcdefgh', 'abcd']);
+  });
+});
+
+describe('redactSecrets', () => {
+  it('returns input unchanged when no secrets', () => {
+    expect(redactSecrets('hello {{secrets.X}}', new Map())).toBe('hello {{secrets.X}}');
+    expect(redactSecrets('plain', null)).toBe('plain');
+  });
+
+  it('replaces a secret value occurrence with ***', () => {
+    const m = new Map<string, unknown>([['secrets.STRIPE', 'sk_test_xyz123']]);
+    expect(redactSecrets('Authorization: Bearer sk_test_xyz123', m)).toBe(
+      'Authorization: Bearer ***',
+    );
+  });
+
+  it('replaces every occurrence (not just first)', () => {
+    const m = new Map<string, unknown>([['secrets.K', 'tokenABCD']]);
+    expect(redactSecrets('a=tokenABCD b=tokenABCD c=other', m)).toBe(
+      'a=*** b=*** c=other',
+    );
+  });
+
+  it('masks the longer secret entirely when one contains another', () => {
+    const m = new Map<string, unknown>([
+      ['secrets.SHORT', 'abcd'],
+      ['secrets.LONG', 'abcdEFGH'],   // contains the short one
+    ]);
+    // Long-first sorting means LONG is replaced before SHORT can chew
+    // out the prefix. Without the sort we'd get '***EFGH'.
+    expect(redactSecrets('value=abcdEFGH', m)).toBe('value=***');
+  });
+
+  it('handles regex-special characters in secrets safely', () => {
+    const m = new Map<string, unknown>([
+      ['secrets.JWT', 'eyJhbGc.payload+signature/with$pecial'],
+    ]);
+    expect(
+      redactSecrets('token=eyJhbGc.payload+signature/with$pecial end', m),
+    ).toBe('token=*** end');
+  });
+
+  it('returns non-strings unchanged', () => {
+    const m = new Map<string, unknown>([['secrets.X', 'abcdefgh']]);
+    expect(redactSecrets(undefined as unknown as string, m)).toBeUndefined();
+    expect(redactSecrets(null as unknown as string, m)).toBeNull();
+    expect(redactSecrets(42 as unknown as string, m)).toBe(42);
+  });
+
+  it('skips non-secret namespaces', () => {
+    const m = new Map<string, unknown>([
+      ['env.BASE_URL', 'https://stg.app.com'],
+      ['email.otp', '482917'],
+    ]);
+    const text = 'env=https://stg.app.com otp=482917';
+    expect(redactSecrets(text, m)).toBe(text);
+  });
+});
+
+describe('redactWithValues', () => {
+  it('uses the precomputed list directly', () => {
+    expect(redactWithValues('a=secretvalue', ['secretvalue'])).toBe('a=***');
+  });
+
+  it('skips short entries even when explicitly passed', () => {
+    expect(redactWithValues('a=ab b=abcd', ['ab', 'abcd'])).toBe('a=ab b=***');
+  });
+
+  it('returns input unchanged when list is empty', () => {
+    expect(redactWithValues('hello', [])).toBe('hello');
+  });
+});

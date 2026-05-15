@@ -8,6 +8,7 @@ import {
   AUDIT_EVENTS,
   AuditEventType,
   WorkspaceAuditService,
+  getAuditContext,
 } from '@/services/core/workspace-audit.service';
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
@@ -15,14 +16,6 @@ import { Request, Response } from 'express';
 
 // UUID validation regex
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// Helper to extract audit context from request
-function getAuditContext(req: Request) {
-  return {
-    ipAddress: req.ip || req.headers['x-forwarded-for']?.toString() || undefined,
-    userAgent: req.headers['user-agent'] || undefined,
-  };
-}
 
 // ============================================================================
 // MEMBERS ENDPOINTS

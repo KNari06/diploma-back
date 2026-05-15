@@ -275,7 +275,6 @@ export interface CreateTestFlowParams {
   moduleId: string;
   userId: string;
   name: string;
-  description?: string;
   orderIndex?: number;
   flowType?: FlowType;
   platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
@@ -292,7 +291,6 @@ export interface UpdateTestFlowParams {
   id: string;
   userId: string;
   name?: string;
-  description?: string;
   orderIndex?: number;
   flowType?: FlowType;
   platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
@@ -493,19 +491,18 @@ export interface IntentTestCaseWithSuggestions extends IntentTestCase {
  */
 export type SavedTestCaseWithSuggestions = IntentTestCaseWithSuggestions;
 
-/**
- * Shared step command - references another test case's commands
- * When encountered during execution, the referenced test case's
- * commands are loaded and executed inline in the same browser session.
- *
- * Usage: Insert into a test case's commands array to reuse steps from another test
- * (e.g., login steps shared across checkout, profile, settings flows)
- */
-export interface SharedStepCommand {
-  action: 'shared_steps';
-  test_case_id: string;   // UUID of the referenced intent_test_cases row
-  description?: string;   // Human-readable label (e.g., "Login as student")
-}
+// Phase B (May 2026) — SharedStepCommand type DEPRECATED.
+// The `action: 'shared_steps'` PlaywrightCommand was a planned-never-built
+// mechanism. No producer ever existed; scenario_setup test_resource bindings
+// own the "reuse steps across tests" use case now at the IntentStep layer.
+// Type kept here in commented form so that any historic JSONB row decoder
+// referencing this name can find the original shape during Phase C cleanup.
+//
+//   export interface SharedStepCommand {
+//     action: 'shared_steps';
+//     test_case_id: string;   // UUID of the referenced intent_test_cases row
+//     description?: string;   // Human-readable label (e.g., "Login as student")
+//   }
 
 // ============================================================================
 // PLAN AUTOMATION CONFIG
@@ -660,6 +657,21 @@ export interface CreateRegressionPlanParams {
   tags?: string[];
   automationConfig?: PlanAutomationConfig;
   notificationsEnabled?: boolean;
+  /**
+   * Optional initial items to add to the plan in the same atomic call.
+   *
+   * Behaviour:
+   *   - When omitted/empty, behaves identically to the legacy create
+   *     (FE still uses `addItem` calls afterwards for that path).
+   *   - When provided, items are added IN ORDER after the plan row is
+   *     inserted. If any item insert fails, the plan is rolled back
+   *     (deleted) so the user never ends up with a half-built plan
+   *     visible in the UI.
+   *   - Each item's `planId` is filled in by the service — callers
+   *     omit it. `orderIndex` is auto-assigned by array position when
+   *     not supplied.
+   */
+  items?: Array<Omit<AddPlanItemParams, 'planId'>>;
 }
 
 /**
@@ -743,6 +755,25 @@ export interface TestExecution {
   platform?: string;
   isNegative?: boolean;
   createdAt: string;
+  /**
+   * Fast-auth telemetry (May 2026). Present only on mobile rows that
+   * actually attempted snapshot restore. Surfaced from
+   * `test_executions.fast_auth_used` + `fast_auth_restore_ms`.
+   *
+   *   - `used === true`  → snapshot restored, login recipe skipped
+   *   - `used === false` → restore attempted, fell back to recipe (or
+   *                        nothing — the test ran logged-out)
+   *   - omitted          → no fast-auth path tried (web run, no snapshot,
+   *                        pre-fast-auth row). Distinct from `used: false`.
+   *
+   * Surfaced by `ExecutionService.mapToTestExecution` and consumed by
+   * the FE regression run view as a REST fallback when the live WS state
+   * has evicted (e.g. user reopens the page after the run completed).
+   */
+  fastAuth?: {
+    used: boolean;
+    restoreMs?: number;
+  };
 }
 
 /**

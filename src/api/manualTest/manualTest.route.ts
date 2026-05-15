@@ -7,6 +7,11 @@ import { TestExecutedStepsRedisService } from '@/services/testing/results/test-e
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { FullTestDataService } from '@/services/testing/ui/manual/full-test-data.service';
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import { NotFoundError, TestRunRequest, ValidationError } from '@/types';
 import { asyncHandler, handleValidationError } from '@/utils/core/error-handler';
 import { logger } from '@/utils/core/logger';
@@ -282,6 +287,23 @@ router.post('/run', requireAuth, testRunRateLimiter, asyncHandler(async (req: Re
     logger.info(`Test created: ${result.data?.id} for URL: ${validatedData.url}, intelligentMode: ${validatedData.intelligentMode}`);
 
     res.status(201).json(result);
+
+    if (result?.success && result?.data?.id) {
+      void WorkspaceAuditService.logForProject({
+        projectId: validatedData.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.MANUAL_TEST_STARTED,
+        targetType: 'test',
+        targetId: result.data.id,
+        metadata: {
+          url: validatedData.url,
+          browsers: validatedData.browsers,
+          intelligent_mode: !!validatedData.intelligentMode,
+          test_goal: validatedData.testGoal,
+        },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     handleValidationError(error);
   }
@@ -589,6 +611,26 @@ router.post('/:id/cancel', requireAuth, asyncHandler(async (req: Request, res: R
   logger.info(`Test cancelled: ${id}`);
 
   res.status(200).json(result);
+
+  if (result?.success) {
+    void (async () => {
+      const { data: testRow } = await supabaseAdmin
+        .from('tests')
+        .select('project_id, url')
+        .eq('id', id)
+        .maybeSingle();
+      if (!testRow?.project_id) return;
+      await WorkspaceAuditService.logForProject({
+        projectId: testRow.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.MANUAL_TEST_CANCELLED,
+        targetType: 'test',
+        targetId: id,
+        metadata: { url: (testRow as any).url },
+        ...getAuditContext(req),
+      });
+    })();
+  }
 }));
 
 /**
@@ -782,6 +824,26 @@ router.post('/:id/retry', requireAuth, testRetryRateLimiter, requireCredits(1), 
   logger.info(`Test retry initiated: ${id}`);
 
   res.status(200).json(result);
+
+  if (result?.success) {
+    void (async () => {
+      const { data: testRow } = await supabaseAdmin
+        .from('tests')
+        .select('project_id, url')
+        .eq('id', id)
+        .maybeSingle();
+      if (!testRow?.project_id) return;
+      await WorkspaceAuditService.logForProject({
+        projectId: testRow.project_id,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.MANUAL_TEST_RETRIED,
+        targetType: 'test',
+        targetId: id,
+        metadata: { url: (testRow as any).url },
+        ...getAuditContext(req),
+      });
+    })();
+  }
 }));
 
 /**

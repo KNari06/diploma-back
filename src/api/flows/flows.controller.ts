@@ -28,7 +28,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, description, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings } = req.body;
+    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -55,12 +55,48 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
 
     const isMobilePlatform = typeof platform === 'string' && platform.startsWith('mobile_');
 
+    // Mobile gate: a mobile flow is unrunnable without an uploaded app AND
+    // a package name (the runner uses both to install + launch). Previously
+    // we only enforced this at editor warm-up time — the flow + initial
+    // test case still got persisted, then the user got redirected to
+    // settings. Reject up-front instead so the project state never gets a
+    // half-configured mobile flow.
+    if (isMobilePlatform) {
+      const { data: projectRow, error: projectErr } = await supabaseAdmin
+        .from('projects')
+        .select('settings')
+        .eq('id', projectId)
+        .single();
+      if (projectErr || !projectRow) {
+        res.status(404).json({ success: false, error: 'Project not found' });
+        return;
+      }
+      const mobileApp = (projectRow.settings as any)?.mobileApp as
+        | { storagePath?: string; packageName?: string }
+        | undefined;
+      if (!mobileApp?.storagePath) {
+        res.status(400).json({
+          success: false,
+          error: 'No mobile app uploaded for this project. Upload an APK/IPA in settings before creating a mobile test case.',
+          code: 'MOBILE_APP_MISSING',
+        });
+        return;
+      }
+      if (!mobileApp.packageName || !String(mobileApp.packageName).trim()) {
+        res.status(400).json({
+          success: false,
+          error: 'The uploaded mobile app has no package name. Set it in settings before creating a mobile test case.',
+          code: 'MOBILE_APP_PACKAGE_NAME_MISSING',
+        });
+        return;
+      }
+    }
+
     // Create flow
     const flow = await FlowService.create({
       moduleId,
       userId,
       name,
-      description,
       platform,
       flowType,
       tags,
@@ -101,8 +137,13 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
           commands: [],
           steps_json: [],
           preconditions: preconditions || [],
-          setup_steps: [],
-          teardown_steps: [],
+          // Phase A (May 2026) — setup_steps / teardown_steps inline-on-test-case
+          // are being deprecated in favour of `scenario_setup` test_resource
+          // bindings (which compile into the same `phase:'setup'` prologue at
+          // run time but are reusable across many tests). We stop seeding the
+          // empty literals here — the columns still exist and default to `[]`
+          // at the DB level, so no read path breaks. Phase B will drop the
+          // remaining stitchPhases() callsites; Phase C will drop the columns.
           tags: tags || [],
           priority: priority || null,
           expected_result: expectedResult || null,
@@ -258,14 +299,13 @@ export async function listFlows(req: AuthenticatedRequest, res: Response): Promi
 export async function updateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, description, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
+    const { name, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
     const userId = getUserId(req);
 
     const flow = await FlowService.update({
       id,
       userId,
       name,
-      description,
       flowType,
       tags,
       priority,

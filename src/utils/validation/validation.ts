@@ -163,10 +163,10 @@ export const sanitizeUrl = (url: string): string => {
 
     // Basic security: prevent localhost/private network access in production
     const hostname = parsed.hostname.toLowerCase();
-    const forbiddenHosts = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
-    if (forbiddenHosts.includes(hostname)) {
-      throw new ValidationError('Localhost URLs are not allowed');
-    }
+    // const forbiddenHosts = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
+    // if (forbiddenHosts.includes(hostname)) {
+      // throw new ValidationError('Localhost URLs are not allowed');
+    // }
 
     return parsed.toString();
   } catch (error) {

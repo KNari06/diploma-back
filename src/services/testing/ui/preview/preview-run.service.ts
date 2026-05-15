@@ -23,6 +23,8 @@ import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from '
 import { runV1WithShadow } from './step-readiness-v2.service';
 import { StepTelemetryCollector } from './step-telemetry-collector.service';
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
+import { recordSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
+import { buildStepRedactor } from '@/utils/interpolation/redact-step';
 import { injectAutoWaitForSteps, normalizeUrlForComparison } from './auto-wait-for.utils';
 import { diagnoseStepBlocker, actOnDiagnosis } from './step-blocker-diagnosis.service';
 import { waitForPageInteractive } from './page-interactive.utils';
@@ -436,29 +438,42 @@ function interpolateContextVariables(step: IntentStep, previewSessionId: string)
   const sessionService = getPreviewSessionService();
   const session = sessionService.getSession(previewSessionId);
   const contextData = session?.contextData;
-  if (!contextData || Object.keys(contextData).length === 0) return step;
+  // contextRunVariables is populated by `applyBindingsToContext` when test
+  // resources (env / secret / data_fixture) are applied to a preview
+  // session. May be absent on legacy sessions or when no bindings exist —
+  // in that case we just resolve from contextData as before.
+  const runVariables = (session as { contextRunVariables?: Map<string, unknown> } | undefined)?.contextRunVariables;
 
-  const resolve = (s: string): string => {
-    if (!s.includes('{{')) return s;
-    return s.replace(/\{\{([\w.-]+)\}\}/g, (match, key) => {
-      const replacement = contextData[key];
-      return typeof replacement === 'string' ? replacement : match;
-    });
-  };
+  const hasContext = !!contextData && Object.keys(contextData).length > 0;
+  const hasRunVars = !!runVariables && runVariables.size > 0;
+  if (!hasContext && !hasRunVars) return step;
+
+  // Source order: scratchpad first (per-run, hot), then workspace
+  // resources. Same priority as the background-replay path so callers
+  // can rely on uniform precedence regardless of which executor runs.
+  const sources = [
+    recordSource('contextData', contextData ?? null),
+    ...(hasRunVars
+      ? [{
+          name: 'runVariables',
+          lookup: (k: string) => (runVariables as Map<string, unknown>).get(k),
+        }]
+      : []),
+  ];
 
   let changed = false;
   const result = { ...step };
 
   if (result.value) {
-    const resolved = resolve(result.value);
+    const resolved = resolvePlaceholders(result.value, sources);
     if (resolved !== result.value) { result.value = resolved; changed = true; }
   }
   if (result.assertionText) {
-    const resolved = resolve(result.assertionText);
+    const resolved = resolvePlaceholders(result.assertionText, sources);
     if (resolved !== result.assertionText) { result.assertionText = resolved; changed = true; }
   }
   if (result.description) {
-    const resolved = resolve(result.description);
+    const resolved = resolvePlaceholders(result.description, sources);
     if (resolved !== result.description) { result.description = resolved; changed = true; }
   }
 
@@ -743,6 +758,66 @@ export class PreviewRunService {
 
     // Batch accumulator: collect enriched steps in-memory, persist once at end
     const enrichedSteps = new Map<string, IntentStep>();
+
+    // ── Phase 2.5 — secret redaction + placeholder preservation ──────────
+    // Three concerns this block handles for the whole run loop:
+    //
+    // 1. WS payloads (`preview:run:step` × 3 emit sites): every successful
+    //    step ships `appliedStep` to the browser. After interpolation the
+    //    `value`/`assertionText`/`description` may carry a real secret —
+    //    `redactForWS` masks those fields before emit so DevTools / WS
+    //    frame loggers never see plaintext.
+    //
+    // 2. DB persistence (`enrichedSteps` × 3 push sites): the value we
+    //    write back to `intent_steps.value` MUST be the original
+    //    `{{secrets.X}}` placeholder, not the resolved one. Otherwise a
+    //    second run reads the resolved string from DB, calls
+    //    resolvePlaceholders against it (no `{{...}}` matches), and the
+    //    test runs with a stale literal forever. `preserveOriginalStep`
+    //    rewinds value/assertionText/description to the pre-interpolation
+    //    forms taken from the input `steps[]`.
+    //
+    // 3. Snapshot semantics: `secretValuesForRun` is captured ONCE per
+    //    run loop. Mid-run resource refresh would not be reflected here —
+    //    that's intentional today (matches command-executor and
+    //    replay-trace), but if a heal hook gains the ability to apply
+    //    additional secrets between steps, both this snapshot AND
+    //    executor.setRunVariables would need a refresh point.
+    //    See note at test-executor.ts where setRunVariables is called.
+    const sessionForRunRedact = getPreviewSessionService().getSession(previewSessionId);
+    const wsRedactor = buildStepRedactor(sessionForRunRedact?.contextRunVariables ?? null);
+    const originalStepById = new Map<string, IntentStep>();
+    for (const s of steps) {
+      if (s?.id) originalStepById.set(s.id, s);
+    }
+    // wsRedactor's StepLike generic accepts IntentStep directly — no
+    // double-cast is needed.
+    const redactForWS = (step: IntentStep | undefined): IntentStep | undefined => {
+      if (!step) return step;
+      return wsRedactor(step);
+    };
+    /**
+     * For DB persistence: rewind interpolated fields back to the
+     * placeholder form taken from the input step. Keeps non-interpolated
+     * fields (recordedFingerprint, evidence, compiled, ...) from the
+     * applied result so we don't lose the run's enrichment.
+     */
+    const preserveOriginalStep = (applied: IntentStep): IntentStep => {
+      const original = applied?.id ? originalStepById.get(applied.id) : undefined;
+      if (!original) return applied;
+      // Fast path: nothing was interpolated (no placeholder anywhere).
+      // Equality on the three fields means there is nothing to restore.
+      const sameValue = applied.value === original.value;
+      const sameAssertion = applied.assertionText === original.assertionText;
+      const sameDescription = applied.description === original.description;
+      if (sameValue && sameAssertion && sameDescription) return applied;
+      return {
+        ...applied,
+        value: original.value,
+        assertionText: original.assertionText,
+        description: original.description,
+      };
+    };
 
     // Initialize trace writer for JSONL logging
     const traceId = intentTestCaseId
@@ -1989,6 +2064,10 @@ export class PreviewRunService {
             // is gated off while a run is in flight (see preview.handler.ts —
             // skipped to avoid page.evaluate() contention with readiness/apply),
             // so without this field the URL bar stays frozen on the pre-run URL.
+            // Phase 2.5: redact `appliedStep` before WS emit — it carries
+            // the post-interpolation value/assertionText/description.
+            // `description` above is the input-side description (no
+            // substitution), safe to pass verbatim.
             webSocketService.emitToUser(userId, 'preview:run:step', {
               previewSessionId,
               stepIndex: originalStepIndex,
@@ -1998,7 +2077,7 @@ export class PreviewRunService {
               description: step.description,
               timestamp: new Date().toISOString(),
               ...(result.url ? { url: result.url } : {}),
-              ...(result.appliedStep ? { appliedStep: result.appliedStep } : {}),
+              ...(result.appliedStep ? { appliedStep: redactForWS(result.appliedStep) } : {}),
               ...(retried ? { retried: true } : {}),
             });
             passedSteps++;
@@ -2177,9 +2256,14 @@ export class PreviewRunService {
               }
             }
 
-            // Accumulate enriched step for batch persist at end of run
+            // Accumulate enriched step for batch persist at end of run.
+            // Phase 2.5: rewind interpolated fields back to the original
+            // `{{...}}` placeholders so DB rows store the source-of-truth
+            // shape, not a one-off substitution. Otherwise `secrets.X`
+            // would land literally in `intent_steps.value` and the next
+            // run would treat it as a stale literal (no `{{` to match).
             if (result.appliedStep) {
-              enrichedSteps.set(result.appliedStep.id, result.appliedStep);
+              enrichedSteps.set(result.appliedStep.id, preserveOriginalStep(result.appliedStep));
             }
 
             // If cancellation was requested during/after this step, stop before next step.
@@ -2433,6 +2517,8 @@ export class PreviewRunService {
                   },
                 });
 
+                // Phase 2.5: redact appliedStep before WS emit; persist
+                // the original placeholder shape (not the resolved value).
                 webSocketService.emitToUser(userId, 'preview:run:step', {
                   previewSessionId,
                   stepIndex: originalStepIndex,
@@ -2441,7 +2527,7 @@ export class PreviewRunService {
                   action: step.type,
                   description: step.description,
                   timestamp: new Date().toISOString(),
-                  ...(retryResult.appliedStep ? { appliedStep: retryResult.appliedStep } : {}),
+                  ...(retryResult.appliedStep ? { appliedStep: redactForWS(retryResult.appliedStep) } : {}),
                   retried: true,
                 });
                 passedSteps++;
@@ -2451,7 +2537,7 @@ export class PreviewRunService {
                   try { lastNavigationSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
                 }
                 if (retryResult.appliedStep) {
-                  enrichedSteps.set(retryResult.appliedStep.id, retryResult.appliedStep);
+                  enrichedSteps.set(retryResult.appliedStep.id, preserveOriginalStep(retryResult.appliedStep));
                 }
 
                 // Lookahead before next step (same as main success path)
@@ -2514,11 +2600,13 @@ export class PreviewRunService {
                       urlChanged: finalResult.urlChanged, url: finalResult.url, retried: true },
                   });
 
+                  // Phase 2.5: redact appliedStep before WS emit; persist
+                  // the original placeholder shape (not the resolved value).
                   webSocketService.emitToUser(userId, 'preview:run:step', {
                     previewSessionId, stepIndex: originalStepIndex, stepId: step.id, status: 'pass',
                     action: step.type, description: step.description,
                     timestamp: new Date().toISOString(),
-                    ...(finalResult.appliedStep ? { appliedStep: finalResult.appliedStep } : {}),
+                    ...(finalResult.appliedStep ? { appliedStep: redactForWS(finalResult.appliedStep) } : {}),
                     retried: true,
                   });
                   passedSteps++;
@@ -2526,7 +2614,7 @@ export class PreviewRunService {
                   if (step.type === 'navigate' || finalResult.urlChanged) {
                     try { lastNavigationSummary = await collectLightPageSummary(session.page); } catch { /* non-fatal */ }
                   }
-                  if (finalResult.appliedStep) enrichedSteps.set(finalResult.appliedStep.id, finalResult.appliedStep);
+                  if (finalResult.appliedStep) enrichedSteps.set(finalResult.appliedStep.id, preserveOriginalStep(finalResult.appliedStep));
 
                   // Lookahead before next step (same as deterministic retry success path)
                   // V15: Don't skip lookahead after fast-path wait_for

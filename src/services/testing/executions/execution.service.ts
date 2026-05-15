@@ -201,6 +201,65 @@ export class ExecutionService {
   }
 
   /**
+   * Phase 2 (May 2026) — Persist per-test mobile telemetry into
+   * `test_executions` so it can be aggregated into `regression_runs`
+   * later (in `recomputeRunStatus` at the completion handler).
+   *
+   * Mirrors `persistExecutedResourcesByTestId` shape:
+   *   - Linked via `result->>testId` (worker doesn't know the execId).
+   *   - Best-effort, non-throwing — a missed write degrades analytics
+   *     but MUST NEVER fail a successful test (the test's outcome is
+   *     the source of truth; telemetry just enriches it).
+   *   - No-op when `testId` is missing or telemetry has no values
+   *     (all-null write is wasteful but technically fine; we skip).
+   *
+   * Caller (mobile-test-run.job) is expected to compute every field
+   * during the run; we don't synthesise zeros here. NULL means "the
+   * job either failed before this stage or didn't run this stage".
+   */
+  static async persistTelemetryByTestId(
+    testId: string,
+    telemetry: {
+      app_setup_ms?: number | null;
+      scenario_steps_ms?: number | null;
+      test_steps_ms?: number | null;
+      session_claim_ms?: number | null;
+      cold_start_used?: boolean | null;
+      scenario_step_count?: number | null;
+      test_step_count?: number | null;
+      // Fast-auth (May 2026). See migration 20260601_mobile_fast_auth_telemetry.sql
+      // for the column semantics and the NULL vs FALSE distinction.
+      fast_auth_used?: boolean | null;
+      fast_auth_restore_ms?: number | null;
+      fast_auth_fallback_reason?: string | null;
+    },
+  ): Promise<void> {
+    if (!testId) return;
+    // All-null payload would be a wasted DB round-trip with no change.
+    // Treat as no-op so callers can pass partial telemetry without
+    // gating on every field themselves.
+    const hasAnyValue = Object.values(telemetry).some((v) => v !== undefined && v !== null);
+    if (!hasAnyValue) return;
+    try {
+      const { error } = await supabaseAdmin
+        .from('test_executions')
+        .update(telemetry)
+        .eq('result->>testId', testId);
+      if (error) {
+        logger.warn('[EXECUTION_SERVICE] Failed to persist telemetry', {
+          testId,
+          error: error.message,
+        });
+      }
+    } catch (err) {
+      logger.warn('[EXECUTION_SERVICE] persistTelemetryByTestId threw', {
+        testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
    * Get execution by ID
    * @param id - Execution ID
    * @returns Execution or null
@@ -354,6 +413,23 @@ export class ExecutionService {
       platform: row.platform || undefined,
       createdAt: row.created_at,
       isNegative: row.is_negative ?? undefined,
+      // Fast-auth (May 2026): only surface when the row actually
+      // recorded a result. `fast_auth_used` is the gate — NULL means
+      // "no fast-auth path attempted" (web run, no snapshot, pre-
+      // migration row) and is distinct from FALSE. Without this branch
+      // the FE would never get the data when falling back to REST
+      // (e.g. user reopens a completed run after the live WS state has
+      // evicted).
+      ...(row.fast_auth_used !== null && row.fast_auth_used !== undefined
+        ? {
+            fastAuth: {
+              used: row.fast_auth_used === true,
+              ...(typeof row.fast_auth_restore_ms === 'number'
+                ? { restoreMs: row.fast_auth_restore_ms }
+                : {}),
+            },
+          }
+        : {}),
     };
   }
 }

@@ -1,4 +1,5 @@
 import adminTracesRoutes from '@/api/admin/admin-traces.route';
+import adminRegressionMetricsRoutes from '@/api/admin/admin-regression-metrics.route';
 import allureImportRoutes from '@/api/allure-import/allure-import.route';
 import analyticsRoutes from '@/api/analytics/analytics.route';
 import emailInboxRoutes from '@/api/email-inbox/email-inbox.routes';
@@ -1338,6 +1339,7 @@ app.use(`/api/${env.API_VERSION}/kb/patterns`, requireAuth, requireApproved, pat
 app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, kbRoutes);
 app.use(`/api/${env.API_VERSION}/kb`, requireAuth, requireApproved, rulesReloadRoutes);
 app.use(`/api/${env.API_VERSION}/admin`, adminTracesRoutes);
+app.use(`/api/${env.API_VERSION}/admin`, adminRegressionMetricsRoutes);
 app.use(`/api/${env.API_VERSION}/playwright`, requireAuth, requireApproved, playwrightRoutes);
 app.use(`/api/${env.API_VERSION}/reports`, requireAuth, requireApproved, reportsRoutes);
 app.use(`/api/${env.API_VERSION}/test-visualization`, requireAuth, requireApproved, testVisualizationRoutes);

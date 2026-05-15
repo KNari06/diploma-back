@@ -124,6 +124,61 @@ export interface WorkspaceMembership {
 }
 
 // ============================================================================
+// PROJECT → WORKSPACE RESOLUTION (cached)
+// ============================================================================
+// Used by WorkspaceAuditService to scope audit rows to a workspace when the
+// caller only carries a projectId. `projects.workspace_id` is effectively
+// immutable (project.controller.ts blocks updates that change it), so a
+// process-local map is safe. Exported for ProjectService to invalidate if
+// that invariant ever changes.
+
+const projectWorkspaceCache = new Map<string, string>();
+
+export async function resolveWorkspaceForProject(projectId: string): Promise<string | null> {
+  if (!projectId) return null;
+
+  const cached = projectWorkspaceCache.get(projectId);
+  if (cached) return cached;
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    if (error) {
+      logger.warn('[WORKSPACE_ACCESS] Failed to resolve workspace for project', {
+        projectId,
+        error: error.message,
+      });
+      return null;
+    }
+
+    const workspaceId = (data as any)?.workspace_id as string | undefined;
+    if (workspaceId) {
+      projectWorkspaceCache.set(projectId, workspaceId);
+      return workspaceId;
+    }
+    return null;
+  } catch (error) {
+    logger.warn('[WORKSPACE_ACCESS] Exception resolving workspace for project', {
+      projectId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+export function invalidateProjectWorkspaceCache(projectId?: string): void {
+  if (projectId) {
+    projectWorkspaceCache.delete(projectId);
+  } else {
+    projectWorkspaceCache.clear();
+  }
+}
+
+// ============================================================================
 // WORKSPACE ACCESS SERVICE
 // ============================================================================
 

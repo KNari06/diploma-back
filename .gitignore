@@ -7,6 +7,9 @@ yarn-error.log*
 # Environment (never commit secrets)
 .env
 .env.*
+# ...but DO commit `.env.example` — the curated, secret-free template
+# DevOps uses to discover tunables (see file header for what belongs).
+!.env.example
 
 # Cursor (local editor state / plans)
 .cursor/plans/

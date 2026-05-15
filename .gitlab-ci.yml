@@ -189,8 +189,10 @@ deploy:dev:vm:
   stage: deploy
   tags:
     - dev-back-runner
+#  rules:
+#    - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
   rules:
-    - if: '$CI_COMMIT_BRANCH == "dev" || $CI_COMMIT_BRANCH == "develop"'
+    - when: never
   variables:
     # Use repo .env by default; override in GitLab variables if needed
     BACKEND_ENV_FILE: "$CI_PROJECT_DIR/.env"

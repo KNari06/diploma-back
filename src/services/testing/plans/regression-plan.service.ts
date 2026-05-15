@@ -35,13 +35,14 @@ export class RegressionPlanService {
    * @returns Created plan
    */
   static async create(params: CreateRegressionPlanParams): Promise<RegressionPlan> {
-    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = params;
+    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled, items } = params;
 
     logger.info('[REGRESSION_PLAN_SERVICE] Creating plan', {
       projectId,
       userId,
       name,
       hasAutomation: !!automationConfig,
+      itemsCount: Array.isArray(items) ? items.length : 0,
     });
 
     // If setting as default, unset existing default
@@ -86,6 +87,41 @@ export class RegressionPlanService {
           .update({ schedule_id: scheduleId })
           .eq('id', plan.id);
         plan.scheduleId = scheduleId;
+      }
+    }
+
+    // Bulk-add initial items in the same call so the wizard's
+    // 21-round-trip "create plan + N×addItem" gets collapsed into 1
+    // network request. If ANY item insert fails we delete the plan
+    // back out so the user doesn't end up looking at a half-built
+    // regression in the UI. Supabase doesn't expose transactions over
+    // the REST API; this is best-effort rollback. Cascade FK on
+    // `regression_plan_items.plan_id` cleans up any successfully-
+    // inserted children automatically.
+    if (Array.isArray(items) && items.length > 0) {
+      try {
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          await this.addItem({
+            ...item,
+            planId: plan.id,
+            // Default orderIndex to array position so caller-supplied
+            // order is preserved without each caller having to enumerate.
+            orderIndex: item.orderIndex ?? i,
+          });
+        }
+      } catch (itemErr) {
+        logger.error('[REGRESSION_PLAN_SERVICE] Initial items add failed — rolling back plan', {
+          planId: plan.id,
+          itemsCount: items.length,
+          error: itemErr instanceof Error ? itemErr.message : String(itemErr),
+        });
+        await supabaseAdmin
+          .from('regression_plans')
+          .delete()
+          .eq('id', plan.id)
+          .eq('user_id', userId);
+        throw itemErr;
       }
     }
 

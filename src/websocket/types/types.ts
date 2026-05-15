@@ -378,9 +378,27 @@ export interface ServerToClientEvents {
   // a new Login resource scoped to this site.
   'preview:auth:required': (data: {
     previewSessionId: string;
-    signal: 'url' | 'form' | 'both';
+    /**
+     * What kind of evidence triggered the emit. The backend picks the
+     * narrowest label that fits — multiple signals may be present in
+     * `triggers` regardless. UI uses this to tailor the banner copy.
+     *   'url'             — only URL/path-based evidence
+     *   'form'            — visible password input (no URL match)
+     *   'both'            — URL + password agree (highest confidence)
+     *   'external_oauth'  — landed on a known OAuth provider host
+     *   'multistep'       — password page reached after a recent email-only
+     *                       step on the same registrable domain
+     *                       (Google-style 2-step flow)
+     *   'backend'         — backend-driven wall (recent 401/403 + secondary
+     *                       signal, no password input present yet)
+     */
+    signal: 'url' | 'form' | 'both' | 'external_oauth' | 'multistep' | 'backend';
     url: string;
     suggestedDomain?: string;
+    /** v3 — confidence score (0..1). Old clients may ignore. */
+    score?: number;
+    /** v3 — diagnostic list of which weights fired. Old clients ignore. */
+    triggers?: string[];
     timestamp: string;
   }) => void;
 
@@ -602,8 +620,36 @@ export interface TestStepCompletedPayload {
   runtimeMeta?: {
     /** Step ID from IntentStep */
     stepId?: string;
-    /** Final status: executed, healed, or failed */
-    runtimeStatus?: 'executed' | 'healed' | 'failed';
+    /**
+     * Final status of the step.
+     *  - 'executed':    dispatched and produced a pass-equivalent result
+     *  - 'healed':      dispatched after a self-heal (web Playwright path only)
+     *  - 'failed':      dispatched, did not produce expected outcome
+     *  - 'skipped':     not dispatched at all (e.g. unsupported step type on
+     *                   the mobile runner). Mobile runner signals this via
+     *                   `resolvedVia: 'skipped'`.
+     *  - 'soft-failed': step failed BUT was authored with
+     *                   `options.continueOnError: true` (or is runner
+     *                   auto-injected) so the failure is tolerable —
+     *                   does not fail the test. UI should render with a
+     *                   distinct "skipped (optional)" badge, not the red
+     *                   failed badge. See `softFailure` field below.
+     */
+    runtimeStatus?: 'executed' | 'healed' | 'failed' | 'skipped' | 'soft-failed';
+    /**
+     * Truthy-only flag that mirrors `runtimeStatus === 'soft-failed'`. Lets
+     * the frontend pick a distinct renderer without re-deriving the rule
+     * from `runtimeStatus`. Absent (not `false`) for hard failures and
+     * successes — keeps existing renderers from accidentally rendering a
+     * "soft" badge for a hard fail when they only check truthiness.
+     */
+    softFailure?: boolean;
+    /**
+     * Mobile-only forwarding of the runner's `resolvedVia` enum so the
+     * frontend can distinguish skip-style outcomes from real-resolve
+     * outcomes without re-deriving from `runtimeStatus`.
+     */
+    resolvedVia?: string;
     /** Source of element resolution */
     source?: 'compiled' | 'resolver' | 'self_heal';
     /** Confidence tier of the resolution */
@@ -1197,6 +1243,23 @@ export interface RegressionRunProgressPayload {
       status?: 'passed' | 'failed' | 'skipped';
       /** Short human-readable reason for failed/skipped (≤ 200 chars). */
       errorMessage?: string;
+      /**
+       * Fast-auth telemetry surfaced to the FE for the live "Restored
+       * session" pill on the test card. Present only on `event ===
+       * 'completed'` for mobile tests that actually attempted fast-auth.
+       *
+       *   - `used === true`  → snapshot restored, login recipe skipped
+       *   - `used === false` → restore attempted, fell back to recipe
+       *   - omitted          → no fast-auth path tried (web run, no
+       *                        snapshot, pre-fast-auth row)
+       *
+       * `restoreMs` is the runner's wallclock for the successful restore
+       * — drives the "saved ~9s" estimate. Absent when used !== true.
+       */
+      fastAuth?: {
+        used: boolean;
+        restoreMs?: number;
+      };
     };
   };
   timestamp: string;
@@ -1635,6 +1698,10 @@ export interface PreviewRunCompletedPayload {
   cancelled?: boolean;
   duration: number; // ms
   timestamp: string;
+  // Present on early-exit terminators emitted from preview:run:start when
+  // validation/guards reject the run before kick-off, and on the mobile
+  // runner's .catch branch. Optional so success paths stay terse.
+  error?: string;
 }
 
 // ============================================================================

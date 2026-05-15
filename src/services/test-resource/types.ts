@@ -115,6 +115,27 @@ export interface ResourceSummary {
   healCount: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Phase 3 — names of the keys inside the encrypted `values` blob, for
+   * resource kinds (`secret`, future `data_fixture` w/ sensitive) where
+   * the envelope wraps a key→value map under a single field. Lets the
+   * settings UI show "STRIPE_KEY, TWILIO_TOKEN" in edit mode WITHOUT
+   * exposing the values themselves. Populated only by single-resource
+   * fetchers (getResource); list endpoints leave it undefined to avoid
+   * decrypting every row on every list call.
+   */
+  decryptedKeyNames?: string[];
+  /**
+   * Fast-auth (May 2026) — `auth` resources only. TRUE when the encrypted
+   * envelope contains a `mobileSnapshot` field. Computed from envelope
+   * KEYS, not values — no decrypt needed. Lets the Logins UI show a
+   * "Mobile ready" chip without paying the per-row decrypt cost.
+   * Size and captured_at are NOT surfaced here on purpose: they live
+   * inside the encrypted blob and would force a decrypt; if the UI ever
+   * needs them, expose via `getResource` (single-resource path that
+   * already decrypts) rather than bloating the list path.
+   */
+  hasMobileSnapshot?: boolean;
 }
 
 /**

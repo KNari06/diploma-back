@@ -32,7 +32,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 | [src/api/](src/api/) | 50+ REST controllers, grouped by domain. | ⏳ TODO |
 | [src/websocket/](src/websocket/) | Socket.IO server + handlers. Most events live in `handlers/preview.handler.ts`. | ⏳ TODO |
 | [src/services/testing/](src/services/testing/) | Non-preview testing services (regression, plans, results, executions, fixtures, exploration). | — |
-| [src/services/test-resource/](src/services/test-resource/) | Polymorphic test resources (auth/login adapters, future: env/secret/...). | — |
+| [src/services/test-resource/](src/services/test-resource/) | Polymorphic test resources — `auth` (logins), `environment`, `secret` adapters live here; `data_fixture` queued. | ✅ |
 | [src/services/kb/](src/services/kb/) | Knowledge base (skills, patterns) for auto-learn. | — |
 | [src/services/skills/](src/services/skills/) | Skill registry — composable test capabilities. | — |
 | src/services/mobile/ | Mobile runner integration (scrcpy, redroid, a11y agent). | — |
@@ -52,6 +52,7 @@ Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 When you need to… | Open
 ---|---
 …understand preview/replay/recording/auto-healing | [src/services/testing/ui/preview/CLAUDE.md](src/services/testing/ui/preview/CLAUDE.md)
+…add a new resource kind (env/secret/fixture/...) | [src/services/test-resource/CLAUDE.md](src/services/test-resource/CLAUDE.md)
 …change LLM behaviour for element resolution | `preview/element-resolver.service.ts`, `preview/intent-step-lint.service.ts`
 …change a prompt | `src/ai/prompts/*.ts`
 …add/modify a BullMQ job | `src/jobs/<name>.job.ts` and register in `src/worker/index.ts`
@@ -87,11 +88,44 @@ WS `preview:run:start`
 → stops recording → loop `applyStep()` → emits progress
 → `preview:run:complete`.
 
-### Background replay (regression / scheduled)
-BullMQ enqueue
+### Background replay (regression / scheduled) — web
+POST `/api/v1/regression/run` or `/run-plan`
+→ `RegressionRunService.runSavedTestCase()` / `runPlan()` ([regression-run.service.ts](src/services/testing/regression/regression-run.service.ts))
+→ INSERT `regression_runs` + `tests` + `test_executions`
+→ BullMQ enqueue
 → [manual-test-run.job.ts](src/jobs/manual-test-run.job.ts)
 → `executePlaywrightTestWithRetry()` (fresh browser, NOT preview session)
 → post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
+
+### Background replay (regression / scheduled) — mobile
+Same entry as web; routing diverges at `dispatchMobileTest()`.
+POST `/api/v1/regression/run` or `/run-plan`
+→ `RegressionRunService.runSavedTestCase()` → branch on `intent_test_cases.platform.startsWith('mobile_')`
+→ **Phase 4 (May 2026)** `decideMaxMobileInFlight()` ([concurrency-decision.ts](src/services/testing/regression/concurrency-decision.ts)) chooses the run's in-flight cap from `REGRESSION_MOBILE_MAX_CONCURRENCY` + live runner pool capacity + test count. Falls back to cap=1 (serial) on any failure path. Logged as `[REGRESSION_RUN] Mobile concurrency decided`.
+→ `dispatchMobileTest()` ([regression-run.service.ts:566+](src/services/testing/regression/regression-run.service.ts))
+→ INSERT `regression_runs` + `tests` + `test_executions`
+→ `QueueManager.addMobileTestJob()` (BullMQ producer)
+→ [mobile-test-run.job.ts](src/jobs/mobile-test-run.job.ts) — `MobileTestRunJobHandler.process()`
+→ `MobileRunnerClient.runSteps(sessionId, intentSteps, { screenshotEachStep:true })` (REST to qait-mobile-runner)
+→ runner returns `RunStepsResult` per-step with screenshot + evidence
+→ `persistCompiledPlansFromRun()` writes compiled plans back to `intent_test_cases.steps_json`
+→ `createTestResult()` inserts into `test_results` with aggregated stats
+→ **Phase 2 telemetry** ([20260516_mobile_telemetry.sql](supabase-migrations/20260516_mobile_telemetry.sql)): per-test wallclock (`app_setup_ms`, `scenario_steps_ms`, `test_steps_ms`, `session_claim_ms`, `cold_start_used`) written into `test_executions` in `mobile-test-run.job.ts` finally block; aggregated into `regression_runs.total_*` by `TestCompletionHandlerService.recomputeRunStatus()` at run finalisation. Best-effort, NEVER fails the test path.
+→ post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
+
+**Mobile regression diverges from web in five ways:** (1) batch RPC (`runSteps`)
+not per-step apply; (2) hardcoded `screenshotEachStep: true`; (3) NO heal layer
+above the runner — mobile relies solely on the runner's per-step retry +
+stabilization-retry tail; (4) compiled-plan persistence happens explicitly via
+`persistCompiledPlansFromRun()` (web persists differently); (5) sessions claimed
+from a runner-side pool (warmup → cold-start fallback) and released in the
+finally block. See `mobile-test-run.job.ts` for the full lifecycle.
+
+### Scheduled cron
+`src/scheduler/index.ts` ticks every 60s
+→ `TestSchedulerJobHandler.processSchedules()` → `claimDueSchedule()` (atomic)
+→ routes to `RegressionRunService.runPlan() | runModule() | runFlow()`
+→ same web / mobile branches as above.
 
 ### Chat → test creation
 POST `/api/chat/message`
@@ -113,6 +147,9 @@ These are codified across the codebase. Also see [.claude/rules/critical-pattern
 6. **CSS selector escaping:** use `CSS.escape()` when interpolating IDs (React 18 `useId()` produces colons that break selectors).
 7. **Element resolution is a 3-stage waterfall:** compiled plan → LLM resolver → smart locator. Never skip a stage.
 8. **DRY before writing new logic:** `rg "<thing>" src/ --type ts` first. There's a high chance it already exists.
+9. **`{{key}}` interpolation goes through `resolvePlaceholders`** ([src/utils/interpolation/resolve-placeholders.ts](src/utils/interpolation/resolve-placeholders.ts)). Three call sites used to do the same `.replace(/\{\{…\}\}/g, …)` against different source maps; that divergence is gone. New variable sources (env / secret / data_fixture / future kinds) are added by passing one more `VariableSource` to the helper, never by writing another regex. Selectors / `elementDescription` are intentionally NOT interpolated — keep it that way.
+10. **Anywhere that EMITS, LOGS, or PERSISTS a step body after interpolation must redact `secrets.*` values.** Helpers: `resolvePlaceholders` (substitution) is paired with `redactSecrets` / `buildStepRedactor` ([src/utils/interpolation/redact-step.ts](src/utils/interpolation/redact-step.ts)) and `executor.redactString` / `executor.redactRuntimeMeta` (for background replay). When you add a new sink (WS event, JSONL writer, DB column, third-party API call, LLM prompt) carrying interpolated `value`/`url`/`assertionText`/`description`, run it through one of these. **DB persistence is the special case:** store the original `{{...}}` placeholder, not the resolved value (see `preserveOriginalStep` in `preview-run.service.ts`). Otherwise re-runs see a stale literal forever.
+11. **Telemetry writes are best-effort — NEVER fail the test path.** Phase 2 (May 2026) instrumentation writes per-test wallclock to `test_executions` and per-run aggregates to `regression_runs`. Every write is wrapped in try/catch that `logger.warn`s and swallows. A row that's missing analytics columns is a degraded audit trail, NOT a failed test. New telemetry sinks added by anyone MUST follow the same pattern. Single funnel for the per-run aggregation: `TestCompletionHandlerService.recomputeRunStatus()` — no other code path may write to `regression_runs.total_*_ms` columns.
 
 ---
 

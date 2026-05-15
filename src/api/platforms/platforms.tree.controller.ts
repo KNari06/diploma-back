@@ -106,18 +106,45 @@ export async function getPlatformTree(req: AuthenticatedRequest, res: Response):
 
     logger.info('[PLATFORM_TREE_API] Base mode', { projectId, userId, limit, offset });
 
-    // Check cache first (base mode only)
+    // Check cache first (base mode only). Stale-bust if a cached tree is
+    // missing one of the canonical platforms (web_ui / api / mobile) — this
+    // happens for legacy projects whose cache was warmed BEFORE the mobile
+    // platform was added to `ensurePlatformsExist`. Re-fetching once on a
+    // detected gap costs ~1 query; without this guard the cache wedges the
+    // stale shape for 30 min until natural eviction.
     const cacheKey = `qait:cache:ptree:base:${projectId}:${userId}:${limit}:${offset}`;
-    const cached = await cache.get(cacheKey);
+    const cached = await cache.get(cacheKey) as { platforms?: { items?: Array<{ platformKey?: string }> } } | null;
     if (cached) {
-      res.json({ success: true, mode: 'base', data: cached, timestamp: new Date() });
-      return;
+      const cachedKeys = new Set((cached.platforms?.items || []).map((p) => p.platformKey));
+      const cachedHasAllCanonical =
+        cachedKeys.has('web_ui') && cachedKeys.has('api') && cachedKeys.has('mobile');
+      if (cachedHasAllCanonical) {
+        res.json({ success: true, mode: 'base', data: cached, timestamp: new Date() });
+        return;
+      }
+      // Fall through — cache is stale-shape, will be re-built below.
+      logger.info('[PLATFORM_TREE_API] Cache stale-shape (missing canonical platform), rebuilding', {
+        projectId,
+        userId,
+        cachedKeys: Array.from(cachedKeys),
+      });
     }
 
     let result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
 
-    // Auto-seed platforms only if none exist (first-time project setup)
-    if (result.platforms.items.length === 0) {
+    // Backfill platforms when ANY canonical platform (web_ui / api / mobile)
+    // is missing — not just when the project is fresh-empty.
+    //
+    // Background (May 2026): early projects were seeded with only web_ui+api;
+    // `mobile` was added later to `ensurePlatformsExist`. Without this
+    // proactive check, those projects never get a `test_platforms` row for
+    // `mobile`, so the FE tree can't render the Mobile category at all.
+    // `ensurePlatformsExist` is idempotent (`existing.find(...) ? skip : create`),
+    // so calling it on a healthy project is a single SELECT — cheap.
+    const presentKeys = new Set(result.platforms.items.map((p: any) => p.platformKey));
+    const canonical = ['web_ui', 'api', 'mobile'];
+    const needsBackfill = canonical.some((k) => !presentKeys.has(k));
+    if (needsBackfill) {
       await PlatformService.ensurePlatformsExist(projectId, userId);
       result = await PlatformTreeService.getBaseModeTree(projectId, userId, { limit, offset });
     }

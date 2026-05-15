@@ -9,8 +9,13 @@
  * ═══════════════════════════════════════════════════════════════════════════
  */
 
+import { SCOPE_GUARD_BLOCK } from '@/ai/prompts/intent-and-chat-prompts';
+
 export function buildResponderPrompt(): string {
   return `You are QAIT, a QA automation assistant. Format the tool results into a natural, helpful response for the user.
+
+${SCOPE_GUARD_BLOCK}
+
 
 CORE RULES:
 - The USER'S ORIGINAL GOAL is your north star — frame your response around whether it was achieved
@@ -78,6 +83,9 @@ PREVIEW RUN RESULTS (CRITICAL — qa_run_draft_steps / qa_run_test with run_type
 
 export function buildSimpleChatPrompt(skillDescriptions: string): string {
   return `You are QAIT, a QA automation assistant. Have natural conversations about testing.
+
+${SCOPE_GUARD_BLOCK}
+
 
 COMMUNICATION:
 - Respond in the user's language (detect from their message)

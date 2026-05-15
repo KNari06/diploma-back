@@ -928,6 +928,112 @@ export class TestCompletionHandlerService {
           completed_at: new Date().toISOString(),
         };
 
+        // ── Phase 2 (May 2026) telemetry aggregation ──────────────────
+        // Roll up per-test wallclock breakdowns into per-run totals so
+        // ad-hoc SQL can answer "p95 regression duration" without
+        // joining test_executions every time.
+        //
+        // Separate SELECT because the earlier query at the top of this
+        // method intentionally pulls only id/status/error_message/
+        // created_at to keep the status-recompute hot path lean.
+        //
+        // sumOrNull semantics: if no rows contribute a non-null value
+        // (e.g. pure-web run), we write NULL — distinct from 0 ms.
+        // Best-effort: a query failure here MUST NOT block the
+        // status finalisation, so we coalesce to nulls and continue.
+        let telemetryAggregates: {
+          test_count: number | null;
+          total_duration_ms: number | null;
+          total_app_setup_ms: number | null;
+          total_scenario_ms: number | null;
+          total_test_steps_ms: number | null;
+          cold_start_count: number | null;
+          // Fast-auth aggregates (May 2026). Same NULL-vs-0 semantics as the
+          // Phase 2 set above — NULL = no rows contributed, 0 = rows existed
+          // but none used fast-auth.
+          fast_auth_used_count: number | null;
+          fast_auth_fallback_count: number | null;
+          total_fast_auth_restore_ms: number | null;
+        } = {
+          test_count: null,
+          total_duration_ms: null,
+          total_app_setup_ms: null,
+          total_scenario_ms: null,
+          total_test_steps_ms: null,
+          cold_start_count: null,
+          fast_auth_used_count: null,
+          fast_auth_fallback_count: null,
+          total_fast_auth_restore_ms: null,
+        };
+        try {
+          const startedAtMs = run.started_at ? new Date(run.started_at).getTime() : null;
+          const totalDurationMs = startedAtMs !== null
+            ? Math.max(0, Date.now() - startedAtMs)
+            : null;
+
+          const { data: tlmRowsData } = await supabaseAdmin
+            .from('test_executions')
+            .select(
+              'app_setup_ms, scenario_steps_ms, test_steps_ms, cold_start_used, ' +
+              'fast_auth_used, fast_auth_restore_ms',
+            )
+            .eq('run_id', run.id);
+
+          // Supabase narrows multi-column selects to a union that doesn't
+          // overlap our row shape; cast via unknown is the documented
+          // escape hatch.
+          const tlmRows = (tlmRowsData ?? []) as unknown as Array<{
+            app_setup_ms: number | null;
+            scenario_steps_ms: number | null;
+            test_steps_ms: number | null;
+            cold_start_used: boolean | null;
+            fast_auth_used: boolean | null;
+            fast_auth_restore_ms: number | null;
+          }>;
+
+          const sumOrNull = (
+            key: 'app_setup_ms' | 'scenario_steps_ms' | 'test_steps_ms' | 'fast_auth_restore_ms',
+          ): number | null => {
+            const present = tlmRows.filter((r) => r[key] != null);
+            if (present.length === 0) return null;
+            return present.reduce((acc, r) => acc + (r[key] as number), 0);
+          };
+
+          // Fast-auth row presence detection: any non-null `fast_auth_used`
+          // means at least one mobile test in this run attempted the path.
+          // Without that marker the run is either pure-web or pre-fast-auth
+          // and we keep aggregates NULL (rather than 0) to stay honest.
+          const hasFastAuthRows = tlmRows.some((r) => r.fast_auth_used !== null);
+
+          telemetryAggregates = {
+            test_count: tlmRows.length > 0 ? tlmRows.length : null,
+            total_duration_ms: totalDurationMs,
+            total_app_setup_ms: sumOrNull('app_setup_ms'),
+            total_scenario_ms: sumOrNull('scenario_steps_ms'),
+            total_test_steps_ms: sumOrNull('test_steps_ms'),
+            cold_start_count: (() => {
+              const count = tlmRows.filter((r) => r.cold_start_used === true).length;
+              // Distinguish "no mobile tests at all" (NULL) from "no
+              // cold starts happened" (0). The presence of any non-null
+              // cold_start_used means mobile rows exist.
+              const hasMobileRows = tlmRows.some((r) => r.cold_start_used !== null);
+              return hasMobileRows ? count : null;
+            })(),
+            fast_auth_used_count: hasFastAuthRows
+              ? tlmRows.filter((r) => r.fast_auth_used === true).length
+              : null,
+            fast_auth_fallback_count: hasFastAuthRows
+              ? tlmRows.filter((r) => r.fast_auth_used === false).length
+              : null,
+            total_fast_auth_restore_ms: sumOrNull('fast_auth_restore_ms'),
+          };
+        } catch (err) {
+          logger.warn('[TEST_COMPLETION] Failed to aggregate Phase 2 telemetry — proceeding without it', {
+            runId: run.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+
         // Optimistic lock: only update if run is still in running/pending status
         // Prevents race condition when multiple tests complete simultaneously
         const persistedStatus = finalStatus === 'passed' ? 'completed' : finalStatus;
@@ -938,6 +1044,10 @@ export class TestCompletionHandlerService {
             status: persistedStatus,
             summary,
             completed_at: new Date().toISOString(),
+            // Phase 2 telemetry aggregates — merged into the single
+            // optimistic-locked UPDATE so a race-loser doesn't half-
+            // write aggregates without flipping status.
+            ...telemetryAggregates,
           })
           .eq('id', run.id)
           .in('status', ['running', 'pending'])

@@ -16,6 +16,7 @@ import {
 import { EditorTraceService } from './editor-trace.service';
 import { evaluateEvidenceShortcut } from './evidence-shortcut.utils';
 import { logIntentResolveLint } from './intent-resolve-audit';
+import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { isDynamicId } from './dynamic-id.util';
 import { getPreviewSessionService } from './preview-session.service';
@@ -955,6 +956,20 @@ export class IntentStepLintService {
           domNodeCount = count;
         }),
       ) as LintResult;
+      // Phase 2.5: pull secret values from the preview session so the
+      // audit log redacts them before persisting the intent snapshot.
+      // Lazy require to avoid the well-known circular eval between this
+      // file and preview-session via editor-trace.
+      const auditSecretValues = (() => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const sessionMod = require('./preview-session.service');
+          const session = sessionMod.getPreviewSessionService?.()?.getSession?.(params.previewSessionId);
+          return collectSecretValues(session?.contextRunVariables);
+        } catch {
+          return [];
+        }
+      })();
       try {
         logIntentResolveLint({
           stepDraft: params.stepDraft,
@@ -963,10 +978,21 @@ export class IntentStepLintService {
           durationMs: Date.now() - startedAt,
           trigger: params.auditTrigger || 'other',
           domNodeCount,
+          secretValues: auditSecretValues,
         });
       } catch { /* never break lint on diagnostics */ }
       return result;
     } catch (err) {
+      const auditSecretValuesErr = (() => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const sessionMod = require('./preview-session.service');
+          const session = sessionMod.getPreviewSessionService?.()?.getSession?.(params.previewSessionId);
+          return collectSecretValues(session?.contextRunVariables);
+        } catch {
+          return [];
+        }
+      })();
       try {
         logIntentResolveLint({
           stepDraft: params.stepDraft,
@@ -981,6 +1007,7 @@ export class IntentStepLintService {
           durationMs: Date.now() - startedAt,
           trigger: params.auditTrigger || 'other',
           domNodeCount,
+          secretValues: auditSecretValuesErr,
         });
       } catch { /* never break lint on diagnostics */ }
       throw err;

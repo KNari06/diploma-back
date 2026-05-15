@@ -21,6 +21,15 @@ import type {
   NegativeSummary,
 } from '@/types/testing.types';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
+// Phase 4 (May 2026) — mobile concurrency cap decided per-run from env +
+// real-time pool capacity. See concurrency-decision.ts for the policy.
+import {
+  decideMaxMobileInFlight,
+  countMobileTests,
+  dominantMobilePlatform,
+  envCapMobile,
+} from './concurrency-decision';
+import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger, formatError } from '@/utils/core/logger';
 import { cache } from '@/utils/core/redis-cache';
@@ -33,7 +42,7 @@ import { ManualTestService } from '../ui/manualTest.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
 import { IntelligentTestStorageService } from '../results/intelligent-test-storage.service';
 import { env } from '@/config/environment/env';
-import { QueueManager } from '@/config/infrastructure/queues';
+import { QueueManager, mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import type { MobileTestJobData, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
@@ -415,27 +424,34 @@ export class RegressionRunService {
     // 3. steps_json conversion (step editor test cases — converted at runtime)
     if (intentCase.replay_strategy === 'commands' && Array.isArray(intentCase.commands) && intentCase.commands.length > 0) {
       commands = intentCase.commands;
-      // Pre-compiled commands path: stitch setup/teardown at the command level.
-      // The converter is IntentStep-aware only, so we convert the extras
-      // separately and bracket the main commands. No-op when the feature
-      // flag is off or both extras are empty — see stitchCommandsForTestCase.
+      // Phase B (May 2026) — stitchCommandsForTestCase is now a pass-through.
+      // setup_steps / teardown_steps deprecated; scenario_setup bindings own
+      // the prologue. Helper call retained so any future restoration is a
+      // single-method change.
       commands = await this.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (intentCase.replay_strategy === 'graph_extract' && Array.isArray(intentCase.graph_ref?.steps) && intentCase.graph_ref.steps.length > 0) {
       commands = intentCase.graph_ref.steps;
+      // Phase B (May 2026) — pass-through, see comment above.
       commands = await this.stitchCommandsForTestCase(commands, intentCase, targetUrl);
     } else if (Array.isArray(intentCase.steps_json) && intentCase.steps_json.length > 0) {
       // Convert intent steps to executable Playwright commands (same path as preview runner).
-      // Normalise main steps through the shared helper BEFORE stitching, so
-      // every downstream consumer — web converter here, mobile runner via
-      // dispatchMobileTest — sees the same IntentStep shape. stitchPhases
-      // itself only normalises extras (setup/teardown); it trusts the main
-      // array the caller passes in. Without this step the web path and the
-      // mobile path would disagree on how raw JSONB becomes IntentStep.
-      const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
-      const normalisedMain = intentCase.steps_json.map((raw: any, i: number) =>
+      // Normalise main steps through the shared helper. Phase B (May 2026) —
+      // stitchPhases removed: setup_steps/teardown_steps columns are
+      // deprecated and always empty in production. The stitch was a no-op
+      // when both extras were empty, so dropping it is byte-identical to
+      // the prior behaviour for every existing test case. scenario_setup
+      // bindings deliver the prologue via runScenarioSetups in test-executor.
+      //
+      // Original code (preserved for Phase C rollback context):
+      //   const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
+      //   const normalisedMain = intentCase.steps_json.map((raw: any, i: number) =>
+      //     normaliseIntentStep(raw, i),
+      //   );
+      //   const { steps: stitchedSteps, counts, didStitch } = stitchPhases(normalisedMain, intentCase);
+      const { normaliseIntentStep } = await import('./intent-step-dispatch.service');
+      const stitchedSteps = intentCase.steps_json.map((raw: any, i: number) =>
         normaliseIntentStep(raw, i),
       );
-      const { steps: stitchedSteps, counts, didStitch } = stitchPhases(normalisedMain, intentCase);
 
       const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
       commands = IntentStepConverterService.convertToCommands(stitchedSteps, targetUrl, intentCase.id);
@@ -444,8 +460,6 @@ export class RegressionRunService {
         stepsCount: intentCase.steps_json.length,
         commandsCount: commands.length,
         stepsWithCompiled: intentCase.steps_json.filter((s: any) => !!s.compiled).length,
-        phaseStitched: didStitch,
-        phaseCounts: counts,
       });
     } else {
       throw new ValidationError(
@@ -462,17 +476,25 @@ export class RegressionRunService {
       );
     }
 
-    // Resolve shared_steps references BEFORE applying parameters
-    const { SharedStepResolverService } = await import('../shared-steps/shared-step-resolver.service');
-    const { commands: resolvedCommands, warnings } =
-      await SharedStepResolverService.resolveCommands(commands, intentCase.project_id);
-
-    if (warnings.length > 0) {
-      logger.warn('[REGRESSION_RUN] Shared step resolution warnings', {
-        intentTestCaseId: intentCase.id,
-        warnings,
-      });
-    }
+    // Phase B (May 2026) — shared_steps resolver is deactivated. The
+    // PlaywrightCommand `action: 'shared_steps'` mechanism never had a
+    // producer (UI, AI, importer) — see audit. scenario_setup resource
+    // bindings are the canonical reuse path. The block below is the
+    // historical call; rolled back here as a one-liner pass-through.
+    // Original code preserved verbatim to ease Phase C rollback if
+    // any unexpected DB row turns up with the dead action type.
+    //
+    //   const { SharedStepResolverService } = await import('../shared-steps/shared-step-resolver.service');
+    //   const { commands: resolvedCommands, warnings } =
+    //     await SharedStepResolverService.resolveCommands(commands, intentCase.project_id);
+    //   if (warnings.length > 0) {
+    //     logger.warn('[REGRESSION_RUN] Shared step resolution warnings', {
+    //       intentTestCaseId: intentCase.id,
+    //       warnings,
+    //     });
+    //   }
+    //   commands = this.applyParameters(resolvedCommands, parameters);
+    const resolvedCommands = commands;
 
     // Apply parameters AFTER resolution (so parent parameters apply to all expanded commands)
     commands = this.applyParameters(resolvedCommands, parameters);
@@ -504,52 +526,52 @@ export class RegressionRunService {
   }
 
   /**
-   * Command-level phase stitching for pre-compiled `commands` and
-   * `graph_ref.steps` replay paths. The steps_json path uses
-   * `stitchPhases` on IntentStep[] BEFORE conversion — richer because
-   * the converter understands all step types. Here we already have
-   * PlaywrightCommand[], so we just convert the setup/teardown
-   * IntentStep[] extras on their own and bracket the main commands.
+   * Command-level phase stitching helper — DEPRECATED in Phase B (May 2026).
    *
-   * No-op when the feature flag is off OR both extras are empty — so
-   * this method is safe to call unconditionally and regressions stay
-   * byte-identical when the flag is off.
+   * Originally bracketed pre-compiled `commands` / `graph_ref.steps` test
+   * cases with setup_steps / teardown_steps converted on the fly. The
+   * extras were always empty in production (no UI writer existed) so this
+   * was a no-op for every test in practice. scenario_setup bindings are
+   * the canonical reuse mechanism now and they run via runScenarioSetups
+   * in the executor, not via this helper.
+   *
+   * Now a pass-through. Original implementation preserved in commented
+   * form for Phase C rollback context.
    */
   private static async stitchCommandsForTestCase(
     mainCommands: any[],
-    intentCase: any,
-    targetUrl: string,
+    _intentCase: any,
+    _targetUrl: string,
   ): Promise<any[]> {
-    const { stitchPhases } = await import('./intent-step-dispatch.service');
-    // Pass an EMPTY main array — we only need the helper to produce the
-    // setup/teardown IntentSteps; main is already in PlaywrightCommand
-    // shape and doesn't round-trip through the converter.
-    const { steps: extras, counts, didStitch } = stitchPhases([], intentCase);
-    if (!didStitch) return mainCommands;
-
-    const setupSteps = extras.filter((s) => s.phase === 'setup');
-    const teardownSteps = extras.filter((s) => s.phase === 'teardown');
-
-    const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
-    const setupCommands = setupSteps.length > 0
-      ? IntentStepConverterService.convertToCommands(setupSteps, targetUrl, intentCase.id)
-      : [];
-    const teardownCommands = teardownSteps.length > 0
-      ? IntentStepConverterService.convertToCommands(teardownSteps, targetUrl, intentCase.id)
-      : [];
-
-    // Main commands inherit an explicit 'main' phase tag so the executor
-    // and report layer treat the boundary consistently (absent = legacy).
-    const taggedMain = mainCommands.map((cmd: any) => ({ ...cmd, phase: 'main' as const }));
-
-    logger.info('[REGRESSION_RUN] Stitched command-level phases', {
-      intentTestCaseId: intentCase.id,
-      setup: setupCommands.length,
-      main: taggedMain.length,
-      teardown: teardownCommands.length,
-      counts,
-    });
-    return [...setupCommands, ...taggedMain, ...teardownCommands];
+    return mainCommands;
+    //
+    // === ORIGINAL IMPLEMENTATION (Phase B deactivation, May 2026) ===
+    //
+    // const { stitchPhases } = await import('./intent-step-dispatch.service');
+    // const { steps: extras, counts, didStitch } = stitchPhases([], intentCase);
+    // if (!didStitch) return mainCommands;
+    //
+    // const setupSteps = extras.filter((s) => s.phase === 'setup');
+    // const teardownSteps = extras.filter((s) => s.phase === 'teardown');
+    //
+    // const { IntentStepConverterService } = await import('../ui/preview/intent-step-converter.service');
+    // const setupCommands = setupSteps.length > 0
+    //   ? IntentStepConverterService.convertToCommands(setupSteps, targetUrl, intentCase.id)
+    //   : [];
+    // const teardownCommands = teardownSteps.length > 0
+    //   ? IntentStepConverterService.convertToCommands(teardownSteps, targetUrl, intentCase.id)
+    //   : [];
+    //
+    // const taggedMain = mainCommands.map((cmd: any) => ({ ...cmd, phase: 'main' as const }));
+    //
+    // logger.info('[REGRESSION_RUN] Stitched command-level phases', {
+    //   intentTestCaseId: intentCase.id,
+    //   setup: setupCommands.length,
+    //   main: taggedMain.length,
+    //   teardown: teardownCommands.length,
+    //   counts,
+    // });
+    // return [...setupCommands, ...taggedMain, ...teardownCommands];
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -587,7 +609,7 @@ export class RegressionRunService {
      * single-case manual dispatch (no batch) — the job skips the update.
      */
     analyticsExecutionId?: string,
-  ): Promise<{ testId: string }> {
+  ): Promise<{ testId: string; jobId: string }> {
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
       mobile_ios: 'ios',
@@ -626,20 +648,27 @@ export class RegressionRunService {
 
     // 3. Extract intent steps from steps_json via the shared IntentStep
     // normaliser (single source of truth for which fields survive the
-    // JSONB round-trip — see intent-step-dispatch.service.ts). Then hand off
-    // to stitchPhases so setup_steps / teardown_steps are prepended and
-    // appended with proper `phase` markers. When the case has no extras,
-    // stitchPhases is a no-op and the mobile job data is byte-identical
-    // to what it was before Phase 3.
-    const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
-    const rawMainSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
+    // JSONB round-trip — see intent-step-dispatch.service.ts).
+    //
+    // Phase B (May 2026) — stitchPhases removed: setup_steps/teardown_steps
+    // were a never-used column duplicate. The compiler in
+    // resource-step-compiler.service.ts already prepends scenario_setup
+    // resource bindings as setup-phase steps before the mobile runner
+    // sees them. No work to do here beyond normalisation.
+    //
+    // Original code (preserved for Phase C rollback context):
+    //   const { stitchPhases, normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    //   const rawMainSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
+    //     normaliseIntentStep(step, index),
+    //   );
+    //   const { steps: stitchedSteps, counts: phaseCounts, didStitch } =
+    //     stitchPhases(rawMainSteps, intentCase);
+    const { normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    const stitchedSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
       normaliseIntentStep(step, index),
     );
-    const { steps: stitchedSteps, counts: phaseCounts, didStitch } =
-      stitchPhases(rawMainSteps, intentCase);
 
-    // Phase 6: apply plan-level parameters to stitched steps (main + setup
-    // + teardown all get the substitution in one pass). Walks every string
+    // Phase 6: apply plan-level parameters to the steps. Walks every string
     // leaf recursively so placeholders in options, bindingHints, etc.
     // resolve too — not just top-level `value`. No-op when `parameters`
     // is empty, preserving pre-Phase-6 behaviour bit-for-bit.
@@ -649,13 +678,6 @@ export class RegressionRunService {
       throw new ValidationError(
         `Mobile test case "${intentCase.name}" has no steps (steps_json is empty)`,
       );
-    }
-
-    if (didStitch) {
-      logger.info('[REGRESSION_RUN] Mobile phases stitched', {
-        intentTestCaseId: intentCase.id,
-        counts: phaseCounts,
-      });
     }
 
     // 3b. Shared resources (Login / Environment / Secret / ...) — Option A.
@@ -761,6 +783,14 @@ export class RegressionRunService {
       appStoragePath: resolvedBuild?.storagePath,
       appOriginalName: resolvedBuild?.originalName,
       appPackage: resolvedBuild?.packageName,
+      // Fast-auth: pass the build number as proxy for Android versionCode.
+      // The compiler's snapshot gate uses it to invalidate captures taken
+      // against an older app build. Undefined when the project has no CI
+      // build pipeline (direct-uploaded APK) — the gate degrades to TTL +
+      // runtime-failure invalidation, which is acceptable for v1.
+      ...(typeof resolvedBuild?.buildNumber === 'number'
+        ? { appVersionCode: resolvedBuild.buildNumber }
+        : {}),
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
       metadata: buildMetadataFromTestCase(intentCase),
@@ -777,8 +807,16 @@ export class RegressionRunService {
 
     await QueueManager.addMobileTestRunJob(jobData);
 
+    // BullMQ job id format mirrors QueueManager.addMobileTestRunJob:
+    //   `${testId}-${browser}`  (see queues.ts:717)
+    // Caller uses this to wait for `queue.completed` in the regression
+    // concurrency gate so Test N+1 doesn't dispatch before Test N's
+    // session destroy is finished on the runner side.
+    const jobId = `${testId}-${browser}`;
+
     logger.info('[REGRESSION_RUN] Mobile test dispatched', {
       testId,
+      jobId,
       platform,
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
@@ -791,7 +829,7 @@ export class RegressionRunService {
       appSource: resolvedBuild?.source,
     });
 
-    return { testId };
+    return { testId, jobId };
   }
 
   /**
@@ -1915,7 +1953,32 @@ export class RegressionRunService {
       .eq('run_id', runId);
 
     if (execError) {
+      // Pre-fix this was a silent `return` — left the run row orphan in
+      // 'running' state because nothing thrown reached runPlan's
+      // `.catch()` finalizer at line 1310. Now we explicitly finalize the
+      // run row before bailing out so the regression list / detail view
+      // doesn't show a forever-running run.
       logger.error('[REGRESSION_RUN] Failed to preload executions', { error: execError, runId });
+      try {
+        await supabaseAdmin
+          .from('regression_runs')
+          .update({
+            status: 'failed',
+            completed_at: new Date().toISOString(),
+            summary: {
+              total: testCases.length,
+              error: `Failed to preload executions: ${execError.message ?? 'unknown'}`,
+              completed_at: new Date().toISOString(),
+            },
+          })
+          .eq('id', runId)
+          .in('status', ['pending', 'running']);
+      } catch (finalizeErr) {
+        logger.error('[REGRESSION_RUN] Failed to finalize run after preload failure', {
+          runId,
+          error: finalizeErr,
+        });
+      }
       return;
     }
 
@@ -2028,10 +2091,78 @@ export class RegressionRunService {
     // Override via REGRESSION_MOBILE_MAX_CONCURRENCY. Should be ≤ runner's
     // POOL_ANDROID_SIZE + POOL_IOS_SIZE — otherwise each extra slot forces
     // a ~60s cold-start that ends up slower than serial execution.
-    const MAX_MOBILE_IN_FLIGHT = Math.max(
-      1,
-      parseInt(process.env.REGRESSION_MOBILE_MAX_CONCURRENCY || '2', 10),
-    );
+    //
+    // Default is 1 (serial). The previous default of 2 caused regression
+    // runs to dispatch two mobile tests in parallel, both racing the same
+    // emulator. When the runner pool claim fails (e.g.
+    // `pm create-user failed: (no output)` on a redroid that hasn't fully
+    // booted multi-user), both tests fall back to cold-start on the same
+    // device, contend on the ADB shell, and the second `runSteps` HTTP
+    // request gets its socket dropped — surfacing as `Client aborted`
+    // after step 0 in the runner. Editor runs never hit this because
+    // they're always single-test. Operators with a healthy warm pool can
+    // raise this to match `POOL_ANDROID_SIZE + POOL_IOS_SIZE`.
+    // Phase 4 (May 2026): dynamic concurrency cap.
+    //
+    // Pre-Phase-4 this was a static parse of REGRESSION_MOBILE_MAX_CONCURRENCY
+    // with a Math.max(1, ...) floor. That ignored real-time pool capacity
+    // and test count — operators had to manually retune the env var.
+    //
+    // Now: we ask the runner for live pool capacity (cheap REST call,
+    // 5s timeout) and decide a cap that respects:
+    //   - envCap (operator's hard ceiling — never violated)
+    //   - poolIdle (don't dispatch more parallel tests than the runner can claim)
+    //   - testCount + platform (skip parallelism overhead when not useful)
+    //
+    // Falls back to cap=1 on any failure path (runner down, classic mode,
+    // iOS-only, ...), preserving the pre-Phase-4 default behaviour. NEVER
+    // throws — the regression always proceeds, just maybe serially.
+    //
+    // Snapshot-and-go: decision is computed once here and re-used for the
+    // entire run. We deliberately don't recompute mid-run; multiple
+    // regressions sharing the pool would race each other otherwise.
+    //
+    // See docs/mobile-test-orchestration-plan.md Phase 4.
+    let MAX_MOBILE_IN_FLIGHT = 1;
+    try {
+      const decision = await decideMaxMobileInFlight({
+        testCount: countMobileTests(levels),
+        platform: dominantMobilePlatform(levels),
+        runnerClient: getMobileRunnerClient(),
+      });
+      MAX_MOBILE_IN_FLIGHT = decision.cap;
+      logger.info('[REGRESSION_RUN] Mobile concurrency decided', {
+        runId,
+        cap: decision.cap,
+        reason: decision.reason,
+        ...decision.inputs,
+      });
+    } catch (err) {
+      // decideMaxMobileInFlight is documented not-to-throw; if it does,
+      // fall back to the env cap (or 1) so the regression still runs.
+      // Surface so we notice in logs and fix.
+      //
+      // Phase 4 audit (May 2026): use `envCapMobile()` rather than an
+      // inline `Math.max(1, parseInt(...))`. parseInt('abc', 10) → NaN
+      // and Math.max(1, NaN) → NaN, which would silently disable the
+      // `inFlight.size >= cap` gate (NaN >= n is always false) and
+      // dispatch every test in parallel. envCapMobile() validates
+      // Number.isFinite + >=1 and falls back to 1 on garbage env.
+      logger.error('[REGRESSION_RUN] decideMaxMobileInFlight threw — falling back to envCap', {
+        runId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      MAX_MOBILE_IN_FLIGHT = envCapMobile();
+    }
+
+    // Defensive guard: log loudly if any testCaseId is dispatched twice
+    // within a single run. Topological levels + dedup at expansion time
+    // (regression-plan.service.ts:941-947) should make this impossible,
+    // but the user has reported a "tests run again" symptom we couldn't
+    // reproduce from logs. If the backend ever emits a duplicate, this
+    // log + early-return surfaces it without putting an extra job on the
+    // queue. Cheap, defensive, removable once the symptom is understood.
+    const dispatchedTestCaseIds = new Set<string>();
 
     let creditExhausted = false;
     // Fail-fast flag — mirrors `creditExhausted`. Flipped to true the first
@@ -2089,6 +2220,23 @@ export class RegressionRunService {
         // still awaits tests that were dispatched before the trigger, so
         // we don't lose verdicts from in-flight tests.
         if (failFastTriggered) break;
+
+        // Defensive duplicate-dispatch guard. If the topological sort or
+        // plan expansion ever lets the same testCaseId through twice in
+        // one run, log loudly and skip the second dispatch — better to
+        // have a missing run-card than to charge the user twice and
+        // confuse the regression UI with phantom executions.
+        const dispatchKey = `${testCase.testType}:${testCase.testCaseId}`;
+        if (dispatchedTestCaseIds.has(dispatchKey)) {
+          logger.error('[REGRESSION_RUN] DUPLICATE DISPATCH detected — skipping second invocation', {
+            runId,
+            testCaseId: testCase.testCaseId,
+            testType: testCase.testType,
+            level: levelIdx,
+          });
+          continue;
+        }
+        dispatchedTestCaseIds.add(dispatchKey);
 
         const execId = execByKey.get(`${testCase.testType}:${testCase.testCaseId}`);
 
@@ -2174,6 +2322,12 @@ export class RegressionRunService {
             // Route: mobile tests → mobile runner queue, web tests → Playwright queue
             const isMobile = savedCase.platform?.startsWith('mobile_');
             let testId: string;
+            // Captured from dispatchMobileTest so the concurrency gate below
+            // can also wait on the BullMQ `queue.completed` event, not just
+            // the execution-completion emitter (which fires several seconds
+            // before the worker's `finally` block finishes destroying the
+            // runner session).
+            let mobileJobId: string | null = null;
 
             if (isMobile) {
               // Phase 5: forward git triggerContext so the APK resolver can
@@ -2195,6 +2349,7 @@ export class RegressionRunService {
                 execId,
               );
               testId = mobileResult.testId;
+              mobileJobId = mobileResult.jobId;
             } else {
               const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
               const testResult = await ManualTestService.runTest(testRequest);
@@ -2235,7 +2390,40 @@ export class RegressionRunService {
               // shared CPU/memory, cap them via WEB_WORKER_CONCURRENCY, not
               // here.)
               if (isMobile) {
-                trackInFlight(waitPromise);
+                // The execution-completion emitter fires when the worker
+                // updates `test_executions.status` — but the worker keeps
+                // running for several more seconds inside its `finally`
+                // block (destroySession, persistCompiledPlans, etc.). If we
+                // released the gate here, Test N+1 would dispatch onto the
+                // runner while Test N's session destroy is still in flight,
+                // racing the runner's emulator teardown.
+                //
+                // Compose with `queue.completed` from the BullMQ worker so
+                // the gate stays closed until the mobile worker's `finally`
+                // also finishes. Failure of either side (job not found,
+                // wait timeout) is non-fatal — the gate releases anyway so
+                // a stuck runner doesn't deadlock the whole regression run.
+                const mobileGatePromise = (async (): Promise<string> => {
+                  const status = await waitPromise;
+                  if (mobileJobId) {
+                    try {
+                      const job = await mobileTestRunQueue.getJob(mobileJobId);
+                      if (job) {
+                        // 10-minute cap mirrors executionCompletionEmitter's
+                        // own DEFAULT_TIMEOUT_MS so a frozen runner doesn't
+                        // wedge the gate for longer than the upstream.
+                        await job.waitUntilFinished(mobileTestRunQueueEvents, 600_000);
+                      }
+                    } catch (err) {
+                      logger.warn('[REGRESSION_RUN] BullMQ wait for mobile job failed; releasing gate anyway', {
+                        jobId: mobileJobId,
+                        error: err instanceof Error ? err.message : String(err),
+                      });
+                    }
+                  }
+                  return status;
+                })();
+                trackInFlight(mobileGatePromise);
                 if (inFlight.size >= MAX_MOBILE_IN_FLIGHT) {
                   emitProgress(
                     'test_started',
@@ -2449,6 +2637,53 @@ export class RegressionRunService {
           })
         );
 
+        // Batch-fetch fast-auth telemetry for every execId in this level
+        // so the per-test `test_completed` WS payload can surface the
+        // "Restored session 200ms" pill the FE renders. One SELECT for
+        // the whole level (NOT N+1). Null/missing values are normal:
+        //   - non-mobile tests have fast_auth_used IS NULL
+        //   - mobile tests with no snapshot have fast_auth_used IS NULL
+        // The map only populates entries that actually attempted fast-auth.
+        // Best-effort: a query failure here leaves the pills off but the
+        // run finalization continues unaffected.
+        const fastAuthByExecId = new Map<
+          string,
+          { used: boolean; restoreMs?: number }
+        >();
+        try {
+          const execIdsForFastAuth = results
+            .map((r) => r.execId)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0);
+          if (execIdsForFastAuth.length > 0) {
+            const { data: faRows } = await supabaseAdmin
+              .from('test_executions')
+              .select('id, fast_auth_used, fast_auth_restore_ms')
+              .in('id', execIdsForFastAuth);
+            for (const row of (faRows ?? []) as Array<{
+              id: string;
+              fast_auth_used: boolean | null;
+              fast_auth_restore_ms: number | null;
+            }>) {
+              if (row.fast_auth_used === null) continue;
+              fastAuthByExecId.set(row.id, {
+                used: row.fast_auth_used,
+                ...(typeof row.fast_auth_restore_ms === 'number'
+                  ? { restoreMs: row.fast_auth_restore_ms }
+                  : {}),
+              });
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            '[REGRESSION_RUN] Failed to fetch fast-auth telemetry for live payload — pills will be off this level',
+            {
+              runId,
+              level: levelIdx,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+        }
+
         for (const result of results) {
           completedCount++;
           if (result.status !== 'passed') {
@@ -2469,6 +2704,7 @@ export class RegressionRunService {
             result.status === 'passed' ? 'passed'
             : result.status === 'failed' ? 'failed'
             : 'skipped';
+          const fa = result.execId ? fastAuthByExecId.get(result.execId) : undefined;
           emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
             currentLevel: levelIdx + 1,
             testExecution: {
@@ -2478,6 +2714,7 @@ export class RegressionRunService {
               platform: result.platform,
               event: 'completed',
               status: mappedStatus,
+              ...(fa ? { fastAuth: fa } : {}),
             },
           });
         }

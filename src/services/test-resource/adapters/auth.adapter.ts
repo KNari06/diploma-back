@@ -39,6 +39,53 @@ export interface AuthConfig extends Record<string, unknown> {
   /** Canonical AuthFixture is the only stored secret — nothing here yet. */
 }
 
+/**
+ * Mobile fast-auth snapshot. Captured once (via the editor "Save login" flow
+ * or auto-captured after a successful recipe replay) and restored before
+ * each test that uses this resource on the matching platform/package. Lets
+ * mobile tests skip the login recipe — the mobile equivalent of web's
+ * cookie+localStorage injection.
+ *
+ * Invalidation triggers, all handled by the consumer (compiler / mobile-job),
+ * never silently inside the adapter:
+ *   1. `apkVersionCode` change → app may have migrated SharedPrefs schema.
+ *      Confident invalidation: fall back to recipe AND mark for re-capture.
+ *   2. Restore failed at runtime (runner returns 409/500) → fall back to
+ *      recipe AND mark snapshot broken so next clean login re-captures.
+ *
+ * Note on TTL: TTL expiry on the base row does NOT invalidate the
+ * snapshot specifically. The server-side session lifetime that TTL
+ * approximates affects recipe-replay credentials and snapshot-restored
+ * cookies equally — both paths would 401 from the app's backend. We let
+ * TTL flow through to whichever path we picked rather than forcing the
+ * "slower" path on stale rows.
+ *
+ * v1 is Android-only. iOS Keychain export needs XCUITest infra we don't
+ * have yet — adding `platform: 'ios'` later is the schema-friendly way
+ * to extend; existing `'android'` rows stay valid.
+ */
+export interface AuthMobileSnapshot {
+  platform: 'android';
+  /** Must match the resolved APK's package at apply time — refuse on mismatch. */
+  packageName: string;
+  /** `ro.build.version.sdk` at capture (e.g. 35 for redroid 15). */
+  androidApiLevel: number;
+  /** Gzipped tar of /data/data/<pkg>/{shared_prefs,databases}, base64-encoded. */
+  dataTarballBase64: string;
+  sizeBytes: number;
+  /** ISO 8601. Distinct from base row `captured_at`: that one bumps on heal
+   *  even when the snapshot wasn't refreshed — this one only bumps on a real
+   *  re-capture. */
+  capturedAt: string;
+  /** APK `versionCode` at capture time — null if the build pipeline didn't
+   *  surface one. When it differs from the current run's APK, invalidate. */
+  apkVersionCode?: number;
+  /** Privilege path that produced this blob — surfaced in admin telemetry
+   *  so we can see if customers hit the su-fallback often (signals their
+   *  QA builds aren't debuggable). Not a security boundary. */
+  capturedVia: 'run-as' | 'su';
+}
+
 /** Encrypted side of the envelope. */
 export interface AuthSensitive extends Record<string, unknown> {
   /**
@@ -52,11 +99,20 @@ export interface AuthSensitive extends Record<string, unknown> {
    * when the user set up 2FA when creating the profile.
    */
   totpSecret?: string;
+
+  /**
+   * Mobile fast-auth blob. Present only when the user (or auto-capture)
+   * has snapshot'd the logged-in app-data dir. Web-only resources never
+   * have this; mobile resources MAY have it — absence means the compiler
+   * falls back to recipe replay (the existing behaviour).
+   */
+  mobileSnapshot?: AuthMobileSnapshot;
 }
 
 export const AUTH_SENSITIVE_FIELDS: Array<keyof AuthSensitive> = [
   'storageState',
   'totpSecret',
+  'mobileSnapshot',
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +146,40 @@ export const authAdapter: ResourceAdapter<AuthConfig, AuthSensitive> = {
 
     if (merged.totpSecret !== undefined && typeof merged.totpSecret !== 'string') {
       errors.push('totpSecret must be a string');
+    }
+
+    // Fast-auth snapshot shape check. We don't try to validate the tarball
+    // bytes here (impossible without unpacking + on-device replay) — we
+    // only enforce the envelope so a malformed write doesn't survive
+    // round-trip. Runtime invalidation (size, age, restore failure) is
+    // the compiler / mobile-job's job, not ours.
+    if (merged.mobileSnapshot !== undefined && merged.mobileSnapshot !== null) {
+      const s = merged.mobileSnapshot as Partial<AuthMobileSnapshot>;
+      if (s.platform !== 'android') {
+        errors.push('mobileSnapshot.platform must be "android" (iOS deferred)');
+      }
+      if (!s.packageName || typeof s.packageName !== 'string') {
+        errors.push('mobileSnapshot.packageName must be a non-empty string');
+      }
+      if (typeof s.androidApiLevel !== 'number' || s.androidApiLevel < 21) {
+        errors.push('mobileSnapshot.androidApiLevel must be a number ≥ 21');
+      }
+      if (!s.dataTarballBase64 || typeof s.dataTarballBase64 !== 'string'
+        || s.dataTarballBase64.length < 32) {
+        // 32 chars ≈ 24 bytes — implausibly small for any real tarball.
+        // Better to reject than persist a garbage blob the runner can't
+        // base64-decode without a confusing error mid-test.
+        errors.push('mobileSnapshot.dataTarballBase64 missing or implausibly short');
+      }
+      if (typeof s.sizeBytes !== 'number' || s.sizeBytes < 0) {
+        errors.push('mobileSnapshot.sizeBytes must be a non-negative number');
+      }
+      if (!s.capturedAt || typeof s.capturedAt !== 'string') {
+        errors.push('mobileSnapshot.capturedAt must be an ISO 8601 string');
+      }
+      if (s.capturedVia !== 'run-as' && s.capturedVia !== 'su') {
+        errors.push('mobileSnapshot.capturedVia must be "run-as" or "su"');
+      }
     }
 
     if (errors.length > 0) return { valid: false, errors };

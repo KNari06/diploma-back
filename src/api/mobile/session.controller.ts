@@ -13,9 +13,8 @@
 
 import { env } from '@/config/environment/env';
 import { redisConnection } from '@/config/infrastructure/queues';
-import { MobileRunnerClient, getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
-import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { ProjectService } from '@/services/core/project.service';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
@@ -24,12 +23,19 @@ import { getIO } from '@/websocket/core/server';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
+// `installAppOnSession` was extracted to `MobileAppPrepService.prepApp` —
+// see `src/services/mobile/mobile-app-prep.service.ts`. The constants and
+// `WarmupData` interface remain exported from this file because the
+// service imports them.
+import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
+import { applyProjectPolicyToSession } from '@/services/mobile/permission-policy.service';
+
 // ── Constants ────────────────────────────────────────────────────────
 
-const WARMUP_PREFIX = 'mobile_warmup:';
+export const WARMUP_PREFIX = 'mobile_warmup:';
 // Kept in lockstep with `IDLE_TTL_MS` in `mobile-idle.service.ts` so an
 // active user can't be expired before the in-memory idle timer fires.
-const WARMUP_TTL = 900; // 15 minutes
+export const WARMUP_TTL = 900; // 15 minutes
 
 /**
  * Runner-side Socket.IO handshake auth for the browser to attach.
@@ -65,36 +71,6 @@ function currentRunnerSocketUrl(): string {
   return env.MOBILE_RUNNER_URL.replace(/^http/, 'ws').replace(/\/$/, '');
 }
 
-type MobilePermissionPolicy = 'auto_allow' | 'auto_deny' | 'manual';
-const VALID_PERMISSION_POLICIES: readonly MobilePermissionPolicy[] = ['auto_allow', 'auto_deny', 'manual'];
-
-/**
- * Resolve the effective permission policy for a session at warmup time.
- *
- * Precedence: test-level override (set later during run) > project default >
- * runner default ('auto_allow'). Since we don't know which test will run
- * during warmup, we seed the session with the project default; per-test
- * overrides can PATCH the runner at run start if they differ.
- *
- * Returns `null` if the stored value is missing or invalid — callers then
- * leave the session on the runner default (avoiding a round-trip).
- */
-async function resolveProjectPermissionPolicy(
-  projectId: string,
-  userId: string,
-): Promise<MobilePermissionPolicy | null> {
-  try {
-    const project = await ProjectService.getProject(projectId, userId);
-    const stored = project?.settings?.mobilePermissionPolicy;
-    if (typeof stored === 'string' && (VALID_PERMISSION_POLICIES as readonly string[]).includes(stored)) {
-      return stored as MobilePermissionPolicy;
-    }
-  } catch {
-    // Swallow — network/db hiccup falls through to the runner default.
-  }
-  return null;
-}
-
 /**
  * Pending-install flag: set when an APK is uploaded but the upload-time
  * `autoBootAndInstall` couldn't reach a running emulator. Stores the
@@ -103,7 +79,7 @@ async function resolveProjectPermissionPolicy(
  * even if Redis thinks the same APK is cached — because in reality the
  * emulator may never have actually received it.
  */
-const PENDING_INSTALL_PREFIX = 'mobile_pending_install:';
+export const PENDING_INSTALL_PREFIX = 'mobile_pending_install:';
 const PENDING_INSTALL_TTL = 3600; // 1 hour
 
 export interface WarmupData {
@@ -116,6 +92,24 @@ export interface WarmupData {
   installedPackage?: string;
   /** Supabase storage path of the APK currently installed */
   appStoragePath?: string;
+  /**
+   * Audit BUG-1 fix: persist the `deviceSelector` used to BOOT this
+   * session so a later warmup can compare against the new request's
+   * selector and detect "user wants to switch devices."
+   *
+   * If the new request asks for a DIFFERENT serial (or source), we
+   * MUST NOT reuse this cached session — otherwise the user picks
+   * device B in the popover, presses Warmup, and silently keeps
+   * landing on device A. Persisting it here lets the cached-reuse
+   * branch above invalidate the cache when the selectors disagree.
+   *
+   * Optional because legacy entries (pre-fix) won't have it; the
+   * comparison defaults to "no recorded selector → reuse is safe."
+   */
+  deviceSelector?: {
+    source?: 'local-emulator' | 'local-physical' | 'cloud';
+    serial?: string;
+  };
 }
 
 /**
@@ -161,10 +155,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     return;
   }
 
-  const { projectId, platform: rawPlatform, appPackage } = req.body as {
+  const { projectId, platform: rawPlatform, appPackage, deviceSelector: rawDeviceSelector } = req.body as {
     projectId?: string;
     platform?: string;
     appPackage?: string;
+    deviceSelector?: unknown;
   };
 
   if (!projectId) {
@@ -174,6 +169,40 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+
+  // Phase 2.6: validate `deviceSelector` if present. Inline validator to
+  // match this file's existing style (no zod). Rejects malformed selectors
+  // up front so the runner doesn't return a confusing INVALID_INPUT 400
+  // through our error pipeline. Both fields are optional but cannot be
+  // wrong-typed when supplied — empty-string serial in particular slips
+  // through `if (selector.serial)` checks downstream.
+  let deviceSelector: { source?: 'local-emulator' | 'local-physical' | 'cloud'; serial?: string } | undefined;
+  if (rawDeviceSelector !== undefined && rawDeviceSelector !== null) {
+    if (typeof rawDeviceSelector !== 'object' || Array.isArray(rawDeviceSelector)) {
+      res.status(400).json({ success: false, error: 'deviceSelector must be an object' });
+      return;
+    }
+    const sel = rawDeviceSelector as { source?: unknown; serial?: unknown };
+    const validSources = ['local-emulator', 'local-physical', 'cloud'] as const;
+    if (sel.source !== undefined && !validSources.includes(sel.source as typeof validSources[number])) {
+      res.status(400).json({
+        success: false,
+        error: `deviceSelector.source must be one of ${validSources.join(', ')}`,
+      });
+      return;
+    }
+    if (sel.serial !== undefined && (typeof sel.serial !== 'string' || sel.serial.trim() === '')) {
+      res.status(400).json({
+        success: false,
+        error: 'deviceSelector.serial must be a non-empty string',
+      });
+      return;
+    }
+    deviceSelector = {
+      source: sel.source as 'local-emulator' | 'local-physical' | 'cloud' | undefined,
+      serial: typeof sel.serial === 'string' ? sel.serial : undefined,
+    };
+  }
 
   logger.info('[MOBILE_SESSION] warmup request', {
     userId,
@@ -299,6 +328,57 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           });
           await redisConnection.del(redisKey);
           // Fall through to create a new session below
+        } else if (
+          // Audit BUG-1 fix: when the caller pinned a new
+          // `deviceSelector` that DOESN'T match what booted this
+          // cached session, we must NOT reuse it — otherwise picking
+          // device B in the popover and pressing Warmup silently lands
+          // back on device A. Compare serial + source: a serial
+          // mismatch is the loud "user explicitly chose differently"
+          // case; a source mismatch (e.g. physical vs emulator on the
+          // same project) is the same intent at a coarser granularity.
+          //
+          // Asymmetric: a request WITHOUT a selector (Default) reuses
+          // anything (intentional — "Default" means "I don't care").
+          // A request WITH a selector requires a match.
+          deviceSelector
+          && (
+            (deviceSelector.serial !== undefined
+              && existing.deviceSelector?.serial !== deviceSelector.serial)
+            || (deviceSelector.source !== undefined
+              && existing.deviceSelector?.source !== deviceSelector.source)
+          )
+        ) {
+          logger.info('[MOBILE_SESSION] Selector changed — invalidating cached session', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+            previousSelector: existing.deviceSelector ?? null,
+            requestedSelector: deviceSelector,
+          });
+          // Audit follow-up: drop the Redis pointer FIRST, then destroy
+          // the runner-side session. Reversing the historical order
+          // closes a concurrent-warmup race:
+          //
+          //   A: starts destroy() ───────── del(redisKey) ──> done
+          //   B:                  read(redisKey) → STILL POINTS AT A's
+          //                       being-destroyed session, then issues
+          //                       install/launch on it → 404 from runner.
+          //
+          // With del-first, B reads "no session" and falls through to
+          // create a fresh one. The destroy() then runs best-effort
+          // (errors already swallowed) — at worst we leak a session
+          // that the runner's TTL/unplug-watchdog will reap anyway.
+          await redisConnection.del(redisKey);
+          try {
+            await client.destroySession(existing.sessionId);
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] destroySession during selector-switch failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Fall through to create a new session below
         } else {
           logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
             projectId,
@@ -311,7 +391,14 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // path (Redis match or device check) and just issues launch_app.
           emitWarmupProgress(userId, 'launching_browser', 15);
           try {
-            await installAppOnSession(client, existing.sessionId, projectId, userId, appPackage);
+            await MobileAppPrepService.prepApp({
+              client,
+              sessionId: existing.sessionId,
+              projectId,
+              userId,
+              appPackage,
+              onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
+            });
           } catch (err) {
             logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
               sessionId: existing.sessionId,
@@ -361,41 +448,67 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // ownerId scopes the runner's Android multi-user so each backend user
     // sees only their own apps on a shared redroid container. See
     // qait-mobile-runner/docs/multi-user-known-risks.md.
+    //
+    // Phase 2.6: when the caller pinned a `deviceSelector`, the pool
+    // path is only meaningful if NO specific serial was requested.
+    //
+    // Bypass cases:
+    //   1. `source === 'local-physical'` — pre-booted emulators can't
+    //      be retargeted to a USB phone.
+    //   2. ANY `serial` pinned — even for `source === 'local-emulator'`,
+    //      because the pool may have a DIFFERENT emulator pre-booted
+    //      and the runner has no contract to re-acquire a specific
+    //      serial out of the pool. Audit BUG-4: shipping the
+    //      "show emulators in popover" UX without this gate would
+    //      silently use whatever's pre-booted instead of the user's
+    //      explicit pick. Default (no selector) keeps pool fast-path.
     let session: Awaited<ReturnType<typeof client.createSession>>;
-    try {
-      session = await client.claimSession(platform, { ownerId: userId });
-      logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
+    const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
+    if (skipPoolForPhysical) {
+      logger.info('[MOBILE_SESSION] Pinned selector — bypassing pool', {
         projectId,
-        sessionId: session.sessionId,
-        platform,
+        deviceSelector,
+      });
+      session = await client.createSession(platform, {
         ownerId: userId,
+        deviceSelector,
       });
-    } catch (poolErr) {
-      logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
-        projectId,
-        error: poolErr instanceof Error ? poolErr.message : String(poolErr),
-      });
-      session = await client.createSession(platform, { ownerId: userId });
+    } else {
+      try {
+        session = await client.claimSession(platform, { ownerId: userId });
+        logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
+          projectId,
+          sessionId: session.sessionId,
+          platform,
+          ownerId: userId,
+        });
+      } catch (poolErr) {
+        logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
+          projectId,
+          error: poolErr instanceof Error ? poolErr.message : String(poolErr),
+        });
+        session = await client.createSession(platform, {
+          ownerId: userId,
+          deviceSelector,
+        });
+      }
     }
 
     // Emulator is up — nudge the loader past the "preparing env" stage.
     emitWarmupProgress(userId, 'launching_browser', 15);
 
-    // Propagate project-level permission policy to the runner. Best-effort:
-    // the runner defaults to 'auto_allow' when the patch fails, which is the
-    // same behaviour a newly-created project gets, so we never block warmup
-    // on this call. Tests may later override the policy at run time.
-    try {
-      const policy = await resolveProjectPermissionPolicy(projectId, userId);
-      if (policy) {
-        await client.setPermissionPolicy(session.sessionId, policy);
-      }
-    } catch (err) {
-      logger.debug('[MOBILE_SESSION] Failed to propagate permission policy (non-fatal)', {
-        sessionId: session.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+    // Propagate project-level permission policy to the runner. Delegates
+    // to the shared service so warmup, regression worker, and CI runs
+    // all read from the same precedence chain (project default →
+    // runner default). Non-fatal: any failure logs at debug and leaves
+    // the session on the runner default.
+    await applyProjectPolicyToSession({
+      client,
+      sessionId: session.sessionId,
+      projectId,
+      userId,
+      context: { source: 'warmup' },
+    });
 
     const runnerSocketUrl = currentRunnerSocketUrl();
 
@@ -406,6 +519,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       runnerSocketUrl,
       platform,
       createdAt: new Date().toISOString(),
+      // Audit BUG-1 fix: persist the selector so the next warmup can
+      // detect "user wants a different device" and invalidate the
+      // cache instead of silently reusing the wrong device. Only
+      // stored when a non-default selector was actually used.
+      ...(deviceSelector ? { deviceSelector } : {}),
     };
 
     await redisConnection.set(
@@ -429,7 +547,14 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // preview stream shows the app already open when the frontend connects.
     // Non-fatal: on failure we still return the session so the user can retry.
     try {
-      await installAppOnSession(client, session.sessionId, projectId, userId, appPackage);
+      await MobileAppPrepService.prepApp({
+        client,
+        sessionId: session.sessionId,
+        projectId,
+        userId,
+        appPackage,
+        onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
+      });
     } catch (err) {
       logger.warn('[MOBILE_SESSION] App install/launch during warmup failed (non-fatal)', {
         sessionId: session.sessionId,
@@ -1039,7 +1164,20 @@ export async function applySession(req: Request, res: Response): Promise<void> {
   }
 
   const { sessionId } = req.params;
-  const { stepDraft } = req.body as { stepDraft?: any };
+  const { stepDraft, intentTestCaseId } = req.body as {
+    stepDraft?: any;
+    /**
+     * Optional `intent_test_cases.id`. When present, a successful apply
+     * persists the freshly-built `compiledPlan` back onto
+     * `intent_test_cases.steps_json[].compiled` — same pattern as the
+     * web preview WS handler (preview.handler.ts:1925). Without this,
+     * mobile editor runs never seed compiled plans for subsequent
+     * regression runs, so regression always pays the full LLM cost on
+     * every step. On Gemini-503 days that cascades into "no element
+     * found" failures even though the editor session passed.
+     */
+    intentTestCaseId?: string;
+  };
 
   if (!sessionId || !stepDraft) {
     res.status(400).json({ success: false, error: 'sessionId and stepDraft are required' });
@@ -1099,6 +1237,54 @@ export async function applySession(req: Request, res: Response): Promise<void> {
         durationMs: output.stepResult?.durationMs,
       },
     });
+
+    // Auto-persist compiled plan to `intent_test_cases.steps_json[].compiled`
+    // when the apply succeeded AND the caller passed `intentTestCaseId`.
+    // Mirrors the web preview WS handler at preview.handler.ts:1920-1937 —
+    // without this, mobile editor sessions never save compiled plans, so
+    // every subsequent regression run hits the LLM/vision resolvers fresh
+    // (visible as `llm resolver timeout` / `vision resolver timeout` /
+    // `tapByText: no element found` cascades on the runner).
+    //
+    // Caller-opt-in via `intentTestCaseId` so editor traffic that isn't
+    // tied to a saved test case (one-off probes) doesn't bloat the DB.
+    // Mutex-safe: updateStepFromPreviewApply takes withTestCaseMutex so
+    // it serializes against batchUpdateStepsFromRun (regression worker).
+    if (output.success && output.appliedStep && intentTestCaseId) {
+      try {
+        const { IntentTestCaseService } = await import(
+          '@/services/testing/ui/preview/intent-test-case.service'
+        );
+        // Cast: mobile's `appliedStep` shape (mobile-step-apply.service.ts:208)
+        // is structurally a subset of web's IntentStep — `id`, `type`,
+        // `description`, `value`, `options`, `bindingHints`, `evidence`,
+        // `compiled`. The service merges by stepId, so extra/missing fields
+        // are non-fatal; this cast just satisfies the type at the boundary.
+        const persisted = await IntentTestCaseService.updateStepFromPreviewApply({
+          intentTestCaseId,
+          appliedStep: output.appliedStep as unknown as Parameters<
+            typeof IntentTestCaseService.updateStepFromPreviewApply
+          >[0]['appliedStep'],
+          userId: req.user!.id,
+        });
+        if (persisted) {
+          logger.info('[MOBILE_SESSION] Auto-persisted appliedStep to intent_test_cases', {
+            intentTestCaseId,
+            stepId: output.appliedStep.id,
+            hasCompiled: !!output.appliedStep.compiled,
+          });
+        }
+      } catch (persistError) {
+        // Non-fatal — the user already saw the apply succeed. Log so a
+        // sudden spike in persist failures (RLS regression, etc.) is
+        // observable without breaking the editor flow.
+        logger.warn('[MOBILE_SESSION] Failed to auto-persist appliedStep (non-fatal)', {
+          intentTestCaseId,
+          stepId: output.appliedStep?.id,
+          error: persistError instanceof Error ? persistError.message : String(persistError),
+        });
+      }
+    }
 
     if (!res.writableEnded) {
       res.json({
@@ -1226,9 +1412,14 @@ export async function autoBootAndInstall(
     // state, last-visited screen, etc.) into the preview before the
     // wipe lands.
     emit('installing', 'Installing app...', sessionId);
-    const installedPackage = await installAppOnSession(
-      client, sessionId, projectId, userId, undefined, { skipLaunch: true },
-    );
+    const installedPackage = await MobileAppPrepService.prepApp({
+      client,
+      sessionId,
+      projectId,
+      userId,
+      skipLaunch: true,
+      onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
+    });
 
     // Wipe app data, then launch fresh. The preview now sees exactly
     // one transition: home screen → first-launch app UI. No stale data
@@ -1306,276 +1497,6 @@ export async function autoBootAndInstall(
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HELPER: Install app on a freshly created session
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Downloads the project's mobile app from Supabase Storage, uploads it to
- * the runner, and sends install_app + launch_app commands. Intended to run
- * in the background after the warmup response has been sent.
- */
-async function installAppOnSession(
-  client: MobileRunnerClient,
-  sessionId: string,
-  projectId: string,
-  userId: string,
-  appPackageOverride?: string,
-  opts?: { skipLaunch?: boolean },
-): Promise<string | undefined> {
-  // Nudge the UI past "preparing env" as soon as install logic starts.
-  emitWarmupProgress(userId, 'launching_browser', 25);
-
-  const project = await ProjectService.getProject(projectId, userId);
-  const mobileApp = project?.settings?.mobileApp;
-
-  if (!mobileApp?.storagePath) {
-    logger.debug('[MOBILE_SESSION] No mobile app configured for project, skipping install', { projectId });
-    return undefined;
-  }
-
-  // Check Redis for what's currently installed on this emulator
-  const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
-  const warmupRaw = await redisConnection.get(redisKey);
-  const warmup: WarmupData | null = warmupRaw ? JSON.parse(warmupRaw) : null;
-
-  // Check for a pending-install flag (set by autoBootAndInstall when the upload
-  // couldn't reach the emulator). If present AND matches the current APK, we
-  // must NOT trust the Redis/device dedup fast paths — force a full install.
-  const pendingKey = `${PENDING_INSTALL_PREFIX}${projectId}:${userId}`;
-  const pendingStoragePath = await redisConnection.get(pendingKey);
-  const hasPendingInstall = pendingStoragePath === mobileApp.storagePath;
-  if (hasPendingInstall) {
-    logger.info('[MOBILE_SESSION] Pending-install flag detected — forcing full install', {
-      sessionId,
-      projectId,
-      storagePath: mobileApp.storagePath,
-    });
-  }
-
-  // If the same APK is already installed (Redis knows), just relaunch — skip download + install.
-  // BUT: respect the pending-install flag which means we can't trust Redis state.
-  //
-  // Audit fix (Bug #4): also bail out of the cached fast path when the
-  // caller explicitly supplied a DIFFERENT packageName than what's cached.
-  // Previous logic took `appPackageOverride || warmup.installedPackage` as
-  // the cached package and tried to launch it — but if override='com.foo'
-  // and cached='com.bar', launch_app(com.foo) hits a not-installed package
-  // and warmup proceeds in a broken state. Falling through forces a full
-  // install of the requested package.
-  const cachedMismatch = !!(appPackageOverride
-    && warmup?.installedPackage
-    && appPackageOverride !== warmup.installedPackage);
-  if (
-    !hasPendingInstall
-    && !cachedMismatch
-    && warmup?.appStoragePath === mobileApp.storagePath
-    && warmup?.installedPackage
-  ) {
-    const cachedPackage = appPackageOverride || warmup.installedPackage;
-    logger.debug('[MOBILE_SESSION] Same APK already installed (Redis), relaunching', {
-      sessionId,
-      projectId,
-      package: cachedPackage,
-      skipLaunch: opts?.skipLaunch === true,
-    });
-    emitWarmupProgress(userId, 'extracting_elements', 75);
-    if (!opts?.skipLaunch) {
-      await client.executeBatchCommands(sessionId, [
-        { type: 'launch_app', params: { packageName: cachedPackage } },
-      ], { timeoutMs: 60_000 });
-    }
-    return cachedPackage;
-  }
-  if (cachedMismatch) {
-    logger.info('[MOBILE_SESSION] Cached package differs from override — forcing full install', {
-      sessionId,
-      projectId,
-      cached: warmup?.installedPackage,
-      override: appPackageOverride,
-    });
-  }
-
-  // If Redis expired but we know the package name, check the DEVICE directly.
-  // This avoids expensive re-download + re-install when the app is still on the emulator.
-  // Skipped when a pending-install flag is set (we don't trust device state in that case).
-  const knownPackage = appPackageOverride || mobileApp.packageName;
-  if (knownPackage && !hasPendingInstall) {
-    try {
-      const checkResult = await client.executeBatchCommands(sessionId, [
-        { type: 'check_package', params: { packageName: knownPackage } },
-      ], { timeoutMs: 10_000 });
-      const isInstalled = !!(checkResult?.results?.[0] as any)?.data?.installed;
-      if (isInstalled) {
-        logger.info('[MOBILE_SESSION] Package still on device (Redis expired), relaunching without reinstall', {
-          sessionId,
-          projectId,
-          package: knownPackage,
-          skipLaunch: opts?.skipLaunch === true,
-        });
-        emitWarmupProgress(userId, 'extracting_elements', 75);
-        if (!opts?.skipLaunch) {
-          await client.executeBatchCommands(sessionId, [
-            { type: 'launch_app', params: { packageName: knownPackage } },
-          ], { timeoutMs: 60_000 });
-        }
-
-        // Restore Redis cache so next warmup skips too
-        if (warmup) {
-          warmup.installedPackage = knownPackage;
-          warmup.appStoragePath = mobileApp.storagePath;
-          await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
-        }
-
-        // Persist packageName to project settings so future warmups can hit
-        // this fast path even after Redis expires (knownPackage may have come
-        // from appPackageOverride when mobileApp.packageName was null).
-        await persistPackageName(projectId, userId, mobileApp, knownPackage);
-
-        return knownPackage;
-      }
-    } catch (err) {
-      logger.debug('[MOBILE_SESSION] Device package check failed, proceeding with install', {
-        error: (err as Error).message,
-      });
-    }
-  }
-
-  logger.info('[MOBILE_SESSION] Installing app on session', {
-    sessionId,
-    projectId,
-    originalName: mobileApp.originalName,
-    oldPackage: warmup?.installedPackage || '(none)',
-  });
-  emitWarmupProgress(userId, 'loading_page', 45);
-
-  const fileBuffer = await MobileAppStorageService.downloadApp(mobileApp.storagePath);
-  const uploaded = await client.uploadApp(fileBuffer, mobileApp.originalName);
-
-  // Prefer explicit package from warmup request or upload metadata
-  const explicitPackage = appPackageOverride || mobileApp.packageName;
-
-  // Always uninstall the old package if we know it from a previous install.
-  // This ensures clean state even when:
-  // - Package name changed between uploads
-  // - packageName was never provided by the user (common — frontend doesn't send it)
-  // - Same package but different signature (would fail with INSTALL_FAILED_UPDATE_INCOMPATIBLE)
-  const oldPackage = warmup?.installedPackage;
-  const shouldUninstallOld = !!oldPackage;
-
-  const installResult = await client.executeBatchCommands(sessionId, [
-    {
-      type: 'install_app',
-      params: {
-        apkPath: uploaded.path,
-        reinstall: true, // use -r as safety net — if uninstall failed silently, install still works
-        clearData: true, // always wipe app data for clean state after install
-        autoLaunch: false, // always launch via an explicit launch_app command below for determinism
-        // Hint runner with the known packageName so it can fall back to it
-        // if `pm list packages -3` diff fails to surface the new package
-        // (rare, but happens with side-loaded splits).
-        ...(explicitPackage ? { packageName: explicitPackage } : {}),
-        ...(shouldUninstallOld ? { uninstallOldPackage: oldPackage } : {}),
-      },
-    },
-  ], { timeoutMs: 120_000 }); // 2 min — adb install can take 60s+ for large APKs
-
-  // Runner wraps every command result as { success, data, durationMs, ... }.
-  // The install handler returns { installed, packageName } inside `data`.
-  const detected = (installResult?.results?.[0] as any)?.data?.packageName as string | undefined;
-  const packageName = explicitPackage || detected;
-
-  // Always issue an explicit launch_app — never rely on install's auto-launch.
-  // Gives us one deterministic code path regardless of whether we knew the
-  // package name up front.
-  // Skipped when caller passes `skipLaunch: true` (warmup pipeline does
-  // its own clear_app_data + launch_app to guarantee the user only ever
-  // sees the freshly-launched, data-wiped app — see `warmupSession`).
-  if (packageName && !opts?.skipLaunch) {
-    emitWarmupProgress(userId, 'extracting_elements', 75);
-    await client.executeBatchCommands(sessionId, [
-      { type: 'launch_app', params: { packageName } },
-    ], { timeoutMs: 60_000 });
-  }
-
-  // Audit fix (Bug #1): install completed but packageName resolution failed.
-  // This is rare (usually `pm list packages -3` diff after install picks it up)
-  // but happens with side-loaded splits. Without a warning the caller's
-  // `if (installedPackage)` guard silently skips the wipe-and-launch step
-  // that's the whole point of `skipLaunch:true` flows. Loud-fail so it shows
-  // up in logs and the caller can fall through to a defensive launch.
-  if (!packageName) {
-    logger.warn('[MOBILE_SESSION] Install succeeded but packageName resolution failed — caller will skip post-install hooks', {
-      sessionId,
-      projectId,
-      hadExplicitPackage: !!explicitPackage,
-      hadDetected: !!detected,
-    });
-  }
-
-  // Update Redis with the installed package so future warmups know what's on the emulator
-  if (warmup && packageName) {
-    warmup.installedPackage = packageName;
-    warmup.appStoragePath = mobileApp.storagePath;
-    await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
-  }
-
-  // Persist packageName to project.settings.mobileApp so future warmups can
-  // use the check_package fast path even after Redis TTL expires, avoiding a
-  // full APK re-download on every expiry.
-  if (packageName) {
-    await persistPackageName(projectId, userId, mobileApp, packageName);
-  }
-
-  // Pending-install flag (if any) has now been consumed — clear it.
-  if (hasPendingInstall) {
-    await redisConnection.del(pendingKey);
-  }
-
-  logger.info('[MOBILE_SESSION] App installed on session', {
-    sessionId,
-    projectId,
-    packageName: packageName || '(auto-launched by runner)',
-  });
-
-  return packageName;
-}
-
-/**
- * Write the detected Android package name back to `project.settings.mobileApp`
- * so subsequent warmups (after Redis TTL expiry) can hit the `check_package`
- * fast path instead of re-downloading the APK. No-op when the value is
- * already up to date. Failures are logged but swallowed — this is a cache
- * warm, not a correctness-critical write.
- */
-async function persistPackageName(
-  projectId: string,
-  userId: string,
-  currentMobileApp: { packageName?: string } & Record<string, unknown>,
-  packageName: string,
-): Promise<void> {
-  if (!packageName || currentMobileApp.packageName === packageName) return;
-  try {
-    await ProjectService.updateProject(projectId, userId, {
-      settings: {
-        mobileApp: {
-          ...currentMobileApp,
-          packageName,
-        } as unknown as Record<string, unknown>,
-      },
-    });
-    logger.info('[MOBILE_SESSION] Persisted packageName to project settings', {
-      projectId,
-      packageName,
-    });
-  } catch (err) {
-    logger.warn('[MOBILE_SESSION] Failed to persist packageName (non-fatal)', {
-      projectId,
-      packageName,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPER: Claim warmed session (used by mobile-test-run.job.ts)
@@ -1583,9 +1504,18 @@ async function persistPackageName(
 
 /**
  * Claim a warmed session from Redis for use in a test run.
- * Atomically reads + deletes the key so no other job can reuse it.
+ * Atomically reads + deletes the key so no other job can reuse it,
+ * THEN verifies with the runner that the session is still alive before
+ * handing it back. Without the liveness check the worker would happily
+ * grab a session id that the runner had already destroyed (idle timer
+ * fired, user closed the editor, runner restarted) and every step of
+ * the resulting regression would return `Session not found: <id>`
+ * because the runner's `sessions` map doesn't have it. The Redis entry
+ * has its own 15-min TTL, but it's a TTL on the WARMUP record, not on
+ * runner-side session aliveness — they can drift.
  *
- * Returns WarmupData if a warmed session exists, null otherwise.
+ * Returns WarmupData if a warmed session exists AND the runner still has
+ * it; null otherwise (caller falls through to pool/cold-start).
  */
 export async function claimWarmedSession(
   projectId: string,
@@ -1601,6 +1531,48 @@ export async function claimWarmedSession(
     await redisConnection.del(key);
 
     const data = JSON.parse(raw) as WarmupData;
+
+    // Skip the liveness check for placeholder rows that autoBootAndInstall
+    // writes BEFORE the real session id is available. Returning a literal
+    // "_booting" string here would just make the worker's runSteps target
+    // the placeholder and 404. Treating it as "no warmup" lets the worker
+    // fall through cleanly to its own session acquisition path.
+    if (!data.sessionId || data.sessionId === '_booting') {
+      logger.debug('[MOBILE_SESSION] Warmed session row was a booting placeholder — discarding', {
+        projectId,
+        userId,
+      });
+      return null;
+    }
+
+    // Liveness check — ask the runner whether it still has this session.
+    // If the runner says no, the Redis row was stale and we MUST NOT hand
+    // the dead id back. Use the same `getMobileRunnerClient()` instance
+    // the warmup created the session with so the URL/auth match.
+    let alive = false;
+    try {
+      const client = getMobileRunnerClient();
+      alive = await client.sessionExists(data.sessionId);
+    } catch (probeErr) {
+      // Probe fail → treat as not-alive. Worker will cold-start. Better
+      // than handing back an id we can't verify.
+      logger.warn('[MOBILE_SESSION] Session liveness probe failed — discarding warmed session', {
+        projectId,
+        userId,
+        sessionId: data.sessionId,
+        error: probeErr instanceof Error ? probeErr.message : String(probeErr),
+      });
+      return null;
+    }
+
+    if (!alive) {
+      logger.warn('[MOBILE_SESSION] Warmed session no longer alive on runner — discarding', {
+        projectId,
+        userId,
+        sessionId: data.sessionId,
+      });
+      return null;
+    }
 
     logger.info('[MOBILE_SESSION] Claimed warmed session for test run', {
       projectId,

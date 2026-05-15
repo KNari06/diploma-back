@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * Preview Auth Detector (v2 — score-based, spam-suppressed)
+ * Preview Auth Detector (v3 — score-based, spam-suppressed)
  *
  * Watches a preview Page for "we're on a login gate" signals and emits
  * `preview:auth:required` to the preview session room when a confidence
@@ -11,8 +11,11 @@
  *   v1 was boolean OR: any URL regex match OR a password input fired the
  *   overlay. Result: `/login-help` triggered it (false positive), and
  *   modern forms using `<input type="text" autocomplete="current-password">`
- *   missed it entirely (false negative). v2 combines signals with weights
+ *   missed it entirely (false negative). v2 combined signals with weights
  *   and a threshold so edge cases wash out instead of triggering spam.
+ *   v3 added three high-value cheap signals (HTTP 401/403, form action,
+ *   multi-step memory) plus opt-in iframe detection and a two-positive
+ *   minimum to keep landing-page demos quiet.
  *
  * Suppression rules — the overlay shows AT MOST ONCE PER HOSTNAME per
  * session, except when one of these legitimate reasons forces a re-show:
@@ -35,12 +38,20 @@
  * Signal weights (sum ≥ THRESHOLD fires the overlay):
  *   +0.60  visible password input (incl. Shadow DOM + autocomplete="current-password")
  *   +0.55  OAuth allowlist match  → signal='external_oauth'
+ *   +0.45  recent main-frame 401/403 response (within last 5s)
  *   +0.30  login URL regex (word-anchored; excludes /help, /status, /docs, ...)
  *   +0.25  workspace custom url_pattern from workspace_resource_defaults
+ *   +0.25  <form action="…/login…"> or <button formaction="…/login…">
  *   +0.20  form with autocomplete="username" + submit button
+ *   +0.20  multi-step boost — password page reached < 30s after an email-only
+ *          submit on the same host (Google-style flow) → signal='multistep'
  *   −0.30  URL contains /help, /about, /status, /faq, /docs, /terms, /privacy,
  *          /history, /log (gerund: logs, logging) → kills `/login-help` etc.
  *   −0.20  page has zero <input> elements (landing pages with "Log in" links)
+ *
+ * Two-positive minimum (v3): unless a strong signal fires (oauth-host or
+ * http-unauthorized), at least TWO positive triggers must be present. A
+ * single password field on a marketing landing won't fire the overlay.
  *
  * THRESHOLD = 0.55 — empirically enough to require either a real password
  * field OR a URL match + a supporting signal.
@@ -142,6 +153,27 @@ const sessionPatterns = new Map<string, string[]>();
 /** Pending pattern-load promises (dedup concurrent loads). */
 const patternLoads = new Map<string, Promise<void>>();
 
+/** v3 — Last seen 401/403 main-frame response per session.
+ *  Stored together with the hostname the request was made against so a
+ *  401 on app1.com doesn't leak a score boost to a subsequent navigation
+ *  on app2.com (multi-host preview, middle-click, redirect chain).
+ *  Cleared on session stop; not eagerly expired since the Map only ever
+ *  holds one entry per session. */
+const lastUnauthAt = new Map<string, { at: number; hostname: string }>();
+
+/** v3 — Multi-step memory: when we see an email-only form submit on a
+ *  hostname, remember it. If the next post-load on the same registrable
+ *  domain shows a password input within MULTISTEP_WINDOW_MS, score gets a
+ *  boost and the emit is tagged signal='multistep'.
+ *
+ *  We key on the registrable domain (`example.com`) rather than the full
+ *  hostname so Google-style cross-host SSO flows still link
+ *  (`app.example.com/identifier` → `accounts.example.com/challenge`). */
+const emailStepAt = new Map<string, { at: number; registrable: string }>();
+
+const UNAUTH_WINDOW_MS = 5_000;          // 401/403 freshness window
+const MULTISTEP_WINDOW_MS = 30_000;      // email-step → password-step linkage
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 function safeUrl(raw: string): URL | null {
   try { return new URL(raw); } catch { return null; }
@@ -157,6 +189,33 @@ function pathnameOf(raw: string): string {
 
 function now(): number {
   return Date.now();
+}
+
+/**
+ * Cheap "registrable domain" approximation — returns the last two labels
+ * of a hostname (`accounts.app.example.com` → `example.com`). Avoids
+ * pulling in a Public Suffix List dependency for the multi-step memory
+ * use case where exact correctness isn't required.
+ *
+ * Known imprecision on suffix-of-suffix TLDs (`co.uk`, `com.br`):
+ *   `foo.co.uk` → `co.uk` (groups too aggressively across all UK sites).
+ * In practice that just means one extra opportunity for a multi-step
+ * boost on the same TLD — strictly more lenient than the previous
+ * exact-hostname check, never less. If we ever see a false-positive
+ * incident from this, swap to `tldts` and key on `domain`.
+ *
+ * IP literals and single-label hostnames return as-is.
+ */
+function registrableDomainOf(hostname: string): string {
+  const h = (hostname || '').toLowerCase();
+  if (!h) return '';
+  // IPv4 literal: keep whole.
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(h)) return h;
+  // IPv6 literal (URL parser strips brackets, but be defensive).
+  if (h.includes(':')) return h;
+  const labels = h.split('.').filter(Boolean);
+  if (labels.length <= 2) return h;
+  return labels.slice(-2).join('.');
 }
 
 /** Test a user-provided pattern as a glob ("*.staging/*" → regex).
@@ -204,7 +263,13 @@ export function markDismissed(sessionId: string, hostname: string): void {
   map.set(hostname.toLowerCase(), now() + DISMISS_TTL_MS);
 }
 
-/** Called on session stop — free all state for this session. */
+/** Called on session stop — free all state for this session.
+ *
+ * IMPORTANT: must be invoked from `PreviewSessionService.stop()` as well
+ * as the page `close` event. A browser-context teardown that happens
+ * without a `close` event (crash, abrupt context.close) won't fire the
+ * page close listener, so the session-service `stop` is the canonical
+ * cleanup hook. */
 export function clearAuthDetectorSession(sessionId: string): void {
   emitted.delete(sessionId);
   dismissed.delete(sessionId);
@@ -213,6 +278,9 @@ export function clearAuthDetectorSession(sessionId: string): void {
   oauthInFlight.delete(sessionId);
   sessionPatterns.delete(sessionId);
   patternLoads.delete(sessionId);
+  // v3 state
+  lastUnauthAt.delete(sessionId);
+  emailStepAt.delete(sessionId);
 }
 
 /**
@@ -240,7 +308,35 @@ export function attachAuthDetector(
     void loadWorkspacePatterns(sessionId, projectId, userId);
   }
 
-  const maybeEmit = async (url: string, trigger: 'nav' | 'post-load'): Promise<void> => {
+  // v3 — listen for HTTP 401/403 on the main-frame so backend-driven
+  // auth walls (no `/login` path, no password input until redirect)
+  // can be detected. We only count document/xhr/fetch from the main
+  // frame; image/css/script 401s are noise. The hostname is recorded
+  // alongside the timestamp so a 401 on app1.com doesn't leak a score
+  // boost when the user navigates to a different host within the window.
+  page.on('response', (response) => {
+    try {
+      const req = response.request();
+      const rt = req.resourceType();
+      if (rt !== 'document' && rt !== 'xhr' && rt !== 'fetch') return;
+      const frame = req.frame();
+      if (!frame || frame !== page.mainFrame()) return;
+      const status = response.status();
+      if (status !== 401 && status !== 403) return;
+      // Take the request URL (where the credentials would have applied),
+      // not the page URL — they can differ during XHR-driven flows.
+      const requestHost = hostnameOf(req.url()) ?? hostnameOf(page.url());
+      if (!requestHost) return;
+      lastUnauthAt.set(sessionId, { at: now(), hostname: requestHost });
+    } catch {
+      /* page tearing down */
+    }
+  });
+
+  const maybeEmit = async (
+    url: string,
+    trigger: 'nav' | 'post-load',
+  ): Promise<void> => {
     // ── Pre-flight hard suppressions ────────────────────────────────────
     if (!url || url === 'about:blank' || url.startsWith('data:') || url.startsWith('chrome')) return;
 
@@ -306,6 +402,15 @@ export function attachAuthDetector(
       triggers.push('oauth-host');
     }
 
+    // v3 — recent 401/403 on the SAME hostname within the freshness window.
+    // Hostname-scoped so a 401 on app1.com doesn't boost a subsequent
+    // navigation to app2.com (multi-host preview, middle-click, redirect).
+    const unauth = lastUnauthAt.get(sessionId);
+    if (unauth && unauth.hostname === hostname && now() - unauth.at < UNAUTH_WINDOW_MS) {
+      score += 0.45;
+      triggers.push('http-unauthorized');
+    }
+
     // URL regex. If the login token is the LAST significant segment
     // (e.g. `/account/login`, `/auth/sign-in`), treat it as the real
     // gate and skip the negative-keyword penalty — otherwise a path
@@ -354,17 +459,76 @@ export function attachAuthDetector(
         score -= 0.20;
         triggers.push('no-inputs');
       }
+      // v3 — login form action (or formaction on submit button) referring
+      // to a login endpoint. Strong "developer says this is a login form"
+      // signal even before a password field is present.
+      if (dom.hasLoginAction) {
+        score += 0.25;
+        triggers.push('form-action');
+      }
+
+      // v3 — multi-step memory: remember email-only forms, then on the
+      // NEXT post-load with a password input boost the score and tag the
+      // signal so the UI can explain "we caught a 2-step login". Linked
+      // by registrable domain (`example.com`) instead of hostname so
+      // Google-style cross-host SSO flows still associate
+      // (`app.example.com/identifier` → `accounts.example.com/challenge`).
+      const registrable = registrableDomainOf(hostname);
+      if (dom.hasEmailOnlyForm && registrable) {
+        emailStepAt.set(sessionId, { at: now(), registrable });
+      }
+      const prev = emailStepAt.get(sessionId);
+      if (
+        prev &&
+        prev.registrable === registrable &&
+        now() - prev.at < MULTISTEP_WINDOW_MS &&
+        dom.hasPasswordField
+      ) {
+        score += 0.20;
+        triggers.push('multistep-confirmed');
+        emailStepAt.delete(sessionId);
+      }
     }
 
     if (score < THRESHOLD) return;
 
+    // ── v3 — Two-positive minimum gate ──────────────────────────────────
+    // Without a "strong" signal (oauth-host or http-unauthorized), require
+    // at least TWO positive triggers. Kills the marketing-landing-page
+    // scenario where a single decorative password input would have hit
+    // the 0.55 threshold by itself.
+    const hasStrongSignal =
+      triggers.includes('oauth-host') || triggers.includes('http-unauthorized');
+    const POSITIVE_TRIGGERS = new Set([
+      'oauth-host',
+      'http-unauthorized',
+      'url-login',
+      'workspace-pattern',
+      'form-action',
+      'password-field',
+      'username-form',
+      'multistep-confirmed',
+    ]);
+    const positiveCount = triggers.filter((t) => POSITIVE_TRIGGERS.has(t)).length;
+    if (!hasStrongSignal && positiveCount < 2) {
+      logger.debug('[PREVIEW_AUTH_DETECTOR] Below two-positive minimum', {
+        sessionId, hostname, score, triggers,
+      });
+      return;
+    }
+
     // ── Determine signal type for the payload ───────────────────────────
     const isExternal = triggers.includes('oauth-host');
+    const isMultistep = triggers.includes('multistep-confirmed');
+    const isBackend =
+      triggers.includes('http-unauthorized') && !triggers.includes('password-field');
     const hasPwd = triggers.includes('password-field');
     const hasUrl = triggers.includes('url-login') || triggers.includes('workspace-pattern');
 
-    let signal: 'url' | 'form' | 'both' | 'external_oauth';
+    let signal: 'url' | 'form' | 'both' | 'external_oauth' | 'multistep' | 'backend';
     if (isExternal) signal = 'external_oauth';
+    else if (isMultistep) signal = 'multistep';
+    else if (isBackend) signal = 'backend';
     else if (hasPwd && hasUrl) signal = 'both';
     else if (hasPwd) signal = 'form';
     else signal = 'url';
@@ -375,10 +539,11 @@ export function attachAuthDetector(
     hostSet.add(hostname);
     lastEmitAt.set(sessionId, now());
 
-    // If this is an external OAuth redirect, remember the ORIGIN host so
-    // the return-nav doesn't re-trigger. We can't know the origin from
-    // here alone, but page.mainFrame() was on the origin just before the
-    // external nav — store it from the page's current URL at attach time.
+    // OAuth redirect bookkeeping: when we emit on an OAuth provider host,
+    // remember the ORIGIN host so the return-nav doesn't re-trigger.
+    // Stashing the origin BEFORE this point happens in the dedicated
+    // framenavigated listener below — by the time we hit the OAuth host,
+    // `__qai_origin_host__` is already the prior main-frame origin.
     if (signal === 'external_oauth') {
       const originHost = (page as any).__qai_origin_host__ as string | undefined;
       if (originHost && originHost !== hostname) {
@@ -387,10 +552,6 @@ export function attachAuthDetector(
           until: now() + OAUTH_RETURN_WINDOW_MS,
         });
       }
-    } else {
-      // Stash origin on first same-origin emit so a LATER OAuth redirect
-      // can reference it. Best-effort — covers the common SSO flow.
-      (page as any).__qai_origin_host__ = hostname;
     }
 
     try {
@@ -399,7 +560,6 @@ export function attachAuthDetector(
         signal,
         url,
         suggestedDomain: hostname,
-        // v2 additions — old clients ignore unknown fields.
         score: Math.round(score * 100) / 100,
         triggers,
         timestamp: new Date().toISOString(),
@@ -415,12 +575,32 @@ export function attachAuthDetector(
     }
   };
 
-  // Main-frame navigations only — subresource iframes (ads, analytics)
-  // can carry auth paths that don't concern the user.
+  // Main-frame navigations only — sub-frame events are intentionally
+  // ignored. Sub-resource iframes (ads/analytics) routinely carry
+  // auth-shaped URLs that aren't relevant to the user. If we ever need
+  // iframe login detection, gate it behind an explicit opt-in (don't
+  // turn it on globally).
+  //
+  // Two listeners run on every main-frame nav:
+  //   1. originStash — remembers the latest "we are here" host BEFORE the
+  //      OAuth redirect, so we can detect the return. This is decoupled
+  //      from emit to avoid the "stash only ran on first same-origin
+  //      emit" bug — origin tracking is independent of detection.
+  //   2. maybeEmit — the score/threshold pipeline.
   page.on('framenavigated', async (frame: Frame) => {
     if (frame !== page.mainFrame()) return;
+    const frameUrl = frame.url();
+    // Always update origin host on a real (http/https) navigation. OAuth
+    // hosts are excluded so their return target stays the prior origin.
+    const parsed = safeUrl(frameUrl);
+    if (parsed && (parsed.protocol === 'http:' || parsed.protocol === 'https:')) {
+      const host = parsed.hostname.toLowerCase();
+      if (host && !isOauthHost(host, parsed.pathname)) {
+        (page as any).__qai_origin_host__ = host;
+      }
+    }
     try {
-      await maybeEmit(frame.url(), 'nav');
+      await maybeEmit(frameUrl, 'nav');
     } catch (err) {
       logger.debug('[PREVIEW_AUTH_DETECTOR] framenavigated probe threw', {
         error: err instanceof Error ? err.message : String(err),
@@ -446,9 +626,17 @@ interface DomSignals {
   hasPasswordField: boolean;
   hasUsernameForm: boolean;
   hasNoInputs: boolean;
+  /** v3 — `<form action="…/login…">` or `<button formaction="…/login…">`.
+   *  Strong "developer says this is a login form" signal that fires even
+   *  before the user reveals a password input. */
+  hasLoginAction: boolean;
+  /** v3 — page has visible username/email input + submit button but NO
+   *  visible password input. Used to remember a multi-step login's first
+   *  page so the second (password) page gets a confirmation boost. */
+  hasEmailOnlyForm: boolean;
 }
 
-async function probeDomSignals(page: Page): Promise<DomSignals> {
+async function probeDomSignals(target: Page | Frame): Promise<DomSignals> {
   // Run a single page.evaluate that does a recursive Shadow-DOM walk —
   // cheaper than three separate locator queries and catches custom
   // elements that wrap their inputs. Wrapped in Promise.race so a slow
@@ -457,11 +645,13 @@ async function probeDomSignals(page: Page): Promise<DomSignals> {
     hasPasswordField: false,
     hasUsernameForm: false,
     hasNoInputs: true,
+    hasLoginAction: false,
+    hasEmailOnlyForm: false,
   };
 
   try {
     return await Promise.race([
-      page.evaluate((): DomSignals => {
+      target.evaluate((): DomSignals => {
         // @ts-expect-error - browser context
         const doc = document;
         // @ts-expect-error - browser context
@@ -470,6 +660,13 @@ async function probeDomSignals(page: Page): Promise<DomSignals> {
         let hasPassword = false;
         let hasUsernameForm = false;
         let inputCount = 0;
+        let hasLoginAction = false;
+        let visibleEmailInput = false;
+        let visibleSubmit = false;
+
+        // Word-boundary match — matches `…/login`, `?action=signin` but not
+        // `/loginhelp`. Browser-side regex (must be inline; no shared file).
+        const ACTION_RE = /\b(?:login|signin|sign[-_]?in|auth|session)\b/i;
 
         const isVisible = (el: any): boolean => {
           if (!el || typeof el.getBoundingClientRect !== 'function') return false;
@@ -483,18 +680,34 @@ async function probeDomSignals(page: Page): Promise<DomSignals> {
           const all = root.querySelectorAll('*');
           for (let i = 0; i < all.length; i++) {
             const el = all[i];
-            if (el.tagName === 'INPUT') {
+            const tag = el.tagName;
+            if (tag === 'INPUT') {
               inputCount++;
               const type = (el.getAttribute('type') || 'text').toLowerCase();
               const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
-              if (type === 'password' && isVisible(el)) {
+              const visible = isVisible(el);
+              if (type === 'password' && visible) {
                 hasPassword = true;
-              } else if (ac === 'current-password' && isVisible(el)) {
+              } else if (ac === 'current-password' && visible) {
                 // Modern forms that mask via JS — we still treat them as password.
                 hasPassword = true;
-              } else if (ac === 'username' || ac === 'email') {
+              } else if (ac === 'username' || ac === 'email' || type === 'email') {
                 hasUsernameForm = true;
+                if (visible) visibleEmailInput = true;
               }
+              // Submit-input also counts toward email-only form detection.
+              if (type === 'submit' && visible) visibleSubmit = true;
+              // formaction on submit buttons.
+              const fa = (el.getAttribute('formaction') || '').toLowerCase();
+              if (fa && ACTION_RE.test(fa)) hasLoginAction = true;
+            } else if (tag === 'BUTTON') {
+              const btnType = (el.getAttribute('type') || 'submit').toLowerCase();
+              if (btnType === 'submit' && isVisible(el)) visibleSubmit = true;
+              const fa = (el.getAttribute('formaction') || '').toLowerCase();
+              if (fa && ACTION_RE.test(fa)) hasLoginAction = true;
+            } else if (tag === 'FORM') {
+              const action = (el.getAttribute('action') || '').toLowerCase();
+              if (action && ACTION_RE.test(action)) hasLoginAction = true;
             }
             // Recurse into open shadow roots. (Closed roots are invisible
             // to JS — there's nothing we can do about those.)
@@ -513,6 +726,9 @@ async function probeDomSignals(page: Page): Promise<DomSignals> {
           hasPasswordField: hasPassword,
           hasUsernameForm: hasUsernameForm && !hasPassword ? hasUsernameForm : false,
           hasNoInputs: inputCount === 0,
+          hasLoginAction,
+          // Email-only form: visible username/email + visible submit, no password.
+          hasEmailOnlyForm: visibleEmailInput && visibleSubmit && !hasPassword,
         };
       }),
       new Promise<DomSignals>((resolve) =>

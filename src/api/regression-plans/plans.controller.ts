@@ -8,6 +8,11 @@ import { ExecutionService } from '@/services/testing/executions/execution.servic
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
+import {
+  AUDIT_EVENTS,
+  WorkspaceAuditService,
+  getAuditContext,
+} from '@/services/core/workspace-audit.service';
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlanItemType, TestType } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
@@ -25,14 +30,50 @@ function getUserId(req: AuthenticatedRequest): string {
 }
 
 /**
+ * Admin snapshot for audit metadata. Used in delete/addItem/removeItem so the
+ * audit row survives even when getById's user-filter would skip it. The
+ * caller's mutation enforces access; this read just reads name/projectId.
+ */
+async function loadPlanForAudit(
+  planId: string,
+): Promise<{ projectId: string; name: string } | null> {
+  const { data } = await supabaseAdmin
+    .from('regression_plans')
+    .select('project_id, name')
+    .eq('id', planId)
+    .maybeSingle();
+  if (!data) return null;
+  return { projectId: (data as any).project_id, name: (data as any).name };
+}
+
+/**
  * Create a new regression plan
  */
 export async function createPlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { projectId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = req.body;
+    const {
+      projectId,
+      name,
+      description,
+      isDefault,
+      tags,
+      automationConfig,
+      notificationsEnabled,
+      // Optional bulk initial items — when present, plan + items are
+      // created atomically (rollback on any item failure). Frontend
+      // wizard sends this to collapse N round-trips into 1. Other
+      // callsites that add items to an EXISTING plan still use the
+      // dedicated `POST /plans/:id/items` endpoint (addItem below).
+      items,
+    } = req.body;
 
     if (!projectId || !name) {
       res.status(400).json({ success: false, error: 'projectId and name are required' });
+      return;
+    }
+
+    if (items !== undefined && !Array.isArray(items)) {
+      res.status(400).json({ success: false, error: 'items must be an array when provided' });
       return;
     }
 
@@ -47,9 +88,20 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      items,
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
+
+    void WorkspaceAuditService.logForProject({
+      projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.REGRESSION_PLAN_CREATED,
+      targetType: 'regression_plan',
+      targetId: plan.id,
+      metadata: { name: plan.name, is_default: plan.isDefault },
+      ...getAuditContext(req),
+    });
   } catch (error) {
     logger.error('[PLANS_API] Failed to create plan', { error });
     handleError(res, error, 'Failed to create plan');
@@ -135,6 +187,28 @@ export async function updatePlan(req: AuthenticatedRequest, res: Response): Prom
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
+
+    if (plan.projectId) {
+      const changedFields = Object.entries({
+        name,
+        description,
+        isDefault,
+        tags,
+        automationConfig,
+        notificationsEnabled,
+      })
+        .filter(([, v]) => v !== undefined)
+        .map(([k]) => k);
+      void WorkspaceAuditService.logForProject({
+        projectId: plan.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_PLAN_UPDATED,
+        targetType: 'regression_plan',
+        targetId: id,
+        metadata: { name: plan.name, changed_fields: changedFields },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[PLANS_API] Failed to update plan', { error });
     handleError(res, error, 'Failed to update plan');
@@ -149,9 +223,24 @@ export async function deletePlan(req: AuthenticatedRequest, res: Response): Prom
     const { id } = req.params;
     const userId = getUserId(req);
 
+    // Admin snapshot — survives the user_id filter that getById applies.
+    const planSnapshot = await loadPlanForAudit(id);
+
     await RegressionPlanService.delete(id, userId);
 
     res.json({ success: true, message: 'Plan deleted', timestamp: new Date() });
+
+    if (planSnapshot) {
+      void WorkspaceAuditService.logForProject({
+        projectId: planSnapshot.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_PLAN_DELETED,
+        targetType: 'regression_plan',
+        targetId: id,
+        metadata: { name: planSnapshot.name },
+        ...getAuditContext(req),
+      });
+    }
   } catch (error) {
     logger.error('[PLANS_API] Failed to delete plan', { error });
     handleError(res, error, 'Failed to delete plan');
@@ -165,6 +254,7 @@ export async function addItem(req: AuthenticatedRequest, res: Response): Promise
   try {
     const { id } = req.params;
     const { itemType, moduleId, flowId, testCaseId, testCaseType, parametersOverride } = req.body;
+    const userId = getUserId(req);
 
     if (!itemType) {
       res.status(400).json({ success: false, error: 'itemType is required' });
@@ -182,6 +272,27 @@ export async function addItem(req: AuthenticatedRequest, res: Response): Promise
     });
 
     res.json({ success: true, data: item, timestamp: new Date() });
+
+    void (async () => {
+      const plan = await loadPlanForAudit(id);
+      if (!plan) return;
+      await WorkspaceAuditService.logForProject({
+        projectId: plan.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.REGRESSION_PLAN_ITEM_ADDED,
+        targetType: 'regression_plan',
+        targetId: id,
+        metadata: {
+          plan_name: plan.name,
+          item_id: item.id,
+          item_type: itemType,
+          module_id: moduleId,
+          flow_id: flowId,
+          test_case_id: testCaseId,
+        },
+        ...getAuditContext(req),
+      });
+    })();
   } catch (error) {
     logger.error('[PLANS_API] Failed to add item', { error });
     handleError(res, error, 'Failed to add item');
@@ -193,12 +304,28 @@ export async function addItem(req: AuthenticatedRequest, res: Response): Promise
  */
 export async function removeItem(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { itemId } = req.params;
+    const { id: planId, itemId } = req.params;
     const userId = getUserId(req);
 
     await RegressionPlanService.removeItem(itemId, userId);
 
     res.json({ success: true, message: 'Item removed', timestamp: new Date() });
+
+    if (planId) {
+      void (async () => {
+        const plan = await loadPlanForAudit(planId);
+        if (!plan) return;
+        await WorkspaceAuditService.logForProject({
+          projectId: plan.projectId,
+          actorUserId: userId,
+          eventType: AUDIT_EVENTS.REGRESSION_PLAN_ITEM_REMOVED,
+          targetType: 'regression_plan',
+          targetId: planId,
+          metadata: { plan_name: plan.name, item_id: itemId },
+          ...getAuditContext(req),
+        });
+      })();
+    }
   } catch (error) {
     logger.error('[PLANS_API] Failed to remove item', { error });
     handleError(res, error, 'Failed to remove item');

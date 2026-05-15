@@ -31,14 +31,40 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { InteractiveNode, IntentStep, LintCandidate, LintResult } from './preview.types';
+import { redactWithValues } from '@/utils/interpolation/redact-secrets';
 
-function buildIntentSnapshot(stepDraft: IntentStep): Record<string, unknown> {
+/**
+ * Phase 2.5 — typed string-field redactor used inside snapshot builders.
+ * Centralises the "preserve undefined / leave non-string alone" guard so
+ * call sites stay one-liners and snapshot fields keep their `string |
+ * undefined` shape (avoids `unknown` casts at the persistence point).
+ *
+ * Equivalent to `redactWithValues` for non-empty inputs; returns the
+ * input unchanged when nothing to mask.
+ */
+function maybeRedactString(
+  value: string | undefined | null,
+  secretValues?: readonly string[],
+): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (!secretValues || secretValues.length === 0) return value;
+  return redactWithValues(value, secretValues);
+}
+
+function buildIntentSnapshot(
+  stepDraft: IntentStep,
+  secretValues?: readonly string[],
+): Record<string, unknown> {
   return {
     id: stepDraft.id,
     type: stepDraft.type,
-    description: stepDraft.description,
-    value: stepDraft.value,
-    assertionText: stepDraft.assertionText,
+    // Three fields here are the documented interpolation targets
+    // (`value`, `assertionText`, `description` — `url` lives on
+    // navigate-shaped commands, not on IntentStep). Redact them before
+    // they hit logs/intent_resolve.log on disk.
+    description: maybeRedactString(stepDraft.description, secretValues),
+    value: maybeRedactString(stepDraft.value, secretValues),
+    assertionText: maybeRedactString(stepDraft.assertionText, secretValues),
     options: stepDraft.options,
     bindingHints: stepDraft.bindingHints,
     recordedFingerprint: stepDraft.recordedFingerprint,
@@ -191,13 +217,20 @@ export function logIntentResolveApply(entry: {
   resolverDegraded?: boolean;
   topSimilarity?: number;
   candidatesCount?: number;
+  /**
+   * Phase 2.5 — pre-collected secret values for redaction inside the
+   * intent snapshot. Caller is responsible for sourcing them from the
+   * preview session (or current run's `runVariables`) once and passing
+   * them through. Omit / empty for non-preview / non-secret runs.
+   */
+  secretValues?: readonly string[];
 }): void {
   appendAuditLine({
     phase: 'apply',
     stepId: entry.stepDraft.id,
     stepType: entry.stepDraft.type,
     outcome: entry.outcome,
-    rejectReason: entry.rejectReason,
+    rejectReason: maybeRedactString(entry.rejectReason, entry.secretValues),
     resolverPath: entry.resolverPath,
     fingerprintMatch: entry.fingerprintMatch,
     clickEffectSignal: entry.clickEffectSignal,
@@ -208,7 +241,7 @@ export function logIntentResolveApply(entry: {
     resolverDegraded: entry.resolverDegraded,
     topSimilarity: entry.topSimilarity,
     candidatesCount: entry.candidatesCount,
-    intent: buildIntentSnapshot(entry.stepDraft),
+    intent: buildIntentSnapshot(entry.stepDraft, entry.secretValues),
     chosen: buildChosenSnapshot(entry.candidate),
   });
 }
@@ -231,6 +264,8 @@ export function logIntentResolveLint(entry: {
   durationMs?: number;
   trigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other';
   domNodeCount?: number;
+  /** Phase 2.5 — see logIntentResolveApply. */
+  secretValues?: readonly string[];
 }): void {
   const top: LintCandidate | undefined = entry.result.candidates?.[0];
   appendAuditLine({
@@ -264,13 +299,13 @@ export function logIntentResolveLint(entry: {
     clarificationQuestion: (entry.result as any).clarificationQuestion,
     interpretation: (entry.result as any).interpretation,
     suggestion: (entry.result as any).suggestion,
-    message: entry.result.message,
+    message: maybeRedactString(entry.result.message, entry.secretValues),
     url: entry.url,
     pageTitle: entry.pageTitle,
     durationMs: entry.durationMs,
     trigger: entry.trigger,
     domNodeCount: entry.domNodeCount,
-    intent: buildIntentSnapshot(entry.stepDraft),
+    intent: buildIntentSnapshot(entry.stepDraft, entry.secretValues),
     chosen: top ? buildChosenSnapshot(top) : null,
   });
 }
