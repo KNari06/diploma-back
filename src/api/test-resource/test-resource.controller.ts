@@ -411,6 +411,207 @@ export async function captureState(req: Request, res: Response): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/test-resource/:id/capture-mobile-snapshot
+//
+// Manual-button entry point for fast-auth capture. The runner does the
+// privileged tar of /data/data/<pkg>/{shared_prefs,databases}; we wrap the
+// metadata into an AuthMobileSnapshot envelope and persist via
+// TestResourceService.captureState.
+//
+// Body: { runnerSessionId: string, packageName: string,
+//         apkVersionCode?: number }
+//
+// `runnerSessionId` is mandatory and is the mobile runner's own session id
+// (NOT the web preview session id). The FE already knows it from the
+// preview run plumbing — we accept it directly rather than resolving via
+// Redis warmup, because this endpoint is REST (not WS) and shouldn't
+// re-implement the WS session-resolution waterfall.
+//
+// Errors surface from the runner's classification:
+//   409  SNAPSHOT_PRIVILEGE   — neither run-as nor su works on this device
+//   413  SNAPSHOT_TOO_LARGE   — over the 5 MB cap
+//   400  PACKAGE_NAME_MISMATCH / PLATFORM_UNSUPPORTED
+// 5xx is forwarded as 502 so the FE can distinguish "your config" (4xx)
+// from "infra blip" (5xx) without parsing strings.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function captureMobileSnapshot(req: Request, res: Response): Promise<void> {
+  const userId = requireAuthed(req, res);
+  if (!userId) return;
+
+  const { id } = req.params;
+  const { runnerSessionId, packageName, apkVersionCode } = (req.body ?? {}) as {
+    runnerSessionId?: unknown;
+    packageName?: unknown;
+    apkVersionCode?: unknown;
+  };
+
+  if (typeof runnerSessionId !== 'string' || !runnerSessionId) {
+    res.status(400).json({ success: false, error: 'runnerSessionId (string) is required' });
+    return;
+  }
+  if (typeof packageName !== 'string' || !packageName) {
+    res.status(400).json({ success: false, error: 'packageName (string) is required' });
+    return;
+  }
+  const versionCode =
+    typeof apkVersionCode === 'number' && Number.isFinite(apkVersionCode)
+      ? apkVersionCode
+      : undefined;
+
+  // Validate the resource exists, belongs to this user, and is the right kind.
+  // We do this BEFORE the runner call so a stale request doesn't burn 30 s of
+  // adb shell only to fail at persistence.
+  const existing = await TestResourceService.getResource(id, userId);
+  if (!existing) {
+    res.status(404).json({ success: false, error: 'Resource not found' });
+    return;
+  }
+  if (existing.kind !== 'auth') {
+    res.status(400).json({
+      success: false,
+      error: `Mobile snapshot is only valid for auth resources; this one is "${existing.kind}"`,
+    });
+    return;
+  }
+
+  try {
+    const { getMobileRunnerClient } = await import('@/services/mobile');
+    const mobileClient = getMobileRunnerClient();
+    const captured = await mobileClient.captureAppData(runnerSessionId, packageName);
+
+    // Build the snapshot envelope the auth adapter validates. `capturedAt`
+    // is server-side wall clock — the runner doesn't return one and we
+    // want a single source of truth for the freshness check.
+    const mobileSnapshot = {
+      platform: 'android' as const,
+      packageName,
+      androidApiLevel: captured.androidApiLevel,
+      dataTarballBase64: captured.dataTarballBase64,
+      sizeBytes: captured.sizeBytes,
+      capturedAt: new Date().toISOString(),
+      capturedVia: captured.capturedVia,
+      ...(versionCode !== undefined ? { apkVersionCode: versionCode } : {}),
+    };
+
+    // `heal: false` — this is a fresh user-initiated capture, not a
+    // supervisor heal. The service stamps `captured_at`/`expires_at` on
+    // the base row independently of our `mobileSnapshot.capturedAt`.
+    await TestResourceService.captureState(
+      id,
+      userId,
+      { sensitive: { mobileSnapshot } },
+      { heal: false },
+    );
+    const resource = await TestResourceService.getResource(id, userId);
+    res.json({
+      success: true,
+      resource,
+      snapshot: {
+        sizeBytes: captured.sizeBytes,
+        capturedAt: mobileSnapshot.capturedAt,
+        capturedVia: captured.capturedVia,
+        androidApiLevel: captured.androidApiLevel,
+      },
+    });
+
+    if (resource?.projectId) {
+      void WorkspaceAuditService.logForProject({
+        projectId: resource.projectId,
+        actorUserId: userId,
+        eventType: AUDIT_EVENTS.RESOURCE_SNAPSHOT_CAPTURED,
+        targetType: 'resource',
+        targetId: id,
+        metadata: {
+          kind: resource.kind,
+          name: resource.name,
+          sizeBytes: captured.sizeBytes,
+          capturedVia: captured.capturedVia,
+          packageName,
+        },
+        ...getAuditContext(req),
+      });
+    }
+  } catch (err) {
+    // Classify by MobileRunnerError fields where possible so the FE can
+    // act on `code` (e.g. show a "snapshot too large" toast specifically).
+    // Anything else collapses to 502 — runner had a problem we can't
+    // attribute to user input.
+    const { MobileRunnerError } = await import('@/services/mobile/mobile-runner.types');
+    if (err instanceof MobileRunnerError) {
+      const status = err.statusCode ?? 500;
+      // Forward 4xx verbatim; map 5xx to 502 so the FE knows it's runner-
+      // side and not a billing/auth/validation problem.
+      const httpStatus = status >= 400 && status < 500 ? status : 502;
+      res.status(httpStatus).json({
+        success: false,
+        error: err.message,
+        code: err.code,
+      });
+      return;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error('[CAPTURE_MOBILE_SNAPSHOT] unexpected error', {
+      resourceId: id,
+      error: msg,
+    });
+    res.status(500).json({ success: false, error: msg });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/test-resource/:id/clear-mobile-snapshot
+//
+// Surgical: strips `sensitive.mobileSnapshot` without touching the recipe
+// or storageState. Backed by the same in-process mutex the failed-restore
+// path uses, so concurrent clears are safe.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function clearMobileSnapshotEndpoint(req: Request, res: Response): Promise<void> {
+  const userId = requireAuthed(req, res);
+  if (!userId) return;
+
+  const { id } = req.params;
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'user-cleared';
+
+  // Validate it exists and is auth. Without the kind check we'd silently
+  // succeed on env/secret resources (which have no mobileSnapshot anyway)
+  // and confuse the user into thinking the action did something.
+  const existing = await TestResourceService.getResource(id, userId);
+  if (!existing) {
+    res.status(404).json({ success: false, error: 'Resource not found' });
+    return;
+  }
+  if (existing.kind !== 'auth') {
+    res.status(400).json({
+      success: false,
+      error: `Mobile snapshot only exists on auth resources; this one is "${existing.kind}"`,
+    });
+    return;
+  }
+
+  await TestResourceService.clearMobileSnapshot(id, userId, reason);
+  const resource = await TestResourceService.getResource(id, userId);
+  res.json({ success: true, resource });
+
+  if (resource?.projectId) {
+    void WorkspaceAuditService.logForProject({
+      projectId: resource.projectId,
+      actorUserId: userId,
+      eventType: AUDIT_EVENTS.RESOURCE_SNAPSHOT_CLEARED,
+      targetType: 'resource',
+      targetId: id,
+      metadata: {
+        kind: resource.kind,
+        name: resource.name,
+        reason: reason.slice(0, 200),
+      },
+      ...getAuditContext(req),
+    });
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/test-resource/:id/mark-broken
 // ─────────────────────────────────────────────────────────────────────────────
 

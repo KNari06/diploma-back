@@ -21,6 +21,7 @@ import { logQueueEvent, logger } from '@/utils/core/logger';
 import { shouldRetry, calculateRetryDelay } from '@/utils/core/error-handler';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { CiRunService } from '@/services/mobile/ci-run.service';
+import type { FastAuthRestore } from '@/services/test-resource/resource-step-compiler.service';
 import { Job } from 'bullmq';
 import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
@@ -102,6 +103,7 @@ export class MobileTestRunJobHandler {
       runnerApiKey,
       appStoragePath,
       appOriginalName,
+      appVersionCode,
       ciRunId,
       metadata,
       // `analyticsRunId` is intentionally not destructured: see the
@@ -160,6 +162,23 @@ export class MobileTestRunJobHandler {
       coldStartUsed: boolean | null;
       scenarioStepCount: number | null;
       testStepCount: number | null;
+      // Fast-auth (May 2026):
+      //   - fastAuthUsed === true   → snapshot was successfully restored
+      //                               AND the app launched. Test skipped
+      //                               the login recipe entirely.
+      //   - fastAuthUsed === false  → restore was attempted but failed
+      //                               (privilege error, launch didn't
+      //                               confirm, network blip). Caller did
+      //                               NOT fall back to recipe inline; the
+      //                               first test step will fail and the
+      //                               snapshot is marked broken so the
+      //                               NEXT test in the regression compiles
+      //                               to recipe path automatically.
+      //   - fastAuthUsed === null   → no fast-auth path was attempted
+      //                               (no snapshot present, or web run).
+      fastAuthUsed: boolean | null;
+      fastAuthRestoreMs: number | null;
+      fastAuthFallbackReason: string | null;
     } = {
       sessionClaimMs: null,
       appSetupMs: null,
@@ -168,6 +187,9 @@ export class MobileTestRunJobHandler {
       coldStartUsed: null,
       scenarioStepCount: null,
       testStepCount: null,
+      fastAuthUsed: null,
+      fastAuthRestoreMs: null,
+      fastAuthFallbackReason: null,
     };
 
     // Validate
@@ -237,6 +259,12 @@ export class MobileTestRunJobHandler {
 
     let sessionId: string | null = null;
     let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
+    // Fast-auth: filled from compileResult.fastAuthRestores. Each entry is a
+    // snapshot the worker will restore via runner HTTP between Phase 3b
+    // (prepApp) and Phase 4 (runSteps). Empty array (not undefined) so the
+    // restore loop branch-light. The compiler already suppressed recipe
+    // steps for these bindings — they only travel through this channel.
+    let fastAuthRestores: FastAuthRestore[] = [];
 
     try {
       // Phase 2 telemetry: capture user-step count up-front so a test
@@ -266,6 +294,15 @@ export class MobileTestRunJobHandler {
           userId,
           projectId: projectId ?? '',
           platform,
+          // Fast-auth gate uses these to decide whether a saved
+          // mobileSnapshot is usable for THIS run. Missing values silently
+          // disable the gate's checks — never the gate itself — so a project
+          // without CI buildNumbers still benefits from fast-auth on the
+          // package-name match alone.
+          ...(appPackage ? { runPackageName: appPackage } : {}),
+          ...(typeof appVersionCode === 'number'
+            ? { runApkVersionCode: appVersionCode }
+            : {}),
         });
 
         // Prepend compiled setup steps. Type cast mirrors the one in
@@ -286,6 +323,16 @@ export class MobileTestRunJobHandler {
             ...intentSteps,
           ] as typeof intentSteps;
         }
+
+        // Fast-auth: capture the compiler's restore directives for the
+        // post-prepApp restore loop below. The compiler already
+        // SUPPRESSED recipe steps for these bindings, so this is the ONLY
+        // path their auth state will be applied. If restore fails at
+        // runtime we mark the snapshot broken (so the next test in the
+        // regression compiles to recipe instead) but DO NOT inline-
+        // recompile — would double the worker latency for marginal value
+        // (Q2 in the design doc).
+        fastAuthRestores = compileResult.fastAuthRestores;
 
         // Pre-build audit snapshot (identical shape to web's AppliedBinding).
         executedResources = [
@@ -561,6 +608,225 @@ export class MobileTestRunJobHandler {
             testId,
             appPackage,
           });
+        }
+      }
+
+      // ── Phase 3c: Fast-auth restore (May 2026) ────────────────────
+      // Replays a previously-captured app-data snapshot to skip the login
+      // recipe entirely. Runs AFTER prepApp because prepApp's `pm clear +
+      // install + launch` would wipe whatever we restored, and BEFORE
+      // runSteps because the test body assumes the app is on-screen and
+      // logged in.
+      //
+      // Multiple snapshots in one run only happen if a test binds more
+      // than one auth resource (rare today — bindings dedupe by kind via
+      // workspace defaults). We restore them sequentially; only the last
+      // one applied to the same package wins, which is fine — there's no
+      // sensible meaning of "two logins in one app" anyway.
+      //
+      // Failure handling (Q2): each restore is independent. If one fails:
+      //   1. Log loudly with the reason (privilege / not launched / 5xx).
+      //   2. Mark this snapshot as broken via TestResourceService so the
+      //      NEXT test in this regression compiles to recipe replay
+      //      instead — the regression self-heals one test at a time.
+      //   3. Set telemetry `fastAuthUsed = false` and a one-line reason.
+      //   4. Continue — test body still runs. It will MOST LIKELY fail
+      //      on step 1 (login screen visible, expected dashboard) but
+      //      that's strictly better than aborting: the user sees a real
+      //      "login required" failure mode they can act on, not a
+      //      mysterious "snapshot couldn't restore" infra error.
+      //
+      // Counting: with N entries, at most ONE will succeed in the common
+      // case (each fastAuthRestore is a different auth resource → different
+      // package OR same package + later one overwrites). Telemetry counts
+      // total ATTEMPTS, not entries; the success boolean is a single value.
+      if (sessionId && fastAuthRestores.length > 0) {
+        // Early cancellation check — restore can take up to 30s per binding
+        // on a multi-MB tarball, so we don't want to start if the user has
+        // already given up. Throws so the outer catch emits the proper
+        // cancellation WS event uniformly with the Phase 4 cancel check.
+        if (await this.isTestCancelled(testId)) {
+          throw new MobileTestCancelledError(testId, browser);
+        }
+
+        // Local abort controller scoped to Phase 3c only. Phase 4 has its
+        // own (`runStepsAbort`) — keeping them separate avoids leaking the
+        // cancel-poller's lifecycle into the restore loop, and means a
+        // restore cancellation doesn't also force-abort the runSteps fetch
+        // that hasn't started yet.
+        const restoreAbort = new AbortController();
+        const restoreCancelPoller = setInterval(async () => {
+          try {
+            if (await this.isTestCancelled(testId)) restoreAbort.abort();
+          } catch { /* polling errors are non-fatal */ }
+        }, 2_000);
+        restoreCancelPoller.unref?.();
+
+        // Emit a progress marker so the UI doesn't show a silent ~200ms
+        // gap between "Launching app…" (17%) and "Executing steps…" (20%).
+        // On a 200-test regression this is 200 events the user would
+        // otherwise wonder about. Non-fatal: WS failures never block restore.
+        try {
+          webSocketService.emitTestProgress(testId, {
+            testId,
+            browser,
+            progress: 18,
+            phase: 'initializing',
+            currentStep: 'Restoring saved session (fast-auth)…',
+            status: 'running',
+            timestamp: new Date().toISOString(),
+            userId,
+            sessionId: chatSessionId,
+          });
+        } catch { /* non-fatal */ }
+
+        const fastAuthT0 = Date.now();
+        let anySuccess = false;
+        let lastFailureReason: string | null = null;
+
+        for (const restore of fastAuthRestores) {
+          try {
+            const result = await client.restoreAppData(
+              sessionId,
+              restore.packageName,
+              restore.dataTarballBase64,
+              { signal: restoreAbort.signal },
+            );
+            if (!result.launched) {
+              // Data was laid down but launch didn't confirm. Treat as
+              // partial-failure — the activity entry might have moved
+              // between snapshot and current build. Don't trust the
+              // snapshot any more; fall back so the next test recompiles.
+              lastFailureReason = `restore wrote data but app launch did not confirm (${result.restoredVia})`;
+              await MobileTestRunJobHandler.markSnapshotBroken(
+                restore.resourceId,
+                userId,
+                lastFailureReason,
+              );
+              logger.warn(
+                '[FAST_AUTH] Restore wrote data but launch unconfirmed — marking broken',
+                {
+                  testId,
+                  resourceId: restore.resourceId,
+                  resourceName: restore.resourceName,
+                  packageName: restore.packageName,
+                },
+              );
+              continue;
+            }
+            anySuccess = true;
+            logger.info('[FAST_AUTH] Snapshot restored, app launched', {
+              testId,
+              resourceId: restore.resourceId,
+              resourceName: restore.resourceName,
+              packageName: restore.packageName,
+              restoredVia: result.restoredVia,
+              restoreMs: result.restoreMs,
+              sizeBytes: restore.sizeBytes,
+            });
+          } catch (err) {
+            // Runner returned non-2xx OR network blip. Decide whether to
+            // INVALIDATE the snapshot or just record the failure:
+            //
+            //   413 SNAPSHOT_TOO_LARGE  → snapshot itself is the problem; strip it.
+            //   409 SNAPSHOT_PRIVILEGE  → device-specific; strip it. Other
+            //                             devices in the pool might work, but
+            //                             on a single-emulator deployment the
+            //                             next test would hit the same wall.
+            //                             Telemetry will tell us if we
+            //                             should soften this to "device
+            //                             marker" instead of full strip.
+            //   400 PACKAGE_NAME_MISMATCH → snapshot is fine, just wrong target.
+            //                              DO NOT strip — user's config bug,
+            //                              not snapshot rot.
+            //   400 PLATFORM_UNSUPPORTED  → same as above — config bug.
+            //   500+ / network / timeout → transient. DO NOT strip — a
+            //                              flaky runner would erase all
+            //                              snapshots within minutes.
+            //
+            // The error's `code` field (set by MobileRunnerError) is the
+            // authoritative signal; status alone isn't (the runner could
+            // ship a 400 for a non-config issue in future).
+            const code = err instanceof MobileRunnerError ? err.code : undefined;
+            const statusCode = err instanceof MobileRunnerError ? err.statusCode : undefined;
+            const reason = err instanceof Error ? err.message : String(err);
+            lastFailureReason = reason.slice(0, 200);
+
+            const shouldInvalidate =
+              code === 'SNAPSHOT_TOO_LARGE' || code === 'SNAPSHOT_PRIVILEGE';
+            const isConfigBug =
+              code === 'PACKAGE_NAME_MISMATCH' || code === 'PLATFORM_UNSUPPORTED';
+            const isTransient =
+              !code && (!statusCode || statusCode >= 500);
+
+            if (shouldInvalidate) {
+              await MobileTestRunJobHandler.markSnapshotBroken(
+                restore.resourceId,
+                userId,
+                lastFailureReason,
+              );
+              logger.warn(
+                '[FAST_AUTH] Restore failed — snapshot stripped, next test falls back to recipe',
+                {
+                  testId,
+                  resourceId: restore.resourceId,
+                  packageName: restore.packageName,
+                  code,
+                  error: reason,
+                },
+              );
+            } else if (isConfigBug) {
+              logger.warn(
+                '[FAST_AUTH] Restore rejected by runner config check — snapshot left intact',
+                {
+                  testId,
+                  resourceId: restore.resourceId,
+                  packageName: restore.packageName,
+                  code,
+                },
+              );
+            } else if (isTransient) {
+              logger.warn(
+                '[FAST_AUTH] Restore failed (transient) — snapshot left intact, will retry next run',
+                {
+                  testId,
+                  resourceId: restore.resourceId,
+                  packageName: restore.packageName,
+                  statusCode,
+                  error: reason,
+                },
+              );
+            } else {
+              // Unknown shape — be conservative, log and leave the snapshot.
+              // Better to retry a snapshot we don't understand than to
+              // strip one that might be fine.
+              logger.warn(
+                '[FAST_AUTH] Restore failed with unrecognised error — snapshot left intact',
+                {
+                  testId,
+                  resourceId: restore.resourceId,
+                  packageName: restore.packageName,
+                  code,
+                  statusCode,
+                  error: reason,
+                },
+              );
+            }
+          }
+        }
+
+        clearInterval(restoreCancelPoller);
+
+        // If the abort came from our cancel poller mid-restore, surface as
+        // typed cancellation for the outer catch — same shape Phase 4 uses.
+        if (restoreAbort.signal.aborted) {
+          throw new MobileTestCancelledError(testId, browser);
+        }
+
+        tlm.fastAuthUsed = anySuccess;
+        tlm.fastAuthRestoreMs = Math.max(0, Date.now() - fastAuthT0);
+        if (!anySuccess) {
+          tlm.fastAuthFallbackReason = lastFailureReason ?? 'restore failed for all bindings';
         }
       }
 
@@ -945,7 +1211,25 @@ export class MobileTestRunJobHandler {
         }
       }
 
-      // ── Phase 9: Post-completion handler (regression tracking) ──
+      // ── Phase 9: Persist telemetry FIRST, then post-completion handler.
+      //
+      // Why order matters here even though the finally block also calls
+      // persistTelemetrySnapshot: the dispatcher's `test_completed` WS
+      // payload (see regression-run.service emitProgress) reads
+      // `fast_auth_used` + `fast_auth_restore_ms` from `test_executions`
+      // when handleTestCompletion fires. If telemetry persists AFTER
+      // handleTestCompletion, the WS payload sees NULL columns and the
+      // FE never shows the "Restored session" pill — telemetry would
+      // eventually catch up in the finally, but the live UI moment is
+      // already gone.
+      //
+      // Calling persistTelemetrySnapshot here AND in finally is
+      // idempotent (UPDATE with same values). The finally call is the
+      // safety net for failure paths where this success-path call
+      // never runs.
+      if (testId) {
+        await MobileTestRunJobHandler.persistTelemetrySnapshot(testId, tlm);
+      }
       try {
         const { TestCompletionHandlerService } = await import(
           '@/services/testing/results/test-completion-handler.service'
@@ -1109,6 +1393,13 @@ export class MobileTestRunJobHandler {
         });
       } catch { /* non-fatal */ }
 
+      // Persist telemetry BEFORE the completion handler so the WS
+      // `test_completed` payload reads fresh fast_auth_* columns. See
+      // success-path comment above for the full rationale. Idempotent
+      // with the finally-block call.
+      if (testId) {
+        await MobileTestRunJobHandler.persistTelemetrySnapshot(testId, tlm);
+      }
       // Post-completion handler on failure (regression tracking)
       try {
         const { TestCompletionHandlerService } = await import(
@@ -1616,6 +1907,9 @@ export class MobileTestRunJobHandler {
       coldStartUsed: boolean | null;
       scenarioStepCount: number | null;
       testStepCount: number | null;
+      fastAuthUsed: boolean | null;
+      fastAuthRestoreMs: number | null;
+      fastAuthFallbackReason: string | null;
     },
   ): Promise<void> {
     try {
@@ -1627,10 +1921,44 @@ export class MobileTestRunJobHandler {
         cold_start_used: tlm.coldStartUsed,
         scenario_step_count: tlm.scenarioStepCount,
         test_step_count: tlm.testStepCount,
+        fast_auth_used: tlm.fastAuthUsed,
+        fast_auth_restore_ms: tlm.fastAuthRestoreMs,
+        fast_auth_fallback_reason: tlm.fastAuthFallbackReason,
       });
     } catch (err) {
       logger.warn('[MOBILE-TEST] Failed to persist telemetry snapshot', {
         testId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Fast-auth: strip a now-suspect mobileSnapshot from its auth resource
+   * so the NEXT test in this regression compiles to recipe replay instead
+   * of trying the same broken snapshot again. Best-effort, never throws —
+   * a failed strip just means one more test pays the restore-retry cost.
+   */
+  private static async markSnapshotBroken(
+    resourceId: string,
+    userId: string,
+    reason: string,
+  ): Promise<void> {
+    try {
+      const { clearMobileSnapshot } = await import(
+        '@/services/test-resource/test-resource.service'
+      );
+      // markBrokenIfNoRecipe: runtime invalidation = "snapshot is gone AND
+      // there's nothing to fall back to". If the resource has a recipe we
+      // leave it active (recipe path still works). If not, mark broken so
+      // the Logins UI surfaces a re-record CTA — without this the user
+      // would silently see "active" resources whose every test fails.
+      await clearMobileSnapshot(resourceId, userId, reason, {
+        markBrokenIfNoRecipe: true,
+      });
+    } catch (err) {
+      logger.warn('[MOBILE-TEST] markSnapshotBroken threw', {
+        resourceId,
         error: err instanceof Error ? err.message : String(err),
       });
     }

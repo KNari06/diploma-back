@@ -48,6 +48,7 @@ import type {
 } from './types';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { expandScenarioSetupRecursively } from './runtime/scenario-setup-expander';
+import type { AuthMobileSnapshot } from './adapters/auth.adapter';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Output types — mirror ApplyResult shape so snapshot writers are uniform
@@ -74,17 +75,57 @@ export interface SkippedBindingSnapshot {
   reason: string;
 }
 
+/**
+ * Out-of-band fast-auth restore the mobile job runs BEFORE `runSteps`.
+ *
+ * Why this isn't a step in `steps[]`: a restore_app_data IntentStep would
+ * (a) couple infrastructure ops to user-step execution, (b) ship a ~200KB
+ * base64 tarball through BullMQ + Redis on every retry, (c) muddy the per-
+ * step telemetry on the runner side. Cleaner to surface it here as a
+ * sibling channel; the mobile job calls `MobileRunnerClient.restoreAppData`
+ * directly per entry, fall back to recipe replay on failure.
+ *
+ * One entry per resource (currently only `auth`). Order doesn't matter —
+ * restores share `pm clear` semantics; running auth restore for package X
+ * then package Y is fine, only the last one applied to the SAME package
+ * wins.
+ */
+export interface FastAuthRestore {
+  resourceId: string;
+  resourceName: string;
+  packageName: string;
+  dataTarballBase64: string;
+  /** Bytes — for telemetry, not enforcement (runner enforced cap at capture). */
+  sizeBytes: number;
+  /** From snapshot, propagated to admin telemetry so we see drift between
+   *  capture-time and run-time Android versions. */
+  androidApiLevel: number;
+  /** From snapshot — telemetry only. */
+  capturedVia: 'run-as' | 'su';
+}
+
 export interface CompileResult {
   /**
    * Runner-shape IntentSteps to prepend before the case's own setup.
    * Each step carries `phase: 'setup'` and `isAutoInjected: true` so the
    * report layer renders them separately from user-authored steps.
+   *
+   * NOTE: when `fastAuthRestores` has entries, those bindings are
+   * deliberately NOT represented in `steps` — the mobile job does the
+   * restore via HTTP and the test body launches the app in its first
+   * step. Both representations would double the work.
    */
   steps: CompiledResourceStep[];
   /** Bindings whose resource was applied — for snapshot writeback. */
   applied: AppliedBindingSnapshot[];
   /** Bindings that were soft-skipped (not required). */
   skipped: SkippedBindingSnapshot[];
+  /**
+   * Fast-auth snapshots the mobile job should restore via runner HTTP
+   * before `runSteps`. Empty array (not undefined) when no auth resource
+   * carried a usable mobileSnapshot — keeps consumer code branch-light.
+   */
+  fastAuthRestores: FastAuthRestore[];
 }
 
 /**
@@ -139,14 +180,29 @@ export class ResourceStepCompilerService {
     userId: string;
     projectId: string;
     platform: MobilePlatform;
+    /**
+     * Resolved APK package name for the current run. Required for fast-auth:
+     * a snapshot captured against package X must NOT be applied to a session
+     * running package Y. Missing → fast-auth path is skipped entirely (no
+     * silent mismatches), recipe replay still works.
+     */
+    runPackageName?: string;
+    /**
+     * Resolved APK versionCode for the current run. Used to invalidate
+     * snapshots taken against an older app build (the app may have migrated
+     * SharedPrefs / DB schema). Missing or zero → version gate is permissive
+     * (we have nothing to compare against — fall back to age/TTL).
+     */
+    runApkVersionCode?: number;
   }): Promise<CompileResult> {
-    const { bindings, userId, platform } = params;
+    const { bindings, userId, platform, runPackageName, runApkVersionCode } = params;
     const applied: AppliedBindingSnapshot[] = [];
     const skipped: SkippedBindingSnapshot[] = [];
     const steps: CompiledResourceStep[] = [];
+    const fastAuthRestores: FastAuthRestore[] = [];
 
     if (!bindings || bindings.length === 0) {
-      return { steps, applied, skipped };
+      return { steps, applied, skipped, fastAuthRestores };
     }
 
     // Same topological order the web applier uses, so behaviour is
@@ -243,6 +299,56 @@ export class ResourceStepCompilerService {
         continue;
       }
 
+      // ── Fast-auth gate ──────────────────────────────────────────────
+      // BEFORE we compile recipe steps for an auth binding, check whether
+      // a usable mobileSnapshot exists. If yes, we suppress recipe-step
+      // emission entirely and surface the snapshot as a sibling
+      // `fastAuthRestores` entry — the mobile job will replay it via
+      // runner HTTP before `runSteps`, and the test body launches the app
+      // already-logged-in via its first step. Doing BOTH would do the
+      // login work twice and defeat the optimisation.
+      //
+      // If `evaluateFastAuthSnapshot` returns `{usable:false}`, we log
+      // the reason (so the run report can show "tried fast-auth, fell
+      // back because X") and proceed with recipe compile.
+      const fastAuthVerdict = evaluateFastAuthSnapshot(
+        resource,
+        platform,
+        runPackageName,
+        runApkVersionCode,
+      );
+      if (fastAuthVerdict?.usable === true) {
+        fastAuthRestores.push(fastAuthVerdict.restore);
+        applied.push({
+          binding: { kind: resource.kind, resource_id: resource.id, required },
+          name: resource.name,
+          kind: resource.kind,
+          status_at_start: staleAtStart ? 'stale' : resource.status,
+          captured_at: resource.expiresAt
+            ? new Date(
+                resource.expiresAt.getTime() - (resource.ttlSeconds ?? 0) * 1000,
+              ).toISOString()
+            : null,
+          healed_during_run: false,
+        });
+        logger.info('[RESOURCE_STEP_COMPILER] Fast-auth snapshot will be restored via HTTP', {
+          resourceId: resource.id,
+          name: resource.name,
+          packageName: fastAuthVerdict.restore.packageName,
+          sizeBytes: fastAuthVerdict.restore.sizeBytes,
+        });
+        continue;
+      }
+      if (fastAuthVerdict?.usable === false) {
+        logger.info(
+          '[RESOURCE_STEP_COMPILER] Fast-auth snapshot unusable — falling back to recipe replay',
+          {
+            resourceId: resource.id,
+            reason: fastAuthVerdict.reason,
+          },
+        );
+      }
+
       // Compile. Each helper returns 0..N steps; empty means "nothing
       // to do for this kind/payload" (legitimate — e.g. an env resource
       // with no config keys). We still snapshot the binding so the
@@ -316,10 +422,89 @@ export class ResourceStepCompilerService {
       steps: steps.length,
       applied: applied.length,
       skipped: skipped.length,
+      fastAuthRestores: fastAuthRestores.length,
     });
 
-    return { steps, applied, skipped };
+    return { steps, applied, skipped, fastAuthRestores };
   }
+}
+
+/**
+ * Decide whether an auth resource has a usable fast-auth snapshot for THIS
+ * run, and surface a clear `reason` when it doesn't. Caller (compiler)
+ * pushes to `fastAuthRestores` when usable, falls back to recipe compile
+ * otherwise, and logs the reason at info-level so the run report can show
+ * "fast-auth was tried but invalidated because X".
+ *
+ * Returns null when there is no fast-auth path to evaluate (e.g. web run,
+ * non-auth kind, snapshot absent). Returns `{ usable: true, ... }` when
+ * the snapshot should be used. Returns `{ usable: false, reason }` when
+ * a snapshot exists but is unusable.
+ */
+function evaluateFastAuthSnapshot(
+  resource: DecryptedResource,
+  platform: MobilePlatform,
+  runPackageName: string | undefined,
+  runApkVersionCode: number | undefined,
+):
+  | null
+  | { usable: true; restore: FastAuthRestore }
+  | { usable: false; reason: string } {
+  if (resource.kind !== 'auth') return null;
+  // v1 is Android-only. We gate by the SNAPSHOT'S platform, not the run's,
+  // because Flutter-on-Android sessions pass `platform='flutter'` to the
+  // compiler but the runner resolves them to a native Android session
+  // (mobile-runner-client routes already handle this) — fast-auth works
+  // identically. We only need to reject pure-iOS, which is already
+  // refused at validation time (snap.platform must be 'android').
+  if (platform === 'ios') return null;
+
+  const snap = (resource.sensitive as { mobileSnapshot?: AuthMobileSnapshot } | undefined)
+    ?.mobileSnapshot;
+  if (!snap) return null;
+
+  if (snap.platform !== 'android') {
+    return { usable: false, reason: `snapshot platform=${snap.platform} is not android` };
+  }
+  if (!runPackageName) {
+    return {
+      usable: false,
+      reason: 'run has no resolved packageName — cannot validate snapshot match',
+    };
+  }
+  if (snap.packageName !== runPackageName) {
+    return {
+      usable: false,
+      reason: `snapshot.packageName=${snap.packageName} != run.packageName=${runPackageName}`,
+    };
+  }
+  // versionCode gate: only enforce when BOTH sides have a real value. If
+  // either is missing we trust the TTL on the base row.
+  if (snap.apkVersionCode != null && runApkVersionCode != null
+      && snap.apkVersionCode !== runApkVersionCode) {
+    return {
+      usable: false,
+      reason: `snapshot apkVersionCode=${snap.apkVersionCode} != run=${runApkVersionCode}`,
+    };
+  }
+  // Tarball sanity check — we already validated at write-time but the row
+  // could have been hand-edited / restored from backup.
+  if (!snap.dataTarballBase64 || snap.dataTarballBase64.length < 32) {
+    return { usable: false, reason: 'snapshot dataTarballBase64 missing or corrupt' };
+  }
+
+  return {
+    usable: true,
+    restore: {
+      resourceId: resource.id,
+      resourceName: resource.name,
+      packageName: snap.packageName,
+      dataTarballBase64: snap.dataTarballBase64,
+      sizeBytes: snap.sizeBytes,
+      androidApiLevel: snap.androidApiLevel,
+      capturedVia: snap.capturedVia,
+    },
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -71,6 +71,47 @@ interface ColdStartVsScenario {
     | 'insufficient_data';
 }
 
+/**
+ * Fast-auth section (May 2026). Mobile equivalent of web's storageState
+ * injection. Captured once via the editor, restored via runner HTTP
+ * before each test that has a matching snapshot.
+ *
+ * Three numbers we watch in the first weeks of prod:
+ *   - adoptionRate     — of tests with auth binding, what % used fast-auth
+ *   - successRate      — of attempts, what % actually skipped recipe replay
+ *   - avgRestoreSec    — how cheap is the restore in practice (target < 1s)
+ *
+ * Plus a savings estimate that compares avgRestoreSec with the avgScenarioSec
+ * we'd otherwise pay — that's the dollar/time number to wave at customers.
+ */
+interface FastAuth {
+  totalAttempts: number;        // rows with fast_auth_used IS NOT NULL
+  succeeded: number;            // fast_auth_used = TRUE
+  fellBack: number;             // fast_auth_used = FALSE
+  successRate: number | null;   // 0..1
+  avgRestoreSec: number | null;
+  /**
+   * ROUGH savings estimate: avg scenario time (over rows WITHOUT fast-auth)
+   * minus avg restore time. Caveats:
+   *   - The "baseline" population is over-inclusive — it counts every
+   *     mobile test with a non-null scenario duration, not just tests
+   *     that would have used auth. So the savings number is biased
+   *     toward whatever the typical scenario_setup costs, not toward
+   *     pure login replay specifically.
+   *   - Clamped at 0 to avoid surfacing "fast-auth wasted 2s" — a
+   *     negative result is more often a measurement issue than a real
+   *     regression.
+   *   - NULL when there are no successful restores OR no baseline rows.
+   * Use it as a rough order-of-magnitude indicator, not a quotable number.
+   * The fix is to add a "has_auth_binding" column at the test-execution
+   * level; deferred until we know fast-auth is worth keeping.
+   */
+  avgSavingsPerUseSecRough: number | null;
+  /** Most common fallback reasons + count. Top 5. Helps spot whether the
+   *  5 MB cap, privilege chain, or launch is the blocker. */
+  topFallbackReasons: Array<{ reason: string; count: number }>;
+}
+
 interface MetricsResponse {
   windowDays: number;
   rangeFrom: string;
@@ -79,6 +120,7 @@ interface MetricsResponse {
   durationByBucket: DurationBucket[] | null;
   scenarioReplayLoad: ScenarioReplayLoad | null;
   coldStartVsScenario: ColdStartVsScenario | null;
+  fastAuth: FastAuth | null;
   warnings: string[];
 }
 
@@ -99,12 +141,14 @@ export const getRegressionMetrics = async (req: Request, res: Response): Promise
   const rangeFrom = new Date(rangeTo.getTime() - days * 86_400_000);
   const warnings: string[] = [];
 
-  const [wallclockBreakdown, durationByBucket, scenarioReplayLoad, coldStartVsScenario] = await Promise.all([
-    safeSection('wallclockBreakdown', () => computeWallclockBreakdown(rangeFrom), warnings),
-    safeSection('durationByBucket', () => computeDurationByBucket(rangeFrom), warnings),
-    safeSection('scenarioReplayLoad', () => computeScenarioReplayLoad(rangeFrom), warnings),
-    safeSection('coldStartVsScenario', () => computeColdStartVsScenario(rangeFrom), warnings),
-  ]);
+  const [wallclockBreakdown, durationByBucket, scenarioReplayLoad, coldStartVsScenario, fastAuth] =
+    await Promise.all([
+      safeSection('wallclockBreakdown', () => computeWallclockBreakdown(rangeFrom), warnings),
+      safeSection('durationByBucket', () => computeDurationByBucket(rangeFrom), warnings),
+      safeSection('scenarioReplayLoad', () => computeScenarioReplayLoad(rangeFrom), warnings),
+      safeSection('coldStartVsScenario', () => computeColdStartVsScenario(rangeFrom), warnings),
+      safeSection('fastAuth', () => computeFastAuth(rangeFrom), warnings),
+    ]);
 
   const response: MetricsResponse = {
     windowDays: days,
@@ -114,6 +158,7 @@ export const getRegressionMetrics = async (req: Request, res: Response): Promise
     durationByBucket,
     scenarioReplayLoad,
     coldStartVsScenario,
+    fastAuth,
     warnings,
   };
 
@@ -380,6 +425,107 @@ function percentile(sortedAsc: number[], p: number): number | null {
   if (sortedAsc.length === 0) return null;
   const idx = Math.min(sortedAsc.length - 1, Math.floor(p * sortedAsc.length));
   return sortedAsc[idx];
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Section 5 — Fast-auth adoption + reliability (May 2026)
+// ──────────────────────────────────────────────────────────────────────
+async function computeFastAuth(rangeFrom: Date): Promise<FastAuth> {
+  // Pull only the columns we need; partial index on
+  // `fast_auth_used IS NOT NULL` makes this cheap. Window-scope by
+  // completed_at to match other sections' time-range semantics.
+  const { data, error } = await supabaseAdmin
+    .from('test_executions')
+    .select('fast_auth_used, fast_auth_restore_ms, fast_auth_fallback_reason, scenario_steps_ms')
+    .gte('completed_at', rangeFrom.toISOString())
+    .not('fast_auth_used', 'is', null);
+  if (error) throw new Error(`fast-auth query failed: ${error.message}`);
+
+  const rows = (data ?? []) as Array<{
+    fast_auth_used: boolean | null;
+    fast_auth_restore_ms: number | null;
+    fast_auth_fallback_reason: string | null;
+    scenario_steps_ms: number | null;
+  }>;
+
+  if (rows.length === 0) {
+    return {
+      totalAttempts: 0,
+      succeeded: 0,
+      fellBack: 0,
+      successRate: null,
+      avgRestoreSec: null,
+      avgSavingsPerUseSecRough: null,
+      topFallbackReasons: [],
+    };
+  }
+
+  const succeeded = rows.filter((r) => r.fast_auth_used === true);
+  const fellBack = rows.filter((r) => r.fast_auth_used === false);
+
+  // Avg restore time over SUCCESSFUL restores only. Failed attempts have
+  // wildly variable timings (early privilege rejection vs late launch
+  // hang) — mixing them obscures the "real" cost of a working restore.
+  const successRestores = succeeded
+    .map((r) => r.fast_auth_restore_ms)
+    .filter((v): v is number => typeof v === 'number');
+  const avgRestoreMs = successRestores.length > 0
+    ? successRestores.reduce((a, b) => a + b, 0) / successRestores.length
+    : null;
+
+  // ROUGH savings estimate. See `avgSavingsPerUseSecRough` field doc on the
+  // FastAuth interface for the caveats — this is an order-of-magnitude
+  // indicator, not a quotable number, because the baseline population
+  // contains tests without auth bindings.
+  let avgSavingsPerUseSecRough: number | null = null;
+  if (avgRestoreMs !== null) {
+    try {
+      const { data: scenarioRowsData } = await supabaseAdmin
+        .from('test_executions')
+        .select('scenario_steps_ms')
+        .gte('completed_at', rangeFrom.toISOString())
+        // Mobile tests with auth scenario AND no fast-auth path used —
+        // i.e. the baseline we'd revert to without snapshots.
+        .is('fast_auth_used', null)
+        .not('scenario_steps_ms', 'is', null);
+      const scenarioMs = ((scenarioRowsData ?? []) as Array<{ scenario_steps_ms: number | null }>)
+        .map((r) => r.scenario_steps_ms)
+        .filter((v): v is number => typeof v === 'number');
+      if (scenarioMs.length > 0) {
+        const avgScenarioMs = scenarioMs.reduce((a, b) => a + b, 0) / scenarioMs.length;
+        // Clamp at 0 — negative savings means restore is slower than
+        // recipe (would be a bug worth investigating, not something to
+        // surface as "fast-auth wasted 2s per test").
+        avgSavingsPerUseSecRough = msToSec(Math.max(0, avgScenarioMs - avgRestoreMs));
+      }
+    } catch {
+      /* non-fatal — savings is a nice-to-have, not core to the section */
+    }
+  }
+
+  // Top-5 fallback reasons by count. Empty when nothing failed yet.
+  const reasonCounts = new Map<string, number>();
+  for (const r of fellBack) {
+    if (!r.fast_auth_fallback_reason) continue;
+    // Truncate any per-row variation (timestamps, ids embedded in error
+    // strings) by keeping only the first 80 chars — usually the verb.
+    const key = r.fast_auth_fallback_reason.slice(0, 80);
+    reasonCounts.set(key, (reasonCounts.get(key) ?? 0) + 1);
+  }
+  const topFallbackReasons = Array.from(reasonCounts.entries())
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  return {
+    totalAttempts: rows.length,
+    succeeded: succeeded.length,
+    fellBack: fellBack.length,
+    successRate: round(succeeded.length / rows.length, 3),
+    avgRestoreSec: msToSec(avgRestoreMs),
+    avgSavingsPerUseSecRough,
+    topFallbackReasons,
+  };
 }
 
 function msToSec(v: number | null | undefined): number | null {

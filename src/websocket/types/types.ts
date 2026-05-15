@@ -1243,6 +1243,23 @@ export interface RegressionRunProgressPayload {
       status?: 'passed' | 'failed' | 'skipped';
       /** Short human-readable reason for failed/skipped (≤ 200 chars). */
       errorMessage?: string;
+      /**
+       * Fast-auth telemetry surfaced to the FE for the live "Restored
+       * session" pill on the test card. Present only on `event ===
+       * 'completed'` for mobile tests that actually attempted fast-auth.
+       *
+       *   - `used === true`  → snapshot restored, login recipe skipped
+       *   - `used === false` → restore attempted, fell back to recipe
+       *   - omitted          → no fast-auth path tried (web run, no
+       *                        snapshot, pre-fast-auth row)
+       *
+       * `restoreMs` is the runner's wallclock for the successful restore
+       * — drives the "saved ~9s" estimate. Absent when used !== true.
+       */
+      fastAuth?: {
+        used: boolean;
+        restoreMs?: number;
+      };
     };
   };
   timestamp: string;

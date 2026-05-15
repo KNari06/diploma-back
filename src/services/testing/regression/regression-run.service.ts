@@ -783,6 +783,14 @@ export class RegressionRunService {
       appStoragePath: resolvedBuild?.storagePath,
       appOriginalName: resolvedBuild?.originalName,
       appPackage: resolvedBuild?.packageName,
+      // Fast-auth: pass the build number as proxy for Android versionCode.
+      // The compiler's snapshot gate uses it to invalidate captures taken
+      // against an older app build. Undefined when the project has no CI
+      // build pipeline (direct-uploaded APK) — the gate degrades to TTL +
+      // runtime-failure invalidation, which is acceptable for v1.
+      ...(typeof resolvedBuild?.buildNumber === 'number'
+        ? { appVersionCode: resolvedBuild.buildNumber }
+        : {}),
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
       metadata: buildMetadataFromTestCase(intentCase),
@@ -2629,6 +2637,53 @@ export class RegressionRunService {
           })
         );
 
+        // Batch-fetch fast-auth telemetry for every execId in this level
+        // so the per-test `test_completed` WS payload can surface the
+        // "Restored session 200ms" pill the FE renders. One SELECT for
+        // the whole level (NOT N+1). Null/missing values are normal:
+        //   - non-mobile tests have fast_auth_used IS NULL
+        //   - mobile tests with no snapshot have fast_auth_used IS NULL
+        // The map only populates entries that actually attempted fast-auth.
+        // Best-effort: a query failure here leaves the pills off but the
+        // run finalization continues unaffected.
+        const fastAuthByExecId = new Map<
+          string,
+          { used: boolean; restoreMs?: number }
+        >();
+        try {
+          const execIdsForFastAuth = results
+            .map((r) => r.execId)
+            .filter((id): id is string => typeof id === 'string' && id.length > 0);
+          if (execIdsForFastAuth.length > 0) {
+            const { data: faRows } = await supabaseAdmin
+              .from('test_executions')
+              .select('id, fast_auth_used, fast_auth_restore_ms')
+              .in('id', execIdsForFastAuth);
+            for (const row of (faRows ?? []) as Array<{
+              id: string;
+              fast_auth_used: boolean | null;
+              fast_auth_restore_ms: number | null;
+            }>) {
+              if (row.fast_auth_used === null) continue;
+              fastAuthByExecId.set(row.id, {
+                used: row.fast_auth_used,
+                ...(typeof row.fast_auth_restore_ms === 'number'
+                  ? { restoreMs: row.fast_auth_restore_ms }
+                  : {}),
+              });
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            '[REGRESSION_RUN] Failed to fetch fast-auth telemetry for live payload — pills will be off this level',
+            {
+              runId,
+              level: levelIdx,
+              error: err instanceof Error ? err.message : String(err),
+            },
+          );
+        }
+
         for (const result of results) {
           completedCount++;
           if (result.status !== 'passed') {
@@ -2649,6 +2704,7 @@ export class RegressionRunService {
             result.status === 'passed' ? 'passed'
             : result.status === 'failed' ? 'failed'
             : 'skipped';
+          const fa = result.execId ? fastAuthByExecId.get(result.execId) : undefined;
           emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
             currentLevel: levelIdx + 1,
             testExecution: {
@@ -2658,6 +2714,7 @@ export class RegressionRunService {
               platform: result.platform,
               event: 'completed',
               status: mappedStatus,
+              ...(fa ? { fastAuth: fa } : {}),
             },
           });
         }

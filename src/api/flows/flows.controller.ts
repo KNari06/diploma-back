@@ -28,7 +28,7 @@ function getUserId(req: AuthenticatedRequest): string {
  */
 export async function createFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
-    const { moduleId, name, description, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings } = req.body;
+    const { moduleId, name, flowType, platform, tags, priority, preconditions, expectedResult, baseUrl, settings } = req.body;
 
     // Validate moduleId required
     if (!moduleId) {
@@ -97,7 +97,6 @@ export async function createFlow(req: AuthenticatedRequest, res: Response): Prom
       moduleId,
       userId,
       name,
-      description,
       platform,
       flowType,
       tags,
@@ -300,14 +299,13 @@ export async function listFlows(req: AuthenticatedRequest, res: Response): Promi
 export async function updateFlow(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, description, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
+    const { name, flowType, tags, priority, preconditions, expectedResult, orderIndex } = req.body;
     const userId = getUserId(req);
 
     const flow = await FlowService.update({
       id,
       userId,
       name,
-      description,
       flowType,
       tags,
       priority,
