@@ -275,7 +275,6 @@ export interface CreateTestFlowParams {
   moduleId: string;
   userId: string;
   name: string;
-  description?: string;
   orderIndex?: number;
   flowType?: FlowType;
   platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
@@ -292,7 +291,6 @@ export interface UpdateTestFlowParams {
   id: string;
   userId: string;
   name?: string;
-  description?: string;
   orderIndex?: number;
   flowType?: FlowType;
   platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
@@ -757,6 +755,25 @@ export interface TestExecution {
   platform?: string;
   isNegative?: boolean;
   createdAt: string;
+  /**
+   * Fast-auth telemetry (May 2026). Present only on mobile rows that
+   * actually attempted snapshot restore. Surfaced from
+   * `test_executions.fast_auth_used` + `fast_auth_restore_ms`.
+   *
+   *   - `used === true`  → snapshot restored, login recipe skipped
+   *   - `used === false` → restore attempted, fell back to recipe (or
+   *                        nothing — the test ran logged-out)
+   *   - omitted          → no fast-auth path tried (web run, no snapshot,
+   *                        pre-fast-auth row). Distinct from `used: false`.
+   *
+   * Surfaced by `ExecutionService.mapToTestExecution` and consumed by
+   * the FE regression run view as a REST fallback when the live WS state
+   * has evicted (e.g. user reopens the page after the run completed).
+   */
+  fastAuth?: {
+    used: boolean;
+    restoreMs?: number;
+  };
 }
 
 /**

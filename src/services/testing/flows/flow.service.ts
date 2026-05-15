@@ -27,7 +27,6 @@ export class FlowService {
       moduleId,
       userId,
       name,
-      description,
       orderIndex,
       flowType,
       platform,
@@ -63,7 +62,6 @@ export class FlowService {
         module_id: moduleId,
         user_id: userId,
         name,
-        description: description || null,
         order_index: finalOrderIndex,
         flow_type: flowType || 'ui',
         platform: platform || null,
@@ -146,7 +144,6 @@ export class FlowService {
       id,
       userId,
       name,
-      description,
       orderIndex,
       flowType,
       platform,
@@ -158,7 +155,6 @@ export class FlowService {
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
-    if (description !== undefined) updates.description = description;
     if (orderIndex !== undefined) updates.order_index = orderIndex;
     if (flowType !== undefined) updates.flow_type = flowType;
     if (platform !== undefined) updates.platform = platform;

@@ -123,6 +123,100 @@ export class MobileRunnerClient {
     });
   }
 
+  // ── Fast-auth (app-data snapshot) ────────────────────────────────
+  //
+  // Mobile equivalent of web's storageState injection. Captures /data/data/<pkg>
+  // shared_prefs + databases as a base64 tarball; restoreAppData replays it
+  // before a test so we skip the login recipe entirely.
+  //
+  // The runner enforces a 5 MB cap on capture and runs a `pm clear` before
+  // restore (replace-not-merge — merging is the source of half the
+  // session-restore bugs we'd otherwise debug). See runner module
+  // src/device/adb/app-data-snapshot.ts for the privilege chain.
+  //
+  // Both endpoints can return:
+  //   - 413 SNAPSHOT_TOO_LARGE (capture only — over 5 MB)
+  //   - 409 SNAPSHOT_PRIVILEGE (neither run-as nor su works on this device)
+  //   - 400 PACKAGE_NAME_MISMATCH / PLATFORM_UNSUPPORTED
+  //
+  // Callers MUST treat any non-2xx as "fall back to recipe replay". Never
+  // surface fast-auth errors as test failures — the recipe path always
+  // exists as a safety net.
+
+  /**
+   * Snapshot the current logged-in state of an Android app's data dir.
+   * Called by the editor "Save login" flow after the user successfully
+   * logs in via the live preview.
+   *
+   * Returns a base64 tarball the caller writes to the auth resource's
+   * `sensitive.mobileSnapshot` field. We don't decode here — the blob
+   * stays opaque to backend code; only the runner ever interprets it.
+   *
+   * No retries: capture is a one-shot user-initiated action, surfacing
+   * a transient runner blip as a clear error is better than masking it.
+   */
+  async captureAppData(
+    sessionId: string,
+    packageName: string,
+  ): Promise<{
+    dataTarballBase64: string;
+    sizeBytes: number;
+    androidApiLevel: number;
+    capturedVia: 'run-as' | 'su';
+  }> {
+    return this.request(
+      'POST',
+      `/api/sessions/${sessionId}/capture-app-data`,
+      {
+        body: { packageName },
+        // Capture tars + base64-encodes inside adb shell — slow but bounded
+        // by the 5 MB cap on the runner. 30s buffer absorbs slow disks.
+        timeoutMs: 30_000,
+        noRetry: true,
+      },
+    );
+  }
+
+  /**
+   * Restore a previously-captured app-data snapshot, replacing the app's
+   * /data/data state. Runner does `pm clear` first then untars. The
+   * caller is expected to launch the app afterwards (e.g. via the test's
+   * first IntentStep) — restore does NOT launch.
+   *
+   * Use this BEFORE `runSteps` when the auth binding has a snapshot. If
+   * this throws, the caller should fall back to recipe replay for the
+   * current test (and mark the snapshot broken so the next run captures
+   * a fresh one).
+   */
+  async restoreAppData(
+    sessionId: string,
+    packageName: string,
+    dataTarballBase64: string,
+    opts?: { signal?: AbortSignal },
+  ): Promise<{
+    restoredVia: 'run-as' | 'su';
+    restoreMs: number;
+    /** False means data was restored but launching the app via `monkey -p`
+     *  didn't confirm success. Caller should fall back to recipe replay —
+     *  the data layout is correct but the activity probably moved. */
+    launched: boolean;
+  }> {
+    return this.request(
+      'POST',
+      `/api/sessions/${sessionId}/restore-app-data`,
+      {
+        body: { packageName, dataTarballBase64 },
+        // `pm clear` + untar + chown. Same 30s budget as capture.
+        timeoutMs: 30_000,
+        noRetry: true,
+        // Honour caller's cancellation — a regression-run cancel during
+        // a multi-MB tarball transfer would otherwise hang up to 30s per
+        // pending test before noticing.
+        signal: opts?.signal,
+      },
+    );
+  }
+
   // ── Session Pool operations ──────────────────────────────────────
 
   /**

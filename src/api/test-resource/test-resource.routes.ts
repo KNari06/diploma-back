@@ -9,8 +9,10 @@
  * GET    /api/v1/test-resource/:id                   — Read one
  * PUT    /api/v1/test-resource/:id                   — Update
  * DELETE /api/v1/test-resource/:id                   — Delete (optional reassign)
- * POST   /api/v1/test-resource/:id/capture           — Persist freshly captured state
- * POST   /api/v1/test-resource/:id/mark-broken       — Runner: recipe no longer works
+ * POST   /api/v1/test-resource/:id/capture                  — Persist freshly captured state
+ * POST   /api/v1/test-resource/:id/capture-mobile-snapshot  — Fast-auth: tar /data/data on Android
+ * POST   /api/v1/test-resource/:id/clear-mobile-snapshot    — Fast-auth: strip the snapshot
+ * POST   /api/v1/test-resource/:id/mark-broken              — Runner: recipe no longer works
  *
  * Auth middleware is applied at mount time (src/index.ts:
  * `requireAuth + requireApproved`).
@@ -26,6 +28,8 @@ import {
   updateResource,
   deleteResource,
   captureState,
+  captureMobileSnapshot,
+  clearMobileSnapshotEndpoint,
   markBroken,
   resolveDefault,
   setDefault,
@@ -49,6 +53,8 @@ router.get('/:id', getResource);
 router.put('/:id', updateResource);
 router.delete('/:id', deleteResource);
 router.post('/:id/capture', captureState);
+router.post('/:id/capture-mobile-snapshot', captureMobileSnapshot);
+router.post('/:id/clear-mobile-snapshot', clearMobileSnapshotEndpoint);
 router.post('/:id/mark-broken', markBroken);
 
 export default router;

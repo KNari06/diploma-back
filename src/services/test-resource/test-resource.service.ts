@@ -201,6 +201,12 @@ function decryptEnvelope(
 }
 
 function toSummary(row: ResourceRow, testCount: number): ResourceSummary {
+  // Envelope-key inspection: `sensitive` is an encrypted-at-rest map keyed
+  // by field name. Reading the KEYS is safe (no decryption, no ciphertext
+  // surfaces in the response). We use this to expose `hasMobileSnapshot`
+  // to the Logins UI without forcing a decrypt on every list call.
+  const sensitiveKeys = row.sensitive ? Object.keys(row.sensitive) : [];
+  const hasMobileSnapshot = row.kind === 'auth' && sensitiveKeys.includes('mobileSnapshot');
   return {
     id: row.id,
     projectId: row.project_id,
@@ -209,7 +215,7 @@ function toSummary(row: ResourceRow, testCount: number): ResourceSummary {
     description: row.description ?? undefined,
     scope: row.scope ?? {},
     config: row.config ?? {},
-    sensitiveKeys: row.sensitive ? Object.keys(row.sensitive) : [],
+    sensitiveKeys,
     status: row.status,
     brokenReason: row.broken_reason ?? undefined,
     capturedAt: row.captured_at ?? undefined,
@@ -224,6 +230,10 @@ function toSummary(row: ResourceRow, testCount: number): ResourceSummary {
     healCount: row.heal_count ?? 0,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // Only set when meaningful — for non-auth kinds it's always false and
+    // adding `hasMobileSnapshot: false` to every env/secret summary just
+    // bloats responses.
+    ...(row.kind === 'auth' ? { hasMobileSnapshot } : {}),
   };
 }
 
@@ -1149,6 +1159,96 @@ export async function markBroken(
   if (error) {
     logger.warn('[TEST_RESOURCE] markBroken failed', { id, error: error.message });
   }
+}
+
+/**
+ * Strip the `mobileSnapshot` field from an auth resource's sensitive
+ * envelope without touching anything else (recipe, storageState, status,
+ * TTL). Used by the mobile job when a restore failed at runtime — we
+ * invalidate the snapshot specifically so the NEXT test in the regression
+ * compiles to recipe replay instead, but leave the resource itself
+ * 'active' so recipe replay still works.
+ *
+ * Best-effort: never throws. A failed strip means one extra test pays
+ * the restore-retry cost; not worth aborting the job over.
+ *
+ * Why surgical and not markBroken: the broken-flag is the right tool when
+ * the WHOLE resource is unusable (e.g. server-side session truly expired).
+ * Here only the snapshot is suspect — the recipe is still authored, still
+ * works. Treating snapshot failure as resource failure would force a
+ * full re-record for what is recoverable in seconds.
+ *
+ * `markBrokenIfNoRecipe` (May 2026 — fast-auth v1): when true AND the
+ * resource has NO recipe to fall back to, flip status to 'broken' so the
+ * Logins UI surfaces a re-record CTA. Set true by the regression-run
+ * failure path (runtime invalidation = the snapshot is gone AND there's
+ * nothing left that works). Set false by the user-facing settings-page
+ * clear (deliberate user action — they don't need a broken-status nag).
+ */
+export async function clearMobileSnapshot(
+  id: string,
+  userId: string,
+  reason: string,
+  opts?: { markBrokenIfNoRecipe?: boolean },
+): Promise<void> {
+  // Read-modify-write on `sensitive` JSONB. Wrap in the per-resource mutex
+  // so concurrent failed restores (regression with 20 in-flight mobile
+  // tests all hitting the same broken snapshot) don't race a stale read
+  // against a fresh write — and so a UI "Save snapshot" running in parallel
+  // can't lose its write to our strip. The mutex is in-process; on a
+  // multi-instance backend deployment two clears can still race, but
+  // both want the same outcome (snapshot gone) so the race is benign.
+  const { withResourceMutex } = await import('./resource-mutex');
+  await withResourceMutex(id, async () => {
+    try {
+      const decrypted = await loadDecrypted(id, userId).catch(() => null);
+      if (!decrypted || decrypted.kind !== 'auth') return;
+      const sensitive = { ...(decrypted.sensitive as Record<string, unknown>) };
+      if (!('mobileSnapshot' in sensitive)) return; // already gone
+
+      delete sensitive.mobileSnapshot;
+      const newEnvelope = encryptEnvelope(sensitive);
+
+      // If the caller asked, AND there's no recipe to fall back to, flip
+      // status to 'broken' as part of the same UPDATE so the UI doesn't
+      // get an intermediate "active but unusable" state. The recipe check
+      // is on the freshly-read decrypted row — no second round-trip.
+      const hasRecipe = Array.isArray(decrypted.recipe) && decrypted.recipe.length > 0;
+      const shouldMarkBroken = opts?.markBrokenIfNoRecipe === true && !hasRecipe;
+
+      const updatePatch: Record<string, unknown> = { sensitive: newEnvelope };
+      if (shouldMarkBroken) {
+        updatePatch.status = 'broken';
+        updatePatch.broken_reason =
+          `Fast-auth snapshot invalidated and no recipe available. ` +
+          `Re-record the login to use this resource again. ` +
+          `Reason: ${reason.slice(0, 200)}`;
+      }
+
+      const { error } = await supabaseAdmin
+        .from('test_resources')
+        .update(updatePatch)
+        .eq('id', id)
+        .eq('user_id', userId);
+      if (error) {
+        logger.warn('[TEST_RESOURCE] clearMobileSnapshot failed', {
+          id,
+          error: error.message,
+        });
+        return;
+      }
+      logger.info('[TEST_RESOURCE] mobileSnapshot stripped after restore failure', {
+        id,
+        reason: reason.slice(0, 200),
+        markedBroken: shouldMarkBroken,
+      });
+    } catch (err) {
+      logger.warn('[TEST_RESOURCE] clearMobileSnapshot threw', {
+        id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -948,6 +948,12 @@ export class TestCompletionHandlerService {
           total_scenario_ms: number | null;
           total_test_steps_ms: number | null;
           cold_start_count: number | null;
+          // Fast-auth aggregates (May 2026). Same NULL-vs-0 semantics as the
+          // Phase 2 set above — NULL = no rows contributed, 0 = rows existed
+          // but none used fast-auth.
+          fast_auth_used_count: number | null;
+          fast_auth_fallback_count: number | null;
+          total_fast_auth_restore_ms: number | null;
         } = {
           test_count: null,
           total_duration_ms: null,
@@ -955,6 +961,9 @@ export class TestCompletionHandlerService {
           total_scenario_ms: null,
           total_test_steps_ms: null,
           cold_start_count: null,
+          fast_auth_used_count: null,
+          fast_auth_fallback_count: null,
+          total_fast_auth_restore_ms: null,
         };
         try {
           const startedAtMs = run.started_at ? new Date(run.started_at).getTime() : null;
@@ -964,21 +973,37 @@ export class TestCompletionHandlerService {
 
           const { data: tlmRowsData } = await supabaseAdmin
             .from('test_executions')
-            .select('app_setup_ms, scenario_steps_ms, test_steps_ms, cold_start_used')
+            .select(
+              'app_setup_ms, scenario_steps_ms, test_steps_ms, cold_start_used, ' +
+              'fast_auth_used, fast_auth_restore_ms',
+            )
             .eq('run_id', run.id);
 
-          const tlmRows = (tlmRowsData ?? []) as Array<{
+          // Supabase narrows multi-column selects to a union that doesn't
+          // overlap our row shape; cast via unknown is the documented
+          // escape hatch.
+          const tlmRows = (tlmRowsData ?? []) as unknown as Array<{
             app_setup_ms: number | null;
             scenario_steps_ms: number | null;
             test_steps_ms: number | null;
             cold_start_used: boolean | null;
+            fast_auth_used: boolean | null;
+            fast_auth_restore_ms: number | null;
           }>;
 
-          const sumOrNull = (key: 'app_setup_ms' | 'scenario_steps_ms' | 'test_steps_ms'): number | null => {
+          const sumOrNull = (
+            key: 'app_setup_ms' | 'scenario_steps_ms' | 'test_steps_ms' | 'fast_auth_restore_ms',
+          ): number | null => {
             const present = tlmRows.filter((r) => r[key] != null);
             if (present.length === 0) return null;
             return present.reduce((acc, r) => acc + (r[key] as number), 0);
           };
+
+          // Fast-auth row presence detection: any non-null `fast_auth_used`
+          // means at least one mobile test in this run attempted the path.
+          // Without that marker the run is either pure-web or pre-fast-auth
+          // and we keep aggregates NULL (rather than 0) to stay honest.
+          const hasFastAuthRows = tlmRows.some((r) => r.fast_auth_used !== null);
 
           telemetryAggregates = {
             test_count: tlmRows.length > 0 ? tlmRows.length : null,
@@ -994,6 +1019,13 @@ export class TestCompletionHandlerService {
               const hasMobileRows = tlmRows.some((r) => r.cold_start_used !== null);
               return hasMobileRows ? count : null;
             })(),
+            fast_auth_used_count: hasFastAuthRows
+              ? tlmRows.filter((r) => r.fast_auth_used === true).length
+              : null,
+            fast_auth_fallback_count: hasFastAuthRows
+              ? tlmRows.filter((r) => r.fast_auth_used === false).length
+              : null,
+            total_fast_auth_restore_ms: sumOrNull('fast_auth_restore_ms'),
           };
         } catch (err) {
           logger.warn('[TEST_COMPLETION] Failed to aggregate Phase 2 telemetry — proceeding without it', {

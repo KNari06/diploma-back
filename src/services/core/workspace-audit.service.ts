@@ -34,6 +34,8 @@ export const AUDIT_EVENTS = {
   RESOURCE_DELETED: 'resource.deleted',
   RESOURCE_CAPTURED: 'resource.captured',
   RESOURCE_MARKED_BROKEN: 'resource.marked_broken',
+  RESOURCE_SNAPSHOT_CAPTURED: 'resource.snapshot_captured',
+  RESOURCE_SNAPSHOT_CLEARED: 'resource.snapshot_cleared',
   RESOURCE_DEFAULT_SET: 'resource.default_set',
   RESOURCE_DEFAULT_CLEARED: 'resource.default_cleared',
 

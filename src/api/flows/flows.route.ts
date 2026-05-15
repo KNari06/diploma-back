@@ -63,9 +63,6 @@ const router = Router();
  *               name:
  *                 type: string
  *                 description: Flow name
- *               description:
- *                 type: string
- *                 description: Optional flow description
  *               flowType:
  *                 type: string
  *                 enum: [ui, api, mixed]
