@@ -16,7 +16,6 @@ import {
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlanItemType, TestType } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
-import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -146,18 +145,11 @@ export async function listPlans(req: AuthenticatedRequest, res: Response): Promi
 
     const userId = getUserId(req);
 
-    // Check cache first
-    const cacheKey = `qait:cache:plans:proj:${projectId}:${userId}`;
-    const cached = await cache.get(cacheKey);
-    if (cached) {
-      res.json({ success: true, data: cached, timestamp: new Date() });
-      return;
-    }
-
+    // No caching — health state is computed from live execution data and must
+    // always reflect the latest run results. Previously a 30-min cache caused
+    // the list to show stale health state (e.g. "passing") while the detail
+    // page (uncached) correctly showed the current state (e.g. "failing").
     const plans = await RegressionPlanService.listByProject(projectId, userId);
-
-    // Cache for 30 minutes
-    await cache.set(cacheKey, plans, 1800);
 
     res.json({ success: true, data: plans, timestamp: new Date() });
   } catch (error) {

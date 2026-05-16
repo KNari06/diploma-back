@@ -629,7 +629,7 @@ export interface RegressionPlanWithStats extends RegressionPlan {
   };
   lastRun: {
     runId: string;
-    status: string;
+    status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
     startedAt: string;
     completedAt: string | null;
     durationMs: number | null;
