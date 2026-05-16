@@ -16,7 +16,6 @@ import {
 import { NotFoundError, ValidationError } from '@/types';
 import type { PlanItemType, TestType } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
-import { cache } from '@/utils/core/redis-cache';
 import { Request, Response } from 'express';
 
 interface AuthenticatedRequest extends Request {
@@ -59,6 +58,8 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
       // Optional bulk initial items — when present, plan + items are
       // created atomically (rollback on any item failure). Frontend
       // wizard sends this to collapse N round-trips into 1. Other
@@ -88,6 +89,8 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
       items,
     });
 
@@ -146,18 +149,11 @@ export async function listPlans(req: AuthenticatedRequest, res: Response): Promi
 
     const userId = getUserId(req);
 
-    // Check cache first
-    const cacheKey = `qait:cache:plans:proj:${projectId}:${userId}`;
-    const cached = await cache.get(cacheKey);
-    if (cached) {
-      res.json({ success: true, data: cached, timestamp: new Date() });
-      return;
-    }
-
+    // No caching — health state is computed from live execution data and must
+    // always reflect the latest run results. Previously a 30-min cache caused
+    // the list to show stale health state (e.g. "passing") while the detail
+    // page (uncached) correctly showed the current state (e.g. "failing").
     const plans = await RegressionPlanService.listByProject(projectId, userId);
-
-    // Cache for 30 minutes
-    await cache.set(cacheKey, plans, 1800);
 
     res.json({ success: true, data: plans, timestamp: new Date() });
   } catch (error) {
@@ -172,7 +168,16 @@ export async function listPlans(req: AuthenticatedRequest, res: Response): Promi
 export async function updatePlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, description, isDefault, tags, automationConfig, notificationsEnabled } = req.body;
+    const {
+      name,
+      description,
+      isDefault,
+      tags,
+      automationConfig,
+      notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
+    } = req.body;
     const userId = getUserId(req);
 
     const plan = await RegressionPlanService.update({
@@ -184,6 +189,8 @@ export async function updatePlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
@@ -196,6 +203,8 @@ export async function updatePlan(req: AuthenticatedRequest, res: Response): Prom
         tags,
         automationConfig,
         notificationsEnabled,
+        mobileBuildMode,
+        pinnedMobileAppBuildId,
       })
         .filter(([, v]) => v !== undefined)
         .map(([k]) => k);

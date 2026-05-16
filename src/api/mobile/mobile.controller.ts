@@ -126,18 +126,27 @@ export async function createMobileAppUploadUrl(req: Request, res: Response): Pro
 /**
  * POST /api/v1/mobile/projects/:projectId/app/finalize
  *
- * Body: { storagePath, packageName, platform?, originalName?, branch?,
- *         commitSha?, buildNumber?, ciRunId? }
+ * Body: { storagePath, packageName, versionName?, versionCode?, platform?,
+ *         originalName?, branch?, commitSha?, buildNumber?, ciRunId? }
  *
  * Called after the client has finished `PUT`ing the file to Supabase. The
- * handler verifies the object exists, then runs the same post-upload work
- * the legacy multipart route does: delete previous APK, write
- * `projects.settings.mobileApp`, optionally insert a versioned build row,
- * kick off `autoBootAndInstall`.
+ * handler verifies the object exists, then:
+ *   1. Inserts a row in `mobile_app_builds` (REQUIRED — every upload now
+ *      lands in version history, not just CI uploads).
+ *   2. Updates the legacy `projects.settings.mobileApp` slot so the editor
+ *      warm-up keeps pointing at the latest binary.
+ *   3. Prunes builds beyond `BUILD_HISTORY_LIMIT` for this (project, platform).
+ *   4. Kicks off `autoBootAndInstall`.
  *
- * Mirrors the shape of `projects.settings.mobileApp` written by the old
- * multipart upload path so downstream consumers (resolver, runner) stay
- * identical.
+ * "version_name OR version_code" is enforced at the API edge — a project
+ * with N nameless builds is impossible to debug because every audit row
+ * looks identical, so the controller refuses uploads that don't supply
+ * at least one identifier.
+ *
+ * Old APKs are NOT deleted on every upload anymore — they live in storage
+ * until `pruneOldBuilds` rotates them out. This keeps the audit trail
+ * meaningful: opening a failed run from last week, the user can still
+ * download the exact APK that ran.
  */
 export async function finalizeMobileAppUpload(req: Request, res: Response): Promise<void> {
   const userId = req.user?.id;
@@ -154,11 +163,22 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     ? req.body.originalName.trim()
     : (storagePath.includes('/') ? storagePath.slice(storagePath.lastIndexOf('/') + 1) : storagePath);
 
+  // Version identity — at least one of versionName / versionCode required.
+  const versionName = typeof req.body?.versionName === 'string' && req.body.versionName.trim()
+    ? req.body.versionName.trim()
+    : undefined;
+  const versionCodeRaw = req.body?.versionCode;
+  let versionCode: number | undefined;
+  if (typeof versionCodeRaw === 'number' && Number.isFinite(versionCodeRaw) && versionCodeRaw >= 0) {
+    versionCode = Math.floor(versionCodeRaw);
+  } else if (typeof versionCodeRaw === 'string' && /^\d+$/.test(versionCodeRaw.trim())) {
+    versionCode = Number(versionCodeRaw.trim());
+  }
+
   const branch = trimMobileBuildField(req.body?.branch);
   const commitSha = trimMobileBuildField(req.body?.commitSha);
   const buildNumber = trimMobileBuildField(req.body?.buildNumber);
   const ciRunId = trimMobileBuildField(req.body?.ciRunId);
-  const hasBuildMeta = !!(branch || commitSha || buildNumber || ciRunId);
 
   if (!storagePath) {
     res.status(400).json({ success: false, error: 'storagePath is required (non-empty string)' });
@@ -168,6 +188,13 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     res.status(400).json({
       success: false,
       error: 'packageName is required (non-empty string). Android: package id (com.example.app); iOS: bundle ID.',
+    });
+    return;
+  }
+  if (!versionName && versionCode === undefined) {
+    res.status(400).json({
+      success: false,
+      error: 'versionName or versionCode is required so this build can be distinguished from earlier uploads.',
     });
     return;
   }
@@ -217,17 +244,8 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     return;
   }
 
-  // Delete previous APK from storage (legacy slot only — versioned builds
-  // are immutable history).
-  const existingApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
-  if (existingApp?.storagePath && existingApp.storagePath !== storagePath) {
-    logger.info('[MOBILE_API] Deleting previous app (finalize)', {
-      projectId,
-      oldStoragePath: existingApp.storagePath,
-    });
-    await MobileAppStorageService.deleteApp(existingApp.storagePath);
-  }
-
+  // Build the metadata once and reuse for both the legacy slot and the
+  // versioned `mobile_app_builds` row.
   const metadata = MobileAppStorageService.finaliseDirectUpload({
     workspaceId: project.workspace_id,
     projectId,
@@ -236,36 +254,66 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     storagePath,
     originalName,
     fileSize: stat.sizeBytes,
+    versionName,
+    versionCode,
   });
 
+  // 1. Record in `mobile_app_builds` FIRST. If this fails we abandon the
+  // upload before touching `projects.settings.mobileApp` — otherwise the
+  // legacy slot would point at a binary with no audit-trail row.
+  const buildRow = await MobileAppStorageService.recordBuild(
+    metadata,
+    { branch, commitSha, buildNumber, ciRunId, source: 'manual' },
+    { projectId, workspaceId: project.workspace_id, uploadedBy: userId },
+  );
+  if (!buildRow) {
+    // recordBuild already logged the cause. The most likely case is a
+    // duplicate commit_sha — the file is in storage but the DB rejected
+    // the insert. We don't delete the file from storage automatically
+    // because the existing row's storage_path may legitimately differ.
+    res.status(409).json({
+      success: false,
+      error: 'Failed to record build in version history (likely duplicate commit_sha for this project+platform).',
+    });
+    return;
+  }
+
+  // 2. Update the legacy slot so editor warm-up + `resolveAppForRun`'s
+  // last-resort fallback both keep working. Same shape as before.
   await ProjectService.updateProject(projectId, userId, {
     settings: {
       mobileApp: metadata as unknown as Record<string, unknown>,
     },
   });
 
-  if (hasBuildMeta) {
-    await MobileAppStorageService.recordBuild(
-      metadata,
-      { branch, commitSha, buildNumber, ciRunId, source: 'manual' },
-      { projectId, workspaceId: project.workspace_id, uploadedBy: userId },
-    );
-  }
-
   logger.info('[MOBILE_API] App finalized (signed-URL flow)', {
     projectId,
     platform,
+    buildId: buildRow.id,
     storagePath: metadata.storagePath,
     fileSize: metadata.fileSize,
-    versioned: hasBuildMeta,
+    versionName,
+    versionCode,
   });
 
   res.status(201).json({
     success: true,
     mobileApp: metadata,
+    build: buildRow,
   });
 
-  // Auto-boot emulator + install APK in background — same fire-and-forget
+  // 3. Prune old builds — fire-and-forget, must not block the response.
+  // Keeps storage cost bounded at BUILD_HISTORY_LIMIT * avg_apk_size per
+  // (project, platform).
+  MobileAppStorageService.pruneOldBuilds(projectId, platform).catch((err) => {
+    logger.warn('[MOBILE_API] pruneOldBuilds failed (non-fatal)', {
+      projectId,
+      platform,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+
+  // 4. Auto-boot emulator + install APK in background — same fire-and-forget
   // contract as the legacy upload route.
   autoBootAndInstall(projectId, userId, platform).catch((err) => {
     logger.warn('[MOBILE_API] Background auto-boot failed (non-fatal)', {
