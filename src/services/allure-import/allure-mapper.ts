@@ -805,7 +805,6 @@ export class HierarchyCache {
         moduleId,
         userId,
         name: featureName,
-        description: `Auto-created from Allure feature label during import`,
       });
 
       logger.info('[AllureMapper] Created flow from Allure feature', {
