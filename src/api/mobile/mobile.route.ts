@@ -13,62 +13,52 @@ import { requireAuth } from '@/middleware/auth.middleware';
 import { requireCiApiKey } from '@/middleware/api-key.middleware';
 import { asyncHandler } from '@/utils/core/error-handler';
 import { Router } from 'express';
-import multer from 'multer';
 import {
+  createMobileAppUploadUrl,
   deleteMobileApp,
+  finalizeMobileAppUpload,
   getMobileApp,
   getProjectPermissionPolicy,
   listMobileAppBuilds,
   patchMobileApp,
   setProjectPermissionPolicy,
-  uploadMobileApp,
 } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
 import { triggerCiRun, getCiRunStatus } from './ci.controller';
 import { warmupSession, destroySession, tapSession, swipeSession, goHomeSession, goBackSession, typeSession, keySession, lintSession, applySession, commandSession, runTestCaseOnSession } from './session.controller';
 
-// ── Multer config for APK/IPA uploads ────────────────────────────
-
-const appUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 500 * 1024 * 1024, // 500MB max
-    files: 1,
-  },
-  fileFilter: (_req, file, cb) => {
-    const allowed = [
-      'application/vnd.android.package-archive', // .apk
-      'application/octet-stream',                // .ipa / .aab
-      'application/x-ios-app',                   // .ipa alt
-    ];
-    // Also check by extension since mime type detection is unreliable for APKs
-    const ext = file.originalname.toLowerCase();
-    if (ext.endsWith('.apk') || ext.endsWith('.ipa') || ext.endsWith('.aab') || allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error(`Invalid file type. Allowed: .apk, .ipa, .aab`));
-    }
-  },
-});
-
 // ── Routes ───────────────────────────────────────────────────────
+//
+// APK/IPA upload uses a signed-URL flow (POST /app/upload-url then
+// POST /app/finalize) so the binary travels client → Supabase Storage
+// directly. The previous multipart POST /app route was hard-capped at
+// 32 MiB by Cloud Run's request-body limit and has been removed.
 
 const router = Router();
 
 /**
- * POST /api/v1/mobile/projects/:projectId/app
- * Upload APK/IPA for a project (replaces previous if exists)
- *
- * Body: multipart/form-data
- *   - file: APK/IPA/AAB file (required)
- *   - platform: 'android' | 'ios' (optional, default: 'android')
- *   - packageName: app package/bundle ID (optional)
+ * POST /api/v1/mobile/projects/:projectId/app/upload-url
+ * Step 1 of the signed-URL upload flow. Body: { filename, platform?, contentLength? }.
+ * Returns: { uploadUrl, token, storagePath }.
  */
 router.post(
-  '/projects/:projectId/app',
+  '/projects/:projectId/app/upload-url',
   requireAuth,
-  appUpload.single('file'),
-  asyncHandler(uploadMobileApp),
+  asyncHandler(createMobileAppUploadUrl),
+);
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/app/finalize
+ * Step 3 of the signed-URL upload flow. Body: { storagePath, packageName,
+ * platform?, originalName?, branch?, commitSha?, buildNumber?, ciRunId? }.
+ *
+ * Verifies the object exists in Supabase Storage and writes metadata into
+ * `projects.settings.mobileApp` (and optionally `mobile_app_builds`).
+ */
+router.post(
+  '/projects/:projectId/app/finalize',
+  requireAuth,
+  asyncHandler(finalizeMobileAppUpload),
 );
 
 /**

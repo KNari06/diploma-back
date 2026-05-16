@@ -783,8 +783,64 @@ export function getEffectiveLabel(node: InteractiveNode | undefined | null): str
   ).toString();
 }
 
+/**
+ * Is this node a LEAF item inside an active popup/dropdown — the kind of
+ * thing a user would actually pick from the list? Used to:
+ *   1. Sort popup elements in buildSceneSummary so options come first,
+ *      not the input that opened the popup.
+ *   2. Emit the `[popup-option]` candidateText hint so the LLM
+ *      disambiguates options from triggers/filters inside the popup.
+ *
+ * Universal heuristic — derived from data the collector already populates,
+ * NO ARIA role allowlist. Works for any taxonomy (option / menuitem /
+ * gridcell / treeitem / future roles) AND for popups whose items have no
+ * ARIA role at all (Wikipedia search results are bare <a>; ant-design
+ * AutoComplete uses <div class="ant-select-item">; Cmdk renders plain
+ * <li>; all common in the wild). Excludes the two things that are clearly
+ * NOT pickable items: the trigger that opened the popup, and any text-
+ * input / textarea / native <select> inside it.
+ *
+ * Caller guarantees `isInsideActiveModal === true` before invoking — this
+ * predicate does NOT recheck overlay membership.
+ */
+function isPopupOptionCandidate(n: InteractiveNode): boolean {
+  // Trigger combobox / disclosure button that owns the popup — never an option.
+  if (n.ariaExpanded === true) return false;
+
+  // Filter / search input inside the popup — not a pickable option.
+  const tagLc = (n.tag || '').toLowerCase();
+  if (tagLc === 'input' || tagLc === 'textarea' || tagLc === 'select') return false;
+
+  // Must have something a user can name. Bare wrapper <div>s with no
+  // text/label/aria carry no semantic anchor for an intent to match.
+  if (!(getEffectiveLabel(n) || '').trim()) return false;
+
+  return true;
+}
+
 export function buildCandidateText(node: InteractiveNode): string {
   const parts: string[] = [];
+
+  // Popup/overlay membership FIRST — surfaced ahead of everything else
+  // because (a) it gates the popup-scope rules in the LLM prompt
+  // (Rule 8 + Rule 18 EXCEPTION) and (b) the candidate text is hard-
+  // capped at MAX_CANDIDATE_TEXT_LENGTH (280 chars); putting these
+  // hints at the end of a dense candidate (long label + container +
+  // href + icon + bbox) risks them being sliced off, which silently
+  // breaks the popup-aware path. Two complementary tags:
+  //   • [active-layer] — node is inside the foreground modal/popup
+  //     (set by snapshot collector via z-index / role=dialog /
+  //      aria-modal / modal-class heuristics).
+  //   • [popup-option] — node is a LEAF inside that popup (not the
+  //     trigger / filter input), scored from data the collector
+  //     already populates. Lets the LLM disambiguate the option
+  //     "Sun · Star…" from the search input that opened the popup.
+  if (node.isInsideActiveModal) {
+    parts.push('[active-layer]');
+    if (isPopupOptionCandidate(node)) {
+      parts.push('[popup-option]');
+    }
+  }
 
   // Container context FIRST (hierarchy awareness)
   // Phase 7: Include landmark role for richer context
@@ -997,10 +1053,10 @@ export function buildCandidateText(node: InteractiveNode): string {
     parts.push(`[${stateHints.join(', ')}]`);
   }
 
-  // Active layer hint (element is inside the foreground modal/popup/dropdown overlay)
-  if (node.isInsideActiveModal) {
-    parts.push('[active-layer]');
-  }
+  // [active-layer] / [popup-option] are emitted at the TOP of the
+  // candidate text now (see top of this function) so they survive the
+  // MAX_CANDIDATE_TEXT_LENGTH truncation on dense candidates. This used
+  // to be the only emission site for the layer hint.
 
   // V8: Visual properties — enables "grey button", "rounded icon", "red cancel"
   const visualHints: string[] = [];
@@ -1087,38 +1143,16 @@ export function buildSceneSummary(
   const modalElements = candidates.filter(c => c.node.isInsideActiveModal === true);
   if (modalElements.length > 0) {
     // Sort "leaf items" first (the things a user would actually pick from
-    // the popup), "container/trigger" elements last.
-    //
-    // Why not a hardcoded role list ([option, menuitem, row, …]):
-    //   – ARIA roles evolve (treeitem, gridcell, menuitemcheckbox, tab,
-    //     listitem, rowheader, …); custom design systems invent more
-    //     (role="suggestion" for typeaheads, role="row" for grid pickers).
-    //     A static set always lags behind.
-    //   – Many real popups have option-shaped children with NO role at
-    //     all (Wikipedia search popup options are bare <a>; ant-design
-    //     AutoComplete uses <div class="ant-select-item">; Cmdk renders
-    //     <li> without role). Filtering by role would hide them entirely.
-    //
-    // Universal heuristic — score each modal element on signals the
-    // collector already populates, no role allowlist:
-    //   • ariaExpanded === true → it's a TRIGGER (combobox / disclosure
-    //     button that opened the popup). NOT what the user picks.
-    //   • tag in {input, textarea, select} → the search box / filter
-    //     control inside the popup, not a leaf item.
-    //   • has visible text (text / labelText / ariaLabel / title) →
-    //     it's something a user can name. Bare wrappers rank last.
-    const scoreLeafness = (n: InteractiveNode): number => {
-      let s = 0;
-      if (n.ariaExpanded === true) s -= 3;
-      const tagLc = (n.tag || '').toLowerCase();
-      if (tagLc === 'input' || tagLc === 'textarea' || tagLc === 'select') s -= 2;
-      const hasText = !!(getEffectiveLabel(n) || '').trim();
-      if (hasText) s += 2;
-      return s;
-    };
-    const optionsFirst = [...modalElements].sort(
-      (a, b) => scoreLeafness(b.node) - scoreLeafness(a.node),
-    );
+    // the popup), "container/trigger" elements last. Same predicate
+    // (`isPopupOptionCandidate`) is used by buildCandidateText to emit the
+    // [popup-option] hint — keeping both signals consistent so the LLM's
+    // PAGE STATE summary lists the same items it sees marked in
+    // candidateText. No role allowlist; see the predicate for rationale.
+    const optionsFirst = [...modalElements].sort((a, b) => {
+      const aIsOption = isPopupOptionCandidate(a.node) ? 0 : 1;
+      const bIsOption = isPopupOptionCandidate(b.node) ? 0 : 1;
+      return aIsOption - bIsOption;
+    });
     const labels: string[] = [];
     const seen = new Set<string>();
     for (const c of optionsFirst) {
@@ -1823,6 +1857,14 @@ const LLM_SHARED_RULES = `RULES:
    popup-scoped intent — match the intent's anchor to one of them by
    semantic / substring / cross-language overlap, not to background
    elements outside the popup.
+
+   CANDIDATE-LEVEL HINTS (emitted at the START of each candidate row,
+   before the label — guaranteed visible inside the 280-char cap):
+     • "[active-layer]"  — node is inside the foreground popup/modal.
+     • "[popup-option]"  — node is a LEAF item inside that popup (not
+       the trigger or filter input). For popup-scoped intents you
+       SHOULD prefer candidates carrying [popup-option] over plain
+       [active-layer], and either over background elements.
 
 9. ANCESTOR PATH HINT (V22):
    The fingerprint may include "ancestorPath=...header#layout-header > div.icon-group > svg"
@@ -2776,6 +2818,12 @@ Select the single best matching element, or return ref=null if the intent does n
   const llmCallStart = Date.now();
   let llmCallMs = 0;
 
+  // V27 observability — snapshot the breaker counter BEFORE the call so
+  // we can correlate "this run had 2/3 failures already" with whatever
+  // happens next. Without this, the breaker is invisible until it fully
+  // trips; the lead-up drift is lost.
+  const breakerFailuresPrior = llmSelectFailures;
+
   try {
     // Primary Gemini Flash Lite → fallback AI_MODELS.fast (gpt-5.4-mini)
     // when Gemini errors out (503 / timeout / abort). Each provider gets
@@ -2828,6 +2876,14 @@ Select the single best matching element, or return ref=null if the intent does n
     };
 
     let response;
+    // V27 observability — track which provider actually produced the
+    // response. Logged in `[LLM_SELECT] Element selection complete` so
+    // operators can spot silent Gemini degradation (when Gemini fails
+    // ~50% of the time and OpenAI fallback quietly wins, the breaker
+    // never opens — but a sharp rise of `providerUsed=openai-fast` in
+    // metrics surfaces it immediately).
+    let providerUsed: 'primary' | 'fallback' = 'primary';
+    let modelUsed: string = AI_TASK_MODELS.disambiguation;
     try {
       response = await callWithModel(AI_TASK_MODELS.disambiguation);
     } catch (primaryErr) {
@@ -2847,6 +2903,8 @@ Select the single best matching element, or return ref=null if the intent does n
         primaryWasAborted: !controller.signal.aborted,  // true ⇒ inner-only abort, fallback worth a try
       });
       response = await callWithModel(FALLBACK);
+      providerUsed = 'fallback';
+      modelUsed = FALLBACK;
     }
 
     llmCallMs = Date.now() - llmCallStart;
@@ -3297,10 +3355,14 @@ Select the single best matching element, or return ref=null if the intent does n
 
     recordLlmSelectSuccess();
 
-    // Attach LLM trace for diagnostics (not cached, only on fresh calls)
+    // Attach LLM trace for diagnostics (not cached, only on fresh calls).
+    // V27: _model now reflects the model that ACTUALLY produced this
+    // response — not always the primary. Lets postmortem traces and
+    // editor JSONL show "this answer came from OpenAI fallback, not
+    // Gemini" without having to cross-reference the warn line above.
     result._prompt = userPrompt;
     result._response = content;
-    result._model = AI_TASK_MODELS.disambiguation;
+    result._model = modelUsed;
 
     // V23: phase breakdown — prepareMs (build prompt), llmCallMs (network),
     // postMs (parse + validate + suggestion). totalMs is from startTime.
@@ -3320,6 +3382,18 @@ Select the single best matching element, or return ref=null if the intent does n
       promptChars,
       candidateCount: candidates.length,
       actionType,
+      // V27 observability — answers "which provider/model won this turn?"
+      // and "which prompt was used?". Without these:
+      //   - silent Gemini degradation is invisible (fallback wins, no
+      //     breaker increment); now visible as a spike in providerUsed=fallback.
+      //   - "why did the LLM reject?" debugging required cross-referencing
+      //     the cache-key string; now mode is on the same log line.
+      //   - prior-run failure counter helps spot pre-outage drift
+      //     (e.g. 1/3 or 2/3 failures before a full breaker trip).
+      providerUsed,
+      modelUsed,
+      mode,
+      breakerFailuresPrior,
       // Etap 1D.4 — track which channels were available so we can build
       // metrics like "% of LLM calls with description hint" and detect
       // regressions where the channel stops getting populated upstream.
@@ -3334,11 +3408,19 @@ Select the single best matching element, or return ref=null if the intent does n
     recordLlmSelectFailure();
 
     const errorMsg = error instanceof Error ? error.message : String(error);
+    // V27 observability — same fields as the success log so a single
+    // grep of `event:"llm_select_*"` gives full picture. `breakerOpened`
+    // tells operators whether this failure was the one that tripped the
+    // circuit breaker (counter post-increment ≥ threshold).
     logger.warn('[LLM_SELECT] Failed', {
       event: 'llm_select_failed',
       error: errorMsg,
       candidateCount: candidates.length,
       latencyMs: Date.now() - startTime,
+      mode,
+      breakerFailuresPrior,
+      breakerFailuresPost: llmSelectFailures,
+      breakerOpened: llmSelectFailures >= LLM_SELECT_BREAKER_THRESHOLD,
     });
 
     throw error;

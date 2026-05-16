@@ -349,6 +349,82 @@ export class SnapshotCollector {
             }
           }
 
+          // ═══════════════════════════════════════════════════════════════
+          // LAYER 3: ARIA-EXPANDED / ARIA-CONTROLS FALLBACK
+          //
+          // Many real-world popups (Wikipedia/MediaWiki Codex typeahead,
+          // MUI Autocomplete, Headless UI Combobox, ant-design Select,
+          // Cmdk command palette, native <datalist>) do NOT use
+          // role="dialog" / aria-modal="true" (so Layer 1 misses them),
+          // AND are deeply nested with CSS-class-defined positioning (so
+          // Layer 2's "body > * > *" + inline-style selector misses them).
+          //
+          // What they DO have, almost universally, is a TRIGGER with
+          // `aria-expanded="true"` pointing at the popup via
+          // `aria-controls="<popup-id>"`. WAI-ARIA spec mandates this
+          // pattern for any disclosure widget — so it's the most
+          // standards-correct popup signal available, with effectively
+          // zero false-positive risk: an open trigger that points at a
+          // visible referenced element IS a popup.
+          //
+          // Why this is safe (zero false positives):
+          //   - aria-expanded="true" is set only when the popup is OPEN
+          //     (set to "false" or removed when closed)
+          //   - aria-controls names the EXACT element being controlled
+          //   - We re-verify the referenced element is actually visible
+          //     (display/visibility/opacity) and meaningful (≥1% viewport)
+          //   - We pick the highest-z-index controlled element when
+          //     multiple disclosures are open (e.g. nested menus)
+          // ═══════════════════════════════════════════════════════════════
+          const expandedTriggers = Array.from(
+            document.querySelectorAll('[aria-expanded="true"][aria-controls]'),
+          );
+          let bestControlled: Element | null = null;
+          let highestControlledZ = -1;
+          for (const trig of expandedTriggers) {
+            const controlsId = trig.getAttribute('aria-controls');
+            if (!controlsId) continue;
+            // aria-controls may list multiple IDs separated by spaces —
+            // take the first one (the primary controlled element).
+            const firstId = controlsId.split(/\s+/)[0];
+            if (!firstId) continue;
+            // Use getElementById (not querySelector) — aria-controls is an
+            // IDREF, so it must match a literal id without CSS-escape
+            // gymnastics for `:` / `.` characters that React 18 useId()
+            // and design-system slugs commonly emit.
+            const controlled = document.getElementById(firstId);
+            if (!controlled) continue;
+            // Same visibility/sanity gates as Layer 1 / Layer 2.
+            const cs = window.getComputedStyle(controlled);
+            if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+            if (parseFloat(cs.opacity) < 0.1) continue;
+            const cRect = controlled.getBoundingClientRect();
+            // @ts-expect-error - window available in browser context
+            const vpAreaL3 = window.innerWidth * window.innerHeight;
+            const cCoverage = vpAreaL3 > 0 ? (cRect.width * cRect.height) / vpAreaL3 : 0;
+            // Lower threshold than Layer 2 (0.5% vs 1%) because typeahead
+            // suggestion menus can be very narrow (single-column dropdown
+            // under a search box). Still excludes 0-dim animating-in elements.
+            if (cCoverage < 0.005) continue;
+            const cZ = parseInt(cs.zIndex, 10);
+            // z-index may be auto / 0 for elements that rely on stacking
+            // context — coerce NaN to 0 instead of skipping, because the
+            // aria-controls relationship is itself strong evidence and we
+            // don't want to over-filter on z-index here.
+            const cZNum = isNaN(cZ) ? 0 : cZ;
+            if (cZNum > highestControlledZ) {
+              highestControlledZ = cZNum;
+              bestControlled = controlled;
+            }
+          }
+          if (bestControlled) {
+            const existingRef = bestControlled.getAttribute('data-agent-ref');
+            if (existingRef) return existingRef;
+            const newRef = `e${win.__agentRefCounter++}`;
+            bestControlled.setAttribute('data-agent-ref', newRef);
+            return newRef;
+          }
+
           return undefined;
         };
 

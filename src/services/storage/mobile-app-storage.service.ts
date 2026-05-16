@@ -184,6 +184,134 @@ export class MobileAppStorageService {
   }
 
   /**
+   * Build a deterministic storage path for an upcoming upload — used by the
+   * signed-URL flow so the path is decided server-side (clients can't pick
+   * arbitrary locations) but the binary is uploaded directly client→Supabase,
+   * bypassing the 32 MiB Cloud Run request limit.
+   */
+  private static buildStoragePath(params: {
+    workspaceId: string;
+    projectId: string;
+    platform: MobilePlatform;
+    originalName: string;
+  }): { storagePath: string; ext: string } {
+    const ext = path.extname(params.originalName).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.includes(ext)) {
+      throw new Error(
+        `Invalid file type: ${ext}. Allowed: ${ALLOWED_EXTENSIONS.join(', ')}`,
+      );
+    }
+    const safeName = path.basename(params.originalName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const fileName = `${safeName}_${Date.now()}${ext}`;
+    const storagePath = `mobile-apps/${params.workspaceId}/${params.projectId}/${params.platform}/${fileName}`;
+    return { storagePath, ext };
+  }
+
+  /**
+   * Create a one-time signed upload URL. The client PUTs the APK/IPA directly
+   * to Supabase Storage using this URL, so the binary never transits the
+   * backend. Path is decided here so callers can't write outside their own
+   * project tree.
+   *
+   * Caller MUST verify project access BEFORE calling — this method only
+   * deals with storage, not authorisation.
+   */
+  static async createSignedUploadUrl(params: {
+    workspaceId: string;
+    projectId: string;
+    platform: MobilePlatform;
+    originalName: string;
+  }): Promise<{ uploadUrl: string; token: string; storagePath: string }> {
+    const { storagePath } = this.buildStoragePath(params);
+
+    const { data, error } = await supabaseAdmin.storage
+      .from(BUCKET)
+      .createSignedUploadUrl(storagePath);
+
+    if (error || !data?.signedUrl || !data?.token) {
+      logger.error('[MOBILE_APP_STORAGE] createSignedUploadUrl failed', {
+        error: error?.message,
+        storagePath,
+      });
+      throw new Error(`Failed to create signed upload URL: ${error?.message || 'Unknown error'}`);
+    }
+
+    logger.info('[MOBILE_APP_STORAGE] Issued signed upload URL', {
+      projectId: params.projectId,
+      platform: params.platform,
+      storagePath,
+    });
+
+    return {
+      uploadUrl: data.signedUrl,
+      token: data.token,
+      storagePath,
+    };
+  }
+
+  /**
+   * Confirm an object exists at `storagePath` and return its real size +
+   * mime-type. Called by the finalize endpoint to refuse requests that point
+   * at a missing or empty object (e.g. user got an upload URL but never PUT
+   * the file).
+   *
+   * Returns null when the object is not present.
+   */
+  static async statObject(storagePath: string): Promise<{ sizeBytes: number; contentType: string | null } | null> {
+    // Supabase JS SDK doesn't expose HEAD directly; list the parent prefix
+    // filtered by the basename. Cheap (one row) and avoids downloading.
+    const parent = storagePath.includes('/') ? storagePath.slice(0, storagePath.lastIndexOf('/')) : '';
+    const name = storagePath.includes('/') ? storagePath.slice(storagePath.lastIndexOf('/') + 1) : storagePath;
+
+    const { data, error } = await supabaseAdmin.storage
+      .from(BUCKET)
+      .list(parent, { search: name, limit: 1 });
+
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] statObject list failed', {
+        error: error.message,
+        storagePath,
+      });
+      return null;
+    }
+    const row = (data || []).find((r) => r.name === name);
+    if (!row) return null;
+
+    const sizeBytes = Number((row.metadata as any)?.size ?? 0);
+    const contentType = ((row.metadata as any)?.mimetype as string | undefined) ?? null;
+    return { sizeBytes, contentType };
+  }
+
+  /**
+   * Build a MobileAppMetadata for an APK/IPA that was uploaded directly by
+   * the client via a signed URL — i.e. the backend never saw the buffer.
+   * Mirrors what `uploadApp` returns so downstream consumers stay identical.
+   */
+  static finaliseDirectUpload(params: {
+    workspaceId: string;
+    projectId: string;
+    platform: MobilePlatform;
+    packageName: string;
+    storagePath: string;
+    originalName: string;
+    fileSize: number;
+  }): MobileAppMetadata {
+    const { data: urlData } = supabaseAdmin.storage
+      .from(BUCKET)
+      .getPublicUrl(params.storagePath);
+
+    return {
+      platform: params.platform,
+      packageName: params.packageName,
+      storagePath: params.storagePath,
+      publicUrl: urlData.publicUrl,
+      originalName: params.originalName,
+      fileSize: params.fileSize,
+      uploadedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
    * Delete a previously uploaded app from Supabase Storage.
    * Best-effort — logs errors but doesn't throw.
    */
