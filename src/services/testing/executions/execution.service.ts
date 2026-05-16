@@ -130,6 +130,7 @@ export class ExecutionService {
       screenshotUrl,
       traceUrl,
       executedResources,
+      mobileAppBuildId,
     } = params;
 
     const updates: Record<string, any> = { status };
@@ -142,6 +143,9 @@ export class ExecutionService {
     // executed_resources is NOT NULL DEFAULT '[]'::jsonb in the schema;
     // send the array as-is (supabase-js will JSON-encode the jsonb column).
     if (executedResources !== undefined) updates.executed_resources = executedResources;
+    // null is meaningful here (legacy / unversioned upload) and we want
+    // to persist it explicitly. `undefined` means "leave alone".
+    if (mobileAppBuildId !== undefined) updates.mobile_app_build_id = mobileAppBuildId;
 
     // Set timestamps based on status
     if (status === 'running') {

@@ -58,6 +58,8 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
       // Optional bulk initial items — when present, plan + items are
       // created atomically (rollback on any item failure). Frontend
       // wizard sends this to collapse N round-trips into 1. Other
@@ -87,6 +89,8 @@ export async function createPlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
       items,
     });
 
@@ -164,7 +168,16 @@ export async function listPlans(req: AuthenticatedRequest, res: Response): Promi
 export async function updatePlan(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const { id } = req.params;
-    const { name, description, isDefault, tags, automationConfig, notificationsEnabled } = req.body;
+    const {
+      name,
+      description,
+      isDefault,
+      tags,
+      automationConfig,
+      notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
+    } = req.body;
     const userId = getUserId(req);
 
     const plan = await RegressionPlanService.update({
@@ -176,6 +189,8 @@ export async function updatePlan(req: AuthenticatedRequest, res: Response): Prom
       tags,
       automationConfig,
       notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
     });
 
     res.json({ success: true, data: plan, timestamp: new Date() });
@@ -188,6 +203,8 @@ export async function updatePlan(req: AuthenticatedRequest, res: Response): Prom
         tags,
         automationConfig,
         notificationsEnabled,
+        mobileBuildMode,
+        pinnedMobileAppBuildId,
       })
         .filter(([, v]) => v !== undefined)
         .map(([k]) => k);

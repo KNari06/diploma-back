@@ -46,7 +46,7 @@ export class RegressionPlanService {
    * @returns Created plan
    */
   static async create(params: CreateRegressionPlanParams): Promise<RegressionPlan> {
-    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled, items } = params;
+    const { projectId, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled, mobileBuildMode, pinnedMobileAppBuildId, items } = params;
 
     logger.info('[REGRESSION_PLAN_SERVICE] Creating plan', {
       projectId,
@@ -65,6 +65,14 @@ export class RegressionPlanService {
         .eq('is_default', true);
     }
 
+    // Build pinning: defaulting `mobile_build_mode` here (not just in the
+    // DB DEFAULT) means we don't depend on the column being present —
+    // safer during the lazy rollout when some envs may run code ahead of
+    // the migration. A 'pinned' mode with no buildId is normalised to
+    // 'latest' so the resolver never has to special-case a half-set pin.
+    const resolvedBuildMode: 'latest' | 'pinned' =
+      mobileBuildMode === 'pinned' && pinnedMobileAppBuildId ? 'pinned' : 'latest';
+
     const { data, error } = await supabaseAdmin
       .from('regression_plans')
       .insert({
@@ -76,6 +84,8 @@ export class RegressionPlanService {
         tags: tags || [],
         automation_config: automationConfig || null,
         notifications_enabled: notificationsEnabled !== undefined ? notificationsEnabled : true,
+        mobile_build_mode: resolvedBuildMode,
+        pinned_mobile_app_build_id: resolvedBuildMode === 'pinned' ? pinnedMobileAppBuildId : null,
       })
       .select('*')
       .single();
@@ -578,7 +588,18 @@ export class RegressionPlanService {
    * @returns Updated plan
    */
   static async update(params: UpdateRegressionPlanParams): Promise<RegressionPlan> {
-    const { id, userId, name, description, isDefault, tags, automationConfig, notificationsEnabled } = params;
+    const {
+      id,
+      userId,
+      name,
+      description,
+      isDefault,
+      tags,
+      automationConfig,
+      notificationsEnabled,
+      mobileBuildMode,
+      pinnedMobileAppBuildId,
+    } = params;
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
@@ -586,6 +607,25 @@ export class RegressionPlanService {
     if (tags !== undefined) updates.tags = tags;
     if (automationConfig !== undefined) updates.automation_config = automationConfig;
     if (notificationsEnabled !== undefined) updates.notifications_enabled = notificationsEnabled;
+
+    // Mobile build pinning. The two fields can move together or
+    // separately — caller might just toggle the mode, or just swap
+    // which build is pinned. Switching mode to 'latest' clears the
+    // pinned id explicitly so a stale UUID doesn't linger in the row.
+    if (mobileBuildMode !== undefined) {
+      updates.mobile_build_mode = mobileBuildMode;
+      if (mobileBuildMode === 'latest') {
+        updates.pinned_mobile_app_build_id = null;
+      }
+    }
+    if (pinnedMobileAppBuildId !== undefined) {
+      updates.pinned_mobile_app_build_id = pinnedMobileAppBuildId;
+      // If the caller sets a buildId without also setting mode, assume
+      // they want to pin. Setting to null without mode means "unpin".
+      if (mobileBuildMode === undefined) {
+        updates.mobile_build_mode = pinnedMobileAppBuildId ? 'pinned' : 'latest';
+      }
+    }
 
     // Handle is_default separately
     if (isDefault !== undefined) {
@@ -1426,6 +1466,10 @@ export class RegressionPlanService {
       automationConfig: row.automation_config || undefined,
       notificationsEnabled: row.notifications_enabled ?? true,
       scheduleId: row.schedule_id || undefined,
+      // Pre-migration rows return null for these — default to 'latest'
+      // so the run path doesn't have to handle absent values.
+      mobileBuildMode: (row.mobile_build_mode as 'latest' | 'pinned') ?? 'latest',
+      pinnedMobileAppBuildId: row.pinned_mobile_app_build_id ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };

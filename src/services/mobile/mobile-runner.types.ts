@@ -409,16 +409,23 @@ export interface MobileTestJobData {
   /** Original filename of the APK/IPA */
   appOriginalName?: string;
   /**
-   * CI buildNumber for the resolved APK — used as a proxy for Android's
-   * `versionCode` when validating fast-auth snapshots. When this value
-   * differs from the snapshot's `apkVersionCode`, the compiler invalidates
-   * the snapshot and falls back to recipe replay. Undefined for direct-
-   * uploaded APKs (the version gate is permissive in that case — we trust
-   * TTL + runtime restore failure). Not authoritative; replace with a real
-   * APK metadata extraction step at upload time if telemetry shows version
-   * drift is a common cause of failed restores.
+   * Real `versionCode` from the build (Android versionCode / iOS
+   * CFBundleVersion). Supplied by the uploader at finalize time. Used
+   * by the fast-auth snapshot gate — when this differs from the
+   * snapshot's `apkVersionCode`, the compiler invalidates the snapshot
+   * and falls back to recipe replay. Falls back to CI buildNumber for
+   * legacy uploads that pre-date explicit version capture. Undefined
+   * when neither is available — the version gate degrades to TTL +
+   * runtime-failure invalidation, acceptable for v1.
    */
   appVersionCode?: number;
+  /**
+   * Human-readable version string ("1.2.3"). Carried purely for
+   * logging / display in runner output — NOT used in any gating
+   * decision (numeric `appVersionCode` is the single source of truth
+   * for fast-auth invalidation).
+   */
+  appVersionName?: string;
   // ── CI/CD fields ──────────────────────────────────────────────
   /** CI run ID for tracking grouped test executions */
   ciRunId?: string;

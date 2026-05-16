@@ -52,7 +52,7 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     appUrl,
     callbackUrl,
     platform: rawPlatform,
-    // Phase 5: optional git metadata. When provided alongside appUrl, the
+    // Optional git metadata. When provided alongside appUrl, the
     // resulting APK is also recorded in `mobile_app_builds` so future
     // git-triggered runs on the same branch / commit can re-use it
     // without a fresh download.
@@ -60,6 +60,13 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     commitSha: rawCommitSha,
     buildNumber: rawBuildNumber,
     ciRunId: rawCiRunId,
+    // Version identity (one of versionName / versionCode required when
+    // appUrl is supplied — same contract as the interactive finalize
+    // endpoint). The CI variant is forgiving: a CI pipeline almost
+    // always has a versionCode equal to the build number, and pipelines
+    // that don't are easy to update once.
+    versionName: rawVersionName,
+    versionCode: rawVersionCode,
   } = req.body as {
     savedTestCaseIds?: string[];
     planId?: string;
@@ -70,6 +77,8 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     commitSha?: string;
     buildNumber?: string;
     ciRunId?: string;
+    versionName?: string;
+    versionCode?: number | string;
   };
 
   // Shared normaliser — same helper as mobile.controller.ts so both upload
@@ -78,7 +87,16 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
   const commitSha = trimMobileBuildField(rawCommitSha);
   const buildNumber = trimMobileBuildField(rawBuildNumber);
   const ciRunId = trimMobileBuildField(rawCiRunId);
-  const hasBuildMeta = !!(branch || commitSha || buildNumber || ciRunId);
+
+  const versionName = typeof rawVersionName === 'string' && rawVersionName.trim()
+    ? rawVersionName.trim()
+    : undefined;
+  let versionCode: number | undefined;
+  if (typeof rawVersionCode === 'number' && Number.isFinite(rawVersionCode) && rawVersionCode >= 0) {
+    versionCode = Math.floor(rawVersionCode);
+  } else if (typeof rawVersionCode === 'string' && /^\d+$/.test(rawVersionCode.trim())) {
+    versionCode = Number(rawVersionCode.trim());
+  }
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
@@ -114,6 +132,17 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
     let appPackage: string | undefined;
 
     if (appUrl) {
+      // Require version identity — same contract as the interactive
+      // finalize endpoint. Without this, every CI build looks identical
+      // in the audit trail and `pruneOldBuilds` becomes destructive.
+      if (!versionName && versionCode === undefined) {
+        res.status(400).json({
+          success: false,
+          error: 'versionName or versionCode is required so this build can be distinguished from earlier uploads.',
+        });
+        return;
+      }
+
       // Rate limit: 1 APK upload per project per 5 min
       const lockKey = `${APK_UPLOAD_LOCK_PREFIX}${projectId}`;
       const lockResult = await redisConnection.set(lockKey, '1', 'EX', APK_UPLOAD_LOCK_TTL, 'NX');
@@ -169,13 +198,10 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
           return;
         }
 
-        // Delete previous app if exists
-        const existingApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
-        if (existingApp?.storagePath) {
-          await MobileAppStorageService.deleteApp(existingApp.storagePath);
-        }
-
-        // Upload to Supabase Storage
+        // Upload to Supabase Storage. The previous APK is NOT deleted
+        // here — old binaries live until `pruneOldBuilds` rotates them
+        // out, so historical CI runs can still be re-installed for
+        // debugging.
         const multerLikeFile = {
           buffer,
           originalname: originalName,
@@ -187,8 +213,31 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
           projectId,
           platform,
         });
+        // Attach version identity onto the metadata so recordBuild +
+        // the legacy slot both carry it. uploadApp doesn't know about
+        // version fields (its signature is intentionally narrow).
+        if (versionName) metadata.versionName = versionName;
+        if (typeof versionCode === 'number') metadata.versionCode = versionCode;
 
-        // Update project settings
+        // Record in `mobile_app_builds` BEFORE updating the legacy slot —
+        // if the insert fails we don't want a legacy pointer to a build
+        // that isn't audit-traceable.
+        const buildRow = await MobileAppStorageService.recordBuild(
+          metadata,
+          { branch, commitSha, buildNumber, ciRunId, source: 'ci' },
+          { projectId, workspaceId, uploadedBy: userId },
+        );
+        if (!buildRow) {
+          await redisConnection.del(lockKey);
+          res.status(409).json({
+            success: false,
+            error: 'Failed to record build in version history (likely duplicate commit_sha for this project+platform).',
+          });
+          return;
+        }
+
+        // Update project settings (legacy slot — points at the newest
+        // upload so the editor warm-up resolves to the right binary).
         await ProjectService.updateProject(projectId, userId, {
           settings: {
             mobileApp: metadata as unknown as Record<string, unknown>,
@@ -199,26 +248,28 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
         appOriginalName = metadata.originalName;
         appPackage = metadata.packageName;
 
-        // Phase 5: record a versioned build when the caller provided git
-        // metadata (same helper used by the interactive upload endpoint).
-        // Best-effort — a failure here MUST NOT fail the CI run (APK
-        // already in storage + legacy slot).
-        if (hasBuildMeta) {
-          await MobileAppStorageService.recordBuild(
-            metadata,
-            { branch, commitSha, buildNumber, ciRunId, source: 'ci' },
-            { projectId, workspaceId, uploadedBy: userId },
-          );
-        }
-
         logger.info('[CI] APK uploaded from URL', {
           projectId,
           appUrl,
           storagePath: appStoragePath,
           size: buffer.length,
+          buildId: buildRow.id,
+          versionName,
+          versionCode,
           branch,
           commitSha,
-          versioned: hasBuildMeta,
+        });
+
+        // Fire-and-forget prune — must not block CI response, must not
+        // throw. Trims storage to BUILD_HISTORY_LIMIT newest per
+        // (project, platform); `ON DELETE SET NULL` keeps execution
+        // history rows intact.
+        MobileAppStorageService.pruneOldBuilds(projectId, platform).catch((err) => {
+          logger.warn('[CI] pruneOldBuilds failed (non-fatal)', {
+            projectId,
+            platform,
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
       } catch (err) {
         // Release rate limit lock on failure

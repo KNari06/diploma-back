@@ -594,7 +594,7 @@ export class RegressionRunService {
      * Undefined for manual / scheduled runs → resolver falls back to
      * legacy `projects.settings.mobileApp`.
      */
-    triggerContext?: { branch?: string; commitSha?: string },
+    triggerContext?: { branch?: string; commitSha?: string; buildId?: string },
     /**
      * Phase 6: runtime parameters from the caller (e.g. `runPlan({ parameters })`).
      * Applied to `intentCase.steps_json` before stitching so placeholders in
@@ -609,7 +609,7 @@ export class RegressionRunService {
      * single-case manual dispatch (no batch) — the job skips the update.
      */
     analyticsExecutionId?: string,
-  ): Promise<{ testId: string; jobId: string }> {
+  ): Promise<{ testId: string; jobId: string; appBuildId: string | null }> {
     // 1. Resolve platform and browser
     const PLATFORM_MAP: Record<string, MobilePlatform> = {
       mobile_ios: 'ios',
@@ -642,6 +642,7 @@ export class RegressionRunService {
     const resolvedBuild = await MobileAppStorageService.resolveAppForRun({
       projectId: intentCase.project_id,
       platform,
+      buildId: triggerContext?.buildId,
       branch: triggerContext?.branch,
       commitSha: triggerContext?.commitSha,
     });
@@ -739,11 +740,20 @@ export class RegressionRunService {
         platform,
         trigger,
         appPackage: resolvedBuild?.packageName,
-        // Phase 5: preserve which APK actually ran for this test — helps
-        // when debugging "test failed on prod build vs. on PR branch".
+        // Preserve which APK actually ran for this test — helps when
+        // debugging "test failed on prod build vs. on PR branch", and
+        // survives `pruneOldBuilds` because it lives on `tests.options`
+        // (which is never pruned), not on `mobile_app_builds`.
+        ...(resolvedBuild?.versionName ? { appVersionName: resolvedBuild.versionName } : {}),
+        ...(typeof resolvedBuild?.versionCode === 'number'
+          ? { appVersionCode: resolvedBuild.versionCode }
+          : {}),
         ...(resolvedBuild?.branch ? { appBranch: resolvedBuild.branch } : {}),
         ...(resolvedBuild?.commitSha ? { appCommitSha: resolvedBuild.commitSha } : {}),
         ...(resolvedBuild?.buildNumber ? { appBuildNumber: resolvedBuild.buildNumber } : {}),
+        ...(resolvedBuild?.id && resolvedBuild.id !== 'legacy-settings'
+          ? { appBuildId: resolvedBuild.id }
+          : {}),
       },
       intelligent_mode: false,
       test_goal: `Regression: ${intentCase.name} (${platform})`,
@@ -783,13 +793,22 @@ export class RegressionRunService {
       appStoragePath: resolvedBuild?.storagePath,
       appOriginalName: resolvedBuild?.originalName,
       appPackage: resolvedBuild?.packageName,
-      // Fast-auth: pass the build number as proxy for Android versionCode.
-      // The compiler's snapshot gate uses it to invalidate captures taken
-      // against an older app build. Undefined when the project has no CI
-      // build pipeline (direct-uploaded APK) — the gate degrades to TTL +
-      // runtime-failure invalidation, which is acceptable for v1.
-      ...(typeof resolvedBuild?.buildNumber === 'number'
-        ? { appVersionCode: resolvedBuild.buildNumber }
+      // Fast-auth: pass the real versionCode if the uploader supplied one;
+      // fall back to CI buildNumber for projects that haven't migrated to
+      // explicit version capture yet. The compiler's snapshot gate uses
+      // this to invalidate captures taken against an older app build —
+      // when both are absent the gate degrades to TTL + runtime-failure
+      // invalidation, which is acceptable.
+      ...(typeof resolvedBuild?.versionCode === 'number'
+        ? { appVersionCode: resolvedBuild.versionCode }
+        : typeof resolvedBuild?.buildNumber === 'number'
+          ? { appVersionCode: resolvedBuild.buildNumber }
+          : {}),
+      // Human-readable version string for runner logs / display.
+      // Not used in any gating decision — versionCode above is what
+      // actually drives fast-auth invalidation.
+      ...(resolvedBuild?.versionName
+        ? { appVersionName: resolvedBuild.versionName }
         : {}),
       testCaseId: intentCase.id,
       testCaseName: intentCase.name,
@@ -829,7 +848,17 @@ export class RegressionRunService {
       appSource: resolvedBuild?.source,
     });
 
-    return { testId, jobId };
+    // appBuildId is null when:
+    //   - resolveAppForRun returned the legacy-settings shim (id === 'legacy-settings')
+    //   - the project has never had a build (resolvedBuild === null)
+    // Callers use this to populate `test_executions.mobile_app_build_id`
+    // so historical runs keep their hard pointer to the binary even after
+    // pruning removes the row from `mobile_app_builds`.
+    const appBuildId = resolvedBuild?.id && resolvedBuild.id !== 'legacy-settings'
+      ? resolvedBuild.id
+      : null;
+
+    return { testId, jobId, appBuildId };
   }
 
   /**
@@ -1201,9 +1230,11 @@ export class RegressionRunService {
     triggerContext?: {
       branch?: string;
       commitSha?: string;
+      /** Explicit mobile build pin from plan/run settings (wins over branch/commit). */
+      buildId?: string;
     };
   }): Promise<RunResult> {
-    const { planId, userId, trigger, parameters = {}, triggerContext } = params;
+    const { planId, userId, trigger, parameters = {}, triggerContext: rawTriggerContext } = params;
 
     try {
       logger.info('[REGRESSION_RUN] Running plan', { planId, userId, trigger });
@@ -1212,6 +1243,43 @@ export class RegressionRunService {
       const plan = await RegressionPlanService.getById(planId, userId);
       if (!plan) {
         throw new NotFoundError('Regression plan', planId);
+      }
+
+      // Merge the plan-level mobile build pin into triggerContext so the
+      // resolver picks the pinned APK by default. Explicit triggerContext
+      // from the caller (e.g. a git webhook with branch + commitSha)
+      // still wins — webhook context is always more specific than a
+      // generic "use this version" plan default.
+      //
+      // Detect a stale pin (build was pruned out by `pruneOldBuilds` after
+      // the plan was created) so we can surface it loudly. The resolver
+      // falls through to latest-on-project either way, but a silent
+      // downgrade is exactly the kind of "why did my regression run
+      // against v1.3 instead of v1.2?" incident we want to make visible.
+      if (plan.mobileBuildMode === 'pinned' && plan.pinnedMobileAppBuildId) {
+        const pinnedRow = await MobileAppStorageService.getBuildById(
+          plan.pinnedMobileAppBuildId,
+          plan.projectId,
+        );
+        if (!pinnedRow) {
+          logger.warn('[REGRESSION_RUN] plan pin missing — pruned or deleted, falling back to latest', {
+            planId,
+            projectId: plan.projectId,
+            pinnedBuildId: plan.pinnedMobileAppBuildId,
+            trigger,
+          });
+        }
+      }
+      const triggerContext =
+        plan.mobileBuildMode === 'pinned' && plan.pinnedMobileAppBuildId
+          ? { buildId: plan.pinnedMobileAppBuildId, ...(rawTriggerContext ?? {}) }
+          : rawTriggerContext;
+      if (triggerContext?.buildId) {
+        logger.info('[REGRESSION_RUN] triggerContext.buildId active', {
+          planId,
+          buildId: triggerContext.buildId,
+          fromPlanPin: plan.mobileBuildMode === 'pinned' && plan.pinnedMobileAppBuildId === triggerContext.buildId,
+        });
       }
 
       const expandedCases = await RegressionPlanService.expandPlan(planId);
@@ -1948,7 +2016,7 @@ export class RegressionRunService {
      * by the mobile branch of the per-case dispatch (see line where
      * `dispatchMobileTest` is called); web Playwright runs ignore it.
      */
-    triggerContext?: { branch?: string; commitSha?: string },
+    triggerContext?: { branch?: string; commitSha?: string; buildId?: string },
     /**
      * When true, the loop sets a `failFastTriggered` flag on the first
      * failure and stops dispatching further tests. Mirrors the existing
@@ -2361,6 +2429,12 @@ export class RegressionRunService {
             // before the worker's `finally` block finishes destroying the
             // runner session).
             let mobileJobId: string | null = null;
+            // `mobile_app_builds.id` of the APK that was installed for this
+            // execution — captured here so the audit-trail update below can
+            // persist it on `test_executions`. Null when the resolver fell
+            // back to the legacy slot (id === 'legacy-settings') or when no
+            // build exists for the project.
+            let mobileAppBuildIdForExec: string | null = null;
 
             if (isMobile) {
               // Phase 5: forward git triggerContext so the APK resolver can
@@ -2383,6 +2457,7 @@ export class RegressionRunService {
               );
               testId = mobileResult.testId;
               mobileJobId = mobileResult.jobId;
+              mobileAppBuildIdForExec = mobileResult.appBuildId;
             } else {
               const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
               const testResult = await ManualTestService.runTest(testRequest);
@@ -2405,6 +2480,11 @@ export class RegressionRunService {
                   trigger,
                   startedAt,
                 },
+                // Mobile only — pin the execution row to the resolved
+                // build so the audit trail survives storage pruning.
+                // ON DELETE SET NULL keeps the row when the build row
+                // itself is later evicted by `pruneOldBuilds`.
+                ...(isMobile ? { mobileAppBuildId: mobileAppBuildIdForExec } : {}),
               });
 
               // Register waiter for dependency-aware ordering

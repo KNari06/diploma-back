@@ -608,6 +608,15 @@ export interface RegressionPlan {
   automationConfig?: PlanAutomationConfig;
   notificationsEnabled: boolean;
   scheduleId?: string;
+  /**
+   * Mobile-only: how this plan picks which APK/IPA to install at dispatch.
+   *   'latest' (default) — newest build for the project + platform.
+   *   'pinned'           — `pinnedMobileAppBuildId` (falls through to
+   *                        'latest' if the pinned build was pruned).
+   */
+  mobileBuildMode?: 'latest' | 'pinned';
+  /** Build id when `mobileBuildMode === 'pinned'`. Null/undefined otherwise. */
+  pinnedMobileAppBuildId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -657,6 +666,10 @@ export interface CreateRegressionPlanParams {
   tags?: string[];
   automationConfig?: PlanAutomationConfig;
   notificationsEnabled?: boolean;
+  /** Mobile build selection mode for this plan (default 'latest'). */
+  mobileBuildMode?: 'latest' | 'pinned';
+  /** Build id when `mobileBuildMode === 'pinned'`. */
+  pinnedMobileAppBuildId?: string | null;
   /**
    * Optional initial items to add to the plan in the same atomic call.
    *
@@ -686,6 +699,9 @@ export interface UpdateRegressionPlanParams {
   tags?: string[];
   automationConfig?: PlanAutomationConfig;
   notificationsEnabled?: boolean;
+  mobileBuildMode?: 'latest' | 'pinned';
+  /** Pass `null` to clear an existing pin. `undefined` leaves it alone. */
+  pinnedMobileAppBuildId?: string | null;
 }
 
 // ============================================================================
@@ -809,6 +825,13 @@ export interface UpdateExecutionStatusParams {
    * Empty / undefined = run had no resource bindings.
    */
   executedResources?: Array<Record<string, unknown>>;
+  /**
+   * `mobile_app_builds.id` of the APK/IPA that was installed for this
+   * execution. Soft FK (ON DELETE SET NULL) so pruning old builds
+   * preserves history rows. Set at mobile dispatch time and never
+   * updated afterwards.
+   */
+  mobileAppBuildId?: string | null;
 }
 
 // ============================================================================

@@ -104,6 +104,7 @@ export class MobileTestRunJobHandler {
       appStoragePath,
       appOriginalName,
       appVersionCode,
+      appVersionName,
       ciRunId,
       metadata,
       // `analyticsRunId` is intentionally not destructured: see the
@@ -245,6 +246,11 @@ export class MobileTestRunJobHandler {
       platform,
       stepsCount: intentSteps.length,
       appPackage,
+      // Version identity of the build under test — surfaces in logs so
+      // failed-run triage can correlate a regression with a specific
+      // upload without joining back to `tests.options`.
+      appVersionName,
+      appVersionCode,
     });
     logQueueEvent('processing', job.id!, { testId, browser });
 
