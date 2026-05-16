@@ -287,6 +287,61 @@ function buildExtractScript(maxNodes: number): string {
     if (bestCandidate) {
       activeModalElement = bestCandidate;
     }
+
+    // 4. ARIA-EXPANDED / ARIA-CONTROLS fallback (parity with snapshot-collector.ts LAYER 3).
+    //
+    // Many real-world popups (Wikipedia/Codex typeahead, MUI Autocomplete,
+    // Headless UI Combobox, Ant Design Select, Cmdk) do NOT use role=dialog
+    // and are deep / CSS-positioned (so the positional scan above misses
+    // them). What they DO have, almost universally, is a trigger with
+    // aria-expanded="true" + aria-controls="<popup-id>" — the WAI-ARIA
+    // standard pattern for disclosure widgets. We only run this if Layers
+    // 1-3 above didn't find anything, so it cannot demote a stronger
+    // signal; it only fills gaps.
+    //
+    // Why this is safe (zero false positives):
+    //   - aria-expanded="true" is set only when popup is OPEN (otherwise
+    //     "false" or removed)
+    //   - aria-controls names the EXACT controlled element via IDREF
+    //   - We re-verify visibility (display/visibility/opacity) and
+    //     meaningful size (≥0.5% viewport — lower than Layer-2's 3%
+    //     because typeahead menus are often single-column dropdowns)
+    //   - Highest-z-index controlled element wins when multiple
+    //     disclosures are open
+    if (!activeModalElement) {
+      var expanded = document.querySelectorAll('[aria-expanded="true"][aria-controls]');
+      var bestL3 = null;
+      var bestL3Z = -1;
+      for (var ei = 0; ei < expanded.length; ei++) {
+        var trig = expanded[ei];
+        var controlsAttr = trig.getAttribute('aria-controls');
+        if (!controlsAttr) continue;
+        // aria-controls is a space-separated IDREF list; take the first.
+        var firstId = controlsAttr.split(/\\s+/)[0];
+        if (!firstId) continue;
+        // getElementById, not querySelector — IDREF doesn't need CSS-escape
+        // for ':' / '.' chars in React 18 useId() / design-system slugs.
+        var controlled = document.getElementById(firstId);
+        if (!controlled) continue;
+        var cs = window.getComputedStyle(controlled);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        if (parseFloat(cs.opacity) < 0.1) continue;
+        var cRect = controlled.getBoundingClientRect();
+        var cArea = cRect.width * cRect.height;
+        var cCov = vpArea > 0 ? cArea / vpArea : 0;
+        if (cCov < 0.005) continue;
+        var cz = parseInt(cs.zIndex, 10);
+        // z-index may be auto/0 for elements relying on stacking context;
+        // coerce NaN→0 rather than skipping, because the aria-controls
+        // relationship is itself strong evidence.
+        var czNum = isNaN(cz) ? 0 : cz;
+        if (czNum > bestL3Z) {
+          bestL3Z = czNum;
+          bestL3 = controlled;
+        }
+      }
+      if (bestL3) activeModalElement = bestL3;
+    }
   })();
 
   const results = [];

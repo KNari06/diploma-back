@@ -17,28 +17,47 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// UPLOAD APP
+// UPLOAD APP — signed-URL flow
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// The backend never touches the APK/IPA buffer: it issues a one-time
+// Supabase signed URL, the client PUTs the binary directly to Storage,
+// then calls /finalize to persist metadata. This bypasses Cloud Run's
+// hard 32 MiB request-body limit which previously made any APK >30 MB
+// fail with 413 from Google Frontend.
+//
+//   1. POST .../app/upload-url   → tiny JSON, returns a Supabase signed URL
+//   2. PUT  <signed URL>         → client streams the APK/IPA directly to
+//                                  Supabase Storage, no backend in the path
+//   3. POST .../app/finalize     → tiny JSON, validates the object exists
+//                                  and writes project.settings.mobileApp
+
+const MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024; // 500MB — mirrors multer
+const ALLOWED_UPLOAD_EXTENSIONS = ['.apk', '.ipa', '.aab'];
+
+function pickPlatform(raw: unknown): MobilePlatform {
+  const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  if (typeof raw === 'string' && VALID[raw]) return VALID[raw];
+  return 'android';
+}
 
 /**
- * POST /api/v1/mobile/projects/:projectId/app
+ * POST /api/v1/mobile/projects/:projectId/app/upload-url
  *
- * Upload APK/IPA for a project. Replaces previous upload if exists.
- * Body: multipart/form-data
- *   - `file` (required)          — APK / IPA / AAB.
- *   - `platform` (optional)      — 'android' | 'ios' | 'flutter', default 'android'.
- *   - `packageName` (optional)   — Android package id.
- *   - `branch` (optional)        — Phase 5: git branch this build was produced from.
- *   - `commitSha` (optional)     — Phase 5: exact commit. Pins the build for a run.
- *   - `buildNumber` (optional)   — Phase 5: CI build id / job number.
- *   - `ciRunId` (optional)       — Phase 5: CI run reference for audit.
+ * Body: { filename, platform?, contentLength? }
+ *   - filename       (required) — must end with .apk / .ipa / .aab.
+ *   - platform       (optional) — 'android' | 'ios' | 'flutter'.
+ *   - contentLength  (optional) — declared file size in bytes; rejected
+ *                                 client-side if >500 MB so we don't issue
+ *                                 a signed URL for an upload that will fail.
  *
- * When any git metadata is provided, a row is ALSO inserted into
- * `mobile_app_builds` for branch / commit lookup. The legacy
- * `projects.settings.mobileApp` slot is always updated so existing
- * single-build consumers keep working unchanged.
+ * Returns: { uploadUrl, token, storagePath, expiresIn }
+ *
+ * The client then issues `PUT uploadUrl` with the file body. The signed URL
+ * is one-time-use and expires in ~2h on Supabase's side (server-set, not
+ * configurable from the SDK).
  */
-export async function uploadMobileApp(req: Request, res: Response): Promise<void> {
+export async function createMobileAppUploadUrl(req: Request, res: Response): Promise<void> {
   const userId = req.user?.id;
   if (!userId) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
@@ -46,29 +65,105 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
   }
 
   const { projectId } = req.params;
-  const raw = req.body.platform as string | undefined;
-  const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
-  const platform: MobilePlatform = raw && VALID[raw] ? VALID[raw] : 'android';
-  // packageName is REQUIRED — the runner needs it to install + launch the app.
-  // The UI form validates this too, but we enforce server-side as well so
-  // CI uploads / direct API calls can't bypass it (previously could land
-  // with packageName: undefined and block the editor at warm-up time).
-  const packageNameRaw = req.body.packageName as string | undefined;
-  const packageName = typeof packageNameRaw === 'string' ? packageNameRaw.trim() : '';
+  const filename = typeof req.body?.filename === 'string' ? req.body.filename.trim() : '';
+  const platform = pickPlatform(req.body?.platform);
+  const contentLengthRaw = req.body?.contentLength;
+  const contentLength = typeof contentLengthRaw === 'number'
+    ? contentLengthRaw
+    : (typeof contentLengthRaw === 'string' && /^\d+$/.test(contentLengthRaw)
+      ? Number(contentLengthRaw)
+      : null);
 
-  // Phase 5: optional git metadata — trimmed, empty strings treated as absent.
-  // Shared normaliser keeps this parsing consistent with the CI path.
-  const branch = trimMobileBuildField(req.body.branch);
-  const commitSha = trimMobileBuildField(req.body.commitSha);
-  const buildNumber = trimMobileBuildField(req.body.buildNumber);
-  const ciRunId = trimMobileBuildField(req.body.ciRunId);
-  const hasBuildMeta = !!(branch || commitSha || buildNumber || ciRunId);
-
-  if (!req.file) {
-    res.status(400).json({ success: false, error: 'No file uploaded. Use form field "file".' });
+  if (!filename) {
+    res.status(400).json({ success: false, error: 'filename is required (non-empty string)' });
+    return;
+  }
+  const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
+  if (!ALLOWED_UPLOAD_EXTENSIONS.includes(ext)) {
+    res.status(400).json({
+      success: false,
+      error: `Invalid file type: ${ext || '(none)'}. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`,
+    });
+    return;
+  }
+  if (contentLength !== null && contentLength > MAX_UPLOAD_SIZE_BYTES) {
+    res.status(413).json({
+      success: false,
+      error: `File too large. Maximum size is ${MAX_UPLOAD_SIZE_BYTES / 1024 / 1024}MB, declared ${(contentLength / 1024 / 1024).toFixed(1)}MB`,
+    });
     return;
   }
 
+  const project = await ProjectService.getProject(projectId, userId);
+  if (!project) {
+    res.status(404).json({ success: false, error: 'Project not found or access denied' });
+    return;
+  }
+
+  const signed = await MobileAppStorageService.createSignedUploadUrl({
+    workspaceId: project.workspace_id,
+    projectId,
+    platform,
+    originalName: filename,
+  });
+
+  logger.info('[MOBILE_API] Issued signed upload URL', {
+    projectId,
+    platform,
+    storagePath: signed.storagePath,
+    declaredSize: contentLength,
+    userId,
+  });
+
+  res.json({
+    success: true,
+    uploadUrl: signed.uploadUrl,
+    token: signed.token,
+    storagePath: signed.storagePath,
+  });
+}
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/app/finalize
+ *
+ * Body: { storagePath, packageName, platform?, originalName?, branch?,
+ *         commitSha?, buildNumber?, ciRunId? }
+ *
+ * Called after the client has finished `PUT`ing the file to Supabase. The
+ * handler verifies the object exists, then runs the same post-upload work
+ * the legacy multipart route does: delete previous APK, write
+ * `projects.settings.mobileApp`, optionally insert a versioned build row,
+ * kick off `autoBootAndInstall`.
+ *
+ * Mirrors the shape of `projects.settings.mobileApp` written by the old
+ * multipart upload path so downstream consumers (resolver, runner) stay
+ * identical.
+ */
+export async function finalizeMobileAppUpload(req: Request, res: Response): Promise<void> {
+  const userId = req.user?.id;
+  if (!userId) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+
+  const { projectId } = req.params;
+  const storagePath = typeof req.body?.storagePath === 'string' ? req.body.storagePath.trim() : '';
+  const packageName = typeof req.body?.packageName === 'string' ? req.body.packageName.trim() : '';
+  const platform = pickPlatform(req.body?.platform);
+  const originalName = typeof req.body?.originalName === 'string' && req.body.originalName.trim()
+    ? req.body.originalName.trim()
+    : (storagePath.includes('/') ? storagePath.slice(storagePath.lastIndexOf('/') + 1) : storagePath);
+
+  const branch = trimMobileBuildField(req.body?.branch);
+  const commitSha = trimMobileBuildField(req.body?.commitSha);
+  const buildNumber = trimMobileBuildField(req.body?.buildNumber);
+  const ciRunId = trimMobileBuildField(req.body?.ciRunId);
+  const hasBuildMeta = !!(branch || commitSha || buildNumber || ciRunId);
+
+  if (!storagePath) {
+    res.status(400).json({ success: false, error: 'storagePath is required (non-empty string)' });
+    return;
+  }
   if (!packageName) {
     res.status(400).json({
       success: false,
@@ -77,58 +172,78 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
     return;
   }
 
-  // Verify project access
   const project = await ProjectService.getProject(projectId, userId);
   if (!project) {
     res.status(404).json({ success: false, error: 'Project not found or access denied' });
     return;
   }
 
-  logger.info('[MOBILE_API] Uploading app', {
-    projectId,
-    platform,
-    packageName,
-    originalName: req.file.originalname,
-    size: req.file.size,
-    userId,
-    branch,
-    commitSha,
-    hasBuildMeta,
-  });
+  // Defence in depth: refuse paths that don't belong to this project's tree.
+  // The signed-url issuer always builds paths under
+  // `mobile-apps/{workspaceId}/{projectId}/{platform}/…`, so a request that
+  // doesn't match means the client tampered with the storagePath.
+  const expectedPrefix = `mobile-apps/${project.workspace_id}/${projectId}/`;
+  if (!storagePath.startsWith(expectedPrefix)) {
+    logger.warn('[MOBILE_API] finalize rejected — path outside project tree', {
+      projectId,
+      storagePath,
+      expectedPrefix,
+      userId,
+    });
+    res.status(400).json({ success: false, error: 'storagePath does not belong to this project' });
+    return;
+  }
 
-  // Delete previous app from storage if exists.
-  // NOTE: this only deletes the OLD legacy settings blob. Versioned
-  // `mobile_app_builds` rows are immutable history and keep their own
-  // storage paths — each new upload lands in a fresh timestamped path.
+  // Verify the object is actually present and not empty.
+  const stat = await MobileAppStorageService.statObject(storagePath);
+  if (!stat) {
+    res.status(404).json({
+      success: false,
+      error: 'Object not found at storagePath — was the PUT to the upload URL successful?',
+    });
+    return;
+  }
+  if (stat.sizeBytes === 0) {
+    res.status(400).json({ success: false, error: 'Uploaded object is empty (0 bytes)' });
+    return;
+  }
+  if (stat.sizeBytes > MAX_UPLOAD_SIZE_BYTES) {
+    // Should never happen — Supabase per-file limit is set at the bucket —
+    // but if a bucket-side limit lets a huge file through we still refuse.
+    res.status(413).json({
+      success: false,
+      error: `Uploaded file too large (${(stat.sizeBytes / 1024 / 1024).toFixed(1)} MB). Max: ${MAX_UPLOAD_SIZE_BYTES / 1024 / 1024} MB.`,
+    });
+    return;
+  }
+
+  // Delete previous APK from storage (legacy slot only — versioned builds
+  // are immutable history).
   const existingApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
-  if (existingApp?.storagePath) {
-    logger.info('[MOBILE_API] Deleting previous app', {
+  if (existingApp?.storagePath && existingApp.storagePath !== storagePath) {
+    logger.info('[MOBILE_API] Deleting previous app (finalize)', {
       projectId,
       oldStoragePath: existingApp.storagePath,
     });
     await MobileAppStorageService.deleteApp(existingApp.storagePath);
   }
 
-  // Upload new app to Supabase Storage
-  const metadata = await MobileAppStorageService.uploadApp(req.file, {
+  const metadata = MobileAppStorageService.finaliseDirectUpload({
     workspaceId: project.workspace_id,
     projectId,
     platform,
     packageName,
+    storagePath,
+    originalName,
+    fileSize: stat.sizeBytes,
   });
 
-  // Save metadata to project settings (legacy slot — always).
-  // Preserves pre-Phase-5 behaviour for code that still reads
-  // `project.settings.mobileApp` (the resolver's last-resort fallback).
   await ProjectService.updateProject(projectId, userId, {
     settings: {
       mobileApp: metadata as unknown as Record<string, unknown>,
     },
   });
 
-  // Phase 5: record a versioned build row when any git metadata is present.
-  // Best-effort — a failure here MUST NOT fail the upload (APK is already
-  // in storage and the legacy slot is set).
   if (hasBuildMeta) {
     await MobileAppStorageService.recordBuild(
       metadata,
@@ -137,10 +252,11 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
     );
   }
 
-  logger.info('[MOBILE_API] App uploaded successfully', {
+  logger.info('[MOBILE_API] App finalized (signed-URL flow)', {
     projectId,
     platform,
     storagePath: metadata.storagePath,
+    fileSize: metadata.fileSize,
     versioned: hasBuildMeta,
   });
 
@@ -149,8 +265,8 @@ export async function uploadMobileApp(req: Request, res: Response): Promise<void
     mobileApp: metadata,
   });
 
-  // Auto-boot emulator + install APK in background (fire-and-forget).
-  // By the time the user opens the editor, the emulator is already running.
+  // Auto-boot emulator + install APK in background — same fire-and-forget
+  // contract as the legacy upload route.
   autoBootAndInstall(projectId, userId, platform).catch((err) => {
     logger.warn('[MOBILE_API] Background auto-boot failed (non-fatal)', {
       projectId,

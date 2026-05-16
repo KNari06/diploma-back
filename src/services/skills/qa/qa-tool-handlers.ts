@@ -4397,7 +4397,6 @@ export async function handleManageFlow(
           moduleId,
           userId: context.userId,
           name,
-          description: args.description || undefined,
           flowType: args.flow_type || undefined,
           // Flows created via QA tools are web UI by default; platform is derived from module tree.
           platform: undefined,
