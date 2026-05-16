@@ -24,15 +24,24 @@ So the work is not "build an agent." The work is:
 
 Everything in this document is sized accordingly: most steps are deletions and consolidations, not new modules.
 
-**How to read this document:**
+**How to read this document — two stages:**
+
+The work splits cleanly into two stages. Stage 2 *requires* Stage 1 to land first; it cannot ship standalone because it relies on the mission orchestrator, the tool registry, and the unified pipeline introduced in Stage 1.
+
+- **Stage 1 — Agentic workflow runtime** (§1-§12): turn today's mixed architecture into one durable, tool-driven agent that can run any QA mission. This is the engineering backbone.
+- **Stage 2 — User-facing surface on top of Stage 1** (§13-§14): how a new user actually meets that agent and walks away with a tangible result in <5 minutes. Mission #0 (guided chat onboarding) + Workflow object (packaged output).
+
+**Section map:**
 - §1 — what's in our code today, verified
 - §2-§3 — the actual bugs and gaps
 - §4 — **research foundations** (industry-settled patterns + standards in 2026) — every architectural choice below references this section
-- §5 — target architecture
-- §6 — phased migration; each phase explicitly cites which §4 pattern it implements
-- §7-§10 — walk-through, what stays, risks, timeline
-- §11 — **behavioral spec** (15 scenarios) — acceptance test suite for the migration
-- §12 — user impact in one sentence
+- §5 — target architecture (Stage 1)
+- §6 — phased migration (Stage 1); each phase explicitly cites which §4 pattern it implements
+- §7-§10 — walk-through, what stays, risks, timeline (Stage 1)
+- §11 — **behavioral spec** (20 scenarios) — acceptance test suite spanning both stages
+- §12 — user impact in one sentence (Stage 1 outcome)
+- §13 — **Stage 2: Fast Onboarding** (Mission #0, guided chat, hybrid rails — pattern R8)
+- §14 — **Stage 2: Workflows** (how agent output is packaged as a first-class user object)
 
 ---
 
@@ -273,6 +282,7 @@ We deliberately do not adopt LATS — for QA workflows the 50× cost is uneconom
 | **R5** | Durable execution (Temporal-style) | Stronger than R4: each tool call is an idempotent activity, replay is event-sourced, retries are automatic at the runtime level. | [Diagrid: Checkpoints Are Not Durable Execution](https://www.diagrid.io/blog/checkpoints-are-not-durable-execution-why-langgraph-crewai-google-adk-and-others-fall-short-for-production-agent-workflows), [AgentMarketCap: Temporal + LangGraph](https://agentmarketcap.ai/blog/2026/04/10/durable-agent-execution-production-temporal-modal-event-sourced) |
 | **R6** | Confidence-based escalation / HITL | Agent runs autonomously while confidence > threshold; otherwise escalates to a human with diagnostic context. The Atos / IBM "bounded autonomy" pattern. | [Atos whitepaper (private)], [IBM Agentic Reasoning](https://www.ibm.com/think/topics/agentic-reasoning) |
 | **R7** | Control plane sidecar | Policy, budget, kill-switch, immutable audit live *around* the agent, intercepting every tool call. Not inside the agent loop. | Atos Polaris pattern, mirrored in LangGraph's checkpointer hooks. |
+| **R8** | Agent-initiated dialog with hybrid rails | Agent speaks first. Each turn returns 2-4 quick-action buttons + a free-text input as fallback. Skeleton of the flow is fixed; button text + ranking is LLM-generated under current context. Replaces forms for onboarding and complex setup. | [Manus Agent Skills onboarding](https://manus.im/features/agent-skills), [Robylon: AI Chatbot for SaaS Onboarding](https://www.robylon.ai/blog/ai-chatbot-saas-onboarding), v0 / Lovable "first artifact" pattern. |
 
 **R4 vs R5 honest note:** in the original Phase 3 of this document I wrote "durable missions via Postgres rows" — that is technically R4 (checkpointing), not R5 (full durable execution). For our scale and BullMQ background it is sufficient. The [Diagrid critique](https://www.diagrid.io/blog/checkpoints-are-not-durable-execution-why-langgraph-crewai-google-adk-and-others-fall-short-for-production-agent-workflows) is correct in principle (checkpoints lose in-flight side effects on crash), but adopting Temporal would be a separate, much larger lift. We note the gap and ship R4. Upgrade to R5 stays on the table for the future.
 
@@ -797,17 +807,63 @@ Mission opens with policy tag `sovereign=true`. Governor rejects any tool call w
 
 ---
 
-### What ties these 15 together
+### Scenario 16 — First-time user drops APK on landing page (Stage 2)
+> User just signed up. Lands on `/start`. Drags `myapp.apk` onto the chat.
 
-- **Same pipeline for all** — web, Telegram, Slack, Jira webhook, git push all enter `processChatTurn` or `MissionOrchestrator.start`. One agent, many doors.
+Agent (initiating, not waiting for user): *"Got it — 'MyApp' v2.4. I see 14 screens declared."* + 3 quick actions: `[Auto-explore main flow (free, 2 min)] [I'll walk you through what to test] [Find login + signup myself]`. User taps option 1. Agent runs `analyze_apk` → `auto_explore_mobile(depth=light)`. At T+90s hits a login screen → emits `ask_human` quick action `[Use test account] [Paste credentials] [Skip — public only]`. Completes at T+3min with a **Workflow** card pinned in `/workflows`.
+
+**Today:** ❌ — no `/start` route, no agent-initiated welcome, APK upload exists but isn't wired to onboarding.
+
+---
+
+### Scenario 17 — Paste URL with no further input (Stage 2)
+> *"https://example.com"* — single line, no verb.
+
+Agent infers intent: `crawl_site(url, depth=1, budget=10pages)` runs in parallel with `discover_openapi(url)` and `discover_kb_urls(url)`. After 15s replies with what it found + 3 quick actions: `[Try the happy path] [Focus on one page] [Find broken links — no creds needed]`. User taps option 3 (cheapest). Workflow built at T+2min, zero credentials asked. Re-engage prompt: *"want to dig deeper with login?"*.
+
+**Today:** ❌ — same as 16, plus `crawl_site` / `discover_openapi` tools don't exist.
+
+---
+
+### Scenario 18 — Drop swagger.json in chat (Stage 2)
+> User drops OpenAPI spec into onboarding chat.
+
+[format-adapters/openapi.adapter.ts](../../src/services/kb/format-adapters/openapi.adapter.ts) parses it (existing code). Post-ingest hook on Mission #0 emits `list_endpoints` + `classify_by_risk`. Agent: *"23 endpoints — 5 write, 18 read. I can:"* + `[Smoke all 23 (needs token)] [Public only (no auth, ~3 min)] [Generate Postman collection]`. Picks option 2 → parallel `run_api_test` × 18 → finds 1 real bug (500 on `GET /orders/:id`). Workflow created with the bug attached.
+
+**Today:** 🟡 — swagger ingests into KB chunks but **dies there**; no post-ingest hook to start a mission.
+
+---
+
+### Scenario 19 — User goes off-rails mid-onboarding (Stage 2)
+> Onboarding screen 2. User types *"расскажи анекдот про QA"*.
+
+Off-rail handler kicks in. Agent: one-line answer (*"программист и тестировщик заходят в бар…"*) + soft return: *"но мы тут настраиваем твой первый workflow — продолжим?"* + the same 3 quick actions from before, in their original order. Free-text input stays available. If user goes off-rails twice in a row, agent escalates: *"hey, this onboarding takes 3 minutes — want to skip to free chat, or shall I just pick smoke defaults?"*.
+
+**Today:** ❌ — no off-rail detection; `general_chat` would just engage in the joke and never resume onboarding.
+
+---
+
+### Scenario 20 — Agent re-engages on critical bugs (Stage 2, Stage 1)
+> User finished onboarding 3 days ago. Scheduled smoke runs daily. Today it found 5 critical bugs in one run.
+
+Agent (initiating, not waiting): pushes to user's active channel (Telegram if linked, else in-app + email). Message: *"⚠️ Daily smoke just found 5 critical bugs in your `example.com` workflow — that's unusual. Want me to:"* + `[Increase frequency to hourly] [Pin issues to your Slack #qa] [Investigate root cause — I'll run a deeper exploration] [Just show me]`. User taps option 3 from Telegram → new mission spawns with the failing flows as scope. **Re-engagement is bounded:** agent only initiates on (a) first signup, (b) critical-bug spike (statistical anomaly vs baseline), (c) workflow paused >7 days. NOT on idle dashboard, NOT on every run.
+
+**Today:** ❌ — no agent-initiated outbound dialog; notifications today are one-way fire-and-forget without quick-action buttons.
+
+---
+
+### What ties these 20 together
+
+- **Same pipeline for all** — web, Telegram, Slack, Jira webhook, git push, onboarding all enter `processChatTurn` or `MissionOrchestrator.start`. One agent, many doors.
 - **Governor decides risk** (8, 9, 12, 15) — not the agent, not hardcoded rules.
 - **Memory closes the loop** (10, 14) — past missions actively shape new plans.
 - **Composition is free** (2, 6, 11, 13) — because every operation is a tool, not a fixed handler.
-- **Today only Scenarios 1 (partial), 4, and 7 work** end-to-end. The other 12 unlock progressively as Phase 1 → 5 land.
+- **Agent initiates with rails** (16, 17, 18, 19, 20) — Stage 2 scenarios where the agent speaks first with quick actions; free text always available as fallback.
+- **Today only Scenarios 1 (partial), 4, and 7 work** end-to-end. The other 17 unlock progressively as Phase 1 → 5 land, plus §13-§14 for the Stage 2 set.
 
-### Mapping scenarios to phases
+### Mapping scenarios to phases / stages
 
-| Scenario | Unblocked by phase |
+| Scenario | Unblocked by |
 |---|---|
 | 1 | Phase 0 (priorKnowledge into LiteEngine) |
 | 2, 11 | Phase 1 (`run_*` tools) + Phase 2 (unified pipeline) |
@@ -819,11 +875,413 @@ Mission opens with policy tag `sovereign=true`. Governor rejects any tool call w
 | 8, 12, 15 | Phase 5 (Governor + confidence/budget/policy gates) |
 | 9 | Phase 3 (mission state) + Phase 5 (kill-switch) |
 | 10, 14 | Phase 6 (memory loop) — partially Phase 1 (`recall_similar_missions`) |
+| **16, 17, 18, 19** | **§13 Stage 2 (Mission #0 onboarding) — depends on Phase 1 + Phase 2** |
+| **20** | **§13 (re-engagement triggers) + §14 (Workflow object) — depends on Phase 3** |
 
-This table doubles as a PM checklist: ship a phase, run its scenarios, count working ones.
+This table doubles as a PM checklist: ship a phase, run its scenarios, count working ones. Stage 2 cannot ship before Stage 1's Phase 1+2 land.
 
 ---
 
-## 12. What this gives a user, in one sentence
+## 12. What this gives a user, in one sentence (end of Stage 1)
 
 After Phase 4: a user writes one Telegram message — *"check checkout flow, if 500s, ping payments team"* — and the system creates a durable mission that plans, runs the test, analyses bugs against prior incidents, notifies the right owner via the right channel, lets the user approve risky actions inline, and leaves a full replayable audit trail. Every step uses code that already exists today; the plan above is mostly the work of getting that code to talk to itself.
+
+**This is necessary but not sufficient.** A new user still has to *know* to type that Telegram message. Stage 2 (§13-§14) answers "how does a first-time user actually meet this system and get value in their first 5 minutes?".
+
+---
+
+# STAGE 2 — User-facing surface
+
+Stage 1 built the engine. Stage 2 is how the user touches it. Two pieces:
+
+- **§13 Mission #0 — Fast Onboarding** (the *front door*): replace the post-signup form with an agent-initiated guided chat that produces a tangible result in <5 minutes.
+- **§14 Workflows** (the *output container*): everything the agent produces — test cases, schedule, alerts, credentials — gets packaged into one named, share-able, reviewable object called a Workflow. This is what the user sees in their dashboard.
+
+**Why these two are coupled:** Mission #0 needs a tangible artifact to point at when it finishes. That artifact is a Workflow. Without §14, Mission #0 would end with "here are 5 test cases, 1 plan, 1 schedule, 3 alerts" scattered across separate screens — same problem as today. Without §13, §14 is an empty dashboard widget. Ship them in the same release.
+
+---
+
+## 13. Stage 2: Fast Onboarding (Mission #0)
+
+> **Pattern reference:** §4.2 R8 — agent-initiated dialog with hybrid rails. Manus pattern: agent speaks first, returns 2-4 quick actions + free-text fallback. Skeleton fixed, button text generated under context.
+>
+> **Goal:** time-to-first-value under 5 minutes. Top-quartile SaaS in 2026 hits this; we're aiming for the upper bound of "aggressive" (under 15 minutes per [SaaS onboarding benchmarks 2026](https://www.robylon.ai/blog/ai-chatbot-saas-onboarding)). Today: >30 minutes typical, frequently abandoned.
+
+### 13.1 The problem with today's onboarding
+
+[onboarding.controller.ts:15-477](../../src/api/workspace/onboarding.controller.ts) is a 477-line form validator that demands `name + baseUrls[] + environments + browser` before the user sees anything. After it passes, the user lands on the dashboard and has to discover Repository → New Test Case → Add Steps → Run. Median time to first run is 30+ minutes; abandonment is highest at "what do I do now?" on the dashboard.
+
+The form gives us nothing the agent couldn't elicit by chat, when it actually needs each datum. Browser choice is irrelevant until first run. Environment URLs are irrelevant until the user wants more than one. baseUrls are inferable from the URL the user pastes. Workspace name is auto-generatable.
+
+### 13.2 The replacement: agent-initiated guided chat
+
+After signup, redirect to `/start` (new route, not `/dashboard`). Single-screen split-view: chat on the left, **artifact pane** on the right (Manus-style — see §13.6 below for what fills it). Agent posts the first message before the user types anything.
+
+```
+Screen 1 — Welcome (agent initiates):
+  "Hi! I'm your QA agent. Let's set up your first test run in 3 minutes.
+   What are we testing today?"
+  Quick actions: [🌐 Website] [📱 Mobile app] [🔌 API]
+  Free-text input below: "or just type / drop anything here"
+
+Screen 2 — Branch on choice (e.g. user picked Website):
+  "Cool! What's the URL?"
+  Inline URL input + buttons:
+    [Public site, no login] [Has login — I'll guide you] [Internal/staging]
+
+Screen 3 — Scope:
+  "Before we run, let me scope this. Pick what matters most:"
+  [Just see if anything is broken (3 min, no credentials)]
+  [Test the main happy-path flow (5 min, ask for credentials when needed)]
+  [Deep exploration — all main pages (10-15 min)]
+  Optional checkboxes: ☐ checkout ☐ signup ☐ payments ☐ + custom
+
+Screen 4 — Approval:
+  "Here's my plan for the next ~5 min:
+     ✓ Crawl example.com surface (12 pages found in sitemap)
+     ✓ Run smoke checks on key pages
+     ✓ Generate 3-5 test cases you can edit later"
+  [▸ Start (15 credits)] [✕ Cancel]
+  Advanced: ☐ I'll review every test before it runs
+
+Screen 5 — Live progress (split-view active):
+  Left: chat updates from emitProcessingStep
+  Right: live screenshots, page list with status dots, progress bar
+  Inline ask_human card pops up when credentials needed.
+
+Screen 6 — Review:
+  "Done in 4m 23s. I created Workflow 'example.com Daily Smoke'.
+   Found 2 issues. Now it's your turn to review:"
+  [Looks good — activate workflow] [Let me edit tests first]
+  [Show me how a test step looks] [Re-run with different focus]
+
+Screen 7 — Activation:
+  Workflow card appears at /workflows. User now has access to
+  the full app (Repository, Plans, Runs) but doesn't have to use it.
+  Agent stays available in sidebar for follow-ups.
+```
+
+### 13.3 Hybrid rails — what's fixed, what's LLM-generated
+
+| Layer | Fixed in config | LLM-generated under context |
+|---|---|---|
+| Screen sequence (1→2→3→4→5→6→7) | ✅ yes | — |
+| Which screen to show next given user choice | ✅ deterministic state machine | — |
+| **Text of welcome message** | greeting structure | localized phrasing, time-of-day, user name |
+| **Quick action labels** | the *kind* (e.g. "scope choice") | exact wording adapted to artifact ("Test the checkout flow" vs "Test the API endpoints") |
+| **Ordering of quick actions** | typically 3 options per screen | LLM ranks by inferred user intent + cost |
+| Approval card content | structure | plan summary, credit estimate, ETA — all from Planner output |
+| Off-rail response | always 1-line answer + soft return | the actual answer to whatever user said |
+| Re-engagement triggers | 3 events only (see §13.5) | the wording of the nudge |
+
+This is the *hybrid rails* answer to the design question. Skeleton is fixed; voice is generated.
+
+### 13.4 Off-rail handling
+
+User on Screen 2 types *"расскажи анекдот"*. Detector (cheap rules: not a URL, not matching any quick-action keyword, no file attached, length < 100 chars and doesn't contain http/api/test) flags as off-topic. Agent responds with **one-line answer** + soft return + the *same* quick actions from before.
+
+```
+🤖 Программист и тестировщик заходят в бар…
+   But we're setting up your first workflow — shall we continue?
+   [🌐 Website] [📱 Mobile app] [🔌 API]
+```
+
+Escalation: if user goes off-rails **twice in a row**, agent offers an exit: *"This onboarding takes 3 min — want to skip to free chat, or shall I just pick smoke defaults for you?"* with `[Continue setup] [Skip to free chat] [Pick smoke defaults]`. Never traps the user.
+
+If user provides a *valid* freetext that maps to a quick action (e.g. types "find broken links" instead of clicking the button), Planner routes it through the same branch. Quick actions are convenience, not requirement.
+
+### 13.5 Re-engagement — when agent speaks first AFTER onboarding
+
+Three triggers only. Anything beyond these is spam.
+
+| Trigger | Channel | Action |
+|---|---|---|
+| **First signup, screen 1** | in-app `/start` | Welcome message + first quick actions (covered above) |
+| **Critical-bug spike** | Telegram if linked, else in-app + email | Anomaly: today's run found N critical bugs where baseline is 0-1. Agent: *"Workflow X just found 5 critical bugs — unusual. Want me to: [investigate] [increase frequency] [pin to Slack]"* |
+| **Workflow paused >7 days** | in-app banner only (no push) | Soft prompt: *"Your `example.com` workflow has been paused for 8 days. Resume, archive, or rebuild?"* |
+
+Explicitly **not** triggers:
+- Idle on dashboard (annoying — Manus tried, dropped it)
+- Each run completion (notifications are user-configured via Workflow alerts)
+- Per-LLM-call cost spike (Governor handles, doesn't dialog)
+
+### 13.6 Code reuse — what already exists
+
+| Capability | File | Reuse for |
+|---|---|---|
+| `QuickAction[]` in chat response | [quick-actions-injector.ts:56](../../src/api/chat/general/sub-agents/quick-actions-injector.ts) | All quick actions on screens 1-7 |
+| Quick-action whitelist | [src/api/preview/quick-action-endpoints.ts] | Approval card, scope picker |
+| Live progress streaming | `emitProcessingStep` → WS [shared/utils.ts:180](../../src/api/chat/shared/utils.ts) | Screen 5 right pane |
+| ExplorationEngine | [exploration-engine.ts:57](../../src/agent/core/lite/exploration/exploration-engine.ts) | The actual crawl/test execution |
+| Exploration storage + read API | [explorations.route.ts](../../src/api/explorations/explorations.route.ts) | Showing artifacts on screen 5/6 |
+| Chat attachments | [chat.controller.ts:103](../../src/api/chat/chat.controller.ts) | APK/swagger drop on screen 1 |
+| Format adapters (OpenAPI, Postman, PDF) | [format-adapters/](../../src/services/kb/format-adapters/) | Parsing dropped files |
+| APK/IPA/AAB upload | [mobile-app-storage.service.ts:20](../../src/services/storage/mobile-app-storage.service.ts) | Mobile branch screen 1 |
+| Test Resources Phase 1-3 (auth/env/secrets) | `src/services/test-resource/` | JIT credential elicitation on screen 5 |
+| Sub-agent pipeline | `src/api/chat/general/sub-agents/` | Drives the whole onboarding chat |
+| Mobile app analysis | [mobile-app-prep.service.ts:278](../../src/services/mobile/mobile-app-prep.service.ts) | Scenario 16 (`analyze_apk`) |
+
+### 13.7 What to add
+
+Backend (3 endpoints + 1 prompt + ~5 tools):
+
+| New file / change | Implements |
+|---|---|
+| `src/api/onboarding/onboarding.controller.ts` — `POST /api/v1/missions/onboarding/start` | Creates chat session with `metadata.onboarding=true`, emits welcome message with first quick actions, returns `{ sessionId, firstMessage, quickActions[] }` |
+| same — `POST /api/v1/missions/onboarding/answer` | Routes quick-action click or freetext into `SubAgentPipeline.execute` with onboarding-aware system prompt; returns next screen |
+| same — `POST /api/v1/missions/onboarding/approve` | Starts `ExplorationEngine` with collected config; returns `{ explorationId, jobId }` |
+| `src/api/chat/general/sub-agents/prompts/onboarding-prompt.ts` | Onboarding-aware system prompt: "NEVER ask open-ended questions. ALWAYS return 2-4 quick actions. Free text is fallback. Goal: produce one runnable Workflow in <5 minutes." |
+| Off-rail detector | Cheap rules in [routing.ts] before pipeline dispatch; flips `onboarding_off_rail=true` on session |
+| Tool `analyze_apk(file_id)` | Wraps `mobile-app-prep` manifest extract |
+| Tool `auto_explore_mobile(app_id, depth)` | Wraps existing exploration in 'scout' mode for mobile |
+| Tool `crawl_site(url, depth, budget)` | Light wrapper over `ExplorationEngine` for screen 5 |
+| Tool `discover_openapi(base_url)` | Probes `/openapi.json`, `/swagger.json`, `/api-docs` |
+| Tool `discover_kb_urls(url)` | Parses meta tags / sitemap for docs links |
+| Tool `build_workflow_from_mission(mission_id)` | Mission #0 finalizer — see §14 |
+| Two new quick-action types: `onboarding_pick_mode`, `onboarding_approve_plan` | Added to whitelist; carry budget + plan summary |
+
+Frontend (1 route + 1 layout + quick-action rendering):
+
+| Change | What |
+|---|---|
+| Route `/start` | Split-view layout (chat left, artifact pane right) |
+| Quick-action rendering for `onboarding_*` types | Buttons with appropriate styling; click → `POST /missions/onboarding/answer` |
+| Artifact pane | Live exploration progress (page list + screenshots + status dots) |
+| Drag-drop handler on chat input | APK / IPA / swagger / Postman → uploads + auto-sends in chat |
+
+### 13.8 What to remove (carefully)
+
+Today's `POST /api/v1/workspaces/onboarding` ([onboarding.controller.ts:15-477](../../src/api/workspace/onboarding.controller.ts)) does **not** get sunset on day one.
+
+Rollout:
+
+1. New users (post-deploy) → redirected to `/start`.
+2. Workspace still auto-created at signup with sensible defaults (`name = first part of user email`, `baseUrls = []`). The first URL the user pastes in `/start` populates `baseUrls`. Environment URLs added via `ask_human` quick action when needed.
+3. Old form available as `/settings/workspace/advanced-setup` for power users.
+4. After 2 weeks of telemetry showing >95% of new users complete via `/start`: delete controller, delete route, delete frontend.
+
+### 13.9 Mission #0 in DB (before Stage 1 Phase 3 lands)
+
+Phase 3 of Stage 1 introduces the `missions` table. Stage 2 can ship **before** that — we use existing tables with a marker:
+
+```
+chat_sessions.metadata = {
+  onboarding: true,
+  onboarding_state: 'screen_1' | 'screen_2' | ... | 'screen_7' | 'completed',
+  onboarding_artifact_kind: 'apk' | 'url' | 'swagger' | 'postman' | 'text',
+  onboarding_collected: { url?, mode?, focus?, credentials_ref?, ... }
+}
+
+intent_test_cases.metadata = {
+  is_onboarding_seed: true,
+  onboarding_session_id: <chatSessionId>,
+  needs_user_review: true   // blocks auto-run until user approves on screen 6
+}
+```
+
+When Phase 3 lands, migrate this to `missions.kind = 'onboarding_first_value'`. No data loss — same fields, different shape.
+
+### 13.10 Hard rules for code review
+
+These are non-negotiable:
+
+1. **No free-text-only screens 1-4.** Every screen returns ≥2 quick actions OR an inline structured input (URL field, file dropzone). PRs adding a bare textarea on these screens — rejected.
+2. **No blocking form before any agent message.** The agent must speak first on `/start`. PRs adding "complete your profile" walls — rejected.
+3. **Credentials JIT, never upfront.** Test Resources adapter is the only place credentials enter; they enter when the agent's `ask_human` tool emits a credentials-quick-action, not at signup.
+4. **Mission #0 result is always a Workflow.** Not "5 test cases + 1 plan + 1 schedule scattered." See §14.
+
+---
+
+## 14. Stage 2: Workflows — packaging agent output
+
+> **Goal:** turn what the agent produces (a bundle of test cases + plan + schedule + alerts + credentials) into one named, share-able, reviewable object the user actually sees in their dashboard. Eliminates the "where did everything go?" confusion of today.
+>
+> **Why "Workflow":** the word is recognised across SaaS (Zapier, n8n, Notion, Make), translates cleanly, describes a *process* not a static set, and reads naturally in chat ("share my QA workflow"). One word, used everywhere — no aliases, no synonyms in UI / email / notifications.
+
+### 14.1 The problem today
+
+Mission #0 (or any agent task) produces:
+- 5 rows in `intent_test_cases`
+- 1 row in `regression_plans`
+- 1 row in `schedules`
+- 0-3 rows in `automation_actions` (Slack/email alerts)
+- 0-N rows in `test_resources` (login, env vars)
+- 1+ rows in `regression_runs` (the first run)
+- Screenshots scattered in `test_results.evidence`
+
+The user has to find each one separately in Repository / Plans / Schedules / Settings. None of them have a parent. The bundle has no name, no card, no preview. Asking *"what did the agent set up for me?"* requires a manual cross-table query.
+
+### 14.2 The Workflow object
+
+One row groups everything:
+
+```sql
+create table workflows (
+  id uuid primary key,
+  workspace_id uuid not null,
+  project_id uuid not null,
+  name text not null,                          -- "example.com Daily Smoke"
+  slug text not null,                          -- url-safe; unique per workspace
+  icon text,                                   -- favicon URL / APK icon URL / '🔌'
+  description text,
+  source_mission_id uuid,                      -- null until Stage 1 Phase 3 lands
+  source_chat_session_id uuid,                 -- works before Phase 3
+  status text not null,                        -- draft | active | paused | archived
+  created_by text not null,                    -- 'agent' | 'user'
+  needs_user_review boolean default true,      -- blocks auto-run until approved
+  test_case_ids uuid[],
+  regression_plan_id uuid,
+  schedule_id uuid,
+  automation_action_ids uuid[],
+  resource_ids uuid[],
+  last_run_id uuid,
+  cover_screenshot_url text,                   -- first screenshot from exploration
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create unique index workflows_slug_workspace on workflows(workspace_id, slug);
+create index workflows_workspace_status on workflows(workspace_id, status);
+```
+
+9 columns + 5 foreign-key arrays. Not a monster — a deliberate aggregator.
+
+### 14.3 What you can do with a Workflow
+
+| Action | Endpoint | Maps to existing code |
+|---|---|---|
+| List | `GET /api/v1/workflows` | new |
+| Detail | `GET /api/v1/workflows/:id` | new — joins existing tables |
+| Rename / pause / archive | `PATCH /api/v1/workflows/:id` | new |
+| Run now | `POST /api/v1/workflows/:id/run-now` | calls `RegressionRunService.runPlan(workflow.regression_plan_id)` |
+| Approve (clear `needs_user_review`) | `POST /api/v1/workflows/:id/approve` | toggles flag, activates schedule |
+| Share (read-only link) | `POST /api/v1/workflows/:id/share` | optional, similar to existing `qa_share_result` skill |
+| Delete | `DELETE /api/v1/workflows/:id` | cascades: drops the row, leaves the underlying test cases (they may be referenced elsewhere) |
+
+Five endpoints total. The schedule, alerts, and test cases continue to live in their own tables and are editable via existing UI — Workflow is a view + identity over them.
+
+### 14.4 Gallery view (the new landing for first-run users)
+
+After Mission #0 approval (screen 6 → 7), user lands on `/workflows`, not `/dashboard`. Three states:
+
+| User state | What they see |
+|---|---|
+| First-ever (just approved Workflow #0) | One large card front-and-centre with "Created 4 min ago by AI agent" badge. Status dot pulsing green. Side panel: *"Want another one? [Add Workflow]"* |
+| Returning, 2-10 Workflows | Grid of cards sorted by `last_run_id` desc. Each card: icon, name, status dot, last-run summary, "Run now" CTA |
+| Power user, >10 Workflows | Compact list with filters by status / project / last-run-result. Cards still available via toggle |
+
+Card structure (already shown in conversation, repeating for spec):
+
+```
+┌─ Workflow: "example.com Daily Smoke" ─────────────────────┐
+│  🌐  example.com         created 4 min ago · by AI agent   │
+│                                                            │
+│  📋  5 test cases  🔐  1 login  📅  Daily 9am  🔔  Slack    │
+│                                                            │
+│  Last run · 2 min ago    ✓ 4 passed  ⚠ 1 issue             │
+│  Issue: /pricing — "Compare" link returns 404              │
+│                                                            │
+│  [▸ Run now]   📝 Edit   📤 Share   🤖 Ask agent           │
+└────────────────────────────────────────────────────────────┘
+```
+
+One primary CTA (Run now). Everything else secondary. AI-agent badge is open: when shared, the receiver sees "AI made this in 4 min" — sells the product implicitly.
+
+### 14.5 Naming convention
+
+- **Auto-generated name on creation:** `<target> <mode>`. Examples: `example.com Daily Smoke`, `MyApp Happy-path Regression`, `Stripe API Smoke`.
+- **User can rename anytime** via PATCH. Old slug kept as redirect for 30 days.
+- **Icon resolution:**
+  - Website: `https://<domain>/favicon.ico` (cached in our storage)
+  - Mobile: APK icon extracted via `mobile-app-prep` (already done for app cards today)
+  - API: literal emoji `🔌` or first letter of API name in a coloured circle
+- **Cover screenshot:** first screenshot from the first successful run. Refreshed weekly.
+
+### 14.6 Status indicators (the colour dot)
+
+| Status | Dot | Meaning |
+|---|---|---|
+| `draft` | grey, pulsing | Created by agent, awaiting user approval (Mission #0 just finished) |
+| `active`, last run green | solid green | Healthy |
+| `active`, last run had issues | amber | Workflow running, but findings need review |
+| `active`, last run failed entirely | red | Schedule still on, but execution broke (infra issue) |
+| `paused` | grey | User-paused; schedule suspended |
+| `archived` | hidden by default, shown in archive filter | Read-only |
+
+The dot is cheap UX that reads in 0.5s. Replace any "Status: foo" text with the dot.
+
+### 14.7 Lifecycle (code-level)
+
+```
+[Mission #0 reaches screen 6 'review']
+  ↓
+build_workflow_from_mission(missionId) tool fires (or post-Mission #0 hook
+                                                    before Stage 1 Phase 3)
+  ↓
+INSERT workflows (status='draft', needs_user_review=true,
+                  created_by='agent', cover_screenshot_url=<first screen>)
+  ↓
+Frontend shows card with overlay 'Review & approve'
+  ↓
+User clicks 'Approve' → PATCH workflows.status='active',
+                                  needs_user_review=false
+  ↓
+Schedule activates (if workflow.schedule_id is set)
+Alerts arm (workflow.automation_action_ids)
+  ↓
+[Time passes; scheduled runs execute via existing RegressionRunService]
+  ↓
+Each run UPDATE workflows.last_run_id, workflows.updated_at
+If run fails → automation_actions fire (existing path)
+If anomaly (Stage 1 Phase 6) → agent re-engages via §13.5 trigger
+  ↓
+[User may pause / archive / edit anytime; schedule respects status]
+```
+
+### 14.8 Workflow vs existing entities — what's the difference
+
+| Concept | Lives in | Used by | Workflow does |
+|---|---|---|---|
+| `intent_test_cases` | Repository | Test authoring, manual runs | Includes references; does not duplicate |
+| `regression_plans` | Plans | Bulk scheduling | Owns at most one plan |
+| `schedules` | Schedules tab | Cron-style triggers | Owns at most one schedule |
+| `automation_actions` | Settings → Automations | Notification rules | Owns the actions; user can add more via Settings |
+| `test_resources` | Settings → Resources | Auth/env/secrets | Owns the references; resources can be shared across Workflows |
+| `regression_runs` | Runs tab | Execution history | Workflow links to the latest one |
+| **Workflow** | `/workflows` | **First-touch user view + bundle identity** | **New aggregator object** |
+
+Power users can still edit each underlying entity from its tab. The Workflow row reflects current state via JOINs at read time — never duplicates source-of-truth data.
+
+### 14.9 Hard rules for code review
+
+1. **Workflow is never source-of-truth for its children.** Test cases are owned by Repository, schedules by Schedules tab, etc. Workflow joins. Drop the row → underlying entities survive.
+2. **Status transitions are exhaustive.** `draft → active`, `active → paused`, `paused → active`, `* → archived`. No silent state.
+3. **`created_by` is honest.** If user creates manually via wizard later, set `'user'`. Don't fake the AI badge.
+4. **AI agent never marks `needs_user_review=false` automatically.** Approval is always a human action. Exception: if Mission #0 ran in "auto-activate" advanced mode (off by default, requires opt-in checkbox on screen 4).
+5. **Name auto-gen uses the registered convention.** PRs proposing different formats need a design discussion first — consistency >> cleverness.
+
+### 14.10 Integration into Stage 1 phases
+
+Stage 2 (§13 + §14) depends on Stage 1 but can ship earlier than Phase 3-6:
+
+| Stage 1 dependency | Why |
+|---|---|
+| Phase 0 (priorKnowledge) | Mission #0's exploration benefits from KB enrichment |
+| Phase 1 (run_*, ask_human, build_workflow_from_mission tools) | Required — onboarding's planner needs these |
+| Phase 2 (unified pipeline) | Strongly recommended — otherwise onboarding chat fights with the `parseIntent` switch |
+| Phase 3 (durable missions) | Helpful for resume-after-tab-close on screen 5; can use `chat_sessions.metadata` as stopgap (see §13.9) |
+| Phase 4 (webhooks) | Not required; §13.5 trigger #2 (critical-bug spike) needs §14 + Phase 6 |
+| Phase 5 (Governor) | Not required for ship; recommended for budget gate on screen 4 approval |
+| Phase 6 (memory loop) | Required for §13.5 trigger #2 anomaly detection |
+
+**Earliest ship:** end of Phase 2. Ship `/start` + Workflow gallery with chat-session metadata in place of missions table. Migrate to missions when Phase 3 lands.
+
+---
+
+## 15. Two-stage summary
+
+**Stage 1** (engineering): one durable agent runtime, every layer is a tool, control plane around it, can run any QA mission. Backbone.
+
+**Stage 2** (product): a new user lands on `/start`, has a 90-second chat where the agent does most of the talking via quick actions, drops their APK / URL / swagger, and walks away in <5 minutes with a Workflow they can run, edit, schedule, and share. The agent stays in the sidebar for follow-ups.
+
+After both stages: a user types one Telegram message *or* drops one file on signup, and the system delivers value end-to-end without forms, without configuration screens, without the user having to know what a "test case" or "regression plan" is until they want to.

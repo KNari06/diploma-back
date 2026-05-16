@@ -80,7 +80,10 @@ const INTENT_PROMPT_CAP = 500;
 //     order — fixes regression where Russian intent ("иконка папка") with
 //     0 token overlap to Kazakh target ("Папкалар") got demoted out of
 //     pruner top-K, then semantic-floor reject killed the resolver.
-const PROMPT_VERSION = 'v3';
+// v4 — pass sceneSummary (PAGE STATE) into the pruner so it can keep
+// popup/dropdown options in the top-K when the intent uses a popup-scope
+// word ("in search results", "из списка", "в выпадающем", etc.).
+const PROMPT_VERSION = 'v4';
 
 // ───────────────────────────────────────────────────────────────────────
 // Types
@@ -155,8 +158,10 @@ const KEY_SEGMENT_INDEX = {
   intentHash: 6,
   fpDigest: 7,
   bhDigest: 8,
-  refsHash: 9,
-  topK: 10,
+  descDigest: 9,
+  sceneDigest: 10,
+  refsHash: 11,
+  topK: 12,
 } as const;
 
 function buildCacheKey(args: {
@@ -168,6 +173,7 @@ function buildCacheKey(args: {
   recordedFingerprint?: TargetFingerprint;
   priorApplyHints?: BindingHints;
   recordedDescription?: string;
+  sceneSummary?: string;
   candidateRefs: string[];
   topK: number;
 }): string {
@@ -182,6 +188,10 @@ function buildCacheKey(args: {
   // recordings with the same intent text but different captured-time
   // descriptions don't collide on a stale prune result.
   const descDigest = args.recordedDescription ? hash16(args.recordedDescription) : '';
+  // v4 — sceneSummary participates in the cache key. Same intent + same
+  // 60 refs but the popup-list snapshot changed (different items visible)
+  // must NOT hit the stale entry.
+  const sceneDigest = args.sceneSummary ? hash16(args.sceneSummary) : '';
   // Hash the truncated intent (matches the prompt cap of 500 chars) so
   // intent texts that differ only past the cap hit the same cache slot —
   // they produce identical prompts.
@@ -198,6 +208,7 @@ function buildCacheKey(args: {
     fpDigest,
     bhDigest,
     descDigest,
+    sceneDigest,
     refsHash,
     String(args.topK),
   ].join('|');
@@ -268,6 +279,13 @@ Be PERMISSIVE — if you exclude the right element here, the resolver cannot rec
 
 Cross-script reminder: lowercase + Unicode-fold both sides before comparing tokens. When the intent and the candidate are in different languages (Russian intent, Kazakh/English UI), translate semantically — token overlap of 0 is NOT grounds for exclusion.
 
+ACTIVE POPUP / DROPDOWN (HARD RULE — overrides all "soft" preferences below):
+When PAGE STATE describes an "Active popup/dropdown" AND the intent uses a popup-scope word — EN: "in/from/inside the dropdown / menu / popup / popover / suggestions / suggestion list / autocomplete / typeahead / search results / results / options / list / picker"; RU: "в выпадающем списке / в меню / в попапе / в подсказках / в результатах поиска / в результатах / в списке / в выборе"; KZ: "тізімде / мәзірде / іздеу нәтижелерінде / нұсқаларда" — you MUST include in your top-K every candidate that:
+  • is listed in PAGE STATE's "visible items" block, OR
+  • shares any token (after lowercase + Unicode-fold + transliteration) with the intent's anchor and looks like an inline popup option (role=option / menuitem / row / treeitem / listitem, or a bare <a>/<li>/<div> with isInsideActiveModal=true), OR
+  • matches the intent's anchor semantically across languages.
+Reserve at most 3 slots for non-popup candidates in this case — language switchers, footer links, hero CTAs etc. are NOT the target when the user said "in the popup/results/dropdown". Pattern "<ANCHOR> in <POPUP-WORD>" means "find the option named <ANCHOR> inside the active popup", not "find a button somewhere on the page". The trigger that opened the popup (the [expanded] combobox / search input) is also NOT what the user picks — keep it at most once for context.
+
 ACTION-AWARE PREFERENCE (soft, not exclusion — still INCLUDE when intent strongly points elsewhere):
 - click / hover: prefer button, a, [role=button|link|menuitem|tab|option], elements with onclick
 - type / fill: prefer input (text/email/password/search), textarea, [contenteditable], [role=textbox|searchbox|combobox]
@@ -281,7 +299,7 @@ CANDIDATE NOTATION (already added by upstream; respect when ranking):
 OUTPUT (JSON only): {"refs":["e1","e7",...]}
 - Refs MUST be copied verbatim from the CANDIDATES list (e.g. "e7", never "7" or "candidate-7" — use the exact value inside ref="...")
 - Up to {TOP_K} refs total
-- Order by descending confidence: identity match > cross-script semantic match > token overlap > container/context match > action-tag fit
+- Order by descending confidence: identity match > active-popup option match (when popup-scope intent) > cross-script semantic match > token overlap > container/context match > action-tag fit
 - No reasoning, no scores, no explanations`;
 
 function buildPrompt(args: {
@@ -291,6 +309,7 @@ function buildPrompt(args: {
   recordedFingerprint?: TargetFingerprint;
   priorApplyHints?: BindingHints;
   recordedDescription?: string;
+  sceneSummary?: string;
   candidates: PrunerCandidate[];
 }): { system: string; user: string } {
   const system = SYSTEM_PROMPT.replace(/\{TOP_K\}/g, String(args.topK));
@@ -339,12 +358,23 @@ function buildPrompt(args: {
     ? `\nRECORDED DESCRIPTION:\n"${args.recordedDescription.replace(/"/g, '\\"').slice(0, 200)}"\n`
     : '';
 
+  // v4 — PAGE STATE (active modal/popup, expanded containers, selected
+  // tabs + the visible items inside the popup). Needed for the
+  // popup-scope HARD RULE in the system prompt: without this block the
+  // pruner can't tell which candidates live inside the active popup, so
+  // intents like "sun in search results" / "из выпадающего списка"
+  // would drop the listbox options in favor of louder background links.
+  // Cap at 400 chars to keep the prompt bounded on dense pages.
+  const sceneBlock = args.sceneSummary
+    ? `\nPAGE STATE:\n${args.sceneSummary.slice(0, 400)}\n`
+    : '';
+
   const candidateLines = args.candidates
     .map((c, i) => `${i + 1}. ref="${c.node.ref}" <${c.node.tag}> ${c.candidateText.slice(0, 280)}`)
     .join('\n');
 
   const user = `INTENT: "${args.intentText.slice(0, INTENT_PROMPT_CAP)}"
-ACTION: ${args.actionType}${recordedBlock}${hintsBlock}${descBlock}
+ACTION: ${args.actionType}${recordedBlock}${hintsBlock}${descBlock}${sceneBlock}
 CANDIDATES (${args.candidates.length}):
 ${candidateLines}
 
@@ -423,6 +453,13 @@ export async function pruneCandidatesViaLLM(params: {
    * sees it — irrecoverable.
    */
   recordedDescription?: string;
+  /**
+   * v4 — PAGE STATE summary built from the full candidate set BEFORE
+   * pruning (active popup/dropdown, expanded containers, selected tabs +
+   * visible items inside the popup). Optional: pruner stays popup-agnostic
+   * if the caller doesn't pass one — old behaviour preserved.
+   */
+  sceneSummary?: string;
   topK?: number;
   mode?: 'apply' | 'heal';
 }): Promise<PrunerResult> {
@@ -478,6 +515,7 @@ export async function pruneCandidatesViaLLM(params: {
     recordedFingerprint: params.recordedFingerprint,
     priorApplyHints: params.priorApplyHints,
     recordedDescription: params.recordedDescription,
+    sceneSummary: params.sceneSummary,
     candidateRefs,
     topK,
   });
@@ -510,6 +548,7 @@ export async function pruneCandidatesViaLLM(params: {
         recordedFingerprint: params.recordedFingerprint,
         priorApplyHints: params.priorApplyHints,
         recordedDescription: params.recordedDescription,
+        sceneSummary: params.sceneSummary,
         candidates: params.candidates,
       });
       const response = await withAILogFields(

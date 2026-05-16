@@ -1060,7 +1060,7 @@ export function buildCandidateText(node: InteractiveNode): string {
  * Gives the LLM a top-down understanding of the page state
  * (which dropdowns are open, which tabs are selected, whether a modal is active).
  */
-function buildSceneSummary(
+export function buildSceneSummary(
   candidates: Array<{ node: InteractiveNode; candidateText: string }>
 ): string {
   const scenes: string[] = [];
@@ -1079,10 +1079,65 @@ function buildSceneSummary(
     scenes.push(`"${label}" tab is selected`);
   }
 
-  // Detect active modal/popup layer (from snapshot collector heuristics)
+  // Detect active modal/popup layer (from snapshot collector heuristics).
+  // Surface up to 6 labels from inside the popup so the LLM can link an
+  // intent like "sun in search results" / "первый пункт списка" to the
+  // actual options on screen, instead of seeing only a generic
+  // "popup is open with N elements".
   const modalElements = candidates.filter(c => c.node.isInsideActiveModal === true);
   if (modalElements.length > 0) {
-    scenes.push(`A modal/popup is open with ${modalElements.length} interactive elements`);
+    // Sort "leaf items" first (the things a user would actually pick from
+    // the popup), "container/trigger" elements last.
+    //
+    // Why not a hardcoded role list ([option, menuitem, row, …]):
+    //   – ARIA roles evolve (treeitem, gridcell, menuitemcheckbox, tab,
+    //     listitem, rowheader, …); custom design systems invent more
+    //     (role="suggestion" for typeaheads, role="row" for grid pickers).
+    //     A static set always lags behind.
+    //   – Many real popups have option-shaped children with NO role at
+    //     all (Wikipedia search popup options are bare <a>; ant-design
+    //     AutoComplete uses <div class="ant-select-item">; Cmdk renders
+    //     <li> without role). Filtering by role would hide them entirely.
+    //
+    // Universal heuristic — score each modal element on signals the
+    // collector already populates, no role allowlist:
+    //   • ariaExpanded === true → it's a TRIGGER (combobox / disclosure
+    //     button that opened the popup). NOT what the user picks.
+    //   • tag in {input, textarea, select} → the search box / filter
+    //     control inside the popup, not a leaf item.
+    //   • has visible text (text / labelText / ariaLabel / title) →
+    //     it's something a user can name. Bare wrappers rank last.
+    const scoreLeafness = (n: InteractiveNode): number => {
+      let s = 0;
+      if (n.ariaExpanded === true) s -= 3;
+      const tagLc = (n.tag || '').toLowerCase();
+      if (tagLc === 'input' || tagLc === 'textarea' || tagLc === 'select') s -= 2;
+      const hasText = !!(getEffectiveLabel(n) || '').trim();
+      if (hasText) s += 2;
+      return s;
+    };
+    const optionsFirst = [...modalElements].sort(
+      (a, b) => scoreLeafness(b.node) - scoreLeafness(a.node),
+    );
+    const labels: string[] = [];
+    const seen = new Set<string>();
+    for (const c of optionsFirst) {
+      const raw = (getEffectiveLabel(c.node) || '').trim();
+      if (!raw) continue;
+      const trimmed = raw.length > 60 ? raw.slice(0, 57) + '…' : raw;
+      const key = trimmed.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      labels.push(`"${trimmed}"`);
+      if (labels.length >= 6) break;
+    }
+    if (labels.length > 0) {
+      scenes.push(
+        `Active popup/dropdown contains ${modalElements.length} elements; visible items: ${labels.join(', ')}`,
+      );
+    } else {
+      scenes.push(`A modal/popup is open with ${modalElements.length} interactive elements`);
+    }
   }
 
   if (scenes.length === 0) return '';
@@ -1742,15 +1797,32 @@ const LLM_SHARED_RULES = `RULES:
    - TOAST/SNACKBAR: small element at TOP or BOTTOM edge
    When an overlay is present, ALWAYS prefer elements INSIDE it over background.
 
-8. PAGE-STATE-DRIVEN selection:
+8. PAGE-STATE-DRIVEN selection (CRITICAL for popups / dropdowns / autocomplete):
    - [expanded] = container is OPEN; its children are visible candidates
    - [collapsed] = container is CLOSED; its children are NOT the target
    - [selected] = tab/option is active; content within is visible
    - [active-layer] = element is inside the foreground overlay
    - "clickable-row" = <tr> wired up as interactive without explicit role
-   When user says "inside dropdown/menu/popup/dialog":
-   - Find children of an [expanded]/[active-layer] container
-   - The trigger (the [expanded] element itself) is NOT the target
+
+   POPUP-CONTAINER WORDS in intent (any language) — strongly bias toward
+   candidates marked [active-layer] / role=option / role=menuitem /
+   role=listitem:
+     • EN: "in/inside/from the dropdown / menu / popup / popover /
+       suggestion(s) / suggestions list / autocomplete / typeahead /
+       search results / results / options / list / picker / select"
+     • RU: "в выпадающем списке / в меню / в попапе / в подсказках /
+       в результатах поиска / в результатах / в списке / в выборе"
+     • KZ: "тізімде / мәзірде / іздеу нәтижелерінде / нұсқаларда"
+   Pattern "<TARGET> in <POPUP-WORD>" / "<TARGET> из <POPUP-WORD>" means
+   "find an option whose text matches <TARGET> inside the currently active
+   popup". The trigger that OPENED the popup (the [expanded] combobox /
+   search input) is NOT the target — pick the option, not the input.
+
+   When PAGE STATE shows "Active popup/dropdown contains … visible items:
+   ['A', 'B', 'C', …]", these strings ARE your candidate pool for any
+   popup-scoped intent — match the intent's anchor to one of them by
+   semantic / substring / cross-language overlap, not to background
+   elements outside the popup.
 
 9. ANCESTOR PATH HINT (V22):
    The fingerprint may include "ancestorPath=...header#layout-header > div.icon-group > svg"
@@ -1859,6 +1931,17 @@ ${LLM_SHARED_RULES}
     different flow than what was recorded. Refuse the guess; return
     null.
 
+    EXCEPTION — active-popup option match is NOT a "loudest CTA fallback":
+    When PAGE STATE shows an active popup/dropdown AND the intent uses a
+    popup-container word (Rule 8: "in search results / suggestions /
+    dropdown / в результатах / тізімде / …") AND one of the popup's
+    options has text that contains the intent's anchor (substring,
+    cross-language, or normalized — "Sun" matches "Sun · Star at the
+    centre of the Solar System") — that option IS the right answer.
+    Confidence 0.80–0.92 depending on uniqueness inside the popup. This
+    is the OPPOSITE of "loudest CTA": you are picking a small in-popup
+    item over the giant background button, not the other way around.
+
 19. REJECT GIBBERISH / IRRELEVANT TEXT (Apply-mode safety):
     Return ref=null when the intent is:
     - Random/gibberish: "asdfgh", "ываыва", "xyzabc"
@@ -1874,16 +1957,29 @@ ${LLM_SHARED_RULES}
 
     - SPECIFIC: contains a unique anchor — exact label/text fragment,
       icon name, role + position together, identifier-shaped value, or
-      a phrase that can only describe one element on the page.
+      a phrase that can only describe one element on the page. Also
+      includes "<ANCHOR> in <LOCATION>" patterns where ANCHOR is a
+      specific text/icon name and LOCATION scopes the search (section,
+      popup, row, card, header, sidebar, modal, search results, dropdown).
       Examples: "кнопка Сохранить", "settings cog in header",
-      "carousel next arrow", "MAT-SMART курс карточка".
+      "carousel next arrow", "MAT-SMART курс карточка",
+      "sun in search results", "Edit button in the second row",
+      "Delete in user menu", "первый пункт в выпадающем списке".
       → Confident pick allowed (≥0.75 if a candidate matches).
+      Note: the anchor token alone may be short ("Sun", "X", "Edit") —
+      what makes the intent SPECIFIC is that anchor + scope together
+      uniquely identify ONE element on the current page state.
 
-    - GENERIC: refers to an element class without a specifier.
-      Examples: "кнопка", "ссылка", "icon", "input field", "button".
-      Multiple candidates plausibly match.
+    - GENERIC: refers to an element class without ANY specifier (no
+      anchor text, no icon name, no scoping location). The intent could
+      describe many elements on the page.
+      Examples: "кнопка", "ссылка", "icon", "input field", "button",
+      "the link", "any button".
       → Cap confidence at 0.6. Emit suggestion (issue=GENERIC_INTENT)
         listing the 3 most likely interpretations.
+      Do NOT classify as GENERIC just because the anchor word is short
+      or common — "Sun in search results" has an anchor ("Sun") and a
+      scope ("search results") → SPECIFIC.
 
     - VAGUE: positional or quantitative without a visual anchor.
       Examples: "четвертая иконка", "first link", "the third button",
@@ -2020,6 +2116,18 @@ EXPECTED: {"ref":"e8","confidence":0.82,"reason":"button with ariaLabel \"Upload
 INTENT: "ываыва asdfgh"
 CANDIDATES: any list
 EXPECTED: {"ref":null,"confidence":0,"reason":"intent is gibberish, no semantic relationship to any candidate"}
+
+— Active-popup option scoped by location word (high confidence 0.88) —
+INTENT: "sun in search results"
+PAGE STATE: "Search" is expanded/open; Active popup/dropdown contains 5 elements; visible items: "Sun · Star at the centre of the Solar System", "Rishi Sunak", "Sunday", "Sunflower", "Sunset"
+CANDIDATES:
+  1. ref="e2" <input> placeholder: "Search Wikipedia" [role: combobox] [expanded]
+  2. ref="e8" <a> "English" [role: link]
+  3. ref="e9" <a> "日本語" [role: link]
+  4. ref="e21" <a> "Sun · Star at the centre of the Solar System" [role: option] [active-layer]
+  5. ref="e22" <a> "Rishi Sunak" [role: option] [active-layer]
+  6. ref="e23" <a> "Sunday" [role: option] [active-layer]
+EXPECTED: {"ref":"e21","confidence":0.88,"reason":"intent anchors on 'sun' scoped to 'search results'; PAGE STATE shows an active search popup; ref=e21 is the option in [active-layer] whose text starts with 'Sun'. Background <a> language links (English/日本語) are NOT the target — Rule 8 says popup-scope intents pick options inside the popup, Rule 18 EXCEPTION makes this a legitimate in-popup match, not a loudest-CTA fallback."}
 
 — Ambiguous duplicates — return alternatives, not guess —
 INTENT: "Delete"
@@ -2857,28 +2965,74 @@ Select the single best matching element, or return ref=null if the intent does n
     };
 
     // Backend-side suggestion synthesizer for cases where the LLM omitted
-    // the field but we still want to help the user. Picks the top-3
-    // candidate labels by visible text length (longer = more specific
-    // anchor) and emits a generic-language hint. Never invents text —
+    // the field but we still want to help the user. Ranks candidate labels
+    // by token overlap with the INTENT (so a Wikipedia search popup with
+    // intent "sun in search results" surfaces the listbox option "Sun ...",
+    // not the language links "English 7,180,000+ articles" that merely have
+    // a comfortable length). Falls back to length-based ranking ONLY when
+    // no candidate shares any token with the intent. Never invents text —
     // every example is a real candidate label.
     const synthesizeFallbackSuggestion = (
       issue: ResolverSuggestion['issue'],
     ): ResolverSuggestion | undefined => {
-      const ranked = [...candidateLabels]
-        .filter((l) => l.length >= 2 && l.length <= 80)
-        // Prefer mid-length labels (8–60 chars) over very short generic
-        // ones ("OK", "Cancel") and over walls of text. Mid range tends
-        // to be the most useful for "you might have meant..." prompts.
+      // Tokenize on unicode word boundaries; drop short noise and obvious
+      // stop words. Mirrors the spirit of extractKeywordsSync but is local
+      // to avoid a cross-cutting dep here.
+      const STOP = new Set([
+        'the','a','an','in','on','at','to','for','with','and','or','of','is','are','from','into','this','that','these','those','it','its',
+        'click','tap','press','select','type','enter','open','close','find','item','element','button','link','field','input','named','called',
+        'и','в','на','с','по','для','из','за','от','к','у','о','об','же','ли','уже','что','как','это','эти','тот','этот','эта',
+        'нажми','выбери','введи','открой','закрой','найди','элемент','кнопка','ссылка','поле','ввод','назван','название','зовут',
+      ]);
+      const tokenize = (s: string): string[] =>
+        s
+          .toLowerCase()
+          .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+          .split(/\s+/)
+          .filter((w) => w.length >= 2 && !STOP.has(w));
+      const intentTokens = new Set(tokenize(intentText));
+      const overlap = (label: string): number => {
+        if (intentTokens.size === 0) return 0;
+        const labelTokens = new Set(tokenize(label));
+        let hits = 0;
+        for (const t of intentTokens) if (labelTokens.has(t)) hits += 1;
+        return hits;
+      };
+      const lenBucket = (s: string): number => {
+        const len = s.length;
+        if (len >= 8 && len <= 60) return 0;
+        if (len < 8) return 1;
+        return 2;
+      };
+
+      // De-duplicate (case-insensitive) so the same label doesn't take
+      // multiple slots in top-3. Preserve first occurrence (highest-prescore).
+      const seen = new Set<string>();
+      const uniqueLabels = candidateLabels.filter((l) => {
+        const len = l.length;
+        if (len < 2 || len > 80) return false;
+        const key = l.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      const scored = uniqueLabels
+        .map((l) => ({ label: l, overlap: overlap(l), bucket: lenBucket(l) }));
+      const hasAnyOverlap = scored.some((s) => s.overlap > 0);
+
+      const ranked = scored
         .sort((a, b) => {
-          const score = (s: string) => {
-            const len = s.length;
-            if (len >= 8 && len <= 60) return 0;     // best
-            if (len < 8) return 1;
-            return 2;                                 // very long
-          };
-          return score(a) - score(b);
+          if (hasAnyOverlap) {
+            // Primary: relevance to intent. Higher overlap first.
+            if (b.overlap !== a.overlap) return b.overlap - a.overlap;
+          }
+          // Tie-break (or no-overlap fallback): mid-length labels first.
+          return a.bucket - b.bucket;
         })
-        .slice(0, 3);
+        .slice(0, 3)
+        .map((s) => s.label);
+
       if (ranked.length === 0) return undefined;
       // Detect dominant script of INTENT to produce a same-language hint.
       // Heuristic: any Cyrillic char → Russian/Kazakh wording; otherwise
@@ -3981,6 +4135,13 @@ export async function resolveElement(params: {
     // captured on the first successful apply. Same chain as line 4028.
     const shadowRecordedFp = stepDraft.recordedFingerprint
       || stepDraft.compiled?.targetFingerprint;
+    // v4 — build PAGE STATE for the pruner from the FULL candidate set
+    // (BEFORE pruning). Without it the pruner has no way to see "this
+    // popup is open with these visible items" and can drop the real
+    // target option in favor of louder background links. Cheap O(n)
+    // pass — same function the main resolver uses downstream at line
+    // 2502, just called earlier so both stages share the same signal.
+    const prunerSceneSummary = buildSceneSummary(candidatesToProcess) || undefined;
     const prunerStartedAt = Date.now();
 
     if (ELEMENT_RESOLVER_CONFIG.pruner.shadowMode) {
@@ -3997,6 +4158,7 @@ export async function resolveElement(params: {
         // Etap 1D.4 — pass description so pruner doesn't drop the right
         // candidate before main resolver gets a chance.
         recordedDescription: stepDraft.recordedDescription,
+        sceneSummary: prunerSceneSummary,
         topK: ELEMENT_RESOLVER_CONFIG.pruner.topK,
         mode: resolveMode,
       }).then(prunerResult => {
@@ -4039,6 +4201,7 @@ export async function resolveElement(params: {
           priorApplyHints: stepDraft.bindingHints,
           // Etap 1D.4 — same description hint for the live pruner path.
           recordedDescription: stepDraft.recordedDescription,
+          sceneSummary: prunerSceneSummary,
           topK: ELEMENT_RESOLVER_CONFIG.pruner.topK,
           mode: resolveMode,
         });
