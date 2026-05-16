@@ -1328,6 +1328,39 @@ export class RegressionRunService {
         .update({ status: 'running', started_at: new Date().toISOString() })
         .eq('id', run.id);
 
+      // Notify all workspace members immediately — closes the gap between run creation
+      // and the first progress event from executeTestCasesAsync (which fires only
+      // after the BullMQ job picks up, potentially seconds later).
+      // Non-fatal: a WS emit failure must never block run startup — the run row
+      // already exists with status='running' and BullMQ will execute it regardless.
+      try {
+        const creationRecipients = await getProjectWorkspaceMemberIds(plan.projectId, userId);
+        const creationPayload = {
+          runId: run.id,
+          userId,
+          planId,
+          projectId: plan.projectId,
+          trigger,
+          status: 'started' as const,
+          progress: 0,
+          message: 'Regression run started',
+          details: { totalTests: executableCases.length, completedTests: 0 },
+          timestamp: new Date().toISOString(),
+        };
+        for (const recipientId of creationRecipients) {
+          webSocketService.emitRegressionRunProgress(recipientId, creationPayload);
+        }
+        logger.info('[REGRESSION_RUN] Creation WS event emitted', {
+          runId: run.id,
+          planId,
+          recipients: creationRecipients.length,
+        });
+      } catch (wsError) {
+        logger.warn('[REGRESSION_RUN] Failed to emit creation WS event — run will proceed normally', {
+          runId: run.id, planId, error: wsError,
+        });
+      }
+
       // 4. Read runtime config from plan's automation_config
       const browserOverride = plan.automationConfig?.runtime?.browser;
       // Opt-in fail-fast: stop dispatching new tests after the first

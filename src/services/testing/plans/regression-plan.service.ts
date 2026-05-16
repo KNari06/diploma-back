@@ -24,6 +24,17 @@ import type {
 } from '@/types/testing.types';
 import { logger } from '@/utils/core/logger';
 
+type RunStatus = RegressionPlanWithStats['lastRun'] extends { status: infer S } | null ? S : never;
+
+function normaliseRunStatus(s: string): RunStatus {
+  const valid = new Set(['pending', 'running', 'completed', 'failed', 'cancelled']);
+  if (!valid.has(s)) {
+    logger.warn('[REGRESSION_PLAN] Unexpected run status from DB — falling back to cancelled', { status: s });
+    return 'cancelled';
+  }
+  return s as RunStatus;
+}
+
 /**
  * Service for managing regression plans
  * Plans define custom test sets for regression testing
@@ -238,7 +249,7 @@ export class RegressionPlanService {
         lastRun: lastRunRow
           ? {
               runId: lastRunRow.id,
-              status: health.state !== 'unknown' ? health.state : lastRunRow.status,
+              status: normaliseRunStatus(lastRunRow.status),
               startedAt: lastRunRow.started_at,
               completedAt: lastRunRow.completed_at,
               durationMs: this.computeDurationMs(lastRunRow.started_at, lastRunRow.completed_at),
@@ -280,7 +291,7 @@ export class RegressionPlanService {
       lastRun: lastRunRow
         ? {
             runId: lastRunRow.id,
-            status: health.state !== 'unknown' ? health.state : lastRunRow.status,
+            status: lastRunRow.status,
             startedAt: lastRunRow.started_at,
             completedAt: lastRunRow.completed_at,
             durationMs: this.computeDurationMs(lastRunRow.started_at, lastRunRow.completed_at),
