@@ -139,7 +139,7 @@ POST `/api/chat/message`
 
 These are codified across the codebase. Also see [.claude/rules/critical-patterns.md](.claude/rules/critical-patterns.md) for the long form.
 
-1. **Never create raw CDP sessions.** `context.newCDPSession(page)` conflicts with the video screencast and freezes preview. Use Playwright's built-in APIs (`page.accessibility.snapshot()`, `page.content()`).
+1. **Never reuse the screencast CDP session in preview.** Piggybacking on the `video-stream` session causes 100% video freeze. In preview contexts, `CdpSnapshotService` opens its own session and detaches in `finally` — that is safe. In background/regression contexts `context.newCDPSession(page)` is always fine. For DevTools outside Etap 2, prefer Playwright built-ins (`page.accessibility.snapshot()`, `page.content()`). See [critical-patterns.md](.claude/rules/critical-patterns.md) section 2 for the full trade-off.
 2. **WebSocket handlers must always emit a response.** Silent `return` = frontend stuck on "Loading…" forever. Even on error paths.
 3. **Recording and step apply are mutually exclusive in a preview session.** Recording auto-stops when a run starts (`PreviewRunService.isRunning()` guard).
 4. **Replay path uses `waitUntil: 'load'`, never `'domcontentloaded'`.** Different timing semantics — don't mix.
