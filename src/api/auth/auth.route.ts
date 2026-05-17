@@ -6,6 +6,11 @@ import path from 'path';
 import { z } from 'zod';
 import { deleteAvatar, uploadAvatar } from './auth-avatar.controller';
 import {
+  getDeletionPreview,
+  postDeleteAccount,
+  postCancelDeletion,
+} from './account-deletion.controller';
+import {
   completeOAuthHandler,
   getOAuthUrlHandler,
   getPendingUsers,
@@ -811,6 +816,26 @@ router.post('/avatar', requireAuth, uploadAvatarMulter.single('avatar'), asyncHa
  * Delete user avatar (authenticated)
  */
 router.delete('/avatar', requireAuth, asyncHandler(deleteAvatar));
+
+// ============================================================================
+// ACCOUNT DELETION (self-service)
+// ============================================================================
+//
+// All three routes go through the standard `requireAuth` middleware
+// AND the auth middleware itself contains a `deleted_at` check that
+// 401s soft-deleted users on any path except the `cancel` endpoint
+// (see middleware/auth.middleware.ts:POST_DELETION_ALLOWED_PATHS).
+//
+//   GET  /me/deletion-preview  → DeletionPreview { scheduledFor,
+//                                  blockingWorkspaces, soleOwnedWorkspaces,
+//                                  graceDays }
+//   POST /me/delete            → schedules soft-delete + 30-day cron.
+//                                Body: { confirmEmail }
+//   POST /me/delete/cancel     → support-only; restores `deleted_at=NULL`
+
+router.get('/me/deletion-preview', requireAuth, asyncHandler(getDeletionPreview));
+router.post('/me/delete', requireAuth, asyncHandler(postDeleteAccount));
+router.post('/me/delete/cancel', requireAuth, asyncHandler(postCancelDeletion));
 
 // ============================================================================
 // ADMIN: User approval management

@@ -1583,6 +1583,19 @@ const startServer = async () => {
         } catch (cleanupError) {
           logger.error('[SERVER] Failed to cleanup zombie runs', { error: formatError(cleanupError) });
         }
+
+        // Start the daily account-deletion purge sweep. Picks up users
+        // whose 30-day grace window has elapsed and runs the hard-purge
+        // cascade against each. See `jobs/account-deletion-purge.job.ts`
+        // for the full operational doc.
+        try {
+          const { AccountDeletionPurgeJob } = await import('@/jobs/account-deletion-purge.job');
+          AccountDeletionPurgeJob.start();
+        } catch (err) {
+          logger.error('[SERVER] Failed to start account-deletion purge', {
+            error: formatError(err),
+          });
+        }
       });
 
       /**
