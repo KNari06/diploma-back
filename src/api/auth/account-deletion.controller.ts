@@ -172,9 +172,21 @@ export async function postDeleteAccount(req: Request, res: Response): Promise<vo
 /**
  * POST /api/v1/auth/me/delete/cancel
  *
- * Support-only path for v1 — auth middleware special-cases this URL to
- * allow soft-deleted users past the 401 guard. No public UI surface
- * yet; intended for a future admin panel or direct DB-bypass.
+ * Self-cancel of a pending account deletion. Uses `req.user.id`, so a
+ * user can only un-delete THEMSELVES — admins acting on behalf of
+ * other users need a separate `/admin/users/:id/restore` endpoint
+ * (not in v1, tracked as a follow-up).
+ *
+ * The auth middleware special-cases this URL via
+ * `POST_DELETION_ALLOWED_PATHS` so a soft-deleted user can call it
+ * with their still-valid JWT during the 30-day grace window. That's
+ * the entire point — without the allowlist they'd be 401'd before
+ * reaching this handler.
+ *
+ * Threat-model note: this DOES NOT escalate privilege. The worst a
+ * stolen JWT can do is undo the legitimate owner's deletion request,
+ * which the legitimate owner can immediately re-issue. No data leaks,
+ * no permission upgrades. Self-cancel is the right v1 default.
  *
  * If the calling user isn't soft-deleted, returns a benign 200.
  */

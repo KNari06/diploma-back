@@ -831,7 +831,13 @@ router.delete('/avatar', requireAuth, asyncHandler(deleteAvatar));
 //                                  graceDays }
 //   POST /me/delete            → schedules soft-delete + 30-day cron.
 //                                Body: { confirmEmail }
-//   POST /me/delete/cancel     → support-only; restores `deleted_at=NULL`
+//   POST /me/delete/cancel     → SELF-cancel of a pending deletion
+//                                during the 30-day grace window. Uses
+//                                `req.user.id`, so a user can only
+//                                un-delete THEMSELVES — admins acting
+//                                on behalf of others should use the
+//                                separate `/admin/users/:id/restore`
+//                                route (TODO, not in v1).
 
 router.get('/me/deletion-preview', requireAuth, asyncHandler(getDeletionPreview));
 router.post('/me/delete', requireAuth, asyncHandler(postDeleteAccount));
