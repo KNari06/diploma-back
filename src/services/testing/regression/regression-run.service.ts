@@ -1719,18 +1719,58 @@ export class RegressionRunService {
       // Verify project access
       await this.verifyProjectAccess(projectId, userId);
 
-      // Get UI test cases with tag from intent_test_cases (unified table)
+      // Get UI test cases with tag from intent_test_cases (unified table).
+      // We pull `priority` so we can run higher-priority tests first
+      // within a tag bucket — a tag is an unordered collection (unlike
+      // a plan which has explicit `position`, or a module/flow which
+      // has `order_index`), so reordering here doesn't violate any
+      // curator-set sequence. Sort is below.
       const { data: uiCases } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, flow_id, depends_on, platform')
+        .select('id, flow_id, depends_on, platform, priority')
         .eq('project_id', projectId)
         .contains('tags', [tag]);
 
       // Get API test cases with tag (scoped to project via environments/endpoints)
       const apiCases = await this.getApiTestConfigsByProjectAndTag(projectId, userId, tag);
 
+      // Sort UI cases by curator-set priority — critical first.
+      // Stable within the same priority bucket (we lean on Array.sort's
+      // stability guarantee, ES2019+). API cases stay in their original
+      // relative order at the end because `api_test_configs` has no
+      // priority column repo-wide (see analytics-query.service:838) — no
+      // signal to sort on, so we don't pretend to.
+      //
+      // NULL handling: legacy rows pre-default (before
+      // intent-test-case.service.ts started inserting 'medium' as the
+      // default) collapse into the medium bucket here. Without this,
+      // newly-created 'medium' tests would run BEFORE older NULL tests
+      // — a confusing ordering change for users who haven't backfilled.
+      // Sort treats unknown-priority as middle-of-the-road, which is
+      // also what every other downstream path (Jira fallback, Telegram
+      // omission) effectively does.
+      //
+      // Case-insensitive lookup: defends against schema drift where a
+      // row might have 'Critical' (capital C) bypassing the CHECK
+      // constraint (e.g. via raw SQL or migration mishap). Without
+      // this, such a row would sort to the medium bucket along with
+      // NULL — silently wrong. Lowercasing keys is cheap and safe.
+      const PRIORITY_ORDER: Record<string, number> = {
+        critical: 0,
+        high: 1,
+        medium: 2,
+        low: 3,
+      };
+      const priorityRank = (p: string | null | undefined): number => {
+        const key = typeof p === 'string' ? p.toLowerCase() : '';
+        return PRIORITY_ORDER[key] ?? PRIORITY_ORDER.medium;
+      };
+      const orderedUiCases = [...(uiCases || [])].sort(
+        (a, b) => priorityRank(a.priority) - priorityRank(b.priority),
+      );
+
       const testCases: ExecutableTestCase[] = [
-        ...(uiCases || []).map((tc: any) => ({
+        ...orderedUiCases.map((tc: any) => ({
           testCaseId: tc.id,
           testType: 'ui' as const,
           flowId: tc.flow_id || undefined,

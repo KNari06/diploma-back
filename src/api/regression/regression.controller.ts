@@ -966,7 +966,14 @@ export async function getRunExecutions(req: AuthenticatedRequest, res: Response)
 
     const executions = await ExecutionService.getByRunId(runId);
 
-    // Batch-fetch test case names for UI display
+    // Batch-fetch test case names for UI display, plus priority for UI cases.
+    // Priority is surfaced so the frontend can colorize / sort the executions
+    // list (critical rows in red, low rows muted) WITHOUT changing the
+    // server-side execution order. We deliberately keep priority a
+    // display-only signal here — runPlan/runFlow already preserve the
+    // user's `position` ordering; reordering server-side would break that
+    // contract. API tests have no priority column (see analytics-query
+    // service:838) so the map is UI-only.
     const uiTestCaseIds = [...new Set(
       executions.filter((e) => e.testType === 'ui').map((e) => e.testCaseId)
     )];
@@ -975,13 +982,22 @@ export async function getRunExecutions(req: AuthenticatedRequest, res: Response)
     )];
 
     const namesMap = new Map<string, string>();
+    const priorityMap = new Map<string, 'critical' | 'high' | 'medium' | 'low'>();
 
     if (uiTestCaseIds.length > 0) {
-      const { data: uiNames } = await supabaseAdmin
+      const { data: uiRows } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, name')
+        .select('id, name, priority')
         .in('id', uiTestCaseIds);
-      for (const row of uiNames || []) namesMap.set(row.id, row.name);
+      for (const row of uiRows || []) {
+        namesMap.set(row.id, row.name);
+        // Guard against schema drift: priority may be NULL or a free-form
+        // string if anyone bypassed the CHECK constraint. Only forward
+        // values we trust the frontend's badge / color scheme to handle.
+        if (row.priority && ['critical', 'high', 'medium', 'low'].includes(row.priority)) {
+          priorityMap.set(row.id, row.priority as 'critical' | 'high' | 'medium' | 'low');
+        }
+      }
     }
     if (apiTestCaseIds.length > 0) {
       const { data: apiNames } = await supabaseAdmin
@@ -996,6 +1012,9 @@ export async function getRunExecutions(req: AuthenticatedRequest, res: Response)
       id: exec.id,
       testCaseId: exec.testCaseId,
       testCaseName: namesMap.get(exec.testCaseId) || null,
+      // UI tests only — API tests intentionally null (no priority column).
+      // Frontend uses this to badge / colorize rows; absence == no badge.
+      priority: priorityMap.get(exec.testCaseId) ?? null,
       testType: exec.testType,
       status: exec.status,
       browser: exec.browser,

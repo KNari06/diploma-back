@@ -1253,7 +1253,25 @@ export interface JiraIssueRequest {
   projectKey: string;
   testReport: FinalTestReport;
   issueType?: 'Bug' | 'Task' | 'Story';
+  /**
+   * Explicit Jira-priority override. Set by API callers who already know
+   * exactly which Jira priority bucket they want (e.g. user clicked "file
+   * as Highest" in the UI). Wins over `testCasePriority` and the
+   * severity-derived fallback. Keep using the literal Jira priority
+   * vocabulary — these strings go straight into the Jira `priority.name`
+   * field on the issue.
+   */
   priority?: 'Highest' | 'High' | 'Medium' | 'Low' | 'Lowest';
+  /**
+   * Optional `intent_test_cases.priority` of the test case this run came
+   * from (one of: 'critical' | 'high' | 'medium' | 'low'). When neither
+   * `priority` (explicit override) nor an obvious severity bucket
+   * applies, this is mapped via `mapTestCasePriorityToJira()` so users
+   * who tag their tests as "critical" see Highest-priority Jira issues
+   * without having to set Jira priority manually in every report.
+   * NULL / undefined → falls through to severity-derived priority.
+   */
+  testCasePriority?: 'critical' | 'high' | 'medium' | 'low';
 }
 
 export interface JiraIssue {
