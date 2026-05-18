@@ -3348,12 +3348,22 @@ export class RegressionRunService {
     // MUST update this reconstruction or have the executor echo `phase`
     // on each step event directly.
     const phaseMapByTestCaseId = new Map<string, Array<'setup' | 'main' | 'teardown'>>();
+    // Surface curator-set priority alongside the phase reconstruction so
+    // the run-details page can badge / colorize execution rows without an
+    // extra round-trip. Display-only — does NOT change execution order.
+    // Map only stores valid enum values; CHECK-violating drift collapses
+    // to null on the wire.
+    const priorityByTestCaseId = new Map<string, 'critical' | 'high' | 'medium' | 'low'>();
+    const VALID_PRIORITY = new Set(['critical', 'high', 'medium', 'low']);
     if (testCaseIds.length > 0) {
       const { data: caseRows } = await supabaseAdmin
         .from('intent_test_cases')
-        .select('id, setup_steps, teardown_steps, steps_json')
+        .select('id, setup_steps, teardown_steps, steps_json, priority')
         .in('id', testCaseIds);
       for (const row of caseRows || []) {
+        if (row.priority && VALID_PRIORITY.has(row.priority)) {
+          priorityByTestCaseId.set(row.id, row.priority as 'critical' | 'high' | 'medium' | 'low');
+        }
         const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
         const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
         const mainCount = Array.isArray(row.steps_json) ? row.steps_json.length : 0;
@@ -3623,6 +3633,10 @@ export class RegressionRunService {
         // artifacts (device screenshots, compiled plan viewer) without an
         // extra join. Undefined for legacy rows (pre-20260417 migration).
         ...(exec.platform ? { platform: exec.platform } : {}),
+        // Curator-set priority of the saved test case, if any. Null for
+        // ad-hoc / chat-lite runs (no saved test case) and API tests
+        // (no priority column on api_test_configs). Display-only.
+        priority: priorityByTestCaseId.get(exec.testCaseId) ?? null,
         bugsCount,
         steps,
         artifacts: execArtifacts,

@@ -1291,6 +1291,24 @@ export async function getExecutionDetail(req: AuthenticatedRequest, res: Respons
       }
     }
 
+    // Surface curator-set priority of the saved test case so the
+    // execution-detail page can badge the header. UI tests only —
+    // api_test_configs has no priority column (analytics-query:838).
+    // Best-effort; CHECK-violating drift collapses to null on the wire.
+    let priority: 'critical' | 'high' | 'medium' | 'low' | null = null;
+    if (execution.test_type === 'ui' && execution.test_case_id) {
+      try {
+        const { data: tc } = await supabaseAdmin
+          .from('intent_test_cases')
+          .select('priority')
+          .eq('id', execution.test_case_id)
+          .maybeSingle();
+        if (tc?.priority && ['critical', 'high', 'medium', 'low'].includes(tc.priority)) {
+          priority = tc.priority as 'critical' | 'high' | 'medium' | 'low';
+        }
+      } catch { /* non-fatal — priority is display-only */ }
+    }
+
     res.json({
       success: true,
       data: {
@@ -1307,6 +1325,7 @@ export async function getExecutionDetail(req: AuthenticatedRequest, res: Respons
           startedAt: execution.started_at,
           completedAt: execution.completed_at,
           result: execution.result,
+          priority,
         },
         testDetail,
       },

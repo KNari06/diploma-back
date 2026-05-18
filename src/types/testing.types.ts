@@ -1026,6 +1026,17 @@ export interface RunReportExecution {
    * (device screenshots, compiled plan viewer) without extra joins.
    */
   platform?: string;
+  /**
+   * Curator-set priority of the saved test case this execution ran, if any.
+   * One of 'critical' | 'high' | 'medium' | 'low'. NULL for ad-hoc /
+   * chat-lite runs (no saved test case) and for API tests (api_test_configs
+   * has no priority column repo-wide — see analytics-query.service:838).
+   * Surfaced here so the run-details page can badge / colorize / filter
+   * rows without an extra join. Display-only — does NOT affect server-side
+   * execution order (see runPlan / runFlow which preserve user-set
+   * position / order_index).
+   */
+  priority?: 'critical' | 'high' | 'medium' | 'low' | null;
   bugsCount: number;
   steps: RunReportStep[];
   artifacts: RunReportExecArtifacts;
