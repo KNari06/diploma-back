@@ -286,11 +286,12 @@ export async function updateSavedTestCase(req: AuthenticatedRequest, res: Respon
     // Generate AI suggestions if case has a flow_id
     let suggestedDependsOn: DependencySuggestion[] = [];
     if (data.flow_id) {
-      suggestedDependsOn = await SavedCaseDependencySuggester.suggestForCase(
+      const result = await SavedCaseDependencySuggester.suggestForCase(
         id,
         data.flow_id,
         userId
       );
+      suggestedDependsOn = result.suggestions;
     }
 
     res.json({
@@ -403,11 +404,12 @@ export async function assignToFlow(req: AuthenticatedRequest, res: Response): Pr
     await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
 
     // Generate AI suggestions
-    const suggestedDependsOn = await SavedCaseDependencySuggester.suggestForCase(
+    const suggestionResult = await SavedCaseDependencySuggester.suggestForCase(
       id,
       flowId,
       userId
     );
+    const suggestedDependsOn = suggestionResult.suggestions;
 
     res.json({
       success: true,
@@ -604,13 +606,14 @@ export async function getDependencySuggestions(req: AuthenticatedRequest, res: R
       res.json({
         success: true,
         data: [],
+        nearMisses: [],
         message: 'No suggestions available - case is not assigned to a flow',
         timestamp: new Date(),
       });
       return;
     }
 
-    const suggestions = await SavedCaseDependencySuggester.suggestForCase(
+    const result = await SavedCaseDependencySuggester.suggestForCase(
       id,
       testCase.flow_id,
       userId
@@ -618,7 +621,12 @@ export async function getDependencySuggestions(req: AuthenticatedRequest, res: R
 
     res.json({
       success: true,
-      data: suggestions,
+      // `data` keeps the same shape (array of confident suggestions) for
+      // backward compatibility. `nearMisses` is the new sibling — populated
+      // only when `data` is empty so the UI can offer "AI considered these
+      // but wasn't sure" instead of a blank "no suggestions" state.
+      data: result.suggestions,
+      nearMisses: result.nearMisses,
       timestamp: new Date(),
     });
   } catch (error) {

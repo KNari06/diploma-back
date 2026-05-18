@@ -174,11 +174,12 @@ export async function saveTestCase(req: AuthenticatedRequest, res: Response): Pr
       await cache.delByPattern(`qait:cache:ptree:flow:${flowId}:*`);
 
       // Get AI suggestions
-      suggestedDependsOn = await SavedCaseDependencySuggester.suggestForCase(
+      const sugResult = await SavedCaseDependencySuggester.suggestForCase(
         result.savedTestCaseId,
         flowId,
         userId
       );
+      suggestedDependsOn = sugResult.suggestions;
     }
 
     res.json({
