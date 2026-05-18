@@ -471,9 +471,18 @@ export async function softDeleteAccount(
 }
 
 /**
- * Revert a soft-delete during the grace period. Admin/support only in
- * v1 — no public route. Wired here so it can be called from a future
- * admin panel without rewriting the logic.
+ * Revert a soft-delete during the grace period.
+ *
+ * In v1 this is reachable only via `POST /api/v1/auth/me/delete/cancel`,
+ * which uses `req.user.id` — so a user can only undo THEIR OWN pending
+ * deletion (the auth middleware allowlist gates that one URL through).
+ * Threat model: no privilege escalation possible — see the controller's
+ * docstring for the full rationale.
+ *
+ * The function takes a parameterised `userId` rather than reading from
+ * a request so a future admin-acting-on-behalf-of-user route can call
+ * it directly without re-implementing the cascade. There is no such
+ * route in v1.
  */
 export async function cancelAccountDeletion(userId: string): Promise<{ ok: boolean }> {
   const { error } = await supabaseAdmin

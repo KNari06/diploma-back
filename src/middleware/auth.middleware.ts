@@ -4,10 +4,14 @@ import { AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { NextFunction, Request, Response } from 'express';
 
-// Endpoints the user is allowed to hit AFTER initiating account deletion.
-// Currently used only for `cancelAccountDeletion` (support-tool path —
-// not wired publicly in v1) but the list is here so future "View my
-// scheduled-deletion status" endpoints can opt in by adding their path.
+// Endpoints the user is allowed to hit AFTER initiating account
+// deletion. Currently used for self-cancel of a pending deletion
+// during the grace window (`POST /api/v1/auth/me/delete/cancel`) —
+// the route's controller uses `req.user.id`, so a user can only
+// un-delete themselves, never anyone else.
+//
+// The list also exists so future "View my scheduled-deletion status"
+// endpoints can opt in by adding their absolute path here.
 //
 // Matched against `req.originalUrl` (absolute path including the
 // mount-point, query stripped) — NOT `req.path`, because inside a
@@ -98,9 +102,10 @@ export const requireAuth = async (
     //     correctness gap where a freshly deleted user could keep
     //     issuing requests for the cache TTL.
     //
-    // The narrow whitelist (`POST_DELETION_ALLOWED_PATHS`) is for the
-    // future support-driven "cancel deletion" endpoint, so admins can
-    // still call it on behalf of a deleted-but-recoverable user.
+    // The narrow whitelist (`POST_DELETION_ALLOWED_PATHS`) lets a
+    // soft-deleted user reach the self-cancel endpoint so they can
+    // back out within the 30-day grace window. See that constant's
+    // docstring for the threat-model rationale.
     try {
       const { data: row } = await supabaseAdmin
         .from('users')
