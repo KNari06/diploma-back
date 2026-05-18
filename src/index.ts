@@ -1584,18 +1584,13 @@ const startServer = async () => {
           logger.error('[SERVER] Failed to cleanup zombie runs', { error: formatError(cleanupError) });
         }
 
-        // Start the daily account-deletion purge sweep. Picks up users
-        // whose 30-day grace window has elapsed and runs the hard-purge
-        // cascade against each. See `jobs/account-deletion-purge.job.ts`
-        // for the full operational doc.
-        try {
-          const { AccountDeletionPurgeJob } = await import('@/jobs/account-deletion-purge.job');
-          AccountDeletionPurgeJob.start();
-        } catch (err) {
-          logger.error('[SERVER] Failed to start account-deletion purge', {
-            error: formatError(err),
-          });
-        }
+        // NOTE: AccountDeletionPurgeJob is intentionally NOT started here.
+        // It runs in the dedicated `src/scheduler/index.ts` process —
+        // same place as TestSchedulerJobHandler / AutoLearnRetireJob.
+        // Cloud Run auto-scales the API to N replicas; starting a
+        // setInterval-based sweep here would fire N copies in parallel
+        // and produce duplicate audit-log entries + wasted storage
+        // round-trips per tick.
       });
 
       /**

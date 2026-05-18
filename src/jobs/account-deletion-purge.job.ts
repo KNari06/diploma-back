@@ -10,18 +10,24 @@
  * script.
  *
  * ──────────────────────────────────────────────────────────────────────
+ * Where this runs
+ * ──────────────────────────────────────────────────────────────────────
+ *
+ * Bootstrapped exclusively from `src/scheduler/index.ts` — the dedicated
+ * single-instance "scheduler" Cloud Run service. Do NOT start it from
+ * `src/index.ts` (the auto-scaled API service): Cloud Run will run N
+ * replicas of the API in production, and N concurrent `setInterval`
+ * sweeps would (a) issue duplicate `ACCOUNT_DELETION_COMPLETED` audit
+ * entries per user, (b) waste storage round-trips, and (c) thrash the
+ * `auth.users` admin-delete on already-purged rows.
+ *
+ * ──────────────────────────────────────────────────────────────────────
  * Why setInterval and not a BullMQ repeatable
  * ──────────────────────────────────────────────────────────────────────
  *
- * The existing scheduler primitive in this codebase (`test-scheduler.job.ts`)
- * uses a process-level setInterval rather than BullMQ repeatables. We
- * follow the same pattern for consistency — one daily tick, no Redis
- * round-trips, no risk of the repeatable getting orphaned in Redis after
- * a deploy that changed its key format. The down-side (one process
- * instance fires the cron) is fine for a daily low-volume sweep.
- *
- * If the deployment moves to multi-instance with a primary/secondary
- * pattern, gate `start()` behind an env-driven leader-elect flag.
+ * Mirrors `test-scheduler.job.ts` and `auto-learn-retire.job.ts`. One
+ * daily tick, no Redis round-trips, no risk of a repeatable getting
+ * orphaned in Redis after a deploy that changed its key format.
  *
  * ──────────────────────────────────────────────────────────────────────
  * Operational notes
