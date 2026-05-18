@@ -4,6 +4,10 @@
  */
 
 import { supabaseAdmin } from '@/db/supabase';
+import {
+  PERMISSIONS,
+  WorkspaceAccessService,
+} from '@/services/core/workspace-access.service';
 import { GitIntegrationService } from '@/services/integrations/git-integration.service';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { ValidationError } from '@/types';
@@ -153,25 +157,68 @@ export class RegressionPlanService {
   }
 
   /**
-   * Get a plan by ID
+   * Get a plan by ID.
+   *
+   * Access model: the plan is readable by any active member of the
+   * workspace that owns the plan's project — NOT only by the user who
+   * originally created it. Plans live inside `projects`, which live
+   * inside `workspaces`. The legacy `user_id` column on
+   * `regression_plans` predates the workspace layer and was used as a
+   * creator-only access gate; this caused symptoms where (a) teammates
+   * couldn't open a `/regressions/<id>` URL shared by a co-worker, and
+   * (b) every user saw a private slice of the same project's plans.
+   *
+   * The `user_id` column is kept as an audit-trail "who created this".
+   * It's no longer the access gate.
+   *
    * @param id - Plan ID
-   * @param userId - User ID for access control
-   * @returns Plan or null if not found
+   * @param userId - Caller's user id, checked against workspace_members
+   * @returns Plan or null if not found / no access
    */
   static async getById(id: string, userId: string): Promise<RegressionPlan | null> {
+    // 1. Load the plan + its project's workspace_id in a single query.
+    //    The implicit `projects!inner` join scopes the read to plans
+    //    whose project still exists (defensive: avoids returning rows
+    //    for projects mid-cascade-delete).
     const { data, error } = await supabaseAdmin
       .from('regression_plans')
-      .select('*')
+      .select('*, projects!inner(workspace_id)')
       .eq('id', id)
-      .eq('user_id', userId)
       .single();
 
     if (error) {
       if (error.code === 'PGRST116') {
+        // Not found. Indistinguishable from "exists but the user has no
+        // access" by design — we never leak existence to non-members.
         return null;
       }
       logger.error('[REGRESSION_PLAN_SERVICE] Failed to get plan', { error, id });
       throw new Error(`Failed to get plan: ${error.message}`);
+    }
+
+    // 2. Authorize on workspace membership rather than user_id.
+    //    `projects` is typed as a possibly-array relation by the
+    //    Supabase client; with `!inner` on a many-to-one FK it's
+    //    actually a single object — coerce defensively so a future
+    //    type-gen change doesn't silently bypass the check.
+    const projectRel = (data as { projects?: { workspace_id?: string } | { workspace_id?: string }[] }).projects;
+    const workspaceId = Array.isArray(projectRel)
+      ? projectRel[0]?.workspace_id
+      : projectRel?.workspace_id;
+
+    if (!workspaceId) {
+      logger.warn('[REGRESSION_PLAN_SERVICE] Plan has no workspace_id (orphan project?)', { id });
+      return null;
+    }
+
+    const allowed = await WorkspaceAccessService.hasPermission(
+      userId,
+      workspaceId,
+      PERMISSIONS.PROJECT_READ,
+    );
+    if (!allowed) {
+      // Same null shape as not-found — see comment on PGRST116 above.
+      return null;
     }
 
     return this.mapToRegressionPlan(data);
