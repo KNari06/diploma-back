@@ -3505,6 +3505,25 @@ export async function handleCreateTestCase(
     }
   }
 
+  // Validate priority enum BEFORE create() — invalid values (LLM
+  // hallucinating "urgent" / "p0" / etc.) would otherwise hit the DB
+  // CHECK constraint and abort the whole insert. We silently drop the
+  // bad value and log a warn; the test still gets created with the
+  // service-level default ('medium' — see IntentTestCaseService.create).
+  const validPriorities: ReadonlyArray<'critical' | 'high' | 'medium' | 'low'> =
+    ['critical', 'high', 'medium', 'low'] as const;
+  let priorityToApply: 'critical' | 'high' | 'medium' | 'low' | undefined;
+  if (args.priority) {
+    if ((validPriorities as ReadonlyArray<string>).includes(args.priority)) {
+      priorityToApply = args.priority as 'critical' | 'high' | 'medium' | 'low';
+    } else {
+      logger.warn('[QA_TOOL] handleCreateTestCase ignoring invalid priority', {
+        received: args.priority,
+        expected: validPriorities,
+      });
+    }
+  }
+
   try {
     const created = await IntentTestCaseService.create({
       projectId,
@@ -3514,15 +3533,22 @@ export async function handleCreateTestCase(
       startUrl: args.start_url || undefined,
       steps,
       status: args.status || 'draft',
+      // Pass priority straight to create() — eliminates the previous
+      // create→update round-trip and avoids the brief window where the
+      // row existed without priority (sort-by-priority queries could
+      // observe stale state). If the LLM omitted priority, create()
+      // applies its own 'medium' default; if the LLM passed bad enum,
+      // we dropped it above and create() also uses 'medium'.
+      ...(priorityToApply ? { priority: priorityToApply } : {}),
     });
 
-    // Apply tags and priority via update if provided
-    if (args.tags || args.priority) {
+    // Apply tags via update if provided. Priority is already set in
+    // create() above — no second write needed for that channel.
+    if (args.tags) {
       await IntentTestCaseService.update({
         id: created.id,
         userId: context.userId,
-        ...(args.tags ? { tags: args.tags } : {}),
-        ...(args.priority ? { priority: args.priority } : {}),
+        tags: args.tags,
       });
     }
 

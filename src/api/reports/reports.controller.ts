@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { logger } from '@/utils/core/logger';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
+import { resolveTestCasePriorityForTestId } from '@/services/testing/regression/resolve-test-case-priority.util';
 import { supabaseAdmin } from '@/db/supabase';
 import { FinalTestReport, JiraIssueRequest } from '@/types';
 
@@ -261,6 +262,14 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
       });
     }
 
+    // Best-effort: resolve the saved test_case priority for this run so
+    // Jira inherits it when the caller didn't override `priority`
+    // explicitly. Helper hides the 2-hop join + fail-open semantics —
+    // see resolve-test-case-priority.util.ts. Service-level precedence
+    // (explicit > test_case > severity) lives in JiraReportService.
+    // Helper is statically imported at the top of this file.
+    const testCasePriority = await resolveTestCasePriorityForTestId(testId);
+
     // Create Jira issue
     const jiraIssue = await JiraReportService.createJiraIssueFromReport({
       userId,
@@ -268,6 +277,7 @@ export const createJiraIssue = async (req: Request, res: Response): Promise<void
       testReport: report,
       issueType: issueType || 'Bug',
       priority,
+      testCasePriority,
     });
 
     res.status(200).json({

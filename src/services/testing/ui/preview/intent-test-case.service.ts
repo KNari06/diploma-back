@@ -89,8 +89,28 @@ export class IntentTestCaseService {
     status?: 'draft' | 'published' | 'archived';
     kind?: 'standalone' | 'regression_member';
     platform?: 'web' | 'mobile_android' | 'mobile_ios' | 'mobile_flutter';
+    /**
+     * Curator-set priority. Defaults to 'medium' so newly-created tests
+     * have a sensible bucket out of the box (sort-by-priority, Jira
+     * mapping, notification badges, executions-list color). Old rows
+     * inserted before this default landed remain NULL until a curator
+     * updates them — downstream code already treats NULL as "no
+     * preference" everywhere (see resolve-test-case-priority.util.ts).
+     * Pass `null` explicitly to opt out of the default (rare; used by
+     * import paths that genuinely want "no opinion").
+     */
+    priority?: 'critical' | 'high' | 'medium' | 'low' | null;
   }): Promise<IntentTestCase> {
-    const { projectId, userId, name, description, startUrl, steps, flowId, status = 'draft', kind = 'standalone', platform = 'web' } = params;
+    const {
+      projectId, userId, name, description, startUrl, steps, flowId,
+      status = 'draft', kind = 'standalone', platform = 'web',
+    } = params;
+    // Explicit `null` from the caller means "no opinion" → store NULL.
+    // Anything else (undefined / valid enum) falls back to 'medium'.
+    const priority: 'critical' | 'high' | 'medium' | 'low' | null =
+      params.priority === null
+        ? null
+        : (params.priority ?? 'medium');
 
     logger.info('[INTENT_TEST_CASE] Creating test case', {
       projectId,
@@ -100,6 +120,7 @@ export class IntentTestCaseService {
       flowId,
       status,
       kind,
+      priority,
     });
 
     // Auto-attach workspace-configured resources (Login, Environment, etc)
@@ -152,6 +173,9 @@ export class IntentTestCaseService {
         status,
         kind,
         platform,
+        // 'medium' by default (see params.priority comment above);
+        // explicit null leaves the DB column NULL.
+        priority,
         resource_bindings: resourceBindings,
       })
       .select('*')
