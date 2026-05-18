@@ -149,18 +149,45 @@ function emitWarmupProgress(
  */
 export async function warmupSession(req: Request, res: Response): Promise<void> {
   const warmupStart = Date.now();
+  // Per-phase timing accumulator. Populated as we go and emitted on the
+  // single final `warmup response` log line so operators can spot which
+  // step dominates a slow warmup without scattering grep-able log lines.
+  const timings: Record<string, number> = {};
+  const time = async <T>(label: string, op: () => Promise<T>): Promise<T> => {
+    const start = Date.now();
+    try {
+      return await op();
+    } finally {
+      timings[label] = (timings[label] ?? 0) + (Date.now() - start);
+    }
+  };
   const userId = req.user?.id;
   if (!userId) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
     return;
   }
 
-  const { projectId, platform: rawPlatform, appPackage, deviceSelector: rawDeviceSelector } = req.body as {
+  const {
+    projectId,
+    platform: rawPlatform,
+    appPackage,
+    deviceSelector: rawDeviceSelector,
+    prelaunch: rawPrelaunch,
+  } = req.body as {
     projectId?: string;
     platform?: string;
     appPackage?: string;
     deviceSelector?: unknown;
+    /**
+     * If `false`, the warmup installs the APK but does NOT auto-launch it.
+     * Callers (frontend) can then trigger `launch_app` explicitly when the
+     * preview surface actually becomes visible. Saves 5-10s on the warmup
+     * critical path. Defaults to `true` to preserve the existing contract
+     * for callers that haven't opted in.
+     */
+    prelaunch?: boolean;
   };
+  const prelaunch = rawPrelaunch !== false; // default true
 
   if (!projectId) {
     res.status(400).json({ success: false, error: 'projectId is required' });
@@ -228,7 +255,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // requests from both reading null and creating duplicate sessions.
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
     const lockKey = `${redisKey}:lock`;
-    const lockAcquired = await redisConnection.set(lockKey, '1', 'EX', 60, 'NX');
+    const lockAcquired = await time('redis_lock', () => redisConnection.set(lockKey, '1', 'EX', 60, 'NX'));
     if (!lockAcquired) {
       // Another warmup is in progress — wait briefly then check for the result
       logger.info('[MOBILE_SESSION] Concurrent warmup detected, waiting for result', { projectId, userId });
@@ -244,6 +271,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             sessionId: parsed.sessionId,
             runnerSocketUrl,
             tookMs: Date.now() - warmupStart,
+            timings,
           });
           // Active editor → start the per-user idle timer.
           try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
@@ -298,6 +326,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             sessionId: bootedSessionId,
             runnerSocketUrl,
             tookMs: Date.now() - warmupStart,
+            timings,
           });
           try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
           res.json({
@@ -318,7 +347,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         // Verify the session still exists on the runner (it may have been
         // destroyed if the runner restarted or the session TTL expired).
         const client = getMobileRunnerClient();
-        const stillAlive = await client.sessionExists(existing.sessionId);
+        const stillAlive = await time('session_exists_check', () => client.sessionExists(existing.sessionId));
 
         if (!stillAlive) {
           logger.warn('[MOBILE_SESSION] Cached session no longer exists on runner, creating fresh', {
@@ -391,14 +420,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // path (Redis match or device check) and just issues launch_app.
           emitWarmupProgress(userId, 'launching_browser', 15);
           try {
-            await MobileAppPrepService.prepApp({
+            await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
               client,
               sessionId: existing.sessionId,
               projectId,
               userId,
               appPackage,
+              skipLaunch: !prelaunch,
               onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
-            });
+            }));
           } catch (err) {
             logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
               sessionId: existing.sessionId,
@@ -414,6 +444,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             sessionId: existing.sessionId,
             runnerSocketUrl,
             tookMs: Date.now() - warmupStart,
+            timings,
           });
           try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
           res.json({
@@ -432,7 +463,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
     // Health check
     const client = getMobileRunnerClient();
-    const healthy = await client.isHealthy();
+    const healthy = await time('runner_health_check', () => client.isHealthy());
     if (!healthy) {
       res.status(503).json({
         success: false,
@@ -447,7 +478,9 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     //
     // ownerId scopes the runner's Android multi-user so each backend user
     // sees only their own apps on a shared redroid container. See
-    // qait-mobile-runner/docs/multi-user-known-risks.md.
+    // qait-mobile-runner/docs/multi-user-known-risks.md. Gated by
+    // MOBILE_MULTI_USER_ISOLATION — default OFF (shared workspace, ~5-15s
+    // faster claim, no `pm create-user` "Maximum user limit" risk).
     //
     // Phase 2.6: when the caller pinned a `deviceSelector`, the pool
     // path is only meaningful if NO specific serial was requested.
@@ -462,6 +495,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     //      "show emulators in popover" UX without this gate would
     //      silently use whatever's pre-booted instead of the user's
     //      explicit pick. Default (no selector) keeps pool fast-path.
+    const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
     let session: Awaited<ReturnType<typeof client.createSession>>;
     const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
     if (skipPoolForPhysical) {
@@ -469,28 +503,29 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         projectId,
         deviceSelector,
       });
-      session = await client.createSession(platform, {
-        ownerId: userId,
+      session = await time('create_session_pinned', () => client.createSession(platform, {
+        ownerId: effectiveOwnerId,
         deviceSelector,
-      });
+      }));
     } else {
       try {
-        session = await client.claimSession(platform, { ownerId: userId });
+        session = await time('pool_claim', () => client.claimSession(platform, { ownerId: effectiveOwnerId }));
         logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
           projectId,
           sessionId: session.sessionId,
           platform,
-          ownerId: userId,
+          ownerId: effectiveOwnerId ?? null,
+          multiUserIsolation: env.MOBILE_MULTI_USER_ISOLATION,
         });
       } catch (poolErr) {
         logger.debug('[MOBILE_SESSION] Pool claim failed, cold-booting', {
           projectId,
           error: poolErr instanceof Error ? poolErr.message : String(poolErr),
         });
-        session = await client.createSession(platform, {
-          ownerId: userId,
+        session = await time('create_session_cold', () => client.createSession(platform, {
+          ownerId: effectiveOwnerId,
           deviceSelector,
-        });
+        }));
       }
     }
 
@@ -502,13 +537,13 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // all read from the same precedence chain (project default →
     // runner default). Non-fatal: any failure logs at debug and leaves
     // the session on the runner default.
-    await applyProjectPolicyToSession({
+    await time('permission_policy', () => applyProjectPolicyToSession({
       client,
       sessionId: session.sessionId,
       projectId,
       userId,
       context: { source: 'warmup' },
-    });
+    }));
 
     const runnerSocketUrl = currentRunnerSocketUrl();
 
@@ -547,14 +582,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // preview stream shows the app already open when the frontend connects.
     // Non-fatal: on failure we still return the session so the user can retry.
     try {
-      await MobileAppPrepService.prepApp({
+      await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
         client,
         sessionId: session.sessionId,
         projectId,
         userId,
         appPackage,
+        skipLaunch: !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
-      });
+      }));
     } catch (err) {
       logger.warn('[MOBILE_SESSION] App install/launch during warmup failed (non-fatal)', {
         sessionId: session.sessionId,
@@ -569,6 +605,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       sessionId: session.sessionId,
       runnerSocketUrl,
       tookMs: Date.now() - warmupStart,
+      timings,
     });
 
     try { refreshIdle(userId, getIO()); } catch { /* non-fatal */ }
@@ -1395,14 +1432,20 @@ export async function autoBootAndInstall(
       };
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      const session = await client.createSession(platform, { ownerId: userId });
+      const autoBootOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
+      const session = await client.createSession(platform, { ownerId: autoBootOwnerId });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID
       bootingData.sessionId = sessionId;
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
-      logger.info('[MOBILE_AUTO_BOOT] Emulator created', { projectId, sessionId, ownerId: userId });
+      logger.info('[MOBILE_AUTO_BOOT] Emulator created', {
+        projectId,
+        sessionId,
+        ownerId: autoBootOwnerId ?? null,
+        multiUserIsolation: env.MOBILE_MULTI_USER_ISOLATION,
+      });
     }
 
     // Install the app, but DO NOT launch it yet — we want the very

@@ -211,6 +211,15 @@ const envSchema = z.object({
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
 
+  // Multi-user isolation: when ON, the runner creates a dedicated Android
+  // user per backend user via `pm create-user` so apps installed by one
+  // user are invisible to another. This costs 5-15s on the cold claim path
+  // and is the source of "Maximum user limit is reached" failures on
+  // long-running redroid containers. Default OFF — single shared workspace
+  // mode where `pm clear` between sessions is sufficient. Flip per-deploy
+  // for tenants that require strict isolation between backend users.
+  MOBILE_MULTI_USER_ISOLATION: z.string().transform(v => v === 'true').default('false'),
+
   // Intent classifier fast-path — set to 'true' to disable the deterministic
   // whitelist that short-circuits trivial messages (greetings, cancels, yes/no
   // after pending confirmation). Kill-switch for the rare case the whitelist
