@@ -1,7 +1,22 @@
 import { verifyToken } from '@/services/auth/auth.service';
+import { supabaseAdmin } from '@/db/supabase';
 import { AuthUser } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { NextFunction, Request, Response } from 'express';
+
+// Endpoints the user is allowed to hit AFTER initiating account deletion.
+// Currently used only for `cancelAccountDeletion` (support-tool path —
+// not wired publicly in v1) but the list is here so future "View my
+// scheduled-deletion status" endpoints can opt in by adding their path.
+//
+// Matched against `req.originalUrl` (absolute path including the
+// mount-point, query stripped) — NOT `req.path`, because inside a
+// router-scoped middleware `req.path` is router-relative and would never
+// match an absolute string. Exact match (not startsWith) so we don't
+// accidentally allow `/cancel-something-else`.
+const POST_DELETION_ALLOWED_PATHS: ReadonlySet<string> = new Set([
+  '/api/v1/auth/me/delete/cancel',
+]);
 
 // Extend Express Request type to include user
 declare global {
@@ -68,6 +83,60 @@ export const requireAuth = async (
         message: 'Please login again',
       });
       return;
+    }
+
+    // Reject if the account is soft-deleted. The user's JWT may still
+    // be valid in Supabase Auth for up to 30 days (the grace window),
+    // but `users.deleted_at` set means the user explicitly asked to
+    // delete their account and we must lock them out immediately.
+    //
+    // One small DB hop per request — acceptable cost given:
+    //   - auth-cache already shaves the heavy lifting in verifyToken,
+    //     and this column lookup is on the primary key with the partial
+    //     index `idx_users_deletion_scheduled` keeping the scan tiny;
+    //   - alternatives (caching the deleted flag) would create a
+    //     correctness gap where a freshly deleted user could keep
+    //     issuing requests for the cache TTL.
+    //
+    // The narrow whitelist (`POST_DELETION_ALLOWED_PATHS`) is for the
+    // future support-driven "cancel deletion" endpoint, so admins can
+    // still call it on behalf of a deleted-but-recoverable user.
+    try {
+      const { data: row } = await supabaseAdmin
+        .from('users')
+        .select('deleted_at')
+        .eq('id', user.id)
+        .maybeSingle();
+      const deletedAt = (row as { deleted_at?: string | null } | null)?.deleted_at ?? null;
+      if (deletedAt) {
+        // `req.originalUrl` is absolute and includes the mount; strip
+        // the query string so `?foo=bar` doesn't defeat the exact match.
+        const absolutePath = (req.originalUrl || '').split('?')[0];
+        const allowed = POST_DELETION_ALLOWED_PATHS.has(absolutePath);
+        if (!allowed) {
+          logger.debug('[AUTH] Rejecting deleted account', {
+            userId: user.id,
+            path: req.path,
+            deletedAt,
+          });
+          res.status(401).json({
+            success: false,
+            error: 'Account deleted',
+            code: 'ACCOUNT_DELETED',
+            message: 'This account has been scheduled for deletion. Contact support if this is a mistake.',
+          });
+          return;
+        }
+      }
+    } catch (err) {
+      // Defensive: if the check itself fails, we fail OPEN — auth still
+      // proceeds. A soft-deleted user can sneak through one request
+      // before the next cache invalidation, which is acceptable vs.
+      // locking everyone out on a Supabase blip.
+      logger.warn('[AUTH] deleted_at check failed (failing open)', {
+        userId: user.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
 
     // Attach user to request

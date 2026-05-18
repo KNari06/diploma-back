@@ -1583,6 +1583,14 @@ const startServer = async () => {
         } catch (cleanupError) {
           logger.error('[SERVER] Failed to cleanup zombie runs', { error: formatError(cleanupError) });
         }
+
+        // NOTE: AccountDeletionPurgeJob is intentionally NOT started here.
+        // It runs in the dedicated `src/scheduler/index.ts` process —
+        // same place as TestSchedulerJobHandler / AutoLearnRetireJob.
+        // Cloud Run auto-scales the API to N replicas; starting a
+        // setInterval-based sweep here would fire N copies in parallel
+        // and produce duplicate audit-log entries + wasted storage
+        // round-trips per tick.
       });
 
       /**
