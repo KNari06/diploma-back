@@ -1904,27 +1904,28 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         return { videoUrl: undefined, traceUrl: undefined };
       });
 
-      // V14: Upload replay trace JSONL to Supabase Storage (non-fatal).
-      // `replayTraceUrl` now carries the opaque storage_path (private bucket,
+      // V14: Upload regression trace JSONL to Supabase Storage (non-fatal).
+      // `replayTraceUrl` carries the opaque storage_path (private bucket,
       // signed URL resolved at read time via the trace_files row).
+      // Field name kept as `replayTraceUrl` for back-compat with TestResult readers.
       let replayTraceUrl: string | undefined;
       if (!isDevelopment) {
         try {
           const traceFilePath = replayTrace.getFilePath();
-          const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-          const uploadResult = await uploadReplayTraceToStorage(
+          const { uploadRegressionTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+          const uploadResult = await uploadRegressionTraceToStorage(
             traceFilePath,
             testData.testId,
             testData.userId || 'anonymous',
           );
           replayTraceUrl = uploadResult.storagePath;
-          logger.info('[PLAYWRIGHT] Replay trace JSONL uploaded to storage', {
+          logger.info('[PLAYWRIGHT] Regression trace JSONL uploaded to storage', {
             testId: testData.testId,
             storagePath: uploadResult.storagePath,
             traceFileId: uploadResult.traceFileId,
           });
         } catch (traceUploadError) {
-          logger.debug('[PLAYWRIGHT] Failed to upload replay trace JSONL', {
+          logger.debug('[PLAYWRIGHT] Failed to upload regression trace JSONL', {
             testId: testData.testId,
             error: traceUploadError instanceof Error ? traceUploadError.message : String(traceUploadError),
           });
@@ -1961,7 +1962,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         videoPath: artifacts.videoPath,
         traceUrl: uploadedArtifacts.traceUrl,
         tracePath: artifacts.tracePath,
-        replayTraceUrl, // V14: Replay trace JSONL URL for debugging
+        replayTraceUrl, // V14: Regression trace JSONL URL (field name kept for back-compat)
         stepRuntimeMeta, // Step-level execution intelligence for reporting
         qualityChecks, // Non-UI quality checks — stored in test_results for user viewing
         needsVideoOnRetry, // Flag: self-healing was triggered, enable video on next retry
@@ -2330,14 +2331,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
       // Unregister from TestRunRegistry
       TestRunRegistry.unregister(runKey);
 
-      // V14: Upload replay trace JSONL (best-effort, even on cancellation).
+      // V14: Upload regression trace JSONL (best-effort, even on cancellation).
       // Stores the opaque storage_path — readers resolve a signed URL via the
       // trace_files row created on the same call.
       let cancelledReplayTraceUrl: string | undefined;
       if (replayTraceFilePath && !isDevelopment) {
         try {
-          const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-          const uploadResult = await uploadReplayTraceToStorage(
+          const { uploadRegressionTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+          const uploadResult = await uploadRegressionTraceToStorage(
             replayTraceFilePath, testData.testId, testData.userId || 'anonymous',
           );
           cancelledReplayTraceUrl = uploadResult.storagePath;
@@ -2481,14 +2482,14 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
     const uploadedArtifacts = await uploadArtifacts(testData, artifacts.videoPath, artifacts.tracePath, [])
       .catch(() => ({ videoUrl: undefined, traceUrl: undefined }));
 
-    // V14: Upload replay trace JSONL (best-effort, even on crash).
+    // V14: Upload regression trace JSONL (best-effort, even on crash).
     // Stores the opaque storage_path — readers resolve a signed URL via the
     // trace_files row created on the same call.
     let failedReplayTraceUrl: string | undefined;
     if (replayTraceFilePath && !isDevelopment) {
       try {
-        const { uploadReplayTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
-        const uploadResult = await uploadReplayTraceToStorage(
+        const { uploadRegressionTraceToStorage } = await import('@/services/storage/test-artifacts-storage.service');
+        const uploadResult = await uploadRegressionTraceToStorage(
           replayTraceFilePath, testData.testId, testData.userId || 'anonymous',
         );
         failedReplayTraceUrl = uploadResult.storagePath;

@@ -373,8 +373,10 @@ export const REPLAY_TRACE_CONFIG = {
   /** Max characters per payload before truncation */
   maxPayloadChars: 50_000,
 
-  /** Directory for trace files. Override: REPLAY_LOGS_DIR */
-  logsDir: process.env.REPLAY_LOGS_DIR ?? path.join(process.cwd(), 'test_logs', 'replay'),
+  /** Directory for trace files. Override: REGRESSION_LOGS_DIR (legacy: REPLAY_LOGS_DIR). */
+  logsDir: process.env.REGRESSION_LOGS_DIR
+    ?? process.env.REPLAY_LOGS_DIR
+    ?? path.join(process.cwd(), 'test_logs', 'regressions'),
 
   /** Events that are always written regardless of file size */
   summaryEvents: ['run_start', 'run_end', 'step_failed'] as const,

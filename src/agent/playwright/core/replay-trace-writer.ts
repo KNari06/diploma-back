@@ -1,9 +1,11 @@
 /**
  * ReplayTraceWriter
- * Writes JSONL trace events for replay test execution.
- * One file per replay run: test_logs/replay/{YYYY-MM-DD}_{testId}_{runId}.jsonl
+ * Writes JSONL trace events for regression (Background Replay) test execution.
+ * One file per run: test_logs/regressions/{YYYY-MM-DD}_{HH-MM-SS}_{testId}.jsonl
+ * (override base dir via env REGRESSION_LOGS_DIR / legacy REPLAY_LOGS_DIR).
  *
- * Based on LiteTraceWriter pattern with mode='replay'.
+ * Based on LiteTraceWriter pattern with mode='replay' (kept for back-compat
+ * with existing JSONL readers).
  *
  * Features:
  * - Append-only JSONL format (crash-safe, streamable)
@@ -95,7 +97,8 @@ export class ReplayTraceWriter {
       fs.mkdirSync(logsDir, { recursive: true });
     }
 
-    // File path: test_logs/replay/{YYYY-MM-DD}_{HH-MM-SS}_{testId}.jsonl
+    // File path: test_logs/regressions/{YYYY-MM-DD}_{HH-MM-SS}_{testId}.jsonl
+    // (folder override: REGRESSION_LOGS_DIR / legacy REPLAY_LOGS_DIR)
     const now = new Date();
     const datePart = now.toISOString().slice(0, 10);
     const timePart = now.toISOString().slice(11, 19).replace(/:/g, '-'); // HH-MM-SS
