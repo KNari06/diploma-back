@@ -1227,6 +1227,7 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
 
   try {
     // Use Promise.allSettled with timeout to handle individual service failures gracefully
+    const { getSchedulerHeartbeatAgeMs } = await import('@/jobs/test-scheduler.job');
     const healthCheckPromise = Promise.allSettled([
       Promise.race([
         testSupabaseConnection(),
@@ -1240,9 +1241,14 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
         QueueManager.healthCheck(),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Queue check timeout')), 10000)),
       ]),
+      // Scheduler heartbeat — Redis read, normally < 50ms. Cap at 3s.
+      Promise.race([
+        getSchedulerHeartbeatAgeMs(),
+        new Promise<number>((_, reject) => setTimeout(() => reject(new Error('Scheduler check timeout')), 3000)),
+      ]),
     ]);
 
-    const [dbResult, authResult, queueResult] = await healthCheckPromise;
+    const [dbResult, authResult, queueResult, schedulerResult] = await healthCheckPromise;
 
     // Safely extract results
     const dbHealth = dbResult.status === 'fulfilled' ? dbResult.value : false;
@@ -1255,6 +1261,14 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
         status: 'unhealthy' as const,
         error: queueResult.reason instanceof Error ? queueResult.reason.message : String(queueResult.reason),
       };
+    // Scheduler is considered healthy if its last tick was within 120s
+    // (twice the 60s interval). Beyond that the process is either dead,
+    // frozen, or crash-looping — schedules will silently stop firing.
+    const schedulerAgeMs = schedulerResult.status === 'fulfilled'
+      ? schedulerResult.value
+      : Infinity;
+    const SCHEDULER_STALE_THRESHOLD_MS = 120_000;
+    const schedulerHealthy = schedulerAgeMs < SCHEDULER_STALE_THRESHOLD_MS;
 
     // Log failures
     if (dbResult.status === 'rejected') {
@@ -1273,6 +1287,9 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
       });
     }
 
+    // Scheduler being down does NOT make the API process unhealthy
+    // (the API can still serve traffic), but it IS surfaced in the
+    // response so monitoring can alert on it independently.
     const isHealthy = dbHealth && authHealth.healthy && queueHealth.status === 'healthy';
     const health = {
       status: isHealthy ? 'healthy' : 'unhealthy',
@@ -1282,6 +1299,8 @@ app.get('/health', async (req: express.Request, res: express.Response) => {
         auth: authHealth.healthy ? 'healthy' : 'unhealthy',
         authLatency: authHealth.latency ? `${authHealth.latency}ms` : undefined,
         queue: queueHealth.status || 'unhealthy',
+        scheduler: schedulerHealthy ? 'healthy' : 'unhealthy',
+        schedulerLastTickAgeMs: Number.isFinite(schedulerAgeMs) ? schedulerAgeMs : null,
       },
       version: process.env.npm_package_version || '1.0.0',
       environment: env.NODE_ENV,

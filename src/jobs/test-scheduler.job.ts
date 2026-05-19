@@ -11,6 +11,48 @@ import { RegressionRunService } from '@/services/testing/regression/regression-r
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
+import { testRunQueue } from '@/config/infrastructure/queues';
+import { env } from '@/config/environment/env';
+
+/**
+ * Redis key holding the scheduler's last-tick wall-clock (ms).
+ * Anything more than ~120s stale means the scheduler process is dead /
+ * frozen / unscheduled. Read this from a /health endpoint or admin panel
+ * to detect "schedules show 'in 13h' but never fire" situations.
+ */
+const SCHEDULER_HEARTBEAT_KEY = `${env.QUEUE_PREFIX}scheduler:last_tick`;
+const SCHEDULER_HEARTBEAT_TTL_SEC = 300; // 5 minutes — TTL is just GC, not signal
+
+async function writeHeartbeat(): Promise<void> {
+  try {
+    const redis = await testRunQueue.client;
+    await redis.set(SCHEDULER_HEARTBEAT_KEY, String(Date.now()), 'EX', SCHEDULER_HEARTBEAT_TTL_SEC);
+  } catch (err) {
+    // Heartbeat is observability — never fail the scheduler on its
+    // own pulse. Surface but swallow.
+    logger.debug('[TEST_SCHEDULER] Heartbeat write failed (non-fatal)', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Read the scheduler heartbeat. Returns milliseconds since last tick
+ * (Infinity if never written / Redis down). Used by the admin/health
+ * endpoint to decide whether to alert.
+ */
+export async function getSchedulerHeartbeatAgeMs(): Promise<number> {
+  try {
+    const redis = await testRunQueue.client;
+    const value = await redis.get(SCHEDULER_HEARTBEAT_KEY);
+    if (!value) return Infinity;
+    const ts = parseInt(value, 10);
+    if (!Number.isFinite(ts)) return Infinity;
+    return Date.now() - ts;
+  } catch {
+    return Infinity;
+  }
+}
 
 /**
  * Test Scheduler Job Handler
@@ -69,6 +111,11 @@ export class TestSchedulerJobHandler {
     }
 
     this.isRunning = true;
+
+    // Update heartbeat FIRST, before any DB call. Even if Supabase is
+    // briefly unavailable and getDueSchedules throws, we still want the
+    // health endpoint to see "scheduler is alive, just blocked on DB".
+    await writeHeartbeat();
 
     try {
       const dueSchedules = await ScheduleService.getDueSchedules();
@@ -151,8 +198,10 @@ export class TestSchedulerJobHandler {
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      
-      // Check if it's an insufficient credits error
+
+      // ── Branch 1: Insufficient credits ──────────────────────────────
+      // Distinct notification so the FE / dashboard can show a
+      // "top up credits" CTA rather than a generic "schedule failed".
       if (errorMessage.includes('Insufficient credits')) {
         logger.warn('[TEST_SCHEDULER] Insufficient credits for scheduled run', {
           userId,
@@ -161,7 +210,6 @@ export class TestSchedulerJobHandler {
           error: errorMessage,
         });
 
-        // Create in-app notification
         try {
           await NotificationService.createNotification({
             userId,
@@ -175,8 +223,6 @@ export class TestSchedulerJobHandler {
               targetId,
               projectId: schedule.projectId,
               error: errorMessage,
-              // claimDueSchedule() already moves next_run_at forward, so this fires at most once per schedule execution.
-              // Use a stable key to avoid duplicates from retries/log replays.
               dedupeKey: `schedule:${schedule.scheduleId}:insufficient`,
             },
           });
@@ -191,9 +237,100 @@ export class TestSchedulerJobHandler {
             userId,
           });
         }
+
+        throw error;
       }
-      
-      // Re-throw to let the caller handle it
+
+      // ── Branch 2: Target deleted / not found ─────────────────────────
+      // The schedule's plan or module was deleted but the row in
+      // test_schedules still references it. Keep firing this forever
+      // would spam logs. Deactivate the schedule and tell the user.
+      const looksLikeNotFound =
+        errorMessage.toLowerCase().includes('not found')
+        || errorMessage.toLowerCase().includes('does not exist');
+      if (looksLikeNotFound) {
+        logger.warn('[TEST_SCHEDULER] Scheduled target no longer exists — deactivating schedule', {
+          userId,
+          scheduleId: schedule.scheduleId,
+          targetType,
+          targetId,
+          error: errorMessage,
+        });
+
+        try {
+          await ScheduleService.deactivate(schedule.scheduleId, userId);
+        } catch (deactivateError) {
+          logger.error('[TEST_SCHEDULER] Failed to deactivate orphan schedule', {
+            error: deactivateError instanceof Error ? deactivateError.message : String(deactivateError),
+            scheduleId: schedule.scheduleId,
+          });
+        }
+
+        try {
+          await NotificationService.createNotification({
+            userId,
+            type: 'personal',
+            category: 'system',
+            title: 'Scheduled run disabled — target was deleted',
+            message: `The ${targetType} this schedule was pointing at no longer exists. The schedule has been disabled.`,
+            metadata: {
+              scheduleId: schedule.scheduleId,
+              targetType,
+              targetId,
+              projectId: schedule.projectId,
+              error: errorMessage,
+              dedupeKey: `schedule:${schedule.scheduleId}:orphan`,
+            },
+          });
+        } catch (notifError) {
+          logger.error('[TEST_SCHEDULER] Failed to create orphan-target notification', {
+            error: notifError instanceof Error ? notifError.message : String(notifError),
+            userId,
+          });
+        }
+
+        throw error;
+      }
+
+      // ── Branch 3: All other failures ─────────────────────────────────
+      // Network blip, DB error, runner crash. Schedule's next_run_at
+      // was already advanced by claimDueSchedule(), so the user misses
+      // exactly one occurrence. Tell them so they aren't surprised.
+      logger.error('[TEST_SCHEDULER] Scheduled run failed', {
+        userId,
+        scheduleId: schedule.scheduleId,
+        targetType,
+        targetId,
+        error: errorMessage,
+      });
+
+      try {
+        await NotificationService.createNotification({
+          userId,
+          type: 'personal',
+          category: 'system',
+          title: 'Scheduled run failed',
+          message: `Your scheduled ${targetType} couldn't start: ${errorMessage.slice(0, 200)}. The next scheduled run will try again.`,
+          metadata: {
+            scheduleId: schedule.scheduleId,
+            targetType,
+            targetId,
+            projectId: schedule.projectId,
+            error: errorMessage,
+            // No dedupeKey across runs — every distinct failure occurrence
+            // is worth surfacing. NotificationService doesn't currently
+            // act on dedupeKey anyway (it's metadata, not a unique index).
+          },
+        });
+      } catch (notifError) {
+        logger.error('[TEST_SCHEDULER] Failed to create generic failure notification', {
+          error: notifError instanceof Error ? notifError.message : String(notifError),
+          userId,
+        });
+      }
+
+      // Re-throw to let the caller (processSchedules loop) record it
+      // and continue with the next schedule.
       throw error;
     }
   }

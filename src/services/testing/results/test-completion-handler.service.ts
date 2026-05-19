@@ -340,13 +340,19 @@ export class TestCompletionHandlerService {
         return;
       }
 
-      // Create notification
+      // Create notification.
+      // `actionUrl` MUST point at /tests/:testId (the AI-test detail view),
+      // NOT /runs/:runId — `tests.id` is not a `regression_runs.id` and
+      // the regression-run-report page returns 404 for it. The FE's
+      // `resolveActionUrl` historically synthesized `/runs/${testId}`
+      // from metadata; passing actionUrl explicitly shortcircuits that.
       await NotificationService.createNotification({
         userId: test.user_id,
         type: 'personal',
         category: 'test',
         title,
         message,
+        actionUrl: `/tests/${test.id}`,
         metadata: {
           testId: test.id,
           status: test.status,
@@ -683,13 +689,18 @@ export class TestCompletionHandlerService {
         message = 'Regression run was cancelled before completion';
       }
 
-      // Create in-app notification
+      // Create in-app notification.
+      // `runId` here is `regression_runs.id`, which matches the FE
+      // `/runs/:runId` route → regression-run-report view. Pass actionUrl
+      // explicitly so the FE doesn't fall back to its (historically
+      // wrong) metadata.testId synthesis.
       await NotificationService.createNotification({
         userId: run.user_id,
         type: 'personal',
         category: 'test',
         title,
         message,
+        actionUrl: `/runs/${run.id}`,
         metadata: {
           runId: run.id,
           status: finalStatus,

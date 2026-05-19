@@ -311,13 +311,18 @@ export class AIAnalysisJobHandler {
       // Some models return 0..1, others 0..100
       const confidencePct = confidence <= 1 ? Math.round(confidence * 100) : Math.round(confidence);
 
-      // Create notification for AI report ready
+      // Create notification for AI report ready.
+      // `testId` is `tests.id` — the AI test, NOT a regression run.
+      // Action target is `/tests/:testId` (ai-tests view), not
+      // `/runs/:runId` (regression-run-report). Pass actionUrl explicitly
+      // so the FE doesn't synthesize the wrong URL from metadata.
       await NotificationService.createNotification({
         userId,
         type: 'personal',
         category: 'system',
         title: 'AI analysis completed',
         message: `Analysis found ${bugs.length} issue(s) with ${confidencePct}% confidence`,
+        actionUrl: `/tests/${testId}`,
         metadata: {
           testId,
           resultId: testResultId,
@@ -342,6 +347,9 @@ export class AIAnalysisJobHandler {
           category: 'system',
           title: 'Critical issues detected',
           message: `Found ${criticalBugs.length} critical issue(s) in your test`,
+          // Same routing rationale as the AI-completed notification above —
+          // testId resolves to /tests/:testId (ai-tests view).
+          actionUrl: `/tests/${testId}`,
           metadata: {
             testId,
             resultId: testResultId,

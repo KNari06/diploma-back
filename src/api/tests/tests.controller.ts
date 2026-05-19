@@ -31,6 +31,24 @@ function classifyTestSource(test: any): TestSource {
 }
 
 /**
+ * Classify a test row's platform from its `browsers` JSONB array.
+ *
+ * Mobile rows carry "mobile-android" / "mobile-ios" / "mobile-flutter" /
+ * "mobile_*" in `browsers[0]` (see Mobile Strategy in CLAUDE.md). Web
+ * rows carry standard Playwright browser names ("chromium", "firefox",
+ * "webkit") or are missing the field entirely. Returns 'web' as the
+ * default so legacy rows without `browsers` populated still show up in
+ * the Web UI tab.
+ */
+function classifyTestPlatform(test: any): 'mobile' | 'web' {
+  const first = Array.isArray(test.browsers) && test.browsers.length > 0
+    ? String(test.browsers[0]).toLowerCase()
+    : '';
+  if (first.startsWith('mobile-') || first.startsWith('mobile_')) return 'mobile';
+  return 'web';
+}
+
+/**
  * Resolve workspace ID to an array of project IDs belonging to that workspace + user.
  */
 async function resolveProjectIds(workspaceId: string, userId: string): Promise<string[]> {
@@ -57,7 +75,7 @@ async function resolveProjectIds(workspaceId: string, userId: string): Promise<s
 export async function listTests(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
     const userId = getUserId(req);
-    const { workspaceId, projectId, source, status, page: pageStr, limit: limitStr } = req.query;
+    const { workspaceId, projectId, source, status, platform, page: pageStr, limit: limitStr } = req.query;
 
     // Accept either workspaceId or projectId (backward compat)
     if (!workspaceId && !projectId) {
@@ -98,14 +116,32 @@ export async function listTests(req: AuthenticatedRequest, res: Response): Promi
       query = query.eq('status', status);
     }
 
-    // Source filter: if specified (and not 'all'), we need to filter in-app
-    // because source is derived from JSONB fields, not a DB column.
+    // ── In-app filters (source + platform) ────────────────────────────
+    // Both filter on JSONB fields, not real DB columns, so they can't be
+    // pushed into the supabase query and must be applied after fetch.
+    //
+    //   source   = classifyTestSource(test) — derived from options.metadata,
+    //              intelligent_mode flag, and options.chatSessionId.
+    //   platform = mobile / web — derived from browsers[0]; mobile rows
+    //              carry "mobile-android" / "mobile-ios" / "mobile-flutter"
+    //              and web rows carry "chromium" / "firefox" / "webkit".
+    //
+    // Without `platform` filtering the FE tabs (Web UI / Mobile UI) would
+    // silently show each other's tests — verified May 2026.
     const sourceFilter = (source && typeof source === 'string' && source !== 'all')
       ? source as TestSource
       : null;
+    const rawPlatform = typeof platform === 'string' ? platform.toLowerCase() : null;
+    const platformFilter: 'mobile' | 'web' | null =
+      rawPlatform === 'mobile' ? 'mobile'
+      : rawPlatform === 'web' ? 'web'
+      : null;
 
-    if (sourceFilter) {
-      // For source filtering, fetch more rows and filter in-app, then paginate
+    const needsInAppFilter = sourceFilter !== null || platformFilter !== null;
+
+    if (needsInAppFilter) {
+      // Fetch a generous superset (limit × 5 covers most realistic
+      // filter ratios) then filter + paginate in-app.
       const fetchLimit = limit * 5;
       const { data: allTests, error } = await query.limit(fetchLimit + offset);
 
@@ -115,7 +151,11 @@ export async function listTests(req: AuthenticatedRequest, res: Response): Promi
         return;
       }
 
-      const filtered = (allTests || []).filter(t => classifyTestSource(t) === sourceFilter);
+      const filtered = (allTests || []).filter((t) => {
+        if (sourceFilter && classifyTestSource(t) !== sourceFilter) return false;
+        if (platformFilter && classifyTestPlatform(t) !== platformFilter) return false;
+        return true;
+      });
       const total = filtered.length;
       const pageTests = filtered.slice(offset, offset + limit);
 
@@ -130,7 +170,7 @@ export async function listTests(req: AuthenticatedRequest, res: Response): Promi
         timestamp: new Date(),
       });
     } else {
-      // No source filter — use DB pagination directly
+      // No in-app filters — use DB pagination directly.
       const { data: tests, error, count } = await query.range(offset, offset + limit - 1);
 
       if (error) {
@@ -182,7 +222,18 @@ async function batchCheckHasBugs(testIds: string[]): Promise<Map<string, boolean
 }
 
 /**
- * Map a test row to the API response format
+ * Map a test row to the API response format.
+ *
+ * Fields surfaced to the UI runs table:
+ *   - `createdAt`     — when the row was inserted (queued)
+ *   - `startedAt`     — when the runner actually picked the test up
+ *   - `completedAt`   — when it finished (success / failure / cancel)
+ *   - `durationMs`    — completedAt - (startedAt || createdAt)
+ *   - `browser`       — first entry of test.browsers, the primary platform
+ *   - `trigger`       — high-level reason this run exists: 'schedule',
+ *                       'api', 'ci', 'manual' (default). Distinct from
+ *                       `source`, which classifies what KIND of test
+ *                       this is (regression / chat / manual / intelligent).
  */
 function mapTestToResponse(test: any, bugsMap: Map<string, boolean>) {
   const startTime = test.started_at || test.created_at;
@@ -190,14 +241,32 @@ function mapTestToResponse(test: any, bugsMap: Map<string, boolean>) {
   const completedMs = test.completed_at ? new Date(test.completed_at).getTime() : null;
   const durationMs = (startMs && completedMs) ? completedMs - startMs : null;
 
+  // `trigger` lives in options metadata — set by the regression run /
+  // schedule / API paths. Default 'manual' for hand-launched tests.
+  const rawTrigger = test.options?.trigger
+    ?? test.options?.metadata?.trigger
+    ?? null;
+  const trigger: 'manual' | 'scheduled' | 'api' | 'ci' | 'regression' =
+    rawTrigger === 'scheduled' ? 'scheduled'
+    : rawTrigger === 'api' ? 'api'
+    : rawTrigger === 'ci' || rawTrigger === 'webhook' ? 'ci'
+    : rawTrigger === 'regression' ? 'regression'
+    : 'manual';
+
+  const browsersArr = Array.isArray(test.browsers) ? test.browsers : null;
+  const browser = browsersArr && browsersArr.length > 0 ? String(browsersArr[0]) : null;
+
   return {
     id: test.id,
     url: test.url,
     status: test.status,
     browsers: test.browsers,
+    browser,
     source: classifyTestSource(test),
+    trigger,
     testGoal: test.test_goal || test.options?.testGoal || null,
     createdAt: test.created_at,
+    startedAt: test.started_at || null,
     completedAt: test.completed_at,
     durationMs: durationMs && durationMs > 0 ? durationMs : null,
     hasBugs: bugsMap.get(test.id) || false,
