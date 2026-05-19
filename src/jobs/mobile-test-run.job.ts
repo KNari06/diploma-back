@@ -30,6 +30,7 @@ import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
+import { env } from '@/config/environment/env';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
 // module so unit tests can exercise them without booting supabase/BullMQ.
 import { sumStepDurations } from './helpers/telemetry';
@@ -428,11 +429,19 @@ export class MobileTestRunJobHandler {
       // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s).
       // Pass `ownerId: userId` so the runner switches to this user's
       // dedicated Android multi-user — apps from other owners are hidden.
+      // Gated by MOBILE_MULTI_USER_ISOLATION (default OFF for shared
+      // workspace; skipping `ownerId` shaves 5-15s and avoids
+      // "Maximum user limit is reached" on long-running redroid hosts).
+      const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
       try {
-        const claimed = await client.claimSession(platform, { ownerId: userId });
+        const claimed = await client.claimSession(platform, { ownerId: effectiveOwnerId });
         sessionId = claimed.sessionId;
         sessionSource = 'pool';
-        logger.info('[MOBILE-TEST] Pool session claimed', { testId, sessionId, platform, ownerId: userId });
+        logger.info('[MOBILE-TEST] Pool session claimed', {
+          testId, sessionId, platform,
+          ownerId: effectiveOwnerId ?? null,
+          multiUserIsolation: env.MOBILE_MULTI_USER_ISOLATION,
+        });
       } catch (poolErr) {
         // Pool exhausted, disabled, or runner unreachable — try next
         logger.debug('[MOBILE-TEST] Pool claim failed, trying warmup', {
@@ -469,14 +478,14 @@ export class MobileTestRunJobHandler {
         // Explicit heads-up: cold starts can take up to a minute, so users
         // see "Booting emulator…" instead of a long silent pause after 10%.
         emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
-        const session = await client.createSession(platform, { ownerId: userId });
+        const session = await client.createSession(platform, { ownerId: effectiveOwnerId });
         sessionId = session.sessionId;
         sessionSource = 'cold';
         logger.info('[MOBILE-TEST] Session created (cold start)', {
           testId,
           sessionId,
           platform,
-          ownerId: userId,
+          ownerId: effectiveOwnerId ?? null,
         });
       }
       } finally {
