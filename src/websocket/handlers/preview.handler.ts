@@ -4962,6 +4962,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
     };
+    // Guard — pick mode is mutually exclusive with run. Source of truth is
+    // the pick service's own active-session map. Done OUTSIDE the
+    // `previewRunStartInFlight` synchronous window so the await doesn't
+    // open a race against double-clicks.
+    if (typeof guardKey === 'string' && guardKey.length > 0) {
+      const { isPickActive: _isPickActiveForRun } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+      if (_isPickActiveForRun(guardKey)) {
+        emitRunTerminator('Pick element is active — exit pick mode first');
+        return;
+      }
+    }
     if (typeof guardKey === 'string' && guardKey.length > 0) {
       if (previewRunStartInFlight.has(guardKey)) {
         logger.warn('[WebSocket] preview:run:start ignored — another start is in flight', {
@@ -5626,6 +5637,19 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       }
 
+      // Guard — cannot start recording while one-shot pick mode is active.
+      {
+        const { isPickActive } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+        if (isPickActive(previewSessionId)) {
+          socket.emit('error', {
+            code: 'PICK_IN_PROGRESS',
+            message: 'Cannot start recording while Pick element is active',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      }
+
       // Already recording? Ignore silently
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) return;
 
@@ -6194,6 +6218,154 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       await finalizeRecording(socket, previewSessionId, ensuredUserId, 'user');
     } catch (error) {
       logger.error('[RECORDING] Stop failed', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Pick element (one-shot, read-only element picker)
+  // ───────────────────────────────────────────────────────────────────────────
+  // Drives the "Pick element" button next to the action-type field in the
+  // manual step form. Mutually exclusive with recording and run; the pick
+  // service owns its own active-session map (`isPickActive(previewSessionId)`)
+  // which is the source of truth recording:start and run:start consult.
+  // Always emits a `preview:pick:state` response — even on validation
+  // failure — so the FE never stalls on "Picking…".
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  socket.on('preview:pick:start', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) {
+        // Audit issue #2 / invariant #2 — always emit :state so the FE
+        // button can exit "Picking…". requireUser() already emitted the
+        // generic 'error' event, but the pick UI listens only to :state.
+        socket.emit('preview:pick:state', {
+          previewSessionId: data?.previewSessionId || '',
+          active: false,
+          reason: 'error',
+          error: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) {
+        socket.emit('preview:pick:state', {
+          previewSessionId: '',
+          active: false,
+          reason: 'error',
+          error: 'previewSessionId is required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'Session not found or not owned by user',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Mutex — pick / recording / run are mutually exclusive.
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'A run is in progress',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'Recording is active — stop recording first',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      if (!page) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'Preview page is not available',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      try {
+        const { startPick } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+        await startPick({
+          previewSessionId,
+          nsp: socket.nsp,
+          userId: ensuredUserId,
+          page,
+          // Service owns its own active-session map. onExit is informational
+          // only — it lets us log when pick auto-exits, but the recording /
+          // run guards consult `isPickActive` directly.
+          onExit: (reason) => {
+            logger.debug('[PREVIEW_PICK] Pick exit notified', {
+              previewSessionId,
+              reason,
+            });
+          },
+        });
+      } catch (err) {
+        logger.error('[PREVIEW_PICK] start failed', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: err instanceof Error ? err.message : 'Pick start failed',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      logger.error('[PREVIEW_PICK] start handler error', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  socket.on('preview:pick:cancel', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) return;
+
+      const { cancelPick } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+      await cancelPick(previewSessionId, 'cancelled');
+    } catch (error) {
+      logger.error('[PREVIEW_PICK] cancel handler error', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -6807,6 +6979,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           // socket is already gone.
           const autoStopTimer = recordingAutoStopTimers.get(previewSessionId);
           if (autoStopTimer) { clearTimeout(autoStopTimer); recordingAutoStopTimers.delete(previewSessionId); }
+          // Cancel any in-flight Pick element session for this preview
+          // session — the socket is gone, the overlay would just leak.
+          try {
+            const { cancelPickForSession } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+            await cancelPickForSession(previewSessionId);
+          } catch (err) {
+            logger.debug('[PREVIEW_PICK] disconnect cleanup failed (non-fatal)', {
+              previewSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
 
           if (
             canCleanupRecording

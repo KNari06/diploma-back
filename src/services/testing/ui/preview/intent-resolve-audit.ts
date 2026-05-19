@@ -262,7 +262,7 @@ export function logIntentResolveLint(entry: {
   url?: string;
   pageTitle?: string;
   durationMs?: number;
-  trigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other';
+  trigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other';
   domNodeCount?: number;
   /** Phase 2.5 — see logIntentResolveApply. */
   secretValues?: readonly string[];

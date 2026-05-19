@@ -9,6 +9,7 @@ import type {
   BindingHints,
   StepEvidence,
   TargetFingerprint,
+  LintStatus,
 } from '@/services/testing/ui/preview/preview.types';
 
 // ============================================================================
@@ -117,6 +118,10 @@ export interface ClientToServerEvents {
   // Preview recording
   'preview:recording:start': (data: PreviewRecordingRequest) => void;
   'preview:recording:stop': (data: PreviewRecordingRequest) => void;
+  // Preview "Pick element" — one-shot read-only element picker.
+  // Mutually exclusive with recording and run (see preview.handler.ts mutex).
+  'preview:pick:start': (data: PreviewPickStartRequest) => void;
+  'preview:pick:cancel': (data: PreviewPickCancelRequest) => void;
   // Inline upload picker responses (correlated by stepId with a
   // `preview:recording:upload:prompt` emitted from the server).
   'preview:recording:upload:resolve': (
@@ -501,6 +506,10 @@ export interface ServerToClientEvents {
    * `preview:recording:upload:cancel`.
    */
   'preview:recording:upload:prompt': (data: PreviewRecordingUploadPromptPayload) => void;
+
+  // Preview pick element (server -> client)
+  'preview:pick:state': (data: PreviewPickStatePayload) => void;
+  'preview:pick:result': (data: PreviewPickResultPayload) => void;
 
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
@@ -1852,6 +1861,90 @@ export interface PreviewRecordingStatePayload {
    * separate config fetch. 0 = cap disabled. Missing on pre-cap builds.
    */
   maxSteps?: number;
+  timestamp: string;
+}
+
+// ============================================================================
+// PREVIEW PICK ELEMENT PAYLOADS
+// ----------------------------------------------------------------------------
+// One-shot "Pick element" mode: user enters pick mode from the manual step
+// form, hovers over the live preview to highlight elements, clicks once to
+// select. The click is intercepted (capture phase, stopImmediatePropagation)
+// so the page sees no real interaction — picking is read-only.
+//
+// Mutually exclusive with recording and run (see preview.handler.ts mutex).
+// ============================================================================
+
+export interface PreviewPickStartRequest {
+  previewSessionId: string;
+}
+
+export interface PreviewPickCancelRequest {
+  previewSessionId: string;
+}
+
+/**
+ * Pick state echo (server -> client). Confirms enter/exit and carries the
+ * server-side reason on auto-exit (timeout, navigation, mutex preempt).
+ */
+export interface PreviewPickStatePayload {
+  previewSessionId: string;
+  active: boolean;
+  reason?: 'started' | 'cancelled' | 'picked' | 'timeout' | 'preempted' | 'session_closed' | 'error';
+  error?: string;
+  timestamp: string;
+}
+
+/**
+ * Pick result (server -> client). Emitted ONCE per successful pick, then
+ * pick-mode auto-exits with a `preview:pick:state { active: false, reason: 'picked' }`.
+ *
+ * Identity contract:
+ *   - `recordedFingerprint` is the SOURCE OF TRUTH for identity. Everything
+ *     the backend resolver consumes lives here.
+ *   - `stableId` / `testId` / `tag` / `ref` are convenience shortcuts that
+ *     mirror the most common fingerprint fields — the FE uses them to
+ *     render the read-only "tag#id" label without unpacking the
+ *     fingerprint. If they ever drift from the fingerprint, the
+ *     fingerprint wins at replay.
+ *   - `bindingHints` is kept separately because the FE persists it into
+ *     the saved step alongside the fingerprint.
+ *
+ * Fields removed deliberately (compared to early drafts):
+ *   - containerRef / isInsideActiveModal: derivable from
+ *     `recordedFingerprint.ancestorChain` server-side; no FE caller today.
+ *   - boundingBox: the in-page overlay paints the "✓ Recorded" badge
+ *     itself, FE doesn't need coords.
+ */
+export interface PreviewPickResultPayload {
+  previewSessionId: string;
+  /** Short human-readable description (LLM-generated, like recording's). */
+  description?: string;
+  /** DOM `id` attribute (post dynamic-id filter). Convenience shortcut. */
+  stableId?: string;
+  /** data-testid / data-test / data-qa value. Convenience shortcut. */
+  testId?: string;
+  /** Volatile in-page ref pointing at the live node, like recording uses. */
+  ref?: string;
+  /** Element tag (button/input/...) — used by FE for the "tag#id" badge. */
+  tag?: string;
+  /** Full recorded fingerprint — SOURCE OF TRUTH for identity. */
+  recordedFingerprint?: TargetFingerprint;
+  /** Binding hints (role/name/label/etc.) for fallback resolution. */
+  bindingHints?: BindingHints;
+  /**
+   * Suggested action type derived from the element kind. Subset of
+   * IntentActionType — buttons → 'click', text inputs → 'type', selects →
+   * 'select', tooltip / hover targets → 'hover'. The form pre-fills the
+   * action dropdown with this but the user can still change it.
+   */
+  suggestedAction?: 'click' | 'type' | 'select' | 'hover';
+  /** Dry-run lint result against the picked element. UI surfaces warnings. */
+  lint?: {
+    status: LintStatus;
+    confidence?: number;
+    message?: string;
+  };
   timestamp: string;
 }
 

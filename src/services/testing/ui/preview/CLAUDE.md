@@ -44,6 +44,7 @@ Element resolution and auto-healing serve all three.
 | [snapshot-diff.util.ts](snapshot-diff.util.ts) | [api/snapshot-router.md](api/snapshot-router.md) | Shadow-mode validator: field-level diff between evaluate and CDP snapshots. Boolean-falsy normalization added. |
 | [candidate-pruner-llm.service.ts](candidate-pruner-llm.service.ts) | [api/candidate-pruner-llm.md](api/candidate-pruner-llm.md) | LLM pre-filter: narrows ~60 candidates to ~15 before resolver. Fail-open, identity-rescue, cross-script matching. |
 | [step-readiness-v2.service.ts](step-readiness-v2.service.ts) | [api/step-readiness-v2.md](api/step-readiness-v2.md) | Smart waiter V2: 3-level readiness (existence→actionability→identity) with soft-escape at 70% budget. Shadow mode via `runV1WithShadow`. |
+| [preview-element-pick.service.ts](preview-element-pick.service.ts) | — | One-shot read-only "Pick element" picker (May 2026). Injects in-page overlay + intercepts the next click in capture phase (page sees nothing). Reuses `RecordingCaptureService.probeForRecording` / `buildRecordedFingerprint` / `buildBindingHints` + `generateRecordedDescription` + dry-run `IntentStepLintService.lintStepWithAI`. Owns its own active-session map (`isPickActive`) used by recording:start / run:start as the source of truth for mutex. |
 
 ### Supporting services
 
@@ -120,6 +121,7 @@ Element resolution and auto-healing serve all three.
 | `preview:tab:switch` / `:close` | Tab control |
 | `preview:html:request` / `:accessibility:request` / `:network:list:request` / `:network:detail:request` | DevTools tabs |
 | `preview:apply-resource` / `:save-login` | Test resources (auth fixture apply) |
+| `preview:pick:start` / `:cancel` | Enter / exit one-shot Pick element mode |
 
 ### Server → Client
 | Event | Meaning |
@@ -134,6 +136,8 @@ Element resolution and auto-healing serve all three.
 | `preview:step:apply:result` | Apply success/fail + evidence |
 | `preview:run:progress` / `:complete` | Run loop status |
 | `preview:auth:required` | Login wall detected |
+| `preview:pick:state` | Pick mode entered or exited (`active: boolean`, `reason?`) |
+| `preview:pick:result` | One-shot picker result — identity + suggested action + dry-run lint |
 
 ---
 
@@ -202,6 +206,32 @@ preview:run:start
 ```
 Timeout: `min(15min, 60s + 15s × steps)`.
 
+### Pick element (one-shot read-only picker)
+```
+preview:pick:start
+  → guard: not recording, not running (else emit :state { active:false, reason:'error' })
+  → preview-element-pick.service.startPick()
+      page.exposeFunction(__qai_pick_callback) + page.evaluate(overlayScript)
+      overlay listens mousemove (hover highlight + tag#id tooltip)
+                  click in CAPTURE phase → preventDefault + stopImmediatePropagation
+                  → window.__qai_pick_callback({ x, y })
+      timeout 60s; auto-cancel on page navigation
+  → emit preview:pick:state { active: true, reason: 'started' }
+
+[user clicks once in the live preview iframe]
+  → callback fires with click coords
+  → probeForRecording(page, x, y) + buildRecordedFingerprint + buildBindingHints
+  → generateRecordedDescription (LLM, fail-open with structural fallback)
+  → IntentStepLintService.lintStepWithAI (dry-run — no DOM mutation)
+  → emit preview:pick:result { description, stableId, testId, ref, recordedFingerprint,
+                                bindingHints, suggestedAction, lint, boundingBox, tag }
+  → emit preview:pick:state { active: false, reason: 'picked' }
+  → overlay torn down
+```
+Frontend stores identity in hidden fields on the manual-step draft. On apply / save the
+fingerprint is plumbed via `recordedFingerprint` / `bindingHints` on the stepDraft so
+the resolver's identity fast-path hits without an LLM call.
+
 ### Background replay (regression / scheduled)
 ```
 BullMQ enqueue (manual-test-run.job.ts)
@@ -255,7 +285,7 @@ If apply fails after action: auto-heal path
 
 ## Invariants (must hold)
 
-1. **Recording ↔ Run mutual exclusion.** `PreviewRunService.isRunning()` blocks new captures. Starting a run stops recording.
+1. **Recording ↔ Run ↔ Pick mutual exclusion.** `PreviewRunService.isRunning()` blocks new captures; starting a run stops recording. Pick element (`preview-element-pick.service.ts` — `isPickActive(sessionId)`) is the third leg: recording:start and run:start both consult it and reject early. The pick service owns its own active-session map (the source of truth) — do NOT mirror it into yet another Set, that's how race windows are born.
 2. **WS handler must always respond.** Even on validation failure, emit a `:result` with `{ error }`. No silent returns.
 3. **CDP sessions — measured trade-off (Etap 2, May 2026).** `preview-video-stream.service.ts` owns the screencast session — never piggyback on it (`existingCdpSession` != screencast session; piggyback causes 100% video freeze, empirically measured). `CdpSnapshotService` opens its **own** session and detaches in `finally` — this is allowed and causes only brief FPS drop (~11 FPS during dense snapshot, recovers immediately). For DevTools/a11y outside Etap 2 still use `page.accessibility.snapshot()` / `page.content()`. Calling `Accessibility.enable` on any session in preview still freezes video. See [critical-patterns.md](../../../../../.claude/rules/critical-patterns.md) §2.
 4. **`waitUntil: 'load'` everywhere in apply/run/replay.** Don't introduce `domcontentloaded`.
