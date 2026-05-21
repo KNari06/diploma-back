@@ -425,6 +425,14 @@ export interface BindingHints {
    */
   href?: string;
   /**
+   * `<a target="...">` attribute, captured at record time when non-empty.
+   * Drives the new-tab path in the replay layer — anchors with `_blank` (or
+   * any named target) are opened via `context.newPage() + goto(href)` so the
+   * preview session gains a real second tab in `session.pages[]` instead of
+   * collapsing the navigation into the active tab.
+   */
+  linkTarget?: string;
+  /**
    * V22: Vue scoped style attribute name (`data-v-XXXXXXX`). Stable per-component
    * marker that narrows down element identity within a Vue app.
    */
@@ -920,6 +928,12 @@ export interface TargetFingerprint {
   ariaControls?: string;
   /** V22: href — for <a> tags, differentiates duplicate link text by destination */
   href?: string;
+  /**
+   * `<a target="...">` attribute at record time. Mirror of `BindingHints.linkTarget`.
+   * Drives the replay-time new-tab path. Resolver treats it as a soft hint
+   * for uniqueness (a `_blank` link is rarely a duplicate of a same-tab one).
+   */
+  linkTarget?: string;
   /** V22: Vue scoped style attribute (data-v-XXXXXXX) — narrows component instance */
   vueScopeId?: string;
   /** Etap 1B.2 — Angular `routerLink` directive value. */
@@ -1382,7 +1396,7 @@ export interface LintResult {
    *   rule_fallback   — degraded mode, rule-based score
    *   user_confirmed  — user picked from clarification UI
    */
-  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_href' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
+  resolverPath?: 'identity_id' | 'identity_testid' | 'identity_href' | 'identity_name' | 'identity_svgicon' | 'identity_custom_element' | 'identity_triple' | 'evidence_shortcut' | 'compiled' | 'llm' | 'vision' | 'rule_fallback' | 'user_confirmed';
   /** Candidate elements (for ambiguous cases) */
   candidates: LintCandidate[];
   /** Elements to highlight on UI */

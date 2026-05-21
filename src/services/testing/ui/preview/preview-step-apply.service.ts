@@ -2641,6 +2641,42 @@ async function executeAction(
         // V13: Track pages before click for new-tab detection
         const pagesBefore = page.context().pages().length;
 
+        // New-tab promotion: anchors with explicit `target` (`_blank` / named)
+        // OR cross-origin anchors AND modifier-driven new-tab clicks
+        // (Cmd/Ctrl/Shift) open via `context.newPage() + goto(href)` instead
+        // of `locator.click()`. The BrowserContext-level `on('page')` hook
+        // (preview-session.attachPopupHandler) adopts the page into
+        // `session.pages` and emits `preview:tab:opened` — no extra plumbing
+        // needed here, we just skip the click and break out of the case.
+        try {
+          const { tryOpenAnchorAsNewTab, shouldOpenAsNewTab, openHrefInNewTab, probeAnchorAtLocator } = await import('./new-tab-opener');
+          const wantsNewTabByModifier = clickModifiers.includes('Meta')
+            || clickModifiers.includes('Control')
+            || clickModifiers.includes('Shift');
+          if (wantsNewTabByModifier) {
+            const probe = await probeAnchorAtLocator(locator);
+            if (probe?.href) {
+              // When Cmd/Ctrl/Shift is held on a same-origin anchor without
+              // `target`, `shouldOpenAsNewTab` returns null (those wouldn't
+              // qualify on their own). The modifier itself is the trigger
+              // here — tag the reason explicitly so logs don't conflate it
+              // with `_blank` attribute-driven promotion.
+              const decision = shouldOpenAsNewTab(probe, page.url())
+                ?? { reason: 'modifier_driven' as const, href: probe.href };
+              const tabOpen = await openHrefInNewTab(page.context(), decision.href, decision.reason);
+              if (tabOpen) break;
+            }
+          } else {
+            const tabOpen = await tryOpenAnchorAsNewTab(locator, page.context(), page.url());
+            if (tabOpen) break;
+          }
+        } catch (probeErr) {
+          // Fail open — never block a normal click on probe glitches.
+          logger.debug('[EXECUTE_ACTION] New-tab probe failed, proceeding with normal click', {
+            error: probeErr instanceof Error ? probeErr.message : String(probeErr),
+          });
+        }
+
         if (humanLike) {
           // Human-like click: hover -> small pause -> click
           await locator.hover({ timeout });

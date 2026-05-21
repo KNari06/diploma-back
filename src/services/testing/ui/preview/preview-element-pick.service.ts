@@ -45,6 +45,7 @@ import {
   type ServerToClientEvents,
   type SocketData,
   type PreviewPickResultPayload,
+  type PreviewPickLintPayload,
   type PreviewPickStatePayload,
 } from '@/websocket/types/types';
 import type {
@@ -428,49 +429,27 @@ async function finishPick(
     description = buildStructuralDescription(probed, suggestedAction);
   }
 
-  // 5) Dry-run lint — predict whether the picked element will resolve
-  //    uniquely at replay. We synthesize a minimal IntentStep that mirrors
-  //    what the form will eventually persist (description + fingerprint +
-  //    bindingHints) and ask lint to score it. No side-effects on the page.
-  let lint: PreviewPickResultPayload['lint'];
-  try {
-    const { IntentStepLintService } = await import('./intent-step-lint.service');
-    if (!stillAlive()) return;
-    const lintResult = await IntentStepLintService.lintStepWithAI({
-      previewSessionId,
-      userId,
-      forceFreshSnapshot: true,
-      // P14 — `pick_dry_run` makes pick-session lint hits trivially
-      // filterable in intent_resolve.log without confusing them with
-      // apply-prelint or find-button traffic.
-      auditTrigger: 'pick_dry_run',
-      stepDraft: {
-        id: `pick-${previewSessionId}-${Date.now()}`,
-        // `SuggestedAction` is a strict subset of `IntentActionType`
-        // (click | type | select | hover) — narrow widening via cast.
-        type: suggestedAction as IntentActionType,
-        description,
-        bindingHints,
-        recordedFingerprint: fingerprint,
-        recordedDescription: description,
-      },
-    });
-    lint = {
-      status: lintResult.status as LintStatus,
-      confidence: lintResult.confidence,
-      message: lintResult.message,
-    };
-  } catch (err) {
-    logger.debug('[PREVIEW_PICK] Lint dry-run failed; emitting without lint', {
-      previewSessionId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // 6) Build the payload. The fingerprint is the source of truth for
-  //    identity; flat shortcuts (stableId/testId/tag/ref) are surfaced
-  //    only for the FE's "tag#id" label rendering so it doesn't have to
-  //    unpack the fingerprint client-side.
+  // 5) Build + emit the PRIMARY result. The fingerprint is the source of
+  //    truth for identity; flat shortcuts (stableId/testId/tag/ref) are
+  //    surfaced only for the FE's "tag#id" label rendering so it doesn't
+  //    have to unpack the fingerprint client-side.
+  //
+  // ⚠️ Two-phase emit (May 2026, bi.group UX incident):
+  //   Before, lint dry-run ran INLINE and `preview:pick:result` was emitted
+  //   only after the LLM finished — adding 5-10s between user's click and
+  //   the form showing any data. From the user's POV the picker felt frozen
+  //   even though the recorded fingerprint was already in hand.
+  //
+  //   Now we emit `preview:pick:result` immediately (description, fingerprint,
+  //   bindingHints — the data the form actually needs) and run lint as
+  //   FIRE-AND-FORGET, emitting a follow-up `preview:pick:lint` when it
+  //   resolves. The lint payload only carries confidence/warning text, so
+  //   late arrival is purely additive.
+  //
+  //   `lint` on the primary payload is intentionally omitted now — FE
+  //   reads the same fields off `preview:pick:lint` instead. Old FE
+  //   clients that read `lint` from the result keep working (field is
+  //   `undefined`, no visual warning) until they upgrade.
   const payload: PreviewPickResultPayload = {
     previewSessionId,
     description,
@@ -481,18 +460,62 @@ async function finishPick(
     recordedFingerprint: fingerprint,
     bindingHints,
     suggestedAction,
-    lint,
     timestamp: new Date().toISOString(),
   };
 
-  // 7) Emit result + auto-exit pick mode. Final guard — if the session
-  // was torn down between the lint await and here, swallow the result
-  // (the teardown path has already emitted :state {active:false}).
   if (!stillAlive()) return;
   const room = createRoomName('preview', previewSessionId);
   nsp.to(room).emit('preview:pick:result', payload);
 
+  // 6) Exit pick mode immediately so the picker overlay clears in the
+  //    preview — the lint still runs but the user can already proceed.
   await cancelPick(previewSessionId, 'picked');
+
+  // 7) Lint dry-run — predict whether the picked element will resolve
+  //    uniquely at replay. Fire-and-forget; the result is purely advisory
+  //    (a confidence badge / "locator may be fragile" warning). Runs after
+  //    we've already released pick mode so a slow LLM never blocks the UI.
+  void (async () => {
+    try {
+      const { IntentStepLintService } = await import('./intent-step-lint.service');
+      const lintResult = await IntentStepLintService.lintStepWithAI({
+        previewSessionId,
+        userId,
+        forceFreshSnapshot: true,
+        // P14 — `pick_dry_run` makes pick-session lint hits trivially
+        // filterable in intent_resolve.log without confusing them with
+        // apply-prelint or find-button traffic.
+        auditTrigger: 'pick_dry_run',
+        stepDraft: {
+          id: `pick-${previewSessionId}-${Date.now()}`,
+          // `SuggestedAction` is a strict subset of `IntentActionType`
+          // (click | type | select | hover) — narrow widening via cast.
+          type: suggestedAction as IntentActionType,
+          description,
+          bindingHints,
+          recordedFingerprint: fingerprint,
+          recordedDescription: description,
+        },
+      });
+      // Session may have closed during the lint await — drop silently.
+      if (!stillAlive()) return;
+      const lintPayload: PreviewPickLintPayload = {
+        previewSessionId,
+        lint: {
+          status: lintResult.status as LintStatus,
+          confidence: lintResult.confidence,
+          message: lintResult.message,
+        },
+        timestamp: new Date().toISOString(),
+      };
+      nsp.to(room).emit('preview:pick:lint', lintPayload);
+    } catch (err) {
+      logger.debug('[PREVIEW_PICK] Lint dry-run failed (background); no lint emit', {
+        previewSessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
 }
 
 type SuggestedAction = 'click' | 'type' | 'select' | 'hover';

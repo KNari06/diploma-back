@@ -279,6 +279,14 @@ Be PERMISSIVE — if you exclude the right element here, the resolver cannot rec
 
 Cross-script reminder: lowercase + Unicode-fold both sides before comparing tokens. When the intent and the candidate are in different languages (Russian intent, Kazakh/English UI), translate semantically — token overlap of 0 is NOT grounds for exclusion.
 
+TYPO TOLERANCE (the user types intent by hand and makes errors):
+INCLUDE candidates that match the intent up to a single-letter typo. A pre-filter must NOT discard a candidate because of one wrong character.
+- "Понорама 360" ≡ "Панорамы 360" (one substituted char + morphology)
+- "Logn" ≡ "Login" (one missing char)
+- "loign" ≡ "login" (transposed chars)
+- "Заявка наипотеку" ≡ "Заявка на ипотеку" (extra/missing space)
+Threshold: Damerau-Levenshtein ≤ 2 for words of 5+ chars; ≤ 1 for 4-char words; exact for 3-char and shorter. When this rule keeps a candidate, KEEP it in the shortlist — the downstream resolver will make the final call.
+
 ACTIVE POPUP / DROPDOWN (HARD RULE — overrides all "soft" preferences below):
 When PAGE STATE describes an "Active popup/dropdown" AND the intent uses a popup-scope word — EN: "in/from/inside the dropdown / menu / popup / popover / suggestions / suggestion list / autocomplete / typeahead / search results / results / options / list / picker"; RU: "в выпадающем списке / в меню / в попапе / в подсказках / в результатах поиска / в результатах / в списке / в выборе"; KZ: "тізімде / мәзірде / іздеу нәтижелерінде / нұсқаларда" — you MUST include in your top-K every candidate that:
   • is listed in PAGE STATE's "visible items" block, OR

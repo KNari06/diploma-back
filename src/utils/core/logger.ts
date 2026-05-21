@@ -213,6 +213,13 @@ const transports: winston.transport[] = [
         if (info.level === 'warn') {
           const NOISY_WARN_TAGS = [
             '[SNAPSHOT_SHADOW_DIVERGENCE]',
+            // `[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements` —
+            // fires on canvas-only / blank intermediate pages (e.g. 360°
+            // panorama viewer at panoDIV) where there are physically no
+            // interactive nodes to collect. Not a bug; the resolver will
+            // just see an empty allowed set and bail. Kept in combined.log
+            // for postmortem because the debugStats payload is rich.
+            '[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements',
           ];
           return NOISY_WARN_TAGS.some((t) => msg.includes(t)) ? false : info;
         }

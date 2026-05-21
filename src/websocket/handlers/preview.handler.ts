@@ -2536,6 +2536,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         y,
         button,
         clickCount,
+        // Pass keyboard modifiers through so Cmd/Ctrl/Shift+Click on a link
+        // produces a new tab (Cmd-click is the canonical "open in new tab"
+        // gesture). The session-service click handler converts these into
+        // a Playwright modifiers array AND uses Cmd/Ctrl/Shift on anchors
+        // as a new-tab trigger even when the anchor lacks `target=_blank`.
+        modifiers,
       });
 
       if (result.success) {
@@ -4396,7 +4402,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const tabIndex = data.tabIndex;
       if (tabIndex === undefined || tabIndex === null || typeof tabIndex !== 'number') {
-        socket.emit('preview:tab:switched', {
+        socket.nsp.to(createRoomName('preview', previewSessionId)).emit('preview:tab:switched', {
           previewSessionId,
           tabs: [],
           activeTabIndex: 0,
@@ -4419,7 +4425,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const tabsInfo = sessionService.getTabsInfo(previewSessionId, ensuredUserId);
       const session = sessionService.getSession(previewSessionId);
 
-      socket.emit('preview:tab:switched', {
+      socket.nsp.to(createRoomName('preview', previewSessionId)).emit('preview:tab:switched', {
         previewSessionId,
         tabs: tabsInfo,
         activeTabIndex: session?.activeTabIndex ?? 0,

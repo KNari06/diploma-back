@@ -63,6 +63,7 @@ Element resolution and auto-healing serve all three.
 | [ai-check.service.ts](ai-check.service.ts) | AI-driven assertion (`check:*` step types). |
 | [draft-steps-cache.ts](draft-steps-cache.ts) | In-memory cache for unsaved draft steps. |
 | [external-nav-trap.ts](external-nav-trap.ts) | Catches navigations to unrelated origins (treats as fake-success signal). |
+| [new-tab-opener.ts](new-tab-opener.ts) | Promotes anchor clicks to real new tabs via `context.newPage() + goto(href)` when `<a target="...">` is set, when the href is cross-origin, or when modifier keys request a new tab (Cmd/Ctrl/Shift). Used by `CommandExecutor.performClick`, preview-step-apply `executeAction` click branch, and preview-session live `executeMouseAction`. The new page is adopted by `attachPopupHandler` like any other popup. |
 | [evidence-shortcut.utils.ts](evidence-shortcut.utils.ts) | Cached "this evidence already worked" shortcut to skip resolver. |
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
 | [page-interactive.utils.ts](page-interactive.utils.ts) | "Is page interactive yet" heuristic. |
@@ -140,7 +141,8 @@ Element resolution and auto-healing serve all three.
 | `preview:run:progress` / `:complete` | Run loop status |
 | `preview:auth:required` | Login wall detected |
 | `preview:pick:state` | Pick mode entered or exited (`active: boolean`, `reason?`) |
-| `preview:pick:result` | One-shot picker result — identity + suggested action + dry-run lint |
+| `preview:pick:result` | One-shot picker result — identity + description + suggested action. Emitted IMMEDIATELY after the probe (no LLM wait). |
+| `preview:pick:lint` | Follow-up dry-run lint verdict (5-10s after `:result`). Carries only `{ status, confidence, message }`. May not fire if lint failed / timed out / session closed. |
 
 ---
 
@@ -225,16 +227,24 @@ preview:pick:start
   → callback fires with click coords
   → probeForRecording(page, x, y) + buildRecordedFingerprint + buildBindingHints
   → generateRecordedDescription (LLM, fail-open with structural fallback)
-  → IntentStepLintService.lintStepWithAI (dry-run — no DOM mutation)
   → emit preview:pick:result { description, stableId, testId, ref, tag,
                                 recordedFingerprint, bindingHints,
-                                suggestedAction, lint }
+                                suggestedAction }                       ← IMMEDIATE
   → emit preview:pick:state { active: false, reason: 'picked' }
   → overlay torn down
+  ┄ (background, fire-and-forget) ┄
+  → IntentStepLintService.lintStepWithAI (dry-run — no DOM mutation)
+  → emit preview:pick:lint { lint: { status, confidence, message } }    ← 5-10s LATER
 ```
+Two-phase emit (May 2026): `:result` ships description + fingerprint as soon as
+the in-page probe finishes so the form can populate immediately. The dry-run
+lint runs in the background and posts a follow-up `:lint` warning when the
+LLM finishes — never blocks the UI on the resolver round-trip. FE clients
+that don't subscribe to `:lint` simply don't see the fragile-locator chip.
+
 Frontend stores identity in hidden fields on the manual-step draft. On apply / save the
 fingerprint is plumbed via `recordedFingerprint` / `bindingHints` on the stepDraft so
-the resolver's identity fast-path hits without an LLM call.
+the resolver's identity fast-path hits without an LLM call (see invariant #14).
 
 ### Hover overlay (in-page outline, replaces React hoverHighlight)
 ```
@@ -326,6 +336,10 @@ If apply fails after action: auto-heal path
 11. **`{{key}}` interpolation uses the unified helper** [`src/utils/interpolation/resolve-placeholders.ts`](../../../../utils/interpolation/resolve-placeholders.ts). Three callers (`preview-step-apply`, `preview-run`, background `test-executor`) read from the same `[scratchpad → runVariables]` source order. `runVariables` is plumbed via `PreviewSession.contextRunVariables` (populated by `preview:apply-resource` for environment/secret/fixture kinds). Adding another variable namespace = one more `VariableSource`, never another regex. Selectors / `elementDescription` are NOT interpolated — keep it that way.
 12. **`secrets.*` values must never leak after interpolation.** Sinks already wired: `command-executor` log, replay-trace JSONL (`ReplayTraceWriter.setRedactValues`), editor-trace JSONL (provider in `EditorTraceService.getOrCreate`), `intent-resolve-audit` (`secretValues` param), WS `preview:step:apply:result` and three `preview:run:step` emits, `runtimeMeta` in `emitTestStepCompleted`. `preview-run` rewinds the persisted `appliedStep` back to its placeholder shape via `preserveOriginalStep` so DB rows store `{{secrets.X}}`, not the resolved value. `session.contextRunVariables` is cleared on `resetSession`. When you add a new emit / log / persist site carrying step bodies, plumb a redactor — see redact-step.md or use `executor.redactString` / `buildStepRedactor`. Snapshot semantics: redaction lists are captured ONCE per run; mid-run resource reapply needs an explicit refresh.
 13. **Hover overlay never blocks user input.** [`preview-hover-overlay.service.ts`](preview-hover-overlay.service.ts) is a paint-only layer — all in-page listeners are `{ passive: true }` and the outline `<div>` has `pointer-events: none`. The pick overlay (a separate service) is the ONLY one that intercepts clicks. If you add a new in-page overlay, follow the hover service's pattern, NOT the pick service's, unless the new overlay is explicitly a one-shot selection mode. Mode-flip precedence: recording mode (server-side, set by recording handlers) wins over navigation mode (FE-driven via `preview:hover-overlay:set`). Pick mode preempts both — pick handler captures the previous mode in `hoverModeBeforePick` and restores it in `onExit`.
+14. **Resolver candidate list MUST NOT carry list-position numbers.** The candidate list rendered into the LLM prompt is `- ref="eXX" <tag> …`, one per line. Earlier `${i + 1}. ref="eXX"` confused weak models (gemini-2.5-flash-lite, May 2026 bi.group "Ташкент" incident): a 55-candidate dense modal list made the model return `e45` (its reasoning's enumeration index) when the actual ref pool only reached `e31`. Validator caught it but the UI surfaced as silent "not found right after Pick". If you add a new resolver prompt path, copy the `- ref="…"` shape and the explicit "DO NOT return a list position" rule. The validator at `LLM_SELECT` now also warns when `parsed.ref ∉ validRefs` so the next regression is caught in logs first.
+15. **Identity fast-path covers six attributes plus the tag+role+text triple.** Six stable-attribute checks (`id` / `testId` / `href` / `svgIcon` / `customElementTag` / `name` / `alt`) run first; a final Tier-2 pass matches `tag + role + text` when ALL three were captured by the recorder/picker and EXACTLY ONE live candidate carries the same triple. Triple-match only fires for click-class actions (click/hover/select) and requires `text.length >= 2`. This is the channel that lets Pick on a CSS-Modules / styled-components site (bi.group, May 2026) skip the LLM entirely. Do NOT use `compiled.targetFingerprint` as a fallback channel here — that's a self-echo of a previous resolver decision and creates a fake-success loop (V27 history at element-resolver.service.ts:3960).
+16. **New-tab promotion is the single path for `<a target=_blank>` / cross-origin anchors / modifier-driven new-tab clicks.** All three click sites (`CommandExecutor.performClick` for background replay, `executeAction` click branch for live Apply/Apply All, `executeMouseAction` for live preview clicks) call into [new-tab-opener.ts](new-tab-opener.ts) BEFORE `locator.click()` / `page.mouse.click()`. Reason: Playwright's `locator.click()` does not reliably honour `target="_blank"` under our launch flags (`--disable-features=IsolateOrigins,site-per-process` + headless) and collapses popups into the active tab; recorded `<a target>` semantics also need to be replayable. The opener creates a Page in the same BrowserContext, which fires `context.on('page')` → `attachPopupHandler` → `preview:tab:opened`, so the FE renders the tab without any extra plumbing. Same-origin anchors without explicit target are NOT promoted — those stay inline so SPA navigations and normal in-flow clicks aren't fragmented across tabs. Probe failures fail OPEN (fall back to normal click). The recorder also captures `<a target>` into `ProbedElement.linkTarget` / `BindingHints.linkTarget` / `TargetFingerprint.linkTarget` so the hint travels with the step (informational; the runtime probe is ground truth).
+17. **Pick service uses two-phase emit.** `preview:pick:result` is sent IMMEDIATELY after the in-page probe (description + fingerprint + bindingHints); `preview:pick:lint` follows 5-10s later with the dry-run resolver verdict. Never block `:result` on the lint — the form must populate without waiting for the LLM. If you add another expensive post-probe enrichment (vision, RAG, second LLM pass), keep it on the same fire-and-forget pattern with its own follow-up event.
 
 ---
 

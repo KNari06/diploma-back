@@ -837,6 +837,126 @@ export function getEffectiveLabel(node: InteractiveNode | undefined | null): str
 }
 
 /**
+ * Honesty guard — verify that a chosen candidate's effective label is
+ * compatible with the user's intent text. Catches two hallucination
+ * classes that escape min-confidence and producer-side validation:
+ *
+ *   1. labelEmpty: chosen node has no text/label/aria/alt/iconLabel/...
+ *      across the full getEffectiveLabel cascade. With a text-bearing
+ *      intent there is no legitimate way to match — model picked
+ *      something arbitrary.
+ *
+ *   2. semanticFloor: both intent and chosen have ≥1 ≥3-char tokens,
+ *      and the two sets have ZERO shared tokens (exact or substring,
+ *      Cyrillic-Latin glyphs folded). This is the "Панорама 360"
+ *      vs "Заказать звонок" case from May 2026 vision-rescue audit.
+ *
+ * Returns:
+ *   - null when guard passes (caller should accept the pick)
+ *   - { kind, reason } when guard fails (caller should treat as
+ *     not_found and proceed to fallback)
+ *
+ * Used by:
+ *   - selectElementWithLLM (Stage 3 LLM resolver, line ~3232+)
+ *   - vision second opinion (Stage 4 rescue, line ~4890+) — previously
+ *     bypassed both guards because they were inlined in selectElement-
+ *     WithLLM. Extracted module-level so vision path enforces the
+ *     same contract.
+ *
+ * Gate notes:
+ *   - heal mode is permissive — the recorded fingerprint is the truth
+ *     source there, the model is encouraged to bias toward "close".
+ *   - synonym intents like "иконка корзины" (no specific text, just
+ *     descriptive nouns) MUST be allowed; the ≥3-char gate on
+ *     intentText filters them out implicitly.
+ */
+export function evaluateHonestyGuard(args: {
+  intentText: string;
+  chosenNode: InteractiveNode | undefined | null;
+  mode: 'apply' | 'heal';
+}): { kind: 'labelEmpty' | 'semanticFloor'; reason: string } | null {
+  const { intentText, chosenNode, mode } = args;
+
+  if (mode === 'heal') return null;
+
+  const intentLower = (intentText || '').toLowerCase().trim();
+  if (intentLower.length < 3) return null;
+
+  const chosenLabel = (getEffectiveLabel(chosenNode) || '').trim();
+
+  // Guard 1 — empty label across ALL channels means the model picked
+  // a node that has no identifying signal whatsoever.
+  if (chosenLabel.length === 0) {
+    return {
+      kind: 'labelEmpty',
+      reason: `chosen candidate has no text/label across any channel — intent="${intentText.slice(0, 40)}" cannot legitimately match`,
+    };
+  }
+
+  // Guard 2 — token-overlap floor. Tokenization mirrors the inline
+  // version that used to live in selectElementWithLLM:
+  //   - Cyrillic glyph fold (M↔М, A↔А, T↔Т, ...) — covers MAT-SMART
+  //     ↔ МАТ-SMART parity.
+  //   - Unicode word splitter with 3-char minimum (drops "по", "за"
+  //     etc. that would falsely overlap unrelated text).
+  //   - "shared" means exact OR substring (≥3 chars both ways) — so
+  //     "папка" intent vs "папкалар" chosen counts as shared (Kazakh
+  //     morphology), but "ok" inside "Bookmark" does NOT.
+  const cyrFold = (s: string): string => {
+    let out = '';
+    for (const ch of s) {
+      const code = ch.charCodeAt(0);
+      switch (code) {
+        case 0x0410: case 0x0430: out += 'a'; break;
+        case 0x0412: case 0x0432: out += 'b'; break;
+        case 0x0415: case 0x0435: out += 'e'; break;
+        case 0x041A: case 0x043A: out += 'k'; break;
+        case 0x041C: case 0x043C: out += 'm'; break;
+        case 0x041D: case 0x043D: out += 'h'; break;
+        case 0x041E: case 0x043E: out += 'o'; break;
+        case 0x0420: case 0x0440: out += 'p'; break;
+        case 0x0421: case 0x0441: out += 'c'; break;
+        case 0x0422: case 0x0442: out += 't'; break;
+        case 0x0425: case 0x0445: out += 'x'; break;
+        case 0x0423: case 0x0443: out += 'y'; break;
+        default: out += ch;
+      }
+    }
+    return out;
+  };
+  const tok = (s: string): Set<string> =>
+    new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
+
+  const intentTokens = tok(intentLower);
+  const chosenTokens = tok(chosenLabel.toLowerCase());
+
+  // Both sides MUST have content for a meaningful overlap check —
+  // chosenTokens empty after fold means the label was punctuation /
+  // emoji / single chars (e.g. "›", "✓") which the guard above
+  // already let through deliberately.
+  if (intentTokens.size === 0 || chosenTokens.size === 0) return null;
+
+  let shared = 0;
+  outer: for (const i of intentTokens) {
+    for (const c of chosenTokens) {
+      if (i === c) { shared = 1; break outer; }
+      if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
+        shared = 1; break outer;
+      }
+    }
+  }
+
+  if (shared === 0) {
+    return {
+      kind: 'semanticFloor',
+      reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
+    };
+  }
+
+  return null;
+}
+
+/**
  * Is this node a LEAF item inside an active popup/dropdown — the kind of
  * thing a user would actually pick from the list? Used to:
  *   1. Sort popup elements in buildSceneSummary so options come first,
@@ -1459,7 +1579,10 @@ async function rescueWithGeminiFlash(params: {
     if (n.autocomplete) attrs.push(`autocomplete="${n.autocomplete}"`);
     if (n.type || n.inputType) attrs.push(`type="${n.type || n.inputType}"`);
     if (n.role) attrs.push(`role="${n.role}"`);
-    return `${i + 1}. ref="${n.ref}" <${n.tag}> ${attrs.join(' ')}`;
+    // Drop list-position prefix to avoid the weak-LLM confusion described
+    // at the main resolver's candidateList comment (bi.group incident).
+    void i;
+    return `- ref="${n.ref}" <${n.tag}> ${attrs.join(' ')}`;
   }).join('\n');
 
   const systemPrompt = `You are an AI element selector for a browser testing tool.
@@ -1483,11 +1606,16 @@ RULES:
    - If multiple icon-buttons look identical (same "icon-button" tag, no icon hint, no label), DO NOT guess by position. Return ref: null with reason "icon-only buttons indistinguishable".
    - Common icon mappings: "eye" = show/hide password, "X" or "cross" = close, "trash"/"bin" = delete, "pencil" = edit, "folder" = folder/directory, "star" = favorite, "book" = bookmarks/library.
 5. If multiple elements could match, pick the one whose label/text is semantically closest.
-6. Only use refs from the provided list — never invent refs.
+6. Only use refs from the provided list — never invent refs. The "ref" field MUST be copied verbatim from one of the \`ref="eXX"\` tokens above (e.g. "e21"). DO NOT return a list position, ordinal, or your reasoning's enumeration index — return the actual ref string.
 7. If no element is a confident match, return ref as null. NEVER return the first candidate as a default guess.
 8. ADJACENCY ≠ SAME FUNCTION. Two controls sitting next to each other in a header / toolbar / row are SEPARATE elements with SEPARATE behaviour. A settings cog and a neighbouring "Click me!" banner are not interchangeable just because they share a row. Spatial / visual prominence is a TIE-BREAKER between candidates whose semantics already match the intent — never a reason to OVERRIDE semantics.
 9. NO "FALLBACK TO LOUDEST CTA". When no candidate semantically matches the intent, the correct answer is ref=null. Picking the most action-y looking element ("Submit", "Get started", "Click me!", "Try it") because something must be clicked is the #1 source of fake-success. Refuse the guess; return null.
-10. Respond ONLY with valid JSON, no markdown or extra text.
+10. TYPO TOLERANCE. The user types intent by hand and may swap, omit, or transpose 1-2 chars. Treat as matching even when characters differ:
+    - "Понорама" ≡ "Панорама" (one substituted char)
+    - "Logn in" ≡ "Login" (missing char), "loign" ≡ "login" (transposed)
+    - "Заявка наипотеку" ≡ "Заявка на ипотеку" (extra/missing space)
+    Apply Damerau-Levenshtein ≤ 2 for 5+ char words; ≤ 1 for 4-char; exact for 3 or shorter. Report confidence ≤ 0.85 when the match required typo correction (meaning OK, literal text differs).
+11. Respond ONLY with valid JSON, no markdown or extra text.
 
 OUTPUT FORMAT:
 {"ref":"eXX","confidence":0.0-1.0,"reason":"brief explanation"}
@@ -1961,8 +2089,27 @@ const LLM_SHARED_RULES = `RULES:
     - below 0.5: weak guess — return alternatives, not a single pick
     NEVER return >0.8 when guessing between duplicates without context.
 
-14. ONLY use refs from the provided list — never invent refs.
-15. Respond ONLY with valid JSON, no markdown.
+14. ONLY use refs from the provided list — never invent refs. The "ref" field MUST be copied verbatim from one of the \`ref="eXX"\` tokens in the candidate list (e.g. "e21"). DO NOT return a list position, an ordinal, or any enumeration index from your own reasoning ("candidate 45", "the 3rd one") — those are NOT refs. Return the actual ref string that appears after \`ref=\` in the candidate line you chose. If you cannot find such a token, return ref:null.
+
+15. TYPO TOLERANCE (treat the user's intent as a hint, not a literal):
+    The user typed the intent by hand and may make minor errors. Treat the
+    following as EQUIVALENT to the recorded/visible label, even when the
+    characters do not match byte-for-byte:
+    - Single-letter typos: "Понорама" ≡ "Панорама", "Курза" ≡ "Курса"
+      (one substituted char), "Logn in" ≡ "Login" (one missing char),
+      "loign" ≡ "login" (transposed chars). Apply Damerau-Levenshtein
+      distance ≤ 2 for words of 5+ characters; ≤ 1 for 4-character words;
+      exact match for 3-character words and shorter.
+    - Missing/extra spaces: "sign in" ≡ "signin", "Заявка наипотеку" ≡
+      "Заявка на ипотеку".
+    - Missing/extra punctuation: "Mail.ru" ≡ "Mailru", "О компании" ≡
+      "О компании!".
+    - Mixed scripts inside a single word: "С-mart" ≡ "C-mart" (Cyrillic
+      С ≡ Latin C). This compounds with rule 1 cross-language matching.
+    Confidence note: when the match required typo-tolerance, report
+    confidence ≤ 0.85 — strong meaning match but the literal text differs.
+
+16. Respond ONLY with valid JSON, no markdown.
 
 OUTPUT FORMAT:
 - One match: {"ref":"eXX","confidence":0.0-1.0,"reason":"brief"}
@@ -2585,10 +2732,26 @@ async function selectElementWithLLM(params: {
   }
   cacheMetrics.inc('llm-select', 'miss');
 
-  // Build candidate list for prompt
+  // Build candidate list for prompt.
+  //
+  // Format: one candidate per line, prefixed with `- ref="eXX"`.
+  //
+  // History (May 2026, bi.group "Ташкент button" incident):
+  //   Earlier the line started with `${i + 1}. ref="eXX"`. On dense modal
+  //   pages (55+ candidates) the gemini-2.5-flash-lite model returned the
+  //   *list position* (e.g. `e45`) instead of the candidate's `ref` value
+  //   when its reasoning text talked about "candidate 45 vs candidate 46".
+  //   The validator at line ~3305 caught it (`validRefs.has(parsed.ref)`
+  //   was false) and silently produced not_found — UI showed "Элемент не
+  //   найден" right after a successful Pick. gpt-5.4-mini didn't confuse
+  //   the two formats, so the bug looked intermittent.
+  //
+  // Fix: remove the list-position prefix entirely. Now the only number-
+  // shaped token on each line is the ref itself, so a model that returns
+  // "the number from that line" returns the right thing.
   const candidateList = candidates
-    .map((c, i) => {
-      return `${i + 1}. ref="${c.node.ref}" <${c.node.tag}> ${c.candidateText}`;
+    .map((c) => {
+      return `- ref="${c.node.ref}" <${c.node.tag}> ${c.candidateText}`;
     })
     .join('\n');
 
@@ -3372,12 +3535,34 @@ Select the single best matching element, or return ref=null if the intent does n
         };
       }
     } else {
-      // Nothing matches or invalid ref
+      // Nothing matches OR LLM returned a ref that isn't in the candidate
+      // set. Distinguish the two — they have very different root causes and
+      // remediations:
+      //   - parsed.ref === null: the model honestly said "no match"
+      //   - parsed.ref is a string but NOT in validRefs: hallucination
+      //     (either invented "eXX" or — observed on bi.group, May 2026 —
+      //     returned a list-position number disguised as a ref like "e45"
+      //     when the candidate list never reached e45). The list-numbering
+      //     fix at candidateList builder addresses the dominant cause;
+      //     this log catches the remaining stragglers.
+      const isHallucinatedRef = typeof parsed.ref === 'string' && parsed.ref.length > 0 && !validRefs.has(parsed.ref);
+      if (isHallucinatedRef) {
+        logger.warn('[LLM_SELECT] LLM returned a ref not in the candidate set — treating as not_found', {
+          returnedRef: parsed.ref,
+          validRefsSample: Array.from(validRefs).slice(0, 12),
+          validRefsCount: validRefs.size,
+          intentText: intentText.slice(0, 80),
+          mode,
+          reasonSnippet: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 120) : undefined,
+        });
+      }
       result = {
-        status: parsed.ref === null ? 'not_found' : 'not_found',
+        status: 'not_found',
         selectedRef: null,
         confidence: 0,
-        reason: (parsed.reason || 'no matching element').slice(0, 200),
+        reason: isHallucinatedRef
+          ? `LLM returned invalid ref "${String(parsed.ref).slice(0, 16)}" (not in candidate set)`
+          : (parsed.reason || 'no matching element').slice(0, 200),
         latencyMs: Date.now() - startTime,
         cacheHit: false,
       };
@@ -4058,6 +4243,114 @@ export async function resolveElement(params: {
         });
         // Don't break — a different attribute (later in the list) may
         // still resolve uniquely on this same page.
+      }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Identity fast-path Tier 2 (May 2026, Pick-element bi.group case):
+    // tag + role + text uniqueness.
+    //
+    // The original identity fast-path above only fires when the recorder
+    // captured a STABLE attribute (id/testId/href/svgIcon/name/alt). On
+    // many real sites (especially CSS-Modules / styled-components pages
+    // like bi.group) interactive elements have NONE of those — just a
+    // tag, a computed role, and a label string. The Pick-element flow
+    // captures all three accurately, but without a stable-attribute
+    // match the resolver falls through to a 5-10s LLM call per click,
+    // and weak models occasionally hallucinate refs from dense modal
+    // lists. Both are user-visible regressions of "I picked the right
+    // element, why is it still searching?".
+    //
+    // Tier 2 closes the gap: if (recordedTag + recordedRole + recordedText)
+    // matches EXACTLY ONE live allowed candidate on the same triple, that
+    // is unambiguously the user's target — return it. No LLM call.
+    //
+    // Why this is safe (and not a 4th false-positive channel like the
+    // V27-rejected `compiled.targetFingerprint` echo):
+    //   1. Origin gating — the triple is only used when ALL THREE fields
+    //      were captured by the recorder/picker. The picker writes them
+    //      from probeForRecording, which reads the actual clicked DOM node.
+    //      Manual-add draft steps never have all three.
+    //   2. Uniqueness gate — exactly one live match. Two "Ташкент"
+    //      candidates with the same tag+role+text would fall through to
+    //      the LLM, which can disambiguate by surrounding context (which
+    //      is exactly what fast-paths cannot reproduce — see Tier 1's
+    //      symmetric `valueMatches.length > 1` skip).
+    //   3. Action-gating — only fires for click/hover/select. Type uses
+    //      a different identity channel (placeholder/name) and we don't
+    //      want a text-based shortcut to override that.
+    //   4. Text-length floor — empty / single-char texts are too weak to
+    //      anchor identity. The recorder already drops these, but we
+    //      double-check here to keep the fast-path conservative.
+    //
+    // Where this lands vs alternatives we considered:
+    //   - Lowering minConfidence in the LLM gate: addresses the symptom,
+    //     not the cost (still ~5s per click) and would inflate
+    //     false-positive rate elsewhere.
+    //   - Strengthening recordedFingerprint with synthetic ids at pick
+    //     time: structurally cleaner but requires touching the recorder
+    //     contract — out of scope for the Pick flow's "wire-only" change.
+    if (identityFp && allAllowed.length > 0) {
+      const recordedTag = (identityFp.tag || '').toLowerCase();
+      const recordedRole = (identityFp.role || '').toLowerCase();
+      const recordedText = (identityFp.text || '').trim();
+      const stepType = stepDraft.type;
+      const isClickClass = stepType === 'click' || stepType === 'hover' || stepType === 'select';
+      const tripleEligible =
+        isClickClass &&
+        recordedTag.length > 0 &&
+        recordedRole.length > 0 &&
+        recordedText.length >= 2;
+      if (tripleEligible) {
+        const tripleMatches = allAllowed.filter((n) => {
+          const nTag = (n.tag || '').toLowerCase();
+          if (nTag !== recordedTag) return false;
+          const nRole = (n.role || '').toLowerCase();
+          if (nRole !== recordedRole) return false;
+          // Text equality is intentionally case-sensitive trim-only — we
+          // want the same display string, not a "looks similar" fuzzy
+          // match. If the page truly localised the label we WANT to fall
+          // through to the LLM so the recorded-description channel takes
+          // over.
+          const nText = (n.text || '').trim();
+          return nText === recordedText;
+        });
+        if (tripleMatches.length === 1) {
+          const chosen = tripleMatches[0];
+          logger.info('[ELEMENT_RESOLVER] identity fast-path hit (tag+role+text)', {
+            previewSessionId,
+            stepType,
+            ref: chosen.ref,
+            tag: chosen.tag,
+            role: chosen.role,
+            textPreview: recordedText.slice(0, 40),
+          });
+          const lintCandidate: LintCandidate = {
+            ref: chosen.ref,
+            label: getEffectiveLabel(chosen) || `<${chosen.tag}>`,
+            reason: 'identity match (tag+role+text)',
+            confidence: 1.0,
+            boundingBox: chosen.boundingBox,
+            node: chosen,
+          };
+          return {
+            status: 'resolved',
+            message: 'Element resolved by recorded tag+role+text',
+            confidence: 1.0,
+            candidates: [lintCandidate],
+            highlight: [{ ref: chosen.ref, boundingBox: chosen.boundingBox, type: 'success' }],
+            cacheHit: false,
+            resolverPath: 'identity_triple',
+            ..._diag,
+          };
+        } else if (tripleMatches.length > 1) {
+          logger.info('[ELEMENT_RESOLVER] identity fast-path tag+role+text — ambiguous, fall through to LLM', {
+            previewSessionId,
+            stepType,
+            matchCount: tripleMatches.length,
+            textPreview: recordedText.slice(0, 40),
+          });
+        }
       }
     }
   }
@@ -4887,39 +5180,74 @@ export async function resolveElement(params: {
               const visionNode = candidatesToProcess.find(c => c.node.ref === visionResult.ref)
                 || (allAllowed.find(n => n.ref === visionResult.ref) ? { node: allAllowed.find(n => n.ref === visionResult.ref)!, candidateText: '' } : undefined);
               if (visionNode) {
-                logger.info('[ELEMENT_RESOLVER] Vision second opinion resolved visual element', {
-                  event: 'vision_second_opinion',
-                  previewSessionId,
-                  ref: visionResult.ref,
-                  confidence: visionResult.confidence,
-                  reason: visionResult.reason,
-                  totalLatencyMs: Date.now() - startTime,
+                // Honesty guard for vision rescue (May 2026 audit, trace
+                // preview_71da3fb2... — vision picked e50 "Заказать звонок"
+                // for intent "Панорама 360" with confidence 0.98 because
+                // the model "saw" the right tile but referenced the wrong
+                // ref). The same guard that runs inside selectElementWithLLM
+                // is re-applied here so the vision path enforces identical
+                // label/overlap contracts. Rejection lets the resolver fall
+                // through to overflow batch / smart-locator instead of
+                // returning a hallucinated ref as resolved.
+                //
+                // Intentionally tight scope: only this one return site is
+                // gated. Other vision paths (proactive icon-only at ~4524,
+                // early bbox-only at ~4116) keep prior behaviour until we
+                // have prod data showing they need the same protection.
+                const guard = evaluateHonestyGuard({
+                  intentText,
+                  chosenNode: visionNode.node,
+                  mode: resolveMode,
                 });
+                if (guard) {
+                  logger.info('[ELEMENT_RESOLVER] Vision second opinion rejected by honesty guard', {
+                    event: 'vision_second_opinion_rejected',
+                    previewSessionId,
+                    ref: visionResult.ref,
+                    confidence: visionResult.confidence,
+                    visionReason: (visionResult.reason || '').slice(0, 120),
+                    guardKind: guard.kind,
+                    guardReason: guard.reason,
+                    intentText: intentText.slice(0, 80),
+                    totalLatencyMs: Date.now() - startTime,
+                  });
+                  // Fall through to existing not_found / overflow handling
+                  // below — same path as if vision had returned null.
+                } else {
+                  logger.info('[ELEMENT_RESOLVER] Vision second opinion resolved visual element', {
+                    event: 'vision_second_opinion',
+                    previewSessionId,
+                    ref: visionResult.ref,
+                    confidence: visionResult.confidence,
+                    reason: visionResult.reason,
+                    totalLatencyMs: Date.now() - startTime,
+                  });
 
-                const lintCandidate: LintCandidate = {
-                  ref: visionNode.node.ref,
-                  label: getEffectiveLabel(visionNode.node) || `<${visionNode.node.tag}>`,
-                  reason: `Vision match: ${visionResult.reason}`,
-                  confidence: visionResult.confidence,
-                  boundingBox: visionNode.node.boundingBox,
-                  node: visionNode.node,
-                };
-
-                return {
-                  status: visionResult.confidence >= 0.5 ? 'resolved' as LintStatus : 'needs_clarification' as LintStatus,
-                  message: `Element found by visual analysis: ${visionResult.reason}`,
-                  confidence: visionResult.confidence,
-                  candidates: [lintCandidate],
-                  highlight: [{
+                  const lintCandidate: LintCandidate = {
                     ref: visionNode.node.ref,
+                    label: getEffectiveLabel(visionNode.node) || `<${visionNode.node.tag}>`,
+                    reason: `Vision match: ${visionResult.reason}`,
+                    confidence: visionResult.confidence,
                     boundingBox: visionNode.node.boundingBox,
-                    type: visionResult.confidence >= 0.5 ? 'success' : 'warning',
-                  }],
-                  cacheHit: false,
-                  degradedMode: false,
-                  resolverPath: 'vision',
-                  ..._diag,
-                };
+                    node: visionNode.node,
+                  };
+
+                  return {
+                    status: visionResult.confidence >= 0.5 ? 'resolved' as LintStatus : 'needs_clarification' as LintStatus,
+                    message: `Element found by visual analysis: ${visionResult.reason}`,
+                    confidence: visionResult.confidence,
+                    candidates: [lintCandidate],
+                    highlight: [{
+                      ref: visionNode.node.ref,
+                      boundingBox: visionNode.node.boundingBox,
+                      type: visionResult.confidence >= 0.5 ? 'success' : 'warning',
+                    }],
+                    cacheHit: false,
+                    degradedMode: false,
+                    resolverPath: 'vision',
+                    ..._diag,
+                  };
+                }
               }
             }
           }

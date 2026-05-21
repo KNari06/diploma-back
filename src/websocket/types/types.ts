@@ -517,6 +517,7 @@ export interface ServerToClientEvents {
   // Preview pick element (server -> client)
   'preview:pick:state': (data: PreviewPickStatePayload) => void;
   'preview:pick:result': (data: PreviewPickResultPayload) => void;
+  'preview:pick:lint': (data: PreviewPickLintPayload) => void;
 
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
@@ -1964,8 +1965,33 @@ export interface PreviewPickResultPayload {
    * action dropdown with this but the user can still change it.
    */
   suggestedAction?: 'click' | 'type' | 'select' | 'hover';
-  /** Dry-run lint result against the picked element. UI surfaces warnings. */
+  /**
+   * Dry-run lint result against the picked element. UI surfaces warnings.
+   *
+   * @deprecated since May 2026 — kept for backwards compatibility with FE
+   * clients that haven't upgraded to the two-phase emit. The pick service
+   * now emits `preview:pick:lint` separately so the primary result is not
+   * blocked on a 5-10s LLM call. New code should read lint from the
+   * `preview:pick:lint` event payload (`PreviewPickLintPayload.lint`).
+   */
   lint?: {
+    status: LintStatus;
+    confidence?: number;
+    message?: string;
+  };
+  timestamp: string;
+}
+
+/**
+ * Follow-up lint emit for the picker. Fired AFTER `preview:pick:result`
+ * (which is sent as soon as the element is probed) so the FE form can
+ * populate description + fingerprint immediately and overlay the lint
+ * warning (if any) when the dry-run resolve finishes. Two-phase emit;
+ * see PreviewPickResultPayload for the rationale.
+ */
+export interface PreviewPickLintPayload {
+  previewSessionId: string;
+  lint: {
     status: LintStatus;
     confidence?: number;
     message?: string;

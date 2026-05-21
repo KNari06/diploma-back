@@ -24,6 +24,7 @@ import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/sma
 import type { ReplayTraceWriter } from '../playwright/core/replay-trace-writer';
 import { executeCoordinateDrag, parseDragCoordinates } from '../playwright/core/drag-helpers';
 import { buildRuntimeMeta, executeCompiledLocatorPlan, quickFingerprintCheck } from './compiled-locator-executor';
+import { tryOpenAnchorAsNewTab } from '@/services/testing/ui/preview/new-tab-opener';
 import {
   buildGlobWaitPayload,
   buildRegexWaitPayload,
@@ -509,6 +510,44 @@ export class CommandExecutor {
         case 'click':
           // ✅ FIX 3: Helper for click with optional navigation wait
           const performClick = async (locator: Locator) => {
+            // New-tab path: if the click target is an <a> that should open
+            // as a new tab (explicit `target` attribute OR cross-origin
+            // anchor), we open it via `context.newPage(); newPage.goto(href)`
+            // instead of `locator.click()`. The BrowserContext-level
+            // `on('page')` listener (preview-session.attachPopupHandler)
+            // pushes the new page to `session.pages` and broadcasts
+            // `preview:tab:opened`, so the editor renders a real second tab.
+            //
+            // We do this BEFORE the scroll/overlay/enabled gates because
+            // (a) those gates only make sense for an actual locator click,
+            // and (b) skipping them on the new-tab path means a stale /
+            // off-screen link still opens (matches user expectation: in a
+            // real browser, middle-click works without scrolling).
+            try {
+              const tabOpen = await tryOpenAnchorAsNewTab(
+                locator,
+                this.page.context(),
+                this.page.url(),
+              );
+              if (tabOpen) {
+                // Swap active page so subsequent steps target the new tab,
+                // mirroring the existing post-click tab-switch path below.
+                this.page = tabOpen.newPage;
+                logger.info('[COMMAND_EXECUTOR] Anchor click promoted to new tab', {
+                  reason: tabOpen.reason,
+                  href: tabOpen.href,
+                  newTabUrl: tabOpen.newPage.url(),
+                });
+                return;
+              }
+            } catch (err) {
+              // Probe failure must NEVER block a click — fall through to the
+              // normal path on any unexpected error.
+              logger.debug('[COMMAND_EXECUTOR] New-tab probe errored, proceeding with normal click', {
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+
             await this.forceScrollIntoView(locator);
             // ✅ Overlay guard: Ensure element is topmost before clicking
             await this.ensureTopMostAtCenter(locator, 2000);
