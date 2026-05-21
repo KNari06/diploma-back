@@ -371,6 +371,11 @@ export type IntentActionType =
   | 'download'
   // V15: Multi-tab support — explicit tab switch
   | 'switch_tab'
+  // Multi-tab — close a tab by index. Recorded when the user clicks × on
+  // a pill in the preview tab bar during a recording session. Replay closes
+  // the same tabIndex; if it's already gone the step soft-succeeds (the
+  // intent — "this tab should not exist anymore" — is already true).
+  | 'close_tab'
   // V16: Gesture and coordinate actions (carousels, canvas, maps)
   | 'swipe'
   | 'click_at'

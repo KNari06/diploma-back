@@ -3469,6 +3469,30 @@ export class PreviewSessionService {
         this.attachPageDownloadHandler(newPage, previewSessionId);
         this.attachTabCloseListener(newPage, previewSessionId);
 
+        // Emit the pill-bar update IMMEDIATELY — the user must see a second
+        // pill appear the moment the popup is created, not 4-10s later after
+        // we wait for DOMContentLoaded + dismiss-overlays + screencast
+        // restart. Tabs UI is purely state-driven (just labels + URLs from
+        // `buildTabsInfo`), so it has no dependency on the new page being
+        // fully interactive. The rest of the handler (overlay-dismiss, DOM
+        // wait, onPageSwitch screencast restart) continues below; subsequent
+        // `preview:tab:switched` / video frames will catch up naturally.
+        //
+        // Why two emits (here AND at the bottom of this handler): the second
+        // emit at line ~3550+ is kept for the case where new-tab labels
+        // changed between this moment and DOM-ready (e.g. <title> filled in
+        // after domcontentloaded). FE is idempotent — same tabsInfo shape
+        // just overwrites state. Cost: one extra socket message per popup.
+        try {
+          const earlyTabsInfo = this.buildTabsInfo(session);
+          webSocketService.emitToRoom('preview', previewSessionId, 'preview:tab:opened', {
+            previewSessionId,
+            tabs: earlyTabsInfo,
+            activeTabIndex: session.activeTabIndex,
+            timestamp: new Date().toISOString(),
+          });
+        } catch { /* non-critical */ }
+
         // V16: Auth detector + external-nav trap for the popup. Popups are
         // frequently payment/OAuth flows that cross-origin-redirect; without
         // these the user gets no safety net once we've switched to the popup.

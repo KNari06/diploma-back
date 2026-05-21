@@ -234,12 +234,20 @@ export async function openHrefInNewTab(
   let newPage: Page | undefined;
   try {
     newPage = await context.newPage();
+    // Use `commit` (URL is locked in, document creation started) instead of
+    // `load` (waits for all subresources — images, fonts, iframes — can take
+    // 2-5s on media-heavy pages). The tab needs to APPEAR in the user's pill
+    // bar as soon as it exists; deeper loading is handled by the receiving
+    // `attachPopupHandler` which does its own `domcontentloaded` wait before
+    // emitting `preview:tab:opened`. Two sequential `load` waits previously
+    // stacked into the visible delay between click and second tab appearing.
+    //
+    // If even `commit` fails (network error, bad URL), fall back to a tiny
+    // `domcontentloaded` so we don't dead-lock — the page stays open either
+    // way; popup-handler will decide what to do with it.
     try {
-      await newPage.goto(href, { waitUntil: 'load', timeout: NEW_PAGE_LOAD_TIMEOUT_MS });
+      await newPage.goto(href, { waitUntil: 'commit', timeout: NEW_PAGE_LOAD_TIMEOUT_MS });
     } catch {
-      // `load` can hang on heavy SPAs — fall back to a shorter
-      // `domcontentloaded`. If even that fails, we keep the page open
-      // anyway (it might still finish loading) but log the issue.
       await newPage
         .waitForLoadState('domcontentloaded', { timeout: NEW_PAGE_FALLBACK_TIMEOUT_MS })
         .catch(() => {});

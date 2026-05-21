@@ -949,6 +949,55 @@ export class CdpSnapshotService {
           remaining: elements.length,
         });
       }
+
+      // DEFENSE-IN-DEPTH against ref duplicates (May 2026 bi.group fix).
+      //
+      // The `findElement` last-resort branch that produced duplicates is
+      // now closed (returns null instead of the overlay node). But the
+      // resolver's correctness depends on a hard invariant: each `ref`
+      // identifies exactly ONE LiteElement per snapshot. A single future
+      // regression upstream (cache key collision, new overlay-detection
+      // edge case, framework re-render race) could re-introduce dupes —
+      // and the resolver would silently click the wrong element again.
+      //
+      // Strategy: scan post-filter elements, group by ref, drop entries
+      // beyond the first for any ref that appears > 1 times. We drop
+      // rather than reassign because:
+      //   - reassigning would break `evidence.lastSuccessRef` stability
+      //     for legitimately-resolved past steps;
+      //   - the first occurrence is usually the correct one (it landed
+      //     in the cache from a prior, uncontested snapshot).
+      // Logged as a warn so any non-zero dropCount in prod surfaces as
+      // a real regression we need to chase.
+      const beforeDedup = elements.length;
+      const seenRefs = new Set<string>();
+      const dupSamples: Array<{ ref: string; tag: string; text: string }> = [];
+      for (let i = elements.length - 1; i >= 0; i--) {
+        const ref = elements[i].ref;
+        if (!ref) continue;
+        if (seenRefs.has(ref)) {
+          if (dupSamples.length < 5) {
+            dupSamples.push({
+              ref,
+              tag: elements[i].tag,
+              text: (elements[i].text || elements[i].name || '').slice(0, 30),
+            });
+          }
+          elements.splice(i, 1);
+        } else {
+          seenRefs.add(ref);
+        }
+      }
+      const droppedDupes = beforeDedup - elements.length;
+      if (droppedDupes > 0) {
+        logger.warn('[CDP_SNAPSHOT] Dropped duplicate-ref elements after assignAgentRefs', {
+          diagId: options.diagId,
+          dropped: droppedDupes,
+          beforeDedup,
+          afterDedup: elements.length,
+          samples: dupSamples,
+        });
+      }
       const refAssignMs = Date.now() - refAssignStart;
 
       // Phase 3c-Node: ancestry walks over DS parentIndex (no extra
@@ -1766,6 +1815,27 @@ export class CdpSnapshotService {
         // Bbox-center match: cheap and works when refs are stable
         // across renders (page didn't reflow). Mismatch on reflow
         // causes one-frame ref churn — acceptable.
+        //
+        // ROOT-CAUSE NOTE (May 2026 bi.group audit) — the previous
+        // implementation ended with `return at;` as a "last resort"
+        // when the walk-up couldn't match `req.tag`. On pages with
+        // open mega-menus / sticky dropdowns / position:fixed overlays,
+        // `elementFromPoint(cx, cy)` returns the overlay node for many
+        // DIFFERENT DS nodes whose bbox centers happen to sit under it.
+        // The walk-up never matches `req.tag` (because the overlay's
+        // ancestor chain is unrelated), so every collided request fell
+        // through to `return at` and got the SAME overlay node. The
+        // first request wrote `data-agent-ref="eNNN"` on the overlay,
+        // every subsequent request hit the `existing` branch and
+        // reused the same ref — producing duplicates like e254 × 16
+        // spanning li/a/div/svg/path observed in the bi.group trace.
+        //
+        // Fix: when walk-up fails to find `req.tag`, return null.
+        // The post-pass in collect() filters empty-ref elements out.
+        // We lose a small number of nodes that genuinely had no
+        // recoverable DOM identity, but we never produce duplicates,
+        // which is the only correctness property the resolver actually
+        // depends on.
         const cx = req.bboxX + req.bboxW / 2;
         const cy = req.bboxY + req.bboxH / 2;
         if (req.bboxW > 0 && req.bboxH > 0) {
@@ -1779,7 +1849,10 @@ export class CdpSnapshotService {
               if (cur.tagName?.toLowerCase() === req.tag) return cur;
               cur = cur.parentElement;
             }
-            return at; // last resort
+            // Walk-up failed: `at` is some unrelated overlay /
+            // background node. Returning it would corrupt refs (see
+            // ROOT-CAUSE NOTE above). Drop instead.
+            return null;
           }
         }
         return null;
