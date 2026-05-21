@@ -2564,39 +2564,47 @@ async function executeAction(
           // Legacy behavior: append typing (uses keyPressDelay if provided)
           await locator.click({ timeout });
           await locator.pressSequentially(value, { timeout, delay: step.options?.keyPressDelay });
-        } else if (value.length <= 50) {
-          // Short text (credentials, emails, OTP, validation data): use pressSequentially
-          // for full keyboard event chain — frameworks that rely on keydown/keyup won't miss input.
-          // Cost: ~20ms × N chars = max 1s for 50 chars — acceptable for reliability.
-          await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
-          await locator.click({ timeout });
-          await locator.pressSequentially(value, { timeout, delay: 20 });
         } else {
-          // Long text (comments, descriptions): fast fill with post-blur fallback
-          await locator.fill(value, { timeout });
+          // When the user explicitly sets keyPressDelay we always use
+          // pressSequentially so the per-keystroke delay is honored — even for
+          // long text where we'd normally take the fast `fill()` path.
+          const userKeyPressDelay = Number.isFinite(step.options?.keyPressDelay)
+            ? Math.max(0, step.options!.keyPressDelay!)
+            : null;
 
-          // Post-fill verification: check value survived after triggering blur.
-          // Some frameworks (WPForms, React controlled inputs) clear fill() values
-          // because they only track state via keyboard events, not programmatic value sets.
-          try {
-            // Trigger blur by pressing Tab (moves focus to next field)
-            await locator.press('Tab', { timeout: 2000 }).catch(() => {});
-            await page.waitForTimeout(100); // Let framework process blur
-            // Re-focus to check value
-            await locator.focus({ timeout: 2000 }).catch(() => {});
-            const postBlurValue = await locator.inputValue().catch(() => '');
-            if (value && postBlurValue.trim() !== value.trim()) {
-              logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
-                expected: value.slice(0, 50),
-                actual: postBlurValue.slice(0, 50),
-              });
-              // Clear and retry with pressSequentially (generates full keyboard event chain)
-              await locator.fill('', { timeout }).catch(() => {});
-              await locator.click({ timeout });
-              await locator.pressSequentially(value, { timeout, delay: 30 });
+          if (value.length <= 50 || userKeyPressDelay != null) {
+            // Short text (credentials, emails, OTP) OR user-requested gradual typing:
+            // use pressSequentially for full keyboard event chain.
+            await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
+            await locator.click({ timeout });
+            await locator.pressSequentially(value, { timeout, delay: userKeyPressDelay ?? 20 });
+          } else {
+            // Long text (comments, descriptions): fast fill with post-blur fallback
+            await locator.fill(value, { timeout });
+
+            // Post-fill verification: check value survived after triggering blur.
+            // Some frameworks (WPForms, React controlled inputs) clear fill() values
+            // because they only track state via keyboard events, not programmatic value sets.
+            try {
+              // Trigger blur by pressing Tab (moves focus to next field)
+              await locator.press('Tab', { timeout: 2000 }).catch(() => {});
+              await page.waitForTimeout(100); // Let framework process blur
+              // Re-focus to check value
+              await locator.focus({ timeout: 2000 }).catch(() => {});
+              const postBlurValue = await locator.inputValue().catch(() => '');
+              if (value && postBlurValue.trim() !== value.trim()) {
+                logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
+                  expected: value.slice(0, 50),
+                  actual: postBlurValue.slice(0, 50),
+                });
+                // Clear and retry with pressSequentially (generates full keyboard event chain)
+                await locator.fill('', { timeout }).catch(() => {});
+                await locator.click({ timeout });
+                await locator.pressSequentially(value, { timeout, delay: 30 });
+              }
+            } catch {
+              // Non-critical — best effort fallback
             }
-          } catch {
-            // Non-critical — best effort fallback
           }
         }
         if (step.options?.pressEnter) {
