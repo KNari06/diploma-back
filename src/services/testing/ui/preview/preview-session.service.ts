@@ -4035,7 +4035,15 @@ export class PreviewSessionService {
   }
 
   /**
-   * Cleanup expired sessions
+   * Cleanup expired sessions.
+   *
+   * For each session past SESSION_TTL_MS we emit `preview:stream:state` with
+   * `reason: 'session_evicted'` BEFORE tearing it down so the frontend can
+   * distinguish a terminal eviction (show "Session expired" + prompt reset)
+   * from a transient stream stop (auto-recover via re-subscribe). Without
+   * this signal the FE watchdog would loop subscribe-churn against a dead
+   * session for MAX_RECOVERY_ATTEMPTS before giving up.
+   * See `apps/web/src/hooks/usePreviewVideoStream.js handleStreamState`.
    */
   private async cleanupExpiredSessions(): Promise<void> {
     const now = Date.now();
@@ -4049,6 +4057,21 @@ export class PreviewSessionService {
 
     for (const sessionId of expiredSessions) {
       logger.info('[PREVIEW_SESSION] Cleaning up expired session', { sessionId });
+      // Notify the FE BEFORE the actual teardown — stopSession can take a few
+      // seconds on a stuck Playwright context, and the FE shouldn't have to
+      // wait that long to know its session is permanently gone.
+      try {
+        webSocketService.emitToRoom('preview', sessionId, 'preview:stream:state', {
+          previewSessionId: sessionId,
+          state: 'stopped',
+          reason: 'session_evicted',
+        });
+      } catch (emitErr) {
+        logger.warn('[PREVIEW_SESSION] Failed to emit stream:state on eviction', {
+          sessionId,
+          error: emitErr instanceof Error ? emitErr.message : String(emitErr),
+        });
+      }
       await this.stopSession(sessionId);
     }
 

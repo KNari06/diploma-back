@@ -318,6 +318,21 @@ export interface ServerToClientEvents {
   // side before this event is emitted (cheap to re-create on reopen).
   'preview:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
 
+  // Preview video stream lifecycle. Emitted when the backend tears down the
+  // video stream for reasons the FE watchdog cannot infer from frame gaps
+  // alone. Frontend uses `reason` to pick between recovery and terminal:
+  //   - 'session_evicted' — TTL cleanup destroyed the preview session
+  //     (Playwright context gone, not coming back). FE shows a terminal
+  //     "Session expired" error and prompts the user to reset.
+  //   - any other value — transient stop (e.g. page close, CDP died);
+  //     FE re-subscribes to rebuild the screencast.
+  // See `apps/web/src/hooks/usePreviewVideoStream.js handleStreamState`.
+  'preview:stream:state': (data: {
+    previewSessionId: string;
+    state: 'stopped';
+    reason: 'session_evicted' | 'explicit_stop' | 'page_close' | 'cdp_dead';
+  }) => void;
+
   // Response to `preview:session:inspect`. Contains non-sensitive counts
   // + sameOrigin flag so the frontend can decide whether to prompt the
   // user before a Run. Counts are zero if the context is pristine.
