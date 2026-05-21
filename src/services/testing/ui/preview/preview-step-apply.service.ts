@@ -3434,6 +3434,38 @@ export class PreviewStepApplyService {
         };
       }
 
+      // close_tab action — symmetric replay of a recording-time × click.
+      // Soft-success semantics: if the target tab is already gone (closed
+      // by the site, evicted, never opened on this replay because a popup
+      // step earlier was skipped), we treat the step as a no-op success.
+      // The user intent "this tab should not exist anymore" is already
+      // true; failing the step here would block downstream actions for
+      // no good reason. The only hard failure path is closeTab returning
+      // false WHILE the tab still exists (e.g. tab index 0 with no other
+      // tabs — the root guard refuses). That's surfaced as an explicit
+      // error so the user sees why replay diverges.
+      if (stepDraft.type === 'close_tab') {
+        const targetTab = parseInt(stepDraft.value || '0', 10);
+        const session = sessionService.getSession(previewSessionId);
+        const tabExists = !!session && targetTab >= 0 && targetTab < session.pages.length;
+        if (!tabExists) {
+          return {
+            success: true,
+            url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+            attempts: 1,
+          };
+        }
+        const closed = await sessionService.closeTab(previewSessionId, userId, targetTab);
+        return {
+          success: closed,
+          error: closed
+            ? undefined
+            : `Could not close tab ${targetTab} (root tab is protected when it's the only one)`,
+          url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+          attempts: 1,
+        };
+      }
+
       // V15: Auto-switch tab if step targets a different tab than currently active
       const session = sessionService.getSession(previewSessionId);
       if (session && stepDraft.tabIndex !== undefined && stepDraft.tabIndex !== session.activeTabIndex) {

@@ -4510,6 +4510,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         closedTabIndex: tabIndex,
         timestamp: new Date().toISOString(),
       });
+
+      // Recording mirror — symmetric with the `preview:tab:switch` handler.
+      // If a user closes a tab while recording, the test must remember
+      // that intent: replay should close the same tab so subsequent steps
+      // run against the right page set. If we skip this, a recorded flow
+      // that opened a popup, did work in it, then closed it, would leave
+      // replay with a leftover tab + stale `activeTabIndex` pointing into
+      // a page that the recorder doesn't expect to be active.
+      if (session?.recording) {
+        socket.emit('preview:recording:step', {
+          previewSessionId,
+          step: {
+            id: `close-tab-${Date.now()}`,
+            type: 'close_tab',
+            description: `Close tab ${tabIndex}`,
+            value: String(tabIndex),
+            tabIndex,
+            evidence: {
+              pageUrl: session?.page?.url() || '',
+              tabIndex,
+            },
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
     } catch (error) {
       logger.error('[WebSocket] Error in preview:tab:close', {
         socketId: socket.id,

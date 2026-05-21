@@ -2537,6 +2537,45 @@ export class CommandExecutor {
           break;
         }
 
+        // Multi-tab close — symmetric replay of a recording-time × click.
+        // Soft-success: if the tab is already gone (popup auto-closed, never
+        // opened on this run because an earlier step diverged) the user's
+        // intent "this tab should not exist" is already true. We don't fail
+        // the step. Hard-fail only when Playwright itself refuses to close
+        // (e.g. attempting to close the very last page in the context).
+        case 'closeTab': {
+          const targetTabIndex = parseInt(String(value || '0'), 10);
+          const pages = this.page.context().pages();
+          if (targetTabIndex < 0 || targetTabIndex >= pages.length) {
+            logger.info('[COMMAND_EXECUTOR] closeTab no-op — target tab not present', {
+              targetTabIndex,
+              totalPages: pages.length,
+            });
+            break;
+          }
+          if (pages.length <= 1) {
+            throw new Error(
+              `closeTab refused — cannot close the last remaining tab (target=${targetTabIndex})`,
+            );
+          }
+          const targetPage = pages[targetTabIndex];
+          const wasActive = targetPage === this.page;
+          try { await targetPage.close(); } catch { /* page may already be closing */ }
+          // If we closed the page we were operating on, swap `this.page` to
+          // the nearest survivor — same rule as PreviewSessionService.closeTab.
+          if (wasActive) {
+            const remaining = this.page.context().pages();
+            const nextIdx = Math.min(targetTabIndex, remaining.length - 1);
+            this.page = remaining[Math.max(0, nextIdx)];
+          }
+          logger.info('[COMMAND_EXECUTOR] Closed tab', {
+            targetTabIndex,
+            wasActive,
+            remainingPages: this.page.context().pages().length,
+          });
+          break;
+        }
+
         // V18: Scratchpad — store key-value for cross-step memory (no browser action)
         case 'store': {
           const storeKey = description?.trim() || '';
