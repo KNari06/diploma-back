@@ -122,6 +122,13 @@ export interface ClientToServerEvents {
   // Mutually exclusive with recording and run (see preview.handler.ts mutex).
   'preview:pick:start': (data: PreviewPickStartRequest) => void;
   'preview:pick:cancel': (data: PreviewPickCancelRequest) => void;
+  // In-page hover overlay (replaces React-rendered hoverHighlight, May
+  // 2026). FE flips this between 'navigation' (mouse is interacting
+  // with the preview) and 'off' (preview is focused but not active —
+  // e.g. when the click-to-enable hint is visible). Backend tracks the
+  // current mode per session; recording start/stop additionally flips
+  // to 'recording' on its own.
+  'preview:hover-overlay:set': (data: PreviewHoverOverlaySetRequest) => void;
   // Inline upload picker responses (correlated by stepId with a
   // `preview:recording:upload:prompt` emitted from the server).
   'preview:recording:upload:resolve': (
@@ -1881,6 +1888,24 @@ export interface PreviewPickStartRequest {
 
 export interface PreviewPickCancelRequest {
   previewSessionId: string;
+}
+
+/**
+ * Set the in-page hover overlay mode (preview-hover-overlay.service.ts).
+ *
+ *   - 'navigation' — paint blue solid outline on hover; default when the
+ *                    preview iframe is being interacted with.
+ *   - 'off'        — tear the overlay down (mouseleave / focus-mode hint
+ *                    on top of the iframe).
+ *
+ * `'recording'` mode is set server-side automatically on
+ * preview:recording:start / finalizeRecording — clients should NOT send
+ * it directly (their request will be honoured but recording state can
+ * overwrite the next moment).
+ */
+export interface PreviewHoverOverlaySetRequest {
+  previewSessionId: string;
+  mode: 'navigation' | 'recording' | 'off';
 }
 
 /**

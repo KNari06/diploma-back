@@ -302,24 +302,21 @@ export function buildAllowedSets(
     // Trust the snapshot collector's judgment — it uses z-index, positioning, coverage,
     // and class-name heuristics to detect custom popups/overlays/drawers.
     hasVisibleModal = true;
-    ruleTrace.push({
-      ruleId: 'modal.detected_via_snapshot',
-      version: 'v2',
-      action: 'exclude',
-      evidence: 'Modal/popup detected by snapshot collector (isInsideActiveModal flag present on nodes)',
-      affectedRefs: [],
-    });
   }
 
-  if (hasVisibleModal) {
-    ruleTrace.push({
-      ruleId: 'modal.detected',
-      version: 'v2',
-      action: 'exclude',
-      evidence: 'Blocking modal/dialog layer detected - background elements will be hard-excluded',
-      affectedRefs: modalNode?.ref ? [modalNode.ref] : [],
-    });
-  }
+  // Bug-D fix (May 2026): the previous version pushed `modal.detected_via_snapshot`
+  // and `modal.detected` entries with `affectedRefs: []`, which the rule-trace
+  // summarizer reads as count=0 — so dashboards / trace_summary reported
+  // "no modal active" even when hasVisibleModal=true. Worse, the entry
+  // EVIDENCE claimed "background elements will be hard-excluded" but the
+  // per-node loop below only applied a SOFT penalty to backgrounds. Two
+  // bugs in one place: false reporting + missing exclusion.
+  //
+  // Fix: collect the actually-excluded background refs during the per-node
+  // walk into `modalExcludedRefs` and emit a single `modal.detected` entry
+  // with those refs as `affectedRefs`. Now the summary count matches reality
+  // and the hard-exclude actually fires.
+  const modalExcludedRefs: string[] = [];
   
   for (const node of nodes) {
     // Skip nodes without valid ref
@@ -331,13 +328,48 @@ export function buildAllowedSets(
     let isSoft = false;
     const nodeRules: RuleTraceEntry[] = [];
     const isNonStandardTextbox = actionType === 'type' && node.tag === 'div' && node.role === 'textbox';
-    
+
     // ═══════════════════════════════════════════════════════════════════════
     // HARD RULES: Exclude elements that are fundamentally incompatible
     // ═══════════════════════════════════════════════════════════════════════
-    
+
+    // Rule 0 (Bug-D fix): hard-exclude modal background when a modal/popup
+    // layer is active. Symmetric with the `modal.detected` evidence string
+    // above ("background elements will be hard-excluded"). Conditions:
+    //   - hasVisibleModal=true (snapshot collector OR role-based detection),
+    //   - node is NOT inside that modal,
+    //   - node passed hit-test as covered (isTopMostAtCenter=false).
+    // All three required: a sticky toolbar that's still visually on top
+    // (isTopMostAtCenter=true) is reachable even when a sidebar drawer is
+    // open and must stay clickable. Without all three, this falls through
+    // to the existing soft-penalty branch (modal.likely_background) for
+    // safety on edge cases.
+    //
+    // Why hard-exclude over soft penalty: previously the resolver's primary
+    // batch (top-60 by DOM order) was polluted by the entire page chrome
+    // when a popup was open, so the LLM saw the popup target AND every
+    // banner/nav button competing for the slot. Hard-exclude collapses the
+    // candidate set to just the popup layer, the prompt becomes one screen
+    // of buttons, identity match wins. See bi.group "Астана" trace for the
+    // exact failure mode this addresses.
+    if (
+      hasVisibleModal
+      && node.isInsideActiveModal !== true
+      && node.isTopMostAtCenter === false
+    ) {
+      excluded = true;
+      modalExcludedRefs.push(node.ref);
+      nodeRules.push({
+        ruleId: 'modal.background_excluded',
+        version: 'v1',
+        action: 'exclude',
+        evidence: 'Modal active, node outside modal and covered (isTopMostAtCenter=false) — hard excluded',
+        affectedRefs: [node.ref],
+      });
+    }
+
     // Rule 1: Visibility check
-    if (node.isVisible === false) {
+    if (!excluded && node.isVisible === false) {
       excluded = true;
       nodeRules.push({
         ruleId: 'visibility.hidden',
@@ -662,7 +694,27 @@ export function buildAllowedSets(
     // Add all rules for this node to trace
     ruleTrace.push(...nodeRules);
   }
-  
+
+  // Bug-D fix part 2 — emit a single summary `modal.detected` entry
+  // AFTER the per-node loop so its `affectedRefs` reflects the actual
+  // backgrounds we hard-excluded. Without this, the rule-trace summary
+  // counted modal.detected as 0 even when the per-node loop excluded
+  // many refs (see bi.group "Астана" trace: 14 modal nodes but
+  // modal.detected.count was 0 because no refs were attached at the
+  // detection site). One entry per resolve, with the same evidence
+  // string as before so existing audit consumers keep working.
+  if (hasVisibleModal) {
+    ruleTrace.push({
+      ruleId: 'modal.detected',
+      version: 'v3',
+      action: 'exclude',
+      evidence: modalExcludedRefs.length > 0
+        ? `Blocking modal/dialog layer detected — hard-excluded ${modalExcludedRefs.length} background ref(s)`
+        : 'Blocking modal/dialog layer detected — no covered background refs to exclude',
+      affectedRefs: modalExcludedRefs,
+    });
+  }
+
   // Log rule trace summary
   const modalElementCount = hasVisibleModal
     ? [...hardAllowed, ...softAllowed].filter(n => n.isInsideActiveModal).length
@@ -673,6 +725,7 @@ export function buildAllowedSets(
     rulesApplied: ruleTrace.length,
     hasVisibleModal,
     modalElementCount,
+    modalExcludedCount: modalExcludedRefs.length,
   });
 
   return { hardAllowed, softAllowed, ruleTrace };
@@ -3148,7 +3201,61 @@ Select the single best matching element, or return ref=null if the intent does n
       // loudest CTA" case (e.g. INTENT="MAT-SMART раздел" on a homepage,
       // chosen "Артықшылықтарымыз" — strictly no overlap).
       let semanticFloorRejected = false;
-      if (mode !== 'heal' && confidence < 0.85) {
+      // Honesty guard (Bug-#2 fix, May 2026): when intent contains real
+      // text but the chosen candidate has NO label across ANY channel,
+      // it cannot legitimately match — LLM hallucinated. The existing
+      // semantic floor below (token-overlap) bails out when chosenTokens
+      // is empty (its `chosenTokens.size > 0` clause), so this is the
+      // separate gate for the "label is empty" case which the original
+      // guard silently let through.
+      //
+      // Symptom this catches: bi.group "Астана" — LLM returned e7 with
+      // confidence 0.78 and reason "best matching text/label" while e7
+      // had no text, no aria-label, no title, no iconLabel. Token set
+      // was empty so semantic floor passed it. Step "succeeded" but
+      // clicked the wrong element.
+      //
+      // Scope:
+      //   - apply mode only (heal mode keeps looser thresholds; the
+      //     recorded fingerprint is the truth source there)
+      //   - intent must carry ≥3 char text (synonym intents like
+      //     "иконка корзины" without specific text are NOT gated)
+      //   - candidate must have empty label across getEffectiveLabel's
+      //     full cascade (labelText|ariaLabel|title|alt|text|placeholder|
+      //     iconLabel|svgIcon|childTestId|dataValue|dataRowKey|
+      //     customElementTag per the function at ~line 814).
+      //     Note: NOT firstTextFragment — getEffectiveLabel intentionally
+      //     omits it. If we ever broaden the cascade there, this guard
+      //     widens automatically — no edit needed here.
+      //
+      // Fallthrough: rejection produces `status: 'not_found'` which the
+      // resolver caller already handles via overflow batch retry, then
+      // smart-locator, then vision rescue. So a rejected guess does
+      // NOT silently fail — it just costs one extra fallback hop.
+      let labelEmptyRejected = false;
+      if (mode !== 'heal') {
+        const intentLower = (intentText || '').toLowerCase().trim();
+        const intentHasText = intentLower.length >= 3;
+        if (intentHasText) {
+          const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
+          const labelCheck = (getEffectiveLabel(chosenCandidate?.node) || '').trim();
+          if (labelCheck.length === 0) {
+            labelEmptyRejected = true;
+          }
+        }
+      }
+
+      // E3 fix (May 2026): semantic floor used to gate on `confidence < 0.85`,
+      // which let through wrong-but-confident picks like
+      //   intent="Панорама 360" → chosen "Агентствам недвижимости" (e120) @ 0.95
+      // The `< 0.85` guard was designed for the borderline case (0.55-0.85 mid-band
+      // where the LLM is uncertain). But zero-token-overlap with a NON-empty label
+      // is a STRONG hallucination signal independent of how confident the model is.
+      // We now run the floor for the WHOLE mode!=='heal' range; below-0.85 still
+      // gets the "shares no tokens" rejection, above-0.85 only triggers when both
+      // sides have content AND zero shared tokens (handled by the inner
+      // `intentTokens.size > 0 && chosenTokens.size > 0` guard already).
+      if (mode !== 'heal') {
         const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
         // V23: use the universal `getEffectiveLabel` so semantic floor sees
         // identity that lives on title/alt/iconLabel/svgIcon/etc., not just
@@ -3206,16 +3313,21 @@ Select the single best matching element, or return ref=null if the intent does n
           if (shared === 0) semanticFloorRejected = true;
         }
       }
-      if (confidence < minConfidence || semanticFloorRejected) {
-        const reason = semanticFloorRejected
-          ? `chosen "${(parsed.reason || '').slice(0, 50)}" shares no tokens with intent — likely no real match on this page`
-          : (parsed.reason || 'description does not match any element');
-        logger.info('[LLM_SELECT] Rejecting low-confidence / off-semantic pick', {
+      if (confidence < minConfidence || semanticFloorRejected || labelEmptyRejected) {
+        // Pick the most diagnostic reason for the trace — labelEmpty is
+        // the most specific signal so it wins when both fire.
+        const reason = labelEmptyRejected
+          ? `chosen candidate has no text/label across any channel — intent="${intentText.slice(0, 40)}" cannot legitimately match`
+          : semanticFloorRejected
+            ? `chosen "${(parsed.reason || '').slice(0, 50)}" shares no tokens with intent — likely no real match on this page`
+            : (parsed.reason || 'description does not match any element');
+        logger.info('[LLM_SELECT] Rejecting low-confidence / off-semantic / empty-label pick', {
           intentText: intentText.slice(0, 80),
           chosenRef: parsed.ref,
           confidence,
           minConfidence,
           semanticFloorRejected,
+          labelEmptyRejected,
         });
         result = {
           status: 'not_found',

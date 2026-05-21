@@ -188,7 +188,7 @@ export class RegressionRunService {
           testId = mobileResult.testId;
         } else {
           // Web test → dispatch to Playwright queue
-          const testRequest = await this.buildTestRequest(intentCase, userId, parameters);
+          const testRequest = await this.buildTestRequest(intentCase, userId, parameters, undefined, trigger);
           const testResult = await ManualTestService.runTest(testRequest);
 
           if (!testResult.success || !testResult.data?.id) {
@@ -395,7 +395,8 @@ export class RegressionRunService {
     intentCase: any,
     userId: string,
     parameters: Record<string, any>,
-    browserOverride?: string
+    browserOverride?: string,
+    trigger?: 'manual' | 'chat' | 'scheduled' | 'webhook',
   ): Promise<any> {
     // Validate URL exists first (with fallback to start_url)
     const targetUrl = intentCase.url || intentCase.start_url;
@@ -507,6 +508,17 @@ export class RegressionRunService {
       ? intentCase.resource_bindings
       : [];
 
+    // Merge trigger into options so the unified tests list (FE Runs
+    // table) can show how the test was launched (Manual / Schedule /
+    // CI / API). Without this every web regression row falls through
+    // to 'Manual' in `mapTestToResponse` — confirmed bug in the prior
+    // re-review. The mobile dispatch path already injects this (see
+    // dispatchMobileTest, May 2026).
+    const mergedOptions = {
+      ...(sourceTest?.options || {}),
+      ...(trigger ? { trigger } : {}),
+    };
+
     return {
       url: targetUrl,
       projectId: intentCase.project_id,
@@ -515,7 +527,7 @@ export class RegressionRunService {
       intelligentMode: false, // Background Replay: deterministic step-by-step execution with self-healing
       testGoal: intentCase.description || intentCase.name,
       commands, // Pre-generated commands
-      options: sourceTest?.options || {},
+      options: mergedOptions,
       resourceBindings,
       metadata: {
         intentTestCaseId: intentCase.id,
@@ -2499,7 +2511,7 @@ export class RegressionRunService {
               mobileJobId = mobileResult.jobId;
               mobileAppBuildIdForExec = mobileResult.appBuildId;
             } else {
-              const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride);
+              const testRequest = await this.buildTestRequest(savedCase, userId, parameters, browserOverride, trigger);
               const testResult = await ManualTestService.runTest(testRequest);
 
               if (!testResult.success || !testResult.data?.id) {

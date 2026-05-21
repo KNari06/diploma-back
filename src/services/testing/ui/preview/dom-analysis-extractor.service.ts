@@ -331,6 +331,17 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
   if ((element as any).ancestorSummary) {
     node.ancestorSummary = (element as any).ancestorSummary;
   }
+  // First ARIA landmark role on ancestor chain. Populated by
+  // snapshot-collector (preview) and cdp-snapshot (Etap 2 — when flag
+  // SNAPSHOT_USE_CDP_PREVIEW is on). Consumed by locator-plan-builder
+  // scoped-text strategy at line ~1081, fingerprint match in
+  // preview-step-apply, recorded-description-llm prompt, and
+  // intent-resolve-audit diagnostics. Recorder writes it independently
+  // into the recorded fingerprint via the same algorithm — keep both
+  // paths in lockstep (invariant #5).
+  if (element.nearestLandmark) {
+    node.nearestLandmark = element.nearestLandmark;
+  }
 
   // V22 Pkg2: Bootstrap / aria-haspopup / activedescendant / row key / clickable-row
   if (element.bsToggle) node.bsToggle = element.bsToggle;

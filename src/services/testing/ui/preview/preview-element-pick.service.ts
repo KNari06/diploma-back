@@ -53,6 +53,7 @@ import type {
   LintStatus,
   IntentActionType,
 } from './preview.types';
+import { buildOverlayResolverHelpers } from './overlay-resolver-helpers';
 
 /**
  * We accept a Socket.IO Namespace rather than a single socket. Emits target
@@ -647,39 +648,14 @@ function buildOverlayScript(callbackName: string): string {
     document.documentElement.appendChild(root);
     document.documentElement.appendChild(tip);
 
-    function safeAttr(el, name) {
-      try { const v = el.getAttribute(name); return v ? String(v) : ''; } catch (e) { return ''; }
-    }
-    function describeElement(el) {
-      const tag = (el.tagName || '').toLowerCase();
-      const id = safeAttr(el, 'id');
-      const tid = safeAttr(el, 'data-testid') || safeAttr(el, 'data-test') || safeAttr(el, 'data-qa');
-      const name = safeAttr(el, 'name');
-      let body = tag;
-      if (id) body += '#' + id;
-      else if (tid) body += '[data-testid="' + tid + '"]';
-      else if (name) body += '[name="' + name + '"]';
-      return body.slice(0, 120);
-    }
-
-    function findInteractive(el) {
-      // Walk up to find a reasonable target — buttons, links, inputs, role=...,
-      // cursor:pointer ancestors. Capped depth.
-      let cur = el;
-      for (let i = 0; cur && i < 10; i++) {
-        if (!(cur instanceof Element)) { cur = cur.parentElement; continue; }
-        const tag = (cur.tagName || '').toLowerCase();
-        if (['a','button','input','select','textarea','summary','label'].includes(tag)) return cur;
-        const role = (cur.getAttribute && cur.getAttribute('role') || '').toLowerCase();
-        if (['button','link','checkbox','radio','tab','menuitem','option','combobox','textbox','switch','treeitem'].includes(role)) return cur;
-        try {
-          const cs = window.getComputedStyle(cur);
-          if (cs && cs.cursor === 'pointer') return cur;
-        } catch (e) {}
-        cur = cur.parentElement;
-      }
-      return el instanceof Element ? el : null;
-    }
+    // ── Shared resolver helpers ─────────────────────────────────────────
+    // safeAttr / looksDynamicId / describeElement / hasClickHandler /
+    // isInteractive / promoteToClickableRow / elevateLabelToControl /
+    // findInteractive. Single source of truth in
+    // overlay-resolver-helpers.ts; the hover-overlay service injects the
+    // same block so hover outline and pick outline pick the SAME element
+    // for any given (x,y).
+    ${buildOverlayResolverHelpers()}
 
     let lastTargetEl = null;
     let lastClientX = 0;

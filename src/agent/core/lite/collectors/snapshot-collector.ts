@@ -18,6 +18,7 @@ import {
 import type { Page } from 'playwright';
 import type { LiteElement, LiteSnapshot, ObstacleFact } from '../lite-types';
 import { VisualStability } from './visual-stability';
+import { LANDMARK_EVALUATE_BUNDLE } from '@/services/testing/ui/preview/landmark.util';
 
 // April 2026: Module-level throttle map for [SNAPSHOT_REJECTS] logging.
 // Snapshot is collected every 500ms by recorder/preview, so per-tick logging
@@ -64,6 +65,12 @@ export class SnapshotCollector {
         // Feature flags
         enableLayer2: LITE_ENGINE_FLAGS.enableLayer2ObstacleClassification,
         fullPage: options?.fullPage ?? false,
+        // ARIA landmark constants — sourced from landmark.util.ts so every
+        // path (snapshot-collector, cdp-snapshot, recorder, background) uses
+        // the same set. Sets don't survive page.evaluate serialization, so
+        // we ship the array form and reconstruct the Set inside the browser.
+        landmarkRoles: LANDMARK_EVALUATE_BUNDLE.ROLES,
+        landmarkTagToRole: LANDMARK_EVALUATE_BUNDLE.TAGS,
       };
 
       // Collect snapshot in page context
@@ -797,15 +804,57 @@ export class SnapshotCollector {
         // ═══════════════════════════════════════════════════════════════════════
         const CONTAINER_SELECTORS = 'form, dialog, [role="dialog"], section, article, aside, nav, header, footer, main, fieldset, .card, .modal, .panel';
         const MAX_PARENT_CHAIN_DEPTH = 6;
+        // ARIA landmark constants — single source of truth in
+        // src/services/testing/ui/preview/landmark.util.ts, injected
+        // through __mc by the outer harness above. Keeps this path
+        // symmetric with cdp-snapshot.service.ts and
+        // background-dom-collector.ts (invariant #5).
+        //
+        // Known asymmetry vs recording-capture.service.ts:1255-1258 —
+        // recorder also tags `<form>` (tag, not just role) as implicit
+        // landmark="form" and walks depth=12 instead of 6. We deliberately
+        // keep the existing snapshot-side cap+set unchanged here (changing
+        // it would shift the parentRefChain contract that has shipped
+        // since V22). The recorder discrepancy is tracked separately and
+        // only affects identity match on landmark="form" or deep (>6)
+        // landmark ancestors.
+        const LANDMARK_ROLES = new Set(__mc.landmarkRoles);
+        const LANDMARK_TAG_TO_ROLE: Record<string, string> = __mc.landmarkTagToRole;
 
-        const getParentRefChain = (el: Element): { chain: string[]; containerRef?: string; containerTitles: string[] } => {
+        const getParentRefChain = (el: Element): {
+          chain: string[];
+          containerRef?: string;
+          containerTitles: string[];
+          nearestLandmark?: string;
+        } => {
           const chain: string[] = [];
           const containerTitles: string[] = [];
           let containerRef: string | undefined;
+          let nearestLandmark: string | undefined;
           let current: Element | null = el.parentElement;
           let depth = 0;
 
+          // Walks the parent chain — depth-capped at MAX_PARENT_CHAIN_DEPTH (6).
+          // background-dom-collector uses 8 for landmark detection on the same
+          // walk; we keep the existing preview cap because the same depth has
+          // shipped for parentRefChain since V22 — bumping it would change the
+          // ref-chain length contract and cascade into the recorder fingerprint
+          // matcher. Landmarks usually live within 3-4 levels of the target so
+          // depth 6 catches the common case without contract churn.
           while (current && depth < MAX_PARENT_CHAIN_DEPTH) {
+            // Landmark check runs on EVERY ancestor (independent of ref) so a
+            // semantic `<nav>` or `<header>` without `data-agent-ref` still
+            // counts. First-match-wins (closest landmark).
+            if (!nearestLandmark) {
+              const parentRole = (current.getAttribute('role') || '').toLowerCase();
+              if (parentRole && LANDMARK_ROLES.has(parentRole)) {
+                nearestLandmark = parentRole;
+              } else {
+                const implicit = LANDMARK_TAG_TO_ROLE[current.tagName];
+                if (implicit) nearestLandmark = implicit;
+              }
+            }
+
             const ref = current.getAttribute('data-agent-ref');
             if (ref) {
               chain.push(ref);
@@ -828,7 +877,7 @@ export class SnapshotCollector {
             depth++;
           }
 
-          return { chain, containerRef, containerTitles };
+          return { chain, containerRef, containerTitles, nearestLandmark };
         };
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -2371,7 +2420,7 @@ export class SnapshotCollector {
             // ═══════════════════════════════════════════════════════════════
             // STEP EDITOR V2: Extract parent chain
             // ═══════════════════════════════════════════════════════════════
-            const { chain: parentRefChain, containerRef, containerTitles } = getParentRefChain(el);
+            const { chain: parentRefChain, containerRef, containerTitles, nearestLandmark } = getParentRefChain(el);
 
             /**
              * Best-effort: get human-readable visible text for an element.
@@ -2602,6 +2651,11 @@ export class SnapshotCollector {
               parentRefChain: parentRefChain.length > 0 ? parentRefChain : undefined,
               containerRef,
               containerTitles: containerTitles.length > 0 ? containerTitles : undefined,
+              // First ARIA landmark role on ancestor chain (banner/navigation/main/…).
+              // Symmetric with cdp-snapshot Phase 3c, recorder probe, and
+              // background-dom-collector. Drives locator-plan-builder scoped-text
+              // strategy and recorded-fingerprint region match.
+              nearestLandmark,
 
               // Phase 4: Custom component interactivity signals
               // Detect framework event bindings (React/Vue/Angular/Alpine/HTMX/Stimulus/Knockout/Qwik/jQuery/Svelte)

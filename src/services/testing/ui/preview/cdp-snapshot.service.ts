@@ -48,6 +48,7 @@ import {
   INTERACTIVE_CHILDREN_SELECTOR,
 } from '@/agent/utils/selectors/modal-detection';
 import { isDynamicId as isDynamicIdUtil } from './dynamic-id.util';
+import { LANDMARK_ROLES, LANDMARK_TAG_TO_ROLE } from './landmark.util';
 
 /**
  * Computed style names requested from `DOMSnapshot.captureSnapshot`.
@@ -749,22 +750,21 @@ function parseTabIndex(v: string | undefined): number | undefined {
 }
 
 /**
- * Implicit landmark role for HTML5 sectioning tags. Mirrors the WAI
- * mapping (`<header>` → 'banner' when top-level, etc.). Simplified
- * here — we treat tag → role 1:1 without contextual rules (top-level
- * vs nested header) because consumer reads it as a hint, not a
- * definitive role.
+ * Implicit landmark role for HTML5 sectioning tags.
+ *
+ * Thin wrapper around the shared LANDMARK_TAG_TO_ROLE table from
+ * `./landmark.util` — that table is keyed by uppercase `Element.tagName`,
+ * but the CDP path works with lowercase `nodeName` strings from
+ * `DOMSnapshot.captureSnapshot`, so we uppercase before the lookup.
+ *
+ * Single source of truth lives in `./landmark.util`. May 2026 B6 audit
+ * fix moved the `<form>` mapping into that util as well, so this
+ * wrapper no longer carries a local fallback — symmetry across
+ * snapshot-collector / cdp-snapshot / background-dom-collector /
+ * recorder (invariant #5) is now structural rather than convention.
  */
 function tagToImplicitLandmarkRole(tag: string): string | undefined {
-  switch (tag) {
-    case 'header': return 'banner';
-    case 'footer': return 'contentinfo';
-    case 'nav': return 'navigation';
-    case 'main': return 'main';
-    case 'aside': return 'complementary';
-    case 'form': return 'form';
-    default: return undefined;
-  }
+  return LANDMARK_TAG_TO_ROLE[tag.toUpperCase()];
 }
 
 /**
@@ -2163,11 +2163,14 @@ export class CdpSnapshotService {
     };
     const tagOf = (nodeIdx: number): string => getStr(nodeName[nodeIdx]).toLowerCase();
 
-    // Container/landmark predicates — same set as in-page collector.
-    const isLandmarkRole = (role: string): boolean =>
-      role === 'banner' || role === 'main' || role === 'navigation' || role === 'complementary'
-      || role === 'search' || role === 'contentinfo' || role === 'form' || role === 'region';
-    const LANDMARK_TAGS = new Set(['header', 'main', 'nav', 'aside', 'footer', 'form']);
+    // Container/landmark predicates — single source of truth in
+    // `./landmark.util`. After B6 audit fix (May 2026) `<form>` is also
+    // in LANDMARK_TAG_TO_ROLE, so the local fallback is gone and both
+    // shapes derive purely from the util. Symmetric with the in-page
+    // snapshot-collector / background-dom-collector / ai-selector
+    // (invariant #5).
+    const isLandmarkRole = (role: string): boolean => LANDMARK_ROLES.has(role);
+    const LANDMARK_TAGS = new Set(Object.keys(LANDMARK_TAG_TO_ROLE).map((t) => t.toLowerCase()));
     const CONTAINER_TAGS = new Set(['form', 'dialog', 'section', 'article', 'fieldset']);
     const HEADING_TAGS = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'legend']);
     // Walk depth cap matches the existing in-page implementation
@@ -2343,13 +2346,12 @@ export class CdpSnapshotService {
       if (chain.length > 0) el.parentRefChain = chain;
       if (titles.length > 0) el.containerTitles = titles;
       if (containerRef) el.containerRef = containerRef;
-      if (landmark) {
-        // LiteElement doesn't carry `nearestLandmark`; we surface it
-        // through `containerTitles` lookup downstream. Skip storing.
-        // (InteractiveNode in preview.types.ts has nearestLandmark
-        // but LiteElement doesn't — preserve current shape.)
-        void landmark;
-      }
+      // First ARIA landmark role (banner/navigation/main/complementary/
+      // contentinfo/search/form/region) on ancestor chain. Symmetric with
+      // snapshot-collector.ts getParentRefChain and background-dom-collector.
+      // Consumed by locator-plan-builder (scoped-text strategy), recorded
+      // fingerprint match, and the LLM scene-summary prompt.
+      if (landmark) el.nearestLandmark = landmark;
       // Shape parity with evaluate-path: ALWAYS set shadowDepth (0 if
       // not in shadow), ALWAYS set isInsideShadowDOM (false if not in
       // shadow). Without explicit defaults, diffSnapshots saw
@@ -2414,16 +2416,53 @@ export class CdpSnapshotService {
       // <img alt>, data-lucide). Used by locator-plan-builder iconLabel
       // strategy and by candidateText for resolver scoring.
       //
-      // Note: customElementTag and svgIcon were considered but neither
-      // is in LiteElement type — evaluate-path populates them but no
-      // consumer reads from LiteElement (svgIcon is read via `as any`
-      // cast in plan-builder for ProbedElement only). Skipping to
-      // maintain shape symmetry with the type definition.
+      // V26 Step B1 (May 2026) — port svgIcon + customElementTag to CDP.
+      // Earlier audit comment claimed "no consumer reads from LiteElement
+      // — svgIcon is read via `as any` only" which was incorrect:
+      // `dom-analysis-extractor.service.ts:313-318` reads BOTH fields
+      // via `(element as any).svgIcon` / `.customElementTag` and writes
+      // them onto `InteractiveNode`. Consumers downstream:
+      //   - locator-plan-builder strategy 6 (mat-icon, ~0.78 confidence)
+      //   - element-resolver `getEffectiveLabel` (icon-only fallback)
+      //   - intent-resolve-audit (diagnostic)
+      // Dropping these on the CDP path silently breaks Angular Material
+      // and Web-Component-heavy apps the moment SNAPSHOT_USE_CDP_PREVIEW
+      // is flipped. Now populated identically here.
       isTopMostAtCenter?: boolean;
       childTestId?: string;
       iconClasses?: string;
       iconLabel?: string;
       nearText?: string;
+      svgIcon?: string;
+      customElementTag?: string;
+      // V26 Step B2 (May 2026) — `alt` attribute as own field.
+      // Byte-symmetric with snapshot-collector.ts:1904+2637 (ownAlt).
+      // Consumers downstream:
+      //   - getEffectiveLabel cascade ([@line 814]) — accessible name
+      //     source for <img>/<area>/<input type=image>
+      //   - locator-plan-builder strategies that emit `[alt="…"]` CSS
+      //   - candidate-pruner-llm uses it in candidate text
+      //   - identity rescue when descriptor-poor
+      // The CDP path already reads `alt` inside `computeChildTestId`
+      // (descriptor-poor gate) but throws the value away. We surface it
+      // here so dom-analysis-extractor's `(element as any).alt` pass-
+      // through (line 322) finds something on the CDP side too.
+      alt?: string;
+      // V26 Step B3 (May 2026) — Vue/BEM cluster fields.
+      // Byte-symmetric with recording-capture.service.ts:1394-1456
+      // (cssClass) and :1461-1468 (vueScopeId). Consumers downstream:
+      //   - locator-plan-builder strategy 22 `[data-v-XXXXX]` (Vue
+      //     scoped, ~0.76 confidence)
+      //   - locator-plan-builder BEM-style CSS strategies built from
+      //     cssClass tokens
+      //   - element-resolver fingerprint hints (`cssClass="..."` line)
+      //   - candidate-pruner-llm picks them up via InteractiveNode
+      // Recorder writes them in PROBE_AT_POINT_FN (browser context, no
+      // imports allowed — see MUST MATCH comment there). We port the
+      // identical filter set here so identity match against recorded
+      // fingerprint agrees on which classes are "stable".
+      cssClass?: string;
+      vueScopeId?: string;
     };
 
     const results: Array<DomWalkResult | null> = await page.evaluate((refs: string[]) => {
@@ -2432,6 +2471,13 @@ export class CdpSnapshotService {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const cssEscape: (v: string) => string = (globalThis as any).CSS?.escape
         ?? ((v: string) => v.replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`));
+
+      // Page-level gate for Angular Material `<mat-icon svgicon>`. Computed
+      // ONCE per snapshot — on plain HTML / React / Vue pages every node
+      // would otherwise pay an extra closest('mat-icon') + querySelector()
+      // walk. Mirrors `__frameworkGates.hasMaterial` in snapshot-collector
+      // (which gates the same algorithm at V26 #B).
+      const hasMaterial = !!doc.querySelector('mat-icon');
 
       const out: Array<DomWalkResult | null> = [];
 
@@ -2910,6 +2956,150 @@ export class CdpSnapshotService {
         } catch { return undefined; }
       };
 
+      // ── svgIcon — Angular Material `<mat-icon svgicon>` registry name.
+      // Byte-symmetric with snapshot-collector.ts:2117-2141.
+      // Order of lookup (V23): self → ancestor → descendant. Covers:
+      //   • the <mat-icon> itself is clickable target
+      //   • icon-only Material button: <button>…<mat-icon svgicon="x"/>
+      //   • wrapper components: <app-excel-btn><mat-icon svgicon="x"/>
+      // Gate via page-level `hasMaterial` (computed once above) so plain
+      // HTML / React / Vue pages skip both DOM walks entirely.
+      // Value capped at 60 chars (defensive — real values are short
+      // identifiers like "chevron-left-outline").
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const computeSvgIcon = (el: any): string | undefined => {
+        if (!hasMaterial) return undefined;
+        try {
+          const matIconHost = el.tagName && el.tagName.toLowerCase() === 'mat-icon'
+            ? el
+            : (el.closest ? el.closest('mat-icon') : null)
+            || (el.querySelector ? el.querySelector('mat-icon') : null);
+          if (!matIconHost) return undefined;
+          const raw = matIconHost.getAttribute('svgicon')
+            || matIconHost.getAttribute('data-mat-icon-name')
+            || '';
+          if (raw && raw.length > 0 && raw.length <= 60) return raw;
+          return undefined;
+        } catch { return undefined; }
+      };
+
+      // ── customElementTag — closest semantic custom-element ancestor.
+      // Byte-symmetric with snapshot-collector.ts:2151-2173.
+      // 6-level ancestor walk; tag MUST contain '-' (custom-element
+      // signature), length 5-60, NOT in the exclude list. Skipped tags:
+      //   • generated component salts (app-cNN/ng-cNN/etc.)
+      //   • Angular structural tags (router-outlet, ng-component)
+      //   • Material primitives we DON'T want as the wrapper anchor
+      //     (mat-icon/menu/select/form-field) — those have their own
+      //     dedicated signals (svgIcon, ariaHasPopup, role) and would
+      //     misanchor identity if used as wrapper.
+      // Returns lowercase tag (recorder symmetric).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const computeCustomElementTag = (el: any): string | undefined => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          let walk: any = el;
+          for (let i = 0; i < 6 && walk && walk !== doc.body; i++) {
+            const t = (walk.tagName || '').toLowerCase();
+            if (t.indexOf('-') >= 0
+              && t.length >= 5
+              && t.length <= 60
+              && !/^(?:app|ng|ion|sl|stencil)-c\d+$/.test(t)
+              && t !== 'router-outlet'
+              && t !== 'ng-component'
+              && t !== 'mat-icon'
+              && t !== 'mat-menu'
+              && t !== 'mat-select'
+              && t !== 'mat-form-field'
+              && walk !== el
+            ) {
+              return t;
+            }
+            walk = walk.parentElement;
+          }
+        } catch { /* best-effort */ }
+        return undefined;
+      };
+
+      // ── cssClass — first 3 stable class tokens, ALL filters mirrored
+      // byte-for-byte from recording-capture.service.ts:1394-1456.
+      // Token kept iff it passes EVERY filter:
+      //   - 1-50 chars
+      //   - NOT Tailwind/UnoCSS utility prefix
+      //   - NOT data-v-XXXXXXX scoped marker (own field)
+      //   - NOT css-XXXXXX / sc-XXXXXX (Emotion / styled-components)
+      //   - NOT Angular runtime markers (ng-star-inserted, ng-tns-cN-M,
+      //     ng-form-state classes)
+      //   - NOT BEM state suffix (block--active, tab--selected, …)
+      //   - NOT bare standalone state class (active, selected, …)
+      //   - NOT 5-8 char mixed-case token IF the element also has any
+      //     css-in-js sibling (likely styled-components display name)
+      // Result is up to 3 tokens joined by space. Must MUST MATCH the
+      // recorder's filter set exactly — any drift breaks identity match
+      // (recorded class="A B C" vs live class="A B C" disagree on
+      // which 3 tokens survive → fingerprint cssClass mismatch).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const computeCssClass = (el: any): string | undefined => {
+        try {
+          // For SVG `target.className` is SVGAnimatedString, not string —
+          // use getAttribute for cross-tag safety (mirrors recorder).
+          const rawClass: string = el.getAttribute('class') || '';
+          if (!rawClass) return undefined;
+
+          // Flag css-in-js presence on THIS element. When true we apply
+          // an extra-strict filter on bare camelCase tokens (recorder
+          // V22 Pkg3 behaviour). Avoid catching legitimate camelCase ids
+          // like "userName" on plain HTML.
+          const hasCssInJs = /(?:^| )(?:css-[a-z0-9]{6,}|sc-[a-zA-Z0-9]{6,})(?: |$)/i.test(rawClass);
+
+          const tokens: string[] = rawClass.split(/\s+/).filter((t: string) => {
+            if (!t || t.length > 50) return false;
+            // Utility / state prefix families (Tailwind, UnoCSS).
+            if (/^(?:[wh]-|p[xytrbl]?-|m[xytrbl]?-|gap-|flex|grid|block|inline|hidden|absolute|relative|fixed|text-|bg-|border|rounded|shadow|opacity|cursor-|select-|items-|justify-|self-|space-|overflow-|min-|max-|top-|left-|right-|bottom-|z-|font-|leading-|tracking-|whitespace-|truncate|line-clamp|transition|duration-|ease-|animate-|hover:|focus:|active:|disabled:|group-)/.test(t)) return false;
+            // Vue scoped marker — captured separately as vueScopeId.
+            if (/^data-v-[a-f0-9]{8}$/.test(t)) return false;
+            // css-in-js scoped classes.
+            if (/^css-[a-z0-9]{6,}$/i.test(t)) return false;
+            if (/^sc-[a-zA-Z0-9]{6,}$/.test(t)) return false;
+            // Angular runtime / form-state markers.
+            if (t === 'ng-star-inserted') return false;
+            if (/^ng-tns-c\d+-\d+$/.test(t)) return false;
+            if (/^ng-(?:un)?touched$|^ng-pristine$|^ng-dirty$|^ng-valid$|^ng-invalid$|^ng-pending$|^ng-submitted$/.test(t)) return false;
+            // BEM state suffix.
+            if (/--(?:active|selected|current|checked|open|opened|expanded|focused|hover|hovered|loading|busy|highlighted|chosen|disabled|first|last|initial|terminal|empty|filled|valid|invalid|dirty|touched|pristine|untouched|pending|error|success|warning)$/.test(t)) return false;
+            // Standalone state class (Bootstrap / legacy pattern).
+            if (/^(?:active|selected|current|checked|open|opened|expanded|focused|hovered|loading|busy|highlighted|chosen|disabled|enabled|valid|invalid|dirty|touched|pristine|untouched|pending|error|success|warning|empty|filled|readonly|required|focused|hidden|visible|collapsed|expanded)$/.test(t)) return false;
+            // Bare camelCase 5-8 chars + css-in-js present → likely a
+            // styled-components display-name hash.
+            if (hasCssInJs && /^[a-z][a-zA-Z]{4,7}$/.test(t) && /[A-Z]/.test(t)) return false;
+            return true;
+          });
+
+          if (tokens.length === 0) return undefined;
+          return tokens.slice(0, 3).join(' ');
+        } catch { return undefined; }
+      };
+
+      // ── vueScopeId — first `data-v-*` attribute name (the hash itself
+      // is the attribute NAME, value is empty). All children of a Vue
+      // single-file component share it, so it narrows beyond text and
+      // survives className refactors. Byte-symmetric with
+      // recording-capture.service.ts:1461-1468.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const computeVueScopeId = (el: any): string | undefined => {
+        try {
+          const attrs = el.attributes;
+          if (!attrs) return undefined;
+          for (let i = 0; i < attrs.length; i++) {
+            const name: string = attrs[i].name;
+            if (name && name.indexOf('data-v-') === 0) {
+              return name;
+            }
+          }
+        } catch { /* best-effort */ }
+        return undefined;
+      };
+
       for (const ref of refs) {
         const el = doc.querySelector(`[data-agent-ref="${cssEscape(ref)}"]`);
         if (!el) {
@@ -2930,6 +3120,22 @@ export class CdpSnapshotService {
           // `<svg><title>` would get a spurious iconLabel on CDP path.
           iconLabel: isIconBtn ? computeIconLabel(el) : undefined,
           nearText: getNearText(el),
+          // V26 Step B1: svgIcon + customElementTag (Angular cluster).
+          // No gate beyond what each helper applies internally — svgIcon
+          // checks `hasMaterial`, customElementTag walks 6 levels with
+          // hyphen-tag predicate.
+          svgIcon: computeSvgIcon(el),
+          customElementTag: computeCustomElementTag(el),
+          // V26 Step B2: own `alt` attribute. Single getAttribute call,
+          // no helper — byte-symmetric with snapshot-collector.ts:2637
+          // (`alt: ownAlt || undefined`, no .trim()). Preserving the
+          // raw value matters: a deliberate `<img alt=" ">` indicates
+          // "decorative + spacer" per WAI-ARIA, distinct from undefined.
+          alt: el.getAttribute('alt') || undefined,
+          // V26 Step B3: Vue/BEM cluster. Both port verbatim recorder
+          // filters — see helper definitions above for MUST-MATCH lines.
+          cssClass: computeCssClass(el),
+          vueScopeId: computeVueScopeId(el),
         };
         out.push(result);
       }
@@ -2969,6 +3175,31 @@ export class CdpSnapshotService {
       if (result.iconClasses) el.iconClasses = result.iconClasses;
       if (result.iconLabel) el.iconLabel = result.iconLabel;
       if (result.nearText) el.nearText = result.nearText;
+      // V26 Step B1 — Angular cluster fields, consumed downstream by
+      // dom-analysis-extractor.service.ts:313-318 → InteractiveNode →
+      // locator-plan-builder strategies (mat-icon, custom-wrapper) and
+      // by element-resolver `getEffectiveLabel`.
+      // customElementTag is typed on LiteElement (line 163). svgIcon is
+      // not yet typed — kept as `as any` for parity with snapshot-collector
+      // emit (also untyped there). Adding the strict type to LiteElement
+      // is tracked as a separate cleanup PR.
+      if (result.customElementTag) el.customElementTag = result.customElementTag;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (result.svgIcon) (el as any).svgIcon = result.svgIcon;
+      // V26 Step B2 — alt attribute. Not yet typed on LiteElement (the
+      // snapshot-collector emit at line 2637 also writes it untyped),
+      // so the `as any` cast mirrors that path until both gain strict
+      // typing in a separate cleanup PR.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (result.alt) (el as any).alt = result.alt;
+      // V26 Step B3 — cssClass + vueScopeId. Same untyped-on-LiteElement
+      // story as svgIcon/alt above. dom-analysis-extractor reads them
+      // via `(element as any)` at lines 325-329 and surfaces them
+      // typed on InteractiveNode for the resolver / plan-builder.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (result.cssClass) (el as any).cssClass = result.cssClass;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      if (result.vueScopeId) (el as any).vueScopeId = result.vueScopeId;
     }
   }
 

@@ -1250,6 +1250,21 @@ const PROBE_AT_POINT_FN = `
   // contentinfo|form). Implicit landmarks via tagName, explicit via role attr.
   // Walk closest-first, stop at body. Mirrors how snapshot collector tags
   // InteractiveNode.nearestLandmark so apply-time and recording-time agree.
+  // MUST MATCH src/services/testing/ui/preview/landmark.util.ts
+  //   EXPLICIT_LANDMARKS == LANDMARK_ROLES (the W3C ARIA 1.2 set).
+  //   LANDMARK_TAGS == LANDMARK_TAG_TO_ROLE keys, lowercased.
+  //
+  // This block runs inside PROBE_AT_POINT_FN serialized via String(fn),
+  // so it cannot import the shared util — same constraint as
+  // dynamic-id.util.ts inline copies elsewhere. Update both this block
+  // and landmark.util.ts together. Two extra entries are intentional:
+  //   1. form tag: recorder treats bare form as implicit landmark
+  //      because identity match downstream needs the form region anchor.
+  //      landmark.util omits this from the shared table (per HTML-AAM
+  //      strict reading) but documents the asymmetry.
+  //   2. walk depth 12 (vs collector 6): recorded fingerprint sometimes
+  //      needs deeper landmark anchors. Tracked as known asymmetry in
+  //      snapshot-collector.ts.
   var nearestLandmark = undefined;
   var landmarkWalk = target.parentElement;
   var LANDMARK_TAGS = { 'header': 'banner', 'nav': 'navigation', 'main': 'main',

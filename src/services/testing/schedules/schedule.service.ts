@@ -559,7 +559,30 @@ export class ScheduleService {
     const guessMinutes = guessParts.hour * 60 + guessParts.minute;
     const targetMinutes = hour * 60 + minute;
     const diffMinutes = guessMinutes - targetMinutes;
-    return new Date(guess.getTime() - diffMinutes * 60 * 1000);
+    const result = new Date(guess.getTime() - diffMinutes * 60 * 1000);
+
+    // DST spring-forward gap guard.
+    //   On the DST-forward day in a behind-UTC tz (e.g. NY 2026-03-08
+    //   2:30 AM doesn't exist — the clock jumps 2:00 → 3:00), the
+    //   single-step Newton correction above lands one DAY too early
+    //   instead of one HOUR too late. Detect by checking that the
+    //   resulting UTC instant still maps back to the SAME calendar
+    //   day in the target tz. If it doesn't, the requested wall-clock
+    //   time is non-existent — return EPOCH so the caller's
+    //   `targetUtc > now` comparison fails and the dayOffset loop
+    //   advances to the next day (where the cron rule may fire at
+    //   the same hour:minute, valid by then).
+    //
+    //   We intentionally don't try to "round forward" to 3:00 AM:
+    //   POSIX cron behaviour is to SKIP non-existent local times, and
+    //   that's what users expect (a daily 2:30 AM cron fires every day
+    //   except the one DST day per year — better than two runs on the
+    //   fall-back day).
+    const verify = this.datePartsInTimezone(result, tz);
+    if (verify.day !== day || verify.month !== month) {
+      return new Date(0);
+    }
+    return result;
   }
 
   /**

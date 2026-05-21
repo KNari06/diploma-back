@@ -3,6 +3,7 @@
  * Extracts enhanced DOM nodes with bounding boxes and metadata
  */
 
+import { LANDMARK_EVALUATE_BUNDLE } from '@/services/testing/ui/preview/landmark.util';
 import { logger } from '@/utils/core/logger';
 import { Page } from 'playwright';
 import type { DOMNode } from './types';
@@ -56,7 +57,7 @@ export class DOMNodeExtractor {
     const { visibleOnly, interactiveOnly } = options;
 
     return await page.evaluate(
-      ({ visibleOnly, interactiveOnly }) => {
+      ({ visibleOnly, interactiveOnly, LANDMARK_ROLES_SET, LANDMARK_TAG_TO_ROLE }) => {
         /**
          * Check if element is visible
          * @ts-ignore - browser context
@@ -255,7 +256,10 @@ export class DOMNodeExtractor {
 
             // Container titles (Phase 7: expanded semantic container detection)
             // Detects fieldset legends, form/section headings, ARIA group labels, landmarks
-            const LANDMARK_ROLES_SET = ['banner', 'navigation', 'main', 'complementary', 'contentinfo', 'search', 'form', 'region'];
+            //
+            // LANDMARK_ROLES_SET + LANDMARK_TAG_TO_ROLE injected via params
+            // from landmark.util.ts so this stays in sync with every other
+            // collector (invariant #5).
             const SEMANTIC_TAGS_SET = ['FIELDSET', 'FORM', 'SECTION', 'ARTICLE', 'NAV', 'ASIDE', 'DIALOG', 'HEADER', 'FOOTER', 'MAIN'];
 
             const cTitles: string[] = [];
@@ -269,12 +273,12 @@ export class DOMNodeExtractor {
 
               // Track nearest landmark
               if (!nearestLandmark) {
-                if (parRole && LANDMARK_ROLES_SET.includes(parRole)) nearestLandmark = parRole;
-                else if (parTag === 'NAV') nearestLandmark = 'navigation';
-                else if (parTag === 'MAIN') nearestLandmark = 'main';
-                else if (parTag === 'HEADER') nearestLandmark = 'banner';
-                else if (parTag === 'FOOTER') nearestLandmark = 'contentinfo';
-                else if (parTag === 'ASIDE') nearestLandmark = 'complementary';
+                if (parRole && LANDMARK_ROLES_SET.indexOf(parRole) !== -1) {
+                  nearestLandmark = parRole;
+                } else {
+                  const implicit = LANDMARK_TAG_TO_ROLE[parTag];
+                  if (implicit) nearestLandmark = implicit;
+                }
               }
 
               // Extract container title
@@ -347,7 +351,17 @@ export class DOMNodeExtractor {
 
         return nodes;
       },
-      { visibleOnly, interactiveOnly }
+      {
+        visibleOnly,
+        interactiveOnly,
+        // Landmark constants — single source of truth in
+        // src/services/testing/ui/preview/landmark.util.ts. Injected
+        // here so this evaluate body stays symmetric with
+        // snapshot-collector / cdp-snapshot / background-dom-collector
+        // (invariant #5).
+        LANDMARK_ROLES_SET: LANDMARK_EVALUATE_BUNDLE.ROLES,
+        LANDMARK_TAG_TO_ROLE: LANDMARK_EVALUATE_BUNDLE.TAGS,
+      },
     );
   }
 }

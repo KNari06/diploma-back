@@ -69,7 +69,7 @@ Main entry. Calls `resolveElement()` (LLM + vision); falls back to rule-based on
   - `previewSessionId`, `stepDraft`, `pageRef?`, `userId`.
   - `includeAlternatives?: boolean` — return full candidate list (default `false`).
   - `forceFreshSnapshot?: boolean` — bypass 500ms snapshot cache (set by Find button & apply).
-  - `auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other'` — audit label.
+  - `auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other'` — audit label. `pick_dry_run` is set by `preview-element-pick.service.ts` when the picker validates a captured element (May 2026).
 - **Returns `LintResult` with optional fields:**
   - `degradedMode?: boolean`, `degradedReason?: 'url_mismatch' | 'llm_timeout' | 'llm_error' | 'circuit_breaker_open'`.
   - `cacheHit?: boolean` — evidence shortcut hit (confidence `0.95`).
