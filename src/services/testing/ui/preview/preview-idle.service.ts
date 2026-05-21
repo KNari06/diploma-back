@@ -84,43 +84,58 @@ export function hasIdle(userId: string): boolean {
 
 /**
  * Fired when a user has been idle past IDLE_TTL_MS.
- * Stops every live preview session the user owns and pushes
- * `preview:session:expired` to the user's room. The frontend closes the
- * editor, shows a toast, and bounces back to Repository.
+ *
+ * The middleware refreshes this timer for every authenticated socket event,
+ * even when the user has no active preview session (mobile-only flow, just
+ * logged in, etc.). So at fire time we re-check ownership and skip the emit
+ * entirely if there's nothing to redirect — otherwise mobile-only / idle
+ * users get a spurious `preview:session:expired` and the frontend reacts
+ * to a session that never existed.
+ *
+ * Order is `emit → stopSession`, not the reverse. The public `stopSession`
+ * has no force-kill safety net (only `stopSessionInternal` does), so if
+ * Playwright hangs on browser teardown the user would sit in a frozen
+ * editor waiting for a redirect that never arrives. By emitting first we
+ * guarantee the redirect; cleanup happens in the background and is
+ * idempotent (`stopSession` is a no-op for already-stopped sessions).
  */
 async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
   try {
-    // Stop the user's preview session so the Playwright context is freed
-    // before we tell the user "your session is gone". Done first so a racing
-    // socket reconnect can't keep the session alive past the event.
-    // preview-session.service.ts maps userId → at most one sessionId
-    // (`userToSession`), so we just resolve that and stop it.
-    let stoppedSessionId: string | null = null;
+    // Lazy-import to dodge the circular-dep risk between preview-session
+    // and any future preview service that wants to reference this one.
+    const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+    const sessionService = getPreviewSessionService();
+
+    // Resolve the user's session BEFORE deciding whether to emit. The
+    // middleware refreshes this timer for every authenticated event, even
+    // when the user has no preview session (mobile-only flow, just logged
+    // in, etc.). No session → nothing to redirect → return silently.
+    const ownedSession = sessionService.getSessionForUser(userId);
+    if (!ownedSession) {
+      logger.debug('[PREVIEW_IDLE] Timer fired without active session — skipping', {
+        userId: userId.substring(0, 8) + '...',
+      });
+      return;
+    }
+    const stoppedSessionId = ownedSession.id;
+
+    // Notify FIRST, then tear down the Playwright session. The public
+    // `stopSession` has no force-kill safety net (only `stopSessionInternal`
+    // does), so a hung Playwright teardown would block the redirect event
+    // and leave the user in a frozen editor. Emitting first guarantees
+    // the redirect; the cleanup below is idempotent and best-effort.
+    io.to(`user:${userId}`).emit('preview:session:expired', { reason: 'idle' });
+
     try {
-      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
-      const sessionService = getPreviewSessionService();
-      const ownedSession = sessionService.getSessionForUser(userId);
-      if (ownedSession) {
-        try {
-          await sessionService.stopSession(ownedSession.id, userId);
-          stoppedSessionId = ownedSession.id;
-        } catch (stopErr) {
-          logger.debug('[PREVIEW_IDLE] stopSession failed', {
-            previewSessionId: ownedSession.id,
-            error: stopErr instanceof Error ? stopErr.message : String(stopErr),
-          });
-        }
-      }
-    } catch (importErr) {
-      logger.warn('[PREVIEW_IDLE] Failed to import preview session service', {
-        error: importErr instanceof Error ? importErr.message : String(importErr),
+      await sessionService.stopSession(stoppedSessionId, userId);
+    } catch (stopErr) {
+      logger.debug('[PREVIEW_IDLE] stopSession failed (post-emit)', {
+        previewSessionId: stoppedSessionId,
+        error: stopErr instanceof Error ? stopErr.message : String(stopErr),
       });
     }
 
-    // Notify all of the user's sockets in the personal room.
-    io.to(`user:${userId}`).emit('preview:session:expired', { reason: 'idle' });
-
-    logger.info('[PREVIEW_IDLE] Fired for user — preview sessions stopped, client notified', {
+    logger.info('[PREVIEW_IDLE] Fired for user — client notified, session stopped', {
       userId: userId.substring(0, 8) + '...',
       stoppedSessionId,
     });
