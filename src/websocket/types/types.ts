@@ -310,6 +310,14 @@ export interface ServerToClientEvents {
   // intentionally left alive on idle so re-opening the test case is fast.
   'mobile:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
 
+  // Web preview editor session expired — fired when the user has been idle
+  // past `IDLE_TTL_MS` (15 min) in `services/testing/ui/preview/preview-idle.service.ts`.
+  // Mirrors `mobile:session:expired`. Frontend closes the editor, clears
+  // `intentTestCaseId` from the URL, toasts the user, and bounces back to
+  // the Repository view. The Playwright preview session is stopped server-
+  // side before this event is emitted (cheap to re-create on reopen).
+  'preview:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+
   // Response to `preview:session:inspect`. Contains non-sensitive counts
   // + sameOrigin flag so the frontend can decide whether to prompt the
   // user before a Run. Counts are zero if the context is pristine.

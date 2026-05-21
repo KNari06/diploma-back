@@ -10,6 +10,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { handleConnection } from '../handlers/connection.handler';
 import { authenticateSocket } from '../middleware/middleware';
 import { refreshIdle } from '@/services/mobile/mobile-idle.service';
+import { refreshIdle as refreshPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
 import {
   ClientToServerEvents,
   ServerToClientEvents,
@@ -158,19 +159,20 @@ export const initializeWebSocket = (httpServer: HTTPServer): SocketIOServer => {
     });
 
     // Per-socket activity middleware: any inbound event from this user
-    // refreshes the mobile-editor idle timer — except for background
-    // heartbeats. The frontend's `startLatencyPing()` sends `ping` every
-    // 10s while a preview session is active, which would otherwise reset
-    // the timer indefinitely and the idle expiry would never fire.
-    // See `services/mobile/mobile-idle.service.ts`.
+    // refreshes the mobile-editor AND web-preview idle timers — except for
+    // background heartbeats. The frontend's `startLatencyPing()` sends `ping`
+    // every 10s while a preview session is active, which would otherwise
+    // reset the timer indefinitely and the idle expiry would never fire.
+    // Both timers share the same activity signal because the user is the
+    // same person regardless of which editor they're using.
+    // See `services/mobile/mobile-idle.service.ts` and
+    //     `services/testing/ui/preview/preview-idle.service.ts`.
     socket.use(([event], next) => {
       const userId = socket.data?.userId;
       if (userId && !IDLE_BACKGROUND_EVENTS.has(event)) {
-        refreshIdle(
-          userId,
-          io as SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData>,
-          `socket-event:${event}`,
-        );
+        const typedIo = io as SocketIOServer<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
+        refreshIdle(userId, typedIo, `socket-event:${event}`);
+        refreshPreviewIdle(userId, typedIo, `socket-event:${event}`);
       }
       next();
     });

@@ -15,6 +15,7 @@ import type { InteractiveNode, PreviewSession, TargetFingerprint } from './previ
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { waitForPageInteractive } from './page-interactive.utils';
+import { cancelIdle as cancelPreviewIdle } from './preview-idle.service';
 
 const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
 const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
@@ -1634,6 +1635,12 @@ export class PreviewSessionService {
       this.sessions.delete(sessionId);
       this.userToSession.delete(session.userId);
 
+      // Drop any pending idle-redirect timer for this user. Without this the
+      // preview-idle service can still fire after an explicit stop and emit
+      // a phantom `preview:session:expired` if the user has reconnected on a
+      // different socket. See preview-idle.service.ts onIdleFire.
+      try { cancelPreviewIdle(session.userId); } catch { /* non-fatal */ }
+
       logger.info('[PREVIEW_SESSION] Session stopped', { sessionId });
     } finally {
       releaseLock();
@@ -1710,6 +1717,9 @@ export class PreviewSessionService {
     // Remove from maps atomically (even if cleanup failed)
     this.sessions.delete(sessionId);
     this.userToSession.delete(session.userId);
+
+    // Drop any pending idle-redirect timer — mirror of stopSession() above.
+    try { cancelPreviewIdle(session.userId); } catch { /* non-fatal */ }
 
     logger.info('[PREVIEW_SESSION] Session stopped (internal)', { sessionId });
   }

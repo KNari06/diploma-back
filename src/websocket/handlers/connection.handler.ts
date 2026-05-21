@@ -20,6 +20,7 @@ import {
   deleteUserMobileKeys,
   getUserWarmupSessionIds,
 } from '@/services/mobile/mobile-idle.service';
+import { cancelIdle as cancelPreviewIdle } from '@/services/testing/ui/preview/preview-idle.service';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents, object, SocketData>;
@@ -60,6 +61,10 @@ async function performDisconnectCleanup(userId: string): Promise<void> {
 
     const deletedKeys = await deleteUserMobileKeys(userId);
     cancelIdle(userId);
+    // Web preview has its own per-user idle timer driven by the same socket
+    // middleware. On grace cleanup we cancel both so a stale timer can't
+    // fire `preview:session:expired` against a reconnect on a fresh socket.
+    cancelPreviewIdle(userId);
 
     logger.info('[WebSocket] Cleanup fired — destroyed sessions + cleared Redis', {
       userId: userId.substring(0, 8) + '...',
