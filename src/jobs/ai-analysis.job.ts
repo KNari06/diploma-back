@@ -5,6 +5,7 @@ import { aiService } from '@/services/ai/analysis/test-results.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
 import { JiraReportService } from '@/services/integrations/jira-report.service';
+import { resolveTestCasePriorityForTestId } from '@/services/testing/regression/resolve-test-case-priority.util';
 import { handleAIError } from '@/utils/core/error-handler';
 import { logAIAnalysis, logger, logQueueEvent } from '@/utils/core/logger';
 import {
@@ -310,13 +311,18 @@ export class AIAnalysisJobHandler {
       // Some models return 0..1, others 0..100
       const confidencePct = confidence <= 1 ? Math.round(confidence * 100) : Math.round(confidence);
 
-      // Create notification for AI report ready
+      // Create notification for AI report ready.
+      // `testId` is `tests.id` — the AI test, NOT a regression run.
+      // Action target is `/tests/:testId` (ai-tests view), not
+      // `/runs/:runId` (regression-run-report). Pass actionUrl explicitly
+      // so the FE doesn't synthesize the wrong URL from metadata.
       await NotificationService.createNotification({
         userId,
         type: 'personal',
         category: 'system',
         title: 'AI analysis completed',
         message: `Analysis found ${bugs.length} issue(s) with ${confidencePct}% confidence`,
+        actionUrl: `/tests/${testId}`,
         metadata: {
           testId,
           resultId: testResultId,
@@ -341,6 +347,9 @@ export class AIAnalysisJobHandler {
           category: 'system',
           title: 'Critical issues detected',
           message: `Found ${criticalBugs.length} critical issue(s) in your test`,
+          // Same routing rationale as the AI-completed notification above —
+          // testId resolves to /tests/:testId (ai-tests view).
+          actionUrl: `/tests/${testId}`,
           metadata: {
             testId,
             resultId: testResultId,
@@ -523,11 +532,24 @@ export class AIAnalysisJobHandler {
         aiAnalysis: aiAnalysisForReport,
       });
 
+      // Best-effort: pull the saved test_case priority so the Jira issue
+      // matches what the curator marked the test as ("critical" test →
+      // Highest Jira priority). Helper hides the 2-hop join (tests →
+      // test_executions.test_case_id → intent_test_cases.priority) and
+      // guarantees fail-open: any DB / schema error returns undefined,
+      // never blocks the Jira sync path. Same helper is reused by the
+      // Telegram and webhook notification paths below so all three
+      // integrations see consistent priority resolution. Static import
+      // at top of file — no dynamic-require gymnastics; the helper has
+      // no circular deps and module resolution is verified at boot.
+      const testCasePriority = await resolveTestCasePriorityForTestId(testId);
+
       await JiraReportService.createJiraIssueFromReport({
         userId: test.user_id,
         projectKey: jiraSettings.projectKey.trim(),
         testReport: report,
         issueType: 'Bug',
+        testCasePriority,
       });
 
       logger.info('[AI-ANALYSIS] Jira issue created (syncOnCreate)', {
@@ -627,12 +649,26 @@ export class AIAnalysisJobHandler {
             const testUrl = test.url || 'Unknown URL';
             const dashboardUrl = `${frontendUrl}/tests/${testId}`;
 
+            // Resolve curator-set priority for the saved test case
+            // (same helper Jira sync uses, imported statically at top
+            // of file). Optional row \u2014 absent for ad-hoc / chat-lite
+            // runs and API tests. Capitalised to match the existing
+            // "Critical Issues Found" header tone.
+            const tcPriority = await resolveTestCasePriorityForTestId(testId);
+            const fields = [
+              { label: 'URL', value: testUrl },
+              ...(tcPriority
+                ? [{
+                  label: 'Test priority',
+                  value: tcPriority.charAt(0).toUpperCase() + tcPriority.slice(1),
+                }]
+                : []),
+            ];
+
             await sendTelegramNotification(tokenData, {
               icon: '\u26A0\uFE0F',
               title: `${bugs.length} Critical Issue${bugs.length > 1 ? 's' : ''} Found`,
-              fields: [
-                { label: 'URL', value: testUrl },
-              ],
+              fields,
               bugs: bugs.slice(0, 5).map((b: any) => ({
                 severity: b.severity,
                 category: b.category,
@@ -682,6 +718,15 @@ export class AIAnalysisJobHandler {
       const testStatus = test.status || 'completed';
       const eventName = `test.${testStatus}`; // test.completed, test.failed, test.cancelled
 
+      // Resolve curator-set priority for the saved test case so external
+      // integrations (Zapier, n8n, custom routers) can branch on it —
+      // e.g. "page on-call when a critical test fails". Helper is
+      // imported statically at top of file; it's fail-open and returns
+      // undefined for ad-hoc / chat-lite runs and API tests. We forward
+      // null in that case so the field shape stays stable across all
+      // webhook events.
+      const testCasePriority = await resolveTestCasePriorityForTestId(testId);
+
       // Send webhook notification
       await QueueManager.addWebhookJob({
         url: webhookUrl,
@@ -690,6 +735,9 @@ export class AIAnalysisJobHandler {
           testId,
           projectId: test.project_id,
           status: testStatus, // ✅ FIX #12: Use actual status
+          // Always present (null when unknown) so downstream routers can
+          // rely on `data.priority` existing in the schema.
+          priority: testCasePriority ?? null,
           aiSummary,
           timestamp: new Date().toISOString(),
         },

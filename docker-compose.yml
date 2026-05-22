@@ -45,3 +45,33 @@ services:
       options:
         max-size: "50m"
         max-file: "3"
+
+  # Scheduler process — owns the per-minute sweep that fires due
+  # regression schedules + auto-learn retire + account-deletion purge.
+  # Must run as its own service: putting it in the backend or worker
+  # container risks N replicas all firing the same schedule (claim is
+  # atomic, but the wasted work + load is real). restart:always ensures
+  # a crash never silently kills scheduled regressions — without this,
+  # users see "next run in 13h" forever while nothing actually runs.
+  scheduler:
+    container_name: qait-scheduler
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    command: ["node", "-r", "tsconfig-paths/register", "dist/scheduler/index.js"]
+    env_file:
+      - .env
+    environment:
+      - QUEUE_PREFIX=${QUEUE_PREFIX:-qait-prod}
+      - LOG_LEVEL=info
+    volumes:
+      - ./logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"

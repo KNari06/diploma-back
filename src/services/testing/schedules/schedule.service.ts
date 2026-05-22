@@ -40,6 +40,15 @@ export class ScheduleService {
       throw new Error('Exactly one of moduleId or planId must be set');
     }
 
+    // Defence-in-depth: refuse to persist an unparseable cron. The
+    // controllers also validate, but other internal callers (e.g.
+    // RegressionPlanService.syncSchedule) may bypass them and we don't
+    // want a bad row that fires every hour forever via the fallback in
+    // calculateNextRun.
+    if (!this.parseCron(cronExpression)) {
+      throw new Error(`Invalid cron expression: "${cronExpression}"`);
+    }
+
     logger.info('[SCHEDULE_SERVICE] Creating schedule', {
       projectId,
       userId,
@@ -132,6 +141,12 @@ export class ScheduleService {
    */
   static async update(params: UpdateTestScheduleParams): Promise<TestSchedule> {
     const { id, userId, name, cronExpression, timezone, parameters, isActive } = params;
+
+    // Defence-in-depth — controllers also validate cron, but other internal
+    // callers may bypass them. Refuse to persist an unparseable cron.
+    if (cronExpression !== undefined && !this.parseCron(cronExpression)) {
+      throw new Error(`Invalid cron expression: "${cronExpression}"`);
+    }
 
     const updates: Record<string, any> = {};
     if (name !== undefined) updates.name = name;
@@ -320,53 +335,31 @@ export class ScheduleService {
   static calculateNextRun(cronExpression: string, timezone: string): string {
     const now = new Date();
 
-    const parts = cronExpression.split(' ');
-    if (parts.length !== 5) {
+    const parsed = this.parseCron(cronExpression);
+    if (!parsed) {
+      // Truly invalid cron — log loudly. Persisting layer (controllers)
+      // should reject before this is ever reached, but keep a safe
+      // fallback so production never explodes on a bad row that
+      // pre-dates validation.
+      logger.error('[SCHEDULE_SERVICE] calculateNextRun: invalid cron — falling back to +1h', {
+        cronExpression,
+      });
       return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
     }
 
-    const [minuteStr, hourStr, domStr, monthStr, dowStr] = parts;
-
-    // Parse each field into a set of allowed values
-    const allowedMinutes = this.parseCronField(minuteStr, 0, 59);
-    const allowedHours = this.parseCronField(hourStr, 0, 23);
-    const allowedDoms = this.parseCronField(domStr, 1, 31);
-    const allowedMonths = this.parseCronField(monthStr, 1, 12);
-    let allowedDows = this.parseCronField(dowStr, 0, 7);
-
-    // Normalize dow=7 (Sunday) to dow=0
-    if (allowedDows && allowedDows.has(7)) {
-      allowedDows.add(0);
-      allowedDows.delete(7);
-    }
-
-    if (!allowedMinutes || !allowedHours) {
-      return new Date(now.getTime() + 60 * 60 * 1000).toISOString();
-    }
-
+    const { minutes, hours, doms, months, dows } = parsed;
     const tz = this.resolveTimezone(timezone);
-    const sortedMinutes = [...allowedMinutes].sort((a, b) => a - b);
-    const sortedHours = [...allowedHours].sort((a, b) => a - b);
+    const sortedMinutes = [...minutes].sort((a, b) => a - b);
+    const sortedHours = [...hours].sort((a, b) => a - b);
 
     // Scan up to 400 days to cover monthly/yearly patterns
     for (let dayOffset = 0; dayOffset <= 400; dayOffset++) {
       const candidate = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
       const candidateParts = this.datePartsInTimezone(candidate, tz);
 
-      // Check month constraint
-      if (allowedMonths && !allowedMonths.has(candidateParts.month)) {
-        continue;
-      }
-
-      // Check day-of-month constraint
-      if (allowedDoms && !allowedDoms.has(candidateParts.day)) {
-        continue;
-      }
-
-      // Check day-of-week constraint
-      if (allowedDows && !allowedDows.has(candidateParts.dow)) {
-        continue;
-      }
+      if (!months.has(candidateParts.month)) continue;
+      if (!doms.has(candidateParts.day)) continue;
+      if (!dows.has(candidateParts.dow)) continue;
 
       // Try each allowed hour:minute combination on this day
       for (const hour of sortedHours) {
@@ -391,39 +384,97 @@ export class ScheduleService {
     return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
   }
 
-  // Parse a single cron field into a Set of allowed integer values.
-  // Supports: "*", specific numbers, comma-separated lists, step values,
-  // and ranges (e.g. "1-5"). Returns null for "*" (all values allowed).
+  /**
+   * Parse a full cron expression into materialised allowed-value sets.
+   *
+   * Returns `null` ONLY when the expression is structurally invalid
+   * (wrong field count, or any field that fails to parse to at least
+   * one allowed value). For wildcards (`*`) we materialise the full
+   * range into the Set, so consumers can iterate uniformly without
+   * having to treat `null`-as-wildcard specially — that distinction
+   * was the source of a silent "every minute" → "every hour" bug.
+   *
+   * `dow=7` (some crontabs use 7 for Sunday) is normalised to `0`.
+   *
+   * Public so the controllers can call `parseCron(x) !== null` as
+   * a cheap validation check before persisting.
+   */
+  static parseCron(cronExpression: string): {
+    minutes: Set<number>;
+    hours: Set<number>;
+    doms: Set<number>;
+    months: Set<number>;
+    dows: Set<number>;
+  } | null {
+    if (typeof cronExpression !== 'string') return null;
+    const parts = cronExpression.trim().split(/\s+/);
+    if (parts.length !== 5) return null;
+
+    const [minuteStr, hourStr, domStr, monthStr, dowStr] = parts;
+
+    const minutes = this.parseCronField(minuteStr, 0, 59);
+    const hours = this.parseCronField(hourStr, 0, 23);
+    const doms = this.parseCronField(domStr, 1, 31);
+    const months = this.parseCronField(monthStr, 1, 12);
+    const dows = this.parseCronField(dowStr, 0, 7);
+
+    if (!minutes || !hours || !doms || !months || !dows) return null;
+
+    // Normalise dow=7 (Sunday alias) to dow=0
+    if (dows.has(7)) {
+      dows.add(0);
+      dows.delete(7);
+    }
+
+    return { minutes, hours, doms, months, dows };
+  }
+
+  /**
+   * Parse a single cron field into a Set of allowed integer values.
+   * Supports: wildcard ("*"), step values ("star-slash-N"), specific
+   * numbers, comma-separated lists, and ranges ("1-5").
+   *
+   * Returns `null` when the field is invalid (would yield no allowed
+   * values). For wildcard and step values, returns the fully expanded
+   * set so the caller can always iterate / `.has()` without a sentinel
+   * check.
+   */
   private static parseCronField(field: string, min: number, max: number): Set<number> | null {
-    if (field === '*') return null;
+    if (typeof field !== 'string' || field.length === 0) return null;
+
+    // Wildcard — every value in range.
+    if (field === '*') {
+      const set = new Set<number>();
+      for (let i = min; i <= max; i++) set.add(i);
+      return set;
+    }
 
     // Step value: */N
     if (field.startsWith('*/')) {
       const step = parseInt(field.slice(2), 10);
       if (isNaN(step) || step <= 0) return null;
       const set = new Set<number>();
-      for (let i = min; i <= max; i += step) {
-        set.add(i);
-      }
-      return set;
+      for (let i = min; i <= max; i += step) set.add(i);
+      return set.size > 0 ? set : null;
     }
 
     // Comma-separated list, possibly with ranges: "1,3,5" or "1-5" or "1-3,5"
     const set = new Set<number>();
     for (const part of field.split(',')) {
       const trimmed = part.trim();
+      if (!trimmed) return null; // "1,,3" is malformed
       if (trimmed.includes('-')) {
         const [startStr, endStr] = trimmed.split('-');
         const start = parseInt(startStr, 10);
         const end = parseInt(endStr, 10);
-        if (!isNaN(start) && !isNaN(end)) {
-          for (let i = start; i <= end; i++) {
-            if (i >= min && i <= max) set.add(i);
-          }
+        if (isNaN(start) || isNaN(end) || start > end) return null;
+        for (let i = start; i <= end; i++) {
+          if (i >= min && i <= max) set.add(i);
         }
       } else {
         const n = parseInt(trimmed, 10);
-        if (!isNaN(n) && n >= min && n <= max) set.add(n);
+        if (isNaN(n) || n < min || n > max) return null;
+        set.add(n);
       }
     }
     return set.size > 0 ? set : null;
@@ -478,6 +529,22 @@ export class ScheduleService {
   /**
    * Build a UTC Date for a given date+time in a specific timezone.
    * E.g. "2026-02-23 09:00 in America/New_York" → correct UTC instant.
+   *
+   * Sign math:
+   *   guess     = UTC instant assuming target naive time IS already UTC
+   *   guessParts.hour = what wall-clock that guess shows in the target TZ
+   *
+   *   If guess in TZ shows 05:00 but we wanted 09:00 (TZ is UTC-4, behind),
+   *   the real UTC must be LATER than guess by 4h → subtract a negative diff
+   *   (which adds time).
+   *
+   *   If guess in TZ shows 14:00 but we wanted 09:00 (TZ is UTC+5, ahead),
+   *   the real UTC must be EARLIER than guess by 5h → subtract a positive
+   *   diff (which subtracts time).
+   *
+   *   Either way: `realUtc = guess - diffMinutes`. The previous code added
+   *   `diffMinutes` and silently broke every non-UTC schedule. Verified
+   *   empirically against America/New_York, Asia/Almaty, and UTC.
    */
   private static buildDateInTimezone(
     year: number,
@@ -487,18 +554,35 @@ export class ScheduleService {
     minute: number,
     tz: string
   ): Date {
-    // Strategy: construct a guess in UTC, then measure the offset and correct.
-    // This handles DST transitions correctly.
     const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
-
-    // What time does `guess` represent in the target timezone?
     const guessParts = this.datePartsInTimezone(guess, tz);
     const guessMinutes = guessParts.hour * 60 + guessParts.minute;
     const targetMinutes = hour * 60 + minute;
     const diffMinutes = guessMinutes - targetMinutes;
+    const result = new Date(guess.getTime() - diffMinutes * 60 * 1000);
 
-    // Adjust: if guess shows 14:00 in tz but we want 09:00, shift by +5h
-    return new Date(guess.getTime() + diffMinutes * 60 * 1000);
+    // DST spring-forward gap guard.
+    //   On the DST-forward day in a behind-UTC tz (e.g. NY 2026-03-08
+    //   2:30 AM doesn't exist — the clock jumps 2:00 → 3:00), the
+    //   single-step Newton correction above lands one DAY too early
+    //   instead of one HOUR too late. Detect by checking that the
+    //   resulting UTC instant still maps back to the SAME calendar
+    //   day in the target tz. If it doesn't, the requested wall-clock
+    //   time is non-existent — return EPOCH so the caller's
+    //   `targetUtc > now` comparison fails and the dayOffset loop
+    //   advances to the next day (where the cron rule may fire at
+    //   the same hour:minute, valid by then).
+    //
+    //   We intentionally don't try to "round forward" to 3:00 AM:
+    //   POSIX cron behaviour is to SKIP non-existent local times, and
+    //   that's what users expect (a daily 2:30 AM cron fires every day
+    //   except the one DST day per year — better than two runs on the
+    //   fall-back day).
+    const verify = this.datePartsInTimezone(result, tz);
+    if (verify.day !== day || verify.month !== month) {
+      return new Date(0);
+    }
+    return result;
   }
 
   /**

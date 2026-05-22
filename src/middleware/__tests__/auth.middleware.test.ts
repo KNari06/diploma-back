@@ -19,6 +19,25 @@ jest.mock('@/services/core/user-credits.service', () => ({
   },
 }));
 
+// Mock supabaseAdmin — the deleted_at lookup added for account-deletion.
+// We expose `__setDeletedAt` on the mock so individual tests can drive
+// the return value without re-wiring the whole chain.
+let __mockDeletedAt: string | null = null;
+jest.mock('@/db/supabase', () => ({
+  supabaseAdmin: {
+    from: jest.fn(() => ({
+      select: jest.fn(() => ({
+        eq: jest.fn(() => ({
+          maybeSingle: jest.fn(async () => ({
+            data: { deleted_at: __mockDeletedAt },
+            error: null,
+          })),
+        })),
+      })),
+    })),
+  },
+}));
+
 import { verifyToken } from '@/services/auth/auth.service';
 import { UserCreditsService } from '@/services/core/user-credits.service';
 
@@ -41,6 +60,7 @@ describe('auth.middleware', () => {
       json: jest.fn().mockReturnThis(),
     };
     mockNext = jest.fn();
+    __mockDeletedAt = null; // default: not soft-deleted
     jest.clearAllMocks();
   });
 
@@ -135,6 +155,88 @@ describe('auth.middleware', () => {
         })
       );
       expect(mockNext).not.toHaveBeenCalled();
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // deleted_at + POST_DELETION_ALLOWED_PATHS branch
+    // (account-deletion feature — `feat/account-deletion`)
+    // ═══════════════════════════════════════════════════════════════════════
+    describe('account-deletion guard', () => {
+      const VALID_TOKEN_HEADER = { authorization: 'Bearer valid-token-long-enough' };
+      const mockUser = { id: 'user-deleted-1', email: 't@t.com', role: 'user' };
+
+      it('rejects a soft-deleted user with ACCOUNT_DELETED on a normal path', async () => {
+        mockReq.headers = VALID_TOKEN_HEADER;
+        mockReq.originalUrl = '/api/v1/projects';
+        mockVerifyToken.mockResolvedValue(mockUser);
+        __mockDeletedAt = '2026-05-01T00:00:00.000Z';
+
+        await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(401);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({
+            success: false,
+            code: 'ACCOUNT_DELETED',
+          }),
+        );
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('allows a soft-deleted user through to the cancel endpoint', async () => {
+        mockReq.headers = VALID_TOKEN_HEADER;
+        mockReq.originalUrl = '/api/v1/auth/me/delete/cancel';
+        mockVerifyToken.mockResolvedValue(mockUser);
+        __mockDeletedAt = '2026-05-01T00:00:00.000Z';
+
+        await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+        expect(mockReq.user).toEqual(mockUser);
+      });
+
+      it('strips the query string before allowlist matching', async () => {
+        // `?foo=bar` must not defeat the allowlist match.
+        mockReq.headers = VALID_TOKEN_HEADER;
+        mockReq.originalUrl = '/api/v1/auth/me/delete/cancel?reason=support';
+        mockVerifyToken.mockResolvedValue(mockUser);
+        __mockDeletedAt = '2026-05-01T00:00:00.000Z';
+
+        await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockRes.status).not.toHaveBeenCalled();
+      });
+
+      it('does NOT allow a near-miss path through (exact-match guard)', async () => {
+        // Catches the regression where a loose startsWith would have
+        // matched `/cancel-something-else`.
+        mockReq.headers = VALID_TOKEN_HEADER;
+        mockReq.originalUrl = '/api/v1/auth/me/delete/cancel-something';
+        mockVerifyToken.mockResolvedValue(mockUser);
+        __mockDeletedAt = '2026-05-01T00:00:00.000Z';
+
+        await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+        expect(mockRes.status).toHaveBeenCalledWith(401);
+        expect(mockRes.json).toHaveBeenCalledWith(
+          expect.objectContaining({ code: 'ACCOUNT_DELETED' }),
+        );
+        expect(mockNext).not.toHaveBeenCalled();
+      });
+
+      it('lets a non-deleted user through normally', async () => {
+        mockReq.headers = VALID_TOKEN_HEADER;
+        mockReq.originalUrl = '/api/v1/projects';
+        mockVerifyToken.mockResolvedValue(mockUser);
+        __mockDeletedAt = null;
+
+        await requireAuth(mockReq as Request, mockRes as Response, mockNext);
+
+        expect(mockNext).toHaveBeenCalled();
+        expect(mockReq.user).toEqual(mockUser);
+      });
     });
   });
 

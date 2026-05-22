@@ -12,7 +12,7 @@ export class JiraReportService {
    * Create Jira issue from test report with full details and attachments
    */
   static async createJiraIssueFromReport(params: JiraIssueRequest): Promise<JiraIssue> {
-    const { userId, projectKey, testReport, issueType = 'Bug', priority } = params;
+    const { userId, projectKey, testReport, issueType = 'Bug', priority, testCasePriority } = params;
 
     logger.info('[JIRA_REPORT] Creating Jira issue', {
       userId,
@@ -31,8 +31,38 @@ export class JiraReportService {
       // 2. Format description with all test details
       const description = this.formatJiraDescription(testReport);
 
-      // 3. Determine priority if not specified
-      const issuePriority = priority || this.determinePriority(testReport.analysis.severity);
+      // 3. Determine priority via 3-tier precedence:
+      //    a) Explicit `priority` from caller — already a Jira label, wins
+      //       (used by the API endpoint when user manually picked one).
+      //    b) `testCasePriority` from the saved intent_test_case row —
+      //       lets a user who marks a test as "critical" auto-file
+      //       Highest-priority Jira issues without re-setting it per run.
+      //    c) AI-derived severity from the test report (legacy behaviour).
+      //
+      // Why test-case priority sits BETWEEN explicit and severity:
+      //   - explicit caller priority is a deliberate per-call decision,
+      //     usually from a UI button — must win.
+      //   - test-case priority is a per-test-case curator choice that
+      //     should beat AI severity (which is per-run and can drift),
+      //     because curators know what's actually business-critical.
+      //   - severity is the safety net when neither signal is present
+      //     (ad-hoc / chat-lite runs with no saved test case).
+      const issuePriority =
+        priority
+        || (testCasePriority ? this.mapTestCasePriorityToJira(testCasePriority) : undefined)
+        || this.determinePriority(testReport.analysis.severity);
+      const prioritySource = priority
+        ? 'explicit'
+        : testCasePriority
+          ? 'test_case'
+          : 'severity_fallback';
+      logger.info('[JIRA_REPORT] Priority resolution', {
+        testId: testReport.testId,
+        chosen: issuePriority,
+        prioritySource,
+        testCasePriority,
+        severity: testReport.analysis.severity,
+      });
 
       // 4. Create Jira issue
       const response = await fetch(
@@ -512,6 +542,36 @@ ${report.artifacts.trace ? `• 📊 Trace: Available` : '• 📊 Trace: Not av
         return 'Low';
       default:
         return 'Medium';
+    }
+  }
+
+  /**
+   * Map an `intent_test_cases.priority` value to a Jira priority label.
+   *
+   * Mirrors `determinePriority()` but typed against the test-case enum
+   * (no 'none' bucket — test cases either have a priority or
+   * undefined / NULL, in which case the caller falls through to severity).
+   *
+   * Kept as a SEPARATE helper from `determinePriority` so:
+   *   - the two input vocabularies stay decoupled (test-case priority is
+   *     a curator choice on the saved test; severity is an AI run-time
+   *     judgment of the bugs found). If we ever extend one without the
+   *     other, the mapping doesn't accidentally drift.
+   *   - call sites read clearly: "we're mapping test-case priority" vs
+   *     "we're mapping AI severity".
+   */
+  private static mapTestCasePriorityToJira(
+    p: 'critical' | 'high' | 'medium' | 'low',
+  ): string {
+    switch (p) {
+      case 'critical':
+        return 'Highest';
+      case 'high':
+        return 'High';
+      case 'medium':
+        return 'Medium';
+      case 'low':
+        return 'Low';
     }
   }
 

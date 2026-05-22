@@ -6,6 +6,11 @@ import path from 'path';
 import { z } from 'zod';
 import { deleteAvatar, uploadAvatar } from './auth-avatar.controller';
 import {
+  getDeletionPreview,
+  postDeleteAccount,
+  postCancelDeletion,
+} from './account-deletion.controller';
+import {
   completeOAuthHandler,
   getOAuthUrlHandler,
   getPendingUsers,
@@ -811,6 +816,32 @@ router.post('/avatar', requireAuth, uploadAvatarMulter.single('avatar'), asyncHa
  * Delete user avatar (authenticated)
  */
 router.delete('/avatar', requireAuth, asyncHandler(deleteAvatar));
+
+// ============================================================================
+// ACCOUNT DELETION (self-service)
+// ============================================================================
+//
+// All three routes go through the standard `requireAuth` middleware
+// AND the auth middleware itself contains a `deleted_at` check that
+// 401s soft-deleted users on any path except the `cancel` endpoint
+// (see middleware/auth.middleware.ts:POST_DELETION_ALLOWED_PATHS).
+//
+//   GET  /me/deletion-preview  → DeletionPreview { scheduledFor,
+//                                  blockingWorkspaces, soleOwnedWorkspaces,
+//                                  graceDays }
+//   POST /me/delete            → schedules soft-delete + 30-day cron.
+//                                Body: { confirmEmail }
+//   POST /me/delete/cancel     → SELF-cancel of a pending deletion
+//                                during the 30-day grace window. Uses
+//                                `req.user.id`, so a user can only
+//                                un-delete THEMSELVES — admins acting
+//                                on behalf of others should use the
+//                                separate `/admin/users/:id/restore`
+//                                route (TODO, not in v1).
+
+router.get('/me/deletion-preview', requireAuth, asyncHandler(getDeletionPreview));
+router.post('/me/delete', requireAuth, asyncHandler(postDeleteAccount));
+router.post('/me/delete/cancel', requireAuth, asyncHandler(postCancelDeletion));
 
 // ============================================================================
 // ADMIN: User approval management

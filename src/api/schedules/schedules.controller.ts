@@ -19,6 +19,41 @@ function getUserId(req: AuthenticatedRequest): string {
 }
 
 /**
+ * Validate a cron expression. Rejects anything that ScheduleService cannot
+ * parse — previously the parser would silently fall back to "now + 1h",
+ * which created schedules that ran hourly forever despite the user
+ * thinking they had set up a daily / weekly / etc. cron.
+ *
+ * Returns null on success, or an error message string on failure.
+ */
+function validateCronExpression(cronExpression: unknown): string | null {
+  if (typeof cronExpression !== 'string') {
+    return 'cronExpression must be a string';
+  }
+  const parsed = ScheduleService.parseCron(cronExpression);
+  if (!parsed) {
+    return `Invalid cron expression: "${cronExpression}". Expected 5 fields: minute hour day-of-month month day-of-week.`;
+  }
+  return null;
+}
+
+/**
+ * Validate an IANA timezone string against Intl. UTC is always allowed.
+ * Empty / undefined is allowed (service defaults to UTC).
+ */
+function validateTimezone(timezone: unknown): string | null {
+  if (timezone === undefined || timezone === null || timezone === '') return null;
+  if (typeof timezone !== 'string') return 'timezone must be a string';
+  try {
+    // `Intl.DateTimeFormat` throws RangeError on unknown TZ ids.
+    Intl.DateTimeFormat('en-US', { timeZone: timezone });
+    return null;
+  } catch {
+    return `Invalid timezone: "${timezone}". Expected IANA name like "Asia/Almaty" or "UTC".`;
+  }
+}
+
+/**
  * Create a new test schedule
  */
 export async function createSchedule(req: AuthenticatedRequest, res: Response): Promise<void> {
@@ -27,6 +62,16 @@ export async function createSchedule(req: AuthenticatedRequest, res: Response): 
 
     if (!projectId || !name || !cronExpression) {
       res.status(400).json({ success: false, error: 'projectId, name, and cronExpression are required' });
+      return;
+    }
+    const cronError = validateCronExpression(cronExpression);
+    if (cronError) {
+      res.status(400).json({ success: false, error: cronError });
+      return;
+    }
+    const tzError = validateTimezone(timezone);
+    if (tzError) {
+      res.status(400).json({ success: false, error: tzError });
       return;
     }
 
@@ -102,6 +147,24 @@ export async function updateSchedule(req: AuthenticatedRequest, res: Response): 
     const { id } = req.params;
     const { name, cronExpression, timezone, parameters, isActive } = req.body;
     const userId = getUserId(req);
+
+    // Validate ONLY the fields the caller is actually changing — partial
+    // updates are allowed and we don't want to force the FE to round-trip
+    // unchanged fields just to satisfy validation.
+    if (cronExpression !== undefined) {
+      const cronError = validateCronExpression(cronExpression);
+      if (cronError) {
+        res.status(400).json({ success: false, error: cronError });
+        return;
+      }
+    }
+    if (timezone !== undefined) {
+      const tzError = validateTimezone(timezone);
+      if (tzError) {
+        res.status(400).json({ success: false, error: tzError });
+        return;
+      }
+    }
 
     const schedule = await ScheduleService.update({
       id,

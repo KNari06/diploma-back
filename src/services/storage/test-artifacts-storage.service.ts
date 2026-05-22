@@ -354,10 +354,10 @@ export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {
 }
 
 /**
- * Upload a replay-mode JSONL trace log to the unified `lite-trace-logs`
+ * Upload a regression-run JSONL trace log to the unified `lite-trace-logs`
  * bucket and register it in `trace_files` so it shows up in the admin UI.
  *
- * Replay traces carry element resolution details (compiled / LLM / self-heal),
+ * Regression traces carry element resolution details (compiled / LLM / self-heal),
  * readiness checks, retry attempts, and step failures — everything needed to
  * diagnose a failed regression run.
  *
@@ -369,12 +369,12 @@ export async function downloadFromStorage(storageUrl: string): Promise<Buffer> {
  * - Local file is best-effort unlinked after a successful upload.
  *
  * @param localPath - Path to local JSONL file (from ReplayTraceWriter)
- * @param testId - UUID of the `tests` row this replay belongs to (used as FK)
+ * @param testId - UUID of the `tests` row this regression run belongs to (used as FK)
  * @param userId - User UUID; falls back to anonymous path if not a UUID
  * @returns Object with storagePath, normalized fileName, fileSize, and optional
  *          `traceFileId` (present only when a trace_files row was inserted).
  */
-export async function uploadReplayTraceToStorage(
+export async function uploadRegressionTraceToStorage(
   localPath: string,
   testId: string,
   userId: string,
@@ -391,7 +391,7 @@ export async function uploadReplayTraceToStorage(
   // skip DB bookkeeping (no user to attribute the row to).
   if (!isUserUuid) {
     const { storagePath, fileName: normalizedFileName, fileSize } =
-      await uploadLiteTraceLogToStorageAnonymous(localPath, path.basename(localPath), 'replay');
+      await uploadLiteTraceLogToStorageAnonymous(localPath, path.basename(localPath), 'regression');
     return { storagePath, fileName: normalizedFileName, fileSize };
   }
 
@@ -400,7 +400,7 @@ export async function uploadReplayTraceToStorage(
     localPath,
     userId,
     path.basename(localPath),
-    'replay',
+    'regression',
   );
 
   try {
@@ -412,7 +412,7 @@ export async function uploadReplayTraceToStorage(
       fileName: uploadResult.fileName,
       storagePath: uploadResult.storagePath,
       fileSize: uploadResult.fileSize,
-      browser: 'replay-trace',
+      browser: 'regression-trace',
       status: 'uploaded',
     });
 
@@ -423,7 +423,7 @@ export async function uploadReplayTraceToStorage(
       traceFileId: id,
     };
   } catch (insertError) {
-    logger.error('[STORAGE] Failed to register replay trace in DB, rolling back storage', {
+    logger.error('[STORAGE] Failed to register regression trace in DB, rolling back storage', {
       error: insertError instanceof Error ? insertError.message : String(insertError),
       storagePath: uploadResult.storagePath,
     });
@@ -443,7 +443,7 @@ export type TraceType =
   | 'draft'
   | 'api-agent'
   | 'exploration'
-  | 'replay';
+  | 'regression';
 
 /**
  * Sanitize an email for safe use as a single Supabase Storage path segment.
@@ -516,7 +516,7 @@ async function resolveUserPathSegment(userId: string): Promise<string> {
  * by `resolveUserPathSegment` in `uploadLiteTraceLogToStorage`), the raw
  * userId as a fallback when email lookup fails, or the literal `anonymous`
  * for non-UUID runs. `traceType` is a dedicated folder per source
- * (editor / preview / draft / replay / lite / api-agent / exploration) so
+ * (editor / preview / draft / regression / lite / api-agent / exploration) so
  * all logs of one kind sit together across dates.
  *
  * Uploads are performed by `supabaseAdmin` (service role), so the bucket's

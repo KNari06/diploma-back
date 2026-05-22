@@ -9,6 +9,7 @@ import type {
   BindingHints,
   StepEvidence,
   TargetFingerprint,
+  LintStatus,
 } from '@/services/testing/ui/preview/preview.types';
 
 // ============================================================================
@@ -117,6 +118,17 @@ export interface ClientToServerEvents {
   // Preview recording
   'preview:recording:start': (data: PreviewRecordingRequest) => void;
   'preview:recording:stop': (data: PreviewRecordingRequest) => void;
+  // Preview "Pick element" — one-shot read-only element picker.
+  // Mutually exclusive with recording and run (see preview.handler.ts mutex).
+  'preview:pick:start': (data: PreviewPickStartRequest) => void;
+  'preview:pick:cancel': (data: PreviewPickCancelRequest) => void;
+  // In-page hover overlay (replaces React-rendered hoverHighlight, May
+  // 2026). FE flips this between 'navigation' (mouse is interacting
+  // with the preview) and 'off' (preview is focused but not active —
+  // e.g. when the click-to-enable hint is visible). Backend tracks the
+  // current mode per session; recording start/stop additionally flips
+  // to 'recording' on its own.
+  'preview:hover-overlay:set': (data: PreviewHoverOverlaySetRequest) => void;
   // Inline upload picker responses (correlated by stepId with a
   // `preview:recording:upload:prompt` emitted from the server).
   'preview:recording:upload:resolve': (
@@ -297,6 +309,29 @@ export interface ServerToClientEvents {
   // and bounce back to the Repository view. The runner emulator is
   // intentionally left alive on idle so re-opening the test case is fast.
   'mobile:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+
+  // Web preview editor session expired — fired when the user has been idle
+  // past `IDLE_TTL_MS` (15 min) in `services/testing/ui/preview/preview-idle.service.ts`.
+  // Mirrors `mobile:session:expired`. Frontend closes the editor, clears
+  // `intentTestCaseId` from the URL, toasts the user, and bounces back to
+  // the Repository view. The Playwright preview session is stopped server-
+  // side before this event is emitted (cheap to re-create on reopen).
+  'preview:session:expired': (data: { reason: 'idle' | 'disconnect' }) => void;
+
+  // Preview video stream lifecycle. Emitted when the backend tears down the
+  // video stream for reasons the FE watchdog cannot infer from frame gaps
+  // alone. Frontend uses `reason` to pick between recovery and terminal:
+  //   - 'session_evicted' — TTL cleanup destroyed the preview session
+  //     (Playwright context gone, not coming back). FE shows a terminal
+  //     "Session expired" error and prompts the user to reset.
+  //   - any other value — transient stop (e.g. page close, CDP died);
+  //     FE re-subscribes to rebuild the screencast.
+  // See `apps/web/src/hooks/usePreviewVideoStream.js handleStreamState`.
+  'preview:stream:state': (data: {
+    previewSessionId: string;
+    state: 'stopped';
+    reason: 'session_evicted' | 'explicit_stop' | 'page_close' | 'cdp_dead';
+  }) => void;
 
   // Response to `preview:session:inspect`. Contains non-sensitive counts
   // + sameOrigin flag so the frontend can decide whether to prompt the
@@ -501,6 +536,11 @@ export interface ServerToClientEvents {
    * `preview:recording:upload:cancel`.
    */
   'preview:recording:upload:prompt': (data: PreviewRecordingUploadPromptPayload) => void;
+
+  // Preview pick element (server -> client)
+  'preview:pick:state': (data: PreviewPickStatePayload) => void;
+  'preview:pick:result': (data: PreviewPickResultPayload) => void;
+  'preview:pick:lint': (data: PreviewPickLintPayload) => void;
 
   // Preview interactive control responses
   'preview:viewport': (data: PreviewViewportPayload) => void;
@@ -1852,6 +1892,133 @@ export interface PreviewRecordingStatePayload {
    * separate config fetch. 0 = cap disabled. Missing on pre-cap builds.
    */
   maxSteps?: number;
+  timestamp: string;
+}
+
+// ============================================================================
+// PREVIEW PICK ELEMENT PAYLOADS
+// ----------------------------------------------------------------------------
+// One-shot "Pick element" mode: user enters pick mode from the manual step
+// form, hovers over the live preview to highlight elements, clicks once to
+// select. The click is intercepted (capture phase, stopImmediatePropagation)
+// so the page sees no real interaction — picking is read-only.
+//
+// Mutually exclusive with recording and run (see preview.handler.ts mutex).
+// ============================================================================
+
+export interface PreviewPickStartRequest {
+  previewSessionId: string;
+}
+
+export interface PreviewPickCancelRequest {
+  previewSessionId: string;
+}
+
+/**
+ * Set the in-page hover overlay mode (preview-hover-overlay.service.ts).
+ *
+ *   - 'navigation' — paint blue solid outline on hover; default when the
+ *                    preview iframe is being interacted with.
+ *   - 'off'        — tear the overlay down (mouseleave / focus-mode hint
+ *                    on top of the iframe).
+ *
+ * `'recording'` mode is set server-side automatically on
+ * preview:recording:start / finalizeRecording — clients should NOT send
+ * it directly (their request will be honoured but recording state can
+ * overwrite the next moment).
+ */
+export interface PreviewHoverOverlaySetRequest {
+  previewSessionId: string;
+  mode: 'navigation' | 'recording' | 'off';
+}
+
+/**
+ * Pick state echo (server -> client). Confirms enter/exit and carries the
+ * server-side reason on auto-exit (timeout, navigation, mutex preempt).
+ */
+export interface PreviewPickStatePayload {
+  previewSessionId: string;
+  active: boolean;
+  reason?: 'started' | 'cancelled' | 'picked' | 'timeout' | 'preempted' | 'session_closed' | 'error';
+  error?: string;
+  timestamp: string;
+}
+
+/**
+ * Pick result (server -> client). Emitted ONCE per successful pick, then
+ * pick-mode auto-exits with a `preview:pick:state { active: false, reason: 'picked' }`.
+ *
+ * Identity contract:
+ *   - `recordedFingerprint` is the SOURCE OF TRUTH for identity. Everything
+ *     the backend resolver consumes lives here.
+ *   - `stableId` / `testId` / `tag` / `ref` are convenience shortcuts that
+ *     mirror the most common fingerprint fields — the FE uses them to
+ *     render the read-only "tag#id" label without unpacking the
+ *     fingerprint. If they ever drift from the fingerprint, the
+ *     fingerprint wins at replay.
+ *   - `bindingHints` is kept separately because the FE persists it into
+ *     the saved step alongside the fingerprint.
+ *
+ * Fields removed deliberately (compared to early drafts):
+ *   - containerRef / isInsideActiveModal: derivable from
+ *     `recordedFingerprint.ancestorChain` server-side; no FE caller today.
+ *   - boundingBox: the in-page overlay paints the "✓ Recorded" badge
+ *     itself, FE doesn't need coords.
+ */
+export interface PreviewPickResultPayload {
+  previewSessionId: string;
+  /** Short human-readable description (LLM-generated, like recording's). */
+  description?: string;
+  /** DOM `id` attribute (post dynamic-id filter). Convenience shortcut. */
+  stableId?: string;
+  /** data-testid / data-test / data-qa value. Convenience shortcut. */
+  testId?: string;
+  /** Volatile in-page ref pointing at the live node, like recording uses. */
+  ref?: string;
+  /** Element tag (button/input/...) — used by FE for the "tag#id" badge. */
+  tag?: string;
+  /** Full recorded fingerprint — SOURCE OF TRUTH for identity. */
+  recordedFingerprint?: TargetFingerprint;
+  /** Binding hints (role/name/label/etc.) for fallback resolution. */
+  bindingHints?: BindingHints;
+  /**
+   * Suggested action type derived from the element kind. Subset of
+   * IntentActionType — buttons → 'click', text inputs → 'type', selects →
+   * 'select', tooltip / hover targets → 'hover'. The form pre-fills the
+   * action dropdown with this but the user can still change it.
+   */
+  suggestedAction?: 'click' | 'type' | 'select' | 'hover';
+  /**
+   * Dry-run lint result against the picked element. UI surfaces warnings.
+   *
+   * @deprecated since May 2026 — kept for backwards compatibility with FE
+   * clients that haven't upgraded to the two-phase emit. The pick service
+   * now emits `preview:pick:lint` separately so the primary result is not
+   * blocked on a 5-10s LLM call. New code should read lint from the
+   * `preview:pick:lint` event payload (`PreviewPickLintPayload.lint`).
+   */
+  lint?: {
+    status: LintStatus;
+    confidence?: number;
+    message?: string;
+  };
+  timestamp: string;
+}
+
+/**
+ * Follow-up lint emit for the picker. Fired AFTER `preview:pick:result`
+ * (which is sent as soon as the element is probed) so the FE form can
+ * populate description + fingerprint immediately and overlay the lint
+ * warning (if any) when the dry-run resolve finishes. Two-phase emit;
+ * see PreviewPickResultPayload for the rationale.
+ */
+export interface PreviewPickLintPayload {
+  previewSessionId: string;
+  lint: {
+    status: LintStatus;
+    confidence?: number;
+    message?: string;
+  };
   timestamp: string;
 }
 

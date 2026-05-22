@@ -131,6 +131,11 @@ function mapActionType(intentAction: IntentActionType): string {
     // V15: Multi-tab
     case 'switch_tab':
       return 'switchTab';
+    // Multi-tab close — symmetric with switch_tab. Background replay maps
+    // this to the existing `closeTab` Playwright action used by the same
+    // command-executor branch that handles the live preview path.
+    case 'close_tab':
+      return 'closeTab';
     // V16: Gestures and coordinates
     case 'swipe':
       return 'swipe';
@@ -410,6 +415,11 @@ export function convertIntentStepToCommand(
 
     // V18: Multi-tab switch — pass target tab index
     case 'switch_tab':
+      command.value = step.value || '0';
+      break;
+
+    // Multi-tab close — target tab index in `value`, same shape as switch.
+    case 'close_tab':
       command.value = step.value || '0';
       break;
 

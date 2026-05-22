@@ -13,6 +13,7 @@
 
 import type { LiteElement } from '@/agent/core/lite/lite-types';
 import { SNAPSHOT_ROUTER_FLAGS } from '@/config/testing/snapshot-router.config';
+import { LANDMARK_EVALUATE_BUNDLE } from '@/services/testing/ui/preview/landmark.util';
 import type { InteractiveNode } from '@/services/testing/ui/preview/preview.types';
 import { SnapshotRouter } from '@/services/testing/ui/preview/snapshot-router.service';
 import { logger } from '@/utils/core/logger';
@@ -403,7 +404,14 @@ function buildExtractScript(maxNodes: number): string {
 
     // Get container titles (form legend, fieldset legend, section heading, ARIA groups)
     // Phase 7: Expanded container detection — depth 8, semantic containers, landmarks
-    const LANDMARK_ROLES = ['banner', 'navigation', 'main', 'complementary', 'contentinfo', 'search', 'form', 'region'];
+    //
+    // LANDMARK_ROLES + LANDMARK_TAG_TO_ROLE are injected from
+    // src/services/testing/ui/preview/landmark.util.ts via template
+    // interpolation so this script stays byte-symmetric with the preview
+    // snapshot-collector / cdp-snapshot / recorder (invariant #5). Edit
+    // landmark.util.ts — never the literals here.
+    const LANDMARK_ROLES = ${JSON.stringify(LANDMARK_EVALUATE_BUNDLE.ROLES)};
+    const LANDMARK_TAG_TO_ROLE = ${JSON.stringify(LANDMARK_EVALUATE_BUNDLE.TAGS)};
     const SEMANTIC_TAGS = ['FIELDSET', 'FORM', 'SECTION', 'ARTICLE', 'NAV', 'ASIDE', 'DIALOG', 'HEADER', 'FOOTER', 'MAIN'];
 
     const containerTitles = [];
@@ -418,15 +426,13 @@ function buildExtractScript(maxNodes: number): string {
       // Track nearest landmark role
       if (!nearestLandmark) {
         // Explicit ARIA landmark role
-        if (parentRole && LANDMARK_ROLES.includes(parentRole)) {
+        if (parentRole && LANDMARK_ROLES.indexOf(parentRole) !== -1) {
           nearestLandmark = parentRole;
+        } else {
+          // Implicit landmark from semantic HTML tags (NAV/MAIN/HEADER/…)
+          const implicit = LANDMARK_TAG_TO_ROLE[parentTag];
+          if (implicit) nearestLandmark = implicit;
         }
-        // Implicit landmark from semantic HTML tags
-        else if (parentTag === 'NAV') nearestLandmark = 'navigation';
-        else if (parentTag === 'MAIN') nearestLandmark = 'main';
-        else if (parentTag === 'HEADER') nearestLandmark = 'banner';
-        else if (parentTag === 'FOOTER') nearestLandmark = 'contentinfo';
-        else if (parentTag === 'ASIDE') nearestLandmark = 'complementary';
       }
 
       // Extract container title from semantic containers

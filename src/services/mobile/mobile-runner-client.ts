@@ -84,7 +84,11 @@ export class MobileRunnerClient {
   ): Promise<MobileSessionResponse> {
     return this.request<MobileSessionResponse>('POST', '/api/sessions', {
       body: { platform, ...config },
-      timeoutMs: 60_000, // Emulator boot can take 30-60s
+      // Emulator boot can exceed the previous 60s on cold-starts under load
+      // (large APK install + slow disk + permission pre-grant). Bumped to
+      // 180s — frontend was hitting the old cap during /warmup and surfacing
+      // a generic timeout error to the user.
+      timeoutMs: 180_000,
     });
   }
 

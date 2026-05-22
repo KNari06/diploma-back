@@ -218,6 +218,17 @@ export interface LiteElement {
   containerRef?: string;
   /** Titles of key containers (form legend, fieldset legend, section heading) */
   containerTitles?: string[];
+  /**
+   * Nearest ARIA landmark role on an ancestor (banner, navigation, main,
+   * complementary, contentinfo, search, form, region). Drives:
+   *  - locator-plan-builder "scoped text" strategy (`navigation >> text="…"`),
+   *  - recorded fingerprint region match at replay / auto-heal,
+   *  - recorded-description-llm prompt context,
+   *  - intent-resolve-audit diagnostics.
+   * Symmetric across recorder, snapshot-collector, cdp-snapshot, and the
+   * background-replay collector — divergence breaks identity match.
+   */
+  nearestLandmark?: string;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PHASE 4: Custom component interactivity signals

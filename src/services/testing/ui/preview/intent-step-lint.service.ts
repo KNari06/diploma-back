@@ -926,7 +926,7 @@ export class IntentStepLintService {
      * Audit-only context for logs/intent_resolve.log so apply-time pre-lints
      * vs editor lints can be told apart in analysis.
      */
-    auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other';
+    auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other';
   }): Promise<LintResult> {
     // Diagnostic wrapper: captures intent + LintResult into intent_resolve.log
     // for every lint call. Implementation lives in `_lintStepWithAIImpl`.
@@ -1021,7 +1021,7 @@ export class IntentStepLintService {
     userId: string;
     includeAlternatives?: boolean;
     forceFreshSnapshot?: boolean;
-    auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'other';
+    auditTrigger?: 'find_button' | 'auto_lint' | 'apply_prelint' | 'pick_dry_run' | 'other';
   }, onContext?: (url: string | undefined, domNodeCount: number) => void): Promise<LintResult> {
     const { previewSessionId, stepDraft, userId, includeAlternatives = false, forceFreshSnapshot = false } = params;
 

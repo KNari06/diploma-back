@@ -15,6 +15,7 @@ import type { InteractiveNode, PreviewSession, TargetFingerprint } from './previ
 import { setupThirdPartyBlocker } from '@/agent/playwright/execution/third-party-blocker';
 import { PREVIEW_SESSION_CONFIG, BROWSER_USER_AGENT, BROWSER_LAUNCH_ARGS, BROWSER_HEADLESS_MODE, BROWSER_EXTRA_HEADERS, BROWSER_STEALTH_SCRIPT } from '@/config/testing/playwright-tuning';
 import { waitForPageInteractive } from './page-interactive.utils';
+import { cancelIdle as cancelPreviewIdle } from './preview-idle.service';
 
 const SESSION_TTL_MS = PREVIEW_SESSION_CONFIG.sessionTtlMs;
 const SESSION_CLEANUP_INTERVAL_MS = PREVIEW_SESSION_CONFIG.sessionCleanupIntervalMs;
@@ -1634,6 +1635,12 @@ export class PreviewSessionService {
       this.sessions.delete(sessionId);
       this.userToSession.delete(session.userId);
 
+      // Drop any pending idle-redirect timer for this user. Without this the
+      // preview-idle service can still fire after an explicit stop and emit
+      // a phantom `preview:session:expired` if the user has reconnected on a
+      // different socket. See preview-idle.service.ts onIdleFire.
+      try { cancelPreviewIdle(session.userId); } catch { /* non-fatal */ }
+
       logger.info('[PREVIEW_SESSION] Session stopped', { sessionId });
     } finally {
       releaseLock();
@@ -1710,6 +1717,9 @@ export class PreviewSessionService {
     // Remove from maps atomically (even if cleanup failed)
     this.sessions.delete(sessionId);
     this.userToSession.delete(session.userId);
+
+    // Drop any pending idle-redirect timer — mirror of stopSession() above.
+    try { cancelPreviewIdle(session.userId); } catch { /* non-fatal */ }
 
     logger.info('[PREVIEW_SESSION] Session stopped (internal)', { sessionId });
   }
@@ -1876,8 +1886,31 @@ export class PreviewSessionService {
     y: number;
     button?: 'left' | 'right' | 'middle';
     clickCount?: number;
+    /**
+     * Keyboard modifiers held during the click. Two effects:
+     *
+     *  1. Anchor new-tab promotion: if a modifier (Cmd/Ctrl/Shift) is held
+     *     on an `<a href>`, the click branch promotes it to a new tab via
+     *     `context.newPage() + goto(href)`. Cmd/Ctrl-click is Chromium's
+     *     canonical "open in new tab" gesture; Shift-click in real Chromium
+     *     opens a NEW WINDOW (a separate top-level browser window, which in
+     *     Playwright terms is a NEW BrowserContext) — but we can't surface
+     *     a second window in the preview UI, so we intercept Shift-click
+     *     here and route it through `context.newPage()` like the others.
+     *     Same-context popup → adopted by `attachPopupHandler` → shows up
+     *     as a sibling tab in the preview pill bar.
+     *
+     *  2. Modifiers that DIDN'T trigger new-tab promotion are forwarded into
+     *     `page.mouse.click({ modifiers })` so Alt-click, Shift+Click on
+     *     non-anchors (range selection), etc. still reach Chromium with the
+     *     real key held.
+     *
+     * Without this field, modifier presses captured by the FE are silently
+     * dropped before reaching Playwright.
+     */
+    modifiers?: { shift?: boolean; ctrl?: boolean; meta?: boolean; alt?: boolean };
   }): Promise<{ success: boolean; error?: string; needsSnapshot: boolean }> {
-    const { sessionId, userId, action, x, y, button = 'left', clickCount = 1 } = params;
+    const { sessionId, userId, action, x, y, button = 'left', clickCount = 1, modifiers } = params;
     const session = this.getAuthorizedSession(sessionId, userId);
 
     if (!session) {
@@ -1929,6 +1962,70 @@ export class PreviewSessionService {
         }
 
         case 'click': {
+          // New-tab promotion: anchors with explicit `target` (`_blank` /
+          // named) OR cross-origin anchors are opened as a real new tab via
+          // `context.newPage(); newPage.goto(href)`. This runs BEFORE the
+          // external-nav blocker because (a) `<a target="_blank">` would
+          // otherwise fall through and Chromium would collapse it back into
+          // the same tab on our headless+disable-isolation config, and (b)
+          // a cross-origin link IS an intentional "go elsewhere" — better
+          // to give the user a real second tab than block the click.
+          // Modifier-driven new-tab (Cmd/Ctrl/Shift+Click): even on a same-
+          // origin `<a>` the user explicitly asked for a new tab, so we
+          // promote it too.
+          try {
+            const anchorProbe = await session.page.evaluate(
+              (coords: { x: number; y: number }) => {
+                const g = globalThis as unknown as {
+                  document: {
+                    elementFromPoint: (x: number, y: number) => unknown;
+                  };
+                };
+                const el = g.document.elementFromPoint(coords.x, coords.y) as unknown as {
+                  closest: (sel: string) => null | { href?: string; getAttribute: (n: string) => string | null };
+                } | null;
+                if (!el) return null;
+                const a = el.closest('a[href]');
+                if (!a) return null;
+                return {
+                  tag: 'a',
+                  href: a.href || undefined,
+                  target: a.getAttribute('target') || undefined,
+                };
+              },
+              { x: clampedX, y: clampedY },
+            ) as { tag: 'a'; href?: string; target?: string } | null;
+
+            const wantsNewTabByModifier = !!(modifiers && (modifiers.meta || modifiers.ctrl || modifiers.shift)) || safeButton === 'middle';
+
+            const { shouldOpenAsNewTab, openHrefInNewTab } = await import('./new-tab-opener');
+            const decision = shouldOpenAsNewTab(anchorProbe, session.page.url());
+
+            if (decision || (wantsNewTabByModifier && anchorProbe?.href)) {
+              const href = decision ? decision.href : anchorProbe!.href!;
+              // Tag the modifier-driven path explicitly. Without this, a
+              // Cmd-Click on a same-origin link would log as `explicit_target`
+              // (which means `<a target=_blank>`) and skew any telemetry that
+              // breaks down promotion channels.
+              const reason = decision ? decision.reason : 'modifier_driven';
+              const tabOpen = await openHrefInNewTab(session.page.context(), href, reason);
+              if (tabOpen) {
+                // `attachPopupHandler` (context.on('page')) is the single
+                // source of truth for adopting the new page into
+                // `session.pages` and emitting `preview:tab:opened`. We
+                // intentionally do NOT mutate session state here.
+                return { success: true, needsSnapshot: true };
+              }
+              // Fall through to normal click if newPage path failed.
+            }
+          } catch (probeErr) {
+            // Probe failure is non-fatal — keep going.
+            logger.debug('[PREVIEW_SESSION] Anchor new-tab probe failed, proceeding', {
+              sessionId,
+              error: probeErr instanceof Error ? probeErr.message : String(probeErr),
+            });
+          }
+
           // V16: Intercept clicks on external-navigation anchors BEFORE they
           // fire. External http(s) links opened inline strand the user (the
           // preview address bar has no "back" history), and custom-protocol
@@ -1951,7 +2048,22 @@ export class PreviewSessionService {
             });
             return { success: false, error: message, needsSnapshot: false };
           }
-          await session.page.mouse.click(clampedX, clampedY, { button: safeButton, clickCount: safeClickCount });
+          // Build Playwright modifiers array from WS payload modifiers. This
+          // lets a recorded Cmd-click reach Chromium with the actual key
+          // held, so middle-button + modifier semantics work naturally for
+          // anchors we didn't promote above (button onClick, JS handlers).
+          const clickModifiers: ('Shift' | 'Control' | 'Alt' | 'Meta')[] = [];
+          if (modifiers) {
+            if (modifiers.shift) clickModifiers.push('Shift');
+            if (modifiers.ctrl) clickModifiers.push('Control');
+            if (modifiers.meta) clickModifiers.push('Meta');
+            if (modifiers.alt) clickModifiers.push('Alt');
+          }
+          await session.page.mouse.click(clampedX, clampedY, {
+            button: safeButton,
+            clickCount: safeClickCount,
+            ...(clickModifiers.length > 0 && { modifiers: clickModifiers }),
+          });
           return { success: true, needsSnapshot: true };
         }
 
@@ -3367,6 +3479,30 @@ export class PreviewSessionService {
         this.attachPageDownloadHandler(newPage, previewSessionId);
         this.attachTabCloseListener(newPage, previewSessionId);
 
+        // Emit the pill-bar update IMMEDIATELY — the user must see a second
+        // pill appear the moment the popup is created, not 4-10s later after
+        // we wait for DOMContentLoaded + dismiss-overlays + screencast
+        // restart. Tabs UI is purely state-driven (just labels + URLs from
+        // `buildTabsInfo`), so it has no dependency on the new page being
+        // fully interactive. The rest of the handler (overlay-dismiss, DOM
+        // wait, onPageSwitch screencast restart) continues below; subsequent
+        // `preview:tab:switched` / video frames will catch up naturally.
+        //
+        // Why two emits (here AND at the bottom of this handler): the second
+        // emit at line ~3550+ is kept for the case where new-tab labels
+        // changed between this moment and DOM-ready (e.g. <title> filled in
+        // after domcontentloaded). FE is idempotent — same tabsInfo shape
+        // just overwrites state. Cost: one extra socket message per popup.
+        try {
+          const earlyTabsInfo = this.buildTabsInfo(session);
+          webSocketService.emitToRoom('preview', previewSessionId, 'preview:tab:opened', {
+            previewSessionId,
+            tabs: earlyTabsInfo,
+            activeTabIndex: session.activeTabIndex,
+            timestamp: new Date().toISOString(),
+          });
+        } catch { /* non-critical */ }
+
         // V16: Auth detector + external-nav trap for the popup. Popups are
         // frequently payment/OAuth flows that cross-origin-redirect; without
         // these the user gets no safety net once we've switched to the popup.
@@ -3899,7 +4035,15 @@ export class PreviewSessionService {
   }
 
   /**
-   * Cleanup expired sessions
+   * Cleanup expired sessions.
+   *
+   * For each session past SESSION_TTL_MS we emit `preview:stream:state` with
+   * `reason: 'session_evicted'` BEFORE tearing it down so the frontend can
+   * distinguish a terminal eviction (show "Session expired" + prompt reset)
+   * from a transient stream stop (auto-recover via re-subscribe). Without
+   * this signal the FE watchdog would loop subscribe-churn against a dead
+   * session for MAX_RECOVERY_ATTEMPTS before giving up.
+   * See `apps/web/src/hooks/usePreviewVideoStream.js handleStreamState`.
    */
   private async cleanupExpiredSessions(): Promise<void> {
     const now = Date.now();
@@ -3913,6 +4057,21 @@ export class PreviewSessionService {
 
     for (const sessionId of expiredSessions) {
       logger.info('[PREVIEW_SESSION] Cleaning up expired session', { sessionId });
+      // Notify the FE BEFORE the actual teardown — stopSession can take a few
+      // seconds on a stuck Playwright context, and the FE shouldn't have to
+      // wait that long to know its session is permanently gone.
+      try {
+        webSocketService.emitToRoom('preview', sessionId, 'preview:stream:state', {
+          previewSessionId: sessionId,
+          state: 'stopped',
+          reason: 'session_evicted',
+        });
+      } catch (emitErr) {
+        logger.warn('[PREVIEW_SESSION] Failed to emit stream:state on eviction', {
+          sessionId,
+          error: emitErr instanceof Error ? emitErr.message : String(emitErr),
+        });
+      }
       await this.stopSession(sessionId);
     }
 

@@ -73,6 +73,16 @@ export const AUDIT_EVENTS = {
   JIRA_ISSUE_UPDATED: 'jira.issue_updated',
   JIRA_ISSUE_STATUS_CHANGED: 'jira.issue_status_changed',
   JIRA_DISCONNECTED: 'jira.disconnected',
+
+  // Account-deletion lifecycle (Phase 1 / May 2026). Logged into the
+  // workspace audit log of every workspace the user is/was a member of,
+  // so the audit trail survives the user-row purge — workspace owners
+  // can later see "X left / was hard-deleted" entries even after the
+  // FK SET NULL on actor_user_id.
+  ACCOUNT_DELETION_REQUESTED: 'account.deletion_requested',
+  ACCOUNT_DELETION_CANCELLED: 'account.deletion_cancelled',
+  ACCOUNT_DELETION_COMPLETED: 'account.deletion_completed',
+  ACCOUNT_DELETION_FAILED: 'account.deletion_failed',
 } as const;
 
 export type AuditEventType = (typeof AUDIT_EVENTS)[keyof typeof AUDIT_EVENTS];

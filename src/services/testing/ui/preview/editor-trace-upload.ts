@@ -11,6 +11,7 @@ import { isValidUUID } from '@/utils/validation/validation';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { TraceType } from '@/services/storage/test-artifacts-storage.service';
+import { aggregateJsonl, type TraceSummary } from './trace-analysis.util';
 
 interface UploadEditorTraceParams {
   filePath: string;
@@ -89,32 +90,49 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
       fileSize: `${Math.round(fileSize / 1024)}KB`,
     });
 
-    // Compute quick summary from JSONL before upload (best-effort)
-    let parsedData: Record<string, unknown> | null = null;
+    // parsed_data layer — what dashboards / SQL queries see in Supabase.
+    //
+    // Strategy: if the writer wrote a `trace_summary` event at close, use
+    // that directly (no double-work, no risk of drift). Otherwise recompute
+    // by re-aggregating the JSONL — same algorithm, defined once in
+    // ./trace-analysis.util.ts. See that file for the field-by-field map.
+    //
+    // Why two paths:
+    //   1. trace_summary at close = the canonical record. Lives inside
+    //      the JSONL itself so `jq` can read it locally without DB.
+    //   2. Upload-time recompute = belt-and-suspenders. If writer was
+    //      killed mid-flush (SIGKILL, OOM, container restart) the
+    //      trace_summary event may be missing — recompute keeps
+    //      parsed_data populated rather than null.
+    let parsedData: TraceSummary | null = null;
     try {
       const raw = await fs.readFile(filePath, 'utf-8');
+
+      // First try the cheap path: scan from the bottom for the
+      // canonical trace_summary event. Writers emit it as the LAST
+      // line on graceful close, so we usually hit it within a few
+      // lines from the end.
       const lines = raw.split('\n');
-      let errors = 0, failedSteps = 0, totalSteps = 0, totalEvents = 0;
-      for (const line of lines) {
+      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 10); i--) {
+        const line = lines[i];
         if (!line.trim()) continue;
-        totalEvents++;
         try {
           const evt = JSON.parse(line);
-          if (evt.stage === 'error' || evt.eventType === 'error') errors++;
-          if (evt.eventType === 'step_result') {
-            totalSteps++;
-            if (evt.payload?.status === 'fail') failedSteps++;
+          if (evt?.eventType === 'trace_summary' && evt.payload) {
+            parsedData = evt.payload as TraceSummary;
+            break;
           }
-          if (evt.eventType === 'run_error_summary') {
-            errors = Math.max(errors, evt.payload?.totalErrors ?? 0);
-          }
-          if (evt.eventType === 'run_end') {
-            if (evt.payload?.totalSteps) totalSteps = evt.payload.totalSteps;
-            if (evt.payload?.failedSteps) failedSteps = evt.payload.failedSteps;
-          }
-        } catch { /* skip malformed */ }
+        } catch { /* malformed tail — fall back to recompute */ }
+        // Stop scanning the tail once we hit any non-summary event —
+        // trace_summary is supposed to be last, no point walking the
+        // full file from the back.
+        break;
       }
-      parsedData = { errors, failedSteps, totalSteps, totalEvents };
+
+      // Fallback recompute when the close-time event wasn't written.
+      if (!parsedData) {
+        parsedData = aggregateJsonl(raw);
+      }
     } catch {
       // Non-fatal — summary will be null
     }
@@ -144,7 +162,9 @@ export async function uploadEditorTrace(params: UploadEditorTraceParams): Promis
         storagePath: uploadResult.storagePath,
         fileSize: uploadResult.fileSize,
         browser: traceType === 'editor' ? 'editor-trace' : 'preview-run-trace',
-        parsedData,
+        // TraceSummary is a flat numeric struct — the explicit cast keeps
+        // it queryable as a plain JSONB record on the Supabase side.
+        parsedData: parsedData as unknown as Record<string, unknown> | null,
       });
     } catch (insertError) {
       logger.error(`${TAG} Failed to insert trace_files record, rolling back storage`, {

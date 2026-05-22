@@ -164,41 +164,68 @@ const transports: winston.transport[] = [
       truncateLargeFields(),
     ),
   }),
-  // V25 — Console transport with debug-level noise filter.
-  // Each suppressed tag below fires every 1-10s during a session and
-  // crowds out the lines we actually care about. They still land in
-  // v25-debug.log if matched there; here we only filter terminal output.
+  // V25 — Console transport with level-aware noise filter.
+  // Each suppressed tag fires every 1-10s during a session and
+  // crowds out the lines we actually care about. Suppression here
+  // is TERMINAL-ONLY — the file transports (v25-debug.log,
+  // etap2-cdp.log, combined.log) still receive these entries, so
+  // post-mortem analysis is unaffected.
   new winston.transports.Console({
     format: winston.format.combine(
       winston.format((info) => {
-        // Suppress only at debug level — info/warn/error always pass.
-        if (info.level !== 'debug') return info;
         const msg = typeof info.message === 'string' ? info.message : String(info.message);
-        const NOISY_DEBUG_TAGS = [
-          '[PREVIEW_VIDEO] Stats',
-          '[PREVIEW_VIDEO] Injected manual frame',
-          '[PREVIEW_VIDEO] First frame guaranteed',
-          '[WebSocketService] Emitted to user',
-          '[STEP_READINESS] Skipped',
-          '[STEP_READINESS] Starting lookahead',
-          '[STEP_READINESS] Element ready',
-          '[STEP_READINESS] Unknown locator',
-          '[PreviewRun] Lookahead skipped',
-          '[PreviewRun] Evidence policy check',
-          '[SNAPSHOT_REJECTS] filter rejection summary',
-          '[ELEMENT_RESOLVER] Starting resolution',
-          '[ELEMENT_RESOLVER] Built allowed sets',
-          '[ELEMENT_RESOLVER] Allowed sets built',
-          '[COMPILED_EXECUTOR] Compiled signature is base64',
-          '[INTENT_LINT] Linting step',
-          '[AI_USAGE] Untracked AI call',
-          '[AI_PROVIDER] Generating text',
-          '[BLOCKER_DIAGNOSIS] Requesting LLM diagnosis',
-          '[BLOCKER_DIAGNOSIS] Wait timed out',
-          '[INTENT_LINT_V23] Clarification LLM resolved',
-          '[INTENT_LINT_V4] Degraded mode: fingerprint',
-        ];
-        return NOISY_DEBUG_TAGS.some(t => msg.includes(t)) ? false : info;
+
+        // Suppress only at debug level — these are pure noise in the terminal.
+        if (info.level === 'debug') {
+          const NOISY_DEBUG_TAGS = [
+            '[PREVIEW_VIDEO] Stats',
+            '[PREVIEW_VIDEO] Injected manual frame',
+            '[PREVIEW_VIDEO] First frame guaranteed',
+            '[WebSocketService] Emitted to user',
+            '[STEP_READINESS] Skipped',
+            '[STEP_READINESS] Starting lookahead',
+            '[STEP_READINESS] Element ready',
+            '[STEP_READINESS] Unknown locator',
+            '[PreviewRun] Lookahead skipped',
+            '[PreviewRun] Evidence policy check',
+            '[SNAPSHOT_REJECTS] filter rejection summary',
+            '[ELEMENT_RESOLVER] Starting resolution',
+            '[ELEMENT_RESOLVER] Built allowed sets',
+            '[ELEMENT_RESOLVER] Allowed sets built',
+            '[COMPILED_EXECUTOR] Compiled signature is base64',
+            '[INTENT_LINT] Linting step',
+            '[AI_USAGE] Untracked AI call',
+            '[AI_PROVIDER] Generating text',
+            '[BLOCKER_DIAGNOSIS] Requesting LLM diagnosis',
+            '[BLOCKER_DIAGNOSIS] Wait timed out',
+            '[INTENT_LINT_V23] Clarification LLM resolved',
+            '[INTENT_LINT_V4] Degraded mode: fingerprint',
+          ];
+          return NOISY_DEBUG_TAGS.some((t) => msg.includes(t)) ? false : info;
+        }
+
+        // Suppress only at warn level — high-frequency Etap 2 shadow-mode
+        // divergence warnings during preview ramp-up. They fire on every
+        // preview-tick (~2/sec) on dense pages and drown the terminal,
+        // but they are essential signal — that's why they keep landing in
+        // logs/etap2-cdp.log via the dedicated file transport. The
+        // terminal does not need them.
+        if (info.level === 'warn') {
+          const NOISY_WARN_TAGS = [
+            '[SNAPSHOT_SHADOW_DIVERGENCE]',
+            // `[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements` —
+            // fires on canvas-only / blank intermediate pages (e.g. 360°
+            // panorama viewer at panoDIV) where there are physically no
+            // interactive nodes to collect. Not a bug; the resolver will
+            // just see an empty allowed set and bail. Kept in combined.log
+            // for postmortem because the debugStats payload is rich.
+            '[SNAPSHOT_COLLECTOR] page.evaluate returned 0 elements',
+          ];
+          return NOISY_WARN_TAGS.some((t) => msg.includes(t)) ? false : info;
+        }
+
+        // info / error — always pass through.
+        return info;
       })(),
       winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss:ms' }),
       winston.format.errors({ stack: true }), // ← FIX: Extract error.stack

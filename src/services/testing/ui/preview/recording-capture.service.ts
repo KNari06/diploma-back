@@ -243,6 +243,16 @@ export interface ProbedElement {
    */
   href?: string;
   /**
+   * `<a target="...">` attribute when present (`_blank`, named target, etc.).
+   * Captured ONLY for anchors with non-empty `target` — replay path uses it
+   * to open the link as a NEW TAB (`context.newPage()`) instead of inline
+   * navigation, which is what Chromium does on a real user click. Without
+   * this, Playwright's `locator.click()` ignores target semantics on certain
+   * site/browser combinations and collapses the popup into the same tab,
+   * which strands the user.
+   */
+  linkTarget?: string;
+  /**
    * V22: Vue scoped style attribute (`data-v-XXXXXXX`). On Vue apps this is
    * a stable component-instance marker — narrows down to "this exact button
    * within this exact component" even if class names are utility-only.
@@ -1250,6 +1260,21 @@ const PROBE_AT_POINT_FN = `
   // contentinfo|form). Implicit landmarks via tagName, explicit via role attr.
   // Walk closest-first, stop at body. Mirrors how snapshot collector tags
   // InteractiveNode.nearestLandmark so apply-time and recording-time agree.
+  // MUST MATCH src/services/testing/ui/preview/landmark.util.ts
+  //   EXPLICIT_LANDMARKS == LANDMARK_ROLES (the W3C ARIA 1.2 set).
+  //   LANDMARK_TAGS == LANDMARK_TAG_TO_ROLE keys, lowercased.
+  //
+  // This block runs inside PROBE_AT_POINT_FN serialized via String(fn),
+  // so it cannot import the shared util — same constraint as
+  // dynamic-id.util.ts inline copies elsewhere. Update both this block
+  // and landmark.util.ts together. Two extra entries are intentional:
+  //   1. form tag: recorder treats bare form as implicit landmark
+  //      because identity match downstream needs the form region anchor.
+  //      landmark.util omits this from the shared table (per HTML-AAM
+  //      strict reading) but documents the asymmetry.
+  //   2. walk depth 12 (vs collector 6): recorded fingerprint sometimes
+  //      needs deeper landmark anchors. Tracked as known asymmetry in
+  //      snapshot-collector.ts.
   var nearestLandmark = undefined;
   var landmarkWalk = target.parentElement;
   var LANDMARK_TAGS = { 'header': 'banner', 'nav': 'navigation', 'main': 'main',
@@ -1457,10 +1482,20 @@ const PROBE_AT_POINT_FN = `
 
   // V22: href — link target. Truncate to keep payload small.
   var hrefAttr = undefined;
+  // anchor target= attribute — captured only for anchors with non-empty value.
+  // Passes through unmodified (short strings: _blank, _self, _parent, _top,
+  // or a window name). Empty/missing stays undefined so replay can branch on
+  // truthiness. NOTE: no backticks in this comment — file is wrapped in a
+  // template literal that doubles as PROBE_AT_POINT_FN source.
+  var linkTargetAttr = undefined;
   if (tag === 'a') {
     var rawHref = target.getAttribute('href') || '';
     if (rawHref && rawHref.length > 0 && rawHref.length < 500) {
       hrefAttr = rawHref.slice(0, 200);
+    }
+    var rawTarget = target.getAttribute('target') || '';
+    if (rawTarget && rawTarget.length > 0 && rawTarget.length < 64) {
+      linkTargetAttr = rawTarget;
     }
   }
 
@@ -2035,6 +2070,7 @@ const PROBE_AT_POINT_FN = `
     cssClass: cssClass,
     ariaControls: ariaControls,
     href: hrefAttr,
+    linkTarget: linkTargetAttr,
     vueScopeId: vueScopeId,
     nearestLandmark: nearestLandmark,
     containerTitles: containerTitles,
@@ -3004,6 +3040,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.cssClass) hints.cssClass = element.cssClass;
     if (element.ariaControls) hints.ariaControls = element.ariaControls;
     if (element.href) hints.href = element.href;
+    if (element.linkTarget) hints.linkTarget = element.linkTarget;
     if (element.vueScopeId) hints.vueScopeId = element.vueScopeId;
     // V22: ancestorSummary, nearestLandmark, containerTitles — provide
     // disambiguation context when the same label recurs across page
@@ -3097,6 +3134,7 @@ Return ONLY the index number (e.g., "2"). Pick the closest ancestor that is an i
     if (element.cssClass) fp.cssClass = element.cssClass;
     if (element.ariaControls) fp.ariaControls = element.ariaControls;
     if (element.href) fp.href = element.href;
+    if (element.linkTarget) fp.linkTarget = element.linkTarget;
     if (element.vueScopeId) fp.vueScopeId = element.vueScopeId;
     if (element.name) fp.name = element.name;
     if (element.type) fp.type = element.type;

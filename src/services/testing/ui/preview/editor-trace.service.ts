@@ -17,6 +17,7 @@
  */
 
 import { LiteTraceWriter } from '@/agent/core/lite/trace/lite-trace-writer';
+import { TraceSummaryAggregator } from './trace-analysis.util';
 import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import * as path from 'path';
 import type { PreviewIntentStep } from '@/websocket/types/types';
@@ -110,6 +111,17 @@ export class EditorTraceService {
    */
   private runVariablesProvider?: () => Map<string, unknown> | undefined;
 
+  /**
+   * Live aggregator for the trace_summary event. Consumes every event
+   * the writer accepts (post-redaction) so the summary written at
+   * close() matches what's actually on disk. See trace-analysis.util.ts
+   * for the field map.
+   *
+   * Lives in memory for the whole session — O(1) memory except for the
+   * latency array which is bounded by element_resolution event count.
+   */
+  private aggregator = new TraceSummaryAggregator();
+
   private constructor(previewSessionId: string, userId: string) {
     this.previewSessionId = previewSessionId;
     this.userId = userId;
@@ -119,6 +131,18 @@ export class EditorTraceService {
       maxFileSizeBytes: EDITOR_MAX_FILE_SIZE,
       maxPayloadChars: EDITOR_MAX_PAYLOAD_CHARS,
     });
+
+    // Intercept writes so every event also feeds the aggregator. We wrap
+    // the bound `write` instead of subclassing LiteTraceWriter because
+    // EditorTraceService is the only consumer that needs this — other
+    // writers (replay-trace, lite-trace) stay untouched.
+    const originalWrite = this.writer.write.bind(this.writer);
+    this.writer.write = (event) => {
+      try {
+        this.aggregator.consume(event);
+      } catch { /* aggregation must never break trace writing */ }
+      originalWrite(event);
+    };
   }
 
   /**
@@ -209,6 +233,20 @@ export class EditorTraceService {
       activeWriters.delete(previewSessionId);
       const filePath = instance.writer.getFilePath();
       const userId = instance.userId;
+
+      // Write the canonical trace_summary event LAST so upload-time
+      // parsedData can read it directly without re-aggregating the
+      // whole file. Best-effort: if writing fails, the upload-side
+      // recompute keeps parsed_data populated.
+      try {
+        const summary = instance.aggregator.finalize();
+        instance.writer.write({
+          stage: 'lifecycle',
+          eventType: 'trace_summary',
+          payload: summary as unknown as Record<string, unknown>,
+        });
+      } catch { /* close path must never throw */ }
+
       await instance.writer.close();
       return { filePath, userId };
     }

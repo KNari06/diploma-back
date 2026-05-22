@@ -9,7 +9,7 @@ When a step lands on the wrong element, run through these in order. Each step ta
 ### 1. Open `preview_run_*.jsonl` for the failing run
 
 ```bash
-ls -lt /Users/yerassylospanov/Desktop/qai-backend/test_logs/*preview_run* | head -3
+ls -lt $CLAUDE_PROJECT_DIR/test_logs/*preview_run* | head -3
 ```
 
 Find the failing step's `step_start` and `step_result` events.
@@ -107,6 +107,3 @@ If any answer is site-specific, re-think before committing.
 - ❌ Treating `clickEffectSignal: 'newtab'` as automatic success. Popup to unrelated domain is the canonical fake-success symptom.
 - ❌ Claiming a fix worked without re-running and checking `resolverPath` in the new trace. The user nodemon-cache-bit me 3 times in one session.
 
-## Memory
-
-Full incident log: `/Users/yerassylospanov/.claude/projects/-Users-yerassylospanov-Desktop-qai-backend/memory/april_28_2026_wrong_element_root_cause.md`

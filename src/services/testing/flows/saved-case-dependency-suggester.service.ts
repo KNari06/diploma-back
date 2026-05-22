@@ -28,6 +28,17 @@ export interface DependencySuggestion {
 }
 
 /**
+ * Combined result so the API can return both confident matches and
+ * "near-miss" candidates the LLM considered but didn't endorse. The
+ * UI uses `nearMisses` only when `suggestions` is empty so users see
+ * that the AI did look and what it weighed, instead of a blank state.
+ */
+export interface DependencySuggestionResult {
+  suggestions: DependencySuggestion[];
+  nearMisses: DependencySuggestion[];
+}
+
+/**
  * Minimal intent case data needed for suggestion calculations
  */
 interface IntentCaseData {
@@ -40,6 +51,13 @@ interface IntentCaseData {
   flow_name?: string;
   project_id?: string;
   depends_on?: string[];
+  /**
+   * Short, plain-text summary of the first STEP_PREVIEW_LIMIT steps, e.g.
+   *   "navigate https://shop.com/login; type 'email field' = user@example.com; click 'Sign in'"
+   * Built once per row from `steps_json` and sent to the LLM so the model
+   * judges by what the test does, not only by what it's called.
+   */
+  steps_preview?: string;
 }
 
 /** Shape of individual suggestion from LLM */
@@ -83,7 +101,24 @@ const MAX_LLM_CANDIDATES = 35;
 
 // --- Score Combination ---
 const URL_BOOST_WEIGHT = 0.15;
-const SAME_FLOW_BOOST = 0.03;
+// Tests in the same flow are usually dependent on each other ("Login → see
+// dashboard → click profile" all live in one flow). 0.03 was rounding noise;
+// 0.10 is meaningful without overpowering the LLM signal.
+const SAME_FLOW_BOOST = 0.10;
+
+// --- Steps preview ---
+// How many step descriptions to include in the LLM prompt per test case.
+// 5 is enough to capture intent without bloating tokens (target × 5 + 35
+// candidates × 5 ≈ 180 short lines, still well under flash-lite's window).
+const STEP_PREVIEW_LIMIT = 5;
+const STEP_DESCRIPTION_MAX_CHARS = 80;
+
+// --- Near-miss surfacing ---
+// When nothing clears MIN_CONFIDENCE_THRESHOLD, expose items at or above this
+// floor under a separate channel so the UI can show "Other candidates" rather
+// than a blank "no suggestions" toast. Caller decides whether to render them.
+const NEAR_MISS_FLOOR = 0.15;
+const MAX_NEAR_MISSES = 3;
 
 // ============================================================================
 // LLM PROMPT
@@ -102,7 +137,8 @@ Rules:
 - Only suggest genuine execution-order dependencies, not just "related" tests
 - Understand directionality: "Login" depends on nothing; "Dashboard" depends on "Login"
 - Tests with the same goal but different scenarios (e.g. "Login valid" vs "Login invalid") are NOT dependencies of each other
-- Consider the test names, descriptions, URLs, and flow context
+- Consider the test names, descriptions, URLs, flow context, AND the first few steps when provided
+- Steps reveal what a test actually does (e.g. "click Login", "type email", "click Submit"). Treat them as the strongest signal of intent — names can lie, steps usually don't
 - Work with ANY language (English, Russian, Kazakh, Turkish, Chinese, etc.) — understand semantics, not keywords
 - Return between 0 and 5 suggestions, sorted by confidence (highest first)
 - If no candidates are true dependencies, return an empty suggestions array
@@ -129,8 +165,9 @@ export class SavedCaseDependencySuggester {
     caseId: string | null,
     flowId: string,
     userId: string,
-    draftCase?: { name: string; description?: string; url?: string }
-  ): Promise<DependencySuggestion[]> {
+    draftCase?: { name: string; description?: string; url?: string; steps?: unknown[] }
+  ): Promise<DependencySuggestionResult> {
+    const empty: DependencySuggestionResult = { suggestions: [], nearMisses: [] };
     try {
       logger.info('[DEPENDENCY_SUGGESTER] Generating suggestions', {
         caseId, flowId, userId, hasDraft: !!draftCase,
@@ -138,38 +175,39 @@ export class SavedCaseDependencySuggester {
 
       // 1. Get target case data
       const targetCase = await this.resolveTargetCase(caseId, flowId, userId, draftCase);
-      if (!targetCase) return [];
+      if (!targetCase) return empty;
 
       // 2. Get project_id from flow
       const projectId = await this.getProjectIdFromFlow(flowId, userId);
       if (!projectId) {
         logger.warn('[DEPENDENCY_SUGGESTER] Could not resolve project for flow', { flowId });
-        return [];
+        return empty;
       }
 
       // 3. Get candidates across entire project
       const candidates = await this.getCandidatesInProject(projectId, userId, caseId, targetCase.depends_on);
       if (candidates.length === 0) {
         logger.info('[DEPENDENCY_SUGGESTER] No candidates in project', { projectId });
-        return [];
+        return empty;
       }
 
       // 4. Score and rank candidates
-      const suggestions = await this.scoreAndRankCandidates(candidates, targetCase);
+      const result = await this.scoreAndRankCandidates(candidates, targetCase);
 
       logger.info('[DEPENDENCY_SUGGESTER] Generated suggestions', {
         caseId, flowId, projectId,
         candidatesCount: candidates.length,
-        suggestionsCount: suggestions.length,
+        suggestionsCount: result.suggestions.length,
+        nearMissCount: result.nearMisses.length,
       });
 
-      return suggestions;
+      return result;
     } catch (error) {
       logger.error('[DEPENDENCY_SUGGESTER] Failed to generate suggestions', {
         error: error instanceof Error ? error.message : String(error),
         caseId, flowId,
       });
-      return [];
+      return empty;
     }
   }
 
@@ -181,7 +219,7 @@ export class SavedCaseDependencySuggester {
     caseId: string | null,
     flowId: string,
     userId: string,
-    draftCase?: { name: string; description?: string; url?: string }
+    draftCase?: { name: string; description?: string; url?: string; steps?: unknown[] }
   ): Promise<IntentCaseData | null> {
     if (draftCase) {
       return {
@@ -190,6 +228,7 @@ export class SavedCaseDependencySuggester {
         description: draftCase.description,
         url: draftCase.url,
         flow_id: flowId,
+        steps_preview: this.summarizeSteps(draftCase.steps),
       };
     }
 
@@ -208,8 +247,8 @@ export class SavedCaseDependencySuggester {
   private static async scoreAndRankCandidates(
     candidates: IntentCaseData[],
     targetCase: IntentCaseData
-  ): Promise<DependencySuggestion[]> {
-    if (candidates.length === 0) return [];
+  ): Promise<DependencySuggestionResult> {
+    if (candidates.length === 0) return { suggestions: [], nearMisses: [] };
 
     // Stage 1: Pre-compute URL continuity scores (free, fast)
     const urlScores = new Map<string, { score: number; reason: string }>();
@@ -229,7 +268,11 @@ export class SavedCaseDependencySuggester {
     // Stage 4: Combine LLM confidence with URL boost
     const validCandidateIds = new Set(candidates.map(c => c.id));
     const candidateMap = new Map(candidates.map(c => [c.id, c]));
-    const results: DependencySuggestion[] = [];
+    // We compute scores for ALL LLM suggestions first (no threshold), then
+    // split into suggestions vs near-misses at the end. This lets the API
+    // tell the UI "the AI did look — here are the things it weighed" when
+    // nothing clears the main bar, instead of returning a blank list.
+    const scored: DependencySuggestion[] = [];
 
     for (const suggestion of llmSuggestions) {
       // Guard: filter out hallucinated IDs
@@ -254,10 +297,7 @@ export class SavedCaseDependencySuggester {
         finalConfidence = Math.min(1.0, finalConfidence + SAME_FLOW_BOOST);
       }
 
-      // Apply minimum threshold
-      if (finalConfidence < MIN_CONFIDENCE_THRESHOLD) continue;
-
-      results.push({
+      scored.push({
         id: suggestion.id,
         name: candidate.name,
         flowName: candidate.flow_name,
@@ -266,9 +306,24 @@ export class SavedCaseDependencySuggester {
       });
     }
 
-    // Sort by confidence descending, take top MAX_SUGGESTIONS
-    results.sort((a, b) => b.confidence - a.confidence);
-    return results.slice(0, MAX_SUGGESTIONS);
+    scored.sort((a, b) => b.confidence - a.confidence);
+
+    const suggestions: DependencySuggestion[] = [];
+    const nearMisses: DependencySuggestion[] = [];
+    for (const s of scored) {
+      if (s.confidence >= MIN_CONFIDENCE_THRESHOLD) {
+        if (suggestions.length < MAX_SUGGESTIONS) suggestions.push(s);
+      } else if (s.confidence >= NEAR_MISS_FLOOR) {
+        if (nearMisses.length < MAX_NEAR_MISSES) nearMisses.push(s);
+      }
+    }
+
+    // Only surface near-misses when the main bucket is empty — otherwise
+    // they'd just be noise next to confident matches.
+    return {
+      suggestions,
+      nearMisses: suggestions.length === 0 ? nearMisses : [],
+    };
   }
 
   // ==========================================================================
@@ -319,6 +374,7 @@ export class SavedCaseDependencySuggester {
       `Name: ${targetCase.name || '(unnamed)'}`,
       targetCase.description ? `Description: ${targetCase.description}` : null,
       targetCase.url ? `URL: ${targetCase.url}` : null,
+      targetCase.steps_preview ? `First steps: ${targetCase.steps_preview}` : null,
     ].filter(Boolean).join('\n');
 
     const candidateLines = candidates.map((c, i) => {
@@ -329,6 +385,7 @@ export class SavedCaseDependencySuggester {
       if (c.description) parts.push(`  description: ${c.description.substring(0, 100)}`);
       if (c.url) parts.push(`  url: ${c.url}`);
       if (c.flow_name) parts.push(`  flow: ${c.flow_name}`);
+      if (c.steps_preview) parts.push(`  steps: ${c.steps_preview}`);
       return `[${i + 1}]\n${parts.join('\n')}`;
     }).join('\n\n');
 
@@ -414,7 +471,7 @@ export class SavedCaseDependencySuggester {
   ): Promise<IntentCaseData | null> {
     const { data, error } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, url, start_url, flow_id, project_id, depends_on')
+      .select('id, name, description, url, start_url, flow_id, project_id, depends_on, steps_json')
       .eq('id', caseId)
       .eq('user_id', userId)
       .single();
@@ -425,7 +482,11 @@ export class SavedCaseDependencySuggester {
     }
 
     const result = data as any;
-    return { ...result, url: result.url || result.start_url } as IntentCaseData;
+    return {
+      ...result,
+      url: result.url || result.start_url,
+      steps_preview: this.summarizeSteps(result.steps_json),
+    } as IntentCaseData;
   }
 
   private static async getProjectIdFromFlow(
@@ -451,7 +512,7 @@ export class SavedCaseDependencySuggester {
   ): Promise<IntentCaseData[]> {
     let query = supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, url, start_url, flow_id, project_id, depends_on, test_flows(name)')
+      .select('id, name, description, url, start_url, flow_id, project_id, depends_on, steps_json, test_flows(name)')
       .eq('project_id', projectId)
       .eq('user_id', userId);
 
@@ -473,7 +534,51 @@ export class SavedCaseDependencySuggester {
       ...row,
       url: row.url || row.start_url,
       flow_name: row.test_flows?.name,
+      steps_preview: this.summarizeSteps(row.steps_json),
     })) as IntentCaseData[];
+  }
+
+  // ==========================================================================
+  // PRIVATE: Step summarization
+  // ==========================================================================
+
+  /**
+   * Compress the first STEP_PREVIEW_LIMIT steps of a test case into a
+   * single short string for the LLM prompt. Returns undefined when there
+   * are no usable steps so the prompt builder can omit the line cleanly.
+   *
+   * Format: "type 'email field'='user@x.com'; click 'Sign in'; navigate /home"
+   * — verb-first, value/element quoted, separators ;. The LLM doesn't need
+   * the structured JSON; a flat line keeps tokens low and reads naturally.
+   */
+  private static summarizeSteps(steps: unknown): string | undefined {
+    if (!Array.isArray(steps) || steps.length === 0) return undefined;
+    const parts: string[] = [];
+    for (const raw of steps.slice(0, STEP_PREVIEW_LIMIT)) {
+      const step = raw as {
+        type?: string;
+        description?: string;
+        value?: string;
+        assertionText?: string;
+      };
+      // Collapse internal whitespace (newlines/tabs/runs of spaces) to a
+      // single space so multi-line `value` fields don't break the "; " join
+      // separator and so the prompt stays one tidy line per step.
+      const clean = (s: string) => s.replace(/\s+/g, ' ').trim();
+      const verb = clean((step?.type || '').toString());
+      const target = clean((step?.description || '').toString());
+      const value = clean((step?.value || step?.assertionText || '').toString());
+      if (!verb && !target && !value) continue;
+      let line = verb;
+      if (target) line = line ? `${line} '${target}'` : `'${target}'`;
+      if (value) line = line ? `${line}=${value}` : value;
+      if (line.length > STEP_DESCRIPTION_MAX_CHARS) {
+        line = line.substring(0, STEP_DESCRIPTION_MAX_CHARS - 1) + '…';
+      }
+      parts.push(line);
+    }
+    if (parts.length === 0) return undefined;
+    return parts.join('; ');
   }
 
   // ==========================================================================

@@ -1,3 +1,6 @@
+# Local temporary files (reviews, scratch, etc.)
+temporary/
+
 # Dependencies
 node_modules/
 npm-debug.log*

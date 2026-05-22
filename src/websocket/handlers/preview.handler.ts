@@ -45,17 +45,26 @@ const previewSubscriptions = new Map<string, Set<string>>();
 const recordingTypingTimers = new Map<string, NodeJS.Timeout>();
 const RECORDING_TYPING_DEBOUNCE_MS = 1500;
 
-/** Per-socket+session hover probe state (throttle + dedup). Key: `${socketId}:${sessionId}` */
-const hoverProbeState = new Map<string, {
-  lastProbeAt: number;
-  lastElementKey: string | null;
-  probeInFlight: boolean;
-  pageUrl: string | null; // Guards against stale probe after navigation
-  /** Latest mouse coordinates — updated on every mouse:move, used by next probe */
-  latestX: number;
-  latestY: number;
-}>();
-const HOVER_PROBE_THROTTLE_MS = 200;
+// V18 React-rendered hover-highlight infrastructure — DISABLED in May 2026.
+// Replaced by the in-page `preview-hover-overlay.service.ts` which paints
+// outlines inside the iframe directly. The two state holders below
+// (hoverProbeState + HOVER_PROBE_THROTTLE_MS) are kept commented out as a
+// fallback restore point for cross-origin iframe support (where the in-page
+// overlay cannot reach across the SOP boundary). To re-enable: uncomment
+// these declarations + flip REACT_HOVER_PROBE_ENABLED in the
+// preview:mouse:move handler below to `true`.
+//
+// /** Per-socket+session hover probe state (throttle + dedup). Key: `${socketId}:${sessionId}` */
+// const hoverProbeState = new Map<string, {
+//   lastProbeAt: number;
+//   lastElementKey: string | null;
+//   probeInFlight: boolean;
+//   pageUrl: string | null; // Guards against stale probe after navigation
+//   /** Latest mouse coordinates — updated on every mouse:move, used by next probe */
+//   latestX: number;
+//   latestY: number;
+// }>();
+// const HOVER_PROBE_THROTTLE_MS = 200;
 
 /** Per-session scroll debounce timers */
 const recordingScrollTimers = new Map<string, {
@@ -695,6 +704,18 @@ async function finalizeRecording(
 
   sessionService.setRecording(previewSessionId, userId, false);
   sessionService.setDialogMode(previewSessionId, userId, 'passive');
+
+  // Flip the in-page hover overlay back to navigation colour scheme.
+  // We don't tear it down here — the user is still in the preview and
+  // hover hints remain useful. The disconnect path is what kills the
+  // overlay entirely.
+  try {
+    const finPage = sessionService.getPage(previewSessionId, userId);
+    if (finPage) {
+      const { setHoverOverlayMode } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
+      void setHoverOverlayMode(previewSessionId, finPage, 'navigation').catch(() => undefined);
+    }
+  } catch { /* non-fatal */ }
 
   // Editor trace: log stop reason and close writer. When a test-case id is
   // supplied (run:start path), forward it so the uploaded trace is linked
@@ -1405,6 +1426,15 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
             error: err instanceof Error ? err.message : String(err),
           });
         });
+
+        // In-page hover overlay (preview-hover-overlay.service.ts) is
+        // NOT installed eagerly on subscribe. Activation is FE-driven
+        // via the `preview:hover-overlay:set` event — typically when
+        // the user enters navigation mode in the iframe. Without this
+        // guard the overlay would paint a blue outline even while the
+        // preview is in focus-mode (showing the "Click to interact"
+        // hint), which confused users in v1 of the rollout. Tear-down
+        // on disconnect is still handled in the disconnect path below.
       }
 
       logger.info('[WebSocket] Subscribed to preview', {
@@ -1514,8 +1544,10 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         previewRoomRefCount.delete(room);
       }
 
-      // V18: Clear hover probe state for this session
-      hoverProbeState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
+      // V18 hover probe state cleanup — DISABLED May 2026 (hoverProbeState
+      // is commented out at the top of this file). Restore both lines
+      // together if cross-origin-iframe fallback gets re-enabled.
+      // hoverProbeState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
       // V20: Clear move/wheel coalesce state for this session
       moveCoalesceState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
       wheelCoalesceState.delete(`${socket.id}:${normalizedPreviewSessionId}`);
@@ -2345,106 +2377,90 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           });
         }
 
-        // V18: Non-blocking hover probe for Cursor-style element highlight
-        const now = Date.now();
-        const hKey = `${socket.id}:${previewSessionId}`;
-        let hState = hoverProbeState.get(hKey);
-        if (!hState) {
-          hState = { lastProbeAt: 0, lastElementKey: null, probeInFlight: false, pageUrl: null, latestX: x, latestY: y };
-          hoverProbeState.set(hKey, hState);
-        }
-        // Always update latest coords — probe will use freshest position when it starts
-        hState.latestX = x;
-        hState.latestY = y;
-        if (!hState.probeInFlight && now - hState.lastProbeAt >= HOVER_PROBE_THROTTLE_MS) {
-          hState.probeInFlight = true;
-          hState.lastProbeAt = now;
-          const hStateRef = hState;
-          // Capture page URL before probe to detect navigation during setImmediate
-          const preProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
-          // Pre-resolve import outside setImmediate to reduce async overhead in hot path
-          const runServicePromise = import('@/services/testing/ui/preview/preview-run.service');
-          setImmediate(async () => {
-            const probeStartMs = Date.now();
-            const hTrace = EditorTraceService.get(previewSessionId);
-            try {
-              // Fix #7: Skip probe during active preview run
-              const { PreviewRunService } = await runServicePromise;
-              if (PreviewRunService.isRunning(previewSessionId)) {
-                // Clear hover during run
-                if (hStateRef.lastElementKey !== null) {
-                  hStateRef.lastElementKey = null;
-                  const room = createRoomName('preview', previewSessionId);
-                  socket.nsp.to(room).emit('preview:element:hover' as any, {
-                    previewSessionId, element: null, timestamp: new Date().toISOString(),
-                  });
-                }
-                hTrace?.writeHoverProbe({ x: hStateRef.latestX, y: hStateRef.latestY, latencyMs: Date.now() - probeStartMs, result: null, skipped: 'run_active' });
-                return;
-              }
-
-              // Use latest coords (not closure coords) — cursor may have moved during throttle window
-              const probeX = hStateRef.latestX;
-              const probeY = hStateRef.latestY;
-
-              // V23: ask probe for the precise reject reason. Without this
-              // every null result trace-encodes as 'no_interactive_element'
-              // — so 53× identical rows during a stuck recording look
-              // identical regardless of whether the page is empty, the
-              // hit-test landed in a cross-origin iframe, or a non-
-              // interactive <div> covered the area.
-              const probeResult = await sessionService.probeInteractiveElementAt({
-                sessionId: previewSessionId,
-                userId: ensuredUserId,
-                x: probeX, y: probeY,
-                withRejectReason: true,
-              });
-              // Narrow: a "real" element has tag/label; rejection has only rejectReason.
-              const el = probeResult && 'tag' in probeResult ? probeResult : null;
-              const rejectReason = probeResult && 'rejectReason' in probeResult
-                ? probeResult.rejectReason : undefined;
-
-              const probeLatencyMs = Date.now() - probeStartMs;
-
-              // Fix #6: Discard result if page navigated during probe
-              const postProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
-              if (preProbeUrl && postProbeUrl && preProbeUrl !== postProbeUrl) {
-                hStateRef.lastElementKey = null;
-                hTrace?.writeHoverProbe({ x: probeX, y: probeY, latencyMs: probeLatencyMs, result: null, skipped: 'page_navigated' });
-                return;
-              }
-
-              hTrace?.writeHoverProbe({
-                x: probeX, y: probeY,
-                originalX: x, originalY: y,
-                latencyMs: probeLatencyMs,
-                result: el ? { tag: el.tag, label: el.label, resolvedVia: el.resolvedVia } : null,
-                skipped: el ? undefined : (rejectReason || 'no_interactive_element'),
-              });
-
-              const elKey = el
-                ? `${el.tag}:${el.boundingBox.x}:${el.boundingBox.y}:${el.boundingBox.width}:${el.boundingBox.height}`
-                : null;
-              // Dedup: only emit when element changes
-              const deduped = elKey === hStateRef.lastElementKey;
-              if (!deduped) {
-                hStateRef.lastElementKey = elKey;
-                const room = createRoomName('preview', previewSessionId);
-                socket.nsp.to(room).emit('preview:element:hover' as any, {
-                  previewSessionId,
-                  element: el,
-                  timestamp: new Date().toISOString(),
-                });
-                hTrace?.writeHoverEmit({ element: el, deduped: false, room });
-              } else {
-                hTrace?.writeHoverEmit({ element: el, deduped: true });
-              }
-            } catch { /* non-critical — don't break hover */ }
-            finally { // Fix #3: Always reset probeInFlight
-              hStateRef.probeInFlight = false;
-            }
-          });
-        }
+        // V18 Non-blocking hover probe + `preview:element:hover` emit —
+        // DISABLED in May 2026. The in-page `preview-hover-overlay.service.ts`
+        // now paints the outline inside the iframe directly; the server
+        // no longer runs PROBE_AT_POINT_FN per mousemove (which was
+        // 30-90 ms / probe on dense pages — pure dead work after FE
+        // stopped rendering React `hoverHighlight`).
+        //
+        // The full block (~110 lines) is preserved below in comment form
+        // as a fallback restore point for cross-origin-iframe support
+        // (where the in-page overlay cannot reach across SOP). To
+        // re-enable: uncomment the `hoverProbeState` / `HOVER_PROBE_THROTTLE_MS`
+        // declarations at the top of this file, uncomment the
+        // `hoverProbeState.delete(...)` call in the unsubscribe path and
+        // the loop in the disconnect path, then uncomment + re-indent
+        // the block below.
+        //
+        // const REACT_HOVER_PROBE_ENABLED = true;
+        // const now = Date.now();
+        // const hKey = `${socket.id}:${previewSessionId}`;
+        // let hState = hoverProbeState.get(hKey);
+        // if (!hState) {
+        //   hState = { lastProbeAt: 0, lastElementKey: null, probeInFlight: false, pageUrl: null, latestX: x, latestY: y };
+        //   hoverProbeState.set(hKey, hState);
+        // }
+        // hState.latestX = x;
+        // hState.latestY = y;
+        // if (REACT_HOVER_PROBE_ENABLED && !hState.probeInFlight && now - hState.lastProbeAt >= HOVER_PROBE_THROTTLE_MS) {
+        //   hState.probeInFlight = true;
+        //   hState.lastProbeAt = now;
+        //   const hStateRef = hState;
+        //   const preProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
+        //   const runServicePromise = import('@/services/testing/ui/preview/preview-run.service');
+        //   setImmediate(async () => {
+        //     const probeStartMs = Date.now();
+        //     const hTrace = EditorTraceService.get(previewSessionId);
+        //     try {
+        //       const { PreviewRunService } = await runServicePromise;
+        //       if (PreviewRunService.isRunning(previewSessionId)) {
+        //         if (hStateRef.lastElementKey !== null) {
+        //           hStateRef.lastElementKey = null;
+        //           const room = createRoomName('preview', previewSessionId);
+        //           socket.nsp.to(room).emit('preview:element:hover' as any, {
+        //             previewSessionId, element: null, timestamp: new Date().toISOString(),
+        //           });
+        //         }
+        //         hTrace?.writeHoverProbe({ x: hStateRef.latestX, y: hStateRef.latestY, latencyMs: Date.now() - probeStartMs, result: null, skipped: 'run_active' });
+        //         return;
+        //       }
+        //       const probeX = hStateRef.latestX;
+        //       const probeY = hStateRef.latestY;
+        //       const probeResult = await sessionService.probeInteractiveElementAt({
+        //         sessionId: previewSessionId, userId: ensuredUserId,
+        //         x: probeX, y: probeY, withRejectReason: true,
+        //       });
+        //       const el = probeResult && 'tag' in probeResult ? probeResult : null;
+        //       const rejectReason = probeResult && 'rejectReason' in probeResult ? probeResult.rejectReason : undefined;
+        //       const probeLatencyMs = Date.now() - probeStartMs;
+        //       const postProbeUrl = sessionService.getPage(previewSessionId, ensuredUserId)?.url() || null;
+        //       if (preProbeUrl && postProbeUrl && preProbeUrl !== postProbeUrl) {
+        //         hStateRef.lastElementKey = null;
+        //         hTrace?.writeHoverProbe({ x: probeX, y: probeY, latencyMs: probeLatencyMs, result: null, skipped: 'page_navigated' });
+        //         return;
+        //       }
+        //       hTrace?.writeHoverProbe({
+        //         x: probeX, y: probeY, originalX: x, originalY: y, latencyMs: probeLatencyMs,
+        //         result: el ? { tag: el.tag, label: el.label, resolvedVia: el.resolvedVia } : null,
+        //         skipped: el ? undefined : (rejectReason || 'no_interactive_element'),
+        //       });
+        //       const elKey = el ? `${el.tag}:${el.boundingBox.x}:${el.boundingBox.y}:${el.boundingBox.width}:${el.boundingBox.height}` : null;
+        //       const deduped = elKey === hStateRef.lastElementKey;
+        //       if (!deduped) {
+        //         hStateRef.lastElementKey = elKey;
+        //         const room = createRoomName('preview', previewSessionId);
+        //         socket.nsp.to(room).emit('preview:element:hover' as any, {
+        //           previewSessionId, element: el, timestamp: new Date().toISOString(),
+        //         });
+        //         hTrace?.writeHoverEmit({ element: el, deduped: false, room });
+        //       } else {
+        //         hTrace?.writeHoverEmit({ element: el, deduped: true });
+        //       }
+        //     } catch { /* non-critical — don't break hover */ }
+        //     finally { hStateRef.probeInFlight = false; }
+        //   });
+        // }
       }
       // No snapshot, no error emit for hover
     } catch (error) {
@@ -2520,6 +2536,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         y,
         button,
         clickCount,
+        // Pass keyboard modifiers through so Cmd/Ctrl/Shift+Click on a link
+        // produces a new tab (Cmd-click is the canonical "open in new tab"
+        // gesture). The session-service click handler converts these into
+        // a Playwright modifiers array AND uses Cmd/Ctrl/Shift on anchors
+        // as a new-tab trigger even when the anchor lacks `target=_blank`.
+        modifiers,
       });
 
       if (result.success) {
@@ -4380,7 +4402,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const tabIndex = data.tabIndex;
       if (tabIndex === undefined || tabIndex === null || typeof tabIndex !== 'number') {
-        socket.emit('preview:tab:switched', {
+        socket.nsp.to(createRoomName('preview', previewSessionId)).emit('preview:tab:switched', {
           previewSessionId,
           tabs: [],
           activeTabIndex: 0,
@@ -4403,7 +4425,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const tabsInfo = sessionService.getTabsInfo(previewSessionId, ensuredUserId);
       const session = sessionService.getSession(previewSessionId);
 
-      socket.emit('preview:tab:switched', {
+      socket.nsp.to(createRoomName('preview', previewSessionId)).emit('preview:tab:switched', {
         previewSessionId,
         tabs: tabsInfo,
         activeTabIndex: session?.activeTabIndex ?? 0,
@@ -4488,6 +4510,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         closedTabIndex: tabIndex,
         timestamp: new Date().toISOString(),
       });
+
+      // Recording mirror — symmetric with the `preview:tab:switch` handler.
+      // If a user closes a tab while recording, the test must remember
+      // that intent: replay should close the same tab so subsequent steps
+      // run against the right page set. If we skip this, a recorded flow
+      // that opened a popup, did work in it, then closed it, would leave
+      // replay with a leftover tab + stale `activeTabIndex` pointing into
+      // a page that the recorder doesn't expect to be active.
+      if (session?.recording) {
+        socket.emit('preview:recording:step', {
+          previewSessionId,
+          step: {
+            id: `close-tab-${Date.now()}`,
+            type: 'close_tab',
+            description: `Close tab ${tabIndex}`,
+            value: String(tabIndex),
+            tabIndex,
+            evidence: {
+              pageUrl: session?.page?.url() || '',
+              tabIndex,
+            },
+          },
+          timestamp: new Date().toISOString(),
+        });
+      }
     } catch (error) {
       logger.error('[WebSocket] Error in preview:tab:close', {
         socketId: socket.id,
@@ -4962,6 +5009,17 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         timestamp: new Date().toISOString(),
       });
     };
+    // Guard — pick mode is mutually exclusive with run. Source of truth is
+    // the pick service's own active-session map. Done OUTSIDE the
+    // `previewRunStartInFlight` synchronous window so the await doesn't
+    // open a race against double-clicks.
+    if (typeof guardKey === 'string' && guardKey.length > 0) {
+      const { isPickActive: _isPickActiveForRun } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+      if (_isPickActiveForRun(guardKey)) {
+        emitRunTerminator('Pick element is active — exit pick mode first');
+        return;
+      }
+    }
     if (typeof guardKey === 'string' && guardKey.length > 0) {
       if (previewRunStartInFlight.has(guardKey)) {
         logger.warn('[WebSocket] preview:run:start ignored — another start is in flight', {
@@ -5626,10 +5684,35 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         }
       }
 
+      // Guard — cannot start recording while one-shot pick mode is active.
+      {
+        const { isPickActive } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+        if (isPickActive(previewSessionId)) {
+          socket.emit('error', {
+            code: 'PICK_IN_PROGRESS',
+            message: 'Cannot start recording while Pick element is active',
+            timestamp: new Date().toISOString(),
+          });
+          return;
+        }
+      }
+
       // Already recording? Ignore silently
       if (sessionService.isRecording(previewSessionId, ensuredUserId)) return;
 
       sessionService.setRecording(previewSessionId, ensuredUserId, true);
+
+      // Flip the in-page hover overlay to "recording" colour scheme
+      // (red dashed) so the user sees a clear visual signal that every
+      // mousemove is being recorded. Non-fatal if it fails — recording
+      // itself doesn't depend on the overlay.
+      try {
+        const recPage = sessionService.getPage(previewSessionId, ensuredUserId);
+        if (recPage) {
+          const { setHoverOverlayMode } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
+          void setHoverOverlayMode(previewSessionId, recPage, 'recording').catch(() => undefined);
+        }
+      } catch { /* non-fatal */ }
 
       // Arm auto-stop timer. Mirrors the mobile runner's RecordingStateRegistry
       // so an abandoned recording doesn't leak buffers/listeners forever.
@@ -6194,6 +6277,241 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       await finalizeRecording(socket, previewSessionId, ensuredUserId, 'user');
     } catch (error) {
       logger.error('[RECORDING] Stop failed', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Pick element (one-shot, read-only element picker)
+  // ───────────────────────────────────────────────────────────────────────────
+  // Drives the "Pick element" button next to the action-type field in the
+  // manual step form. Mutually exclusive with recording and run; the pick
+  // service owns its own active-session map (`isPickActive(previewSessionId)`)
+  // which is the source of truth recording:start and run:start consult.
+  // Always emits a `preview:pick:state` response — even on validation
+  // failure — so the FE never stalls on "Picking…".
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  socket.on('preview:pick:start', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) {
+        // Audit issue #2 / invariant #2 — always emit :state so the FE
+        // button can exit "Picking…". requireUser() already emitted the
+        // generic 'error' event, but the pick UI listens only to :state.
+        socket.emit('preview:pick:state', {
+          previewSessionId: data?.previewSessionId || '',
+          active: false,
+          reason: 'error',
+          error: 'Authentication required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) {
+        socket.emit('preview:pick:state', {
+          previewSessionId: '',
+          active: false,
+          reason: 'error',
+          error: 'previewSessionId is required',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'Session not found or not owned by user',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Mutex — pick / recording / run are mutually exclusive.
+      const { PreviewRunService } = await import('@/services/testing/ui/preview/preview-run.service');
+      if (PreviewRunService.isRunning(previewSessionId)) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'A run is in progress',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      if (sessionService.isRecording(previewSessionId, ensuredUserId)) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'Recording is active — stop recording first',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      if (!page) {
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: 'Preview page is not available',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+
+      // Turn the in-page hover overlay OFF for the duration of pick mode
+      // — the pick service installs its own (more aggressive) overlay
+      // that blocks clicks. Restore the previous mode in onExit.
+      let hoverModeBeforePick: 'navigation' | 'recording' | 'off' = 'off';
+      try {
+        const { getHoverOverlayMode, setHoverOverlayMode } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
+        hoverModeBeforePick = getHoverOverlayMode(previewSessionId);
+        if (hoverModeBeforePick !== 'off') {
+          await setHoverOverlayMode(previewSessionId, page, 'off');
+        }
+      } catch { /* non-fatal */ }
+
+      try {
+        const { startPick } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+        await startPick({
+          previewSessionId,
+          nsp: socket.nsp,
+          userId: ensuredUserId,
+          page,
+          // Service owns its own active-session map. onExit also flips
+          // the hover overlay back to whatever mode it was in before
+          // pick — usually 'navigation' (or 'recording' if pick was
+          // launched mid-recording, which the mutex actually prevents,
+          // but we restore the captured value defensively).
+          onExit: (reason) => {
+            logger.debug('[PREVIEW_PICK] Pick exit notified', {
+              previewSessionId,
+              reason,
+            });
+            if (hoverModeBeforePick !== 'off') {
+              void (async () => {
+                try {
+                  const { setHoverOverlayMode } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
+                  await setHoverOverlayMode(previewSessionId, page, hoverModeBeforePick);
+                } catch { /* non-fatal */ }
+              })();
+            }
+          },
+        });
+      } catch (err) {
+        logger.error('[PREVIEW_PICK] start failed', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        socket.emit('preview:pick:state', {
+          previewSessionId,
+          active: false,
+          reason: 'error',
+          error: err instanceof Error ? err.message : 'Pick start failed',
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      // Invariant #2: every WS handler must emit a response on the
+      // channel the FE is awaiting. Inner try/catch blocks already do
+      // this, but a top-level throw (e.g. dynamic `import()` failure,
+      // unexpected `requireUser` throw) would otherwise leave the FE
+      // pick button spinning forever AND the hover overlay stuck at
+      // 'off' since pick:start preemptively turned it off above.
+      logger.error('[PREVIEW_PICK] start handler error', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        socket.emit('preview:pick:state', {
+          previewSessionId: (data && (data as { previewSessionId?: string }).previewSessionId) || '',
+          active: false,
+          reason: 'error',
+          error: error instanceof Error ? error.message : 'Pick start failed',
+          timestamp: new Date().toISOString(),
+        });
+      } catch { /* emit-failure is unrecoverable; log already happened */ }
+    }
+  });
+
+  socket.on('preview:pick:cancel', async (data) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId } = data;
+      if (!previewSessionId) return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) return;
+
+      const { cancelPick } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+      await cancelPick(previewSessionId, 'cancelled');
+    } catch (error) {
+      logger.error('[PREVIEW_PICK] cancel handler error', {
+        socketId: socket.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // In-page hover overlay (preview-hover-overlay.service.ts)
+  //
+  // FE sends 'preview:hover-overlay:set' to flip the overlay mode when
+  // the preview navigation state changes:
+  //   - User enables navigation mode in the iframe → 'navigation'
+  //   - User leaves / focuses something else / clicks the close-overlay
+  //     hint → 'off'
+  //
+  // Server-side recording start/stop flips the mode automatically (see
+  // recording handlers above) — we still honour explicit FE writes so a
+  // mid-recording focus change can clear the outline.
+  //
+  // Pick mode silently overrides (pick handler sets 'off' before calling
+  // startPick and restores the previous mode in onExit).
+  // ═══════════════════════════════════════════════════════════════════════════
+  socket.on('preview:hover-overlay:set' as any, async (data: { previewSessionId: string; mode: 'navigation' | 'recording' | 'off' }) => {
+    try {
+      const ensuredUserId = requireUser();
+      if (!ensuredUserId) return;
+
+      const { previewSessionId, mode } = data || {};
+      if (!previewSessionId) return;
+      if (mode !== 'navigation' && mode !== 'recording' && mode !== 'off') return;
+
+      const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
+      const sessionService = getPreviewSessionService();
+      if (!sessionService.isSessionOwned(previewSessionId, ensuredUserId)) return;
+
+      // Do NOT overwrite recording outline when FE asks for 'navigation' —
+      // recording state takes precedence (FE's request is stale during the
+      // tiny window after recording starts). We let the FE turn it OFF
+      // unconditionally (user wants no overlay → respect that).
+      if (mode === 'navigation' && sessionService.isRecording(previewSessionId, ensuredUserId)) {
+        return;
+      }
+
+      const page = sessionService.getPage(previewSessionId, ensuredUserId);
+      if (!page) return;
+
+      const { setHoverOverlayMode } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
+      await setHoverOverlayMode(previewSessionId, page, mode);
+    } catch (error) {
+      logger.debug('[HOVER_OVERLAY] set handler error (non-fatal)', {
         socketId: socket.id,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -6807,6 +7125,30 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           // socket is already gone.
           const autoStopTimer = recordingAutoStopTimers.get(previewSessionId);
           if (autoStopTimer) { clearTimeout(autoStopTimer); recordingAutoStopTimers.delete(previewSessionId); }
+          // Cancel any in-flight Pick element session for this preview
+          // session — the socket is gone, the overlay would just leak.
+          try {
+            const { cancelPickForSession } = await import('@/services/testing/ui/preview/preview-element-pick.service');
+            await cancelPickForSession(previewSessionId);
+          } catch (err) {
+            logger.debug('[PREVIEW_PICK] disconnect cleanup failed (non-fatal)', {
+              previewSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+
+          // Tear down the in-page hover overlay (mousemove listener,
+          // outline div, tooltip). Without this the listeners would
+          // outlive the socket and keep firing on the orphaned page.
+          try {
+            const { teardownHoverForSession } = await import('@/services/testing/ui/preview/preview-hover-overlay.service');
+            await teardownHoverForSession(previewSessionId);
+          } catch (err) {
+            logger.debug('[HOVER_OVERLAY] disconnect cleanup failed (non-fatal)', {
+              previewSessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
 
           if (
             canCleanupRecording
@@ -6884,10 +7226,12 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
     cleanupPreviewSubscriptions(socket.id);
     cleanupRateLimits(socket.id); // V2: Cleanup rate limit data
-    // V18: Cleanup all hover probe entries for this socket (keyed as socketId:sessionId)
-    for (const key of hoverProbeState.keys()) {
-      if (key.startsWith(`${socket.id}:`)) hoverProbeState.delete(key);
-    }
+    // V18 hover probe cleanup — DISABLED May 2026 (hoverProbeState
+    // commented out at the top of this file). Restore alongside the
+    // declarations + mouse:move block.
+    // for (const key of hoverProbeState.keys()) {
+    //   if (key.startsWith(`${socket.id}:`)) hoverProbeState.delete(key);
+    // }
     // V20: Cleanup all move/wheel coalesce entries for this socket
     for (const key of moveCoalesceState.keys()) {
       if (key.startsWith(`${socket.id}:`)) moveCoalesceState.delete(key);

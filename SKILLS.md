@@ -1,6 +1,6 @@
 ---
 platform: qait
-version: "1.0"
+version: '1.0'
 description: QAIT Agent Skills Registry — Master Index
 total_tools: 20
 total_skills: 5
@@ -8,7 +8,7 @@ supported_ai_models:
   - gpt-4o
   - gpt-4o-mini
   - gpt-4-turbo
-  - gemini-2.0-flash
+  - gemini-2.5-flash
   - gemini-2.0-pro
   - claude-sonnet-4-5-20250929
 ---
@@ -58,13 +58,13 @@ src/services/api/
 
 ## Registered Skills
 
-| # | Skill | Provider | Tools | Auth | API | Documentation |
-|---|-------|----------|-------|------|-----|---------------|
-| 1 | **Jira** | `jira` | 5 | OAuth 2.0 (3LO) | Atlassian REST API v3 | `src/services/skills/integrations/skills/SKILL.jira.md` |
-| 2 | **GitHub** | `github` | 4 | OAuth 2.0 | GitHub REST API v3 | `src/services/skills/integrations/skills/SKILL.github.md` |
-| 3 | **Notion** | `notion` | 4 | OAuth 2.0 | Notion API (2022-06-28) | `src/services/skills/integrations/skills/SKILL.notion.md` |
-| 4 | **Telegram** | `telegram` | 4 | Bot Token | Telegram Bot API | `src/services/skills/integrations/skills/SKILL.telegram.md` |
-| 5 | **Memory** | `internal` | 3 | None (internal) | Supabase + OpenAI Embeddings | `src/services/ai/memory/SKILL.memory.md` |
+| #   | Skill        | Provider   | Tools | Auth            | API                          | Documentation                                               |
+| --- | ------------ | ---------- | ----- | --------------- | ---------------------------- | ----------------------------------------------------------- |
+| 1   | **Jira**     | `jira`     | 5     | OAuth 2.0 (3LO) | Atlassian REST API v3        | `src/services/skills/integrations/skills/SKILL.jira.md`     |
+| 2   | **GitHub**   | `github`   | 4     | OAuth 2.0       | GitHub REST API v3           | `src/services/skills/integrations/skills/SKILL.github.md`   |
+| 3   | **Notion**   | `notion`   | 4     | OAuth 2.0       | Notion API (2022-06-28)      | `src/services/skills/integrations/skills/SKILL.notion.md`   |
+| 4   | **Telegram** | `telegram` | 4     | Bot Token       | Telegram Bot API             | `src/services/skills/integrations/skills/SKILL.telegram.md` |
+| 5   | **Memory**   | `internal` | 3     | None (internal) | Supabase + OpenAI Embeddings | `src/services/ai/memory/SKILL.memory.md`                    |
 
 ---
 
@@ -72,48 +72,48 @@ src/services/api/
 
 ### Jira (5 tools)
 
-| Tool | Action | Type | Confirmation |
-|------|--------|------|-------------|
-| `jira_create_issue` | Create Bug/Task/Story/Epic in a Jira project | WRITE | Required |
-| `jira_search_issues` | Search issues using JQL queries | READ | No |
-| `jira_add_comment` | Add a comment to an existing issue | WRITE | Required |
-| `jira_get_issue` | Get full details of an issue by key | READ | No |
-| `jira_transition_issue` | Change issue status (e.g., To Do -> In Progress) | WRITE | Required |
+| Tool                    | Action                                           | Type  | Confirmation |
+| ----------------------- | ------------------------------------------------ | ----- | ------------ |
+| `jira_create_issue`     | Create Bug/Task/Story/Epic in a Jira project     | WRITE | Required     |
+| `jira_search_issues`    | Search issues using JQL queries                  | READ  | No           |
+| `jira_add_comment`      | Add a comment to an existing issue               | WRITE | Required     |
+| `jira_get_issue`        | Get full details of an issue by key              | READ  | No           |
+| `jira_transition_issue` | Change issue status (e.g., To Do -> In Progress) | WRITE | Required     |
 
 ### GitHub (4 tools)
 
-| Tool | Action | Type | Confirmation |
-|------|--------|------|-------------|
-| `github_create_issue` | Create issue with title, body, and labels | WRITE | Required |
-| `github_list_prs` | List pull requests (open/closed/all) | READ | No |
-| `github_add_comment` | Add comment to an issue or PR | WRITE | Required |
-| `github_get_repo` | Get repository details (branch, language, stars) | READ | No |
+| Tool                  | Action                                           | Type  | Confirmation |
+| --------------------- | ------------------------------------------------ | ----- | ------------ |
+| `github_create_issue` | Create issue with title, body, and labels        | WRITE | Required     |
+| `github_list_prs`     | List pull requests (open/closed/all)             | READ  | No           |
+| `github_add_comment`  | Add comment to an issue or PR                    | WRITE | Required     |
+| `github_get_repo`     | Get repository details (branch, language, stars) | READ  | No           |
 
 ### Notion (4 tools)
 
-| Tool | Action | Type | Confirmation |
-|------|--------|------|-------------|
-| `notion_create_page` | Create a sub-page under a parent page | WRITE | Required |
-| `notion_search` | Search across all shared pages by title | READ | No |
-| `notion_update_page` | Update page properties (title, status, tags, etc.) | WRITE | Required |
-| `notion_add_to_database` | Add a new row/entry to a Notion database | WRITE | Required |
+| Tool                     | Action                                             | Type  | Confirmation |
+| ------------------------ | -------------------------------------------------- | ----- | ------------ |
+| `notion_create_page`     | Create a sub-page under a parent page              | WRITE | Required     |
+| `notion_search`          | Search across all shared pages by title            | READ  | No           |
+| `notion_update_page`     | Update page properties (title, status, tags, etc.) | WRITE | Required     |
+| `notion_add_to_database` | Add a new row/entry to a Notion database           | WRITE | Required     |
 
 ### Telegram (4 tools)
 
-| Tool | Action | Type | Confirmation |
-|------|--------|------|-------------|
-| `telegram_send_message` | Send text message with HTML/Markdown formatting | WRITE | Required |
-| `telegram_get_chat` | Get chat/group/channel info | READ | No |
-| `telegram_send_document` | Send a file via public URL | WRITE | Required |
-| `telegram_send_notification` | Send formatted notification with severity level | WRITE | Required |
+| Tool                         | Action                                          | Type  | Confirmation |
+| ---------------------------- | ----------------------------------------------- | ----- | ------------ |
+| `telegram_send_message`      | Send text message with HTML/Markdown formatting | WRITE | Required     |
+| `telegram_get_chat`          | Get chat/group/channel info                     | READ  | No           |
+| `telegram_send_document`     | Send a file via public URL                      | WRITE | Required     |
+| `telegram_send_notification` | Send formatted notification with severity level | WRITE | Required     |
 
 ### Memory (3 tools)
 
-| Tool | Action | Type | Confirmation |
-|------|--------|------|-------------|
-| `remember_fact` | Save a fact/preference/pattern to workspace memory | INTERNAL | No |
-| `search_memory` | Semantic search across workspace memory | INTERNAL | No |
-| `forget_fact` | Delete a memory entry by key | INTERNAL | No |
+| Tool            | Action                                             | Type     | Confirmation |
+| --------------- | -------------------------------------------------- | -------- | ------------ |
+| `remember_fact` | Save a fact/preference/pattern to workspace memory | INTERNAL | No           |
+| `search_memory` | Semantic search across workspace memory            | INTERNAL | No           |
+| `forget_fact`   | Delete a memory entry by key                       | INTERNAL | No           |
 
 ---
 
@@ -121,13 +121,14 @@ src/services/api/
 
 The agent follows these rules for all tool execution:
 
-| Type | Behavior | Examples |
-|------|----------|---------|
-| **READ** | Execute immediately without asking the user | `jira_search_issues`, `github_list_prs`, `notion_search`, `telegram_get_chat` |
-| **WRITE** | Describe the planned action, show a preview, wait for user confirmation, then execute | `jira_create_issue`, `github_add_comment`, `notion_create_page`, `telegram_send_message` |
-| **INTERNAL** | Execute silently as part of the agent's internal cognition. Not displayed to user. | `remember_fact`, `search_memory`, `forget_fact` |
+| Type         | Behavior                                                                              | Examples                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| **READ**     | Execute immediately without asking the user                                           | `jira_search_issues`, `github_list_prs`, `notion_search`, `telegram_get_chat`            |
+| **WRITE**    | Describe the planned action, show a preview, wait for user confirmation, then execute | `jira_create_issue`, `github_add_comment`, `notion_create_page`, `telegram_send_message` |
+| **INTERNAL** | Execute silently as part of the agent's internal cognition. Not displayed to user.    | `remember_fact`, `search_memory`, `forget_fact`                                          |
 
 **Write confirmation flow:**
+
 1. Parse the user's intent
 2. Show a summary/preview of the action (e.g., the issue title, message text, page properties)
 3. Ask "Should I proceed?" / "Should I create this?" / "Should I send this?"
@@ -164,12 +165,12 @@ All integration tokens are stored in the `integration_tokens` table with a `prov
 
 ```typescript
 type IntegrationProvider =
-  | 'jira'      // Atlassian Jira (OAuth 2.0 3LO)
-  | 'github'    // GitHub (OAuth 2.0)
-  | 'gitlab'    // GitLab (OAuth 2.0) — planned
-  | 'notion'    // Notion (OAuth 2.0)
-  | 'trello'    // Trello (OAuth 1.0a) — planned
-  | 'slack'     // Slack (OAuth 2.0) — planned
+  | 'jira' // Atlassian Jira (OAuth 2.0 3LO)
+  | 'github' // GitHub (OAuth 2.0)
+  | 'gitlab' // GitLab (OAuth 2.0) — planned
+  | 'notion' // Notion (OAuth 2.0)
+  | 'trello' // Trello (OAuth 1.0a) — planned
+  | 'slack' // Slack (OAuth 2.0) — planned
   | 'telegram'; // Telegram (Bot Token — no OAuth)
 ```
 
@@ -199,13 +200,17 @@ Follow these steps to add a new integration skill:
 
 ```typescript
 interface SkillDefinition {
-  id: string;                                    // Unique skill ID (e.g., 'jira-skill')
-  name: string;                                  // Display name (e.g., 'Jira')
-  provider: IntegrationProvider;                 // Provider type
-  description: string;                           // Description injected into system prompt
-  tools: ChatCompletionTool[];                   // OpenAI function calling tool definitions
-  isAvailable(ctx: SkillContext): Promise<boolean>;  // Check if user has valid token
-  execute(toolName: string, args: Record<string, any>, ctx: SkillContext): Promise<SkillResult>;
+  id: string; // Unique skill ID (e.g., 'jira-skill')
+  name: string; // Display name (e.g., 'Jira')
+  provider: IntegrationProvider; // Provider type
+  description: string; // Description injected into system prompt
+  tools: ChatCompletionTool[]; // OpenAI function calling tool definitions
+  isAvailable(ctx: SkillContext): Promise<boolean>; // Check if user has valid token
+  execute(
+    toolName: string,
+    args: Record<string, any>,
+    ctx: SkillContext,
+  ): Promise<SkillResult>;
 }
 
 interface SkillContext {
@@ -218,7 +223,7 @@ interface SkillResult {
   success: boolean;
   data?: any;
   message: string;
-  displayToUser?: boolean;  // false for internal tools (memory)
+  displayToUser?: boolean; // false for internal tools (memory)
 }
 ```
 
@@ -226,15 +231,15 @@ interface SkillResult {
 
 ## Environment Variables
 
-| Variable | Required | Used By |
-|----------|----------|---------|
-| `OPENAI_API_KEY` | Yes | OpenAI completions + embeddings |
-| `OPENAI_MODEL` | No | AI model selection (default: gpt-4o-mini) |
-| `JIRA_CLIENT_ID` | For Jira | Jira OAuth |
-| `JIRA_CLIENT_SECRET` | For Jira | Jira OAuth |
-| `GITHUB_CLIENT_ID` | For GitHub | GitHub OAuth |
-| `GITHUB_CLIENT_SECRET` | For GitHub | GitHub OAuth |
-| `NOTION_CLIENT_ID` | For Notion | Notion OAuth |
-| `NOTION_CLIENT_SECRET` | For Notion | Notion OAuth |
-| `TELEGRAM_BOT_TOKEN` | For Telegram | Global Telegram bot token (fallback) |
-| `BACKEND_URL` | For OAuth | OAuth callback URL base |
+| Variable               | Required     | Used By                                   |
+| ---------------------- | ------------ | ----------------------------------------- |
+| `OPENAI_API_KEY`       | Yes          | OpenAI completions + embeddings           |
+| `OPENAI_MODEL`         | No           | AI model selection (default: gpt-4o-mini) |
+| `JIRA_CLIENT_ID`       | For Jira     | Jira OAuth                                |
+| `JIRA_CLIENT_SECRET`   | For Jira     | Jira OAuth                                |
+| `GITHUB_CLIENT_ID`     | For GitHub   | GitHub OAuth                              |
+| `GITHUB_CLIENT_SECRET` | For GitHub   | GitHub OAuth                              |
+| `NOTION_CLIENT_ID`     | For Notion   | Notion OAuth                              |
+| `NOTION_CLIENT_SECRET` | For Notion   | Notion OAuth                              |
+| `TELEGRAM_BOT_TOKEN`   | For Telegram | Global Telegram bot token (fallback)      |
+| `BACKEND_URL`          | For OAuth    | OAuth callback URL base                   |

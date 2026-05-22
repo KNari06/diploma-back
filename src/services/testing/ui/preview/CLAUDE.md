@@ -44,6 +44,9 @@ Element resolution and auto-healing serve all three.
 | [snapshot-diff.util.ts](snapshot-diff.util.ts) | [api/snapshot-router.md](api/snapshot-router.md) | Shadow-mode validator: field-level diff between evaluate and CDP snapshots. Boolean-falsy normalization added. |
 | [candidate-pruner-llm.service.ts](candidate-pruner-llm.service.ts) | [api/candidate-pruner-llm.md](api/candidate-pruner-llm.md) | LLM pre-filter: narrows ~60 candidates to ~15 before resolver. Fail-open, identity-rescue, cross-script matching. |
 | [step-readiness-v2.service.ts](step-readiness-v2.service.ts) | [api/step-readiness-v2.md](api/step-readiness-v2.md) | Smart waiter V2: 3-level readiness (existence→actionability→identity) with soft-escape at 70% budget. Shadow mode via `runV1WithShadow`. |
+| [preview-element-pick.service.ts](preview-element-pick.service.ts) | — | One-shot read-only "Pick element" picker (May 2026). Injects in-page overlay + intercepts the next click in capture phase (page sees nothing). Reuses `RecordingCaptureService.probeForRecording` / `buildRecordedFingerprint` / `buildBindingHints` + `generateRecordedDescription` + dry-run `IntentStepLintService.lintStepWithAI`. Owns its own active-session map (`isPickActive`) used by recording:start / run:start as the source of truth for mutex. |
+| [preview-hover-overlay.service.ts](preview-hover-overlay.service.ts) | — | In-page hover outline (May 2026). Replaces the React-rendered `usePreviewHoverHighlight`. Paints sub-frame outlines inside the iframe; never blocks clicks / keystrokes / focus. Modes: `'navigation'` (blue solid) / `'recording'` (red dashed) / `'off'`. Re-injects on `framenavigated`. Pick service flips mode to `'off'` for the duration of pick (its own overlay takes over) and restores on exit. |
+| [overlay-resolver-helpers.ts](overlay-resolver-helpers.ts) | — | Shared JS-string template for in-page element resolution. Used by BOTH pick and hover-overlay so the outline matches the click target byte-for-byte. Implements a lightweight (~250-line) subset of PROBE_AT_POINT_FN: native tags, ARIA roles, behavioral signals (`onclick`/tabindex/React `__reactProps$.onClick`/Angular `(click)`/Vue/Alpine), `contenteditable`, `draggable`, highest-cursor-pointer-ancestor walk with global-pointer bail, row promotion, `<label>` → control elevation, dynamic-id filter for tooltip. Does NOT replicate PROBE's heavy rules (shadow DOM piercing, MUI fieldset rim, wrapper→icon descent) — the server-side PROBE runs on click via `finishPick()` and corrects those. |
 
 ### Supporting services
 
@@ -60,6 +63,7 @@ Element resolution and auto-healing serve all three.
 | [ai-check.service.ts](ai-check.service.ts) | AI-driven assertion (`check:*` step types). |
 | [draft-steps-cache.ts](draft-steps-cache.ts) | In-memory cache for unsaved draft steps. |
 | [external-nav-trap.ts](external-nav-trap.ts) | Catches navigations to unrelated origins (treats as fake-success signal). |
+| [new-tab-opener.ts](new-tab-opener.ts) | Promotes anchor clicks to real new tabs via `context.newPage() + goto(href)` when `<a target="...">` is set, when the href is cross-origin, or when modifier keys request a new tab (Cmd/Ctrl/Shift). Used by `CommandExecutor.performClick`, preview-step-apply `executeAction` click branch, and preview-session live `executeMouseAction`. The new page is adopted by `attachPopupHandler` like any other popup. |
 | [evidence-shortcut.utils.ts](evidence-shortcut.utils.ts) | Cached "this evidence already worked" shortcut to skip resolver. |
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
 | [page-interactive.utils.ts](page-interactive.utils.ts) | "Is page interactive yet" heuristic. |
@@ -120,6 +124,8 @@ Element resolution and auto-healing serve all three.
 | `preview:tab:switch` / `:close` | Tab control |
 | `preview:html:request` / `:accessibility:request` / `:network:list:request` / `:network:detail:request` | DevTools tabs |
 | `preview:apply-resource` / `:save-login` | Test resources (auth fixture apply) |
+| `preview:pick:start` / `:cancel` | Enter / exit one-shot Pick element mode |
+| `preview:hover-overlay:set` | FE flips in-page hover outline mode (`navigation` / `recording` / `off`) when navigation mode toggles |
 
 ### Server → Client
 | Event | Meaning |
@@ -134,6 +140,10 @@ Element resolution and auto-healing serve all three.
 | `preview:step:apply:result` | Apply success/fail + evidence |
 | `preview:run:progress` / `:complete` | Run loop status |
 | `preview:auth:required` | Login wall detected |
+| `preview:pick:state` | Pick mode entered or exited (`active: boolean`, `reason?`) |
+| `preview:pick:result` | One-shot picker result — identity + description + suggested action. Emitted IMMEDIATELY after the probe (no LLM wait). |
+| `preview:pick:lint` | Follow-up dry-run lint verdict (5-10s after `:result`). Carries only `{ status, confidence, message }`. May not fire if lint failed / timed out / session closed. |
+| `preview:stream:state` | Video stream stopped server-side (`{ state: 'stopped', reason }`). Emitted from `cleanupExpiredSessions` with `reason: 'session_evicted'` so the FE can show a terminal "Session expired" instead of looping recovery. Other reasons (page_close / cdp_dead / explicit_stop) are reserved for future producers — FE treats them as transient and re-subscribes. |
 
 ---
 
@@ -202,6 +212,65 @@ preview:run:start
 ```
 Timeout: `min(15min, 60s + 15s × steps)`.
 
+### Pick element (one-shot read-only picker)
+```
+preview:pick:start
+  → guard: not recording, not running (else emit :state { active:false, reason:'error' })
+  → preview-element-pick.service.startPick()
+      page.exposeFunction(__qai_pick_callback) + page.evaluate(overlayScript)
+      overlay listens mousemove (hover highlight + tag#id tooltip)
+                  click in CAPTURE phase → preventDefault + stopImmediatePropagation
+                  → window.__qai_pick_callback({ x, y })
+      timeout 60s; auto-cancel on page navigation
+  → emit preview:pick:state { active: true, reason: 'started' }
+
+[user clicks once in the live preview iframe]
+  → callback fires with click coords
+  → probeForRecording(page, x, y) + buildRecordedFingerprint + buildBindingHints
+  → generateRecordedDescription (LLM, fail-open with structural fallback)
+  → emit preview:pick:result { description, stableId, testId, ref, tag,
+                                recordedFingerprint, bindingHints,
+                                suggestedAction }                       ← IMMEDIATE
+  → emit preview:pick:state { active: false, reason: 'picked' }
+  → overlay torn down
+  ┄ (background, fire-and-forget) ┄
+  → IntentStepLintService.lintStepWithAI (dry-run — no DOM mutation)
+  → emit preview:pick:lint { lint: { status, confidence, message } }    ← 5-10s LATER
+```
+Two-phase emit (May 2026): `:result` ships description + fingerprint as soon as
+the in-page probe finishes so the form can populate immediately. The dry-run
+lint runs in the background and posts a follow-up `:lint` warning when the
+LLM finishes — never blocks the UI on the resolver round-trip. FE clients
+that don't subscribe to `:lint` simply don't see the fragile-locator chip.
+
+Frontend stores identity in hidden fields on the manual-step draft. On apply / save the
+fingerprint is plumbed via `recordedFingerprint` / `bindingHints` on the stepDraft so
+the resolver's identity fast-path hits without an LLM call (see invariant #14).
+
+### Hover overlay (in-page outline, replaces React hoverHighlight)
+```
+FE: previewNavigationMode toggle
+  → ws emit preview:hover-overlay:set { mode: 'navigation' | 'off' }
+  → preview.handler.ts
+      → setHoverOverlayMode(sessionId, page, mode)
+      → page.evaluate(buildHoverScript(mode))
+          installs root + tip + mousemove/scroll listeners (passive)
+          OR re-uses existing instance, just flips window[STATE_KEY].mode
+  → on framenavigated → re-injects (script + DOM are gone post-nav)
+  → on page close → teardownHover()
+
+preview:recording:start → setHoverOverlayMode(... 'recording')  # red dashed
+finalizeRecording        → setHoverOverlayMode(... 'navigation') # blue solid
+preview:pick:start       → setHoverOverlayMode(... 'off') + restore on exit
+
+socket.disconnect → teardownHoverForSession()
+```
+The overlay paints SAME element pick would capture (shared resolver in
+[overlay-resolver-helpers.ts](overlay-resolver-helpers.ts)). Never blocks
+clicks / keystrokes / focus — purely visual. Listeners are `{ passive: true }`.
+React `usePreviewHoverHighlight` was REMOVED in May 2026 — re-import if a
+cross-origin-iframe fallback is needed.
+
 ### Background replay (regression / scheduled)
 ```
 BullMQ enqueue (manual-test-run.job.ts)
@@ -255,11 +324,11 @@ If apply fails after action: auto-heal path
 
 ## Invariants (must hold)
 
-1. **Recording ↔ Run mutual exclusion.** `PreviewRunService.isRunning()` blocks new captures. Starting a run stops recording.
+1. **Recording ↔ Run ↔ Pick mutual exclusion.** `PreviewRunService.isRunning()` blocks new captures; starting a run stops recording. Pick element (`preview-element-pick.service.ts` — `isPickActive(sessionId)`) is the third leg: recording:start and run:start both consult it and reject early. The pick service owns its own active-session map (the source of truth) — do NOT mirror it into yet another Set, that's how race windows are born.
 2. **WS handler must always respond.** Even on validation failure, emit a `:result` with `{ error }`. No silent returns.
 3. **CDP sessions — measured trade-off (Etap 2, May 2026).** `preview-video-stream.service.ts` owns the screencast session — never piggyback on it (`existingCdpSession` != screencast session; piggyback causes 100% video freeze, empirically measured). `CdpSnapshotService` opens its **own** session and detaches in `finally` — this is allowed and causes only brief FPS drop (~11 FPS during dense snapshot, recovers immediately). For DevTools/a11y outside Etap 2 still use `page.accessibility.snapshot()` / `page.content()`. Calling `Accessibility.enable` on any session in preview still freezes video. See [critical-patterns.md](../../../../../.claude/rules/critical-patterns.md) §2.
 4. **`waitUntil: 'load'` everywhere in apply/run/replay.** Don't introduce `domcontentloaded`.
-5. **Recorder probe and snapshot collector must use the same criteria.** If the recorder captures an element, the resolver must be able to see it. Symmetry break = wrong-element bug. Both sides use the same dynamic-id regex (`dynamic-id.util.ts`) and the same Tier-1/Tier-2 selection rules.
+5. **Recorder probe and snapshot collector must use the same criteria.** If the recorder captures an element, the resolver must be able to see it. Symmetry break = wrong-element bug. Both sides use the same dynamic-id regex (`dynamic-id.util.ts`) and the same Tier-1/Tier-2 selection rules. A THIRD party is the in-page resolver in [`overlay-resolver-helpers.ts`](overlay-resolver-helpers.ts) — used by both pick and hover overlays. It is intentionally a **strict subset** of `PROBE_AT_POINT_FN` (lightweight rules only: native tags, ARIA roles, behavioral signals, row/label promotion). It must NEVER diverge in the opposite direction (resolve an element the canonical PROBE wouldn't), because pick saves the **canonical** PROBE result on click — the overlay's job is purely visual hint.
 6. **`node.id` and `node.testIdAttr` must be populated by the collector** (not just declared on the type). They drive the identity fast-path.
 7. **Field sessions are single-shot.** One focus→blur cycle = one Type step, with `input.value` as canonical content.
 8. **Lookahead before action, not after.** `waitForStepReadiness` runs before the click, not after. Otherwise we click the stale node and wait for the new one to appear.
@@ -267,6 +336,11 @@ If apply fails after action: auto-heal path
 10. **Fake-success guard:** post-click `weak signal (focus/none/newtab) + fingerprint mismatch + has ground truth` → mark as FAIL, don't claim success. Layer at `preview-step-apply.ts`.
 11. **`{{key}}` interpolation uses the unified helper** [`src/utils/interpolation/resolve-placeholders.ts`](../../../../utils/interpolation/resolve-placeholders.ts). Three callers (`preview-step-apply`, `preview-run`, background `test-executor`) read from the same `[scratchpad → runVariables]` source order. `runVariables` is plumbed via `PreviewSession.contextRunVariables` (populated by `preview:apply-resource` for environment/secret/fixture kinds). Adding another variable namespace = one more `VariableSource`, never another regex. Selectors / `elementDescription` are NOT interpolated — keep it that way.
 12. **`secrets.*` values must never leak after interpolation.** Sinks already wired: `command-executor` log, replay-trace JSONL (`ReplayTraceWriter.setRedactValues`), editor-trace JSONL (provider in `EditorTraceService.getOrCreate`), `intent-resolve-audit` (`secretValues` param), WS `preview:step:apply:result` and three `preview:run:step` emits, `runtimeMeta` in `emitTestStepCompleted`. `preview-run` rewinds the persisted `appliedStep` back to its placeholder shape via `preserveOriginalStep` so DB rows store `{{secrets.X}}`, not the resolved value. `session.contextRunVariables` is cleared on `resetSession`. When you add a new emit / log / persist site carrying step bodies, plumb a redactor — see redact-step.md or use `executor.redactString` / `buildStepRedactor`. Snapshot semantics: redaction lists are captured ONCE per run; mid-run resource reapply needs an explicit refresh.
+13. **Hover overlay never blocks user input.** [`preview-hover-overlay.service.ts`](preview-hover-overlay.service.ts) is a paint-only layer — all in-page listeners are `{ passive: true }` and the outline `<div>` has `pointer-events: none`. The pick overlay (a separate service) is the ONLY one that intercepts clicks. If you add a new in-page overlay, follow the hover service's pattern, NOT the pick service's, unless the new overlay is explicitly a one-shot selection mode. Mode-flip precedence: recording mode (server-side, set by recording handlers) wins over navigation mode (FE-driven via `preview:hover-overlay:set`). Pick mode preempts both — pick handler captures the previous mode in `hoverModeBeforePick` and restores it in `onExit`.
+14. **Resolver candidate list MUST NOT carry list-position numbers.** The candidate list rendered into the LLM prompt is `- ref="eXX" <tag> …`, one per line. Earlier `${i + 1}. ref="eXX"` confused weak models (gemini-2.5-flash-lite, May 2026 bi.group "Ташкент" incident): a 55-candidate dense modal list made the model return `e45` (its reasoning's enumeration index) when the actual ref pool only reached `e31`. Validator caught it but the UI surfaced as silent "not found right after Pick". If you add a new resolver prompt path, copy the `- ref="…"` shape and the explicit "DO NOT return a list position" rule. The validator at `LLM_SELECT` now also warns when `parsed.ref ∉ validRefs` so the next regression is caught in logs first.
+15. **Identity fast-path covers six attributes plus the tag+role+text triple.** Six stable-attribute checks (`id` / `testId` / `href` / `svgIcon` / `customElementTag` / `name` / `alt`) run first; a final Tier-2 pass matches `tag + role + text` when ALL three were captured by the recorder/picker and EXACTLY ONE live candidate carries the same triple. Triple-match only fires for click-class actions (click/hover/select) and requires `text.length >= 2`. This is the channel that lets Pick on a CSS-Modules / styled-components site (bi.group, May 2026) skip the LLM entirely. Do NOT use `compiled.targetFingerprint` as a fallback channel here — that's a self-echo of a previous resolver decision and creates a fake-success loop (V27 history at element-resolver.service.ts:3960).
+16. **New-tab promotion is the single path for `<a target=_blank>` / cross-origin anchors / modifier-driven new-tab clicks.** All three click sites (`CommandExecutor.performClick` for background replay, `executeAction` click branch for live Apply/Apply All, `executeMouseAction` for live preview clicks) call into [new-tab-opener.ts](new-tab-opener.ts) BEFORE `locator.click()` / `page.mouse.click()`. Reason: Playwright's `locator.click()` does not reliably honour `target="_blank"` under our launch flags (`--disable-features=IsolateOrigins,site-per-process` + headless) and collapses popups into the active tab; recorded `<a target>` semantics also need to be replayable. The opener creates a Page in the same BrowserContext, which fires `context.on('page')` → `attachPopupHandler` → `preview:tab:opened`, so the FE renders the tab without any extra plumbing. Same-origin anchors without explicit target are NOT promoted — those stay inline so SPA navigations and normal in-flow clicks aren't fragmented across tabs. Probe failures fail OPEN (fall back to normal click). The recorder also captures `<a target>` into `ProbedElement.linkTarget` / `BindingHints.linkTarget` / `TargetFingerprint.linkTarget` so the hint travels with the step (informational; the runtime probe is ground truth).
+17. **Pick service uses two-phase emit.** `preview:pick:result` is sent IMMEDIATELY after the in-page probe (description + fingerprint + bindingHints); `preview:pick:lint` follows 5-10s later with the dry-run resolver verdict. Never block `:result` on the lint — the form must populate without waiting for the LLM. If you add another expensive post-probe enrichment (vision, RAG, second LLM pass), keep it on the same fire-and-forget pattern with its own follow-up event.
 
 ---
 

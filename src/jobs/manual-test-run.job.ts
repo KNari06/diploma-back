@@ -2,6 +2,7 @@ import { executePlaywrightTestWithRetry } from '@/agent';
 import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
+import { resolveTestCasePriorityForTestId } from '@/services/testing/regression/resolve-test-case-priority.util';
 import { AgentResponse, TestJobData } from '@/types';
 import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
@@ -744,6 +745,14 @@ export class ManualTestRunJobHandler {
               duration = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
             }
 
+            // Curator-set priority of the saved test case, if any.
+            // Same helper as Jira sync; fail-open (returns undefined
+            // for ad-hoc / chat-lite runs and API tests).
+            const { resolveTestCasePriorityForTestId } = await import(
+              '@/services/testing/regression/resolve-test-case-priority.util'
+            );
+            const tcPriority = await resolveTestCasePriorityForTestId(testId);
+
             await sendTelegramNotification(tokenData, {
               icon: '\u274C',
               title: 'Test Failed',
@@ -751,6 +760,12 @@ export class ManualTestRunJobHandler {
                 { label: 'URL', value: testUrl },
                 { label: 'Browsers', value: (test.browsers || []).join(', ') || '—' },
                 ...(duration ? [{ label: 'Duration', value: duration }] : []),
+                ...(tcPriority
+                  ? [{
+                    label: 'Test priority',
+                    value: tcPriority.charAt(0).toUpperCase() + tcPriority.slice(1),
+                  }]
+                  : []),
               ],
               error: errorMessage,
               ctaLabel: 'View test results \u2192',

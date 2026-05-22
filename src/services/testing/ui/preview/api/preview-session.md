@@ -198,7 +198,8 @@ The hot path — called by recording handlers, apply/run, lint, periodic DOM tic
 
 - Wraps `RecordingCaptureService.probeForRecording()` and matches against current `session.pageState.domNodes`.
 - **Returns:** `{ tag, label, boundingBox, resolvedVia }` on success; `{ rejectReason }` when `withRejectReason=true` and probe finds no interactive target.
-- **Caller:** `preview:mouse:probe` WS event (V26 on-demand element inspect).
+- **Caller (current):** `preview:mouse:probe` WS event (V26 on-demand element inspect).
+- **Caller (legacy, disabled May 2026):** Previously called per-mousemove by the `preview:mouse:move` handler to drive the React `preview:element:hover` highlight. That path is now gated by `REACT_HOVER_PROBE_ENABLED = false` — see [preview-handler.md](preview-handler.md). The in-page `preview-hover-overlay.service.ts` paints the outline directly in the iframe and never round-trips to this function.
 
 ### `setContextData({ sessionId, userId, key, value }): Promise<{ version, data } | null>`
 

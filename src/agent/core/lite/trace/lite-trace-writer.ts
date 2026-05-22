@@ -363,7 +363,14 @@ export class LiteTraceWriter {
   // ═══════════════════════════════════════════════════════════════════════════
 
   /**
-   * Check if event type is a summary event (always written even when file size limit reached)
+   * Check if event type is a summary event (always written even when file size limit reached).
+   *
+   * `trace_summary` was added in May 2026 — the editor-trace path writes it
+   * as the LAST event on `close()` so upload-side `parsed_data` reads
+   * pre-aggregated stats without re-scanning the JSONL. If the file hits
+   * its size cap before close fires, dropping the summary would leave
+   * `parsed_data` empty for that session. The line is small (~500 bytes
+   * of bucket counts) and survives the cap by design.
    */
   private isSummaryEvent(eventType: string): boolean {
     return [
@@ -373,6 +380,7 @@ export class LiteTraceWriter {
       'iteration_end',
       'error',
       'log_truncated',
+      'trace_summary',
     ].includes(eventType);
   }
 

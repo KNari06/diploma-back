@@ -1,5 +1,5 @@
 ---
-description: Hard-won patterns from past bugs — CDP, WebSocket, CSS, concurrency, Playwright
+description: Hard-won patterns from past bugs — CDP, WebSocket, CSS, concurrency, Playwright, OpenAI role mapping, Supabase
 alwaysApply: true
 ---
 
@@ -112,3 +112,54 @@ rg "functionNameOrPattern" src/ --type ts
 3-stage waterfall: compiled plan → LLM resolver → smart locator. Never skip stages — each catches cases the previous misses.
 
 Upload fallback chain: `setInputFiles` → nearby hidden input + shadow DOM → `fileChooser` (3s) → synthetic drag-drop.
+
+## 9. OpenAI role mapping
+
+DB stores `'ai'`, OpenAI API requires `'assistant'`. Passing raw `msg.role` causes a 400 error.
+
+```typescript
+import { convertRoleForOpenAI } from "@/utils/helpers/chat-helpers";
+
+// CORRECT
+const messages = chatHistory.map((msg) => ({
+  role: convertRoleForOpenAI(msg.role), // 'ai' → 'assistant'
+  content: msg.content,
+}));
+
+// WRONG — 400 from OpenAI
+const messages = chatHistory.map((msg) => ({
+  role: msg.role,
+  content: msg.content,
+}));
+```
+
+- DB/TypeScript types: `'user' | 'ai' | 'system'`
+- OpenAI accepts: `'user' | 'assistant' | 'system' | 'function' | 'tool' | 'developer'`
+- Use `convertRoleForOpenAI()` before **every** OpenAI API call.
+
+## 10. Supabase field verification
+
+Before using a field in `.select()`, verify it exists in `supabase-migrations/supabase-schema.sql`. Querying a non-existent field returns no error — it silently returns `null`.
+
+```typescript
+// CORRECT — verified fields
+.select("id, url, status, created_at")
+
+// WRONG — fields don't exist, silent null
+.select("test_id, created_date")
+```
+
+## 11. Supabase N+1 queries
+
+Never call `.single()` inside a loop. Batch with `.in()`.
+
+```typescript
+// BAD — N+1
+for (const r of results) {
+  const test = await supabase.from("tests").select("*").eq("id", r.test_id).single();
+}
+
+// GOOD — one query
+const testIds = results.map((r) => r.test_id);
+const { data: tests } = await supabase.from("tests").select("*").in("id", testIds);
+```

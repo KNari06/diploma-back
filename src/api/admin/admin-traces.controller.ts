@@ -17,7 +17,9 @@ const BROWSER_TYPE_MAP: Record<string, string> = {
   'preview-run-trace': 'preview_run',
   'lite-trace-log': 'lite',
   'api-agent-trace': 'api_agent',
-  'replay-trace': 'replay',
+  'regression-trace': 'regression',
+  // Back-compat: rows written before the regression rename.
+  'replay-trace': 'regression',
 };
 
 const TYPE_TO_BROWSER: Record<string, string> = {
@@ -25,7 +27,7 @@ const TYPE_TO_BROWSER: Record<string, string> = {
   preview_run: 'preview-run-trace',
   lite: 'lite-trace-log',
   api_agent: 'api-agent-trace',
-  replay: 'replay-trace',
+  regression: 'regression-trace',
 };
 
 /** All trace categories currently surfaced to the admin UI. */
@@ -34,6 +36,8 @@ const ADMIN_VISIBLE_BROWSERS = [
   'preview-run-trace',
   'lite-trace-log',
   'api-agent-trace',
+  'regression-trace',
+  // Back-compat: rows written before the regression rename.
   'replay-trace',
 ];
 
@@ -94,7 +98,13 @@ export const listAllTraces = async (req: Request, res: Response): Promise<void> 
   if (type !== 'all') {
     const browserValue = TYPE_TO_BROWSER[type];
     if (browserValue) {
-      query = query.eq('browser', browserValue);
+      // `regression` covers both the current `regression-trace` rows and
+      // legacy `replay-trace` rows written before the rename.
+      if (type === 'regression') {
+        query = query.in('browser', ['regression-trace', 'replay-trace']);
+      } else {
+        query = query.eq('browser', browserValue);
+      }
     } else {
       // Also support filtering by raw browser value
       query = query.eq('browser', type);

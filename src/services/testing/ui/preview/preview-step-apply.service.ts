@@ -2564,39 +2564,47 @@ async function executeAction(
           // Legacy behavior: append typing (uses keyPressDelay if provided)
           await locator.click({ timeout });
           await locator.pressSequentially(value, { timeout, delay: step.options?.keyPressDelay });
-        } else if (value.length <= 50) {
-          // Short text (credentials, emails, OTP, validation data): use pressSequentially
-          // for full keyboard event chain — frameworks that rely on keydown/keyup won't miss input.
-          // Cost: ~20ms × N chars = max 1s for 50 chars — acceptable for reliability.
-          await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
-          await locator.click({ timeout });
-          await locator.pressSequentially(value, { timeout, delay: 20 });
         } else {
-          // Long text (comments, descriptions): fast fill with post-blur fallback
-          await locator.fill(value, { timeout });
+          // When the user explicitly sets keyPressDelay we always use
+          // pressSequentially so the per-keystroke delay is honored — even for
+          // long text where we'd normally take the fast `fill()` path.
+          const userKeyPressDelay = Number.isFinite(step.options?.keyPressDelay)
+            ? Math.max(0, step.options!.keyPressDelay!)
+            : null;
 
-          // Post-fill verification: check value survived after triggering blur.
-          // Some frameworks (WPForms, React controlled inputs) clear fill() values
-          // because they only track state via keyboard events, not programmatic value sets.
-          try {
-            // Trigger blur by pressing Tab (moves focus to next field)
-            await locator.press('Tab', { timeout: 2000 }).catch(() => {});
-            await page.waitForTimeout(100); // Let framework process blur
-            // Re-focus to check value
-            await locator.focus({ timeout: 2000 }).catch(() => {});
-            const postBlurValue = await locator.inputValue().catch(() => '');
-            if (value && postBlurValue.trim() !== value.trim()) {
-              logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
-                expected: value.slice(0, 50),
-                actual: postBlurValue.slice(0, 50),
-              });
-              // Clear and retry with pressSequentially (generates full keyboard event chain)
-              await locator.fill('', { timeout }).catch(() => {});
-              await locator.click({ timeout });
-              await locator.pressSequentially(value, { timeout, delay: 30 });
+          if (value.length <= 50 || userKeyPressDelay != null) {
+            // Short text (credentials, emails, OTP) OR user-requested gradual typing:
+            // use pressSequentially for full keyboard event chain.
+            await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
+            await locator.click({ timeout });
+            await locator.pressSequentially(value, { timeout, delay: userKeyPressDelay ?? 20 });
+          } else {
+            // Long text (comments, descriptions): fast fill with post-blur fallback
+            await locator.fill(value, { timeout });
+
+            // Post-fill verification: check value survived after triggering blur.
+            // Some frameworks (WPForms, React controlled inputs) clear fill() values
+            // because they only track state via keyboard events, not programmatic value sets.
+            try {
+              // Trigger blur by pressing Tab (moves focus to next field)
+              await locator.press('Tab', { timeout: 2000 }).catch(() => {});
+              await page.waitForTimeout(100); // Let framework process blur
+              // Re-focus to check value
+              await locator.focus({ timeout: 2000 }).catch(() => {});
+              const postBlurValue = await locator.inputValue().catch(() => '');
+              if (value && postBlurValue.trim() !== value.trim()) {
+                logger.info('[EXECUTE_ACTION] fill() value lost after blur — retrying with pressSequentially', {
+                  expected: value.slice(0, 50),
+                  actual: postBlurValue.slice(0, 50),
+                });
+                // Clear and retry with pressSequentially (generates full keyboard event chain)
+                await locator.fill('', { timeout }).catch(() => {});
+                await locator.click({ timeout });
+                await locator.pressSequentially(value, { timeout, delay: 30 });
+              }
+            } catch {
+              // Non-critical — best effort fallback
             }
-          } catch {
-            // Non-critical — best effort fallback
           }
         }
         if (step.options?.pressEnter) {
@@ -2632,6 +2640,42 @@ async function executeAction(
 
         // V13: Track pages before click for new-tab detection
         const pagesBefore = page.context().pages().length;
+
+        // New-tab promotion: anchors with explicit `target` (`_blank` / named)
+        // OR cross-origin anchors AND modifier-driven new-tab clicks
+        // (Cmd/Ctrl/Shift) open via `context.newPage() + goto(href)` instead
+        // of `locator.click()`. The BrowserContext-level `on('page')` hook
+        // (preview-session.attachPopupHandler) adopts the page into
+        // `session.pages` and emits `preview:tab:opened` — no extra plumbing
+        // needed here, we just skip the click and break out of the case.
+        try {
+          const { tryOpenAnchorAsNewTab, shouldOpenAsNewTab, openHrefInNewTab, probeAnchorAtLocator } = await import('./new-tab-opener');
+          const wantsNewTabByModifier = clickModifiers.includes('Meta')
+            || clickModifiers.includes('Control')
+            || clickModifiers.includes('Shift');
+          if (wantsNewTabByModifier) {
+            const probe = await probeAnchorAtLocator(locator);
+            if (probe?.href) {
+              // When Cmd/Ctrl/Shift is held on a same-origin anchor without
+              // `target`, `shouldOpenAsNewTab` returns null (those wouldn't
+              // qualify on their own). The modifier itself is the trigger
+              // here — tag the reason explicitly so logs don't conflate it
+              // with `_blank` attribute-driven promotion.
+              const decision = shouldOpenAsNewTab(probe, page.url())
+                ?? { reason: 'modifier_driven' as const, href: probe.href };
+              const tabOpen = await openHrefInNewTab(page.context(), decision.href, decision.reason);
+              if (tabOpen) break;
+            }
+          } else {
+            const tabOpen = await tryOpenAnchorAsNewTab(locator, page.context(), page.url());
+            if (tabOpen) break;
+          }
+        } catch (probeErr) {
+          // Fail open — never block a normal click on probe glitches.
+          logger.debug('[EXECUTE_ACTION] New-tab probe failed, proceeding with normal click', {
+            error: probeErr instanceof Error ? probeErr.message : String(probeErr),
+          });
+        }
 
         if (humanLike) {
           // Human-like click: hover -> small pause -> click
@@ -3385,6 +3429,38 @@ export class PreviewStepApplyService {
         return {
           success: switched,
           error: switched ? undefined : `Tab ${targetTab} not available after waiting`,
+          url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+          attempts: 1,
+        };
+      }
+
+      // close_tab action — symmetric replay of a recording-time × click.
+      // Soft-success semantics: if the target tab is already gone (closed
+      // by the site, evicted, never opened on this replay because a popup
+      // step earlier was skipped), we treat the step as a no-op success.
+      // The user intent "this tab should not exist anymore" is already
+      // true; failing the step here would block downstream actions for
+      // no good reason. The only hard failure path is closeTab returning
+      // false WHILE the tab still exists (e.g. tab index 0 with no other
+      // tabs — the root guard refuses). That's surfaced as an explicit
+      // error so the user sees why replay diverges.
+      if (stepDraft.type === 'close_tab') {
+        const targetTab = parseInt(stepDraft.value || '0', 10);
+        const session = sessionService.getSession(previewSessionId);
+        const tabExists = !!session && targetTab >= 0 && targetTab < session.pages.length;
+        if (!tabExists) {
+          return {
+            success: true,
+            url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+            attempts: 1,
+          };
+        }
+        const closed = await sessionService.closeTab(previewSessionId, userId, targetTab);
+        return {
+          success: closed,
+          error: closed
+            ? undefined
+            : `Could not close tab ${targetTab} (root tab is protected when it's the only one)`,
           url: sessionService.getPage(previewSessionId, userId)?.url() || '',
           attempts: 1,
         };

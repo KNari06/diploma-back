@@ -188,12 +188,12 @@ Key services integrated: `PreviewSessionService`, `RecordingCaptureService`, `Pr
   1. Validate user, rate limit
   2. Coalesce: record latest (x, y) in `moveCoalesceState`; schedule ONE `executeMouseAction('move')` per tick via setImmediate
   3. Side effect 1 (recording): update `recordingLastHover` with (x, y, timestamp) if recording
-  4. Side effect 2 (hover probe): throttle probe to every `HOVER_PROBE_THROTTLE_MS` (200ms); probe `probeInteractiveElementAt()` with fresh coords; emit `preview:element:hover` if element changed
+  4. Side effect 2 (hover probe): **DISABLED in May 2026** (`REACT_HOVER_PROBE_ENABLED = false`). The hover outline is now painted by the in-page `preview-hover-overlay.service.ts` listening to `mousemove` directly inside the iframe — no server-side PROBE per move, no `preview:element:hover` emit. The legacy throttle + `probeInteractiveElementAt` + emit code is guarded so it can be re-enabled as a cross-origin-iframe fallback if needed.
 - **Response event:** None (fire-and-forget)
 - **Side-effects:**
   - Coalesces multiple moves per event loop into ONE Playwright call
   - Records hover position for click step pre-probe
-  - Emits hover element (deduped by element key) for Cursor-style highlight
+  - (Legacy, disabled) Emits hover element for React-rendered highlight
   - Skips probe during active run (clears hover)
   - Guards against stale probe after page navigation
 - **Gotchas:** Coalesce means `executeMouseAction()` may lag coords by 1 tick, but hover probe + recording use LATEST coords from map (race-safe); probe result filtered by reject reason (v23) to distinguish "no element" vs "cross-origin" vs "non-interactive"
@@ -566,7 +566,11 @@ The recording upload flow now has client→server response events to complete th
 |-------|-----------|---------|---------|---------|
 | `preview:page` | server→client | On subscribe, after apply, DOM tick | `{ previewSessionId, url, pageTitle, domVersion, pageSignature, domNodes[], timestamp }` | Live page snapshot with coordinate data |
 | `preview:viewport` | server→client | On subscribe, after viewport:set | `{ previewSessionId, viewport: {width, height}, devicePixelRatio, timestamp }` | Viewport metadata for coordinate mapping |
-| `preview:element:hover` | server→client | Hover probe throttled (200ms) | `{ previewSessionId, element: {tag, label, boundingBox}, timestamp }` | Cursor-style element highlight (deduped) |
+| `preview:element:hover` | server→client | **DISABLED May 2026** — `REACT_HOVER_PROBE_ENABLED = false`. Code retained behind the flag for cross-origin-iframe fallback. The in-page `preview-hover-overlay.service.ts` replaces this. | `{ previewSessionId, element: {tag, label, boundingBox}, timestamp }` | (legacy) Cursor-style element highlight |
+| `preview:hover-overlay:set` | client→server | FE flips in-page hover overlay mode when `previewNavigationMode` toggles | `{ previewSessionId, mode: 'navigation' \| 'recording' \| 'off' }` | Drives `setHoverOverlayMode` in [`preview-hover-overlay.service.ts`](../preview-hover-overlay.service.ts) |
+| `preview:pick:start` / `:cancel` | client→server | One-shot read-only element picker | `{ previewSessionId }` | Drives [`preview-element-pick.service.ts`](../preview-element-pick.service.ts) |
+| `preview:pick:state` | server→client | Pick mode entered / exited | `{ previewSessionId, active, reason?, error?, timestamp }` | Tracks pick session lifecycle |
+| `preview:pick:result` | server→client | Pick fired — one-shot per session | `{ previewSessionId, description?, stableId?, testId?, ref?, tag?, recordedFingerprint?, bindingHints?, suggestedAction?, lint?, timestamp }` | Identity + suggested action for the manual step form |
 | `preview:recording:warning` | server→client | Click on cross-origin/unsupported host | `{ previewSessionId, type, message, iframeSelector?, hostKind?, timestamp }` | Warn user recording cannot capture this element |
 
 ### Step & Run Results

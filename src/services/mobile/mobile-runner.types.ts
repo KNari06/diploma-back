@@ -106,6 +106,12 @@ export interface MobileIntentStepOptions {
   pressEnter?: boolean;
   scrollDirection?: 'up' | 'down' | 'left' | 'right';
   scrollAmount?: number;
+  /** Swipe direction (mobile swipe step). Distinct from scrollDirection so
+   *  editor swipe steps don't conflict with scroll steps semantically.
+   *  Forwarded by the frontend; runner reads it via resolveDirection(). */
+  direction?: 'up' | 'down' | 'left' | 'right';
+  /** Swipe distance hint (0-1 normalised). Forwarded by the editor. */
+  distance?: number;
   continueOnError?: boolean;
   // App management
   activityName?: string;
