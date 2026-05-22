@@ -143,6 +143,7 @@ Element resolution and auto-healing serve all three.
 | `preview:pick:state` | Pick mode entered or exited (`active: boolean`, `reason?`) |
 | `preview:pick:result` | One-shot picker result — identity + description + suggested action. Emitted IMMEDIATELY after the probe (no LLM wait). |
 | `preview:pick:lint` | Follow-up dry-run lint verdict (5-10s after `:result`). Carries only `{ status, confidence, message }`. May not fire if lint failed / timed out / session closed. |
+| `preview:stream:state` | Video stream stopped server-side (`{ state: 'stopped', reason }`). Emitted from `cleanupExpiredSessions` with `reason: 'session_evicted'` so the FE can show a terminal "Session expired" instead of looping recovery. Other reasons (page_close / cdp_dead / explicit_stop) are reserved for future producers — FE treats them as transient and re-subscribes. |
 
 ---
 
