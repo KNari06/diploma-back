@@ -39,7 +39,10 @@
  */
 
 import type { CDPSession, Frame, Page } from 'playwright';
+import * as fs from 'fs';
+import * as path from 'path';
 import { logger } from '@/utils/core/logger';
+import { isDevelopment } from '@/config/environment/env';
 import type { LiteElement, LiteSnapshot, ObstacleFact, TransientStateInfo } from '@/agent/core/lite/lite-types';
 import {
   POSITIONAL_CANDIDATES_SELECTOR,
@@ -103,6 +106,32 @@ export interface CdpSnapshotOptions {
    * divergence analysis can correlate by session/run.
    */
   diagId?: string;
+  /**
+   * Forensic rejection logging — opt-in, DEV-ONLY.
+   *
+   * When true AND `isDevelopment` (NODE_ENV === 'development'),
+   * every node that gets dropped in mapToLiteElements (tier1 /
+   * iconish / tier2), findElement (refAssign), or the dedup pass
+   * is recorded with `{ tag, attrs, bbox, reason }` and written to
+   * a per-snapshot JSONL file under `test_logs/editor/`. The raw
+   * DS payload (~1.5 MB) and live page HTML (~1 MB) are also
+   * dumped alongside for offline diagnosis.
+   *
+   * **Production behaviour: the flag is IGNORED.** isDevelopment
+   * gate inside collect() short-circuits, no JSONL, no DS dump,
+   * no HTML dump. The reason: dump sizes × every user-triggered
+   * lint would fill the prod disk within days.
+   *
+   * **CALLER RESPONSIBILITY: still gate this at the call site.**
+   * The service-level dev gate is defence in depth; callers MUST
+   * still pass `forensicRejections` only for user-initiated lint
+   * (find_button / apply_prelint), not for idle ticks. Mis-gated
+   * caller in DEV would produce ~3 MB per second per session.
+   *
+   * Use case: debugging "the element I want is missing from the
+   * candidate list" bugs (May 2026 bi.group close-X incident).
+   */
+  forensicRejections?: boolean;
 }
 
 /**
@@ -190,6 +219,328 @@ interface RawCdpBundle {
   domSnapshot: any; // Protocol.DOMSnapshot.CaptureSnapshotResponse
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   axTree: any;      // Protocol.Accessibility.GetFullAXTreeResponse
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Forensic rejection logging (May 2026)
+//
+// Opt-in per-snapshot JSONL trace of every element dropped by the
+// pipeline stages. Triggered only by user-initiated lint/Find (not
+// idle preview-tick), so the disk cost is bounded.
+//
+// Used for diagnosing "target was never collected" bugs without
+// adding cross-stage state to the regular fast path — every record
+// is shaped {tag, attrs, bbox, reason} and pushed to a per-stage
+// array carried through the collect() call.
+// ─────────────────────────────────────────────────────────────────
+
+/** Compact per-element record carried in `passed.sample` / `rejected[]` / `final.elements`. */
+interface ForensicNode {
+  tag: string;
+  attrs: Record<string, string>;
+  bbox: { x: number; y: number; w: number; h: number } | null;
+  /** DS-node index inside the source document — lets you cross-reference
+   *  with the raw CDP DOMSnapshot dump when really deep diagnosis is needed. */
+  dsNodeIdx?: number;
+  /** Truncated visible text (≤60 chars). NEVER includes input.value or any
+   *  resolved `{{secrets.*}}` (those never reach this layer — collector
+   *  reads attrs, not runtime fields). */
+  text?: string;
+}
+
+interface ForensicRejection extends ForensicNode {
+  reason: string;
+  /** Optional structured diagnosis — populated for refAssign / dedup where
+   *  the WHY is non-trivial. tier1/iconish/tier2 use `reason` alone. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  diag?: Record<string, any>;
+}
+
+interface ForensicStageRecord {
+  stage: 'summary' | 'tier1' | 'iconish' | 'tier2' | 'refAssign' | 'dedup' | 'final';
+  inputCount: number;
+  passedCount: number;
+  rejected: ForensicRejection[];
+  /** Optional small sample of nodes that PASSED the stage. Sampled at
+   *  most ~10 entries — enough to confirm "did the target survive?"
+   *  without ballooning the file on a 500-node page. */
+  passedSample?: ForensicNode[];
+  /** Stage wall-clock in ms. Useful when chasing perf regressions. */
+  durationMs?: number;
+  /** Free-form per-stage extras (counters, hit rates, etc.). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  extra?: Record<string, any>;
+}
+
+interface ForensicCollector {
+  diagId: string;
+  /** Snapshot start wall-clock — used to compute per-stage durations. */
+  startedAt: number;
+  /** Captured at the end of collect() so the `summary` stage can carry
+   *  context (URL, viewport, document count, phase timings). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  summary?: Record<string, any>;
+  /** Captured at the end — final element list snapshot for "did it survive?" */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  final?: { elementCount: number; elements: ForensicNode[]; extra?: Record<string, any> };
+  stages: ForensicStageRecord[];
+}
+
+const FORENSIC_LOGS_DIR = path.join(process.cwd(), 'test_logs', 'editor');
+/** Attributes we keep on each rejection record — small but diagnostic.
+ *  Wider than the v1 list to capture framework-specific hints (alpine,
+ *  htmx, qwik) and a11y signals that often distinguish the target from
+ *  decorative siblings on icon-heavy pages. */
+const FORENSIC_INTEREST_ATTRS = [
+  'id', 'class', 'role', 'type', 'name', 'href', 'xlink:href',
+  'aria-label', 'aria-labelledby', 'aria-controls', 'aria-haspopup', 'aria-expanded',
+  'data-testid', 'data-test-id', 'data-test', 'data-cy', 'data-qa', 'data-test-element', 'data-track',
+  'data-action', 'data-bind', 'data-toggle',
+  'tabindex', 'title', 'alt', 'placeholder',
+] as const;
+
+/** How many `passed.sample` entries to keep per stage. Tuned so the JSONL
+ *  stays scannable (~10 lines per stage) while still showing both
+ *  identity-rich (first matches usually have id/testId) and bbox-only
+ *  (later matches) nodes. */
+const FORENSIC_PASSED_SAMPLE_SIZE = 10;
+/** Cap on final.elements — every surviving element is recorded so you can
+ *  grep for "is my target in there at all?" in one place. 500 is the
+ *  MAX_TOTAL_ELEMENTS cap anyway, so this is effectively "all". */
+const FORENSIC_FINAL_ELEMENT_CAP = 500;
+
+function pickForensicAttrs(attrs: DecodedAttrs): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of FORENSIC_INTEREST_ATTRS) {
+    const v = attrs.get(key);
+    if (v !== undefined && v !== '') out[key] = v.length > 120 ? v.slice(0, 120) : v;
+  }
+  // Class lists get long fast; truncate aggressively to keep JSONL compact.
+  if (out.class && out.class.length > 80) out.class = out.class.slice(0, 80) + '…';
+  return out;
+}
+
+function bboxToForensic(
+  bounds: { x: number; y: number; width: number; height: number } | undefined,
+): ForensicRejection['bbox'] {
+  if (!bounds) return null;
+  return {
+    x: Math.round(bounds.x),
+    y: Math.round(bounds.y),
+    w: Math.round(bounds.width),
+    h: Math.round(bounds.height),
+  };
+}
+
+/**
+ * Build a compact ForensicNode from a fully-mapped LiteElement. Used by
+ * `passedSample` and `final.elements` arrays so they share the same shape
+ * as `rejected[]` — one jq filter works across the whole JSONL.
+ */
+function liteElementToForensic(el: LiteElement): ForensicNode {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const elAny = el as any;
+  // bbox=null when:
+  //   - el.bounds genuinely absent, OR
+  //   - tier1.noBounds-rescue (real bounds were missing, we faked
+  //     {0,0,0,0} for refAssign Stage A/C to work). Honest reporting
+  //     here keeps `jq '.bbox == null'` queries reliable.
+  const isRescued = elAny.__noBoundsRescued === true;
+  return {
+    tag: el.tag,
+    attrs: {
+      ...(el.id ? { id: el.id } : {}),
+      ...(el.testIdAttr ? { 'data-testid': el.testIdAttr } : {}),
+      ...(el.role ? { role: el.role } : {}),
+      ...(el.htmlName ? { name: el.htmlName } : {}),
+      ...(el.ariaLabel ? { 'aria-label': el.ariaLabel } : {}),
+      ...(el.placeholder ? { placeholder: el.placeholder } : {}),
+      ...(el.href ? { href: el.href } : {}),
+      ...(el.type ? { type: el.type } : {}),
+      ...(el.ref ? { ref: el.ref } : {}),
+      ...(isRescued ? { '__rescue': 'noBounds' } : {}),
+    },
+    bbox: (el.bounds && !isRescued)
+      ? {
+        x: Math.round(el.bounds.x),
+        y: Math.round(el.bounds.y),
+        w: Math.round(el.bounds.width),
+        h: Math.round(el.bounds.height),
+      }
+      : null,
+    dsNodeIdx: elAny.__dsNodeIndex,
+    ...(el.text ? { text: el.text.slice(0, 60) } : {}),
+  };
+}
+
+/**
+ * Best-effort async write. Fire-and-forget — the caller does NOT await
+ * this, so the snapshot return path is not blocked by disk I/O. Critical
+ * on cloud VMs with network-attached storage where `writeFileSync` can
+ * block the event loop for tens of ms.
+ *
+ * Errors are swallowed — forensic logging must NEVER fail a snapshot
+ * collect (CLAUDE.md invariant 11: telemetry writes are best-effort).
+ */
+function writeForensicJsonl(collector: ForensicCollector): void {
+  if (collector.stages.length === 0 && !collector.summary && !collector.final) return;
+  // Serialize on the caller thread (cheap CPU work) so the snapshot of
+  // the stages object can't be mutated between fire and actual write.
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const safeDiagId = collector.diagId.replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+  const filePath = path.join(FORENSIC_LOGS_DIR, `${safeDiagId}_forensic_${ts}.jsonl`);
+  const writeTs = new Date().toISOString();
+
+  // JSONL line builder — uniform shape across all stages so a single jq
+  // filter can scan the whole file. `stage` is the discriminator.
+  const lines: string[] = [];
+
+  // Line 1 — summary header. Always first when present so a reader
+  // can `head -n1 file.jsonl | jq` to get context without scanning.
+  if (collector.summary) {
+    lines.push(JSON.stringify({
+      ts: writeTs,
+      diagId: collector.diagId,
+      stage: 'summary',
+      ...collector.summary,
+    }));
+  }
+
+  // Stage lines in pipeline order.
+  for (const s of collector.stages) {
+    lines.push(JSON.stringify({
+      ts: writeTs,
+      diagId: collector.diagId,
+      stage: s.stage,
+      input: { count: s.inputCount },
+      passed: {
+        count: s.passedCount,
+        ...(s.passedSample && s.passedSample.length > 0
+          ? { sample: s.passedSample }
+          : {}),
+      },
+      rejected: s.rejected,
+      ...(s.durationMs !== undefined ? { durationMs: s.durationMs } : {}),
+      ...(s.extra ? { extra: s.extra } : {}),
+    }));
+  }
+
+  // Final line — surviving elements snapshot. Lets you grep for
+  // attributes of the target right next to all the dropped ones.
+  if (collector.final) {
+    lines.push(JSON.stringify({
+      ts: writeTs,
+      diagId: collector.diagId,
+      stage: 'final',
+      elementCount: collector.final.elementCount,
+      elements: collector.final.elements,
+      ...(collector.final.extra ? { extra: collector.final.extra } : {}),
+    }));
+  }
+
+  const payload = lines.join('\n') + '\n';
+  const totalRejected = collector.stages.reduce((a, s) => a + s.rejected.length, 0);
+
+  // Run mkdir + writeFile off the critical path. .catch() prevents
+  // unhandled-rejection crashes; logger.debug keeps the trail visible
+  // when investigating "why didn't the forensic file appear".
+  void fs.promises.mkdir(FORENSIC_LOGS_DIR, { recursive: true })
+    .then(() => fs.promises.writeFile(filePath, payload, 'utf8'))
+    .then(() => {
+      logger.info('[CDP_SNAPSHOT] Forensic rejection log written', {
+        diagId: collector.diagId,
+        filePath,
+        stageCount: collector.stages.length,
+        totalRejected,
+      });
+    })
+    .catch((err) => {
+      logger.debug('[CDP_SNAPSHOT] Forensic write failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+}
+
+/**
+ * Deep-dump companion to `writeForensicJsonl`. Writes the raw CDP
+ * DOMSnapshot payload and the live page HTML to disk alongside the
+ * JSONL — same basename, sibling files. Lets the operator confirm
+ * "is the target node even in the data?" without re-running the lint.
+ *
+ * Best-effort: all errors swallowed (CLAUDE.md invariant 11).
+ *
+ * Cost:
+ *   - DS dump: 2-15MB JSON on dense pages, ~50ms to stringify
+ *   - HTML dump: 0.5-5MB, single page.content() call
+ * Acceptable because forensic mode itself is opt-in (only user-triggered
+ * lint sets it), so the disk hit is bounded to a handful per session.
+ *
+ * Filename pattern (matches the JSONL emit):
+ *   <safeDiagId>_forensic_<ts>_ds.json
+ *   <safeDiagId>_forensic_<ts>_html.html
+ *
+ * The shared timestamp lets `ls -lt` group them, and `_ds`/`_html`
+ * suffixes are filter-friendly:
+ *   ls test_logs/editor/<sessionId>_forensic_*_ds.json | tail -1
+ */
+async function writeForensicArtifacts(
+  collector: ForensicCollector,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  rawDomSnapshot: any,
+  page: Page,
+): Promise<void> {
+  // Same filename derivation as writeForensicJsonl — keep them lockstep
+  // so the artifacts are obviously paired in `ls` output. We approximate
+  // the JSONL's timestamp by recomputing here; if the two writes happen
+  // in different ms ticks they end up with different timestamps. That's
+  // acceptable because the diagId prefix is enough to find the trio.
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const safeDiagId = collector.diagId.replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
+  const basePath = path.join(FORENSIC_LOGS_DIR, `${safeDiagId}_forensic_${ts}`);
+
+  // Fire DS dump and HTML dump in parallel. Both fail-open.
+  const dsPath = `${basePath}_ds.json`;
+  const htmlPath = `${basePath}_html.html`;
+
+  const dsPromise = (async () => {
+    try {
+      // JSON.stringify can be 100-300ms on dense pages. Acceptable on
+      // a debug path, but we explicitly do it OFF the event loop tick
+      // that returned the snapshot (caller is .catch()'d, not awaited).
+      const dsString = JSON.stringify(rawDomSnapshot);
+      await fs.promises.mkdir(FORENSIC_LOGS_DIR, { recursive: true });
+      await fs.promises.writeFile(dsPath, dsString, 'utf8');
+      logger.info('[CDP_SNAPSHOT] Forensic DS dump written', {
+        diagId: collector.diagId,
+        filePath: dsPath,
+        sizeBytes: Buffer.byteLength(dsString),
+      });
+    } catch (err) {
+      logger.debug('[CDP_SNAPSHOT] Forensic DS dump failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+
+  const htmlPromise = (async () => {
+    try {
+      // page.content() can throw on closed/navigating pages. Best-effort.
+      const html = await page.content();
+      await fs.promises.mkdir(FORENSIC_LOGS_DIR, { recursive: true });
+      await fs.promises.writeFile(htmlPath, html, 'utf8');
+      logger.info('[CDP_SNAPSHOT] Forensic HTML dump written', {
+        diagId: collector.diagId,
+        filePath: htmlPath,
+        sizeBytes: Buffer.byteLength(html),
+      });
+    } catch (err) {
+      logger.debug('[CDP_SNAPSHOT] Forensic HTML dump failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  })();
+
+  await Promise.all([dsPromise, htmlPromise]);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -420,7 +771,23 @@ function isInteractiveIconish(
     || attrs.has('data-test')
     || attrs.has('data-cy')
     || attrs.has('data-qa');
-  return hasStableId || hasTestIdAttr;
+  // V-bigroup-2 May 2026 — iconish on CSS-Modules sites:
+  //   bi.group close-X SVG had neither id nor testId (CSS-Modules
+  //   strips identifiers), but DID carry aria-label / role="button"
+  //   on the wrapper. Previous predicate returned 0 iconish hits on
+  //   the entire bi.group page. These are now accepted:
+  //     - aria-label / role / aria-* hint → screen-reader-targeted icon
+  //     - href (svg/img inside <a>; sometimes inlined as direct attr)
+  //     - title attr (tooltips often live here for icon-only buttons)
+  //   Tier-2 cursor:pointer pass also picks these up if the parent has
+  //   pointer; this predicate covers the case where DS layout puts the
+  //   icon itself in `cursor: default` but the wrapper has pointer.
+  const hasAriaHint = attrs.has('aria-label')
+    || attrs.has('aria-labelledby')
+    || attrs.has('role');
+  const hasTitle = attrs.has('title');
+  const hasHref = attrs.has('href') || attrs.has('xlink:href');
+  return hasStableId || hasTestIdAttr || hasAriaHint || hasTitle || hasHref;
 }
 
 /**
@@ -464,13 +831,31 @@ const MAX_TIER2_ELEMENTS = 300;
 
 /**
  * Hard cap on TOTAL elements returned (Tier-1 + Tier-2 combined).
- * Mirrors `MAX_INTERACTIVE_NODES = 500` in `dom-analysis-extractor.service.ts`,
- * which is the effective limit downstream consumers see anyway. Clipping
- * here saves Phase 3.5/4/3c-Eval per-element work on the ~80% of
- * elements that would just be discarded by the extractor — on a 5000-
- * button toolbar, that's the difference between 3.5s and ~600ms.
+ *
+ * History (May 2026):
+ *   - v1: 500. Mirrored `MAX_INTERACTIVE_NODES = 500` in
+ *     dom-analysis-extractor.service.ts. Worked for sparse pages.
+ *   - v2: 1500. The bi.group close-X audit revealed dense modals where
+ *     365 tier-1 + 135 tier-2 = 500 was hit, dropping 761 tier-2
+ *     candidates. Even with tier-2 priority sort fix, dense pages
+ *     (admin panels, design systems, e-commerce with 50+ icon buttons
+ *     per row) can starve the priority-sorted tier-2 cohort if tier-1
+ *     alone exceeds 500.
+ *     Trade-off measured on bi.group:
+ *       - +3× memory (~1MB → ~3MB per snapshot)
+ *       - +2-3× refAssign / Phase 4 latency (~21ms → ~60ms)
+ *       - LLM prompt size UNCHANGED (pruner caps to 15 regardless)
+ *     Net wall-clock impact: ~80ms → ~200ms total snapshot. Within
+ *     budget for the lint path (5s LLM dominates anyway).
+ *
+ * IMPORTANT: this MUST stay in sync with `MAX_INTERACTIVE_NODES` in
+ * dom-analysis-extractor.service.ts. If the CDP cap is higher than the
+ * extractor cap, priority-sorted tier-2 nodes get dropped by the
+ * downstream extractor in document order — losing the very priority
+ * ordering this cap was raised to preserve. Bumping one without the
+ * other is the bug class to watch for. Bumping logged in CLAUDE.md.
  */
-const MAX_TOTAL_ELEMENTS = 500;
+const MAX_TOTAL_ELEMENTS = 1500;
 
 /**
  * Build a `LiteElement` from a single DS node + its AX cross-reference.
@@ -909,8 +1294,23 @@ export class CdpSnapshotService {
       // existing `snapshot-collector.ts` logic that derives fields
       // from raw DOM (text walks, ancestor chains, parent class
       // tokens, container titles, modal heuristics) lives here.
+      // Forensic collector — populated only when caller opted in AND
+      // we're running in a dev environment. The JSONL alone is ~200KB
+      // per snapshot, but writeForensicArtifacts also dumps the raw DS
+      // payload (~1.5MB) and live HTML (~1MB). A handful of those per
+      // session per user fills production disk inside a week, so prod
+      // never writes them. Local dev gets the full set for debugging.
+      //
+      // Caller-side gating (`forensicRejections: true` only on
+      // user-initiated find_button / apply_prelint) is the FIRST line
+      // of defense; this env check is the SECOND, in case a future
+      // caller forgets the auditTrigger gate.
+      const forensic: ForensicCollector | undefined = (options.forensicRejections && isDevelopment)
+        ? { diagId: diagId ?? 'unknown', startedAt, stages: [] }
+        : undefined;
+
       const mappingStart = Date.now();
-      const elements = this.mapToLiteElements(raw);
+      const elements = this.mapToLiteElements(raw, forensic);
       const mappingMs = Date.now() - mappingStart;
 
       // Phase 3.5: assign data-agent-ref attributes via single
@@ -938,8 +1338,75 @@ export class CdpSnapshotService {
       // Keep filter here even when the per-doc compactor works — it's
       // O(n) and idempotent on already-clean arrays.
       const beforeFilter = elements.length;
+      const refAssignRejected: ForensicRejection[] = [];
+      // Sample of elements that DID get a ref — answers "did my target
+      // survive ref assignment?". Bias toward identity-rich entries.
+      const refAssignPassed: ForensicNode[] | undefined = forensic ? [] : undefined;
+      if (refAssignPassed) {
+        for (const el of elements) {
+          if (!el.ref) continue;
+          if (refAssignPassed.length >= FORENSIC_PASSED_SAMPLE_SIZE) break;
+          const node = liteElementToForensic(el);
+          const hasIdentity = !!(node.attrs.id || node.attrs['data-testid'] || node.attrs['aria-label'] || node.attrs.role || node.text);
+          if (!hasIdentity && refAssignPassed.length >= Math.floor(FORENSIC_PASSED_SAMPLE_SIZE / 2)) continue;
+          refAssignPassed.push(node);
+        }
+      }
       for (let i = elements.length - 1; i >= 0; i--) {
-        if (!elements[i].ref) elements.splice(i, 1);
+        if (!elements[i].ref) {
+          if (forensic) {
+            const el = elements[i];
+            // Classify WHY findElement returned null so dropped-element
+            // pattern analysis ("are most drops descriptor-poor anonymous
+            // divs?" vs "is it bbox-mismatch on a specific class?") is
+            // possible with a single jq group_by.
+            const hasId = !!el.id;
+            const hasTestId = !!el.testIdAttr;
+            const hasName = !!el.htmlName;
+            const hasAriaLabel = !!el.ariaLabel;
+            const hasBbox = !!(el.bounds && el.bounds.width > 0 && el.bounds.height > 0);
+            let likelyCause: string;
+            if (!hasId && !hasTestId && !hasName && !hasAriaLabel && !hasBbox) {
+              likelyCause = 'no-identity-no-bbox';
+            } else if (!hasBbox) {
+              likelyCause = 'noBbox.descriptorFailedToMatch';
+            } else if (!hasId && !hasTestId && (el.tag === 'div' || el.tag === 'span')) {
+              likelyCause = 'genericTagBboxCollision';
+            } else {
+              likelyCause = 'bboxMismatchOrPageMutated';
+            }
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const inPageDiag = (el as any).__refAssignDiag;
+            refAssignRejected.push({
+              ...liteElementToForensic(el),
+              reason: 'refAssign.findElementReturnedNull',
+              diag: {
+                likelyCause,
+                hasId, hasTestId, hasName, hasAriaLabel, hasBbox,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                docIdx: (el as any).__docIndex,
+                // In-page diagnostics from runRefAssignmentInFrame.
+                // These are the SMOKING-GUN fields: walkUp shows the
+                // exact px-drift between DS bbox and live bbox per
+                // ancestor; computedTransform shows whether the page
+                // is using CSS transforms (the #1 cause of bbox drift);
+                // atPoint shows what elementFromPoint actually returned
+                // (separates "overlay collision" from "page mutated").
+                ...(inPageDiag ? {
+                  stageHit: inPageDiag.stageHit,
+                  atPoint: inPageDiag.atPoint,
+                  walkUp: inPageDiag.walkUp?.slice(0, 8) ?? [],
+                  descendTried: inPageDiag.descendTried,
+                  descendFound: inPageDiag.descendFound,
+                  computedTransform: inPageDiag.computedTransform,
+                  computedOpacity: inPageDiag.computedOpacity,
+                  computedVisibility: inPageDiag.computedVisibility,
+                } : {}),
+              },
+            });
+          }
+          elements.splice(i, 1);
+        }
       }
       const droppedEmptyRefs = beforeFilter - elements.length;
       if (droppedEmptyRefs > 0) {
@@ -947,6 +1414,24 @@ export class CdpSnapshotService {
           diagId: options.diagId,
           dropped: droppedEmptyRefs,
           remaining: elements.length,
+        });
+      }
+      if (forensic) {
+        // Aggregate likelyCause distribution so the reader sees the
+        // dominant failure mode without grouping by hand.
+        const causeCounts: Record<string, number> = {};
+        for (const r of refAssignRejected) {
+          const c = r.diag?.likelyCause ?? 'unknown';
+          causeCounts[c] = (causeCounts[c] || 0) + 1;
+        }
+        forensic.stages.push({
+          stage: 'refAssign',
+          inputCount: beforeFilter,
+          passedCount: elements.length,
+          rejected: refAssignRejected,
+          passedSample: refAssignPassed,
+          durationMs: Date.now() - refAssignStart,
+          extra: { causeCounts },
         });
       }
 
@@ -970,8 +1455,10 @@ export class CdpSnapshotService {
       // Logged as a warn so any non-zero dropCount in prod surfaces as
       // a real regression we need to chase.
       const beforeDedup = elements.length;
+      const dedupStart = forensic ? Date.now() : 0;
       const seenRefs = new Set<string>();
       const dupSamples: Array<{ ref: string; tag: string; text: string }> = [];
+      const dedupRejected: ForensicRejection[] = [];
       for (let i = elements.length - 1; i >= 0; i--) {
         const ref = elements[i].ref;
         if (!ref) continue;
@@ -983,12 +1470,41 @@ export class CdpSnapshotService {
               text: (elements[i].text || elements[i].name || '').slice(0, 30),
             });
           }
+          if (forensic) {
+            const el = elements[i];
+            dedupRejected.push({
+              ...liteElementToForensic(el),
+              reason: 'dedup.duplicateRef',
+              diag: {
+                collidedWithRef: ref,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                docIdx: (el as any).__docIndex,
+              },
+            });
+          }
           elements.splice(i, 1);
         } else {
           seenRefs.add(ref);
         }
       }
       const droppedDupes = beforeDedup - elements.length;
+      if (forensic) {
+        // Aggregate which refs caused the most collisions — surfaces
+        // the e24×46 "overlay collision" pattern at a glance.
+        const collisionCounts: Record<string, number> = {};
+        for (const r of dedupRejected) {
+          const ref = r.diag?.collidedWithRef as string | undefined;
+          if (ref) collisionCounts[ref] = (collisionCounts[ref] || 0) + 1;
+        }
+        forensic.stages.push({
+          stage: 'dedup',
+          inputCount: beforeDedup,
+          passedCount: elements.length,
+          rejected: dedupRejected,
+          durationMs: Date.now() - dedupStart,
+          extra: { collisionCounts },
+        });
+      }
       if (droppedDupes > 0) {
         logger.warn('[CDP_SNAPSHOT] Dropped duplicate-ref elements after assignAgentRefs', {
           diagId: options.diagId,
@@ -1092,7 +1608,10 @@ export class CdpSnapshotService {
       // walks, and Phase 3.5 per-frame ref assignment, and must not
       // leak into consumers (LiteElement type doesn't expose them,
       // but they exist on the object via `as any` casts).
-      // Cleanup is in-place: same array, no allocation.
+      // Cleanup is in-place: same array, no allocation. Note:
+      // `__refAssignDiag` / `__refAssignContext` are NOT deleted here —
+      // they're needed by the forensic emit BELOW. Deleted in a second
+      // pass after the emit.
       for (const el of elements) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         delete (el as any).__dsNodeIndex;
@@ -1152,6 +1671,90 @@ export class CdpSnapshotService {
         },
         { frameworkClickable: 0, checked: 0, hasValue: 0, contentEditable: 0, invalid: 0, withText: 0 },
       );
+
+      // Forensic JSONL — best-effort, must not affect collect timing
+      // surface beyond the small per-stage push work already done.
+      if (forensic) {
+        // Compose `summary` header — context for everything that follows.
+        // Lets the reader answer "what page / which frame / how big a DOM"
+        // without grepping other log files.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const dsAny = raw.domSnapshot as any;
+        // Page context captured in the refAssign evaluate — has scroll,
+        // DPR, document readiness, DOM mutation count. Stored on the
+        // outer `elements` array (not on any specific element, which
+        // could be filter-dropped) — see assignAgentRefs for the
+        // attach site.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const pageContext = (elements as any).__refAssignContext;
+        forensic.summary = {
+          url: snapshot.url.slice(0, 200),
+          title: snapshot.title?.slice(0, 100),
+          viewport: snapshot.viewport,
+          documents: Array.isArray(dsAny?.documents) ? dsAny.documents.length : 0,
+          activeModalRef: snapshot.activeModalRef,
+          isTransient: snapshot.transientState?.isTransient === true,
+          obstacleCount: snapshot.obstacleFacts?.length ?? 0,
+          totalMs,
+          phases: phaseTimings,
+          runtimeFieldCoverage: runtimeStats,
+          ...(pageContext ? {
+            scroll: { x: pageContext.scrollX, y: pageContext.scrollY },
+            devicePixelRatio: pageContext.devicePixelRatio,
+            documentReady: pageContext.documentReady,
+            domMutationsDuringSnapshot: pageContext.domMutationsDuringSnapshot,
+            evalViewport: { w: pageContext.viewportW, h: pageContext.viewportH },
+          } : {}),
+        };
+
+        // `final` — every surviving element in compact form. Lets you
+        // jq-search by tag/attrs/text in the same file as rejections.
+        forensic.final = {
+          elementCount: elements.length,
+          elements: elements.slice(0, FORENSIC_FINAL_ELEMENT_CAP).map(liteElementToForensic),
+          extra: {
+            refsUnique: new Set(elements.map((e) => e.ref).filter(Boolean)).size,
+            elementsWithoutRef: elements.filter((e) => !e.ref).length,
+            elementsWithEmptyBbox: elements.filter((e) => !e.bounds || (e.bounds.width === 0 && e.bounds.height === 0)).length,
+          },
+        };
+
+        writeForensicJsonl(forensic);
+
+        // Diagnostic deep-dump (May 2026, bi.group close-X investigation).
+        // When forensic mode is on, also dump the RAW DS payload and the
+        // live page HTML to disk alongside the JSONL. This is the last
+        // line of defense for "target node is missing from DS entirely"
+        // bugs — without these dumps we can only see what survived our
+        // pipeline, not what CDP actually returned.
+        //
+        // Format: same basename as the JSONL, sibling files with
+        // suffixes `_ds.json` and `_html.html`. Fire-and-forget; large
+        // payloads (~5-10MB on dense pages) — write off the critical
+        // path so the snapshot return is not blocked.
+        //
+        // To opt out per-snapshot, the caller can avoid setting
+        // `forensicRejections`. There is no separate flag — these
+        // dumps share the same trigger as the JSONL because they're
+        // only useful TOGETHER (the JSONL tells you what was dropped,
+        // the DS/HTML tell you what was even there to begin with).
+        writeForensicArtifacts(forensic, raw.domSnapshot, page).catch(() => { /* swallow */ });
+      }
+
+      // Second cleanup pass — remove forensic-only properties from
+      // surviving elements so they don't leak into LiteSnapshot
+      // consumers (resolver, locator-plan-builder). Deferred from the
+      // first cleanup pass because forensic emit above needs to read
+      // them.
+      for (const el of elements) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        delete (el as any).__refAssignDiag;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        delete (el as any).__noBoundsRescued;
+      }
+      // Array-level property cleanup (different scope from element-level).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      delete (elements as any).__refAssignContext;
 
       logger.debug('[CDP_SNAPSHOT] Collected', {
         diagId,
@@ -1342,7 +1945,7 @@ export class CdpSnapshotService {
    * containerTitles, isInsideShadowDOM, etc.) handled by Phase 3c
    * once refs are assigned — see `populateAncestryFields`.
    */
-  private static mapToLiteElements(raw: RawCdpBundle): LiteElement[] {
+  private static mapToLiteElements(raw: RawCdpBundle, forensic?: ForensicCollector): LiteElement[] {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ds = raw.domSnapshot as any;
     const strings: string[] = Array.isArray(ds.strings) ? ds.strings : [];
@@ -1363,6 +1966,51 @@ export class CdpSnapshotService {
     }
 
     const elements: LiteElement[] = [];
+
+    // Per-stage rejection accumulators — allocated ONLY when forensic
+    // mode is on. The hot path (preview-tick / regression) sees
+    // `forensic === undefined` here and pays for no extra arrays /
+    // counters. Every loop-body branch already does `if (forensic)`,
+    // so undefined here means "skip everything forensic-related".
+    const tier1Rejected: ForensicRejection[] | undefined = forensic ? [] : undefined;
+    const iconishRejected: ForensicRejection[] | undefined = forensic ? [] : undefined;
+    const tier2Rejected: ForensicRejection[] | undefined = forensic ? [] : undefined;
+    // Bounded passed-samples — first N kept that have ANY identity hint
+    // (id / testId / aria-label / text). We bias toward identity-rich
+    // samples so the JSONL shows useful entries even when the page has
+    // hundreds of anonymous div-buttons. Falls back to first N if no
+    // identity-rich nodes are found.
+    const tier1Passed: ForensicNode[] | undefined = forensic ? [] : undefined;
+    const iconishPassed: ForensicNode[] | undefined = forensic ? [] : undefined;
+    const tier2Passed: ForensicNode[] | undefined = forensic ? [] : undefined;
+    let tier1Considered = 0;
+    let tier1Kept = 0;
+    let tier1NoBoundsRescued = 0; // tier1 nodes kept with bbox=(0,0,0,0) — DS had no layout-row.
+    let iconishConsidered = 0;
+    let iconishKept = 0;
+    let tier2Considered = 0;
+    let tier2Kept = 0;
+    const mapStartedAt = forensic ? Date.now() : 0;
+
+    // Helper to push a passed-sample with identity bias. Skips entries
+    // when the cap is already hit OR when this entry has no useful
+    // hint AND we already have FORENSIC_PASSED_SAMPLE_SIZE/2 identity-
+    // free entries.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const recordPassed = (arr: ForensicNode[] | undefined, tagName: string, attrs: DecodedAttrs, bounds: { x:number;y:number;width:number;height:number } | undefined, dsNodeIdx: number, rawText: string | undefined) => {
+      if (!arr || arr.length >= FORENSIC_PASSED_SAMPLE_SIZE) return;
+      const pickedAttrs = pickForensicAttrs(attrs);
+      const hasIdentity = !!(pickedAttrs.id || pickedAttrs['data-testid'] || pickedAttrs['aria-label'] || pickedAttrs.role || (rawText && rawText.length > 0));
+      // After half the slots are used, only accept identity-rich entries.
+      if (!hasIdentity && arr.length >= Math.floor(FORENSIC_PASSED_SAMPLE_SIZE / 2)) return;
+      arr.push({
+        tag: tagName,
+        attrs: pickedAttrs,
+        bbox: bboxToForensic(bounds),
+        dsNodeIdx,
+        ...(rawText ? { text: rawText.slice(0, 60) } : {}),
+      });
+    };
 
     // Walk every document (main frame + same-origin iframes; cross-
     // origin iframes show up as separate documents too — DS gives all
@@ -1437,32 +2085,83 @@ export class CdpSnapshotService {
       // the passes is the only correct order.
       let tier2Added = 0;
 
-      // Pass 1: tier-1, capped at MAX_TOTAL_ELEMENTS. Pages with
-      // >500 semantic-interactive children (rare but real on table
-      // grids, infinite-scroll feeds) get clipped — same behaviour
-      // as evaluate path's downstream extractor cap. Better to clip
-      // here than to do per-element Phase 4 work on elements that
-      // get dropped 50ms later.
+      // Pass 1: tier-1, capped at MAX_TOTAL_ELEMENTS (1500 after the
+      // bi.group bump). Pages with >1500 semantic-interactive children
+      // (rare — only huge data grids / infinite-scroll feeds) get
+      // clipped. Better to clip here than to do per-element Phase 4
+      // work on elements that would be discarded downstream anyway.
+      // Tier-1 is checked FIRST so semantic buttons/links never lose
+      // their slot to cursor:pointer noise (tier-2 fallback).
       for (let i = 0; i < nodeCount; i++) {
-        if (elements.length >= MAX_TOTAL_ELEMENTS) break;
+        if (elements.length >= MAX_TOTAL_ELEMENTS) {
+          if (forensic) {
+            // We stop walking, but record this as a single capacity event
+            // rather than per-node — avoids flooding the JSONL.
+            tier1Rejected!.push({
+              tag: '(cap)', attrs: { remainingNodes: String(nodeCount - i) }, bbox: null,
+              reason: 'tier1.maxTotalElementsReached',
+            });
+          }
+          break;
+        }
         const tagName = getStr(nodes.nodeName?.[i]).toLowerCase();
         if (!tagName || tagName.startsWith('#')) continue;
         const attrs = decodeAttributes(nodes.attributes?.[i], getStr);
-        if (!isInteractiveNodeTier1(tagName, attrs)) continue;
+
+        if (forensic) tier1Considered++;
+        if (!isInteractiveNodeTier1(tagName, attrs)) {
+          // Tier-1 not interactive — too noisy to record every <div> /
+          // <span>. Pass to tier1.5 / tier-2 (re-evaluated below) so
+          // skipping silently here is correct. Only record nodes that
+          // PASS tier-1 but get dropped by bounds/layout — those are
+          // the surprising ones.
+          continue;
+        }
 
         const layoutIdx = layoutByNodeIdx.get(i);
-        const bounds = layoutIdx !== undefined ? decodeBoundsForLayoutIdx(layout, layoutIdx) : undefined;
-        if (!bounds) continue;
+        let bounds = layoutIdx !== undefined ? decodeBoundsForLayoutIdx(layout, layoutIdx) : undefined;
+        // V-bibgroup-2 May 2026 — Tier-1 noBounds rescue:
+        //   DS occasionally omits layout-row for nodes that ARE visible
+        //   in the live DOM (paint-layer skipping, sub-pixel rendering,
+        //   position:fixed children of complex stacking contexts).
+        //   bi.group close-X buttons fell into this gap: <button> tags
+        //   with valid getBoundingClientRect at evaluate time, but no
+        //   DS bounds → previously dropped silently.
+        //   Solution: keep them in elements[] with zero bbox.
+        //   refAssign Stage A (id/testId/name) and Stage C (descriptor
+        //   fallback by aria-label/placeholder) can still recover the
+        //   live node; if no descriptor matches, refAssign returns null
+        //   and the post-filter drops it harmlessly.
+        let boundsWereMissing = false;
+        if (!bounds) {
+          bounds = { x: 0, y: 0, width: 0, height: 0 };
+          boundsWereMissing = true;
+        }
         const styles = layoutIdx !== undefined ? decodeStylesForLayoutIdx(layout, layoutIdx, getStr) : undefined;
 
         const backendId = nodes.backendNodeId?.[i];
         const axNode = typeof backendId === 'number' ? axByBackendId.get(backendId) : undefined;
 
-        elements.push(buildLiteElementFromNode({
+        const elBuilt = buildLiteElementFromNode({
           tagName, attrs, bounds, styles, axNode,
           dsNodeIndex: i, docIndex: docIdx, docUrl,
           rawText: textByParentIdx.get(i),
-        }));
+        });
+        if (boundsWereMissing) {
+          // Mark rescue so forensic / consumers can distinguish "real
+          // 0×0 element" from "DS had no layout, we kept it for ID
+          // fallback". `liteElementToForensic` reads this and emits
+          // bbox:null instead of bbox:{0,0,0,0}, which keeps the
+          // jq-filter on `.bbox == null` honest.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (elBuilt as any).__noBoundsRescued = true;
+        }
+        elements.push(elBuilt);
+        if (forensic) {
+          tier1Kept++;
+          if (boundsWereMissing) tier1NoBoundsRescued++;
+          recordPassed(tier1Passed, tagName, attrs, bounds, i, textByParentIdx.get(i));
+        }
       }
 
       // Build set of indexes added by Pass 1 so subsequent passes
@@ -1498,13 +2197,30 @@ export class CdpSnapshotService {
         const attrs = decodeAttributes(nodes.attributes?.[i], getStr);
         if (!isInteractiveIconish(tagName, attrs)) continue;
 
+        if (forensic) iconishConsidered++;
         const layoutIdx = layoutByNodeIdx.get(i);
         const bounds = layoutIdx !== undefined ? decodeBoundsForLayoutIdx(layout, layoutIdx) : undefined;
-        if (!bounds) continue;
+        if (!bounds) {
+          if (forensic) {
+            iconishRejected!.push({
+              tag: tagName, attrs: pickForensicAttrs(attrs), bbox: null,
+              reason: 'iconish.noBounds',
+            });
+          }
+          continue;
+        }
         // Min-size gate matches evaluate-path (5×5) — filters out
         // 0-size hidden icon placeholders without dropping typical
         // 16-32px button glyphs.
-        if (bounds.width < 5 || bounds.height < 5) continue;
+        if (bounds.width < 5 || bounds.height < 5) {
+          if (forensic) {
+            iconishRejected!.push({
+              tag: tagName, attrs: pickForensicAttrs(attrs), bbox: bboxToForensic(bounds),
+              reason: 'iconish.tooSmall',
+            });
+          }
+          continue;
+        }
         const styles = layoutIdx !== undefined ? decodeStylesForLayoutIdx(layout, layoutIdx, getStr) : undefined;
 
         const backendId = nodes.backendNodeId?.[i];
@@ -1515,14 +2231,48 @@ export class CdpSnapshotService {
           dsNodeIndex: i, docIndex: docIdx, docUrl,
           rawText: textByParentIdx.get(i),
         }));
+        if (forensic) {
+          iconishKept++;
+          recordPassed(iconishPassed, tagName, attrs, bounds, i, textByParentIdx.get(i));
+        }
         tier1Indexes.add(i);
       }
 
-      // Pass 2: tier-2 (cursor:pointer), capped at MAX_TIER2_ELEMENTS
-      // to prevent pages with global cursor:pointer CSS from flooding.
+      // Pass 2: tier-2 (cursor:pointer) — TWO-PHASE.
+      //
+      // ROOT-CAUSE NOTE (May 2026 bi.group close-X audit):
+      //   The previous implementation walked DS in document order and
+      //   accepted the first 300 cursor:pointer matches that fit under
+      //   MAX_TOTAL_ELEMENTS. On bi.group the close-X SVG wrapper
+      //   <span class="c-PJLV c-cSaKLY"> with cursor:pointer and bbox
+      //   (925, 168.5, 32, 32) was at DS-walk position ~2649, behind
+      //   ~135 unrelated cursor:pointer nodes (card hover decorations,
+      //   inline links, etc). The cap fired AT 500 total = 135 tier2
+      //   accepted, our close-X NEVER reached.
+      //
+      // Fix: COLLECT all tier-2 candidates first, then SORT by priority:
+      //   1. Small bbox (16-64px) — icons, action buttons (close, menu,
+      //      arrow, settings — the high-value targets on dense pages)
+      //   2. position: absolute|fixed — overlay-style UI (modal close,
+      //      floating actions, toast dismiss)
+      //   3. Has aria-* / role / data-state attrs — Radix/HeadlessUI
+      //      semantic widgets
+      //   4. Larger / generic — the long tail
+      //
+      // Then accept up to the cap from the sorted list. Close-X is now
+      // in tier 1+2 (small bbox + absolute), guaranteed inclusion.
+      type Tier2Candidate = {
+        nodeIdx: number;
+        tagName: string;
+        attrs: DecodedAttrs;
+        bounds: { x: number; y: number; width: number; height: number };
+        styles: DecodedStyles;
+        priority: number;
+      };
+      const tier2Candidates: Tier2Candidate[] = [];
+
+      // Phase 2a: collect all tier-2 candidates from DS.
       for (let i = 0; i < nodeCount; i++) {
-        if (tier2Added >= MAX_TIER2_ELEMENTS) break;
-        if (elements.length >= MAX_TOTAL_ELEMENTS) break;
         if (tier1Indexes.has(i)) continue;
 
         const tagName = getStr(nodes.nodeName?.[i]).toLowerCase();
@@ -1533,20 +2283,131 @@ export class CdpSnapshotService {
         const styles = decodeStylesForLayoutIdx(layout, layoutIdx, getStr);
         if (!isInteractiveNodeTier2(styles)) continue;
 
+        if (forensic) tier2Considered++;
         const bounds = decodeBoundsForLayoutIdx(layout, layoutIdx);
-        if (!bounds) continue;
+        if (!bounds) {
+          if (forensic) {
+            const attrs = decodeAttributes(nodes.attributes?.[i], getStr);
+            tier2Rejected!.push({
+              tag: tagName, attrs: pickForensicAttrs(attrs), bbox: null,
+              reason: 'tier2.noBounds',
+            });
+          }
+          continue;
+        }
 
         const attrs = decodeAttributes(nodes.attributes?.[i], getStr);
-        const backendId = nodes.backendNodeId?.[i];
+
+        // Compute priority score — LOWER = more important.
+        // Bands: 0-icon (smallest), 1-overlay (positioned), 2-aria, 3-default.
+        // Within band: smaller bbox first (icons before banners).
+        let priority = 3;
+        const isSmallIcon = bounds.width <= 64 && bounds.height <= 64
+          && bounds.width >= 8 && bounds.height >= 8;
+        const isOverlayPositioned = styles ? (styles.position === 'absolute' || styles.position === 'fixed') : false;
+        const hasAriaSemantic = attrs.has('aria-label') || attrs.has('aria-haspopup')
+          || attrs.has('aria-expanded') || attrs.has('role') || attrs.has('data-state');
+        if (isSmallIcon && isOverlayPositioned) priority = 0;          // floating icon-button — top
+        else if (isSmallIcon) priority = 1;                            // any icon-sized clickable
+        else if (isOverlayPositioned) priority = 1;                    // floating panel/button
+        else if (hasAriaSemantic) priority = 2;                        // semantic widget
+        // else priority = 3 (default — long-tail)
+
+        // Mix bbox-area tiebreaker (smaller = earlier) into priority by
+        // shifting into a fractional component. Bbox area is bounded by
+        // viewport ≈ 1280*720 = 921600. log2 gives 20-bit range; we'd
+        // rather not depend on log — use raw area / 1e7 so it stays a
+        // small float compared to integer priority.
+        const area = bounds.width * bounds.height;
+        const finalScore = priority + Math.min(area / 1e7, 0.99);
+
+        tier2Candidates.push({
+          nodeIdx: i,
+          tagName,
+          attrs,
+          bounds,
+          styles: styles ?? { display: '', visibility: '', opacity: '', cursor: '', pointerEvents: '', position: '', zIndex: '', backgroundColor: '', color: '', borderRadius: '' },
+          priority: finalScore,
+        });
+      }
+
+      // Phase 2b: sort by priority (lower = first), then fill up to caps.
+      tier2Candidates.sort((a, b) => a.priority - b.priority);
+
+      for (const c of tier2Candidates) {
+        if (tier2Added >= MAX_TIER2_ELEMENTS) {
+          if (forensic) {
+            tier2Rejected!.push({
+              tag: '(cap)', attrs: { remainingCandidates: String(tier2Candidates.length - tier2Added) }, bbox: null,
+              reason: 'tier2.maxTier2ElementsReached',
+            });
+          }
+          break;
+        }
+        if (elements.length >= MAX_TOTAL_ELEMENTS) {
+          if (forensic) {
+            tier2Rejected!.push({
+              tag: '(cap)', attrs: { remainingCandidates: String(tier2Candidates.length - tier2Added) }, bbox: null,
+              reason: 'tier2.maxTotalElementsReached',
+            });
+          }
+          break;
+        }
+        const backendId = nodes.backendNodeId?.[c.nodeIdx];
         const axNode = typeof backendId === 'number' ? axByBackendId.get(backendId) : undefined;
 
         elements.push(buildLiteElementFromNode({
-          tagName, attrs, bounds, styles, axNode,
-          dsNodeIndex: i, docIndex: docIdx, docUrl,
-          rawText: textByParentIdx.get(i),
+          tagName: c.tagName, attrs: c.attrs, bounds: c.bounds, styles: c.styles, axNode,
+          dsNodeIndex: c.nodeIdx, docIndex: docIdx, docUrl,
+          rawText: textByParentIdx.get(c.nodeIdx),
         }));
+        if (forensic) {
+          tier2Kept++;
+          recordPassed(tier2Passed, c.tagName, c.attrs, c.bounds, c.nodeIdx, textByParentIdx.get(c.nodeIdx));
+        }
         tier2Added++;
       }
+    }
+
+    if (forensic) {
+      // `inputCount` here is "nodes that passed the predicate gate"
+      // (isInteractiveNodeTier1 / isInteractiveIconish / cursor:pointer),
+      // NOT "nodes walked". Non-interactive nodes are skipped silently
+      // to keep JSONL size bounded — recording every <div> would balloon
+      // the file 50-100×. `(cap)` sentinel entries cover the
+      // MAX_TOTAL_ELEMENTS / MAX_TIER2_ELEMENTS cutoff cases.
+      const mappingDuration = Date.now() - mapStartedAt;
+      forensic.stages.push({
+        stage: 'tier1',
+        inputCount: tier1Considered,
+        passedCount: tier1Kept,
+        rejected: tier1Rejected ?? [],
+        passedSample: tier1Passed,
+        // All three mapping passes share the same outer loop, so we
+        // attribute the total mapping duration to tier1 (the bulk of
+        // mapping work) rather than triple-counting. iconish/tier2
+        // durations are nested and tiny relative to tier1.
+        durationMs: mappingDuration,
+        // noBoundsRescued counts elements kept despite DS having no
+        // layout-row. They aren't in rejected[] — they passed — but
+        // they're a distinct cohort worth tracking separately so the
+        // jq query for "real drops" remains `.rejected | length`.
+        ...(tier1NoBoundsRescued > 0 ? { extra: { noBoundsRescued: tier1NoBoundsRescued } } : {}),
+      });
+      forensic.stages.push({
+        stage: 'iconish',
+        inputCount: iconishConsidered,
+        passedCount: iconishKept,
+        rejected: iconishRejected ?? [],
+        passedSample: iconishPassed,
+      });
+      forensic.stages.push({
+        stage: 'tier2',
+        inputCount: tier2Considered,
+        passedCount: tier2Kept,
+        rejected: tier2Rejected ?? [],
+        passedSample: tier2Passed,
+      });
     }
 
     return elements;
@@ -1700,6 +2561,36 @@ export class CdpSnapshotService {
         continue;
       }
 
+      // Attach the per-element diag to the LiteElement itself so the
+      // forensic emit in collect() can read it by index. Stored under
+      // `__refAssignDiag` symbol-property — invisible to LiteElement
+      // type consumers, deleted in collect()'s cleanup pass.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const diags = (docElements as any).__refAssignDiags as any[] | undefined;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ctx = (docElements as any).__refAssignContext as any | undefined;
+      if (diags) {
+        for (let i = 0; i < docElements.length; i++) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (docElements[i] as any).__refAssignDiag = diags[i];
+        }
+      }
+      // Page context is doc-level (one per frame). Hoist onto the
+      // OUTER `elements` array itself (it's a NodeJS Array, properties
+      // attach fine). Putting it on `docElements[0]` was buggy:
+      // docElements[0] is the first element of THIS document, and that
+      // element may get dropped by the empty-ref filter below — the
+      // context goes to the trash with it. The outer-array approach
+      // survives all element splices; collector reads from
+      // (elements as any).__refAssignContext.
+      // We only set for the MAIN frame (docIdx=0) — iframe context is
+      // less useful at the summary level. Could be promoted to a
+      // map<docIdx, ctx> if iframe forensic becomes important.
+      if (ctx && docIdx === 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (elements as any).__refAssignContext = ctx;
+      }
+
       // Compact in place: assign refs and drop entries whose findElement
       // returned null in-page (empty ref). The same loop as before, just
       // applied to whichever per-doc array we processed.
@@ -1749,24 +2640,67 @@ export class CdpSnapshotService {
       bboxH: number;
     };
 
-    const requests: RefAssignmentRequest[] = docElements.map((el) => ({
-      tag: el.tag,
-      role: el.role || '',
-      type: el.type || '',
-      name: el.htmlName || '',
-      id: el.htmlId || '',
-      ariaLabel: el.ariaLabel || '',
-      placeholder: el.placeholder || '',
-      // testId attribute-name varies (data-testid / data-test / data-cy);
-      // mapping wrote it under different fields. Snapshot-collector
-      // checks `data-testid` / `data-test` only — match that for now.
-      // Wider testIdAttributes config (locator-config.ts) is read
-      // upstream by builder, not here.
-      testId: '',
-      bboxX: el.bounds?.x ?? 0,
-      bboxY: el.bounds?.y ?? 0,
-      bboxW: el.bounds?.width ?? 0,
-      bboxH: el.bounds?.height ?? 0,
+    // Build requests carrying the ORIGINAL index so refs can be returned
+    // in element order regardless of how we process internally. We sort
+    // before evaluate so that high-specificity requests (stable id /
+    // testId / small bbox) run FIRST and claim their DOM nodes before
+    // generic-tag overlay-area requests get a chance to collide.
+    //
+    // Why this matters: when DS yields parent-before-child order and the
+    // parent is an overlay wrapper div, the wrapper's request runs first
+    // and locks `data-agent-ref` on the wrapper. Later child requests
+    // then see the wrapper as "already assigned" and (correctly) skip
+    // it — but the OLD bug was returning that wrapper anyway. With the
+    // current findElement (`refAlreadyAssigned` check), the wrapper
+    // doesn't block children, but ordering still affects WHICH node
+    // each ref attaches to. Specific-first ordering minimises walk-up
+    // collisions and keeps refs attached to the most specific element.
+    type Indexed = RefAssignmentRequest & { __origIdx: number; __area: number; __specificity: number };
+    const indexed: Indexed[] = docElements.map((el, idx) => {
+      const id = el.htmlId || '';
+      const testIdAttr = el.testIdAttr || '';
+      const bboxW = el.bounds?.width ?? 0;
+      const bboxH = el.bounds?.height ?? 0;
+      // Specificity score, lower = process first:
+      //   0 = has stable id          (unique selector, can't collide)
+      //   1 = has testId             (typically unique)
+      //   2 = has aria-label / name  (often unique within form/region)
+      //   3 = bbox-only              (must rely on geometry)
+      let specificity = 3;
+      if (id) specificity = 0;
+      else if (testIdAttr) specificity = 1;
+      else if (el.ariaLabel || el.htmlName) specificity = 2;
+      return {
+        tag: el.tag,
+        role: el.role || '',
+        type: el.type || '',
+        name: el.htmlName || '',
+        id,
+        ariaLabel: el.ariaLabel || '',
+        placeholder: el.placeholder || '',
+        testId: testIdAttr,
+        bboxX: el.bounds?.x ?? 0,
+        bboxY: el.bounds?.y ?? 0,
+        bboxW,
+        bboxH,
+        __origIdx: idx,
+        __area: bboxW * bboxH,
+        __specificity: specificity,
+      };
+    });
+    // Sort: most specific first; within same specificity, smaller bbox
+    // first (children before parents). Both bbox-0 elements (noBounds
+    // rescue) sort by specificity only — they go to Stage A/C anyway.
+    indexed.sort((a, b) => {
+      if (a.__specificity !== b.__specificity) return a.__specificity - b.__specificity;
+      return a.__area - b.__area;
+    });
+
+    // Strip orchestration-only fields before sending to evaluate.
+    const requests: RefAssignmentRequest[] = indexed.map((r) => ({
+      tag: r.tag, role: r.role, type: r.type, name: r.name,
+      id: r.id, ariaLabel: r.ariaLabel, placeholder: r.placeholder, testId: r.testId,
+      bboxX: r.bboxX, bboxY: r.bboxY, bboxW: r.bboxW, bboxH: r.bboxH,
     }));
 
     // The evaluate body MUST mirror the existing snapshot-collector
@@ -1783,7 +2717,60 @@ export class CdpSnapshotService {
     // `Element`, `CSS` are all browser globals. Node TypeScript doesn't
     // know them; we use `any` casts at the boundary rather than wider
     // lib options (would pollute the whole file with browser types).
-    return frame.evaluate((reqs: RefAssignmentRequest[]) => {
+    // Extended return contract (May 2026 forensic v2): the evaluate
+    // returns refs PLUS per-request diagnostics (walk-up trace, scoring
+    // detail, what elementFromPoint returned). Diagnostics are collected
+    // unconditionally — overhead is tiny (one extra object per
+    // failed-find) and we always have access to it when forensic mode
+    // requests it at the Node layer. Refs path is unaffected.
+    interface WalkUpDiagEntry {
+      depth: number;
+      /** Which z-stack layer from elementsFromPoint this entry came
+       *  from. Layer 0 = topmost (what elementFromPoint would return).
+       *  Layers > 0 mean we pierced an overlay to find this candidate. */
+      layer: number;
+      tag: string;
+      live: { x: number; y: number; w: number; h: number } | null;
+      score: 'exact' | 'loose' | 'mismatch';
+      dx: number;
+      dy: number;
+      taken: boolean;
+    }
+    interface ReqDiag {
+      atPoint: { tag: string; id: string; classFirst: string; stackDepth?: number } | null;
+      walkUp: WalkUpDiagEntry[];
+      descendTried: number;
+      descendFound: number;
+      stageHit:
+        | 'A.id' | 'A.testId' | 'A.name'
+        | 'B.exact'              // walk-up free match, exact bbox
+        | 'B.loose'              // walk-up free match, IoU ≥ 0.5 (formerly 'B.iou')
+        | 'B.mismatch'           // walk-up free match, but bbox is mismatched (specific-tag last resort)
+        | 'B.taken'              // walk-up generic-tag, only candidate was already ref-taken
+        | 'B.descend.exact'      // descend fallback, exact bbox among children
+        | 'B.descend.loose'      // descend fallback, non-exact among children
+        | 'B.last-resort-taken'  // specific-tag, all free exhausted, fell back to taken ancestor
+        | 'C.ariaLabel' | 'C.placeholder'
+        | 'null';
+      computedTransform?: string;
+      computedOpacity?: string;
+      computedVisibility?: string;
+    }
+    interface PageContext {
+      scrollX: number;
+      scrollY: number;
+      devicePixelRatio: number;
+      documentReady: string;
+      domMutationsDuringSnapshot: number;
+      viewportW: number;
+      viewportH: number;
+    }
+    interface EvalResult { refs: string[]; diags: ReqDiag[]; context: PageContext }
+
+    // Tolerate test mocks that return a bare `string[]` (legacy shape)
+    // — wrap into the new EvalResult contract on Node side. Production
+    // browser context returns the structured object below.
+    const rawEvalResult = await frame.evaluate((reqs: RefAssignmentRequest[]) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const win = (globalThis as any).window;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1796,6 +2783,27 @@ export class CdpSnapshotService {
       if (!win.__agentFingerprintMap) win.__agentFingerprintMap = new Map();
 
       const out: string[] = [];
+      // Per-request diagnostics. Same length as `out` / `reqs` — index aligns.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const diags: any[] = [];
+
+      // Lightweight DOM mutation counter for the duration of this evaluate.
+      // Surfaces "DOM is mutating while we measure" pages — useful when
+      // bbox shifts look mysterious. MutationObserver is cheap; we
+      // disconnect at the end of the function.
+      let domMutationCount = 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let mutObserver: any = null;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const MO = (globalThis as any).MutationObserver;
+        if (MO && doc?.documentElement) {
+          mutObserver = new MO(() => { domMutationCount++; });
+          mutObserver.observe(doc.documentElement, {
+            childList: true, subtree: true, attributes: true, characterData: false,
+          });
+        }
+      } catch { /* ignore */ }
 
       // Helper: find the candidate element for a request. Strategy:
       //   1. By id (CSS escaped).
@@ -1803,56 +2811,362 @@ export class CdpSnapshotService {
       // We don't iterate elementsFromPoint because bbox center can be
       // covered by overlay; instead use elementFromPoint at center as
       // a verification step after finding via attributes.
+      /**
+       * Bbox match score — three buckets:
+       *   'exact'    — within ±10px on all 4 sides (font load, sub-pixel,
+       *                sticky offset, lazy-image reflow all fit here).
+       *   'loose'    — IoU ≥ 0.5 (intersection-over-union). Catches
+       *                animations and layout reflows up to ~30% drift.
+       *                Same logical element, different exact box.
+       *   'mismatch' — neither. Different element.
+       *
+       * Empty req bbox returns 'loose' so descriptor-only matching still
+       * works (id/text fallback flows pass empty bbox).
+       *
+       * Why three buckets and not just one tolerance:
+       *   bi.group had overlay div 1280×680 vs target child div 100×30 —
+       *   they NEVER overlap meaningfully (IoU=0). A single 10px-loose
+       *   match would still let the overlay collision happen. The
+       *   discrete 'exact' vs 'loose' distinction lets us PREFER exact
+       *   when available and FALL BACK to loose when reflow shifted
+       *   the element.
+       */
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const findElement = (req: RefAssignmentRequest): any => {
+      const bboxScore = (el: any, req: RefAssignmentRequest): 'exact' | 'loose' | 'mismatch' => {
+        if (req.bboxW <= 0 || req.bboxH <= 0) return 'loose';
+        let r: { x: number; y: number; width: number; height: number };
+        try {
+          r = el.getBoundingClientRect?.();
+          if (!r) return 'mismatch';
+        } catch {
+          return 'mismatch';
+        }
+        const TOL_EXACT = 10;
+        if (
+          Math.abs(r.x - req.bboxX) <= TOL_EXACT
+          && Math.abs(r.y - req.bboxY) <= TOL_EXACT
+          && Math.abs(r.width - req.bboxW) <= TOL_EXACT
+          && Math.abs(r.height - req.bboxH) <= TOL_EXACT
+        ) return 'exact';
+
+        // IoU = area(intersection) / area(union)
+        const ix1 = Math.max(r.x, req.bboxX);
+        const iy1 = Math.max(r.y, req.bboxY);
+        const ix2 = Math.min(r.x + r.width, req.bboxX + req.bboxW);
+        const iy2 = Math.min(r.y + r.height, req.bboxY + req.bboxH);
+        if (ix2 <= ix1 || iy2 <= iy1) return 'mismatch';
+        const inter = (ix2 - ix1) * (iy2 - iy1);
+        const areaA = r.width * r.height;
+        const areaB = req.bboxW * req.bboxH;
+        const union = areaA + areaB - inter;
+        if (union <= 0) return 'mismatch';
+        return inter / union >= 0.5 ? 'loose' : 'mismatch';
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tagMatches = (el: any, tag: string): boolean =>
+        el?.tagName?.toLowerCase() === tag;
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const refAlreadyAssigned = (el: any): boolean => {
+        try { return !!el.getAttribute?.('data-agent-ref'); } catch { return false; }
+      };
+
+      // Tag classification: which tags are SAFE to walk-up loosely.
+      // - GENERIC: div/span — any ancestor with same tag is suspect
+      //   because overlays/wrappers share the tag with intended targets.
+      //   These need strict bbox verification.
+      // - SPECIFIC: everything else. Overlay-as-<button>/<svg> is virtually
+      //   non-existent in real pages, so an ancestor with the same tag is
+      //   reliably the right element. bbox is used only as TIEBREAKER.
+      //
+      // This distinction is what unlocks recall on dynamic pages: bi.group
+      // had 360+ specific-tag elements rejected by uniform bbox-strict
+      // checking because CSS transforms / animations / sub-pixel rendering
+      // shift live bbox vs DS bbox by 5-30px routinely. Specific tags
+      // don't NEED bbox to be safe — the tag identity alone is enough.
+      const GENERIC_TAGS = new Set(['div', 'span']);
+
+      /**
+       * Attribute-value CSS string escaper.
+       * Different beast than `CSS.escape` (which is for identifiers).
+       * For string values inside `[attr="..."]` we must escape `"` and
+       * `\` AND normalize control characters (newline, carriage return,
+       * tab, null) — the CSS selector grammar treats them as invalid
+       * tokens and `querySelector` throws. Without normalization,
+       * Stage C silently misses elements whose aria-label / placeholder
+       * legitimately contains \n (multi-line textarea placeholders,
+       * SVG title with newlines, screen-reader hints with line breaks).
+       */
+      const attrEscape = (v: string): string =>
+        v.replace(/[\n\r\t\0]/g, ' ')
+          .replace(/\\/g, '\\\\')
+          .replace(/"/g, '\\"');
+
+      /**
+       * findElement — map a DS-extracted request to a live DOM node.
+       *
+       * EVOLUTION (May 2026 bi.group):
+       *   v1 (original): tag-only walk-up → overlay collision (46 dups).
+       *   v2 (first fix): ±2px bbox-strict → 94% loss from reflow drift.
+       *   v3 (current): bbox-strict only for GENERIC tags (div/span).
+       *     Specific tags (svg/button/a/img/li/path/input/etc.) trust the
+       *     tag identity — overlay-as-<button> doesn't happen in practice,
+       *     so any ancestor matching the tag IS the right element. bbox
+       *     becomes a tiebreaker among multiple matches, not a gate.
+       *
+       * Stages:
+       *   A. Stable selectors (id / testId / name) — unique by contract.
+       *   B. elementFromPoint walk-up + ancestor scoring:
+       *      - Generic tags: require exact (±10px) or IoU≥0.5; reject if
+       *        refAlreadyAssigned (overlay collision defense).
+       *      - Specific tags: take first tag-match that is free; bbox
+       *        is logged but does not gate. If all candidates are taken,
+       *        fall back to cache-map (line below).
+       *   C. Descriptor fallback (aria-label / placeholder / text) for
+       *      elements whose DS bbox was 0×0 or whose Stage B missed.
+       *      Scoped by tag.
+       */
+      // Capture per-ancestor bbox detail. Used by diag.walkUp records to
+      // tell the operator EXACTLY by how many px each tag-matched ancestor
+      // diverged from the request — separates "transform shifted things"
+      // from "overlay collision" from "page mutated mid-snapshot".
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const measureLive = (el: any): { x: number; y: number; w: number; h: number } | null => {
+        try {
+          const r = el.getBoundingClientRect?.();
+          if (!r) return null;
+          return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+        } catch {
+          return null;
+        }
+      };
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const findElement = (req: RefAssignmentRequest, diag: any): any => {
+        const tagIsGeneric = GENERIC_TAGS.has(req.tag);
+
+        // Stage A — stable identity selectors. Unique by contract.
         if (req.id) {
           try {
-            // CSS.escape REQUIRED — React 18 useId emits colons.
             const candidate = doc.querySelector(`#${cssEscape(req.id)}`);
-            if (candidate && candidate.tagName.toLowerCase() === req.tag) return candidate;
+            if (candidate && tagMatches(candidate, req.tag)) { diag.stageHit = 'A.id'; return candidate; }
           } catch { /* invalid selector — fall through */ }
         }
-        // Bbox-center match: cheap and works when refs are stable
-        // across renders (page didn't reflow). Mismatch on reflow
-        // causes one-frame ref churn — acceptable.
+        if (req.testId) {
+          try {
+            const v = attrEscape(req.testId);
+            const candidate = doc.querySelector(`[data-testid="${v}"], [data-test-id="${v}"], [data-test="${v}"]`);
+            if (candidate && tagMatches(candidate, req.tag)) { diag.stageHit = 'A.testId'; return candidate; }
+          } catch { /* ignore */ }
+        }
+        if (req.name && (req.tag === 'input' || req.tag === 'select' || req.tag === 'textarea' || req.tag === 'button')) {
+          try {
+            const candidate = doc.querySelector(`${req.tag}[name="${attrEscape(req.name)}"]`);
+            if (candidate) { diag.stageHit = 'A.name'; return candidate; }
+          } catch { /* ignore */ }
+        }
+
+        // Stage B — bbox-driven via elementsFromPoint (multi-layer).
         //
-        // ROOT-CAUSE NOTE (May 2026 bi.group audit) — the previous
-        // implementation ended with `return at;` as a "last resort"
-        // when the walk-up couldn't match `req.tag`. On pages with
-        // open mega-menus / sticky dropdowns / position:fixed overlays,
-        // `elementFromPoint(cx, cy)` returns the overlay node for many
-        // DIFFERENT DS nodes whose bbox centers happen to sit under it.
-        // The walk-up never matches `req.tag` (because the overlay's
-        // ancestor chain is unrelated), so every collided request fell
-        // through to `return at` and got the SAME overlay node. The
-        // first request wrote `data-agent-ref="eNNN"` on the overlay,
-        // every subsequent request hit the `existing` branch and
-        // reused the same ref — producing duplicates like e254 × 16
-        // spanning li/a/div/svg/path observed in the bi.group trace.
+        // Why `elementsFromPoint` and not `elementFromPoint`:
+        //   On bi.group the modal has a fullscreen overlay backdrop
+        //   (CSS-Modules class `c-kyMCoO`) that covers the entire
+        //   viewport at higher z-index than the modal content.
+        //   `elementFromPoint(cx, cy)` for ANY point under the modal
+        //   returns the backdrop — its parent chain doesn't contain
+        //   the target. Walk-up never reaches the real element. 470
+        //   elements lost this way in production trace.
         //
-        // Fix: when walk-up fails to find `req.tag`, return null.
-        // The post-pass in collect() filters empty-ref elements out.
-        // We lose a small number of nodes that genuinely had no
-        // recoverable DOM identity, but we never produce duplicates,
-        // which is the only correctness property the resolver actually
-        // depends on.
-        const cx = req.bboxX + req.bboxW / 2;
-        const cy = req.bboxY + req.bboxH / 2;
+        //   `elementsFromPoint` returns the FULL z-stack at the point.
+        //   We walk every layer from front to back and run the same
+        //   per-layer walk-up. The first matching layer wins.
         if (req.bboxW > 0 && req.bboxH > 0) {
+          const cx = req.bboxX + req.bboxW / 2;
+          const cy = req.bboxY + req.bboxH / 2;
+          // elementsFromPoint returns Element[] in z-front-to-back order.
+          // Fallback to single elementFromPoint if older Chromium.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const stack: any[] = (typeof doc.elementsFromPoint === 'function'
+            ? doc.elementsFromPoint(cx, cy)
+            : [doc.elementFromPoint(cx, cy)].filter(Boolean));
+          if (stack.length > 0) {
+            // Capture what the TOP element was — top diagnostic for
+            // "wrong element clicked" / overlay collision bugs. The
+            // diag also records stack depth so we know we tried more
+            // than one layer.
+            try {
+              const top = stack[0];
+              diag.atPoint = {
+                tag: top.tagName?.toLowerCase() || '',
+                id: top.id || '',
+                classFirst: (top.className && typeof top.className === 'string' ? top.className.split(/\s+/)[0] : '') || '',
+                stackDepth: stack.length,
+              };
+            } catch { /* ignore */ }
+
+            // Generic-tag policy: strict bbox match required (overlay
+            // collisions are real for div/span). Walk-up on each layer
+            // collecting exactFree / looseFree / exactTaken.
+            if (tagIsGeneric) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              let exactFree: any = null;
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              let exactTaken: any = null;
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              let looseFree: any = null;
+              // Iterate every z-layer. First exact match anywhere wins.
+              for (let li = 0; li < stack.length && !exactFree; li++) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                let cur: any = stack[li];
+                for (let depth = 0; depth < 8 && cur && !exactFree; depth++) {
+                  if (tagMatches(cur, req.tag)) {
+                    const score = bboxScore(cur, req);
+                    const taken = refAlreadyAssigned(cur);
+                    // Walk-up records cap at ~16 entries to keep JSONL
+                    // size bounded across multi-layer iteration.
+                    if (diag.walkUp.length < 16) {
+                      const live = measureLive(cur);
+                      diag.walkUp.push({
+                        depth, layer: li, tag: req.tag, live, score,
+                        dx: live ? live.x - req.bboxX : 0,
+                        dy: live ? live.y - req.bboxY : 0,
+                        taken,
+                      });
+                    }
+                    if (score === 'exact') {
+                      if (!taken && !exactFree) exactFree = cur;
+                      if (taken && !exactTaken) exactTaken = cur;
+                    } else if (score === 'loose' && !taken && !looseFree) {
+                      looseFree = cur;
+                    }
+                  }
+                  cur = cur.parentElement;
+                }
+              }
+              if (exactFree) { diag.stageHit = 'B.exact'; return exactFree; }
+              if (looseFree) { diag.stageHit = 'B.loose'; return looseFree; }
+              if (exactTaken) { diag.stageHit = 'B.taken'; return exactTaken; }
+              // Generic falls through to Stage C (descriptor fallback).
+            } else {
+              // Specific-tag policy: trust tag identity. Walk every
+              // layer; prefer first free with exact > loose > mismatch.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              let bestFree: any = null;
+              let bestFreeScore: 'exact' | 'loose' | 'mismatch' | null = null;
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              let bestTaken: any = null;
+              for (let li = 0; li < stack.length && bestFreeScore !== 'exact'; li++) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                let cur: any = stack[li];
+                for (let depth = 0; depth < 8 && cur && bestFreeScore !== 'exact'; depth++) {
+                  if (tagMatches(cur, req.tag)) {
+                    const taken = refAlreadyAssigned(cur);
+                    const score = bboxScore(cur, req);
+                    if (diag.walkUp.length < 16) {
+                      const live = measureLive(cur);
+                      diag.walkUp.push({
+                        depth, layer: li, tag: req.tag, live, score,
+                        dx: live ? live.x - req.bboxX : 0,
+                        dy: live ? live.y - req.bboxY : 0,
+                        taken,
+                      });
+                    }
+                    if (taken) {
+                      if (!bestTaken) bestTaken = cur;
+                    } else {
+                      // Outer loop guard already prevents this branch
+                      // from running when bestFreeScore === 'exact'.
+                      // So upgrade rules here are: any score is better
+                      // than `null`; 'exact' beats anything; 'loose'
+                      // beats 'mismatch'. 'exact' wins immediately and
+                      // also short-circuits the outer for via the
+                      // bestFreeScore !== 'exact' guard.
+                      if (!bestFree) {
+                        bestFree = cur; bestFreeScore = score;
+                      } else if (score === 'exact') {
+                        bestFree = cur; bestFreeScore = score;
+                      } else if (bestFreeScore === 'mismatch' && score === 'loose') {
+                        bestFree = cur; bestFreeScore = score;
+                      }
+                    }
+                  }
+                  cur = cur.parentElement;
+                }
+              }
+              if (bestFree) {
+                diag.stageHit = bestFreeScore === 'exact'
+                  ? 'B.exact'
+                  : bestFreeScore === 'loose'
+                    ? 'B.loose'
+                    : 'B.mismatch';
+                return bestFree;
+              }
+
+              // Descend fallback: querySelectorAll inside the TOP layer
+              // first, then next layer if needed. Caps to keep cost
+              // bounded on huge pages.
+              try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                let descFreeFallback: any = null;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                let descFreeExact: any = null;
+                let totalTried = 0;
+                for (let li = 0; li < stack.length && !descFreeExact && totalTried < 32; li++) {
+                  const descendants = stack[li].querySelectorAll?.(req.tag) ?? [];
+                  const layerLimit = Math.min(descendants.length, 32 - totalTried);
+                  for (let i = 0; i < layerLimit; i++) {
+                    totalTried++;
+                    const d = descendants[i];
+                    if (refAlreadyAssigned(d)) continue;
+                    const score = bboxScore(d, req);
+                    if (score === 'exact') { descFreeExact = d; break; }
+                    if (!descFreeFallback) descFreeFallback = d;
+                  }
+                }
+                diag.descendTried = totalTried;
+                if (descFreeExact) { diag.descendFound = 1; diag.stageHit = 'B.descend.exact'; return descFreeExact; }
+                if (descFreeFallback) { diag.descendFound = 1; diag.stageHit = 'B.descend.loose'; return descFreeFallback; }
+              } catch { /* ignore */ }
+
+              if (bestTaken) { diag.stageHit = 'B.last-resort-taken'; return bestTaken; }
+            }
+          }
+        }
+
+        // Stage C — descriptor fallback. Runs when:
+        //   - bbox is 0×0 (DS missed layout for an element that's live)
+        //   - Stage B exhausted without a hit
+        if (req.ariaLabel) {
+          try {
+            const candidate = doc.querySelector(`${req.tag}[aria-label="${attrEscape(req.ariaLabel)}"]`);
+            if (candidate && !refAlreadyAssigned(candidate)) { diag.stageHit = 'C.ariaLabel'; return candidate; }
+          } catch { /* ignore */ }
+        }
+        if (req.placeholder) {
+          try {
+            const candidate = doc.querySelector(`${req.tag}[placeholder="${attrEscape(req.placeholder)}"]`);
+            if (candidate && !refAlreadyAssigned(candidate)) { diag.stageHit = 'C.placeholder'; return candidate; }
+          } catch { /* ignore */ }
+        }
+
+        // No hit anywhere. Capture computed style on the elementFromPoint
+        // result if any — helps prove "transform shifted bbox" hypothesis.
+        if (req.bboxW > 0 && req.bboxH > 0) {
+          const cx = req.bboxX + req.bboxW / 2;
+          const cy = req.bboxY + req.bboxH / 2;
           const at = doc.elementFromPoint(cx, cy);
           if (at) {
-            // Walk up to find the matching tag (elementFromPoint may
-            // return a child like SVG path, we want the button wrap).
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            let cur: any = at;
-            for (let depth = 0; depth < 5 && cur; depth++) {
-              if (cur.tagName?.toLowerCase() === req.tag) return cur;
-              cur = cur.parentElement;
-            }
-            // Walk-up failed: `at` is some unrelated overlay /
-            // background node. Returning it would corrupt refs (see
-            // ROOT-CAUSE NOTE above). Drop instead.
-            return null;
+            try {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const win2 = (globalThis as any).window;
+              const cs = win2.getComputedStyle?.(at);
+              if (cs) {
+                diag.computedTransform = cs.transform || '';
+                diag.computedOpacity = cs.opacity || '';
+                diag.computedVisibility = cs.visibility || '';
+              }
+            } catch { /* ignore */ }
           }
         }
         return null;
@@ -1876,45 +3190,120 @@ export class CdpSnapshotService {
         return `${req.tag}|${req.role}|${req.type}|${req.name}|${req.id}|${req.ariaLabel}|${req.placeholder}|${req.testId}|${text}|${domPath}`;
       };
 
-      for (const req of reqs) {
-        const el = findElement(req);
-        if (!el) {
-          // Element disappeared between DOMSnapshot and evaluate.
-          // Push an empty ref; mapping caller filters these out.
-          out.push('');
-          continue;
-        }
+      // Wrap main loop in try/finally so mutObserver is ALWAYS
+      // disconnected — without this, a throw inside findElement /
+      // fpKey would leak the observer for the lifetime of the page
+      // (browser GC reclaims on navigation, but until then every DOM
+      // mutation runs through our handler).
+      try {
+        for (const req of reqs) {
+          // Fresh diag for this request. Same length / index alignment
+          // as `out`. findElement mutates diag fields as it executes.
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const diag: any = {
+            atPoint: null,
+            walkUp: [],
+            descendTried: 0,
+            descendFound: 0,
+            stageHit: 'null',
+          };
+          const el = findElement(req, diag);
+          if (!el) {
+            out.push('');
+            diags.push(diag);
+            continue;
+          }
 
-        // Reuse existing data-agent-ref if already set.
-        const existing = el.getAttribute('data-agent-ref');
-        if (existing) {
-          out.push(existing);
-          continue;
-        }
+          // Reuse existing data-agent-ref if already set.
+          const existing = el.getAttribute('data-agent-ref');
+          if (existing) {
+            out.push(existing);
+            diags.push(diag);
+            continue;
+          }
 
-        // Look up by fingerprint to survive React re-renders.
-        const key = fpKey(el, req);
-        const cached = win.__agentFingerprintMap.get(key);
-        if (typeof cached === 'string' && cached.length > 0) {
-          el.setAttribute('data-agent-ref', cached);
-          out.push(cached);
-          continue;
-        }
+          // Look up by fingerprint to survive React re-renders.
+          const key = fpKey(el, req);
+          const cached = win.__agentFingerprintMap.get(key);
+          if (typeof cached === 'string' && cached.length > 0) {
+            el.setAttribute('data-agent-ref', cached);
+            out.push(cached);
+            diags.push(diag);
+            continue;
+          }
 
-        // Allocate fresh ref from monotonic counter. Per-frame
-        // counters are isolated (each iframe has its own window) so
-        // refs from different frames can collide on raw value (`e1`
-        // in main + `e1` in iframe). Caller is responsible for any
-        // cross-frame disambiguation needed by downstream consumers
-        // (e.g. iframe-aware adapter for self-heal Phase 3).
-        const fresh = `e${win.__agentRefCounter++}`;
-        win.__agentFingerprintMap.set(key, fresh);
-        el.setAttribute('data-agent-ref', fresh);
-        out.push(fresh);
+          // Allocate fresh ref from monotonic counter.
+          const fresh = `e${win.__agentRefCounter++}`;
+          win.__agentFingerprintMap.set(key, fresh);
+          el.setAttribute('data-agent-ref', fresh);
+          out.push(fresh);
+          diags.push(diag);
+        }
+      } finally {
+        try { mutObserver?.disconnect?.(); } catch { /* ignore */ }
       }
+      const context = {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        scrollX: (win as any).scrollX ?? (win as any).pageXOffset ?? 0,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        scrollY: (win as any).scrollY ?? (win as any).pageYOffset ?? 0,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        devicePixelRatio: (win as any).devicePixelRatio ?? 1,
+        documentReady: doc?.readyState ?? 'unknown',
+        domMutationsDuringSnapshot: domMutationCount,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        viewportW: (win as any).innerWidth ?? 0,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        viewportH: (win as any).innerHeight ?? 0,
+      };
 
-      return out;
+      return { refs: out, diags, context };
     }, requests);
+
+    // Normalize: accept either the new structured shape OR a bare
+    // `string[]` (used by test mocks that pre-date the diag plumbing).
+    let evalResult: EvalResult;
+    if (Array.isArray(rawEvalResult)) {
+      evalResult = {
+        refs: rawEvalResult as string[],
+        diags: (rawEvalResult as string[]).map(() => ({
+          atPoint: null, walkUp: [], descendTried: 0, descendFound: 0, stageHit: 'null' as const,
+        })),
+        context: {
+          scrollX: 0, scrollY: 0, devicePixelRatio: 1, documentReady: 'unknown',
+          domMutationsDuringSnapshot: 0, viewportW: 0, viewportH: 0,
+        },
+      };
+    } else {
+      evalResult = rawEvalResult as EvalResult;
+    }
+
+    // Un-permute: refs came back in `requests` order (which we sorted
+    // for specificity-first processing). Caller expects them in
+    // `docElements` order so `docElements[i].ref = refs[i]` is correct.
+    // We also un-permute diags in the same shuffle so the forensic
+    // collector can attach the right diag to the right element later
+    // (it identifies by docElements[i]).
+    const reorderedOut: string[] = new Array(docElements.length).fill('');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const reorderedDiags: any[] = new Array(docElements.length).fill(null);
+    for (let i = 0; i < indexed.length; i++) {
+      reorderedOut[indexed[i].__origIdx] = evalResult.refs[i] ?? '';
+      reorderedDiags[indexed[i].__origIdx] = evalResult.diags[i] ?? null;
+    }
+
+    // Stash diags + context on the docElements array so the collect()
+    // caller can read them when forensic mode is on. Using a Symbol
+    // would be cleaner but TS in browser-evaluate context complicates
+    // shared definitions; a property name is fine because docElements
+    // is private to the CDP pipeline (downstream consumers see the
+    // returned LiteSnapshot.elements which is a different array).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (docElements as any).__refAssignDiags = reorderedDiags;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (docElements as any).__refAssignContext = evalResult.context;
+
+    return reorderedOut;
   }
 
   /**

@@ -1057,11 +1057,23 @@ export class IntentStepLintService {
     // modal/dropdown just appeared or the user interacted with the page since
     // the last interval tick. fullPage: include below-viewport elements.
     const sessionService = getPreviewSessionService();
+    // Forensic JSONL gating: emit only for user-actionable lint paths,
+    // not background dry-runs (pick) or auto-lints fired on typing.
+    // The Find button and apply pre-lint are the cases where "target
+    // missing from candidates" matters for diagnosis. Pick dry-run is
+    // fire-and-forget UI hint — writing a forensic file for every hover
+    // would flood test_logs/editor/ with noise.
+    const forensicEnabled = params.auditTrigger === 'find_button'
+      || params.auditTrigger === 'apply_prelint';
+
     const snapshotStart = Date.now();
     const snapshot = await sessionService.getSnapshot(previewSessionId, userId, {
       includeDomNodes: true,
       fullPage: true,
       force: forceFreshSnapshot,
+      // Forensic rejection JSONL — see cdp-snapshot.service.ts →
+      // writeForensicJsonl. Gated by auditTrigger above.
+      forensicRejections: forensicEnabled,
     });
     const snapshotMs = Date.now() - snapshotStart;
 

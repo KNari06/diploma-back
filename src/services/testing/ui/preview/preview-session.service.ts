@@ -2507,6 +2507,9 @@ export class PreviewSessionService {
       includeDomNodes?: boolean;
       /** Collect elements below the viewport (for replay/run where scroll will happen) */
       fullPage?: boolean;
+      /** Forensic rejection logging — forwarded to SnapshotRouter → CDP service.
+       *  Off by default; only the lint resolver entry sets it true. */
+      forensicRejections?: boolean;
     }
   ): Promise<{
     url: string;
@@ -2594,6 +2597,7 @@ export class PreviewSessionService {
         fullPage: options?.fullPage,
         diagId: sessionId,
         lastDomNodeCount: session.pageState?.domNodes?.length,
+        forensicRejections: options?.forensicRejections,
       });
       const domAnalysis = DomAnalysisExtractorService.extract(snapshot);
       const currentUrl = session.page.url();

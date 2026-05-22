@@ -75,6 +75,14 @@ export interface SnapshotRouterOptions {
    * `previewSessionId` / `runId` / etc. as appropriate.
    */
   diagId?: string;
+  /**
+   * Forensic rejection logging — opt-in flag forwarded to the CDP
+   * snapshot service. Triggers a per-snapshot JSONL trace of every
+   * node dropped in the mapping / refAssign / dedup stages.
+   * Off by default; only the lint resolver entry sets this true for
+   * user-initiated Find/Run snapshots, so idle ticks stay zero-cost.
+   */
+  forensicRejections?: boolean;
 }
 
 /**
@@ -329,6 +337,7 @@ export class SnapshotRouter {
           fullPage: options.fullPage,
           skipStabilityWait: options.skipStabilityWait,
           diagId: options.diagId,
+          forensicRejections: options.forensicRejections,
         });
         const durationMs = Date.now() - startedAt;
         // INFO level: every successful CDP collect logged so we can
@@ -476,6 +485,7 @@ export class SnapshotRouter {
         fullPage: options.fullPage,
         skipStabilityWait: options.skipStabilityWait,
         diagId: options.diagId,
+        forensicRejections: options.forensicRejections,
       });
       cdpResult = { status: 'fulfilled', value };
     } catch (reason) {

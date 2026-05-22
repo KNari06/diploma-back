@@ -2488,6 +2488,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
 
+      // Pick mode short-circuit: when the user is in "Pick element" mode,
+      // a click on the preview must NOT propagate to the real page — it
+      // is a read-only selection signal. The in-page overlay
+      // (buildOverlayScript) only catches PHYSICAL clicks; clicks that
+      // arrive here came through WS from the frontend stream surface and
+      // would otherwise reach executeMouseAction → Playwright
+      // page.click() → real interaction. Route them through the pick
+      // service instead, which probes the element + emits
+      // `preview:pick:result` without touching the page.
+      try {
+        const { handleExternalPickClick } = await import(
+          '@/services/testing/ui/preview/preview-element-pick.service'
+        );
+        if (handleExternalPickClick(previewSessionId, x, y)) return;
+      } catch (err) {
+        // Best-effort: a failure here should not silently downgrade to a
+        // real click (which would defeat the read-only contract). Log
+        // loudly and bail.
+        logger.error('[WebSocket] handleExternalPickClick threw — dropping click', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
       // V9: Pre-click probe for recording (state-aware: need element state BEFORE click)
       let preClickElement: Awaited<ReturnType<typeof import('@/services/testing/ui/preview/recording-capture.service').RecordingCaptureService.probeForRecording>> = null;
       const isRecording = sessionService.isRecording(previewSessionId, ensuredUserId);

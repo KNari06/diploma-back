@@ -2012,6 +2012,29 @@ const LLM_SHARED_RULES = `RULES:
    - TOAST/SNACKBAR: small element at TOP or BOTTOM edge
    When an overlay is present, ALWAYS prefer elements INSIDE it over background.
 
+7.5 WRAPPER vs INNER-ICON — pick the CLICK-TARGET, not the decoration:
+    Icon-button patterns expose multiple stacked candidates at the SAME
+    screen position — typically a clickable wrapper (<button>, <span>, <a>,
+    <li>) around a decorative inner element (<svg>, <path>, <img>, <i>).
+    All carry [active-layer] and look equally interactive in the list.
+    PREFER THE WRAPPER over the inner icon when ALL of these hold:
+      - both candidates fit the intent equally (same semantic match)
+      - the wrapper's bbox CONTAINS the inner's bbox (wrapper.x ≤ inner.x
+        AND wrapper.y ≤ inner.y AND wrapper.x+w ≥ inner.x+w AND
+        wrapper.y+h ≥ inner.y+h)
+      - the wrapper is one of {button, a, span, li, div with role=button}
+      - the inner is one of {svg, path, img, i}
+    WHY: wrappers carry the click handler in 99% of real UIs (React's
+    onClick goes on <button>, not on the inner SVG). Picking the SVG
+    sometimes works by event bubbling, but it gives a smaller hit-target
+    (16×16 vs 32×32), is fragile to icon-library swaps (svg→img→mask),
+    and contradicts the user's mental model — "кнопка закрыть" / "close
+    button" means the BUTTON, the X glyph is just its label.
+    Example: <span 32×32 @(925,169)> wrapping <svg 16×16 @(933,177)> for
+    a modal close-X → return the SPAN, not the SVG.
+    Exception: if intent EXPLICITLY mentions "icon" / "иконка" / "крестик"
+    as the noun (not "button with icon"), the inner element is fine.
+
 8. PAGE-STATE-DRIVEN selection (CRITICAL for popups / dropdowns / autocomplete):
    - [expanded] = container is OPEN; its children are visible candidates
    - [collapsed] = container is CLOSED; its children are NOT the target
@@ -3404,6 +3427,57 @@ Select the single best matching element, or return ref=null if the intent does n
           const labelCheck = (getEffectiveLabel(chosenCandidate?.node) || '').trim();
           if (labelCheck.length === 0) {
             labelEmptyRejected = true;
+          }
+
+          // ESCAPE HATCH (May 2026, bi.group close-X audit):
+          // The labelEmpty guard exists to stop the LLM from guessing
+          // on "find email" when only candidates are decorative divs.
+          // But icon-only modal buttons (close X, dismiss, menu toggle)
+          // have NO label by construction — their identity IS the
+          // position + small bbox + active-modal context. The LLM has
+          // already reasoned about that context and returned a high-
+          // confidence pick. Re-applying a "must have label" guard
+          // throws away the LLM's verdict for a stricter rule.
+          //
+          // We trust the LLM when ALL of these geometric/contextual
+          // signals agree (no regex, no language hardcoding — these
+          // signals are language-agnostic and verifiable):
+          //
+          //   1. chosenCandidate present (sanity)
+          //   2. node.isInsideActiveModal — there's an active overlay
+          //      AND chosen node is part of it (not the background
+          //      page that gets hard-excluded elsewhere)
+          //   3. node.isTopMostAtCenter — actually clickable at its
+          //      center (not occluded by yet another overlay)
+          //   4. node.boundingBox is small (≤96×96) — icon/button
+          //      size, not a wrapper div / page section. Decorative
+          //      large divs that the LLM might hallucinate on are
+          //      filtered out by this gate.
+          //   5. confidence >= 0.8 — model's own uncertainty bound
+          //
+          // If any gate fails, the original labelEmpty rejection stands.
+          // No reliance on intent-language matching — works equally for
+          // English / Russian / Kazakh / anything else.
+          if (labelEmptyRejected && chosenCandidate?.node) {
+            const node = chosenCandidate.node;
+            const isInModal = node.isInsideActiveModal === true;
+            const isTop = node.isTopMostAtCenter === true;
+            const bb = node.boundingBox;
+            const hasGeometry = !!(bb && bb.width > 0 && bb.height > 0);
+            const isIconSized = !!(bb && bb.width <= 96 && bb.height <= 96);
+            const llmConfident = confidence >= 0.8;
+            if (isInModal && isTop && hasGeometry && isIconSized && llmConfident) {
+              labelEmptyRejected = false;
+              logger.info('[LLM_SELECT] labelEmpty rejection escaped (icon-sized node in active modal)', {
+                chosenRef: parsed.ref,
+                confidence,
+                isInsideActiveModal: isInModal,
+                isTopMostAtCenter: isTop,
+                bboxW: bb?.width,
+                bboxH: bb?.height,
+                tag: node.tag,
+              });
+            }
           }
         }
       }

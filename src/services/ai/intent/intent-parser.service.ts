@@ -1375,11 +1375,21 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
 
   // Step 5: Normalize and clean fields based on intent type
   if (parsed.intent === 'api_test') {
+    // Tokenize on Unicode word boundaries via splitting on
+    // non-letter/non-digit. Set-based lookup avoids the JS `\b` bug
+    // where Cyrillic characters don't form ASCII word boundaries
+    // (so /\b(хард)\b/ would never match "хард" in "сделай хард тест").
+    // Extending vocabulary now = one Set entry, not a regex edit.
+    const HARD_LEVEL = new Set(['hard', 'хард', 'сложный', 'сложно']);
+    const MEDIUM_LEVEL = new Set(['medium', 'медиум', 'средний']);
+    const LIGHT_LEVEL = new Set(['light', 'лайт', 'легкий', 'лёгкий', 'простой']);
     const extractAgentLevelFromText = (text: string): 'light' | 'medium' | 'hard' | undefined => {
-      const lower = (text || '').toLowerCase();
-      if (/\b(hard|хард)\b/i.test(lower)) return 'hard';
-      if (/\b(medium|медиум)\b/i.test(lower)) return 'medium';
-      if (/\b(light|лайт)\b/i.test(lower)) return 'light';
+      const tokens = (text || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+      for (const t of tokens) {
+        if (HARD_LEVEL.has(t)) return 'hard';
+        if (MEDIUM_LEVEL.has(t)) return 'medium';
+        if (LIGHT_LEVEL.has(t)) return 'light';
+      }
       return undefined;
     };
 
@@ -1439,9 +1449,17 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
         parsed.apiMethod = undefined;
       }
     } else {
-      // Try to infer method from text if missing
-      const methodMatch = trimmedMessage.match(/\b(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\b/i);
-      const normalized = normalizeMethod(methodMatch?.[1]);
+      // Try to infer method from text if missing.
+      // HTTP method names are intrinsically ASCII (RFC 7231), so the
+      // KEYWORDS don't need translation — but the SURROUNDING text often
+      // is Cyrillic ("обычный GET запрос"). JS `\b` is ASCII-only and
+      // does not match between Cyrillic and a Latin keyword, so the old
+      // /\bGET\b/i quietly failed on those phrasings. Token-split via
+      // Unicode-aware boundary, then Set lookup.
+      const HTTP_METHODS: Set<string> = new Set(VALID_HTTP_METHODS);
+      const tokens = trimmedMessage.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+      const found = tokens.find((t) => HTTP_METHODS.has(t.toUpperCase()));
+      const normalized = normalizeMethod(found);
       if (normalized) {
         parsed.apiMethod = normalized as any;
       }

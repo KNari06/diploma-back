@@ -105,6 +105,62 @@ export function isPickActive(previewSessionId: string): boolean {
 }
 
 /**
+ * Route an externally-originated click (e.g. user clicked on the preview
+ * stream in the frontend → WS `preview:mouse:click`) through the same
+ * pipeline the in-page overlay callback uses.
+ *
+ * The in-page overlay-script intercept (`buildOverlayScript`) only fires
+ * for PHYSICAL user events inside the page; Playwright-driven clicks via
+ * CDP `Input.dispatchMouseEvent` bypass DOM listeners and trigger trusted
+ * events. That means without this routing path, a frontend click during
+ * pick mode would land on `executeMouseAction` and ACTUALLY click the
+ * page element — defeating the "read-only pick" contract.
+ *
+ * Returns:
+ *   - `true` if the click was consumed (caller must NOT proceed to
+ *     `executeMouseAction`).
+ *   - `false` if no pick session is armed (caller proceeds normally).
+ *
+ * Same idempotency guards as the in-page callback: rejects clicks before
+ * overlay init, after a previous resolution, or on a closed session.
+ */
+export function handleExternalPickClick(
+  previewSessionId: string,
+  x: number,
+  y: number,
+): boolean {
+  const session = activePickSessions.get(previewSessionId);
+  if (!session) return false;
+  // Session is closed (cancelled / nav'd away) — caller should treat the
+  // click as a normal interaction.
+  if (session.closed) return false;
+  // Initializing OR already resolved: still CONSUME the click (return
+  // true). Returning false here would let the caller route the click
+  // into executeMouseAction → real page click, defeating the read-only
+  // contract. The user's "stray double click" should still be swallowed
+  // until the session terminator fires and removes us from the active
+  // map.
+  if (session.initializing || session.resolved) return true;
+
+  // Disarm the timeout watchdog IMMEDIATELY — mirrors the in-page
+  // callback (see line ~224). Without this the watchdog could fire
+  // mid-`finishPick` and double-emit a `:state{timeout}` after
+  // `:result{picked}`.
+  clearTimeout(session.timeoutTimer);
+  session.resolved = true;
+
+  void finishPick(previewSessionId, { x, y }).catch((err) => {
+    logger.error('[PREVIEW_PICK] finishPick (external) failed', {
+      previewSessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    void cancelPick(previewSessionId, 'error', err instanceof Error ? err.message : String(err));
+  });
+
+  return true;
+}
+
+/**
  * Enter pick mode. Caller must have acquired the pick-mutex already.
  * Idempotent: starting twice for the same session cancels the previous
  * session first.
