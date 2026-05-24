@@ -345,6 +345,22 @@ export function buildAllowedSets(
     // to the existing soft-penalty branch (modal.likely_background) for
     // safety on edge cases.
     //
+    // Why three conditions (and not "modal active → exclude everything"):
+    //   - Centered fullscreen modal (e.g. bi.group city picker) covers the
+    //     center of every background button → isTopMostAtCenter=false on
+    //     all of them → all excluded. Correct.
+    //   - Side drawer (left/right) covers ~25% of viewport. A button in the
+    //     opposite half has its center UNCOVERED → isTopMostAtCenter=true
+    //     → NOT excluded. Correct — user can physically click it.
+    //   - Transparent modal backdrop covers the whole viewport → buttons
+    //     under it get isTopMostAtCenter=false → excluded. Correct — user
+    //     CAN'T click through a backdrop that intercepts pointer events.
+    //   - Sticky FAB with z-index > backdrop → isTopMostAtCenter=true →
+    //     NOT excluded. Correct — user can click the FAB.
+    // The three conditions together are precise: they reflect PHYSICAL
+    // clickability, not just modal presence. Do NOT relax this rule
+    // without measuring against all four scenarios above.
+    //
     // Why hard-exclude over soft penalty: previously the resolver's primary
     // batch (top-60 by DOM order) was polluted by the entire page chrome
     // when a popup was open, so the LLM saw the popup target AND every
