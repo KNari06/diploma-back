@@ -1,0 +1,670 @@
+import { supabaseAdmin } from '@/db/supabase';
+import { logger } from '@/utils/core/logger';
+import { ExecutionService } from '../executions/execution.service';
+import { HealthCheckAggregatorService } from './health-check-aggregator.service';
+import { TestReportGeneratorService } from '../results/test-report-generator.service';
+import { deriveRunStatus } from '@/utils/testing/run-status.utils';
+import type {
+  RunReport,
+  RunReportExecution,
+  RunReportStep,
+  RunReportSummary,
+  RunReportArtifactsSummary,
+  EnrichedBug,
+  ExecutionHealthChecks,
+  NegativeSummary,
+} from '@/types/testing.types';
+
+export class RegressionReportAssemblerService {
+  // =========================================================================
+  // RUN REPORT METHODS
+  // =========================================================================
+
+  /**
+   * Get a run with ownership check, including plan name
+   */
+  static async getRunWithOwnership(
+    runId: string,
+    userId: string,
+  ): Promise<any | null> {
+    const { data, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('*, regression_plans(name)')
+      .eq('id', runId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[REGRESSION_RUN] Failed to get run', { error, runId });
+      return null;
+    }
+    return data;
+  }
+
+  /**
+   * Fetch a run by its public share token (no ownership check)
+   */
+  static async getRunByShareToken(shareToken: string): Promise<any | null> {
+    const { data, error } = await supabaseAdmin
+      .from('regression_runs')
+      .select('*, regression_plans(name)')
+      .eq('share_token', shareToken)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('[REGRESSION_RUN] Failed to get run by share token', { error, shareToken });
+      return null;
+    }
+    return data;
+  }
+
+  /**
+   * Batch fetch test case names by IDs
+   */
+  static async batchGetTestCaseNames(
+    testCaseIds: string[],
+  ): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!testCaseIds.length) return map;
+
+    const { data, error } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, name')
+      .in('id', testCaseIds);
+
+    if (error) {
+      logger.warn('[REGRESSION_RUN] Failed to fetch test case names', { error, count: testCaseIds.length });
+    }
+
+    for (const row of data || []) {
+      map.set(row.id, row.name);
+    }
+    return map;
+  }
+
+  /**
+   * Batch fetch test results (artifacts + ai_summary) by test IDs.
+   * When a test has multiple results (one per browser), picks the first one
+   * with ai_summary, or falls back to the first result.
+   */
+  static async batchGetTestResults(
+    testIds: string[],
+  ): Promise<Map<string, any>> {
+    const map = new Map<string, any>();
+    if (!testIds.length) return map;
+
+    const { data, error } = await supabaseAdmin
+      .from('test_results')
+      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
+      .in('test_id', testIds)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.warn('[REGRESSION_RUN] Failed to fetch test results', { error, count: testIds.length });
+    }
+
+    for (const row of data || []) {
+      // Prefer the result that has ai_summary
+      const existing = map.get(row.test_id);
+      if (!existing || (!existing.ai_summary && row.ai_summary)) {
+        map.set(row.test_id, row);
+      }
+    }
+    return map;
+  }
+
+  /**
+   * Batch fetch executed steps from tests table
+   */
+  static async batchGetExecutedSteps(
+    testIds: string[],
+  ): Promise<Map<string, any[]>> {
+    const map = new Map<string, any[]>();
+    if (!testIds.length) return map;
+
+    const { data, error } = await supabaseAdmin
+      .from('tests')
+      .select('id, executed_steps')
+      .in('id', testIds);
+
+    if (error) {
+      logger.warn('[REGRESSION_RUN] Failed to fetch executed steps', { error, count: testIds.length });
+    }
+
+    for (const row of data || []) {
+      map.set(row.id, row.executed_steps || []);
+    }
+    return map;
+  }
+
+  /**
+   * Build a full aggregated run report (authenticated — checks ownership)
+   */
+  static async buildFullReport(
+    runId: string,
+    userId: string,
+  ): Promise<RunReport | null> {
+    const run = await this.getRunWithOwnership(runId, userId);
+    if (!run) return null;
+    return RegressionReportAssemblerService.assembleReport(run);
+  }
+
+  /**
+   * Build a full report for a publicly shared run (no ownership check).
+   */
+  static async buildPublicReport(shareToken: string): Promise<RunReport | null> {
+    const run = await this.getRunByShareToken(shareToken);
+    if (!run) return null;
+    return RegressionReportAssemblerService.assembleReport(run);
+  }
+
+  /**
+   * Shared report assembly logic used by both buildFullReport and buildPublicReport.
+   * Fetches executions, test results, steps, bugs, artifacts and assembles RunReport.
+   */
+  static async assembleReport(run: any): Promise<RunReport> {
+    // Phase 1: Parallel fetch stats + executions
+    const [stats, executions] = await Promise.all([
+      ExecutionService.getStats(run.id),
+      ExecutionService.getByRunId(run.id),
+    ]);
+
+    const planName = (run.regression_plans as any)?.name || null;
+
+    // Get test case names
+    const testCaseIds = [...new Set(executions.map((e) => e.testCaseId))];
+    const namesMap = await RegressionReportAssemblerService.batchGetTestCaseNames(testCaseIds);
+
+    // Extract testIds from UI executions (stored in execution.result.testId)
+    const testIds: string[] = [];
+    for (const exec of executions) {
+      const testId = exec.result?.testId;
+      if (testId && exec.testType === 'ui') {
+        testIds.push(testId);
+      }
+    }
+
+    // Batch-fetch negativeMeta for negative test cases
+    const negativeTestCaseIds = executions.filter((e) => e.isNegative).map((e) => e.testCaseId);
+    const negativeMetaMap = new Map<string, import('@/types/testing.types').NegativeMeta>();
+    if (negativeTestCaseIds.length > 0) {
+      const { data: negRows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, negative_meta')
+        .in('id', negativeTestCaseIds);
+      for (const row of negRows || []) {
+        if (row.negative_meta) {
+          negativeMetaMap.set(row.id, row.negative_meta as import('@/types/testing.types').NegativeMeta);
+        }
+      }
+    }
+
+    // Phase 3 — post-hoc phase map.
+    // The step executor doesn't (yet) echo our `phase` marker back in its
+    // event trace. Rather than thread the flag through a second service
+    // we don't own, we reconstruct phase locally: for each test case that
+    // was stitched, grab setup_steps / teardown_steps lengths, and tag the
+    // executed-step timeline by index. When the case has no extras, the
+    // map stays empty and the report falls back to the legacy shape
+    // (no phase field on steps).
+    //
+    // IMPORTANT — assumption: the executor emits `step_completed` events
+    // in the same order it received the commands. The indexing here will
+    // produce wrong phase labels if that ever changes (parallel execution
+    // within a test case, reordering for optimisation, etc.). Today the
+    // Playwright executor is strictly serial per-test-case (Mobile runner
+    // too), so this is safe — but any future change to execution ordering
+    // MUST update this reconstruction or have the executor echo `phase`
+    // on each step event directly.
+    const phaseMapByTestCaseId = new Map<string, Array<'setup' | 'main' | 'teardown'>>();
+    // Surface curator-set priority alongside the phase reconstruction so
+    // the run-details page can badge / colorize execution rows without an
+    // extra round-trip. Display-only — does NOT change execution order.
+    // Map only stores valid enum values; CHECK-violating drift collapses
+    // to null on the wire.
+    const priorityByTestCaseId = new Map<string, 'critical' | 'high' | 'medium' | 'low'>();
+    const VALID_PRIORITY = new Set(['critical', 'high', 'medium', 'low']);
+    if (testCaseIds.length > 0) {
+      const { data: caseRows } = await supabaseAdmin
+        .from('intent_test_cases')
+        .select('id, setup_steps, teardown_steps, steps_json, priority')
+        .in('id', testCaseIds);
+      for (const row of caseRows || []) {
+        if (row.priority && VALID_PRIORITY.has(row.priority)) {
+          priorityByTestCaseId.set(row.id, row.priority as 'critical' | 'high' | 'medium' | 'low');
+        }
+        const setupCount = Array.isArray(row.setup_steps) ? row.setup_steps.length : 0;
+        const teardownCount = Array.isArray(row.teardown_steps) ? row.teardown_steps.length : 0;
+        const mainCount = Array.isArray(row.steps_json) ? row.steps_json.length : 0;
+        if (setupCount === 0 && teardownCount === 0) continue; // legacy case — skip
+        const phases: Array<'setup' | 'main' | 'teardown'> = [
+          ...Array(setupCount).fill('setup' as const),
+          ...Array(mainCount).fill('main' as const),
+          ...Array(teardownCount).fill('teardown' as const),
+        ];
+        phaseMapByTestCaseId.set(row.id, phases);
+      }
+    }
+
+    // Phase 2: Parallel enrichment fetch
+    const [testResultsMap, testReports, executedStepsMap] = await Promise.all([
+      RegressionReportAssemblerService.batchGetTestResults(testIds),
+      TestReportGeneratorService.batchGetReportsByTestIds(testIds),
+      RegressionReportAssemblerService.batchGetExecutedSteps(testIds),
+    ]);
+
+    // Index reports by testId
+    const reportsMap = new Map<string, any>();
+    for (const report of testReports) {
+      reportsMap.set(report.testId, report);
+    }
+
+    // Build executions, bugs, aggregated artifacts
+    const reportExecutions: RunReportExecution[] = [];
+    const allBugs: EnrichedBug[] = [];
+    const allRecommendations = new Set<string>();
+    let totalConfidence = 0;
+    let confidenceCount = 0;
+
+    const aggArtifacts: RunReportArtifactsSummary = {
+      screenshots: [],
+      bugScreenshots: [],
+      consoleLogs: [],
+      networkLogs: [],
+    };
+
+    const validSeverities = new Set(['critical', 'high', 'medium', 'low']);
+    const validCategories = new Set(['functional', 'performance', 'accessibility', 'visual', 'security']);
+
+    for (const exec of executions) {
+      const testCaseName = namesMap.get(exec.testCaseId) || 'Unknown';
+      const testId = exec.result?.testId;
+
+      // Build steps from executed_steps
+      const steps: RunReportStep[] = [];
+      let execArtifacts: {
+        videoUrl?: string;
+        traceUrl?: string;
+        screenshots: string[];
+        bugScreenshots: string[];
+        consoleLogs: string[];
+        networkLogs: Array<{ method: string; url: string; status?: number; durationMs?: number }>;
+        qualityChecks?: any;
+      } = {
+        videoUrl: undefined,
+        traceUrl: undefined,
+        screenshots: [],
+        bugScreenshots: [],
+        consoleLogs: [],
+        networkLogs: [],
+      };
+      let bugsCount = 0;
+      let execHealthChecks: ExecutionHealthChecks | undefined;
+
+      if (testId && exec.testType === 'ui') {
+        // Build steps
+        const rawSteps = executedStepsMap.get(testId) || [];
+        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        // Reconstruct phase from the test case's setup_steps / steps_json /
+        // teardown_steps counts. Indexed by executed-step position so as
+        // long as the executor fires step_completed events in order (it does),
+        // we can label setup / main / teardown without touching the
+        // executor service. Undefined entries fall back to legacy (no phase).
+        const phaseList = phaseMapByTestCaseId.get(exec.testCaseId);
+        for (let i = 0; i < completedSteps.length; i++) {
+          const step = completedSteps[i];
+          const meta = step.data?.runtimeMeta;
+          const success = step.data?.success !== false;
+          const isSoftFailure = !success && !!step.data?.softFailure;
+          // Surface self-healing + flakiness so QA can spot fragile steps in
+          // the report. A step is "healed" when its locator had to be rewritten
+          // by self_heal to pass; "flaky" is an independent historical signal
+          // the backend annotates onto the runtimeMeta.
+          const healed = meta?.runtimeStatus === 'healed' || meta?.source === 'self_heal';
+          const phase = phaseList?.[i];
+          // Phase 3: a failing teardown step is a warning, not a failure —
+          // teardown runs best-effort and never flips the overall verdict.
+          const isTeardownFailure = !success && phase === 'teardown';
+          steps.push({
+            index: i + 1,
+            description: step.data?.stepDescription || step.data?.step || `Step ${i + 1}`,
+            // V16: Soft failures (e.g. auto-injected waitFor timeout) are warnings, not errors
+            // Phase 3: teardown failures are also warnings by contract.
+            status: success ? 'passed' : (isSoftFailure || isTeardownFailure ? 'warning' : 'failed'),
+            durationMs: meta?.executionMs,
+            error: !success ? {
+              message: meta?.failureExplanation || meta?.failedReason || 'Step failed',
+              failedReason: meta?.failedReason,
+              screenshot: meta?.bugScreenshotUrl,
+              rootCause: meta?.rootCause,
+              networkVerdict: meta?.networkVerdict,
+            } : undefined,
+            ...(healed ? { healed: true } : {}),
+            ...(typeof meta?.healConfidence === 'number' ? { healConfidence: meta.healConfidence } : {}),
+            // Forward self-heal before/after provenance. Only meaningful when
+            // healed === true, but we keep the guards independent so a partial
+            // meta still surfaces whatever fields are present.
+            ...(meta?.healedFrom ? { healedFrom: meta.healedFrom } : {}),
+            ...(meta?.healedTo ? { healedTo: meta.healedTo } : {}),
+            ...(meta?.healWhatChanged ? { healWhatChanged: meta.healWhatChanged } : {}),
+            ...(meta?.flaky ? { flaky: true } : {}),
+            ...(phase ? { phase } : {}),
+          });
+        }
+
+        // Build artifacts from test_results
+        const testResult = testResultsMap.get(testId);
+        if (testResult) {
+          execArtifacts.videoUrl = testResult.video_url || undefined;
+          execArtifacts.traceUrl = testResult.trace_url || undefined;
+          if (testResult.screenshot) {
+            const screenshots = Array.isArray(testResult.screenshot)
+              ? testResult.screenshot
+              : [testResult.screenshot];
+            // Filter out base64 data — only include URLs
+            execArtifacts.screenshots = screenshots.filter(
+              (s: string) => typeof s === 'string' && !s.startsWith('data:'),
+            );
+          }
+          if (testResult.logs) {
+            execArtifacts.consoleLogs = Array.isArray(testResult.logs) ? testResult.logs : [];
+          }
+          if (testResult.network_logs && Array.isArray(testResult.network_logs)) {
+            execArtifacts.networkLogs = testResult.network_logs.map((nl: any) => ({
+              method: nl.method || '',
+              url: nl.url || '',
+              status: nl.status ?? undefined,
+              durationMs: nl.responseTime || nl.durationMs,
+            }));
+          }
+
+          // Extract quality checks from test_results
+          if (testResult.quality_checks && typeof testResult.quality_checks === 'object') {
+            const qc = testResult.quality_checks;
+            execArtifacts.qualityChecks = {
+              webVitals: qc.webVitals || undefined,
+              accessibility: qc.accessibility || undefined,
+              brokenResources: Array.isArray(qc.brokenResources) ? qc.brokenResources : undefined,
+              slowAPIs: Array.isArray(qc.slowAPIs) ? qc.slowAPIs : undefined,
+            };
+          }
+
+          // Aggregate health checks from existing test result data
+          execHealthChecks = HealthCheckAggregatorService.aggregateFromTestResult(testResult);
+
+          // Aggregate into run-level artifacts
+          if (execArtifacts.videoUrl && !aggArtifacts.videoUrl) aggArtifacts.videoUrl = execArtifacts.videoUrl;
+          if (execArtifacts.traceUrl && !aggArtifacts.traceUrl) aggArtifacts.traceUrl = execArtifacts.traceUrl;
+          aggArtifacts.screenshots.push(...execArtifacts.screenshots);
+          aggArtifacts.consoleLogs.push(...execArtifacts.consoleLogs);
+          aggArtifacts.networkLogs.push(...execArtifacts.networkLogs);
+        }
+
+        // Extract bug screenshots from executed steps (stored in runtimeMeta.bugScreenshotUrl)
+        for (const step of steps) {
+          if (step.error?.screenshot && typeof step.error.screenshot === 'string') {
+            execArtifacts.bugScreenshots.push(step.error.screenshot);
+          }
+        }
+        aggArtifacts.bugScreenshots.push(...execArtifacts.bugScreenshots);
+
+        // Aggregate quality checks at run level
+        if (execArtifacts.qualityChecks) {
+          if (!aggArtifacts.qualityChecks) {
+            aggArtifacts.qualityChecks = { brokenResources: [], slowAPIs: [] };
+          }
+          const agg = aggArtifacts.qualityChecks;
+          const ec = execArtifacts.qualityChecks;
+
+          // Web vitals: keep the latest non-empty one
+          if (ec.webVitals) agg.webVitals = ec.webVitals;
+
+          // Accessibility: merge warnings arrays, sum totals
+          if (ec.accessibility) {
+            if (!agg.accessibility) {
+              agg.accessibility = { warnings: [], totalWarnings: 0 };
+            }
+            agg.accessibility.warnings.push(...(ec.accessibility.warnings || []));
+            agg.accessibility.totalWarnings += ec.accessibility.totalWarnings || 0;
+          }
+
+          // Broken resources / slow APIs: concatenate
+          if (ec.brokenResources) {
+            agg.brokenResources = [...(agg.brokenResources || []), ...ec.brokenResources];
+          }
+          if (ec.slowAPIs) {
+            agg.slowAPIs = [...(agg.slowAPIs || []), ...ec.slowAPIs];
+          }
+        }
+
+        // Extract bugs: prefer test_reports > ai_summary
+        const report = reportsMap.get(testId);
+        const testResultData = testResultsMap.get(testId);
+        const rawBugSource =
+          report?.analysis?.bugs ||
+          testResultData?.ai_summary?.bugs ||
+          [];
+        const rawBugs: any[] = Array.isArray(rawBugSource) ? rawBugSource : [];
+
+        for (let i = 0; i < rawBugs.length; i++) {
+          const bug = rawBugs[i];
+          if (!bug || typeof bug !== 'object') continue;
+          allBugs.push({
+            id: bug.id || `${exec.id}-bug-${i}`,
+            title: bug.title || bug.message || bug.description || '',
+            severity: validSeverities.has(bug.severity) ? bug.severity : 'medium',
+            category: validCategories.has(bug.category) ? bug.category : 'functional',
+            testCaseId: exec.testCaseId,
+            testCaseName,
+            executionId: exec.id,
+            steps: Array.isArray(bug.steps) ? bug.steps : (Array.isArray(bug.stepsToReproduce) ? bug.stepsToReproduce : []),
+            expected: bug.expectedResult || bug.expected || '',
+            actual: bug.actualResult || bug.actual || '',
+            selector: bug.domSelector || bug.selector,
+            recommendation: bug.recommendation || '',
+          });
+        }
+        bugsCount = rawBugs.length;
+
+        // Collect recommendations
+        const recsSource =
+          report?.analysis?.recommendations ||
+          testResultData?.ai_summary?.recommendations ||
+          [];
+        const recs: string[] = Array.isArray(recsSource) ? recsSource : [];
+        for (const r of recs) {
+          if (typeof r === 'string' && r.trim()) {
+            allRecommendations.add(r);
+          }
+        }
+
+        // Collect confidence
+        const conf = report?.analysis?.confidence ?? testResultData?.ai_summary?.confidence;
+        if (typeof conf === 'number') {
+          totalConfidence += conf;
+          confidenceCount++;
+        }
+      }
+
+      // V14: Extract failure classification from AI summary
+      const execAiSummary = testId ? (testResultsMap.get(testId)?.ai_summary) : null;
+      const failureClassification = execAiSummary?.failureClassification || null;
+      const rootCauseStep = execAiSummary?.rootCauseStep ?? null;
+
+      reportExecutions.push({
+        id: exec.id,
+        testCaseId: exec.testCaseId,
+        testCaseName,
+        status: exec.status,
+        durationMs: exec.durationMs || 0,
+        browser: exec.browser || 'chrome',
+        // Raw test case platform — lets the frontend render mobile-specific
+        // artifacts (device screenshots, compiled plan viewer) without an
+        // extra join. Undefined for legacy rows (pre-20260417 migration).
+        ...(exec.platform ? { platform: exec.platform } : {}),
+        // Curator-set priority of the saved test case, if any. Null for
+        // ad-hoc / chat-lite runs (no saved test case) and API tests
+        // (no priority column on api_test_configs). Display-only.
+        priority: priorityByTestCaseId.get(exec.testCaseId) ?? null,
+        bugsCount,
+        steps,
+        artifacts: execArtifacts,
+        ...(exec.isNegative && { isNegative: true }),
+        ...(exec.isNegative && negativeMetaMap.has(exec.testCaseId) && { negativeMeta: negativeMetaMap.get(exec.testCaseId) }),
+        ...(execHealthChecks && { healthChecks: execHealthChecks }),
+        ...(failureClassification && { failureClassification }),
+        ...(rootCauseStep !== null && { rootCauseStep }),
+        ...(execAiSummary?.classificationEvidence?.length > 0 && {
+          classificationEvidence: execAiSummary.classificationEvidence,
+        }),
+      });
+    }
+
+    // Build merged summary (stats + bugs breakdown)
+    const bySeverity: Record<string, number> = {};
+    const byCategory: Record<string, number> = {};
+    for (const bug of allBugs) {
+      bySeverity[bug.severity] = (bySeverity[bug.severity] || 0) + 1;
+      byCategory[bug.category] = (byCategory[bug.category] || 0) + 1;
+    }
+    // V14: Compute real flaky count and classification breakdown from AI analysis
+    const byClassification: Record<string, number> = {};
+    for (const re of reportExecutions) {
+      if (re.failureClassification) {
+        byClassification[re.failureClassification] = (byClassification[re.failureClassification] || 0) + 1;
+      }
+    }
+
+    // Phase 7 — per-platform split for this single run. Built from the
+    // already-mapped `reportExecutions` so we don't re-scan the DB.
+    // Uses the same bucketing as PlanHealthReport (NULL → web,
+    // mobile_* → mobile, everything else depending on execution.source
+    // → api). Keeps the "how many web vs mobile vs api did THIS run do"
+    // question answerable without joining back to intent_test_cases.
+    const platformBreakdown = {
+      web:    { total: 0, passed: 0, failed: 0 },
+      mobile: { total: 0, passed: 0, failed: 0 },
+      api:    { total: 0, passed: 0, failed: 0 },
+    };
+    for (const re of reportExecutions) {
+      const raw = (re as any).platform as string | undefined;
+      // An execution from an API test case doesn't carry a UI platform.
+      // Today we don't have a dedicated `testType` on RunReportExecution,
+      // but the `testCaseId` shape + absent `steps[]` is a reasonable
+      // heuristic; if/when we add a hard `testType` field the check
+      // here should switch to that. For now: treat absent steps as API,
+      // otherwise bucket by platform string.
+      const looksLikeApi = !re.steps || re.steps.length === 0;
+      const bucket: 'web' | 'mobile' | 'api' =
+        looksLikeApi && !raw ? 'api'
+          : raw && raw.startsWith('mobile_') ? 'mobile'
+          : 'web';
+      platformBreakdown[bucket].total++;
+      const status = (re.status || '').toLowerCase();
+      if (status === 'passed' || status === 'completed') platformBreakdown[bucket].passed++;
+      else if (status === 'failed') platformBreakdown[bucket].failed++;
+    }
+
+    const summary: RunReportSummary = {
+      total: stats.total,
+      passed: stats.passed,
+      failed: stats.failed,
+      skipped: stats.skipped,
+      flaky: byClassification['flaky'] || 0,
+      totalBugs: allBugs.length,
+      bySeverity,
+      byCategory,
+      byClassification,
+      platformBreakdown,
+    };
+
+    // Compute duration (guard against negative if clocks are skewed)
+    let durationMs: number | null = null;
+    if (run.started_at && run.completed_at) {
+      const diff = new Date(run.completed_at).getTime() - new Date(run.started_at).getTime();
+      durationMs = diff > 0 ? diff : 0;
+    }
+
+    // Derive status from live execution data to avoid stale regression_runs cache.
+    // ?? run.status: defensive fallback for the (practically impossible) case where
+    // run.status is null/empty — regression_runs.status is NOT NULL in the DB schema.
+    const normalizedStatus = deriveRunStatus({ cachedStatus: run.status, execStats: stats }) ?? run.status;
+
+    // Build health summary from all execution health checks
+    const healthSummary = HealthCheckAggregatorService.buildHealthSummary(
+      reportExecutions.map((e) => e.healthChecks),
+    );
+
+    // Split executions into positive and negative
+    const positiveExecutions = reportExecutions.filter((e) => !e.isNegative);
+    const negativeExecs = reportExecutions.filter((e) => e.isNegative);
+
+    let negativeSummary: NegativeSummary | undefined;
+    if (negativeExecs.length > 0) {
+      negativeSummary = {
+        total: negativeExecs.length,
+        passed: negativeExecs.filter((e) => e.status === 'passed').length,
+        failed: negativeExecs.filter((e) => e.status === 'failed').length,
+        skipped: negativeExecs.filter((e) => e.status === 'skipped').length,
+      };
+    }
+
+    return {
+      id: run.id,
+      planId: run.plan_id || null,
+      planName,
+      status: normalizedStatus,
+      trigger: run.trigger,
+      startedAt: run.started_at,
+      completedAt: run.completed_at || null,
+      durationMs,
+      aiConfidence: confidenceCount > 0 ? Math.round(totalConfidence / confidenceCount) : null,
+      summary,
+      executions: positiveExecutions,
+      bugs: allBugs,
+      recommendations: [...allRecommendations],
+      artifactsSummary: aggArtifacts,
+      healthSummary,
+      ...(negativeSummary && { negativeSummary }),
+      ...(negativeExecs.length > 0 && { negativeExecutions: negativeExecs }),
+    };
+  }
+}
+
+// ============================================================================
+// WORKSPACE MEMBER RESOLUTION HELPER
+// ============================================================================
+
+/**
+ * Resolve all active workspace member user IDs for a project.
+ * Returns at least the given ownerId, plus all workspace members if the project belongs to a workspace.
+ * Non-fatal: falls back to [ownerId] on any error.
+ */
+export async function getProjectWorkspaceMemberIds(projectId: string, ownerId: string): Promise<string[]> {
+  try {
+    const { data: projRow } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+    if (!workspaceId) return [ownerId];
+
+    const { data: members } = await supabaseAdmin
+      .from('workspace_members')
+      .select('user_id')
+      .eq('workspace_id', workspaceId)
+      .eq('status', 'active');
+
+    const ids = new Set<string>();
+    ids.add(ownerId);
+    for (const m of members || []) {
+      const uid = (m as any)?.user_id as string | undefined;
+      if (uid) ids.add(uid);
+    }
+    return Array.from(ids);
+  } catch {
+    return [ownerId];
+  }
+}
