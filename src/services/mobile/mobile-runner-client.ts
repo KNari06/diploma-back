@@ -21,6 +21,7 @@ import type {
   MobileUiState,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
+import { mintRunnerUserToken } from './user-token';
 
 // ============================================================================
 // CONFIGURATION
@@ -80,20 +81,22 @@ export class MobileRunnerClient {
 
   async createSession(
     platform: MobilePlatform,
-    config?: MobileSessionConfig & { ownerId?: string },
+    config?: MobileSessionConfig & { ownerId?: string; userId?: string },
   ): Promise<MobileSessionResponse> {
+    const { userId, ...rest } = config ?? {};
     return this.request<MobileSessionResponse>('POST', '/api/sessions', {
-      body: { platform, ...config },
+      body: { platform, ...rest },
       // Emulator boot can exceed the previous 60s on cold-starts under load
       // (large APK install + slow disk + permission pre-grant). Bumped to
       // 180s — frontend was hitting the old cap during /warmup and surfacing
       // a generic timeout error to the user.
       timeoutMs: 180_000,
+      userId,
     });
   }
 
-  async destroySession(sessionId: string): Promise<void> {
-    await this.request('DELETE', `/api/sessions/${sessionId}`);
+  async destroySession(sessionId: string, opts?: { userId?: string }): Promise<void> {
+    await this.request('DELETE', `/api/sessions/${sessionId}`, { userId: opts?.userId });
   }
 
   async sessionExists(sessionId: string): Promise<boolean> {
@@ -120,10 +123,12 @@ export class MobileRunnerClient {
   async setPermissionPolicy(
     sessionId: string,
     policy: 'auto_allow' | 'auto_deny' | 'manual',
+    opts?: { userId?: string },
   ): Promise<void> {
     await this.request('PATCH', `/api/sessions/${sessionId}/permission-policy`, {
       body: { policy },
       timeoutMs: 5000,
+      userId: opts?.userId,
     });
   }
 
@@ -162,6 +167,7 @@ export class MobileRunnerClient {
   async captureAppData(
     sessionId: string,
     packageName: string,
+    opts?: { userId?: string },
   ): Promise<{
     dataTarballBase64: string;
     sizeBytes: number;
@@ -177,6 +183,7 @@ export class MobileRunnerClient {
         // by the 5 MB cap on the runner. 30s buffer absorbs slow disks.
         timeoutMs: 30_000,
         noRetry: true,
+        userId: opts?.userId,
       },
     );
   }
@@ -196,7 +203,7 @@ export class MobileRunnerClient {
     sessionId: string,
     packageName: string,
     dataTarballBase64: string,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; userId?: string },
   ): Promise<{
     restoredVia: 'run-as' | 'su';
     restoreMs: number;
@@ -217,6 +224,7 @@ export class MobileRunnerClient {
         // a multi-MB tarball transfer would otherwise hang up to 30s per
         // pending test before noticing.
         signal: opts?.signal,
+        userId: opts?.userId,
       },
     );
   }
@@ -232,12 +240,13 @@ export class MobileRunnerClient {
    */
   async claimSession(
     platform: MobilePlatform,
-    opts?: { ownerId?: string },
+    opts?: { ownerId?: string; userId?: string },
   ): Promise<MobileSessionResponse> {
     return this.request<MobileSessionResponse>('POST', '/api/sessions/claim', {
       body: { platform, ...(opts?.ownerId ? { ownerId: opts.ownerId } : {}) },
       timeoutMs: 20_000, // Pool may wait up to 15s for idle session
       noRetry: true, // 503 means pool exhausted — don't retry, fall back to cold start
+      userId: opts?.userId,
     });
   }
 
@@ -246,10 +255,11 @@ export class MobileRunnerClient {
    * The runner resets device state (app data, network, video) before
    * marking the session as idle for the next test.
    */
-  async releaseSession(sessionId: string): Promise<void> {
+  async releaseSession(sessionId: string, opts?: { userId?: string }): Promise<void> {
     await this.request('POST', '/api/sessions/release', {
       body: { sessionId },
       timeoutMs: 15_000, // Reset can take up to 10s
+      userId: opts?.userId,
     });
   }
 
@@ -282,7 +292,7 @@ export class MobileRunnerClient {
   async executeBatchCommands(
     sessionId: string,
     commands: unknown[],
-    opts?: { interactive?: boolean; timeoutMs?: number; signal?: AbortSignal },
+    opts?: { interactive?: boolean; timeoutMs?: number; signal?: AbortSignal; userId?: string },
   ): Promise<{ results: unknown[] }> {
     return this.request<{ results: unknown[] }>(
       'POST',
@@ -295,6 +305,7 @@ export class MobileRunnerClient {
         // be silently retried (user may have already moved on).
         noRetry: opts?.interactive,
         signal: opts?.signal,
+        userId: opts?.userId,
       },
     );
   }
@@ -311,6 +322,7 @@ export class MobileRunnerClient {
       /** Propagated to the outgoing fetch so client-disconnect aborts
        *  reach the runner and free its session mutex. */
       signal?: AbortSignal;
+      userId?: string;
     },
   ): Promise<MobileRunStepsResponse> {
     const body: MobileRunStepsRequest = {
@@ -327,6 +339,7 @@ export class MobileRunnerClient {
         body,
         timeoutMs: CLIENT_CONFIG.runStepsTimeoutMs,
         signal: opts?.signal,
+        userId: opts?.userId,
       },
     );
   }
@@ -340,6 +353,7 @@ export class MobileRunnerClient {
   async uploadApp(
     fileBuffer: Buffer,
     originalName: string,
+    opts?: { userId?: string },
   ): Promise<{ path: string; filename: string; originalName: string; size: number }> {
     if (!env.MOBILE_RUNNER_ENABLED) {
       throw new MobileRunnerError('Mobile testing is not enabled', 503, 'DISABLED');
@@ -363,6 +377,9 @@ export class MobileRunnerClient {
     };
     if (this.apiKey) {
       headers['X-API-Key'] = this.apiKey;
+    }
+    if (opts?.userId && env.RUNNER_USER_TOKEN_SECRET) {
+      headers['X-User-Token'] = mintRunnerUserToken(opts.userId, env.RUNNER_USER_TOKEN_SECRET);
     }
 
     const controller = new AbortController();
@@ -425,6 +442,7 @@ export class MobileRunnerClient {
      * Optional: runners older than 2026-04-23 ignore the field.
      */
     bindingHints?: Record<string, unknown>,
+    opts?: { userId?: string },
   ): Promise<{
     status: 'resolved' | 'not_found' | 'low_confidence' | 'error';
     boundingBox?: { x: number; y: number; width: number; height: number };
@@ -446,6 +464,7 @@ export class MobileRunnerClient {
         ? { intent, actionType, bindingHints }
         : { intent, actionType },
       timeoutMs: 15_000, // LLM resolve can take a few seconds
+      userId: opts?.userId,
     });
   }
 
@@ -479,6 +498,7 @@ export class MobileRunnerClient {
       includeScreenshot?: boolean;
       timeoutMs?: number;
       signal?: AbortSignal;
+      userId?: string;
     },
   ): Promise<MobileUiState> {
     const params = new URLSearchParams();
@@ -496,15 +516,17 @@ export class MobileRunnerClient {
       timeoutMs: opts?.timeoutMs ?? 8_000,
       noRetry: true,
       signal: opts?.signal,
+      userId: opts?.userId,
     });
   }
 
   // ── Artifacts ───────────────────────────────────────────────────
 
-  async getArtifacts(sessionId: string): Promise<MobileArtifactBundle> {
+  async getArtifacts(sessionId: string, opts?: { userId?: string }): Promise<MobileArtifactBundle> {
     return this.request<MobileArtifactBundle>(
       'GET',
       `/api/runs/${sessionId}/artifacts`,
+      { userId: opts?.userId },
     );
   }
 
@@ -525,6 +547,13 @@ export class MobileRunnerClient {
        * is released at the next step boundary.
        */
       signal?: AbortSignal;
+      /**
+       * Authenticated user this call is acting on behalf of. When set AND
+       * env `RUNNER_USER_TOKEN_SECRET` is non-empty we mint a per-request
+       * `X-User-Token` HMAC. Either side missing = no header (runner stays
+       * in its current legacy/enforced behaviour). See user-token.ts.
+       */
+      userId?: string;
     },
   ): Promise<T> {
     if (!env.MOBILE_RUNNER_ENABLED) {
@@ -544,6 +573,13 @@ export class MobileRunnerClient {
     }
     if (this.geminiApiKey) {
       headers['X-Gemini-Api-Key'] = this.geminiApiKey;
+    }
+    // Mint per-request user token when we have both a known user AND a
+    // configured secret. Empty secret = dev / pre-rollout deploys; runner
+    // accepts those without a header in legacy mode. Missing userId =
+    // system-level call (health check, capacity probe) — also skip.
+    if (opts?.userId && env.RUNNER_USER_TOKEN_SECRET) {
+      headers['X-User-Token'] = mintRunnerUserToken(opts.userId, env.RUNNER_USER_TOKEN_SECRET);
     }
 
     // Retry loop for 5xx errors

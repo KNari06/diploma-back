@@ -61,9 +61,15 @@ export const OBSERVE_MOBILE_PAGE_TOOL: ChatCompletionTool = {
     description:
       'Read the current mobile screen. Returns the accessibility tree as ' +
       'a compact ASCII dump, current app/activity, screen size, and keyboard/dialog ' +
-      'flags. Call this BEFORE acting or answering anything about the UI, and AGAIN ' +
-      'after any action to see the post-action state. Safe to call multiple times — ' +
-      'read-only.',
+      'flags. Also returns device-fresh foreground truth: `expectedApp` (what we ' +
+      'launched), `actualForeground` (what is ON SCREEN right now via dumpsys — ' +
+      'screenState + window stack + primary window), `foregroundMismatch` (set when ' +
+      'expected ≠ actual — warn the user the app under test is no longer focused), ' +
+      '`recentDisruption` (crash / ANR observed since the last call — surface it ' +
+      'rather than acting on a broken UI), and `webView` (detected + suggestedContext ' +
+      '— call switch_to_webview when suggestedContext is "webview"). Call this BEFORE ' +
+      'acting or answering anything about the UI, and AGAIN after any action to see ' +
+      'the post-action state. Safe to call multiple times — read-only.',
     parameters: {
       type: 'object',
       properties: {
@@ -784,6 +790,7 @@ async function runObserveMobilePage(
       includeTree: false,
       includeScreenshot: true,
       signal: opts?.abortSignal,
+      userId: bb.userId,
     });
     bb.setSnapshot(snap);
     bb.recordToolCall({
@@ -1438,7 +1445,7 @@ async function runMobileRunDraftSteps(
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       steps.map(toRunnerCommand),
-      { interactive: false, signal: opts?.abortSignal },
+      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     runnerResults = results ?? [];
   } catch (err) {
@@ -2185,7 +2192,7 @@ async function runSwitchToWebview(
     await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'switch_context', params: { context: 'WEB' } }],
-      { interactive: false, signal: opts?.abortSignal },
+      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     bb.enterWebContext();
 
@@ -2196,7 +2203,7 @@ async function runSwitchToWebview(
       const { results } = await client.executeBatchCommands(
         bb.mobileSessionId,
         [{ type: 'web_get_url', params: {} }],
-        { interactive: true, signal: opts?.abortSignal },
+        { interactive: true, signal: opts?.abortSignal, userId: bb.userId },
       );
       const first = results?.[0] as { data?: { url?: string } } | undefined;
       url = first?.data?.url;
@@ -2259,7 +2266,7 @@ async function runSwitchToNative(
     await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'switch_context', params: { context: 'NATIVE' } }],
-      { interactive: false, signal: opts?.abortSignal },
+      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     bb.exitWebContext();
     bb.recordToolCall({
@@ -2313,7 +2320,7 @@ async function runWebEvaluate(
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'web_evaluate', params: { expression } }],
-      { interactive: true, signal: opts?.abortSignal },
+      { interactive: true, signal: opts?.abortSignal, userId: bb.userId },
     );
     const first = results?.[0] as
       | { success?: boolean; data?: { result?: unknown }; error?: string }
@@ -2396,6 +2403,7 @@ async function dispatchSingleCommand(
       {
         interactive: opts.interactive,
         signal: opts.abortSignal,
+        userId: bb.userId,
       },
     );
     const result = (results?.[0] ?? null) as RunnerCommandResult | null;
@@ -2502,6 +2510,7 @@ async function ensureScreenDims(
       includeTree: false,
       includeScreenshot: false,
       signal,
+      userId: bb.userId,
     });
     bb.setSnapshot(fresh);
     return fresh.screenSize;

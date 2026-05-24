@@ -133,6 +133,7 @@ export async function handleMobileAction(
       includeTree: false,
       includeScreenshot: false, // fast-path skips the screenshot — text tree is enough
       signal: abortSignal,
+      userId,
     });
     blackboard.setSnapshot(snap);
     snapshotHeader = formatSnapshotForPrompt(snap);

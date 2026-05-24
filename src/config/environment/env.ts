@@ -210,6 +210,13 @@ const envSchema = z.object({
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
+  // Shared HMAC secret used to mint per-request X-User-Token headers for the
+  // mobile runner. Format mirrored from qait-mobile-runner/src/auth/user-token.ts:
+  //   `<userId>.<expiresAtMs>.<HMAC-SHA256(secret, userId + '.' + expiresAtMs)>`
+  // Empty in dev = don't mint tokens (legacy mode). When the runner flips to
+  // RUNNER_REQUIRE_USER_ID=1 this MUST be set on every backend instance and
+  // MUST match the runner's `RUNNER_USER_TOKEN_SECRET`. Rotate via deploy.
+  RUNNER_USER_TOKEN_SECRET: z.string().optional().default(''),
 
   // Multi-user isolation: when ON, the runner creates a dedicated Android
   // user per backend user via `pm create-user` so apps installed by one

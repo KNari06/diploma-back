@@ -377,6 +377,25 @@ export interface MobileHealthResponse {
 // because the backend only reads these fields — we don't want to import
 // the runner's A11yTree type into the backend just to re-export it.
 
+/** Window summary inside `actualForeground.windows[]`. Mirror of runner shape. */
+export interface MobileForegroundWindow {
+  packageName: string;
+  activityName: string | null;
+  kind: 'app' | 'launcher' | 'system_ui' | 'system_settings' | 'recents' | 'unknown';
+  isFocused: boolean;
+  isResumed: boolean;
+}
+
+/** Device-fresh foreground truth (dumpsys-derived). */
+export interface MobileActualForeground {
+  screenState: 'awake' | 'locked' | 'aod' | 'off' | 'unknown';
+  windows: MobileForegroundWindow[];
+  /** The single most-likely-foreground window. Null when nothing resolvable. */
+  primary: MobileForegroundWindow | null;
+  capturedAt: string;
+  durationMs: number;
+}
+
 export interface MobileUiState {
   sessionId: string;
   platform: 'android' | 'ios';
@@ -392,6 +411,43 @@ export interface MobileUiState {
   /** base64-encoded PNG. Omit with ?includeScreenshot=false. */
   screenshotBase64?: string;
   capturedAt: string;
+  /**
+   * Alias for the legacy `app` field — what the runner *expected* to be
+   * foregrounded based on the session's launched package. Compare against
+   * `actualForeground.primary.packageName` to detect drift.
+   */
+  expectedApp?: string;
+  /**
+   * Device-fresh truth via dumpsys (Android) / equivalent (iOS). What is
+   * ACTUALLY on screen right now, independent of the a11y dump. Used to
+   * detect cases where the user wandered out of the app under test
+   * (settings, launcher, another app).
+   */
+  actualForeground?: MobileActualForeground;
+  /**
+   * Populated when `expectedApp` and `actualForeground.primary.packageName`
+   * disagree. Null when they match. Drives the LLM "user left the app"
+   * warning in mobile chat.
+   */
+  foregroundMismatch?: { expected: string; actual: string } | null;
+  /**
+   * Recent crash / ANR captured from logcat (Android) within the runner's
+   * observation window. Null when none observed. Lets the LLM surface
+   * "the app just crashed" instead of guessing from an unstable tree.
+   */
+  recentDisruption?: {
+    type: 'crash' | 'anr';
+    packageName: string;
+    snippet: string;
+    capturedAt: string;
+  } | null;
+  /**
+   * WebView heuristics. `detected=true` means the screen has at least one
+   * WebView host (Capacitor / Cordova / RN-WebView / hybrid). The runner
+   * suggests which context the LLM should drive — `webview` flips
+   * tap_element to DOM mode after switch_to_webview.
+   */
+  webView?: { detected: boolean; suggestedContext: 'native' | 'webview' };
 }
 
 // ── BullMQ Job Data ──────────────────────────────────────────────

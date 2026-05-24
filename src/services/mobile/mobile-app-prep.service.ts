@@ -219,7 +219,7 @@ export class MobileAppPrepService {
         await time('branch1_close_launch', () => client.executeBatchCommands(sessionId, [
           { type: 'close_app', params: { packageName: cachedPackage, hard: true } },
           { type: 'launch_app', params: { packageName: cachedPackage } },
-        ], { timeoutMs: 60_000 }));
+        ], { timeoutMs: 60_000, userId }));
       }
       branchTaken = 'cached_fast_path';
       logger.info('[MOBILE_APP_PREP] timing', {
@@ -247,7 +247,7 @@ export class MobileAppPrepService {
         const checkResult = await time('branch2_check_package', () => client.executeBatchCommands(sessionId, [
           { type: 'check_package', params: { packageName: knownPackage } },
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ], { timeoutMs: 10_000 })) as any;
+        ], { timeoutMs: 10_000, userId })) as any;
         const isInstalled = !!checkResult?.results?.[0]?.data?.installed;
         if (isInstalled) {
           logger.info('[MOBILE_APP_PREP] Package still on device (Redis expired), hard-reset + relaunch without reinstall', {
@@ -265,7 +265,7 @@ export class MobileAppPrepService {
             await time('branch2_close_launch', () => client.executeBatchCommands(sessionId, [
               { type: 'close_app', params: { packageName: knownPackage, hard: true } },
               { type: 'launch_app', params: { packageName: knownPackage } },
-            ], { timeoutMs: 60_000 }));
+            ], { timeoutMs: 60_000, userId }));
           }
 
           // Restore Redis cache so the next prep skips this branch too.
@@ -304,7 +304,7 @@ export class MobileAppPrepService {
     emit('loading_page', 45);
 
     const fileBuffer = await time('storage_download', () => MobileAppStorageService.downloadApp(effectiveStoragePath));
-    const uploaded = await time('runner_upload', () => client.uploadApp(fileBuffer, effectiveOriginalName ?? 'app.apk'));
+    const uploaded = await time('runner_upload', () => client.uploadApp(fileBuffer, effectiveOriginalName ?? 'app.apk', { userId }));
 
     // Prefer explicit package from caller / project metadata.
     const explicitPackage = appPackageOverride || projectAny.packageName;
@@ -337,7 +337,7 @@ export class MobileAppPrepService {
       // failing-fast 60s sooner than the legacy 240s when the runner is
       // genuinely wedged. The circuit breaker in AdbClient now propagates
       // hung-emulator failures within ~30s independently of this timeout.
-    ], { timeoutMs: 180_000 })) as any;
+    ], { timeoutMs: 180_000, userId })) as any;
 
     // Runner wraps every command result as { success, data, durationMs, ... }.
     // The install handler returns { installed, packageName } inside `data`.
@@ -356,7 +356,7 @@ export class MobileAppPrepService {
       // the launch is truly stuck.
       await time('runner_launch', () => client.executeBatchCommands(sessionId, [
         { type: 'launch_app', params: { packageName } },
-      ], { timeoutMs: 90_000 }));
+      ], { timeoutMs: 90_000, userId }));
     }
 
     // Audit fix (Bug #1): install completed but packageName resolution
