@@ -12,7 +12,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { env } from '@/config/environment/env';
 import { AutomationActionService } from '@/services/automation/automation-action.service';
-import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-run.service';
+import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-report-assembler.service';
 import * as crypto from 'crypto';
 
 /**
