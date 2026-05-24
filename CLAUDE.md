@@ -174,6 +174,14 @@ Quick checklist:
 
 ---
 
+## Architecture
+
+See [.claude/rules/architecture.md](.claude/rules/architecture.md) — layer breakdown, `db/` sublayer contract, dependency direction, file size rules.
+
+See [.claude/rules/testing.md](.claude/rules/testing.md) — mock boundary, what to test and where, file placement, naming.
+
+---
+
 ## Pre-commit checks
 
 ```bash
