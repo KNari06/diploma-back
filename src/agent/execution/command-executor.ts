@@ -2576,6 +2576,31 @@ export class CommandExecutor {
           break;
         }
 
+        // Multi-tab open — create a new page in the context, navigate it to
+        // `value` (URL), and make it the active page so subsequent steps target
+        // it. Mirrors live-preview `open_tab` (PreviewSessionService.openTab).
+        case 'openTab': {
+          const url = String(value || '').trim();
+          if (!url) {
+            throw new Error('openTab requires a URL in value');
+          }
+          const ctx = this.page.context();
+          const newPage = await ctx.newPage();
+          try {
+            await newPage.goto(url, { waitUntil: 'load', timeout: timeout || 30000 });
+          } catch {
+            // Page is committed even if subresources stalled — fall back to a
+            // short domcontentloaded wait rather than failing the whole step.
+            try { await newPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
+          }
+          this.page = newPage;
+          logger.info('[COMMAND_EXECUTOR] Opened new tab', {
+            url,
+            totalPages: ctx.pages().length,
+          });
+          break;
+        }
+
         // V18: Scratchpad — store key-value for cross-step memory (no browser action)
         case 'store': {
           const storeKey = description?.trim() || '';
