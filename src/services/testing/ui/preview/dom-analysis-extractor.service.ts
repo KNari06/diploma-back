@@ -11,9 +11,18 @@ import { computeImplicitRole } from './implicit-role.util';
 import { isDynamicId } from './dynamic-id.util';
 
 // Constants
-// P2 FIX: Increased from 200 to 500 for complex enterprise dashboards
-// Modern admin panels, data grids, and dashboards routinely have 300+ interactive elements
-const MAX_INTERACTIVE_NODES = 500; // Limit to prevent huge payloads
+// P2 FIX: Increased from 200 to 500 for complex enterprise dashboards.
+// Modern admin panels, data grids, and dashboards routinely have 300+
+// interactive elements.
+//
+// V-bigroup-3 (May 2026): bumped from 500 to 1500 in lockstep with
+// `MAX_TOTAL_ELEMENTS` in cdp-snapshot.service.ts. The CDP snapshot's
+// tier-2 priority sort places icon-buttons (close X / menu / floating
+// actions) at the front of tier-2; if THIS cap is below the CDP cap,
+// the extractor walks snapshot.elements in document order and the
+// priority ordering is silently lost. Bump in pairs — otherwise dense
+// modals lose icon-targets that DID make it through the CDP cap.
+const MAX_INTERACTIVE_NODES = 1500; // Limit to prevent huge payloads
 const MAX_TEXT_LENGTH = 100; // Truncate text content
 const MAX_PARENT_CHAIN_LENGTH = 6; // Limit parent chain depth
 const DOM_ANALYSIS_VERSION = '2.0'; // V2: ARIA state, validation, labels, hierarchy

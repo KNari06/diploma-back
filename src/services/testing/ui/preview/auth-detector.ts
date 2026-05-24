@@ -74,8 +74,14 @@ const OAUTH_RETURN_WINDOW_MS = 2 * 60_000; // post-OAuth return silence
 // from matching, and the exclusion of "auth" on its own stops false
 // positives like `/authorization-status` / `/authenticate-me`. URLs that
 // actually want to match "auth" still hit via `/oauth` or `/auth/login`.
+//
+// Multilingual coverage: Russian apps commonly use `/вход`,
+// `/авторизация`, `/регистрация` as login URL paths. These are added so
+// the +0.30 URL signal fires for non-English clients. Cyrillic
+// characters are matched directly (no `\b` involved here — anchoring is
+// by `/` and `?`/`#`/end-of-string, which are URL-structural).
 const LOGIN_URL_RE =
-  /(?:^|\/)(?:login|log[-_]?in|signin|sign[-_]?in|oauth|sso|saml|idp|session)(?:\/|$|\?|#)/i;
+  /(?:^|\/)(?:login|log[-_]?in|signin|sign[-_]?in|oauth|sso|saml|idp|session|вход|войти|авторизация|регистрация)(?:\/|$|\?|#)/i;
 
 // Negative keywords — if URL path contains one, we're probably NOT on
 // the login gate itself. Covers three families:
@@ -415,9 +421,11 @@ export function attachAuthDetector(
     // (e.g. `/account/login`, `/auth/sign-in`), treat it as the real
     // gate and skip the negative-keyword penalty — otherwise a path
     // like `/account/login` would cancel itself out (account=-, login=+).
+    // Kept in lockstep with LOGIN_URL_RE — same vocabulary including
+    // Cyrillic equivalents.
     const urlMatches = LOGIN_URL_RE.test(pathname);
     const lastSegment = pathname.replace(/\/+$/, '').split('/').pop() ?? '';
-    const loginIsLastSegment = /^(?:login|log[-_]?in|signin|sign[-_]?in|oauth|sso|saml|idp|session)$/i.test(lastSegment);
+    const loginIsLastSegment = /^(?:login|log[-_]?in|signin|sign[-_]?in|oauth|sso|saml|idp|session|вход|войти|авторизация|регистрация)$/i.test(lastSegment);
 
     if (urlMatches) {
       score += 0.30;
@@ -666,7 +674,13 @@ async function probeDomSignals(target: Page | Frame): Promise<DomSignals> {
 
         // Word-boundary match — matches `…/login`, `?action=signin` but not
         // `/loginhelp`. Browser-side regex (must be inline; no shared file).
-        const ACTION_RE = /\b(?:login|signin|sign[-_]?in|auth|session)\b/i;
+        //
+        // Two-fold boundary: ASCII `\b` (for English keywords) PLUS
+        // Unicode-aware boundary via `\p{L}` (for Cyrillic equivalents).
+        // JS `\b` is ASCII-only — without the `\p{L}` clause, an action
+        // like `?form=вход` or `formaction="/авторизация"` silently
+        // wouldn't trigger `hasLoginAction` for multilingual apps.
+        const ACTION_RE = /(?:\b|(?<![\p{L}\p{N}]))(?:login|signin|sign[-_]?in|auth|session|вход|войти|авторизация|регистрация)(?:\b|(?![\p{L}\p{N}]))/iu;
 
         const isVisible = (el: any): boolean => {
           if (!el || typeof el.getBoundingClientRect !== 'function') return false;

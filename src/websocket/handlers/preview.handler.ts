@@ -28,6 +28,7 @@ import {
 } from './preview-input-helpers';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { uploadEditorTrace } from '@/services/testing/ui/preview/editor-trace-upload';
+import { detectPageLoadError } from '@/services/testing/ui/preview/page-load-error.util';
 import { collectSecretValues, redactWithValues } from '@/utils/interpolation/redact-secrets';
 import { buildStepRedactor } from '@/utils/interpolation/redact-step';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -1969,10 +1970,59 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
         ? redactWithValues(result.error, secretValues)
         : result.error;
 
+      // Detect "the click triggered a navigation that failed to load"
+      // (Chrome error page). The click TECHNICALLY succeeded — apply
+      // pipeline saw `clickEffectSignal: 'detach'` and reports
+      // `success: true`. But the user landed on a blank chrome-error
+      // page and would otherwise see "everything froze for 60s, then
+      // nothing works". Annotate the result with a clear error message
+      // and emit a separate `preview:page:load-error` event so the
+      // frontend can show a toast / banner instead of silently swapping
+      // to a chrome-error preview.
+      //
+      // We DO NOT flip result.success to false — downstream consumers
+      // (run loop, auto-persist) read that flag and a false here would
+      // be wrong (the user's action DID complete; the FAILURE is the
+      // destination page, not the click). The new field `pageLoadError`
+      // is the canonical signal for "navigation target failed to load".
+      const pageLoadErr = detectPageLoadError(result.url);
+      if (pageLoadErr.isLoadError) {
+        logger.warn('[PREVIEW_APPLY] Navigation landed on browser error page', {
+          previewSessionId,
+          chosenRef: (result as { chosenRef?: string }).chosenRef,
+          url: pageLoadErr.url,
+          message: pageLoadErr.message,
+        });
+        // Standalone WS event — frontend listens for this and renders
+        // a network-error toast. Decoupled from `apply:result` so the
+        // existing apply UI flow keeps working even when the toast
+        // listener is not wired up yet.
+        socket.emit('preview:page:load-error', {
+          previewSessionId,
+          url: pageLoadErr.url,
+          message: pageLoadErr.message,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
       socket.emit('preview:step:apply:result', {
         ...result,
+        // `result.error` reflects the APPLY outcome (locator not found,
+        // assertion failed, timeout). We DO NOT overwrite or augment it
+        // with the chrome-error message here — that would produce a
+        // contradictory payload (success:true + error:"Page failed to
+        // load..."), and downstream consumers (auto-persist below,
+        // run-loop, editor UI) branch on `success`. Instead the network
+        // load-error rides on the dedicated `pageLoadError` field plus
+        // the standalone `preview:page:load-error` WS event.
         error: redactedError,
         appliedStep: redactedAppliedStep,
+        // `pageLoadError`: structured signal that the navigation that
+        // followed this apply landed on a browser failure page. The
+        // standalone WS event (emitted above) is the primary toast
+        // channel; this field lets the apply-result consumer correlate
+        // the error with the specific step that triggered it.
+        ...(pageLoadErr.isLoadError ? { pageLoadError: { url: pageLoadErr.url, message: pageLoadErr.message } } : {}),
         timestamp: new Date().toISOString(),
       });
 
@@ -2487,6 +2537,31 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
 
       const { getPreviewSessionService } = await import('@/services/testing/ui/preview');
       const sessionService = getPreviewSessionService();
+
+      // Pick mode short-circuit: when the user is in "Pick element" mode,
+      // a click on the preview must NOT propagate to the real page — it
+      // is a read-only selection signal. The in-page overlay
+      // (buildOverlayScript) only catches PHYSICAL clicks; clicks that
+      // arrive here came through WS from the frontend stream surface and
+      // would otherwise reach executeMouseAction → Playwright
+      // page.click() → real interaction. Route them through the pick
+      // service instead, which probes the element + emits
+      // `preview:pick:result` without touching the page.
+      try {
+        const { handleExternalPickClick } = await import(
+          '@/services/testing/ui/preview/preview-element-pick.service'
+        );
+        if (handleExternalPickClick(previewSessionId, x, y)) return;
+      } catch (err) {
+        // Best-effort: a failure here should not silently downgrade to a
+        // real click (which would defeat the read-only contract). Log
+        // loudly and bail.
+        logger.error('[WebSocket] handleExternalPickClick threw — dropping click', {
+          previewSessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
 
       // V9: Pre-click probe for recording (state-aware: need element state BEFORE click)
       let preClickElement: Awaited<ReturnType<typeof import('@/services/testing/ui/preview/recording-capture.service').RecordingCaptureService.probeForRecording>> = null;

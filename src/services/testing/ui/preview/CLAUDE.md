@@ -40,7 +40,7 @@ Element resolution and auto-healing serve all three.
 | [intent-test-case.service.ts](intent-test-case.service.ts) | — | CRUD for intent test cases (steps + metadata). Import/export. |
 | [intent-step-converter.service.ts](intent-step-converter.service.ts) | — | `IntentStep` ↔ Playwright commands (used by background replay). |
 | [snapshot-router.service.ts](snapshot-router.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2) Routes snapshot collection between legacy `evaluate` and CDP path. `useCdpForPreviewPoll` flag added; dense-gate removed. |
-| [cdp-snapshot.service.ts](cdp-snapshot.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2 / WIP) CDP-based snapshot pipeline — skeleton, most phases TODO. |
+| [cdp-snapshot.service.ts](cdp-snapshot.service.ts) | [api/snapshot-router.md](api/snapshot-router.md) | (Etap 2 / WIP) CDP-based snapshot pipeline — skeleton, most phases TODO. Optional `forensicRejections` flag (gated by `auditTrigger ∈ {find_button, apply_prelint}` in lint path) writes per-stage rejection JSONL to `test_logs/editor/<diagId>_forensic_<ts>.jsonl` for "target missing from candidates" debugging. |
 | [snapshot-diff.util.ts](snapshot-diff.util.ts) | [api/snapshot-router.md](api/snapshot-router.md) | Shadow-mode validator: field-level diff between evaluate and CDP snapshots. Boolean-falsy normalization added. |
 | [candidate-pruner-llm.service.ts](candidate-pruner-llm.service.ts) | [api/candidate-pruner-llm.md](api/candidate-pruner-llm.md) | LLM pre-filter: narrows ~60 candidates to ~15 before resolver. Fail-open, identity-rescue, cross-script matching. |
 | [step-readiness-v2.service.ts](step-readiness-v2.service.ts) | [api/step-readiness-v2.md](api/step-readiness-v2.md) | Smart waiter V2: 3-level readiness (existence→actionability→identity) with soft-escape at 70% budget. Shadow mode via `runV1WithShadow`. |
@@ -63,6 +63,7 @@ Element resolution and auto-healing serve all three.
 | [ai-check.service.ts](ai-check.service.ts) | AI-driven assertion (`check:*` step types). |
 | [draft-steps-cache.ts](draft-steps-cache.ts) | In-memory cache for unsaved draft steps. |
 | [external-nav-trap.ts](external-nav-trap.ts) | Catches navigations to unrelated origins (treats as fake-success signal). |
+| [page-load-error.util.ts](page-load-error.util.ts) | Pure detector for browser load-failure pages (`chrome-error://chromewebdata/`, etc.). Single source of truth used by apply handler and run loop to surface `preview:page:load-error` instead of timing out for 60s on a blank error page. |
 | [new-tab-opener.ts](new-tab-opener.ts) | Promotes anchor clicks to real new tabs via `context.newPage() + goto(href)` when `<a target="...">` is set, when the href is cross-origin, or when modifier keys request a new tab (Cmd/Ctrl/Shift). Used by `CommandExecutor.performClick`, preview-step-apply `executeAction` click branch, and preview-session live `executeMouseAction`. The new page is adopted by `attachPopupHandler` like any other popup. |
 | [evidence-shortcut.utils.ts](evidence-shortcut.utils.ts) | Cached "this evidence already worked" shortcut to skip resolver. |
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
@@ -140,6 +141,7 @@ Element resolution and auto-healing serve all three.
 | `preview:step:apply:result` | Apply success/fail + evidence |
 | `preview:run:progress` / `:complete` | Run loop status |
 | `preview:auth:required` | Login wall detected |
+| `preview:page:load-error` | Active tab landed on a browser load-failure page (`chrome-error://chromewebdata/` etc.). Network blip / DNS / TLS / site outage. Carries `{ url, message }`. Emitted from `preview.handler.ts` after `applyStep` AND from `preview-run.service.ts` after each successful apply when the destination is a browser error page. Frontend shows a network-error toast; run loop short-circuits at the step that caused the bad navigation (NOT the next step). Detection logic centralized in [page-load-error.util.ts](page-load-error.util.ts). |
 | `preview:pick:state` | Pick mode entered or exited (`active: boolean`, `reason?`) |
 | `preview:pick:result` | One-shot picker result — identity + description + suggested action. Emitted IMMEDIATELY after the probe (no LLM wait). |
 | `preview:pick:lint` | Follow-up dry-run lint verdict (5-10s after `:result`). Carries only `{ status, confidence, message }`. May not fire if lint failed / timed out / session closed. |
