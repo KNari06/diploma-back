@@ -1,5 +1,22 @@
 # ─────────────────────────────────────────────────────────────────
 # QAI Backend — GitLab CI/CD (Azure)
+#
+# Одна Docker image → деплой двух Container Apps:
+#   • qai-api-prod    — CMD: node -r tsconfig-paths/register dist/index.js
+#   • qai-worker-prod — CMD: node ... + HTTP health server на 8080
+#
+# Образ хранится в Azure Container Registry (ACR). Container Apps тянут
+# через Managed Identity (без паролей).
+#
+# Required CI/CD Variables (Group: qait.dev):
+#   AZURE_CLIENT_ID       — terraform output gitlab_runner_client_id
+#   AZURE_TENANT_ID       — terraform output azure_tenant_id
+#   AZURE_SUBSCRIPTION_ID — terraform output azure_subscription_id
+#   RESOURCE_GROUP        — qai-prod-rg
+#   ACR_NAME              — qaiprodacr24d6d7 (БЕЗ .azurecr.io)
+#   ACR_LOGIN_SERVER      — qaiprodacr24d6d7.azurecr.io
+#   CONTAINER_APP_API     — qai-api-prod
+#   CONTAINER_APP_WORKER  — qai-worker-prod
 # ─────────────────────────────────────────────────────────────────
 
 variables:
@@ -7,7 +24,6 @@ variables:
   DOCKER_TLS_CERTDIR: "/certs"
   DOCKER_TLS_VERIFY: "1"
   DOCKER_CERT_PATH: "/certs/client"
-  DOCKER_DRIVER: overlay2
   DOCKER_BUILDKIT: "0"
   IMAGE: "${ACR_LOGIN_SERVER}/qai-backend:${CI_COMMIT_SHORT_SHA}"
   IMAGE_LATEST: "${ACR_LOGIN_SERVER}/qai-backend:latest"
@@ -16,6 +32,10 @@ stages:
   - build
   - deploy
 
+# ─────────────────────────────────────────────────────────────────
+# Шаблон: авторизация в Azure через OIDC Federated Identity
+# (аналог .gcp_auth в GCP версии)
+# ─────────────────────────────────────────────────────────────────
 .azure_auth: &azure_auth
   id_tokens:
     AZURE_TOKEN:
@@ -25,14 +45,16 @@ stages:
       az login --federated-token "$AZURE_TOKEN" \
         --service-principal \
         -u "$AZURE_CLIENT_ID" \
-        --tenant "$AZURE_TENANT_ID" \
-        --output none
-
+        --tenant "$AZURE_TENANT_ID" --output none
       az account set --subscription "$AZURE_SUBSCRIPTION_ID"
 
+# ─────────────────────────────────────────────────────────────────
+# Сборка Docker образа и push в ACR
+# (аналог build в GCP — Artifact Registry → ACR)
+# ─────────────────────────────────────────────────────────────────
 build:
   stage: build
-  image: mcr.microsoft.com/azure-cli:azurelinux3.0
+  image: mcr.microsoft.com/azure-cli
   services:
     - name: docker:26-dind
       alias: docker
@@ -40,90 +62,84 @@ build:
     - if: '$CI_COMMIT_BRANCH == "main"'
   <<: *azure_auth
   script:
+    - apk add --no-cache docker-cli
+    - echo "🔐 Login to ACR via Managed Identity"
+    - az acr login --name "$ACR_NAME"
+    - echo "🔨 Building $IMAGE"
     - |
-      set -euo pipefail
-
-      echo "🐳 Installing Docker CLI inside Azure CLI image..."
-      tdnf install -y moby-cli ca-certificates
-      tdnf clean all
-
-      echo "⏳ Waiting for Docker daemon..."
-      for i in $(seq 1 30); do
-        docker info >/dev/null 2>&1 && break
-        sleep 2
-      done
-      docker info >/dev/null
-
-      echo "🔐 Login to ACR via Azure OIDC"
-      az acr login --name "$ACR_NAME"
-
-      echo "🔨 Building $IMAGE"
       docker pull "$IMAGE_LATEST" 2>/dev/null || true
       docker build \
         --cache-from "$IMAGE_LATEST" \
         --tag "$IMAGE" \
         --tag "$IMAGE_LATEST" \
         .
+    - echo "⬆️  Pushing to ACR..."
+    - docker push "$IMAGE"
+    - docker push "$IMAGE_LATEST"
 
-      echo "⬆️ Pushing to ACR..."
-      docker push "$IMAGE"
-      docker push "$IMAGE_LATEST"
-
+# ─────────────────────────────────────────────────────────────────
+# Деплой API — Container App (публичный ingress на 3000)
+# Terraform имеет ignore_changes на image — CI безопасно обновляет
+# ─────────────────────────────────────────────────────────────────
 deploy:api:
   stage: deploy
-  image: mcr.microsoft.com/azure-cli:azurelinux3.0
+  image: mcr.microsoft.com/azure-cli
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-  needs:
-    - build
+  needs: [build]
   <<: *azure_auth
   script:
+    - echo "🚀 Deploying API → $CONTAINER_APP_API"
     - |
-      set -euo pipefail
-
-      echo "🚀 Deploying API → $CONTAINER_APP_API"
       az containerapp update \
         --name "$CONTAINER_APP_API" \
         --resource-group "$RESOURCE_GROUP" \
         --image "$IMAGE" \
         --output none
-
+    - |
       URL=$(az containerapp show \
         --name "$CONTAINER_APP_API" \
         --resource-group "$RESOURCE_GROUP" \
-        --query "properties.configuration.ingress.fqdn" \
-        -o tsv)
-
+        --query "properties.configuration.ingress.fqdn" -o tsv)
       echo "✅ API deployed → https://$URL"
   environment:
     name: production/api
     url: https://api.qait.dev
 
+# ─────────────────────────────────────────────────────────────────
+# Деплой Worker — Container App (internal, другой entrypoint)
+# Worker command/args заданы в Terraform — обновляем только image
+# ─────────────────────────────────────────────────────────────────
 deploy:worker:
   stage: deploy
-  image: mcr.microsoft.com/azure-cli:azurelinux3.0
+  image: mcr.microsoft.com/azure-cli
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
-  needs:
-    - build
+  needs: [build]
   <<: *azure_auth
   script:
+    - echo "🚀 Deploying Worker → $CONTAINER_APP_WORKER"
+    # command/args заданы в Terraform — CI обновляет только image
     - |
-      set -euo pipefail
-
-      echo "🚀 Deploying Worker → $CONTAINER_APP_WORKER"
       az containerapp update \
         --name "$CONTAINER_APP_WORKER" \
         --resource-group "$RESOURCE_GROUP" \
         --image "$IMAGE" \
-        --command "node" \
-        --args "-e" "require('http').createServer((_,res)=>res.end('ok')).listen(process.env.PORT||8080);require('tsconfig-paths/register');require('./dist/worker/index.js');" \
         --output none
-
-      echo "✅ Worker deployed"
+    - echo "✅ Worker deployed"
   environment:
     name: production/worker
 
+# ─────────────────────────────────────────────────────────────────
+# DEV deploy to Azure VM via shell runner
+# Runner requirements:
+#   - executor: shell
+#   - tags: dev-back-runner
+#   - docker installed on VM
+# Optional CI/CD variables:
+#   BACKEND_ENV_FILE       - путь к .env на VM (default: репо .env)
+#   BACKEND_CONTAINER_PORT - exposed API порт (default: 3000)
+# ─────────────────────────────────────────────────────────────────
 deploy:dev:vm:
   stage: deploy
   tags:
@@ -133,6 +149,7 @@ deploy:dev:vm:
   variables:
     BACKEND_ENV_FILE: "$CI_PROJECT_DIR/.env"
     BACKEND_CONTAINER_PORT: "3000"
+
     DEV_IMAGE: "qait-backend:dev-${CI_COMMIT_SHORT_SHA}"
     DEV_IMAGE_LATEST: "qait-backend:dev-latest"
     DEV_NET: "qait-dev"
@@ -142,6 +159,7 @@ deploy:dev:vm:
     - |
       set -euo pipefail
 
+      # Force LOCAL docker on VM (shell runner), ignore global dind variables
       unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_TLS_CERTDIR
       export DOCKER_HOST="unix:///var/run/docker.sock"
 
@@ -151,19 +169,19 @@ deploy:dev:vm:
       echo "🔎 Проверяю env файл: $BACKEND_ENV_FILE"
       if [ ! -f "$BACKEND_ENV_FILE" ]; then
         echo "❌ BACKEND_ENV_FILE not found: $BACKEND_ENV_FILE"
-        echo "Создай .env в репо или переопредели BACKEND_ENV_FILE в GitLab CI/CD Variables."
+        echo "Создай .env в репо или переопредели BACKEND_ENV_FILE."
         exit 1
       fi
 
       docker network create "$DEV_NET" >/dev/null 2>&1 || true
 
-      echo "🔨 Build DEV image target=runner → $DEV_IMAGE"
+      echo "🔨 Build DEV image (target=runner) → $DEV_IMAGE"
       docker build --pull --target runner -t "$DEV_IMAGE" -t "$DEV_IMAGE_LATEST" .
 
       echo "🧹 Remove old containers"
       docker rm -f "$API_NAME" "$WORKER_NAME" >/dev/null 2>&1 || true
 
-      echo "🚀 Run API: ${API_NAME} порт ${BACKEND_CONTAINER_PORT}:3000"
+      echo "🚀 Run API: ${API_NAME} (порт ${BACKEND_CONTAINER_PORT}:3000)"
       docker run -d \
         --name "$API_NAME" \
         --restart unless-stopped \
