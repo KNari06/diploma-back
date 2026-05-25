@@ -608,6 +608,7 @@ export class MobileTestRunJobHandler {
           screenshotEachStep: true,
           metadata,
           signal: runStepsAbort.signal,
+          userId,
         });
       } catch (err) {
         clearInterval(cancelPoller);
@@ -1142,10 +1143,10 @@ export class MobileTestRunJobHandler {
       if (sessionId) {
         try {
           if (sessionSource === 'pool') {
-            await client.releaseSession(sessionId);
+            await client.releaseSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
           } else {
-            await client.destroySession(sessionId);
+            await client.destroySession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
           }
         } catch (err) {

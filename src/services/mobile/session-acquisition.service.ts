@@ -100,7 +100,7 @@ export class MobileSessionAcquisitionService {
       // "Maximum user limit is reached" on long-running redroid hosts).
       const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
       try {
-        const claimed = await client.claimSession(platform, { ownerId: effectiveOwnerId });
+        const claimed = await client.claimSession(platform, { ownerId: effectiveOwnerId, userId });
         sessionId = claimed.sessionId;
         sessionSource = 'pool';
         logger.info('[MOBILE-TEST] Pool session claimed', {
@@ -145,7 +145,7 @@ export class MobileSessionAcquisitionService {
         // see "Booting emulator…" instead of a long silent pause after 10%.
         emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
         const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-        const session = await client.createSession(platform, { ownerId: effectiveOwnerId });
+        const session = await client.createSession(platform, { ownerId: effectiveOwnerId, userId });
         sessionId = session.sessionId;
         sessionSource = 'cold';
         logger.info('[MOBILE-TEST] Session created (cold start)', {

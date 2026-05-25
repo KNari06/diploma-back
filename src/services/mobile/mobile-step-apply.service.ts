@@ -235,7 +235,7 @@ export class MobileStepApplyService {
    * trace-session scoping).
    */
   static async apply(input: MobileApplyInput): Promise<MobileApplyOutput> {
-    const { sessionId, stepDraft, signal } = input;
+    const { sessionId, stepDraft, signal, userId } = input;
     const client = getMobileRunnerClient();
 
     const rawStepType = stepDraft.type || stepDraft.kind || 'click';
@@ -261,7 +261,7 @@ export class MobileStepApplyService {
       const lintActionType = LINT_ACTION_TYPE_MAP[rawStepType] || 'tap';
 
       try {
-        const lintResult = await client.lintElement(sessionId, description, lintActionType);
+        const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, { userId });
 
         if (lintResult.status === 'resolved' && lintResult.boundingBox) {
           const bb = lintResult.boundingBox;
@@ -321,7 +321,7 @@ export class MobileStepApplyService {
             commands.push({ type: RAW_CMD_MAP[rawStepType] || 'tap', params: { ...coordParams } });
           }
 
-          await client.executeBatchCommands(sessionId, commands);
+          await client.executeBatchCommands(sessionId, commands, { userId });
           const durationMs = Date.now() - applyStart;
 
           const appliedStep = {
@@ -395,6 +395,7 @@ export class MobileStepApplyService {
       screenshotEachStep: true,
       stopOnFailure: false,
       signal,
+      userId,
     });
 
     const stepResult = result.steps?.[0];

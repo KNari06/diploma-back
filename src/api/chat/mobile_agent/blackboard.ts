@@ -78,6 +78,13 @@ export class MobileBlackboard {
   private webContext: 'NATIVE' | 'WEB' = 'NATIVE';
   private webContextUrl: string | undefined;
 
+  // ── Per-turn cost guards (Phase B5) ───────────────────────────────
+  // `take_screenshot` is the priciest observation tool — a base64 PNG
+  // costs ~1500-3000 vision tokens at OpenAI's image input rate. Capping
+  // per turn keeps a chatty LLM from rage-snapshotting and blowing the
+  // budget. The guard is informational here; tools.ts enforces it.
+  private screenshotsThisTurn = 0;
+
   constructor(init: {
     goal: string;
     mobileSessionId: string;
@@ -311,5 +318,26 @@ export class MobileBlackboard {
       planDone: done,
       planFailed: failed,
     };
+  }
+
+  // ── Per-turn cost guards (Phase B5) ───────────────────────────────
+
+  /**
+   * Returns the number of `take_screenshot` tool calls already made
+   * this turn. Tools.ts consults this before issuing another
+   * screenshot and short-circuits with an error result when the cap
+   * is hit.
+   */
+  screenshotsTakenThisTurn(): number {
+    return this.screenshotsThisTurn;
+  }
+
+  /**
+   * Atomic "I just took a screenshot" hook. Bumps the counter — call
+   * this AFTER a successful screenshot fetch so a failed call doesn't
+   * burn budget.
+   */
+  recordScreenshot(): void {
+    this.screenshotsThisTurn += 1;
   }
 }

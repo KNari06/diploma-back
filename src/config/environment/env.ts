@@ -210,6 +210,13 @@ const envSchema = z.object({
   MOBILE_RUNNER_URL: z.string().url().optional().default('http://localhost:4100'),
   MOBILE_RUNNER_ENABLED: z.string().transform(v => v === 'true').default('false'),
   MOBILE_RUNNER_API_KEY: z.string().optional().default(''),
+  // Shared HMAC secret used to mint per-request X-User-Token headers for the
+  // mobile runner. Format mirrored from qait-mobile-runner/src/auth/user-token.ts:
+  //   `<userId>.<expiresAtMs>.<HMAC-SHA256(secret, userId + '.' + expiresAtMs)>`
+  // Empty in dev = don't mint tokens (legacy mode). When the runner flips to
+  // RUNNER_REQUIRE_USER_ID=1 this MUST be set on every backend instance and
+  // MUST match the runner's `RUNNER_USER_TOKEN_SECRET`. Rotate via deploy.
+  RUNNER_USER_TOKEN_SECRET: z.string().optional().default(''),
 
   // Multi-user isolation: when ON, the runner creates a dedicated Android
   // user per backend user via `pm create-user` so apps installed by one
@@ -230,6 +237,53 @@ const envSchema = z.object({
   // instant retries by caching the full (message + context) pair for 60s.
   // Set to 'true' to disable.
   INTENT_CACHE_DISABLED: z.string().transform(v => v === 'true').default('false'),
+
+  // Phase B1: mobile-editor force-route. When `true` (default), chat
+  // requests carrying `context.mobileEditorMode=true` with a non-empty
+  // `mobileSessionId` skip the LLM intent classifier and route directly
+  // to the `mobile_agent` handler. The frontend sets these fields in the
+  // Mobile Session Debug surface, so every request there is BY DEFINITION
+  // about the live mobile session — running the classifier just gives it
+  // a chance to mis-route short chit-chat to `general_chat`, which has
+  // no observe_mobile_page tool and produces the "I can help with UI/
+  // API/regression…" generic reply (see user-reported screenshot trace).
+  //
+  // Set to `false` to revert to classifier-only routing if the force
+  // path ever misbehaves. Mirrors how web's `mode === 'editor'` gates
+  // `resolveEditorPageContext` in general/handler.ts.
+  MOBILE_EDITOR_FORCE_ROUTE: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
+  // Phase B2-B4: mobile-editor eager snapshot inject. When `true`
+  // (default), the mobile_agent handler eagerly fetches the runner's
+  // `/ui-state` snapshot BEFORE the first LLM call and injects it as a
+  // system message — same pattern web uses with `getPageContext`. The
+  // LLM gets device-fresh foreground + a11y tree without needing to
+  // call the observe_mobile_page tool first.
+  //
+  // Set to `false` to revert to tool-only (PULL) mode. The
+  // `observe_mobile_page` tool stays available either way; this only
+  // controls whether the pre-fetch happens.
+  MOBILE_CHAT_EAGER_SNAPSHOT: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
+  // Phase B-SEC: redact email / phone / card (Luhn-validated) / OTP /
+  // JWT-shaped tokens in the a11y tree BEFORE it lands in the LLM
+  // prompt. Default ON — anything visible on the device screen could
+  // contain personal data, and shipping it to OpenAI/Gemini in chat
+  // turns is a compliance hazard. Set `false` only for evaluating the
+  // unredacted output during internal QA — never disable in prod.
+  // Patterns + replacements live in `src/services/chat/pii-redactor.ts`.
+  MOBILE_CHAT_PII_REDACTION: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
+
+  // Phase B-SEC: comma-separated allowlist of hostnames that
+  // `MobileRunnerClient` is willing to call. Empty (default) = legacy
+  // mode where the validator still blocks loopback / RFC1918 / link-
+  // local addresses but accepts any other host (matches today's
+  // operator-controlled env.MOBILE_RUNNER_URL). Set to e.g.
+  // "runner-prod.qai.dev,10.0.5.20" when introducing per-session
+  // runner routing so an attacker can't redirect us to
+  // 169.254.169.254 or internal services. See
+  // `src/services/mobile/validate-runner-url.ts`.
+  MOBILE_RUNNER_ALLOWED_HOSTS: z.string().optional().default(''),
 
   // Mobile-agent reasoning persistence. When true (default), each turn's
   // think_aloud entries are written to chat_messages.metadata.reasoningTrace.

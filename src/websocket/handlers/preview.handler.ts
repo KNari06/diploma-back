@@ -5326,6 +5326,7 @@ export const handlePreviewEvents = (socket: TypedSocket): void => {
           screenshotEachStep: true,
           stopOnFailure: true,
           metadata: buildMetadataFromTestCase(testCase),
+          userId,
         }).then((result) => {
           logger.info('[WebSocket] Mobile run completed', {
             mobileSessionId,

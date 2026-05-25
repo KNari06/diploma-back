@@ -101,7 +101,7 @@ export class FastAuthOrchestratorService {
           sessionId,
           restore.packageName,
           restore.dataTarballBase64,
-          { signal: restoreAbort.signal },
+          { signal: restoreAbort.signal, userId },
         );
         if (!result.launched) {
           // Data was laid down but launch didn't confirm. Treat as

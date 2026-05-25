@@ -20,6 +20,7 @@
  */
 
 import { SCOPE_GUARD_BLOCK } from '@/ai/prompts/intent-and-chat-prompts';
+import { UNTRUSTED_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
 
 export function buildMobileAgentSystemPrompt(): string {
   return [
@@ -28,14 +29,42 @@ export function buildMobileAgentSystemPrompt(): string {
     '',
     SCOPE_GUARD_BLOCK,
     '',
+    // Phase B-SEC: this block teaches the LLM that any content
+    // between BEGIN/END markers (which `formatMobileSnapshotForChat`
+    // wraps the a11y tree in) is observation, not instructions.
+    // It lives in the STATIC system prompt so it stays in OpenAI's
+    // prompt cache instead of repeating per turn.
+    UNTRUSTED_CONTENT_INSTRUCTION,
+    '',
     '## Your job',
     '- Answer questions about the current mobile screen.',
     '- Execute single or multi-step flows on the device (tap, type, swipe, scroll, back, launch app).',
     '- Explain what you see and what you\u2019re about to do, briefly.',
     '',
+    '## Observation tools (Phase B5 — pick the lightest one that answers your question)',
+    '- `observe_mobile_page` — full screen read: a11y tree + foreground + screenshot.',
+    '  ~300-800ms. Call BEFORE any action and AGAIN after one that changes the UI.',
+    '  Cached for a few seconds per turn.',
+    '- `get_foreground` — cheap probe (~50-150ms). ONLY the foreground app/activity +',
+    '  screenState. NO tree, NO screenshot. Use when the question is purely',
+    '  "what app is open?" / "did the launch land?" / "are we still in app X?".',
+    '  Also surfaces foreground mismatch (session expected one app, device shows another).',
+    '- `get_step_history` — recent test-step records (~1ms, no device call). Use for',
+    '  "what did we just do?", "did that step succeed?", "show the last few actions".',
+    '  Sensitive type_text values are pre-redacted to inputLength + inputClass.',
+    '- `get_recent_logs` — logcat / unified-log tail with severity filter. Use when the',
+    '  user reports a crash / ANR / unexpected behaviour, or when a tree hints at an',
+    '  error condition (loading spinner stuck, error toast). Payload capped at ~2KB.',
+    '- `take_screenshot` — EXPENSIVE (~1500-3000 vision tokens per call). Limited to 2',
+    '  per turn. ONLY when text tree is insufficient: icon-only UI, custom graphics,',
+    '  user explicitly asks to "see" the screen. Prefer observe_mobile_page when the',
+    '  a11y tree suffices.',
+    '',
+    'Selection rule of thumb: start with the SPECIFIC cheap tool (get_foreground /',
+    'get_step_history / get_recent_logs) when the user’s question maps to one of',
+    'them; escalate to observe_mobile_page when you need the full tree.',
+    '',
     '## Action tools',
-    '- `observe_mobile_page` — read the current screen. ALWAYS call first, and AGAIN',
-    '  after any action that changes the UI. Cached for a few seconds per turn.',
     '- `tap_element` — tap by description (visible text / resId / accessibility-id / role).',
     '  Never tap by raw coordinates; the runner resolves the description for you.',
     '- `type_text` — focus a field and type. For passwords / OTPs / tokens, set',

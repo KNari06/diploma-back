@@ -27,6 +27,10 @@
 
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { redactPii } from '@/services/chat/pii-redactor';
+import { wrapUntrusted } from '@/services/chat/untrusted-content-wrapper';
+import { env } from '@/config/environment/env';
+import { incCounter, observeMs } from '@/utils/core/mobile-chat-metrics';
 import {
   MobileRunnerError,
   type MobileIntentStep,
@@ -61,9 +65,15 @@ export const OBSERVE_MOBILE_PAGE_TOOL: ChatCompletionTool = {
     description:
       'Read the current mobile screen. Returns the accessibility tree as ' +
       'a compact ASCII dump, current app/activity, screen size, and keyboard/dialog ' +
-      'flags. Call this BEFORE acting or answering anything about the UI, and AGAIN ' +
-      'after any action to see the post-action state. Safe to call multiple times — ' +
-      'read-only.',
+      'flags. Also returns device-fresh foreground truth: `expectedApp` (what we ' +
+      'launched), `actualForeground` (what is ON SCREEN right now via dumpsys — ' +
+      'screenState + window stack + primary window), `foregroundMismatch` (set when ' +
+      'expected ≠ actual — warn the user the app under test is no longer focused), ' +
+      '`recentDisruption` (crash / ANR observed since the last call — surface it ' +
+      'rather than acting on a broken UI), and `webView` (detected + suggestedContext ' +
+      '— call switch_to_webview when suggestedContext is "webview"). Call this BEFORE ' +
+      'acting or answering anything about the UI, and AGAIN after any action to see ' +
+      'the post-action state. Safe to call multiple times — read-only.',
     parameters: {
       type: 'object',
       properties: {
@@ -624,8 +634,122 @@ const MOBILE_CREATE_TEST_CASE_TOOL: ChatCompletionTool = {
   },
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase B5 — cheap observation tools (foreground / step-history / logs /
+// take_screenshot).
+//
+// Mental model for the LLM: prefer the SPECIFIC tool over `observe_mobile_page`
+// when the question is narrow. observe_mobile_page is the heavy hammer
+// (a11y dump + screencap, ~300-800ms, big payload). Each of these is
+// ~50-200ms and one-purpose. The system prompt steers selection — these
+// descriptions repeat the cost framing so the model has it in context.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GET_FOREGROUND_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'get_foreground',
+    description:
+      'Cheap probe: returns which app/activity is currently in the foreground via dumpsys (Android) ' +
+      'or WDA activeAppInfo (iOS). Does NOT include the a11y tree or a screenshot — much faster than ' +
+      'observe_mobile_page (~50-150ms vs ~300-800ms). Use this when the question is purely about ' +
+      'identity ("what app is open?", "did the launch land?", "are we still in kz.kolesa?"). Also ' +
+      'returns `mismatch` when the session expected one app but dumpsys reports another — surface ' +
+      'that to the user before describing UI. Falls back to observe_mobile_page if you need any ' +
+      'screen content.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+};
+
+const GET_STEP_HISTORY_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'get_step_history',
+    description:
+      'Returns the most recent test-step records executed by the runner this session: command type, ' +
+      'params summary, success/failure, durationMs, error message. Does NOT touch the device — pulls ' +
+      'from in-memory state, ~1ms. Use this for "what did we just do?", "did that tap succeed?", ' +
+      'or "show me the last few steps". Sensitive fields (e.g. type_text values) are redacted to ' +
+      '{ inputLength, inputClass } by default — never receive raw user-typed text from this tool.',
+    parameters: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description:
+            'How many of the most-recent steps to return. Clamped to [1, 50] server-side. ' +
+            'Default 10 — enough context without flooding the prompt.',
+          minimum: 1,
+          maximum: 50,
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+};
+
+const GET_RECENT_LOGS_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'get_recent_logs',
+    description:
+      'Returns the recent device log tail (Android logcat or iOS unified log) filtered by severity. ' +
+      'Server caps the payload to ~2KB so single calls never blow the prompt budget. Use when the ' +
+      'user reports a crash / ANR / unexpected behaviour, or when you observed a tree that hints at ' +
+      'a backend error (loading spinner stuck, error toast text). PII (email, phone, card, OTP, JWT) ' +
+      'is redacted client-side before injection.',
+    parameters: {
+      type: 'object',
+      properties: {
+        level: {
+          type: 'string',
+          enum: ['verbose', 'debug', 'info', 'warn', 'error'],
+          description:
+            'Minimum severity to include. Default `warn` — info+ is rarely useful in chat. Pick `error` ' +
+            'for crash investigation, `warn` for general health checks.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max log lines (after server-side filter). Clamped to [1, 500] server-side. Default 100.',
+          minimum: 1,
+          maximum: 500,
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+};
+
+const TAKE_SCREENSHOT_TOOL: ChatCompletionTool = {
+  type: 'function',
+  function: {
+    name: 'take_screenshot',
+    description:
+      'Capture a fresh PNG of the device screen. EXPENSIVE — ~1500-3000 vision tokens per call. Use ONLY ' +
+      'when the text a11y tree is insufficient: icon-only UI, custom-drawn graphics, visual confirmation ' +
+      'after a destructive step, or when the user explicitly asks to "see" the screen. The image is ' +
+      'returned as a base64 data URL in the tool result so vision-capable models can attach it. Limit ' +
+      'of 2 calls per turn — beyond that the tool short-circuits with a budget-exhausted error.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+};
+
 export const MOBILE_AGENT_TOOLS: ChatCompletionTool[] = [
   OBSERVE_MOBILE_PAGE_TOOL,
+  // Phase B5 cheap observation tools — listed RIGHT AFTER observe so
+  // the LLM sees them as "lighter alternatives" to the heavy probe.
+  GET_FOREGROUND_TOOL,
+  GET_STEP_HISTORY_TOOL,
+  GET_RECENT_LOGS_TOOL,
+  TAKE_SCREENSHOT_TOOL,
   TAP_ELEMENT_TOOL,
   TYPE_TEXT_TOOL,
   SWIPE_TOOL,
@@ -686,10 +810,22 @@ export async function executeTool(
   const args = parseArgs(rawArgs);
   const startedAt = Date.now();
 
-  try {
+  // Inner function so we can wrap the switch result with metrics
+  // without duplicating the try/catch shape. Returns the raw ToolResult
+  // OR throws — both paths are recorded by the wrapper below.
+  const runOne = async (): Promise<ToolResult> => {
     switch (name) {
       case 'observe_mobile_page':
         return await runObserveMobilePage(args, bb, opts);
+      // Phase B5 — cheap observation tools.
+      case 'get_foreground':
+        return await runGetForeground(args, bb, opts);
+      case 'get_step_history':
+        return await runGetStepHistory(args, bb, opts);
+      case 'get_recent_logs':
+        return await runGetRecentLogs(args, bb, opts);
+      case 'take_screenshot':
+        return await runTakeScreenshot(args, bb, opts);
       case 'tap_element':
         return await runTapElement(args, bb, opts);
       case 'type_text':
@@ -729,19 +865,29 @@ export async function executeTool(
           content: `Unknown tool: ${name}. Available: ${MOBILE_AGENT_TOOLS.map((t) => t.function.name).join(', ')}.`,
         };
     }
+  };
+
+  // Phase B7: per-tool metrics. We record AROUND the dispatcher, not
+  // inside individual executors, so the counter / histogram surface is
+  // automatic for every existing AND future tool. Outcome label
+  // distinguishes ok / failed; the `tool` label is the function name.
+  // Latency is wall-clock end-to-end (includes I/O to runner) — the
+  // value chat operators care about.
+  let result: ToolResult;
+  try {
+    result = await runOne();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    logger.error('[MOBILE_TOOLS] Tool threw', {
-      tool: name,
-      error: message,
-      durationMs: Date.now() - startedAt,
-    });
+    const durationMs = Date.now() - startedAt;
+    incCounter('mobile_chat.tool_call', `${name}.failed`);
+    observeMs(`mobile_chat.tool_call_ms.${name}`, durationMs);
+    logger.error('[MOBILE_TOOLS] Tool threw', { tool: name, error: message, durationMs });
     bb.recordToolCall({
       tool: name,
       args,
       ok: false,
       error: message,
-      durationMs: Date.now() - startedAt,
+      durationMs,
       at: startedAt,
     });
     return {
@@ -749,6 +895,9 @@ export async function executeTool(
       content: `Tool "${name}" failed: ${message}`,
     };
   }
+  incCounter('mobile_chat.tool_call', `${name}.${result.ok ? 'ok' : 'failed'}`);
+  observeMs(`mobile_chat.tool_call_ms.${name}`, Date.now() - startedAt);
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -784,6 +933,7 @@ async function runObserveMobilePage(
       includeTree: false,
       includeScreenshot: true,
       signal: opts?.abortSignal,
+      userId: bb.userId,
     });
     bb.setSnapshot(snap);
     bb.recordToolCall({
@@ -1438,7 +1588,7 @@ async function runMobileRunDraftSteps(
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       steps.map(toRunnerCommand),
-      { interactive: false, signal: opts?.abortSignal },
+      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     runnerResults = results ?? [];
   } catch (err) {
@@ -2185,7 +2335,7 @@ async function runSwitchToWebview(
     await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'switch_context', params: { context: 'WEB' } }],
-      { interactive: false, signal: opts?.abortSignal },
+      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     bb.enterWebContext();
 
@@ -2196,7 +2346,7 @@ async function runSwitchToWebview(
       const { results } = await client.executeBatchCommands(
         bb.mobileSessionId,
         [{ type: 'web_get_url', params: {} }],
-        { interactive: true, signal: opts?.abortSignal },
+        { interactive: true, signal: opts?.abortSignal, userId: bb.userId },
       );
       const first = results?.[0] as { data?: { url?: string } } | undefined;
       url = first?.data?.url;
@@ -2259,7 +2409,7 @@ async function runSwitchToNative(
     await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'switch_context', params: { context: 'NATIVE' } }],
-      { interactive: false, signal: opts?.abortSignal },
+      { interactive: false, signal: opts?.abortSignal, userId: bb.userId },
     );
     bb.exitWebContext();
     bb.recordToolCall({
@@ -2313,7 +2463,7 @@ async function runWebEvaluate(
     const { results } = await client.executeBatchCommands(
       bb.mobileSessionId,
       [{ type: 'web_evaluate', params: { expression } }],
-      { interactive: true, signal: opts?.abortSignal },
+      { interactive: true, signal: opts?.abortSignal, userId: bb.userId },
     );
     const first = results?.[0] as
       | { success?: boolean; data?: { result?: unknown }; error?: string }
@@ -2396,6 +2546,7 @@ async function dispatchSingleCommand(
       {
         interactive: opts.interactive,
         signal: opts.abortSignal,
+        userId: bb.userId,
       },
     );
     const result = (results?.[0] ?? null) as RunnerCommandResult | null;
@@ -2502,6 +2653,7 @@ async function ensureScreenDims(
       includeTree: false,
       includeScreenshot: false,
       signal,
+      userId: bb.userId,
     });
     bb.setSnapshot(fresh);
     return fresh.screenSize;
@@ -2545,5 +2697,291 @@ function formatSnapshotForLlm(
   ]
     .filter(Boolean)
     .join('\n');
-  return `${header}\n${snap.formattedTree}`;
+
+  // MED-3 fix: parity with the eager-inject path
+  // (`mobile-context.service.ts:formatMobileSnapshotForChat`). The a11y
+  // tree is user-controlled content from arbitrary apps \u2014 it may carry
+  // PII (emails / OTPs / cards inside EditText) AND prompt-injection
+  // payloads ("Ignore previous instructions" planted in a TextView).
+  //
+  // Two transforms, in order:
+  //   1. redactPii \u2014 env-gated via MOBILE_CHAT_PII_REDACTION (default
+  //      ON). Stops user PII visible on screen from leaking to OpenAI/
+  //      Gemini logs.
+  //   2. wrapUntrusted \u2014 always on. Frames the tree with markers and
+  //      strips forged copies of those markers, so the system prompt's
+  //      untrusted-content policy applies to it the same way as the
+  //      eager-inject block.
+  //
+  // Order matters: redact FIRST so PII never sits between the markers
+  // even briefly, then wrap. The header is OUR text (snap fields are
+  // controlled by the runner, not by app content) \u2014 we don't wrap that.
+  let body = snap.formattedTree ?? '';
+  if (env.MOBILE_CHAT_PII_REDACTION) {
+    body = redactPii(body);
+  }
+  const wrappedBody = wrapUntrusted(body);
+  return `${header}\n${wrappedBody}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase B5 — cheap observation executors
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * get_foreground — dumpsys / WDA probe, no a11y tree.
+ */
+async function runGetForeground(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const client = getMobileRunnerClient();
+  try {
+    const res = await client.fetchForeground(bb.mobileSessionId, {
+      userId: bb.userId,
+      signal: opts?.abortSignal,
+    });
+
+    // Compact human-readable result. Order: WARNING first (foreground
+    // mismatch is the LLM's #1 signal here), then identity, then state.
+    const lines: string[] = [];
+    if (res.mismatch) {
+      lines.push(`⚠️ FOREGROUND MISMATCH: expected ${res.mismatch.expected}, actual ${res.mismatch.actual}.`);
+    }
+    if (res.expectedApp) lines.push(`expected: ${res.expectedApp}`);
+    const fg = res.foreground;
+    lines.push(`screenState: ${fg.screenState}`);
+    if (fg.primary) {
+      const act = fg.primary.activityName ? ` (${fg.primary.activityName})` : '';
+      lines.push(`primary: ${fg.primary.packageName}${act} — kind=${fg.primary.kind}`);
+    } else {
+      lines.push('primary: <none>');
+    }
+    lines.push(`platform: ${res.platform}`);
+    lines.push(`capturedAt: ${res.capturedAt}`);
+    lines.push(`probeMs: ${fg.durationMs}`);
+
+    bb.recordToolCall({
+      tool: 'get_foreground',
+      args: {},
+      ok: true,
+      durationMs: fg.durationMs,
+      at: Date.now(),
+    });
+    return {
+      ok: true,
+      content: lines.join('\n'),
+      data: res,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    bb.recordToolCall({ tool: 'get_foreground', args: {}, ok: false, error: message, durationMs: 0, at: Date.now() });
+    return { ok: false, content: `get_foreground failed: ${message}` };
+  }
+}
+
+/**
+ * get_step_history — in-memory step list from runner, redacted by default.
+ */
+async function runGetStepHistory(
+  args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const rawLimit = typeof args.limit === 'number' ? args.limit : 10;
+  // Runner clamps too, but we pre-clamp here so a buggy/malicious LLM
+  // call doesn't even hit the runner with garbage.
+  const limit = Math.max(1, Math.min(Math.floor(rawLimit), 50));
+
+  const client = getMobileRunnerClient();
+  try {
+    // includeRawInputs is HARDCODED to false from the chat path. Raw
+    // typed text is only exposed by explicit operator/debug tools —
+    // never to the LLM.
+    const res = await client.fetchStepHistory(bb.mobileSessionId, {
+      limit,
+      includeRawInputs: false,
+      userId: bb.userId,
+      signal: opts?.abortSignal,
+    });
+
+    if (res.steps.length === 0) {
+      bb.recordToolCall({ tool: 'get_step_history', args: { limit }, ok: true, durationMs: 0, at: Date.now() });
+      return { ok: true, content: 'No steps recorded this session yet.', data: res };
+    }
+
+    // Compact serialisation — one line per step, easy for the LLM to scan.
+    const formatted = res.steps
+      .map((s) => {
+        const status = s.success ? 'OK' : 'FAIL';
+        const err = s.errorMessage ? ` — ${s.errorMessage.slice(0, 100)}` : '';
+        // Keep params summary compact; full JSON would bloat the prompt.
+        const paramsBrief = compactParams(s.paramsSummary);
+        return `[${s.stepIndex}] ${s.commandType} ${paramsBrief} → ${status} (${s.durationMs}ms)${err}`;
+      })
+      .join('\n');
+
+    bb.recordToolCall({
+      tool: 'get_step_history',
+      args: { limit },
+      ok: true,
+      durationMs: 0,
+      at: Date.now(),
+    });
+    return {
+      ok: true,
+      content: `Recent steps (${res.steps.length}, redacted=${res.redacted}):\n${formatted}`,
+      data: res,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    bb.recordToolCall({ tool: 'get_step_history', args: { limit }, ok: false, error: message, durationMs: 0, at: Date.now() });
+    return { ok: false, content: `get_step_history failed: ${message}` };
+  }
+}
+
+/** Compact serialiser for a step's params summary — at most ~60 chars. */
+function compactParams(p: Record<string, unknown>): string {
+  const entries = Object.entries(p).slice(0, 4); // first 4 keys is enough
+  if (entries.length === 0) return '{}';
+  const parts = entries.map(([k, v]) => {
+    const vs = typeof v === 'string' ? JSON.stringify(v) : String(v);
+    return `${k}=${vs.length > 40 ? vs.slice(0, 40) + '…' : vs}`;
+  });
+  return `{${parts.join(', ')}}`;
+}
+
+/**
+ * get_recent_logs — logcat / unified-log tail with backend PII redaction
+ * as defence in depth (the runner's payload cap is already 2KB).
+ */
+async function runGetRecentLogs(
+  args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const validLevels = ['verbose', 'debug', 'info', 'warn', 'error'] as const;
+  type LogLevel = typeof validLevels[number];
+  const levelArg = typeof args.level === 'string' ? args.level : 'warn';
+  const level: LogLevel = (validLevels.includes(levelArg as LogLevel) ? levelArg : 'warn') as LogLevel;
+  const rawLimit = typeof args.limit === 'number' ? args.limit : 100;
+  const limit = Math.max(1, Math.min(Math.floor(rawLimit), 500));
+
+  const client = getMobileRunnerClient();
+  try {
+    const res = await client.fetchRecentLogs(bb.mobileSessionId, {
+      level,
+      limit,
+      userId: bb.userId,
+      signal: opts?.abortSignal,
+    });
+
+    // Backend-side PII pass — even though runner caps and filters by
+    // level, log lines from production apps can contain email / phone /
+    // OTP / JWT artefacts. We redact at the chat boundary the same
+    // way `formatMobileSnapshotForChat` redacts the a11y tree.
+    const redactedLines = env.MOBILE_CHAT_PII_REDACTION
+      ? res.lines.map((l) => redactPii(l))
+      : res.lines;
+
+    // Wrap as untrusted content — log lines are arbitrary app output.
+    // An attacker could plant "ignore previous instructions" inside a
+    // log message, so the wrapper + the system-prompt-level
+    // UNTRUSTED_CONTENT_INSTRUCTION (added in B-SEC) keep the LLM
+    // honest.
+    const body = wrapUntrusted(redactedLines.join('\n'));
+    const header =
+      `Recent logs (platform=${res.platform}, level=${res.level}, lines=${redactedLines.length}` +
+      `${res.truncated ? ', payload truncated' : ''}):`;
+
+    bb.recordToolCall({ tool: 'get_recent_logs', args: { level, limit }, ok: true, durationMs: 0, at: Date.now() });
+    return {
+      ok: true,
+      content: `${header}\n${body}`,
+      data: res,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    bb.recordToolCall({
+      tool: 'get_recent_logs',
+      args: { level, limit },
+      ok: false,
+      error: message,
+      durationMs: 0,
+      at: Date.now(),
+    });
+    return { ok: false, content: `get_recent_logs failed: ${message}` };
+  }
+}
+
+/** Per-turn cap on screenshot tools — prevents vision-token burn. */
+const SCREENSHOT_BUDGET_PER_TURN = 2;
+
+/**
+ * take_screenshot — base64 PNG via runner /ui-state (screenshot only,
+ * no tree). Capped per turn — see SCREENSHOT_BUDGET_PER_TURN.
+ */
+async function runTakeScreenshot(
+  _args: Record<string, unknown>,
+  bb: MobileBlackboard,
+  opts?: { abortSignal?: AbortSignal },
+): Promise<ToolResult> {
+  const taken = bb.screenshotsTakenThisTurn();
+  if (taken >= SCREENSHOT_BUDGET_PER_TURN) {
+    bb.recordToolCall({ tool: 'take_screenshot', args: {}, ok: false, error: 'budget_exceeded', durationMs: 0, at: Date.now() });
+    return {
+      ok: false,
+      content:
+        `Screenshot budget exceeded for this turn (${taken}/${SCREENSHOT_BUDGET_PER_TURN}). ` +
+        'Describe what you need in text using observe_mobile_page instead — it returns the a11y ' +
+        'tree which usually covers the same information at a fraction of the vision-token cost.',
+    };
+  }
+
+  const client = getMobileRunnerClient();
+  try {
+    // Fetch the screenshot via /ui-state — tree omitted because the
+    // LLM didn't ask for it. Screenshot ON, tree OFF → cheaper than a
+    // full observe.
+    const res = await client.fetchUiState(bb.mobileSessionId, {
+      includeTree: false,
+      includeScreenshot: true,
+      userId: bb.userId,
+      signal: opts?.abortSignal,
+    });
+
+    if (!res.screenshotBase64) {
+      bb.recordToolCall({ tool: 'take_screenshot', args: {}, ok: false, error: 'no_screenshot_returned', durationMs: 0, at: Date.now() });
+      return {
+        ok: false,
+        content: 'take_screenshot: runner returned no screenshot (driver / capture failed).',
+      };
+    }
+
+    // SUCCESS — count this against the budget AFTER the round-trip so
+    // a failed call doesn't burn a slot.
+    bb.recordScreenshot();
+    bb.recordToolCall({ tool: 'take_screenshot', args: {}, ok: true, durationMs: 0, at: Date.now() });
+
+    // The base64 payload is included in `data` (not `content`) so the
+    // pipeline can attach it as a multimodal image input on the next
+    // LLM call (vision-capable models). `content` is a short text
+    // signal so non-vision models still see SOMETHING.
+    return {
+      ok: true,
+      content:
+        `Captured screenshot at ${res.capturedAt} (${res.screenSize.width}x${res.screenSize.height}). ` +
+        `Used ${taken + 1}/${SCREENSHOT_BUDGET_PER_TURN} of this turn's screenshot budget.`,
+      data: {
+        screenshotBase64: res.screenshotBase64,
+        capturedAt: res.capturedAt,
+        screenSize: res.screenSize,
+      },
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    bb.recordToolCall({ tool: 'take_screenshot', args: {}, ok: false, error: message, durationMs: 0, at: Date.now() });
+    return { ok: false, content: `take_screenshot failed: ${message}` };
+  }
 }

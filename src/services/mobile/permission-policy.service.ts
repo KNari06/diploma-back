@@ -108,7 +108,7 @@ export async function applyProjectPolicyToSession(params: {
   if (!policy) return null;
 
   try {
-    await client.setPermissionPolicy(sessionId, policy);
+    await client.setPermissionPolicy(sessionId, policy, { userId });
     return policy;
   } catch (err) {
     logger.debug('[PERMISSION_POLICY] runner PATCH failed (non-fatal)', {

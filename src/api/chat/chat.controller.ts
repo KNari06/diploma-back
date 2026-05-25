@@ -22,6 +22,8 @@ import {
   type RequestKey,
 } from './shared/request-key';
 import { routeToHandler } from './shared/routing';
+import { parseMobileContext } from './mobile_agent/shared';
+import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
 import {
@@ -43,6 +45,54 @@ import { PROGRESS, emitProcessingStep } from './shared/utils';
 
 // History handlers
 import { debugChatData, getChatHistory, getChatSessions, getCurrentChatHistory } from './history';
+
+/**
+ * Phase B1: decide whether to short-circuit the LLM intent classifier
+ * for a chat request that came from the Mobile Session Debug surface.
+ *
+ * Returns a synthesised `parsedIntent` (mobile_agent) when force-route
+ * conditions are met, or null when the normal classifier path should
+ * run. Pure function — caller passes the parsed context and the env
+ * flag, gets back a decision. Easy to unit-test.
+ *
+ * Why we route everything to `mobile_agent` (not `mobile_action` for
+ * one-shot taps): the agent handler subsumes the action handler — it
+ * can dispatch single tools too, just with one extra LLM roundtrip.
+ * The cost (one extra ~500ms LLM call on direct-action requests like
+ * "tap login") is the price we pay to guarantee correctness on the
+ * observation case ("what do you see?") that this whole phase was
+ * built to fix. A future refinement could splitting on action-verb
+ * detection, but heuristics here re-introduce the very classifier
+ * fragility we're trying to bypass.
+ *
+ * Conditions for force-route (ALL must hold):
+ *   - env.MOBILE_EDITOR_FORCE_ROUTE is on (default true)
+ *   - context.mobileEditorMode === true
+ *   - context.mobileSessionId is a non-empty string
+ *
+ * Missing mobileSessionId with mobileEditorMode=true is a frontend race
+ * (session teardown overlap) — falls through to the classifier so
+ * mobile_agent's own NO_SESSION_REPLY explains the situation instead of
+ * a silent misroute.
+ */
+export function decideForceRoute(
+  context: unknown,
+  flagEnabled: boolean,
+): { intent: 'mobile_agent'; intent_confidence: number; confidence: number; metadata: { routingSource: 'force_route' } } | null {
+  if (!flagEnabled) return null;
+  const ctx = parseMobileContext(context);
+  if (!ctx) return null;
+  if (ctx.mobileEditorMode !== true) return null;
+  if (typeof ctx.mobileSessionId !== 'string' || ctx.mobileSessionId.length === 0) {
+    return null;
+  }
+  return {
+    intent: 'mobile_agent',
+    intent_confidence: 1.0,
+    confidence: 1.0,
+    metadata: { routingSource: 'force_route' },
+  };
+}
 
 /**
  * ═══════════════════════════════════════════════════════════════════════════
@@ -356,30 +406,75 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // STEP 5: PARSE INTENT (FIX #5)
+    // STEP 4.7 (Phase B1): MOBILE EDITOR FORCE-ROUTE
     // ═══════════════════════════════════════════════════════════════════════
-    // `isTestCaseScope` activates the per-test-case intent guard inside
-    // parseIntent (mirrors the editor-mode platform_test guard). Blocked
-    // intents are silently rewritten to general_chat with a logged warning;
-    // the user gets a normal AI reply rather than a 4xx they can't recover
-    // from mid-flow.
-    const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
-    const parsedIntent = await parseIntentWithLogging(
-      message,
-      context,
-      chatSessionId,
-      userId,
-      workspace_id,
-      checkRequestTimeout,
-      abortSignal, // Pass abort signal for cancellation checks
-      functionLogger,
-      inputResult.mode || 'lite', // Pass mode for editor action detection
-      chatStore.kind === 'testcase', // isTestCaseScope
-      testCaseId, // dual-emit progress events into chat:tc:<tcid>
-    );
+    // The frontend's Mobile Session Debug surface (TestSuitesMobile.tsx)
+    // ALWAYS attaches `context.mobileEditorMode=true` + a live
+    // `mobileSessionId` to every chat request. Every message in that
+    // surface is about THIS mobile session — never an API test, regression
+    // suite, or web preview. The text-based intent classifier sometimes
+    // mis-routes short / chatty messages ("hi", "what do you see?") to
+    // `general_chat`, which has no mobile context and no
+    // `observe_mobile_page` tool — that's the trace behind the user-
+    // reported "I help with UI/API/regression…" generic reply.
+    //
+    // We trust the frontend signal here for the same reason web trusts
+    // `mode === 'editor'` — both are set by the editor shell, not by the
+    // user. A request with `mobileEditorMode=true` but no `mobileSessionId`
+    // is a frontend race (session teardown overlap); we fall through to
+    // the normal classifier so `mobile_agent` returns its own
+    // `NO_SESSION_REPLY` instead of a silent misroute.
+    //
+    // Kill switch: env `MOBILE_EDITOR_FORCE_ROUTE=false` reverts to
+    // classifier-only routing.
+    const forceRouteIntent = decideForceRoute(context, env.MOBILE_EDITOR_FORCE_ROUTE);
 
-    // Check if request was cancelled
-    checkRequestAbortedWithLogging(abortSignal);
+    let parsedIntent: Awaited<ReturnType<typeof parseIntent>>;
+    if (forceRouteIntent) {
+      parsedIntent = forceRouteIntent as Awaited<ReturnType<typeof parseIntent>>;
+      // Phase B7: count force-route hits so ops can verify the path is
+      // actually firing on real Mobile-Editor traffic. Label = `applied`
+      // so future work can distinguish e.g. `disabled_by_env`.
+      incCounter('mobile_chat.force_route', 'applied');
+      logger.info('[CHAT] mobileEditorMode force-route → mobile_agent', {
+        chatSessionId,
+        userId,
+        // Re-parse here just for the log field — the helper already
+        // validated mobileSessionId is a non-empty string, so this is
+        // safe to cast.
+        mobileSessionId: (parseMobileContext(context) as { mobileSessionId: string }).mobileSessionId,
+        messagePreview: message.slice(0, 60),
+      });
+      // Same abort guard the classifier path runs immediately after
+      // its LLM call — preserves the existing cancellation contract.
+      checkRequestAbortedWithLogging(abortSignal);
+    } else {
+      // ═══════════════════════════════════════════════════════════════════════
+      // STEP 5: PARSE INTENT (FIX #5)
+      // ═══════════════════════════════════════════════════════════════════════
+      // `isTestCaseScope` activates the per-test-case intent guard inside
+      // parseIntent (mirrors the editor-mode platform_test guard). Blocked
+      // intents are silently rewritten to general_chat with a logged warning;
+      // the user gets a normal AI reply rather than a 4xx they can't recover
+      // from mid-flow.
+      const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
+      parsedIntent = await parseIntentWithLogging(
+        message,
+        context,
+        chatSessionId,
+        userId,
+        workspace_id,
+        checkRequestTimeout,
+        abortSignal, // Pass abort signal for cancellation checks
+        functionLogger,
+        inputResult.mode || 'lite', // Pass mode for editor action detection
+        chatStore.kind === 'testcase', // isTestCaseScope
+        testCaseId, // dual-emit progress events into chat:tc:<tcid>
+      );
+
+      // Check if request was cancelled
+      checkRequestAbortedWithLogging(abortSignal);
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 5.5: SMART TEST CASE RESOLVER

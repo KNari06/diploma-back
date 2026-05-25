@@ -10,10 +10,17 @@ import apiTestRoutes from '@/api/apiTest/apiTest.route';
 import apiFlowSpecRoutes from '@/api/apiFlowSpec/apiFlowSpec.route';
 import aiLogsRoutes from '@/api/ai-logs/ai-logs.routes';
 import { initLogBridge } from '@/utils/core/log-bridge';
+import { startDumpLoop as startMobileChatMetricsLoop } from '@/utils/core/mobile-chat-metrics';
 
 // Start the cross-process log bridge subscriber so worker/scheduler logs
 // land in this process's ring buffer (and thus the System Logs tab).
 initLogBridge();
+
+// Phase B7: start the mobile-chat metrics dump loop. Counters and
+// histograms accumulate in-memory and print to the log every 5 minutes
+// (`[MOBILE_CHAT_METRICS] dump`). The loop unref()s itself so it
+// doesn't keep the process alive during graceful shutdown.
+startMobileChatMetricsLoop();
 import authRoutes from '@/api/auth/auth.route';
 import chatRoutes from '@/api/chat/chat.route';
 import feedbackRoutes from '@/api/chat/feedback.route';
