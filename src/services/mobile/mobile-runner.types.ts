@@ -450,6 +450,72 @@ export interface MobileUiState {
   webView?: { detected: boolean; suggestedContext: 'native' | 'webview' };
 }
 
+// ── Phase B5 — runner observation endpoints ──────────────────────
+
+/**
+ * Response shape from runner `GET /api/sessions/:id/foreground`.
+ * Mirrors what `qait-mobile-runner/src/api/routes/session.routes.ts`
+ * emits — keep in sync if the runner contract evolves.
+ *
+ * `foreground` is intentionally typed as the same `MobileActualForeground`
+ * we already use inside `MobileUiState` — the runner returns the same
+ * shape from both endpoints so backend tools can swap eager-inject and
+ * tool-call paths without re-mapping.
+ */
+export interface MobileForegroundResponse {
+  sessionId: string;
+  platform: 'android' | 'ios';
+  expectedApp?: string;
+  foreground: MobileActualForeground;
+  mismatch: { expected: string; actual: string } | null;
+  capturedAt: string;
+}
+
+/**
+ * Single step entry in `MobileStepHistoryResponse.steps`. Mirrors the
+ * runner's `RedactedStepSummary` from `runner/step-history.ts` — the
+ * sensitive field (`type_text.text`) has already been replaced with
+ * `{ inputLength, inputClass }` upstream. Backend may still apply an
+ * additional layer of PII redaction defence-in-depth (Phase B-SEC).
+ */
+export interface MobileStepSummary {
+  stepIndex: number;
+  commandType: string;
+  paramsSummary: Record<string, unknown>;
+  success: boolean;
+  durationMs: number;
+  errorMessage?: string;
+  startedAt: number;
+  completedAt: number;
+}
+
+export interface MobileStepHistoryResponse {
+  sessionId: string;
+  steps: MobileStepSummary[];
+  /** False ⇒ caller passed `?includeRawInputs=true`. */
+  redacted: boolean;
+  capturedAt: string;
+}
+
+export type MobileLogLevel = 'verbose' | 'debug' | 'info' | 'warn' | 'error';
+
+/**
+ * Response shape from runner `GET /api/sessions/:id/logs`. The runner
+ * already caps payload at ~2KB and applies the requested `level` filter
+ * before returning. Lines are unparsed (raw `adb logcat -d` output for
+ * Android, `xcrun simctl log show` for iOS sim, `go-ios syslog` for
+ * physical iOS).
+ */
+export interface MobileLogsResponse {
+  sessionId: string;
+  platform: 'android' | 'ios';
+  level: MobileLogLevel;
+  lines: string[];
+  /** True when the runner's 2KB cap kicked in OR a single line was character-truncated. */
+  truncated: boolean;
+  capturedAt: string;
+}
+
 // ── BullMQ Job Data ──────────────────────────────────────────────
 
 export interface MobileTestJobData {

@@ -19,9 +19,32 @@ import type {
   MobileIntentStep,
   MobileTestMetadata,
   MobileUiState,
+  MobileForegroundResponse,
+  MobileStepHistoryResponse,
+  MobileLogsResponse,
+  MobileLogLevel,
 } from './mobile-runner.types';
 import { MobileRunnerError } from './mobile-runner.types';
 import { mintRunnerUserToken } from './user-token';
+import { validateRunnerUrl, parseAllowedHosts } from './validate-runner-url';
+
+/**
+ * Phase B-SEC helper. Returns the hostname allowlist used by the
+ * SSRF guard, with the env-configured `MOBILE_RUNNER_URL` hostname
+ * auto-included. Pure: re-reads env each call so test overrides work
+ * without restart.
+ */
+function buildEffectiveAllowlist(): Set<string> {
+  const fromCsv = parseAllowedHosts(env.MOBILE_RUNNER_ALLOWED_HOSTS);
+  try {
+    const envHost = new URL(env.MOBILE_RUNNER_URL).hostname.toLowerCase();
+    fromCsv.add(envHost);
+  } catch {
+    // If env.MOBILE_RUNNER_URL is malformed, we'll fail in the validator
+    // a moment later with a clearer error — don't suppress it here.
+  }
+  return fromCsv;
+}
 
 // ============================================================================
 // CONFIGURATION
@@ -50,7 +73,42 @@ export class MobileRunnerClient {
   private geminiApiKey: string;
 
   constructor(opts?: { baseUrl?: string; apiKey?: string; geminiApiKey?: string }) {
-    this.baseUrl = (opts?.baseUrl || env.MOBILE_RUNNER_URL).replace(/\/$/, '');
+    const candidate = (opts?.baseUrl || env.MOBILE_RUNNER_URL).replace(/\/$/, '');
+    // Phase B-SEC: SSRF guard. Reject non-http(s) schemes, malformed
+    // URLs, and internal addresses (loopback / RFC1918 / link-local)
+    // unless explicitly allowlisted.
+    //
+    // The operator-configured `env.MOBILE_RUNNER_URL` is the trust
+    // anchor — by definition the deploy operator chose that URL, so
+    // we auto-grant its hostname even if it's internal (local dev
+    // points at `localhost:4100`; staging may sit on `10.0.x.y`).
+    // The validator THEN sees an allowlist that includes the env
+    // host, which means:
+    //   - Today (single-runner deploy): the env URL works, but if a
+    //     per-session callsite later passes a DIFFERENT internal
+    //     URL, it'll be rejected unless it's also allowlisted.
+    //   - Once `MOBILE_RUNNER_ALLOWED_HOSTS` is set, callers can pick
+    //     any of those, plus the env default.
+    //
+    // Crashing at construct time when misconfigured is intentional —
+    // better to fail fast on startup than silently route the chat to
+    // an unexpected host.
+    const effectiveAllowlist = buildEffectiveAllowlist();
+    const validation = validateRunnerUrl(candidate, effectiveAllowlist);
+    if (!validation.ok) {
+      // Phase B7: count SSRF rejections by reason so ops can tell
+      // "deploy misconfig" (host_not_allowed once at boot) from
+      // "active probing" (repeated invalid_url / internal_address).
+      // Lazy-require to dodge circular-import risk during module init.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { incCounter } = require('@/utils/core/mobile-chat-metrics') as typeof import('@/utils/core/mobile-chat-metrics');
+      incCounter('mobile_chat.ssrf_rejection', validation.reason);
+      throw new Error(
+        `MobileRunnerClient: refusing to construct with unsafe URL "${candidate}" — ${validation.reason}: ${validation.detail}. ` +
+          `Check MOBILE_RUNNER_URL and MOBILE_RUNNER_ALLOWED_HOSTS env vars.`,
+      );
+    }
+    this.baseUrl = candidate;
     this.apiKey = opts?.apiKey || env.MOBILE_RUNNER_API_KEY;
     this.geminiApiKey = opts?.geminiApiKey || env.GEMINI_API_KEY || '';
   }
@@ -514,6 +572,112 @@ export class MobileRunnerClient {
       // with 2s latency is fine; a double-screenshot on retry wastes the
       // device's time).
       timeoutMs: opts?.timeoutMs ?? 8_000,
+      noRetry: true,
+      signal: opts?.signal,
+      userId: opts?.userId,
+    });
+  }
+
+  // ── Phase B5 — cheap observation endpoints ─────────────────────
+
+  /**
+   * `GET /api/sessions/:id/foreground` — dumpsys-only foreground probe
+   * (Android) or WDA activeAppInfo (iOS). ~50-150ms typical, no a11y
+   * dump, no screenshot. Use this when the LLM only needs "what app
+   * is open right now?" — order-of-magnitude cheaper than
+   * `fetchUiState`.
+   *
+   * Returns the same `MobileActualForeground` shape that's embedded
+   * inside `MobileUiState.actualForeground`, plus the runner's
+   * mismatch verdict (session.packageName vs the device-fresh
+   * answer).
+   */
+  async fetchForeground(
+    sessionId: string,
+    opts?: { timeoutMs?: number; signal?: AbortSignal; userId?: string },
+  ): Promise<MobileForegroundResponse> {
+    return this.request<MobileForegroundResponse>(
+      'GET',
+      `/api/sessions/${sessionId}/foreground`,
+      {
+        // Tight budget: this endpoint is meant to be the fast lane. If
+        // it's slow, callers should escalate to fetchUiState. Don't retry
+        // — a stale-by-100ms answer beats double the dumpsys load.
+        timeoutMs: opts?.timeoutMs ?? 3_000,
+        noRetry: true,
+        signal: opts?.signal,
+        userId: opts?.userId,
+      },
+    );
+  }
+
+  /**
+   * `GET /api/sessions/:id/step-history?limit=N&includeRawInputs=...`
+   * — recent test-step records from the runner's in-memory
+   * `TestRunManager`. Never touches the device, so it returns
+   * essentially instantly (~1ms).
+   *
+   * `type_text.text` values are redacted by default at the runner
+   * (replaced with `{ inputLength, inputClass }`). Backend may also
+   * apply its own PII layer downstream for defence-in-depth.
+   *
+   * Pass `includeRawInputs: true` ONLY from explicitly-debug paths
+   * (operator tooling) — never from the chat path.
+   */
+  async fetchStepHistory(
+    sessionId: string,
+    opts?: {
+      limit?: number;
+      includeRawInputs?: boolean;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+      userId?: string;
+    },
+  ): Promise<MobileStepHistoryResponse> {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts?.includeRawInputs === true) params.set('includeRawInputs', 'true');
+    const qs = params.toString();
+    const path = `/api/sessions/${sessionId}/step-history${qs ? `?${qs}` : ''}`;
+    return this.request<MobileStepHistoryResponse>('GET', path, {
+      timeoutMs: opts?.timeoutMs ?? 3_000,
+      noRetry: true,
+      signal: opts?.signal,
+      userId: opts?.userId,
+    });
+  }
+
+  /**
+   * `GET /api/sessions/:id/logs?level=warn&limit=N&since=ISO` — logcat
+   * tail (Android) or unified-log tail (iOS sim / physical). Runner
+   * caps the payload at ~2KB and trims by `level` server-side, so
+   * the response is already compact enough to fit in an LLM prompt.
+   *
+   * `since` is silently ignored on iOS in v1 (the simctl wrapper uses
+   * `--last 1m` rather than absolute timestamps); on Android it's
+   * passed through as `logcat -T` with a basic safety check.
+   */
+  async fetchRecentLogs(
+    sessionId: string,
+    opts?: {
+      level?: MobileLogLevel;
+      limit?: number;
+      since?: string;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+      userId?: string;
+    },
+  ): Promise<MobileLogsResponse> {
+    const params = new URLSearchParams();
+    if (opts?.level !== undefined) params.set('level', opts.level);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts?.since !== undefined) params.set('since', opts.since);
+    const qs = params.toString();
+    const path = `/api/sessions/${sessionId}/logs${qs ? `?${qs}` : ''}`;
+    return this.request<MobileLogsResponse>('GET', path, {
+      // adb logcat is bounded by a server-side timeout (10s) AND a
+      // payload cap; we wait up to 6s for the round trip.
+      timeoutMs: opts?.timeoutMs ?? 6_000,
       noRetry: true,
       signal: opts?.signal,
       userId: opts?.userId,
