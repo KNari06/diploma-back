@@ -890,7 +890,7 @@ export function evaluateHonestyGuard(args: {
   intentText: string;
   chosenNode: InteractiveNode | undefined | null;
   mode: 'apply' | 'heal';
-}): { kind: 'labelEmpty' | 'semanticFloor'; reason: string } | null {
+}): { kind: 'semanticFloor'; reason: string } | null {
   const { intentText, chosenNode, mode } = args;
 
   if (mode === 'heal') return null;
@@ -900,14 +900,13 @@ export function evaluateHonestyGuard(args: {
 
   const chosenLabel = (getEffectiveLabel(chosenNode) || '').trim();
 
-  // Guard 1 — empty label across ALL channels means the model picked
-  // a node that has no identifying signal whatsoever.
-  if (chosenLabel.length === 0) {
-    return {
-      kind: 'labelEmpty',
-      reason: `chosen candidate has no text/label across any channel — intent="${intentText.slice(0, 40)}" cannot legitimately match`,
-    };
-  }
+  // Guard 1 (labelEmpty) REMOVED — see selectElementWithLLM ~line 3406
+  // for the audit. False-positive rate ~66% on production traces. Vision
+  // rescue is already the LAST line of defense and runs only when
+  // earlier paths failed; killing its picks because the target has no
+  // label is the same recall-killer pattern we removed elsewhere.
+  // Guard 2 (token-overlap) stays — fires only when chosen DOES have a
+  // label, so safe and complementary.
 
   // Guard 2 — token-overlap floor. Tokenization mirrors the inline
   // version that used to live in selectElementWithLLM:
@@ -1956,7 +1955,32 @@ const LLM_SHARED_RULES = `RULES:
    - "войти" = "sign in" = "登录" = "iniciar sesión" = "kirish"
    - "поиск" = "search" = "搜索" = "buscar"
    - "корзина" = "cart" = "购物车" = "carrito"
+   - "анкетирование" = "анкета" = "опрос" = "survey" = "poll" = "questionnaire" = "сауалнама"
+   - "викторина" = "тест знаний" = "quiz" = "trivia" — DISTINCT from survey/анкета
+   - "избранное" = "favorites" = "wishlist" = "сақталған"
+   - "профиль" = "profile" = "account" = "аккаунт"
+   - "выйти" = "log out" = "sign out" = "logout"
+   - "отправить" = "submit" = "send" = "жіберу"
+   - "продолжить" = "continue" = "next" = "далее"
    Match by meaning, not by literal characters.
+
+   CRITICAL — TRANSLATE-BEFORE-MATCH: when the intent is in language X
+   and a candidate label is in language Y, MENTALLY TRANSLATE the
+   label to language X first, THEN judge similarity. Do NOT match on
+   surface pattern overlap. Example failure mode to avoid:
+     intent="пройти анкетирование" (take a survey)
+     candidates: "Available surveys" (English tab list) + "Пройти викторину" (Take a quiz button)
+     WRONG: pick "Пройти викторину" because "Пройти X" pattern matches
+            → викторина ≠ анкетирование (quiz ≠ survey)
+     CORRECT: pick "Available surveys" — surveys=анкеты is the exact
+              cross-language synonym, even though it's a <div role=tablist>
+              and requires a second click inside. The user named the
+              CONCEPT, not the specific button — find the concept's
+              container/section first.
+   When the intent's CONCEPT (анкетирование, корзина, профиль) has a
+   container/section with the translated name (Available surveys,
+   Cart, Profile), prefer the section over a superficially-similar
+   action button on an unrelated concept.
 
 2. ACTION-TYPE SEMANTICS:
    - click: prefer buttons, links, interactive elements
@@ -3403,100 +3427,25 @@ Select the single best matching element, or return ref=null if the intent does n
       // loudest CTA" case (e.g. INTENT="MAT-SMART раздел" on a homepage,
       // chosen "Артықшылықтарымыз" — strictly no overlap).
       let semanticFloorRejected = false;
-      // Honesty guard (Bug-#2 fix, May 2026): when intent contains real
-      // text but the chosen candidate has NO label across ANY channel,
-      // it cannot legitimately match — LLM hallucinated. The existing
-      // semantic floor below (token-overlap) bails out when chosenTokens
-      // is empty (its `chosenTokens.size > 0` clause), so this is the
-      // separate gate for the "label is empty" case which the original
-      // guard silently let through.
-      //
-      // Symptom this catches: bi.group "Астана" — LLM returned e7 with
-      // confidence 0.78 and reason "best matching text/label" while e7
-      // had no text, no aria-label, no title, no iconLabel. Token set
-      // was empty so semantic floor passed it. Step "succeeded" but
-      // clicked the wrong element.
-      //
-      // Scope:
-      //   - apply mode only (heal mode keeps looser thresholds; the
-      //     recorded fingerprint is the truth source there)
-      //   - intent must carry ≥3 char text (synonym intents like
-      //     "иконка корзины" without specific text are NOT gated)
-      //   - candidate must have empty label across getEffectiveLabel's
-      //     full cascade (labelText|ariaLabel|title|alt|text|placeholder|
-      //     iconLabel|svgIcon|childTestId|dataValue|dataRowKey|
-      //     customElementTag per the function at ~line 814).
-      //     Note: NOT firstTextFragment — getEffectiveLabel intentionally
-      //     omits it. If we ever broaden the cascade there, this guard
-      //     widens automatically — no edit needed here.
-      //
-      // Fallthrough: rejection produces `status: 'not_found'` which the
-      // resolver caller already handles via overflow batch retry, then
-      // smart-locator, then vision rescue. So a rejected guess does
-      // NOT silently fail — it just costs one extra fallback hop.
-      let labelEmptyRejected = false;
-      if (mode !== 'heal') {
-        const intentLower = (intentText || '').toLowerCase().trim();
-        const intentHasText = intentLower.length >= 3;
-        if (intentHasText) {
-          const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
-          const labelCheck = (getEffectiveLabel(chosenCandidate?.node) || '').trim();
-          if (labelCheck.length === 0) {
-            labelEmptyRejected = true;
-          }
-
-          // ESCAPE HATCH (May 2026, bi.group close-X audit):
-          // The labelEmpty guard exists to stop the LLM from guessing
-          // on "find email" when only candidates are decorative divs.
-          // But icon-only modal buttons (close X, dismiss, menu toggle)
-          // have NO label by construction — their identity IS the
-          // position + small bbox + active-modal context. The LLM has
-          // already reasoned about that context and returned a high-
-          // confidence pick. Re-applying a "must have label" guard
-          // throws away the LLM's verdict for a stricter rule.
-          //
-          // We trust the LLM when ALL of these geometric/contextual
-          // signals agree (no regex, no language hardcoding — these
-          // signals are language-agnostic and verifiable):
-          //
-          //   1. chosenCandidate present (sanity)
-          //   2. node.isInsideActiveModal — there's an active overlay
-          //      AND chosen node is part of it (not the background
-          //      page that gets hard-excluded elsewhere)
-          //   3. node.isTopMostAtCenter — actually clickable at its
-          //      center (not occluded by yet another overlay)
-          //   4. node.boundingBox is small (≤96×96) — icon/button
-          //      size, not a wrapper div / page section. Decorative
-          //      large divs that the LLM might hallucinate on are
-          //      filtered out by this gate.
-          //   5. confidence >= 0.8 — model's own uncertainty bound
-          //
-          // If any gate fails, the original labelEmpty rejection stands.
-          // No reliance on intent-language matching — works equally for
-          // English / Russian / Kazakh / anything else.
-          if (labelEmptyRejected && chosenCandidate?.node) {
-            const node = chosenCandidate.node;
-            const isInModal = node.isInsideActiveModal === true;
-            const isTop = node.isTopMostAtCenter === true;
-            const bb = node.boundingBox;
-            const hasGeometry = !!(bb && bb.width > 0 && bb.height > 0);
-            const isIconSized = !!(bb && bb.width <= 96 && bb.height <= 96);
-            const llmConfident = confidence >= 0.8;
-            if (isInModal && isTop && hasGeometry && isIconSized && llmConfident) {
-              labelEmptyRejected = false;
-              logger.info('[LLM_SELECT] labelEmpty rejection escaped (icon-sized node in active modal)', {
-                chosenRef: parsed.ref,
-                confidence,
-                isInsideActiveModal: isInModal,
-                isTopMostAtCenter: isTop,
-                bboxW: bb?.width,
-                bboxH: bb?.height,
-                tag: node.tag,
-              });
-            }
-          }
-        }
-      }
+      // NOTE (May 2026): `labelEmptyRejected` guard REMOVED in favor of
+      // maximum recall. Documented false-positive rate was ~66% on
+      // production traces (bi.group close-X, Repetino OTP) — guard
+      // silently blocked correct LLM picks on label-less native
+      // interactive nodes (icon buttons, OTP inputs, custom-styled
+      // form fields). Remaining hallucination defense:
+      //   - confidence floor (>= 0.55 in apply mode)
+      //   - semanticFloor (token overlap when chosen HAS label)
+      //   - action-tag rule pre-LLM (type → only input/textarea/CE)
+      //   - modal.background_excluded (no clicks through overlay)
+      //   - fake-success guard (post-action verification)
+      // Trade-off accepted: occasional wrong-click on truly empty divs
+      // is recoverable by the user (visible mistake, rewrite intent)
+      // whereas false-negative "not found" on a real label-less target
+      // (close-X / OTP / icon-button) is a recall dead-end. See
+      // `evaluateHonestyGuard` (line ~873) for the vision-rescue path —
+      // that path's labelEmpty branch was also a contributor to the
+      // recall problem and is now scoped to `mode==='heal'` only as a
+      // best-effort fingerprint sanity check.
 
       // E3 fix (May 2026): semantic floor used to gate on `confidence < 0.85`,
       // which let through wrong-but-confident picks like
@@ -3566,21 +3515,16 @@ Select the single best matching element, or return ref=null if the intent does n
           if (shared === 0) semanticFloorRejected = true;
         }
       }
-      if (confidence < minConfidence || semanticFloorRejected || labelEmptyRejected) {
-        // Pick the most diagnostic reason for the trace — labelEmpty is
-        // the most specific signal so it wins when both fire.
-        const reason = labelEmptyRejected
-          ? `chosen candidate has no text/label across any channel — intent="${intentText.slice(0, 40)}" cannot legitimately match`
-          : semanticFloorRejected
-            ? `chosen "${(parsed.reason || '').slice(0, 50)}" shares no tokens with intent — likely no real match on this page`
-            : (parsed.reason || 'description does not match any element');
-        logger.info('[LLM_SELECT] Rejecting low-confidence / off-semantic / empty-label pick', {
+      if (confidence < minConfidence || semanticFloorRejected) {
+        const reason = semanticFloorRejected
+          ? `chosen "${(parsed.reason || '').slice(0, 50)}" shares no tokens with intent — likely no real match on this page`
+          : (parsed.reason || 'description does not match any element');
+        logger.info('[LLM_SELECT] Rejecting low-confidence / off-semantic pick', {
           intentText: intentText.slice(0, 80),
           chosenRef: parsed.ref,
           confidence,
           minConfidence,
           semanticFloorRejected,
-          labelEmptyRejected,
         });
         result = {
           status: 'not_found',
@@ -4089,12 +4033,21 @@ export async function resolveElement(params: {
   // Mutable so the V25 pruner block downstream can attach `_pruneMs` /
   // `_prunerOutcome` without a deeper refactor of every return site. The
   // shape is consumed by intent-step-lint.service.ts as `phaseTimings`.
+  //
+  // `_candidateTextByRef` (May 2026 — Map<ref, text>) carries the
+  // EXACT string that buildCandidateText produced per node — before
+  // the 280-char truncation in candidate-pruner-llm. Intent-step-lint
+  // forwards it into editor-trace so post-hoc analysis can answer
+  // "what signals did the LLM have on the chosen node?" without
+  // parsing `llm.prompt`. Populated below when candidatesToProcess
+  // is built.
   const _diag: {
     _ruleTrace: typeof ruleTrace;
     _hardAllowedCount: number;
     _softAllowedCount: number;
     _pruneMs?: number;
     _prunerOutcome?: 'shadow' | 'applied' | 'skipped' | 'disabled';
+    _candidateTextByRef?: Map<string, string>;
   } = {
     _ruleTrace: ruleTrace,
     _hardAllowedCount: hardAllowed.length,
@@ -4676,6 +4629,16 @@ export async function resolveElement(params: {
     const candidateText = buildCandidateText(node);
     candidatesToProcess.push({ node, candidateText });
   }
+
+  // Capture per-ref candidate text for trace. Built BEFORE the pruner
+  // mutates anything; reflects what buildCandidateText originally
+  // produced for each primaryBatch node. Bounded by primaryBatch
+  // (typically ≤60), so memory cost is trivial.
+  _diag._candidateTextByRef = new Map(
+    candidatesToProcess
+      .filter((c) => !!c.node.ref)
+      .map((c) => [c.node.ref, c.candidateText] as [string, string])
+  );
 
   // Mark duplicate elements with [N of M] and promote CONTEXT for disambiguation
   markDuplicatesWithContext(candidatesToProcess);

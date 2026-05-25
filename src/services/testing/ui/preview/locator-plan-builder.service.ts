@@ -1489,8 +1489,29 @@ export class LocatorPlanBuilder {
      * — only the cap thresholds and ban-lists differ.
      */
     config?: LocatorConfig;
+    /**
+     * Etap May 2026 — optional callback fired once after the live
+     * `count()` validation phase. Receives aggregate counts (total /
+     * valid / unique / dead / ambiguous) so callers with their own
+     * trace (editor-trace JSONL) can emit a `compiled_validation`
+     * event without duplicating the logger.info that already runs
+     * inside validateOnPage. NEVER throws — wrap in try/catch on the
+     * caller side anyway to keep build path resilient.
+     *
+     * When omitted, validation still runs and emits the server-side
+     * log; only the JSONL trace event is skipped.
+     */
+    onValidation?: (stats: {
+      total: number;
+      valid: number;
+      unique: number;
+      dead: number;
+      ambiguous: number;
+      maxAmbiguous: number;
+      durationMs: number;
+    }) => void;
   }): Promise<CompiledStepPlan> {
-    const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef, pageSignature, page } = params;
+    const { step, resolvedNode, pageUrl, pageTitle, snapshotRef, screenshotRef, pageSignature, page, onValidation } = params;
     const config = params.config ?? DEFAULT_LOCATOR_CONFIG;
 
     logger.debug('[LOCATOR_PLAN_BUILDER] Building compiled plan', {
@@ -1538,7 +1559,27 @@ export class LocatorPlanBuilder {
     let validatedAt: string | undefined;
 
     if (page && rawPlan.length > 0) {
+      const validationStart = Date.now();
       const validated = await validateOnPage(rawPlan, page, config);
+      // Compute aggregate stats from the same `validated` array the
+      // logger.info inside validateOnPage already reads. Re-derived
+      // here (cheap) so we don't have to plumb a return type through
+      // a function with one call site.
+      if (onValidation) {
+        try {
+          const thresholdsLocal = config.thresholds ?? DEFAULT_LOCATOR_CONFIG.thresholds;
+          const maxAmbiguousLocal = thresholdsLocal.maxAmbiguous ?? DEFAULT_LOCATOR_CONFIG.thresholds.maxAmbiguous;
+          onValidation({
+            total: validated.length,
+            valid: validated.filter((r) => r.validated).length,
+            unique: validated.filter((r) => r.matchCount === 1).length,
+            dead: validated.filter((r) => r.matchCount === 0).length,
+            ambiguous: validated.filter((r) => typeof r.matchCount === 'number' && r.matchCount > maxAmbiguousLocal).length,
+            maxAmbiguous: maxAmbiguousLocal,
+            durationMs: Date.now() - validationStart,
+          });
+        } catch { /* callback never breaks the build path */ }
+      }
       locatorPlan = sortAndCap(validated, config);
       // Plan is unverified if not a single locator survived validation.
       // sortAndCap's fallback path keeps top-3 with validated=false, so

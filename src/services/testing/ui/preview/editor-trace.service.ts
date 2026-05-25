@@ -652,8 +652,26 @@ export class EditorTraceService {
     evidenceRef?: string;
     /** Total resolution time in ms */
     latencyMs: number;
+    /**
+     * Optional per-node candidateText (the EXACT string the LLM saw
+     * for this node, before the 280-char truncation). When the caller
+     * passes it as a Map<ref, text>, this writer attaches the text
+     * to each entry in `domSnapshot` so post-hoc analysis can answer
+     * "what signals did the LLM have on the chosen node?" without
+     * parsing `llm.prompt`.
+     *
+     * When omitted, domSnapshot entries get no `candidateText` field —
+     * back-compat with older call sites.
+     */
+    candidateTextByRef?: Map<string, string>;
   }): void {
-    // Build compact DOM snapshot — only fields useful for debugging
+    // Build compact DOM snapshot — only fields useful for debugging.
+    // Includes the per-node candidateText (when caller supplied a map)
+    // so analysts can see exactly what string the LLM consumed for
+    // each candidate. Truncated to 320 chars (one cap above the 280
+    // the candidate-pruner uses — so the FULL pre-truncation string
+    // is preserved; the cap is just defense against pathologic input).
+    const textMap = data.candidateTextByRef;
     const domSnapshot = data.domNodes.slice(0, 100).map((n) => ({
       ref: n.ref,
       tag: n.tag,
@@ -668,11 +686,27 @@ export class EditorTraceService {
       isInsideActiveModal: n.isInsideActiveModal || undefined,
       isTopMostAtCenter: n.isTopMostAtCenter,
       containerTitles: n.containerTitles?.length ? n.containerTitles : undefined,
+      ...(textMap && n.ref && textMap.get(n.ref)
+        ? { candidateText: safeSlice(textMap.get(n.ref) || '', 320) }
+        : {}),
     }));
 
     // Build compact rule trace — group by ruleId for readability
     const rulesSummary = data.ruleTrace
       ? summarizeRuleTrace(data.ruleTrace)
+      : undefined;
+
+    // Excluded refs — flatten ruleTrace entries whose action===exclude.
+    // Lets the analyst answer "which refs did rule-engine drop before
+    // LLM saw them?" without iterating `rules` and grouping manually.
+    // Deduplicated; capped at 50 to keep the JSONL compact on dense
+    // pages where modal.background_excluded can list 200+ refs.
+    const excludedRefs = data.ruleTrace
+      ? Array.from(new Set(
+          data.ruleTrace
+            .filter((e) => e.action === 'exclude')
+            .flatMap((e) => e.affectedRefs)
+        )).slice(0, 50)
       : undefined;
 
     // Compact result
@@ -723,6 +757,10 @@ export class EditorTraceService {
         latencyMs: data.latencyMs,
         result: resultSummary,
         rules: rulesSummary,
+        // Flat list of refs the rule-engine hard-excluded before LLM.
+        // Lets analysts answer "where did the right candidate go?"
+        // without parsing `rules[].affectedRefs` manually.
+        ...(excludedRefs && excludedRefs.length > 0 ? { excludedRefs } : {}),
         domSnapshot,
         llm: llmTrace,
       },
@@ -955,6 +993,43 @@ export class EditorTraceService {
     this.writer.write({
       stage: 'resolution',
       eventType: 'compiled_reorder',
+      payload: data,
+    });
+  }
+
+  /**
+   * Fired once per build-time validation phase (Etap 1A). Aggregate
+   * counts across the WHOLE compiled plan — not per-attempt.
+   *
+   * Use case: explains WHY a compiled run failed with zero apply
+   * attempts. `compiled_attempt` records per-strategy results but if
+   * ALL strategies returned 0 matches the trace previously showed only
+   * the final not_found — no signal that the whole plan was dead on
+   * arrival. With this event the analyst sees `dead: 5/5` and knows
+   * to look at the page, not at the resolver.
+   *
+   * Mirrors the existing `[LOCATOR_PLAN_BUILDER] Validation phase`
+   * server log (locator-plan-builder.service.ts ~line 1356) but
+   * surfaces it into the per-session JSONL so post-hoc analysis
+   * doesn't need backend log access.
+   */
+  writeCompiledValidation(data: {
+    stepId?: string;
+    total: number;
+    /** matchCount === 1 (unambiguous) */
+    unique: number;
+    /** matchCount === 0 (locator finds nothing on the live page) */
+    dead: number;
+    /** matchCount > maxAmbiguous (too many matches to disambiguate) */
+    ambiguous: number;
+    /** Combined non-dead-non-ambiguous count (same as logger info). */
+    valid: number;
+    maxAmbiguous: number;
+    durationMs: number;
+  }): void {
+    this.writer.write({
+      stage: 'resolution',
+      eventType: 'compiled_validation',
       payload: data,
     });
   }

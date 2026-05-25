@@ -1465,6 +1465,17 @@ export interface LintResult {
   _hardAllowedCount?: number;
   /** @internal Soft allowed count */
   _softAllowedCount?: number;
+  /**
+   * @internal Map of ref → exact candidateText buildCandidateText
+   * produced for that node (before the 280-char truncation in the
+   * candidate pruner). Populated by selectElementWithLLM; consumed by
+   * intent-step-lint when emitting `element_resolution` editor trace
+   * so post-hoc analysis can answer "what signals did the LLM see on
+   * the chosen node?" without parsing `llm.prompt`. Undefined when
+   * the resolver took a non-LLM path (evidence shortcut, identity
+   * fast-path).
+   */
+  _candidateTextByRef?: Map<string, string>;
   /** @internal LLM call trace (prompt + response) for debugging */
   _llmTrace?: {
     model: string;
