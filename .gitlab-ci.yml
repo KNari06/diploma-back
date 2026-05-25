@@ -54,7 +54,7 @@ stages:
 # ─────────────────────────────────────────────────────────────────
 build:
   stage: build
-  image: mcr.microsoft.com/azure-cli
+  image: mcr.microsoft.com/azure-cli:azurelinux3.0
   services:
     - name: docker:26-dind
       alias: docker
@@ -62,20 +62,34 @@ build:
     - if: '$CI_COMMIT_BRANCH == "main"'
   <<: *azure_auth
   script:
-    - apk add --no-cache docker-cli
-    - echo "🔐 Login to ACR via Managed Identity"
-    - az acr login --name "$ACR_NAME"
-    - echo "🔨 Building $IMAGE"
     - |
+      set -euo pipefail
+
+      echo "🐳 Installing Docker CLI (Azure Linux uses tdnf, не apk)"
+      tdnf install -y moby-cli ca-certificates
+      tdnf clean all
+
+      echo "⏳ Waiting for Docker daemon..."
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        sleep 2
+      done
+      docker info >/dev/null
+
+      echo "🔐 Login to ACR via Managed Identity"
+      az acr login --name "$ACR_NAME"
+
+      echo "🔨 Building $IMAGE"
       docker pull "$IMAGE_LATEST" 2>/dev/null || true
       docker build \
         --cache-from "$IMAGE_LATEST" \
         --tag "$IMAGE" \
         --tag "$IMAGE_LATEST" \
         .
-    - echo "⬆️  Pushing to ACR..."
-    - docker push "$IMAGE"
-    - docker push "$IMAGE_LATEST"
+
+      echo "⬆️ Pushing to ACR..."
+      docker push "$IMAGE"
+      docker push "$IMAGE_LATEST"
 
 # ─────────────────────────────────────────────────────────────────
 # Деплой API — Container App (публичный ingress на 3000)
@@ -83,7 +97,7 @@ build:
 # ─────────────────────────────────────────────────────────────────
 deploy:api:
   stage: deploy
-  image: mcr.microsoft.com/azure-cli
+  image: mcr.microsoft.com/azure-cli:azurelinux3.0
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
   needs: [build]
@@ -112,7 +126,7 @@ deploy:api:
 # ─────────────────────────────────────────────────────────────────
 deploy:worker:
   stage: deploy
-  image: mcr.microsoft.com/azure-cli
+  image: mcr.microsoft.com/azure-cli:azurelinux3.0
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
   needs: [build]
