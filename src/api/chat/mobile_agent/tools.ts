@@ -2697,7 +2697,31 @@ function formatSnapshotForLlm(
   ]
     .filter(Boolean)
     .join('\n');
-  return `${header}\n${snap.formattedTree}`;
+
+  // MED-3 fix: parity with the eager-inject path
+  // (`mobile-context.service.ts:formatMobileSnapshotForChat`). The a11y
+  // tree is user-controlled content from arbitrary apps \u2014 it may carry
+  // PII (emails / OTPs / cards inside EditText) AND prompt-injection
+  // payloads ("Ignore previous instructions" planted in a TextView).
+  //
+  // Two transforms, in order:
+  //   1. redactPii \u2014 env-gated via MOBILE_CHAT_PII_REDACTION (default
+  //      ON). Stops user PII visible on screen from leaking to OpenAI/
+  //      Gemini logs.
+  //   2. wrapUntrusted \u2014 always on. Frames the tree with markers and
+  //      strips forged copies of those markers, so the system prompt's
+  //      untrusted-content policy applies to it the same way as the
+  //      eager-inject block.
+  //
+  // Order matters: redact FIRST so PII never sits between the markers
+  // even briefly, then wrap. The header is OUR text (snap fields are
+  // controlled by the runner, not by app content) \u2014 we don't wrap that.
+  let body = snap.formattedTree ?? '';
+  if (env.MOBILE_CHAT_PII_REDACTION) {
+    body = redactPii(body);
+  }
+  const wrappedBody = wrapUntrusted(body);
+  return `${header}\n${wrappedBody}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

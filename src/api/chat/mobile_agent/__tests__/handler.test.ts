@@ -32,6 +32,28 @@ jest.mock('@/utils/core/logger', () => ({
   logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
+// HIGH-1 fix: handler now calls assertMobileSessionOwnership against
+// Redis. Default-allow in these mocks so the existing happy-path tests
+// keep asserting their original contract. The dedicated authz suite
+// at the bottom overrides this on a per-test basis.
+jest.mock('@/services/mobile/mobile-session-authz', () => {
+  class MobileSessionAuthzError extends Error {
+    constructor(public readonly reason: string, message: string) {
+      super(message);
+      this.name = 'MobileSessionAuthzError';
+    }
+  }
+  return {
+    assertMobileSessionOwnership: jest.fn().mockResolvedValue(undefined),
+    MobileSessionAuthzError,
+  };
+});
+
+jest.mock('@/utils/core/mobile-chat-metrics', () => ({
+  incCounter: jest.fn(),
+  observeMs: jest.fn(),
+}));
+
 jest.mock('../progress', () => ({
   emitMobileAgentThinking: jest.fn(),
   emitMobileToolStep: jest.fn(),
@@ -260,5 +282,68 @@ describe('handleMobileAgent — existing contracts unchanged', () => {
     expect(res._status).toBe(200);
     expect((res._body as any).success).toBe(false);
     expect((res._body as any).reply).toMatch(/Something went wrong/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HIGH-1: ownership guard — foreign mobileSessionId must NOT reach runner
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('handleMobileAgent — mobileSessionId ownership guard', () => {
+  // Pull the mocked symbol fresh per describe so we can override the
+  // default-allow behaviour set at module scope.
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const authz = require('@/services/mobile/mobile-session-authz') as {
+    assertMobileSessionOwnership: jest.Mock;
+    MobileSessionAuthzError: new (reason: string, message: string) => Error;
+  };
+  /* eslint-enable @typescript-eslint/no-require-imports */
+
+  it('returns 403 + does NOT touch the runner when sessionId is not owned', async () => {
+    authz.assertMobileSessionOwnership.mockRejectedValueOnce(
+      new authz.MobileSessionAuthzError(
+        'no_warmup',
+        'No warmup binding found for user u1 → session foreign-sess',
+      ),
+    );
+
+    const res = mockRes();
+    await handleMobileAgent({} as any, res as any, {
+      message: 'tap login',
+      userId: 'u1',
+      workspace_id: 'w1',
+      chatSessionId: 'chat-1',
+      context: { mobileSessionId: 'foreign-sess', mobileEditorMode: true },
+    });
+
+    // 403 — authenticated but not authorised for THIS resource.
+    expect(res._status).toBe(403);
+    expect((res._body as any).success).toBe(false);
+
+    // Critical: eager fetch and pipeline must NOT have run. A buggy
+    // implementation could 403 the response but still leak a runner
+    // observation against the foreign session — assert both stayed
+    // untouched.
+    expect(mockedResolve).not.toHaveBeenCalled();
+    expect(mockedPipeline).not.toHaveBeenCalled();
+  });
+
+  it('proceeds normally when ownership check passes (regression guard)', async () => {
+    authz.assertMobileSessionOwnership.mockResolvedValueOnce(undefined);
+    mockedResolve.mockResolvedValue(baseSnapshot);
+    mockedPipeline.mockReturnValue(happyPipelineResult());
+
+    const res = mockRes();
+    await handleMobileAgent({} as any, res as any, {
+      message: 'hi',
+      userId: 'u1',
+      workspace_id: 'w1',
+      chatSessionId: 'chat-1',
+      context: { mobileSessionId: 'sess-1', mobileEditorMode: true },
+    });
+
+    expect(res._status).toBe(200);
+    expect((res._body as any).success).toBe(true);
+    expect(mockedPipeline).toHaveBeenCalled();
   });
 });

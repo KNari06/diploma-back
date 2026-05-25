@@ -28,6 +28,10 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { isReasoningPersistEnabled } from './reasoning-trace';
 import { resolveMobileSessionContext } from '@/services/chat/mobile-context.service';
 import { incCounter, observeMs } from '@/utils/core/mobile-chat-metrics';
+import {
+  assertMobileSessionOwnership,
+  MobileSessionAuthzError,
+} from '@/services/mobile/mobile-session-authz';
 
 interface MobileAgentParams {
   message: string;
@@ -68,6 +72,47 @@ export async function handleMobileAgent(
       sessionId: chatSessionId,
     });
     return;
+  }
+
+  // HIGH-1 fix: verify the client-supplied `mobileSessionId` actually
+  // belongs to this authenticated user BEFORE we touch the runner. The
+  // chat surface only validates the *shape* of the string in
+  // `decideForceRoute`; an attacker who knows another user's sessionId
+  // could otherwise observe/tap/type into a foreign session.
+  //
+  // Done BEFORE constructing the blackboard / running eager-fetch so a
+  // forged sessionId never reaches `fetchUiState`. A 403 here is the
+  // correct semantic — the request was authenticated but not authorised
+  // for THIS resource. We log + count the rejection for ops visibility.
+  try {
+    await assertMobileSessionOwnership(userId, mobileSessionId);
+  } catch (authzErr) {
+    if (authzErr instanceof MobileSessionAuthzError) {
+      incCounter('mobile_chat.authz_rejection', authzErr.reason);
+      logger.warn('[MOBILE_AGENT] Rejected unauthorised mobileSessionId', {
+        userId,
+        mobileSessionId,
+        reason: authzErr.reason,
+      });
+      // Don't persist the foreign sessionId into chat history — pass
+      // the bare fallback reply through saveMobileChatTurn the same way
+      // a "no session" turn does.
+      await saveMobileChatTurn(
+        chatSessionId,
+        message,
+        NO_SESSION_REPLY,
+        { noSession: true, authzRejected: true },
+        'mobile_agent',
+      );
+      res.status(403).json({
+        success: false,
+        reply: NO_SESSION_REPLY,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
+    }
+    throw authzErr;
   }
 
   const blackboard = new MobileBlackboard({
