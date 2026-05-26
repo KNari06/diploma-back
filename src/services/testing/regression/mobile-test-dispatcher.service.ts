@@ -107,7 +107,9 @@ export class MobileTestDispatcherService {
     //   );
     //   const { steps: stitchedSteps, counts: phaseCounts, didStitch } =
     //     stitchPhases(rawMainSteps, intentCase);
-    const { normaliseIntentStep } = await import('./intent-step-dispatch.service');
+    const { normaliseIntentStep, sanitizeMobileAppPackageSteps } = await import(
+      './intent-step-dispatch.service'
+    );
     const stitchedSteps = (intentCase.steps_json || []).map((step: any, index: number) =>
       normaliseIntentStep(step, index),
     );
@@ -123,6 +125,11 @@ export class MobileTestDispatcherService {
         `Mobile test case "${intentCase.name}" has no steps (steps_json is empty)`,
       );
     }
+
+    // open_app/close_app: rewrite stale display labels (e.g. "ANDROID") to the
+    // resolved build's package so the runner acts on the app under test instead
+    // of failing on a non-existent package. Shared helper — see its doc.
+    sanitizeMobileAppPackageSteps(intentSteps, resolvedBuild?.packageName);
 
     // 3b. Shared resources (Login / Environment / Secret / ...) — Option A.
     //

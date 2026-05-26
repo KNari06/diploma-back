@@ -20,6 +20,7 @@ import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.se
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { MobilePlatform, MobileIntentStep, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { toMobilePlatformKey } from '@/services/mobile/mobile-runner.types';
+import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
 import { IntelligentTestStorageService } from '@/services/testing/results/intelligent-test-storage.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
@@ -367,6 +368,10 @@ export async function handleMobileTest(
     if (analyticsRunId) {
       AnalyticsQueryService.invalidateWorkspaceCaches(workspace_id);
     }
+
+    // Normalise open_app/close_app package targets (stale "ANDROID" labels →
+    // resolved package) before the runner sees them.
+    sanitizeMobileAppPackageSteps(intentSteps, appPackage);
 
     // ── Step 7: Queue BullMQ job ──────────────────────────────────
     const jobData: MobileTestJobData = {

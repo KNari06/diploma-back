@@ -13,6 +13,7 @@ import { QueueManager, redisConnection } from '@/config/infrastructure/queues';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData, MobileTestMetadata } from '@/services/mobile/mobile-runner.types';
+import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import {
   MobileAppStorageService,
   MobileAppMetadata,
@@ -385,6 +386,10 @@ export async function triggerCiRun(req: Request, res: Response): Promise<void> {
 
       // Track in CI run
       await CiRunService.addTestToRun(runId, testId, tc.id, tc.name);
+
+      // Normalise open_app/close_app package targets (stale "ANDROID" labels →
+      // resolved package) before the runner sees them.
+      sanitizeMobileAppPackageSteps(tc.intentSteps, appPackage);
 
       // Queue BullMQ job
       const jobData: MobileTestJobData = {
