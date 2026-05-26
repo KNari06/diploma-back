@@ -513,6 +513,9 @@ export class MobileRunnerClient {
     message?: string;
     /** Compiled locator plan built from the resolved node — persist onto IntentStep. */
     compiledPlan?: import('./mobile-runner.types').MobileCompiledPlan;
+    visibleNodeCount?: number;
+    topNodes?: string[];
+    intentWords?: string[];
   }> {
     return this.request('POST', `/api/commands/${sessionId}/lint`, {
       // Only attach bindingHints when we actually have some — keeps the wire
