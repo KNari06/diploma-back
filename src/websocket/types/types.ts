@@ -164,6 +164,17 @@ export interface ClientToServerEvents {
 
   // Heartbeat
   ping: () => void;
+
+  // Mobile-runner activity keepalive. Live device interactions (tap/swipe/
+  // typing) and recording actions are forwarded straight to the mobile
+  // runner's own socket and never reach the backend, so an actively-used
+  // session would otherwise be torn down at ~15 min. The frontend emits this
+  // (throttled) on each such action; on the server it keeps BOTH 15-min
+  // windows alive: the in-memory idle timers (via the `socket.use()` activity
+  // middleware in core/server.ts — this event is intentionally NOT in
+  // IDLE_BACKGROUND_EVENTS) and the Redis `mobile_warmup` binding (via
+  // `refreshWarmupTtl` in heartbeat.handler.ts). See mobile-idle.service.ts.
+  'mobile:keepalive': () => void;
 }
 
 // ============================================================================

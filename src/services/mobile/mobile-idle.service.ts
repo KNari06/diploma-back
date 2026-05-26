@@ -38,6 +38,14 @@ const PENDING_INSTALL_PREFIX = 'mobile_pending_install:';
 const idleTimers = new Map<string, NodeJS.Timeout>();
 
 /**
+ * userId → last time we re-armed the Redis warmup TTL. Throttles the SCAN so
+ * a burst of keepalives (one per gesture upstream) costs at most one SCAN per
+ * `WARMUP_EXTEND_MIN_INTERVAL_MS` per user.
+ */
+const warmupExtendThrottle = new Map<string, number>();
+const WARMUP_EXTEND_MIN_INTERVAL_MS = 60 * 1000;
+
+/**
  * Reset (or start) the idle timer for a user.
  * Called from a `socket.use(...)` middleware on every event from any of
  * the user's sockets, and once explicitly after a successful warmup.
@@ -78,6 +86,64 @@ export function cancelIdle(userId: string): void {
     clearTimeout(t);
     idleTimers.delete(userId);
   }
+  warmupExtendThrottle.delete(userId);
+}
+
+/**
+ * Re-arm the TTL on the user's `mobile_warmup:*:{userId}` Redis key(s) back to
+ * the idle window (IDLE_TTL_MS), keeping the warmup binding in lockstep with
+ * the in-memory idle timer.
+ *
+ * WHY: the warmup key is created with a FIXED TTL at warmup and is otherwise
+ * never extended. The in-memory idle timer slides forward on activity (see
+ * `refreshIdle`), but without this the Redis binding still expires at a fixed
+ * 15 min — and that binding is what `assertMobileSessionOwnership` (chat
+ * `mobile_action`/`mobile_agent`) and session resolution depend on. Letting it
+ * lapse under an active user is the exact "drift bounce" the IDLE_TTL_MS doc
+ * comment warns about.
+ *
+ * Called (throttled, fire-and-forget) from the `mobile:keepalive` handler.
+ * Best-effort: a Redis error is logged and swallowed — it must never break the
+ * keepalive path. TTL is derived from IDLE_TTL_MS so the two can't drift.
+ */
+export async function refreshWarmupTtl(userId: string): Promise<void> {
+  if (!userId) return;
+
+  const now = Date.now();
+  if (now - (warmupExtendThrottle.get(userId) ?? 0) < WARMUP_EXTEND_MIN_INTERVAL_MS) return;
+  warmupExtendThrottle.set(userId, now);
+
+  const ttlSeconds = Math.round(IDLE_TTL_MS / 1000);
+  const targetSuffix = `:${userId}`;
+  const stream = redisConnection.scanStream({ match: `${WARMUP_PREFIX}*`, count: 200 });
+  const toExtend: string[] = [];
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      stream.on('data', (keys: string[]) => {
+        for (const k of keys) {
+          if (k.endsWith(targetSuffix)) toExtend.push(k);
+        }
+      });
+      stream.on('end', () => resolve());
+      stream.on('error', (err) => reject(err));
+    });
+
+    if (toExtend.length === 0) return;
+
+    await Promise.all(toExtend.map((k) => redisConnection.expire(k, ttlSeconds)));
+
+    logger.debug('[MOBILE_IDLE] warmup TTL refreshed', {
+      userId: userId.substring(0, 8) + '...',
+      keys: toExtend.length,
+      ttlSeconds,
+    });
+  } catch (error) {
+    logger.warn('[MOBILE_IDLE] warmup TTL refresh failed (non-fatal)', {
+      userId: userId.substring(0, 8) + '...',
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 /**
@@ -94,6 +160,7 @@ export function hasIdle(userId: string): boolean {
  * emulator session is intentionally NOT destroyed.
  */
 async function onIdleFire(userId: string, io: SocketIOServer): Promise<void> {
+  warmupExtendThrottle.delete(userId);
   try {
     const deletedKeys = await deleteUserMobileKeys(userId);
 
