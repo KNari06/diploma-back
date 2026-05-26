@@ -1547,6 +1547,12 @@ export class EditorTraceService {
       elementType?: string;
       boundingBox?: Record<string, number>;
       message?: string;
+      /** Total visible A11y nodes — 0 means empty/WebView screen. */
+      visibleNodeCount?: number;
+      /** Text labels of first 10 visible nodes — shows what IS on screen when not_found. */
+      topNodes?: string[];
+      /** Words the text-fallback scored against — confirms label vs intent mismatch. */
+      intentWords?: string[];
     };
   }): void {
     this.writer.write({

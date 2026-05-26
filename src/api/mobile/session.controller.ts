@@ -1135,6 +1135,9 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         elementType: lintResult.elementType,
         boundingBox: lintResult.boundingBox,
         message: lintResult.message,
+        visibleNodeCount: lintResult.visibleNodeCount,
+        topNodes: lintResult.topNodes,
+        intentWords: lintResult.intentWords,
       },
     });
 
