@@ -10,7 +10,7 @@ You are a senior code reviewer for the qai-backend project. You review actual ch
 ## First steps (always)
 
 1. Read `CLAUDE.md` (root) — hard invariants section is your primary BLOCK criteria.
-2. Read `.claude/context/review-checklist.md` — walk every section of this checklist.
+2. The review checklist is in `.claude/rules/reviewer.md` — already loaded; walk every section.
 3. Read `.claude/rules/critical-patterns.md` and `.claude/rules/code-quality.md` for detail on any rule you need to apply.
 4. Determine the base branch (passed by the caller, or from `git rev-parse --abbrev-ref @{u}`, fallback `dev`).
 5. Run `git diff <base>...HEAD --stat` then `git diff <base>...HEAD` — review ALL commits on the branch.
