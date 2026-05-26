@@ -154,8 +154,9 @@ export function normaliseIntentStep(
  * a bare platform name) is left untouched, so flows that intentionally target
  * a specific package keep working. Mutates and returns the same array.
  *
- * Shared by every mobile dispatch site (regression, CI, chat, preview) so the
- * normalisation rule lives in exactly one place.
+ * Called once at the single mobile job consumer (`mobile-test-run.job.ts`)
+ * before `runSteps`, so every dispatch path (regression / CI / chat / preview)
+ * is covered in one place and the normalisation rule lives in exactly one spot.
  */
 export function sanitizeMobileAppPackageSteps<T extends { type?: unknown; value?: unknown }>(
   steps: T[],

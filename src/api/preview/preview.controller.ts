@@ -14,7 +14,6 @@ import { getPreviewSessionService } from '@/services/testing/ui/preview/preview-
 import { ManualTestService } from '@/services/testing/ui/manualTest.service';
 import type { MobileIntentStep, MobilePlatform, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { buildMetadataFromTestCase } from '@/services/mobile/mobile-runner.types';
-import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import { cancelTest } from '@/services/testing/ui/manual/test-cancellation';
 import { logger } from '@/utils/core/logger';
 import { sanitizeUrl } from '@/utils/validation/validation';
@@ -674,10 +673,6 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         test_goal: `Editor: ${testCase.name} (${mobilePlatform})`,
         commands: [],
       });
-
-      // Normalise open_app/close_app package targets (stale "ANDROID" labels →
-      // resolved package) before the runner sees them.
-      sanitizeMobileAppPackageSteps(intentSteps, mobileApp?.packageName);
 
       const jobData: MobileTestJobData = {
         testId,
