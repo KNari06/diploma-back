@@ -14,6 +14,10 @@
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence } from './preview.types';
+// Step.options.* forwarding (replaceContent, keyPressDelay, cssSelector,
+// disableStabilityChecks, disableCaching) lives in a dedicated module so
+// this converter stays focused on the action→command shape.
+import { applyStepOptionsToCommand } from './intent-step-options-forwarder';
 
 /**
  * Extended PlaywrightCommand with intent metadata for runtime resolution
@@ -299,37 +303,18 @@ export function convertIntentStepToCommand(
       }),
       // V11: Expected outcome for 4xx detection in replay
       expectedOutcome: resolveExpectedOutcome(step),
-      // Forward stability/cache toggles so the executor can mirror the
-      // preview behaviour user-side toggles already control (see
-      // preview-step-apply.service.ts:2451 for stability,
-      // intent-step-lint.service.ts:1227 for caching).
-      ...(step.options?.disableStabilityChecks === true && {
-        disableStabilityChecks: true,
-      }),
-      ...(step.options?.disableCaching === true && {
-        disableCaching: true,
-      }),
     },
   };
 
-  // Manual CSS selector override: when the user pins a raw CSS selector via
-  // step.options.cssSelector, route it through command.selector AND flag
-  // intentMeta.cssSelectorOverride so the executor can distinguish a
-  // user-pinned selector from one derived from the compiled plan. Mirrors
-  // preview-step-apply.service.ts:2093 — preview uses this raw CSS instead
-  // of the resolver waterfall.
-  const pinnedCss = typeof step.options?.cssSelector === 'string'
-    ? step.options.cssSelector.trim()
-    : '';
-  if (pinnedCss.length > 0) {
-    command.selector = pinnedCss;
-    if (command.intentMeta) {
-      command.intentMeta.cssSelectorOverride = pinnedCss;
-    }
-  } else if (primarySelector) {
-    // Add selector if compiled plan available
+  // Add selector if compiled plan available
+  if (primarySelector) {
     command.selector = primarySelector;
   }
+
+  // Forward user-toggle step.options.* (replaceContent, keyPressDelay,
+  // cssSelector, disableStabilityChecks, disableCaching). May also
+  // override command.selector when cssSelector is pinned.
+  applyStepOptionsToCommand(step, command);
 
   // Handle specific action types
   switch (step.type) {
@@ -339,24 +324,6 @@ export function convertIntentStepToCommand(
       // to press Enter after type without calling AI
       if (step.options?.pressEnter && command.intentMeta) {
         command.intentMeta.pressEnter = true;
-      }
-      // Pass replaceContent flag so the executor honours the user's
-      // "Clear field before typing" toggle. Only forward when explicitly
-      // set — undefined keeps the default (clear), matching preview.
-      if (step.options?.replaceContent !== undefined && command.intentMeta) {
-        command.intentMeta.replaceContent = step.options.replaceContent;
-      }
-      // Forward per-keystroke delay to the executor's intent type path.
-      // Mirrors preview-step-apply.service.ts:2566/2571 — the value is
-      // passed to pressSequentially({ delay }). Negative / non-finite
-      // values are dropped so the executor falls back to Playwright's
-      // default (no delay), same as preview's "unset" branch.
-      if (
-        Number.isFinite(step.options?.keyPressDelay) &&
-        (step.options!.keyPressDelay as number) >= 0 &&
-        command.intentMeta
-      ) {
-        command.intentMeta.keyPressDelay = step.options!.keyPressDelay;
       }
       // V13: Pass isPaste flag so executor dispatches clipboard paste instead of fill
       if (step.options?.isPaste && command.intentMeta) {
