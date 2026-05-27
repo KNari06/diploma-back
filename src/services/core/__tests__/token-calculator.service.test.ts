@@ -88,54 +88,54 @@ describe('TokenCalculatorService', () => {
   // ═══════════════════════════════════════════════════════════════════════════
   describe('calculateCostFromTokens', () => {
     it('should return 0 for 0 tokens', () => {
-      expect(TokenCalculatorService.calculateCostFromTokens(0, 0, 'gpt-4o')).toBe(0);
+      expect(TokenCalculatorService.calculateCostFromTokens(0, 0, 'gpt-5.4-mini')).toBe(0);
     });
 
     it('should handle negative input tokens by treating as 0', () => {
-      const cost = TokenCalculatorService.calculateCostFromTokens(-100, 100, 'gpt-4o');
+      const cost = TokenCalculatorService.calculateCostFromTokens(-100, 100, 'gpt-5.4-mini');
       // Only output tokens should be counted
-      expect(cost).toBe((100 / 1000) * MODEL_PRICING['gpt-4o'].output);
+      expect(cost).toBe((100 / 1000) * MODEL_PRICING['gpt-5.4-mini'].output);
     });
 
     it('should handle negative output tokens by treating as 0', () => {
-      const cost = TokenCalculatorService.calculateCostFromTokens(100, -100, 'gpt-4o');
+      const cost = TokenCalculatorService.calculateCostFromTokens(100, -100, 'gpt-5.4-mini');
       // Only input tokens should be counted
-      expect(cost).toBe((100 / 1000) * MODEL_PRICING['gpt-4o'].input);
+      expect(cost).toBe((100 / 1000) * MODEL_PRICING['gpt-5.4-mini'].input);
     });
 
     it('should handle NaN tokens', () => {
-      expect(TokenCalculatorService.calculateCostFromTokens(NaN, 100, 'gpt-4o')).toBe(
-        (100 / 1000) * MODEL_PRICING['gpt-4o'].output
+      expect(TokenCalculatorService.calculateCostFromTokens(NaN, 100, 'gpt-5.4-mini')).toBe(
+        (100 / 1000) * MODEL_PRICING['gpt-5.4-mini'].output
       );
     });
 
-    it('should fallback to gpt-4o-mini for unknown model', () => {
+    it('should fallback to gpt-4.1-mini for unknown model', () => {
       const cost = TokenCalculatorService.calculateCostFromTokens(1000, 500, 'unknown-model' as any);
       const expectedCost =
-        (1000 / 1000) * MODEL_PRICING['gpt-4o-mini'].input +
-        (500 / 1000) * MODEL_PRICING['gpt-4o-mini'].output;
+        (1000 / 1000) * MODEL_PRICING['gpt-4.1-mini'].input +
+        (500 / 1000) * MODEL_PRICING['gpt-4.1-mini'].output;
       expect(cost).toBe(expectedCost);
     });
 
-    it('should calculate gpt-4o cost correctly', () => {
+    it('should calculate gpt-5.4-mini cost correctly', () => {
       const inputTokens = 1000;
       const outputTokens = 500;
       const expectedCost =
-        (inputTokens / 1000) * MODEL_PRICING['gpt-4o'].input +
-        (outputTokens / 1000) * MODEL_PRICING['gpt-4o'].output;
-      expect(TokenCalculatorService.calculateCostFromTokens(inputTokens, outputTokens, 'gpt-4o')).toBe(
+        (inputTokens / 1000) * MODEL_PRICING['gpt-5.4-mini'].input +
+        (outputTokens / 1000) * MODEL_PRICING['gpt-5.4-mini'].output;
+      expect(TokenCalculatorService.calculateCostFromTokens(inputTokens, outputTokens, 'gpt-5.4-mini')).toBe(
         expectedCost
       );
     });
 
-    it('should calculate gpt-4o-mini cost correctly', () => {
+    it('should calculate gpt-4.1-mini cost correctly', () => {
       const inputTokens = 1000;
       const outputTokens = 500;
       const expectedCost =
-        (inputTokens / 1000) * MODEL_PRICING['gpt-4o-mini'].input +
-        (outputTokens / 1000) * MODEL_PRICING['gpt-4o-mini'].output;
+        (inputTokens / 1000) * MODEL_PRICING['gpt-4.1-mini'].input +
+        (outputTokens / 1000) * MODEL_PRICING['gpt-4.1-mini'].output;
       expect(
-        TokenCalculatorService.calculateCostFromTokens(inputTokens, outputTokens, 'gpt-4o-mini')
+        TokenCalculatorService.calculateCostFromTokens(inputTokens, outputTokens, 'gpt-4.1-mini')
       ).toBe(expectedCost);
     });
   });
