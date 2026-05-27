@@ -769,9 +769,26 @@ export class CommandExecutor {
               await this.page.keyboard.press(`${mod}+v`);
             } else {
               // Honour the user's "Clear field before typing" toggle.
-              // Default (undefined) → clear, matching preview-step-apply.service.ts:2548.
-              // false → append to existing content.
-              if (intentCommand.intentMeta.replaceContent !== false) {
+              // Default (undefined) → DO NOT clear, preserving today's
+              // web-regression executor behaviour (plain pressSequentially,
+              // no fill('') call). Only explicit `replaceContent === true`
+              // opts into clearing. This is intentionally stricter than
+              // preview's `!== false` form: the executor historically
+              // never cleared by default, so silently flipping that for
+              // every old saved step would be a regression.
+              //
+              // Frontend always sends an explicit boolean (default ON for
+              // new type steps), so the visible toggle in the UI fully
+              // controls the behaviour going forward. Steps saved before
+              // the toggle existed lack the field entirely and continue
+              // to behave exactly as they did before this branch.
+              if (intentCommand.intentMeta.replaceContent === true) {
+                // Focus the field first — preview's append branch does
+                // this (preview-step-apply.service.ts:2565). Unfocused
+                // fills can silently no-op on contenteditable / custom
+                // widgets. Best-effort: ignore click failures since the
+                // following fill/type will still surface a real error.
+                await intentTypeLocator.click({ timeout: timeout || 30000 }).catch(() => {});
                 await intentTypeLocator.fill('', { timeout: timeout || 30000 }).catch(() => {});
               }
               // Per-keystroke delay: honour `step.options.keyPressDelay`
@@ -3479,6 +3496,11 @@ export class CommandExecutor {
     // the raw locator directly. Mirrors preview-step-apply.service.ts:2093.
     // If the pinned selector doesn't match, fail the step with a clear
     // error — no AI fallback, since the user explicitly pinned this.
+    //
+    // Note: when `cssSelectorOverride` is set, the converter guarantees
+    // `command.selector` is the same pinned string (intent-step-converter
+    // line ~325). The narrowing here is for TypeScript's benefit; at
+    // runtime the && command.selector branch is the override path.
     const cssOverride = intentMeta?.cssSelectorOverride;
     if (cssOverride && command.selector) {
       const overrideContext = iframeSelector
