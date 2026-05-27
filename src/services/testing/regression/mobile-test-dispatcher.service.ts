@@ -1,4 +1,4 @@
-import { supabaseAdmin } from '@/db/supabase';
+import * as regressionDb from './db/regression.db';
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { logger } from '@/utils/core/logger';
 import { dbAdminService } from '@/db/supabase';
@@ -68,11 +68,7 @@ export class MobileTestDispatcherService {
 
     // 2. Fetch project workspace (needed for MobileTestJobData; the APK
     // itself comes from the resolver below, not from project settings).
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('workspace_id')
-      .eq('id', intentCase.project_id)
-      .single();
+    const workspaceId = await regressionDb.getProjectWorkspaceId(intentCase.project_id);
 
     // Phase 5: resolve which APK to install.
     // Precedence inside the resolver:
@@ -226,7 +222,7 @@ export class MobileTestDispatcherService {
     const jobData: MobileTestJobData = {
       testId,
       userId,
-      workspaceId: project?.workspace_id || '',
+      workspaceId: workspaceId || '',
       projectId: intentCase.project_id,
       platform,
       browser,

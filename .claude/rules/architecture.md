@@ -46,3 +46,17 @@ This is what enables unit testing services without a real database.
 ## When touching existing services that violate these rules
 
 Extract the concern you're working on, don't perpetuate the violation. If a service directly queries Supabase, extract those queries to a `db/` file as part of your change.
+
+## First db/ sublayer in production: regression pipeline
+
+`src/services/testing/regression/db/` is the first domain that follows this rule:
+
+| File | What it holds |
+|---|---|
+| `regression-test-query.db.ts` | Test case query helpers (moved from `regression-test-query.service.ts`) |
+| `regression.db.ts` | Query functions for priority resolver, web builder, save service, and mobile dispatcher |
+
+Three service files in the same folder still import `supabaseAdmin` directly
+(`test-execution-orchestrator.service.ts`, `regression-report-assembler.service.ts`,
+`regression-run.service.ts`) — they predate the pattern and need a follow-up
+extraction before their unit tests can be written.
