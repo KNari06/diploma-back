@@ -11,6 +11,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { detectFrameworkFromBuffer } from '@/services/mobile/archive-platform-detect';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
 
@@ -34,6 +35,14 @@ export interface MobileAppMetadata {
   versionName?: string;
   /** Integer build code (Android versionCode / iOS CFBundleVersion). */
   versionCode?: number;
+  /**
+   * Framework detected from the archive itself (`flutter` / `react-native` /
+   * `android` / `ios`). Stamped at upload time by the ZIP-CD inspector so
+   * the editor + runner can route accordingly even when `platform` was
+   * filled from the file-extension heuristic. `undefined` only when the
+   * archive predates this feature or detection failed.
+   */
+  detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
 }
 
 /**
@@ -183,6 +192,16 @@ export class MobileAppStorageService {
       .from(BUCKET)
       .getPublicUrl(storagePath);
 
+    // Run framework detection on the in-memory buffer BEFORE building the
+    // metadata. We do it here (inside uploadApp) so the CI upload-from-URL
+    // path gets the same `detectedFramework` stamp that the signed-URL +
+    // finalize flow already produces — without forcing every caller to
+    // wire detection by hand. Detection is hard-contract non-throwing, so
+    // any failure just leaves `detectedFramework` undefined.
+    const detectedFramework = file.buffer
+      ? await detectFrameworkFromBuffer(file.buffer, file.originalname)
+      : undefined;
+
     const metadata: MobileAppMetadata = {
       platform,
       packageName,
@@ -191,6 +210,7 @@ export class MobileAppStorageService {
       originalName: file.originalname,
       fileSize: file.size,
       uploadedAt: new Date().toISOString(),
+      ...(detectedFramework ? { detectedFramework } : {}),
     };
 
     logger.info('[MOBILE_APP_STORAGE] Upload successful', {
@@ -317,6 +337,7 @@ export class MobileAppStorageService {
     fileSize: number;
     versionName?: string;
     versionCode?: number;
+    detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
   }): MobileAppMetadata {
     const { data: urlData } = supabaseAdmin.storage
       .from(BUCKET)
@@ -332,6 +353,7 @@ export class MobileAppStorageService {
       uploadedAt: new Date().toISOString(),
       ...(params.versionName ? { versionName: params.versionName } : {}),
       ...(typeof params.versionCode === 'number' ? { versionCode: params.versionCode } : {}),
+      ...(params.detectedFramework ? { detectedFramework: params.detectedFramework } : {}),
     };
   }
 

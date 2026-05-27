@@ -12,6 +12,7 @@ import {
   MobileAppMetadata,
   trimMobileBuildField,
 } from '@/services/storage/mobile-app-storage.service';
+import { MobileAppParserService } from '@/services/mobile/mobile-app-parser.service';
 import { autoBootAndInstall } from './session.controller';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -138,10 +139,21 @@ export async function createMobileAppUploadUrl(req: Request, res: Response): Pro
  *   3. Prunes builds beyond `BUILD_HISTORY_LIMIT` for this (project, platform).
  *   4. Kicks off `autoBootAndInstall`.
  *
- * "version_name OR version_code" is enforced at the API edge — a project
- * with N nameless builds is impossible to debug because every audit row
- * looks identical, so the controller refuses uploads that don't supply
- * at least one identifier.
+ * Version identity precedence — the API NO LONGER 400s on missing version.
+ * The values are filled in via this waterfall:
+ *   1. Client-supplied `versionName` / `versionCode` / `packageName` win
+ *      (CI uploaders with explicit overrides keep working).
+ *   2. If any field is missing, the binary is downloaded from Storage and
+ *      parsed (`MobileAppParserService`) — APK/AAB AndroidManifest.xml,
+ *      IPA Info.plist. Parser failures are swallowed and yield `{}`.
+ *   3. If after merging we STILL have neither `versionName` nor
+ *      `versionCode`, we synthesise a timestamp-based fallback
+ *      `versionName = "build-YYYY-MM-DDTHH-MM"` so every build row stays
+ *      distinguishable.
+ *
+ * `packageName` remains required overall — the runner cannot launch the
+ * app without it — but the client may omit it as long as parsing recovers
+ * one from the binary.
  *
  * Old APKs are NOT deleted on every upload anymore — they live in storage
  * until `pruneOldBuilds` rotates them out. This keeps the audit trail
@@ -157,22 +169,26 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
 
   const { projectId } = req.params;
   const storagePath = typeof req.body?.storagePath === 'string' ? req.body.storagePath.trim() : '';
-  const packageName = typeof req.body?.packageName === 'string' ? req.body.packageName.trim() : '';
+  const clientPackageName = typeof req.body?.packageName === 'string' && req.body.packageName.trim()
+    ? req.body.packageName.trim()
+    : undefined;
   const platform = pickPlatform(req.body?.platform);
   const originalName = typeof req.body?.originalName === 'string' && req.body.originalName.trim()
     ? req.body.originalName.trim()
     : (storagePath.includes('/') ? storagePath.slice(storagePath.lastIndexOf('/') + 1) : storagePath);
 
-  // Version identity — at least one of versionName / versionCode required.
-  const versionName = typeof req.body?.versionName === 'string' && req.body.versionName.trim()
+  // Client-supplied version identity (still accepted — CI uploaders pass
+  // these explicitly). Missing values are filled in below by parsing the
+  // binary, with a timestamp fallback as last resort.
+  const clientVersionName = typeof req.body?.versionName === 'string' && req.body.versionName.trim()
     ? req.body.versionName.trim()
     : undefined;
-  const versionCodeRaw = req.body?.versionCode;
-  let versionCode: number | undefined;
-  if (typeof versionCodeRaw === 'number' && Number.isFinite(versionCodeRaw) && versionCodeRaw >= 0) {
-    versionCode = Math.floor(versionCodeRaw);
-  } else if (typeof versionCodeRaw === 'string' && /^\d+$/.test(versionCodeRaw.trim())) {
-    versionCode = Number(versionCodeRaw.trim());
+  const clientVersionCodeRaw = req.body?.versionCode;
+  let clientVersionCode: number | undefined;
+  if (typeof clientVersionCodeRaw === 'number' && Number.isFinite(clientVersionCodeRaw) && clientVersionCodeRaw >= 0) {
+    clientVersionCode = Math.floor(clientVersionCodeRaw);
+  } else if (typeof clientVersionCodeRaw === 'string' && /^\d+$/.test(clientVersionCodeRaw.trim())) {
+    clientVersionCode = Number(clientVersionCodeRaw.trim());
   }
 
   const branch = trimMobileBuildField(req.body?.branch);
@@ -182,20 +198,6 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
 
   if (!storagePath) {
     res.status(400).json({ success: false, error: 'storagePath is required (non-empty string)' });
-    return;
-  }
-  if (!packageName) {
-    res.status(400).json({
-      success: false,
-      error: 'packageName is required (non-empty string). Android: package id (com.example.app); iOS: bundle ID.',
-    });
-    return;
-  }
-  if (!versionName && versionCode === undefined) {
-    res.status(400).json({
-      success: false,
-      error: 'versionName or versionCode is required so this build can be distinguished from earlier uploads.',
-    });
     return;
   }
 
@@ -244,18 +246,113 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     return;
   }
 
+  // Version identity waterfall: client → parsed → timestamp fallback.
+  //
+  // Parser runs only when at least one identity field is missing — this
+  // avoids a 5-15 second Supabase download on fully-populated CI uploads.
+  // The cost matters: CI pipelines re-upload on every commit, and adding a
+  // mandatory download to every finalize would noticeably slow them down.
+  //
+  // The trade-off: when ALL three identity fields are client-supplied (the
+  // common CI case), we don't get a `detectedFramework` stamp on the
+  // upload. That's acceptable because:
+  //   1. CI clients already know their framework — they pass
+  //      `platform='flutter'` explicitly when relevant.
+  //   2. The framework chip / editor auto-pick logic on the frontend
+  //      degrades gracefully on undefined (no chip, fallback to extension
+  //      heuristic).
+  //   3. The legacy `MobileAppStorageService.uploadApp` path (used by CI
+  //      upload-from-URL) DOES detect from the in-memory buffer — that
+  //      path runs detection with zero extra I/O.
+  // If a customer specifically asks for ground-truth framework on every
+  // finalize regardless of client values, drop `needsParse` here.
+  let parsed: {
+    versionName?: string;
+    versionCode?: number;
+    packageName?: string;
+    framework?: 'android' | 'ios' | 'flutter' | 'react-native';
+  } = {};
+  const needsParse = !clientVersionName || clientVersionCode === undefined || !clientPackageName;
+  if (needsParse) {
+    parsed = await MobileAppParserService.parseFromStorage(storagePath, platform);
+  }
+
+  const mergedVersionName = clientVersionName ?? parsed.versionName;
+  const mergedVersionCode = clientVersionCode ?? parsed.versionCode;
+  const mergedPackageName = clientPackageName ?? parsed.packageName;
+
+  // Why we don't promote `platform` here even when the detector says
+  // "flutter": the runner's `createFlutterSession` still has the
+  // chicken-and-egg issue — it probes the Flutter VM Service BEFORE the
+  // backend has installed the app, so promoting an android upload to
+  // `platform='flutter'` would route the next warmup through that broken
+  // path and surface as a 500 loop in the editor (see Bug B in the
+  // post-mortem). Instead we stamp `detectedFramework` on the metadata so
+  // the frontend can react (show a mismatch chip, auto-pick the editor
+  // platform when the user explicitly opts in), and revisit the promotion
+  // story once the runner's Flutter session creation is lazy-attach.
+  const effectivePlatform: MobilePlatform = platform;
+
+  // packageName is non-negotiable — the runner literally cannot launch the
+  // app without it. Refuse if neither the client nor the parser produced one.
+  if (!mergedPackageName) {
+    res.status(400).json({
+      success: false,
+      error: 'packageName is required and could not be read from the binary. Pass it explicitly (Android: package id e.g. com.example.app; iOS: bundle ID).',
+    });
+    return;
+  }
+
+  // Fallback synth: if version identity is still empty, mint a timestamp-
+  // based versionName so `mobile_app_builds` rows remain distinguishable.
+  // Format: "build-2026-05-27T14-30" (strip seconds & ms, ':' is invalid
+  // in many UI contexts, replace with '-').
+  let fallbackVersionName: string | undefined;
+  if (!mergedVersionName && mergedVersionCode === undefined) {
+    const iso = new Date().toISOString(); // 2026-05-27T14:30:01.123Z
+    fallbackVersionName = `build-${iso.slice(0, 16).replace(':', '-')}`;
+  }
+  const finalVersionName = mergedVersionName ?? fallbackVersionName;
+  const finalVersionCode = mergedVersionCode;
+
+  const versionSource: 'client' | 'parsed' | 'fallback' = clientVersionName || clientVersionCode !== undefined
+    ? 'client'
+    : (parsed.versionName || parsed.versionCode !== undefined)
+      ? 'parsed'
+      : 'fallback';
+  // Loggable framework mismatch: the user said "android" via .apk extension
+  // but the binary is actually flutter / react-native. We don't auto-promote
+  // (see comment above) — just record it so we can see in the logs how
+  // often this happens and surface it to the frontend later.
+  const frameworkMismatch = !!parsed.framework
+    && parsed.framework !== 'android'
+    && parsed.framework !== 'ios';
+  logger.info('[MOBILE_API] finalize: version source', {
+    projectId,
+    platform: effectivePlatform,
+    detectedFramework: parsed.framework ?? null,
+    frameworkMismatch,
+    versionSource,
+    packageNameSource: clientPackageName ? 'client' : 'parsed',
+    finalVersionName,
+    finalVersionCode,
+  });
+
   // Build the metadata once and reuse for both the legacy slot and the
-  // versioned `mobile_app_builds` row.
+  // versioned `mobile_app_builds` row. We persist `detectedFramework` only
+  // in the legacy slot (JSONB) — adding it to `mobile_app_builds` needs a
+  // separate migration, tracked as a follow-up.
   const metadata = MobileAppStorageService.finaliseDirectUpload({
     workspaceId: project.workspace_id,
     projectId,
-    platform,
-    packageName,
+    platform: effectivePlatform,
+    packageName: mergedPackageName,
     storagePath,
     originalName,
     fileSize: stat.sizeBytes,
-    versionName,
-    versionCode,
+    versionName: finalVersionName,
+    versionCode: finalVersionCode,
+    detectedFramework: parsed.framework,
   });
 
   // 1. Record in `mobile_app_builds` FIRST. If this fails we abandon the
@@ -288,12 +385,13 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
 
   logger.info('[MOBILE_API] App finalized (signed-URL flow)', {
     projectId,
-    platform,
+    platform: effectivePlatform,
+    detectedFramework: parsed.framework ?? null,
     buildId: buildRow.id,
     storagePath: metadata.storagePath,
     fileSize: metadata.fileSize,
-    versionName,
-    versionCode,
+    versionName: finalVersionName,
+    versionCode: finalVersionCode,
   });
 
   res.status(201).json({
