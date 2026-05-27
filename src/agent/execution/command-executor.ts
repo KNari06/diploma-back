@@ -768,8 +768,23 @@ export class CommandExecutor {
               const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
               await this.page.keyboard.press(`${mod}+v`);
             } else {
+              // Honour the user's "Clear field before typing" toggle.
+              // Default (undefined) → clear, matching preview-step-apply.service.ts:2548.
+              // false → append to existing content.
+              if (intentCommand.intentMeta.replaceContent !== false) {
+                await intentTypeLocator.fill('', { timeout: timeout || 30000 }).catch(() => {});
+              }
+              // Per-keystroke delay: honour `step.options.keyPressDelay`
+              // when set. Mirrors preview-step-apply.service.ts:2566/2571.
+              // Undefined → no delay option → Playwright default (matches
+              // today's web regression behaviour).
+              const userKeyDelay = intentCommand.intentMeta.keyPressDelay;
+              const typeOpts: { timeout: number; delay?: number } = { timeout: timeout || 30000 };
+              if (Number.isFinite(userKeyDelay) && (userKeyDelay as number) >= 0) {
+                typeOpts.delay = userKeyDelay;
+              }
               // Use type() to simulate real keyboard events character by character
-              await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+              await intentTypeLocator.pressSequentially(String(value), typeOpts);
             }
 
             // V10: Smart Enter decision
@@ -1629,8 +1644,16 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            // V15.5: noWaitAfter skips post-action stability wait (see clickOpts comment above)
-            await intentFillLocator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
+            // Honour "Clear field before typing": when replaceContent === false,
+            // append by reading current value and concatenating. Default (undefined/true)
+            // uses fill() which inherently replaces.
+            if (intentCommand.intentMeta.replaceContent === false) {
+              const existing = await intentFillLocator.inputValue({ timeout: timeout || 30000 }).catch(() => '');
+              await intentFillLocator.fill(`${existing}${String(value)}`, { timeout: timeout || 30000, noWaitAfter: true });
+            } else {
+              // V15.5: noWaitAfter skips post-action stability wait (see clickOpts comment above)
+              await intentFillLocator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
+            }
             break;
           }
 
@@ -2660,7 +2683,15 @@ export class CommandExecutor {
       // Only mutating actions go through it; read-only (assert/wait/getText)
       // skip the call entirely to stay fast.
       const intentType = playwrightActionToIntent(action);
-      if (intentType !== null) {
+      // Honour step.options.disableStabilityChecks: when the user toggled
+      // this off in the editor, skip the post-action settle entirely.
+      // Mirrors preview-step-apply.service.ts:2451 (preview gates its
+      // pre-phase smartStepWait on the same flag). Note: the regression
+      // path has no pre-phase smartStepWait — Playwright's auto-waits
+      // cover that — so this single gate covers parity.
+      const stabilityDisabled = isIntentCommand
+        && intentCommand.intentMeta?.disableStabilityChecks === true;
+      if (intentType !== null && !stabilityDisabled) {
         try {
           await smartStepWait({
             page: this.page,
@@ -3442,6 +3473,43 @@ export class CommandExecutor {
     const stepId = intentMeta?.stepId || 'unknown';
     const iframeSelector = intentMeta?.iframeSelector;
 
+    // User-pinned CSS selector: when the user manually overrode the
+    // selector via step.options.cssSelector, skip the entire resolver
+    // waterfall (compiled / evidence shortcut / LLM / self-heal) and use
+    // the raw locator directly. Mirrors preview-step-apply.service.ts:2093.
+    // If the pinned selector doesn't match, fail the step with a clear
+    // error — no AI fallback, since the user explicitly pinned this.
+    const cssOverride = intentMeta?.cssSelectorOverride;
+    if (cssOverride && command.selector) {
+      const overrideContext = iframeSelector
+        ? await this.getFrameFromIframeSelector(iframeSelector, Math.min(timeout, 10000))
+        : this.page;
+      const overrideLocator = overrideContext.locator(command.selector).first();
+      try {
+        await overrideLocator.waitFor({ state: 'visible', timeout: Math.min(timeout, 10000) });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `User-pinned CSS selector did not match a visible element: ${command.selector} — ${message}`,
+        );
+      }
+      const runtimeMeta: StepRuntimeMeta = {
+        runtimeStatus: 'executed',
+        source: 'resolver',
+        confidenceTier: 'high',
+        executionMs: Date.now() - startTime,
+        usedLocatorStrategy: 'user_pinned_css',
+        resolutionPath: 'compiled',
+      };
+      this.stepRuntimeMeta.set(stepId, runtimeMeta);
+      logger.info('[COMMAND_EXECUTOR] Using user-pinned CSS selector (resolver bypass)', {
+        stepId,
+        selector: command.selector.slice(0, 80),
+        iframe: !!iframeSelector,
+      });
+      return { locator: overrideLocator, runtimeMeta };
+    }
+
     // V11: If no compiled plan exists, pre-mark compiled as deterministic fail so
     // allStagesDeterministicFail() can return true for intent-only steps (no compiled plan).
     // Without this, fail-fast is silently disabled for all intent-only steps.
@@ -3543,7 +3611,16 @@ export class CommandExecutor {
           // result-shape differ (preview returns LintResult during lint phase,
           // background returns {locator, runtimeMeta} during execute phase).
           // Saves 1-2s LLM call when element hasn't changed between runs.
-          if (intentMeta.evidence?.lastSuccessRef && retryCtx.attempt === 0) {
+          if (
+            intentMeta.evidence?.lastSuccessRef
+            && retryCtx.attempt === 0
+            // Honour step.options.disableCaching: when set, always run the
+            // full resolver instead of taking the cached-ref fast-path.
+            // Mirrors the gate in intent-step-lint.service.ts:1227 used by
+            // preview. Default (undefined/false) keeps the fast-path on,
+            // matching today's web regression behaviour.
+            && !intentMeta.disableCaching
+          ) {
             const shortcut = evaluateEvidenceShortcut({
               evidence: intentMeta.evidence,
               domNodes,

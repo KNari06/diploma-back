@@ -52,6 +52,40 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     lookaheadTimeoutMs?: number;
     /** V10: Press Enter after type action (from step.options.pressEnter) */
     pressEnter?: boolean;
+    /**
+     * Clear field before typing (from step.options.replaceContent).
+     * - undefined / true → clear before typing (default, matches preview behavior)
+     * - false → append to existing content
+     * See preview-step-apply.service.ts:2548 for the canonical condition shape.
+     */
+    replaceContent?: boolean;
+    /**
+     * Per-keystroke delay (ms) for `pressSequentially` in the intent `type`
+     * path. From `step.options.keyPressDelay`. When undefined we pass no
+     * `delay` option (Playwright default) — same as preview's non-humanLike
+     * branch when the user didn't set it. We deliberately do NOT inject a
+     * random delay here (that's preview's `humanLike` path, not wired).
+     */
+    keyPressDelay?: number;
+    /**
+     * Marks `command.selector` as a user-pinned raw CSS override from
+     * `step.options.cssSelector`. When set, the executor must short-circuit
+     * the resolver waterfall and use the literal selector — failing the step
+     * if the locator doesn't match, with no AI/self-heal fallback. Mirrors
+     * preview-step-apply.service.ts:2093.
+     */
+    cssSelectorOverride?: string;
+    /**
+     * From `step.options.disableStabilityChecks`. When true the executor
+     * skips smartStepWait calls (matches preview-step-apply.service.ts:2451).
+     */
+    disableStabilityChecks?: boolean;
+    /**
+     * From `step.options.disableCaching`. When true the executor skips the
+     * `evidence.lastSuccessRef` fast-path and always runs full resolution.
+     * Matches the gate in intent-step-lint.service.ts:1227 used by preview.
+     */
+    disableCaching?: boolean;
     /** V13: Content was pasted — use clipboard paste instead of fill/pressSequentially */
     isPaste?: boolean;
     /** V11: Expected outcome for 4xx detection (default: 'success') */
@@ -265,11 +299,35 @@ export function convertIntentStepToCommand(
       }),
       // V11: Expected outcome for 4xx detection in replay
       expectedOutcome: resolveExpectedOutcome(step),
+      // Forward stability/cache toggles so the executor can mirror the
+      // preview behaviour user-side toggles already control (see
+      // preview-step-apply.service.ts:2451 for stability,
+      // intent-step-lint.service.ts:1227 for caching).
+      ...(step.options?.disableStabilityChecks === true && {
+        disableStabilityChecks: true,
+      }),
+      ...(step.options?.disableCaching === true && {
+        disableCaching: true,
+      }),
     },
   };
 
-  // Add selector if compiled plan available
-  if (primarySelector) {
+  // Manual CSS selector override: when the user pins a raw CSS selector via
+  // step.options.cssSelector, route it through command.selector AND flag
+  // intentMeta.cssSelectorOverride so the executor can distinguish a
+  // user-pinned selector from one derived from the compiled plan. Mirrors
+  // preview-step-apply.service.ts:2093 — preview uses this raw CSS instead
+  // of the resolver waterfall.
+  const pinnedCss = typeof step.options?.cssSelector === 'string'
+    ? step.options.cssSelector.trim()
+    : '';
+  if (pinnedCss.length > 0) {
+    command.selector = pinnedCss;
+    if (command.intentMeta) {
+      command.intentMeta.cssSelectorOverride = pinnedCss;
+    }
+  } else if (primarySelector) {
+    // Add selector if compiled plan available
     command.selector = primarySelector;
   }
 
@@ -281,6 +339,24 @@ export function convertIntentStepToCommand(
       // to press Enter after type without calling AI
       if (step.options?.pressEnter && command.intentMeta) {
         command.intentMeta.pressEnter = true;
+      }
+      // Pass replaceContent flag so the executor honours the user's
+      // "Clear field before typing" toggle. Only forward when explicitly
+      // set — undefined keeps the default (clear), matching preview.
+      if (step.options?.replaceContent !== undefined && command.intentMeta) {
+        command.intentMeta.replaceContent = step.options.replaceContent;
+      }
+      // Forward per-keystroke delay to the executor's intent type path.
+      // Mirrors preview-step-apply.service.ts:2566/2571 — the value is
+      // passed to pressSequentially({ delay }). Negative / non-finite
+      // values are dropped so the executor falls back to Playwright's
+      // default (no delay), same as preview's "unset" branch.
+      if (
+        Number.isFinite(step.options?.keyPressDelay) &&
+        (step.options!.keyPressDelay as number) >= 0 &&
+        command.intentMeta
+      ) {
+        command.intentMeta.keyPressDelay = step.options!.keyPressDelay;
       }
       // V13: Pass isPaste flag so executor dispatches clipboard paste instead of fill
       if (step.options?.isPaste && command.intentMeta) {
