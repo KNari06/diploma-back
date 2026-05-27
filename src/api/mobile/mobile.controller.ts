@@ -12,7 +12,7 @@ import {
   MobileAppMetadata,
   trimMobileBuildField,
 } from '@/services/storage/mobile-app-storage.service';
-import { MobileAppParserService } from '@/services/mobile/mobile-app-parser.service';
+import { MobileAppParserService, type ParsedAppInfo } from '@/services/mobile/mobile-app-parser.service';
 import { autoBootAndInstall } from './session.controller';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -266,12 +266,11 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
   //      path runs detection with zero extra I/O.
   // If a customer specifically asks for ground-truth framework on every
   // finalize regardless of client values, drop `needsParse` here.
-  let parsed: {
-    versionName?: string;
-    versionCode?: number;
-    packageName?: string;
-    framework?: 'android' | 'ios' | 'flutter' | 'react-native';
-  } = {};
+  //
+  // Type comes from `ParsedAppInfo` (the parser's authoritative shape),
+  // not an inline literal — inline types silently drift when the parser
+  // adds new fields.
+  let parsed: ParsedAppInfo = {};
   const needsParse = !clientVersionName || clientVersionCode === undefined || !clientPackageName;
   if (needsParse) {
     parsed = await MobileAppParserService.parseFromStorage(storagePath, platform);

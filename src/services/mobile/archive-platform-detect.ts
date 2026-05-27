@@ -70,16 +70,24 @@ export async function detectFrameworkFromArchive(
     return undefined;
   }
 
-  const result = await Promise.race([
-    inspect(filePath, originalName, isIpa),
-    new Promise<undefined>((resolve) =>
-      setTimeout(() => {
-        logger.debug(`[archive-detect] timeout (>${DETECT_TIMEOUT_MS}ms) for ${originalName}`);
-        resolve(undefined);
-      }, DETECT_TIMEOUT_MS),
-    ),
-  ]);
-  return result;
+  // Defensive try around Promise.race: `inspect` already has its own
+  // try/catch returning undefined, but if any future refactor breaks that
+  // contract, an uncaught reject would propagate to the caller. We treat
+  // detector failures as "framework unknown" — never a hard error.
+  try {
+    return await Promise.race([
+      inspect(filePath, originalName, isIpa),
+      new Promise<undefined>((resolve) =>
+        setTimeout(() => {
+          logger.debug(`[archive-detect] timeout (>${DETECT_TIMEOUT_MS}ms) for ${originalName}`);
+          resolve(undefined);
+        }, DETECT_TIMEOUT_MS),
+      ),
+    ]);
+  } catch (err) {
+    logger.debug(`[archive-detect] race rejected for ${originalName}: ${(err as Error).message}`);
+    return undefined;
+  }
 }
 
 /**

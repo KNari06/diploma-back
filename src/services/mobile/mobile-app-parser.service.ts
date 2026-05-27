@@ -124,12 +124,23 @@ export async function parseFromStorage(
 
     const fields = extractFields(result, platform);
 
-    // Framework detection runs in parallel-friendly fashion against the same
-    // local temp file — no extra Supabase download. The detector is bounded
-    // (2s timeout, ≤64 MB CD scan) and hard-contract non-throwing, so any
-    // failure leaves `framework` undefined and we fall through to the
-    // user-selected platform on the finalize side.
-    const framework = await detectFrameworkFromArchive(tempPath, storagePath);
+    // Framework detection runs against the same local temp file — no
+    // extra Supabase download. Detector is hard-contract non-throwing by
+    // design, but we still isolate it in a local try/catch so a future
+    // regression (or a transient fs failure that bubbles past the
+    // detector's own swallow) can't take down the parser's version /
+    // packageName result. The caller's finalize flow critically depends
+    // on those fields; framework is just a hint.
+    let framework: DetectedFramework | undefined;
+    try {
+      framework = await detectFrameworkFromArchive(tempPath, storagePath);
+    } catch (err) {
+      logger.debug('[MOBILE_APP_PARSER] detector threw — swallowing', {
+        storagePath,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      framework = undefined;
+    }
 
     logger.info('[MOBILE_APP_PARSER] Parsed binary', {
       storagePath,
