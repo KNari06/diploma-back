@@ -24,6 +24,12 @@ import { SelectorStabilityScore, SmartWaitService } from '../utils/selectors/sma
 import type { ReplayTraceWriter } from '../playwright/core/replay-trace-writer';
 import { executeCoordinateDrag, parseDragCoordinates } from '../playwright/core/drag-helpers';
 import { buildRuntimeMeta, executeCompiledLocatorPlan, quickFingerprintCheck } from './compiled-locator-executor';
+// Step.options.* helpers (forwarded from intent-step-options-forwarder).
+// Field family: replaceContent, keyPressDelay, cssSelector,
+// disableStabilityChecks, disableCaching — see ./step-options/* for docs.
+import { typeWithOptionalClear } from './step-options/clear-before-type';
+import { fillWithOptionalAppend } from './step-options/append-fill';
+import { tryPinnedCssLocator } from './step-options/pinned-css-locator';
 import { tryOpenAnchorAsNewTab } from '@/services/testing/ui/preview/new-tab-opener';
 import {
   buildGlobWaitPayload,
@@ -768,8 +774,15 @@ export class CommandExecutor {
               const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
               await this.page.keyboard.press(`${mod}+v`);
             } else {
-              // Use type() to simulate real keyboard events character by character
-              await intentTypeLocator.pressSequentially(String(value), { timeout: timeout || 30000 });
+              await typeWithOptionalClear(
+                intentTypeLocator,
+                String(value),
+                timeout || 30000,
+                {
+                  replaceContent: intentCommand.intentMeta.replaceContent,
+                  keyPressDelay: intentCommand.intentMeta.keyPressDelay,
+                },
+              );
             }
 
             // V10: Smart Enter decision
@@ -1629,8 +1642,12 @@ export class CommandExecutor {
               'type',
               timeout || 30000
             );
-            // V15.5: noWaitAfter skips post-action stability wait (see clickOpts comment above)
-            await intentFillLocator.fill(String(value), { timeout: timeout || 30000, noWaitAfter: true });
+            await fillWithOptionalAppend(
+              intentFillLocator,
+              String(value),
+              timeout || 30000,
+              intentCommand.intentMeta.replaceContent,
+            );
             break;
           }
 
@@ -2660,7 +2677,12 @@ export class CommandExecutor {
       // Only mutating actions go through it; read-only (assert/wait/getText)
       // skip the call entirely to stay fast.
       const intentType = playwrightActionToIntent(action);
-      if (intentType !== null) {
+      // Honour step.options.disableStabilityChecks (see
+      // ./step-options/* for the field family). Mirrors
+      // preview-step-apply.service.ts:2451.
+      const stabilityDisabled = isIntentCommand
+        && intentCommand.intentMeta?.disableStabilityChecks === true;
+      if (intentType !== null && !stabilityDisabled) {
         try {
           await smartStepWait({
             page: this.page,
@@ -3442,6 +3464,20 @@ export class CommandExecutor {
     const stepId = intentMeta?.stepId || 'unknown';
     const iframeSelector = intentMeta?.iframeSelector;
 
+    // User-pinned CSS selector short-circuit (step.options.cssSelector).
+    // See ./step-options/pinned-css-locator.ts for details.
+    const pinnedCssResult = await tryPinnedCssLocator(
+      command,
+      this.page,
+      (iframeSel, t) => this.getFrameFromIframeSelector(iframeSel, t),
+      timeout,
+      startTime,
+    );
+    if (pinnedCssResult) {
+      this.stepRuntimeMeta.set(stepId, pinnedCssResult.runtimeMeta);
+      return pinnedCssResult;
+    }
+
     // V11: If no compiled plan exists, pre-mark compiled as deterministic fail so
     // allStagesDeterministicFail() can return true for intent-only steps (no compiled plan).
     // Without this, fail-fast is silently disabled for all intent-only steps.
@@ -3543,7 +3579,13 @@ export class CommandExecutor {
           // result-shape differ (preview returns LintResult during lint phase,
           // background returns {locator, runtimeMeta} during execute phase).
           // Saves 1-2s LLM call when element hasn't changed between runs.
-          if (intentMeta.evidence?.lastSuccessRef && retryCtx.attempt === 0) {
+          if (
+            intentMeta.evidence?.lastSuccessRef
+            && retryCtx.attempt === 0
+            // step.options.disableCaching — see ./step-options/* for the
+            // field family. Mirrors intent-step-lint.service.ts:1227.
+            && !intentMeta.disableCaching
+          ) {
             const shortcut = evaluateEvidenceShortcut({
               evidence: intentMeta.evidence,
               domNodes,
