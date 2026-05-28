@@ -16,6 +16,7 @@ import { redisConnection } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -444,6 +445,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               projectId,
               userId,
               appPackage,
+              platform,
               skipLaunch: !prelaunch,
               onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
             }));
@@ -608,6 +610,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         projectId,
         userId,
         appPackage,
+        platform,
         skipLaunch: !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
       }));
@@ -1410,9 +1413,15 @@ export async function autoBootAndInstall(
     const client = getMobileRunnerClient();
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
-    // Load app so we know which storagePath to pend if we fail early
+    // Load app so we know which storagePath to pend if we fail early.
+    // Reads the platform-sharded slot when available so an Android+iOS
+    // dual-platform project pends the correct binary instead of always
+    // the legacy singular one (which is whatever was uploaded last).
     const project = await ProjectService.getProject(projectId, userId);
-    const appStoragePath = project?.settings?.mobileApp?.storagePath;
+    const projectAppForPend = getProjectMobileApp(project?.settings, platform);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const legacyApp = (project?.settings as any)?.mobileApp;
+    const appStoragePath = projectAppForPend?.storagePath ?? legacyApp?.storagePath;
 
     // Check for existing session
     let sessionId: string | null = null;
@@ -1483,6 +1492,7 @@ export async function autoBootAndInstall(
       sessionId,
       projectId,
       userId,
+      platform,
       skipLaunch: true,
       onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
     });
@@ -1544,9 +1554,18 @@ export async function autoBootAndInstall(
     logger.error('[MOBILE_AUTO_BOOT] Failed', { projectId, userId, error: message });
 
     // Mark APK as pending so the next warmup re-attempts the install.
+    // CRITICAL: read the platform-sharded slot, not the legacy singular
+    // one. The legacy slot mirrors the latest upload across all
+    // platforms, so on a dual-platform project this could point at the
+    // wrong-platform binary — pending-install would then force-install
+    // an .apk on an iOS session (or vice versa) on the next warmup.
     try {
       const project = await ProjectService.getProject(projectId, userId);
-      await setPendingInstall(project?.settings?.mobileApp?.storagePath);
+      const shardedApp = getProjectMobileApp(project?.settings, platform);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const legacyApp = (project?.settings as any)?.mobileApp;
+      const pendingPath = shardedApp?.storagePath ?? legacyApp?.storagePath;
+      await setPendingInstall(pendingPath);
     } catch { /* best-effort */ }
 
     // Clean up the _booting placeholder so warmup doesn't wait forever

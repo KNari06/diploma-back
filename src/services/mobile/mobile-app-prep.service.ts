@@ -46,6 +46,8 @@ import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.s
 import { ProjectService } from '@/services/core/project.service';
 import { logger } from '@/utils/core/logger';
 import { WARMUP_PREFIX, WARMUP_TTL, PENDING_INSTALL_PREFIX, type WarmupData } from '@/api/mobile/session.controller';
+import { getProjectMobileApp, buildMobileAppSettingsPatch } from '@/services/mobile/project-mobile-app.helper';
+import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 
 /**
  * Stage labels recognised by the editor's loading-bar component. The worker
@@ -93,6 +95,20 @@ export interface PrepAppArgs {
    * progress checkpoints the original `installAppOnSession` emitted.
    */
   onProgress?: (stage: AppPrepStage, progress: number) => void;
+  /**
+   * Platform the caller is preparing the session for. Drives the
+   * platform-sharded read of `project.settings.mobileApps[platform]`.
+   *
+   * When undefined, the helper falls back to the legacy singular slot
+   * (`project.settings.mobileApp`) for back-compat with any caller that
+   * hasn't been migrated yet — this matches the pre-multi-platform
+   * behaviour, so existing Android workflows aren't disturbed.
+   *
+   * Editor callers know the platform from the active flow. Worker
+   * callers know it from the regression run config. Both should pass
+   * it explicitly going forward.
+   */
+  platform?: MobilePlatform;
 }
 
 /**
@@ -115,6 +131,7 @@ export class MobileAppPrepService {
       appOriginalNameOverride,
       skipLaunch,
       onProgress,
+      platform,
     } = args;
 
     const emit = (stage: AppPrepStage, progress: number): void => {
@@ -144,8 +161,29 @@ export class MobileAppPrepService {
     // read the project so we can persist a detected packageName back to
     // settings (cache warm for future warmups), and so the editor path is
     // unchanged from the pre-extraction behavior.
+    //
+    // Multi-platform read: when `platform` is provided, fetch from the
+    // sharded `mobileApps[platform]` slot — this is what lets a project
+    // with both .apk and .ipa uploaded boot the iOS session against the
+    // .ipa instead of accidentally trying to `xcrun simctl install` the
+    // .apk that happened to be the most recent upload. When `platform`
+    // is undefined we read the legacy singular slot for back-compat with
+    // any caller that hasn't been wired through yet.
     const project = await time('project_load', () => ProjectService.getProject(projectId, userId));
-    const projectMobileApp = project?.settings?.mobileApp ?? {};
+    const sharded = platform
+      ? getProjectMobileApp(project?.settings, platform)
+      : undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const legacy = (project?.settings as any)?.mobileApp;
+    // When the caller specified a platform, the sharded slot is the ONLY
+    // valid source. Falling through to `legacy` when sharded is empty
+    // would resurrect the cross-platform bug: a project with only an
+    // .apk uploaded would have its iOS warmups install the .apk on the
+    // simulator, which crashes downstream (`xcrun simctl install` →
+    // "Mach error -308" or the new install_app guard in step-dispatcher).
+    // For unspecified-platform callers (legacy code paths) we keep the
+    // historical behaviour of consulting `mobileApp` directly.
+    const projectMobileApp = sharded ?? (platform ? undefined : legacy) ?? {};
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const projectAny = projectMobileApp as any;
 
@@ -278,7 +316,7 @@ export class MobileAppPrepService {
           // Persist packageName to project settings so future preps can
           // hit this fast path even after Redis expires (knownPackage may
           // have come from appPackageOverride when packageName was null).
-          await persistPackageName(projectId, userId, projectMobileApp, knownPackage);
+          await persistPackageName(projectId, userId, projectMobileApp, knownPackage, platform, project?.settings);
 
           branchTaken = 'device_check_fast_path';
           logger.info('[MOBILE_APP_PREP] timing', {
@@ -382,10 +420,12 @@ export class MobileAppPrepService {
       await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
     }
 
-    // Persist packageName to project.settings.mobileApp so future preps can
-    // use the check_package fast path even after Redis TTL expires.
+    // Persist packageName to project settings so future preps can use
+    // the check_package fast path even after Redis TTL expires. With
+    // platform passed through, the write goes to mobileApps[platform]
+    // (and mirrors to legacy) instead of clobbering the legacy slot.
     if (packageName) {
-      await persistPackageName(projectId, userId, projectMobileApp, packageName);
+      await persistPackageName(projectId, userId, projectMobileApp, packageName, platform, project?.settings);
     }
 
     // Pending-install flag (if any) has now been consumed — clear it.
@@ -410,11 +450,20 @@ export class MobileAppPrepService {
 }
 
 /**
- * Write the detected Android package name back to
- * `project.settings.mobileApp` so subsequent preps (after Redis TTL expiry)
- * can hit the `check_package` fast path instead of re-downloading the APK.
- * No-op when the value is already up to date. Failures are logged but
- * swallowed — this is a cache warm, not a correctness-critical write.
+ * Write the detected package name back to project settings so subsequent
+ * preps (after Redis TTL expiry) can hit the `check_package` fast path
+ * instead of re-downloading the binary. No-op when the value is already
+ * up to date. Failures are logged but swallowed — this is a cache warm,
+ * not a correctness-critical write.
+ *
+ * Dual-platform note: the write goes through `buildMobileAppSettingsPatch`
+ * when the caller knows the platform, so the per-platform shard is
+ * updated AND the legacy mirror is kept in sync. The previous
+ * implementation wrote ONLY to `settings.mobileApp` (legacy singular),
+ * which clobbered the latest-upload semantics — an iOS prep would
+ * overwrite the legacy slot with iOS metadata even when the user's most
+ * recent action was an Android upload. Callers that don't know the
+ * platform (legacy paths) fall back to legacy-only writes.
  */
 async function persistPackageName(
   projectId: string,
@@ -422,20 +471,23 @@ async function persistPackageName(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   currentMobileApp: any,
   packageName: string,
+  platform: MobilePlatform | undefined,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  currentSettings: any,
 ): Promise<void> {
   if (!packageName || currentMobileApp?.packageName === packageName) return;
   try {
+    const updated = { ...currentMobileApp, packageName };
+    const settingsPatch = platform
+      ? buildMobileAppSettingsPatch(currentSettings, platform, updated)
+      : { mobileApp: updated as unknown as Record<string, unknown> };
     await ProjectService.updateProject(projectId, userId, {
-      settings: {
-        mobileApp: {
-          ...currentMobileApp,
-          packageName,
-        } as unknown as Record<string, unknown>,
-      },
+      settings: settingsPatch,
     });
     logger.info('[MOBILE_APP_PREP] Persisted packageName to project settings', {
       projectId,
       packageName,
+      platform: platform ?? '(unspecified)',
     });
   } catch (err) {
     logger.warn('[MOBILE_APP_PREP] Failed to persist packageName (non-fatal)', {

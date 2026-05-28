@@ -8,6 +8,11 @@
 import { ProjectService } from '@/services/core/project.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import {
+  getProjectMobileApp,
+  getAllProjectMobileApps,
+  buildMobileAppSettingsPatch,
+} from '@/services/mobile/project-mobile-app.helper';
+import {
   MobileAppStorageService,
   MobileAppMetadata,
   trimMobileBuildField,
@@ -374,12 +379,21 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
     return;
   }
 
-  // 2. Update the legacy slot so editor warm-up + `resolveAppForRun`'s
-  // last-resort fallback both keep working. Same shape as before.
+  // 2. Update both the legacy singular slot AND the per-platform
+  // `mobileApps[platform]` shard. The helper merges with current
+  // settings so a previous upload on the OTHER platform stays intact
+  // — uploading .ipa no longer wipes the .apk metadata (this is the
+  // whole point of the dual-platform feature).
+  //
+  // `updateProject` merges `settings` shallowly into the existing JSONB,
+  // so we only need to include the two keys we're touching here.
+  const settingsPatch = buildMobileAppSettingsPatch(
+    project.settings as Record<string, unknown> | undefined,
+    effectivePlatform,
+    metadata as unknown as MobileAppMetadata,
+  );
   await ProjectService.updateProject(projectId, userId, {
-    settings: {
-      mobileApp: metadata as unknown as Record<string, unknown>,
-    },
+    settings: settingsPatch,
   });
 
   logger.info('[MOBILE_API] App finalized (signed-URL flow)', {
@@ -427,7 +441,24 @@ export async function finalizeMobileAppUpload(req: Request, res: Response): Prom
 /**
  * GET /api/v1/mobile/projects/:projectId/app
  *
- * Get current mobile app metadata for a project.
+ * Returns mobile-app metadata for a project. Three response shapes
+ * depending on the query string:
+ *
+ *   GET .../app                       → `{ mobileApp, mobileApps }`
+ *     - `mobileApp`: legacy singular slot (back-compat for old callers
+ *       that haven't been updated to read the per-platform dict)
+ *     - `mobileApps`: `{ android?, ios?, flutter? }` — the source of
+ *       truth for dual-platform projects. Empty platforms are omitted.
+ *
+ *   GET .../app?platform=ios          → `{ mobileApp: <ios slot> }`
+ *     - Returns the slot for the requested platform only. `null` when
+ *       that platform hasn't been uploaded. Convenient for callers
+ *       that need a single platform's metadata without filtering the
+ *       full dict client-side.
+ *
+ * Existing single-app frontends keep working: they read `mobileApp`
+ * which we mirror to the latest upload. New dual-app UIs read
+ * `mobileApps` and ignore the legacy field.
  */
 export async function getMobileApp(req: Request, res: Response): Promise<void> {
   const userId = req.user?.id;
@@ -444,14 +475,21 @@ export async function getMobileApp(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const mobileApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
+  // Optional platform filter for single-platform callers.
+  const rawPlatform = (req.query.platform as string) || '';
+  const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  const filterPlatform: MobilePlatform | undefined = VALID[rawPlatform];
 
-  if (!mobileApp) {
-    res.json({ success: true, mobileApp: null });
+  if (filterPlatform) {
+    const slot = getProjectMobileApp(project.settings, filterPlatform) ?? null;
+    res.json({ success: true, mobileApp: slot });
     return;
   }
 
-  res.json({ success: true, mobileApp });
+  // Full response — both shapes side by side for back-compat.
+  const all = getAllProjectMobileApps(project.settings);
+  const legacy = (project.settings?.mobileApp as MobileAppMetadata | undefined) ?? null;
+  res.json({ success: true, mobileApp: legacy, mobileApps: all });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -528,7 +566,25 @@ export async function patchMobileApp(req: Request, res: Response): Promise<void>
     return;
   }
 
-  const existing = project.settings?.mobileApp as MobileAppMetadata | undefined;
+  // Optional `?platform=ios` (or body) lets the caller target a specific
+  // shard. Defaults to the legacy singular slot's platform when the
+  // request doesn't specify one — so old single-platform callers keep
+  // working unchanged.
+  const rawPlatformParam = (req.query.platform as string) || req.body?.platform;
+  const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  const requestedPlatform: MobilePlatform | undefined = VALID[rawPlatformParam];
+
+  const legacy = project.settings?.mobileApp as MobileAppMetadata | undefined;
+  const targetPlatform: MobilePlatform | undefined =
+    requestedPlatform ?? (legacy?.platform as MobilePlatform | undefined);
+
+  // Prefer the sharded slot when we know the platform; fall back to
+  // legacy for old projects that don't have shards yet.
+  const existing: MobileAppMetadata | undefined =
+    targetPlatform
+      ? (getProjectMobileApp(project.settings, targetPlatform) ?? legacy)
+      : legacy;
+
   if (!existing) {
     res.status(404).json({
       success: false,
@@ -539,11 +595,15 @@ export async function patchMobileApp(req: Request, res: Response): Promise<void>
 
   const updated: MobileAppMetadata = { ...existing, packageName };
 
-  await ProjectService.updateProject(projectId, userId, {
-    settings: {
-      mobileApp: updated as unknown as Record<string, unknown>,
-    },
-  });
+  const settingsPatch = targetPlatform
+    ? buildMobileAppSettingsPatch(
+        project.settings as Record<string, unknown> | undefined,
+        targetPlatform,
+        updated,
+      )
+    : { mobileApp: updated as unknown as Record<string, unknown> };
+
+  await ProjectService.updateProject(projectId, userId, { settings: settingsPatch });
 
   logger.info('[MOBILE_API] App packageName updated', { projectId, packageName });
 
@@ -574,20 +634,60 @@ export async function deleteMobileApp(req: Request, res: Response): Promise<void
     return;
   }
 
-  const mobileApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
+  // Per-platform delete: `DELETE .../app?platform=ios` clears ONLY the
+  // iOS slot, leaving any uploaded .apk for Android untouched. Without
+  // a platform param we keep the historical behaviour (clear both the
+  // legacy singular slot and ALL platform shards) so old single-app
+  // callers still see a full reset.
+  const rawPlatform = (req.query.platform as string) || '';
+  const VALID: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
+  const targetPlatform: MobilePlatform | undefined = VALID[rawPlatform];
 
+  if (targetPlatform) {
+    const slot = getProjectMobileApp(project.settings, targetPlatform);
+    if (!slot) {
+      res.json({ success: true, message: `No ${targetPlatform} app to delete` });
+      return;
+    }
+    await MobileAppStorageService.deleteApp(slot.storagePath);
+
+    // Remove the platform's shard, keep others. Also clear the legacy
+    // singular slot when it happens to point at the same upload — leaving
+    // a stale legacy pointer would have the warmup fallback resurrect a
+    // deleted binary on next read.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const currentApps = (project.settings as any)?.mobileApps as Record<string, unknown> | undefined;
+    const nextApps = { ...(currentApps ?? {}) };
+    delete nextApps[targetPlatform];
+    const legacy = project.settings?.mobileApp as MobileAppMetadata | undefined;
+    const legacyMatches = legacy && legacy.storagePath === slot.storagePath;
+    await ProjectService.updateProject(projectId, userId, {
+      settings: {
+        mobileApps: nextApps,
+        ...(legacyMatches ? { mobileApp: null } : {}),
+      },
+    });
+
+    logger.info('[MOBILE_API] App deleted (per-platform)', {
+      projectId,
+      platform: targetPlatform,
+      storagePath: slot.storagePath,
+    });
+    res.json({ success: true, message: 'App deleted' });
+    return;
+  }
+
+  // Legacy "delete everything" path.
+  const mobileApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
   if (!mobileApp) {
     res.json({ success: true, message: 'No app to delete' });
     return;
   }
-
-  // Delete from storage
   await MobileAppStorageService.deleteApp(mobileApp.storagePath);
-
-  // Clear from project settings
   await ProjectService.updateProject(projectId, userId, {
     settings: {
       mobileApp: null,
+      mobileApps: {},
     },
   });
 

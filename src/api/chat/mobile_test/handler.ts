@@ -18,6 +18,7 @@ import { env } from '@/config/environment/env';
 import { dbAdminService, supabaseAdmin } from '@/db/supabase';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import type { MobilePlatform, MobileIntentStep, MobileTestJobData } from '@/services/mobile/mobile-runner.types';
 import { toMobilePlatformKey } from '@/services/mobile/mobile-runner.types';
 import { AnalyticsQueryService } from '@/services/analytics/analytics-query.service';
@@ -263,13 +264,17 @@ export async function handleMobileTest(
 
     try {
       const project = (await dbAdminService.getProject(projectId)) as any;
-      const mobileApp = project?.settings?.mobileApp;
+      // Read the platform-sharded slot so a dual-platform project doesn't
+      // accidentally install the wrong-platform binary. `platform` is
+      // resolved above (line ~228) from the parsed intent.
+      const mobileApp = getProjectMobileApp(project?.settings, platform);
       if (mobileApp?.storagePath) {
         appStoragePath = mobileApp.storagePath;
         appOriginalName = mobileApp.originalName;
         projectAppPackage = mobileApp.packageName;
         logger.info('[MOBILE_TEST] Found project mobile app', {
           testId,
+          platform,
           appStoragePath,
           appOriginalName,
           projectAppPackage,
