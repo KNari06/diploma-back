@@ -1433,6 +1433,10 @@ export class IntentStepLintService {
           ruleTrace: resolverResult._ruleTrace,
           hardAllowedCount: resolverResult._hardAllowedCount,
           softAllowedCount: resolverResult._softAllowedCount,
+          // May 2026 — surfaces per-node `candidateText` (the EXACT
+          // string the LLM consumed pre-truncation) into the JSONL
+          // domSnapshot entries. See preview.types.ts comment.
+          candidateTextByRef: resolverResult._candidateTextByRef,
           latencyMs: resolveLatencyMs,
         });
       }

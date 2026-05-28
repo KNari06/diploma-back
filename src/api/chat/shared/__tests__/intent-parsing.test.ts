@@ -12,12 +12,12 @@ describe('intent-parsing', () => {
   describe('buildIntentMessage', () => {
     it('should return default message for null input', () => {
       const result = buildIntentMessage(null);
-      expect(result).toBe('🤔 Understanding your request...');
+      expect(result).toBe('Understanding your request...');
     });
 
     it('should return default message for undefined input', () => {
       const result = buildIntentMessage(undefined);
-      expect(result).toBe('🤔 Understanding your request...');
+      expect(result).toBe('Understanding your request...');
     });
 
     // API test intent
@@ -30,20 +30,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🔍 Got it! Testing GET https://api.example.com/users');
-      });
-
-      it('should include urgency emoji for high urgency', () => {
-        const intent: IntentResult = {
-          intent: 'api_test',
-          apiMethod: 'POST',
-          apiUrl: '/api/users',
-          urgency: 'high',
-        };
-
-        const result = buildIntentMessage(intent);
-        expect(result).toContain('⚡');
-        expect(result).toContain('POST /api/users');
+        expect(result).toBe('Got it! Testing GET https://api.example.com/users');
       });
 
       it('should return message with just URL when method not provided', () => {
@@ -53,7 +40,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🔍 Got it! Testing API endpoint https://api.example.com/users');
+        expect(result).toBe('Got it! Testing API endpoint https://api.example.com/users');
       });
 
       it('should return generic message when no URL or method', () => {
@@ -62,7 +49,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🔍 Got it! You want to test an API endpoint');
+        expect(result).toBe('Got it! Testing an API endpoint');
       });
     });
 
@@ -77,20 +64,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🌐 Got it! Testing login form on https://example.com');
-      });
-
-      it('should include urgency emoji for high urgency', () => {
-        const intent: IntentResult = {
-          intent: 'platform_test',
-          page: 'https://example.com',
-          scope: 'form',
-          target: 'login form',
-          urgency: 'high',
-        };
-
-        const result = buildIntentMessage(intent);
-        expect(result).toContain('⚡');
+        expect(result).toBe('Got it! Testing login form on https://example.com');
       });
 
       it('should return message with page and scope only', () => {
@@ -101,7 +75,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🌐 Got it! Testing full on https://example.com');
+        expect(result).toBe('Got it! Testing full on https://example.com');
       });
 
       it('should return message with scope and target only', () => {
@@ -112,7 +86,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🌐 Got it! Testing Buy button (element)');
+        expect(result).toBe('Got it! Testing Buy button (element)');
       });
 
       it('should return message with page only', () => {
@@ -122,7 +96,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🌐 Got it! Testing website https://example.com');
+        expect(result).toBe('Got it! Testing website https://example.com');
       });
 
       it('should return generic message when no specifics', () => {
@@ -131,7 +105,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('🌐 Got it! You want to test a website');
+        expect(result).toBe('Got it! Testing a website');
       });
     });
 
@@ -144,7 +118,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('❓ Are you trying to test a login form or API?');
+        expect(result).toBe('Are you trying to test a login form or API?');
       });
 
       it('should return default clarification message when question is empty', () => {
@@ -154,7 +128,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('❓ I need a bit more information to help you better');
+        expect(result).toBe('I need a bit more information to help you better');
       });
 
       it('should return default clarification message when no question', () => {
@@ -163,7 +137,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('❓ I need a bit more information to help you better');
+        expect(result).toBe('I need a bit more information to help you better');
       });
     });
 
@@ -175,7 +149,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('💬 Got it! Let me help you with that');
+        expect(result).toBe('Got it! Let me help you with that');
       });
     });
 
@@ -187,7 +161,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('✅ Intent understood!');
+        expect(result).toBe('Intent understood!');
       });
     });
 
@@ -199,7 +173,7 @@ describe('intent-parsing', () => {
         };
 
         const result = buildIntentMessage(intent);
-        expect(result).toBe('✅ Intent understood!');
+        expect(result).toBe('Intent understood!');
       });
 
       it('should handle very long URL gracefully', () => {

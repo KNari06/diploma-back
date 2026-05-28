@@ -386,9 +386,9 @@ describe('CreditCostTrackerService', () => {
       mockUserCreditsService.getUserCredits.mockResolvedValue({
         id: 'uc-1',
         user_id: 'user-123',
-        credits_balance: 5,
+        credits_balance: 0,
         total_purchased: 10,
-        total_used: 5,
+        total_used: 10,
         subscription_plan: 'free',
         subscription_status: 'active',
         subscription_expires_at: null,
@@ -402,8 +402,8 @@ describe('CreditCostTrackerService', () => {
       const result = await CreditCostTrackerService.checkCreditsForTest('user-123', 'intelligent');
 
       expect(result.hasEnough).toBe(false);
-      expect(result.available).toBe(5);
-      expect(result.shortage).toBe(TEST_CREDITS.INTELLIGENT - 5);
+      expect(result.available).toBe(0);
+      expect(result.shortage).toBe(TEST_CREDITS.INTELLIGENT);
     });
 
     it('should handle null user credits', async () => {

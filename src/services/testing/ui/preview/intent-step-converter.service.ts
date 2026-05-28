@@ -14,6 +14,10 @@
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
 import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence } from './preview.types';
+// Step.options.* forwarding (replaceContent, keyPressDelay, cssSelector,
+// disableStabilityChecks, disableCaching) lives in a dedicated module so
+// this converter stays focused on the action→command shape.
+import { applyStepOptionsToCommand } from './intent-step-options-forwarder';
 
 /**
  * Extended PlaywrightCommand with intent metadata for runtime resolution
@@ -52,6 +56,40 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     lookaheadTimeoutMs?: number;
     /** V10: Press Enter after type action (from step.options.pressEnter) */
     pressEnter?: boolean;
+    /**
+     * Clear field before typing (from step.options.replaceContent).
+     * - undefined / true → clear before typing (default, matches preview behavior)
+     * - false → append to existing content
+     * See preview-step-apply.service.ts:2548 for the canonical condition shape.
+     */
+    replaceContent?: boolean;
+    /**
+     * Per-keystroke delay (ms) for `pressSequentially` in the intent `type`
+     * path. From `step.options.keyPressDelay`. When undefined we pass no
+     * `delay` option (Playwright default) — same as preview's non-humanLike
+     * branch when the user didn't set it. We deliberately do NOT inject a
+     * random delay here (that's preview's `humanLike` path, not wired).
+     */
+    keyPressDelay?: number;
+    /**
+     * Marks `command.selector` as a user-pinned raw CSS override from
+     * `step.options.cssSelector`. When set, the executor must short-circuit
+     * the resolver waterfall and use the literal selector — failing the step
+     * if the locator doesn't match, with no AI/self-heal fallback. Mirrors
+     * preview-step-apply.service.ts:2093.
+     */
+    cssSelectorOverride?: string;
+    /**
+     * From `step.options.disableStabilityChecks`. When true the executor
+     * skips smartStepWait calls (matches preview-step-apply.service.ts:2451).
+     */
+    disableStabilityChecks?: boolean;
+    /**
+     * From `step.options.disableCaching`. When true the executor skips the
+     * `evidence.lastSuccessRef` fast-path and always runs full resolution.
+     * Matches the gate in intent-step-lint.service.ts:1227 used by preview.
+     */
+    disableCaching?: boolean;
     /** V13: Content was pasted — use clipboard paste instead of fill/pressSequentially */
     isPaste?: boolean;
     /** V11: Expected outcome for 4xx detection (default: 'success') */
@@ -272,6 +310,11 @@ export function convertIntentStepToCommand(
   if (primarySelector) {
     command.selector = primarySelector;
   }
+
+  // Forward user-toggle step.options.* (replaceContent, keyPressDelay,
+  // cssSelector, disableStabilityChecks, disableCaching). May also
+  // override command.selector when cssSelector is pinned.
+  applyStepOptionsToCommand(step, command);
 
   // Handle specific action types
   switch (step.type) {

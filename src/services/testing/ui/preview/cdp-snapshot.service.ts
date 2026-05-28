@@ -1098,7 +1098,6 @@ function buildLiteElementFromNode(args: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (el as any).__docUrl = args.docUrl;
   }
-
   return el;
 }
 
@@ -2656,6 +2655,45 @@ export class CdpSnapshotService {
     // each ref attaches to. Specific-first ordering minimises walk-up
     // collisions and keeps refs attached to the most specific element.
     type Indexed = RefAssignmentRequest & { __origIdx: number; __area: number; __specificity: number };
+    // Resolve scroll offset to normalize bounds from document-space to
+    // viewport-space.
+    //
+    // CDP `DOMSnapshot.bounds` is DOCUMENT-relative — origin at top-left
+    // of the document, not the viewport. The in-page evaluate below
+    // calls `elementsFromPoint(cx, cy)` and `getBoundingClientRect()`
+    // which are VIEWPORT-relative. Without subtracting scroll, every
+    // element below the fold is silently rejected at refAssign with
+    // `findElementReturnedNull / atPoint: null` (measured 543/639 = 85%
+    // of refAssign rejections on a `scrollY=500` bi.group capture, with
+    // the target "Астана" button — doc-y=792.5 → viewport-y=292.5 —
+    // being one of the casualties).
+    //
+    // ⚠️ Which scroll? LIVE, not snapshot.
+    //   `getBoundingClientRect()` (used by `bboxScore`) reads the LIVE
+    //   DOM scroll. If we subtracted the snapshot-time scroll (stashed
+    //   in `__docScrollY`), `bboxScore` would compare:
+    //       req.bboxY = doc-y - snapshotScroll
+    //       r.y      = doc-y - liveScroll  (from getBoundingClientRect)
+    //   When the user scrolled between captureSnapshot and refAssign
+    //   (~50ms gap) the difference exceeds TOL_EXACT=10px and bboxScore
+    //   returns 'mismatch' → element silently dropped.
+    //
+    //   Reading scroll INSIDE the evaluate body (`win.scrollX/Y`) closes
+    //   the race: same instant as getBoundingClientRect, same coord
+    //   space. Snapshot-time scroll (`__docScrollX/Y`) is used only as
+    //   a forensic hint — see `liteElementToForensic` consumers.
+    //
+    // ⚠️ Per-iframe scroll: each iframe has its own scroll position.
+    //   `assignAgentRefs` already groups by `docIdx`, so each call to
+    //   `runRefAssignmentInFrame` runs inside ONE frame. Reading
+    //   `win.scrollX/Y` inside that frame's evaluate is therefore
+    //   frame-local — correct for both main page and iframes.
+    //
+    // Stage-A identity selectors (id/testId/name) don't read bbox at
+    // all, so the scroll subtraction is a no-op for them. Only Stage B
+    // (bbox walk-up) and Stage C (descriptor + bbox tiebreaker) actually
+    // need viewport coords.
+
     const indexed: Indexed[] = docElements.map((el, idx) => {
       const id = el.htmlId || '';
       const testIdAttr = el.testIdAttr || '';
@@ -2670,6 +2708,13 @@ export class CdpSnapshotService {
       if (id) specificity = 0;
       else if (testIdAttr) specificity = 1;
       else if (el.ariaLabel || el.htmlName) specificity = 2;
+      // Bounds stay DOCUMENT-relative on the request payload. The
+      // evaluate body subtracts live `win.scrollX/Y` once at entry so
+      // every comparison downstream (elementsFromPoint,
+      // getBoundingClientRect, bboxScore IoU) runs in viewport space.
+      // Public `el.bounds` is NOT modified — downstream consumers
+      // (resolver, recording, forensic logs) continue to see
+      // document-relative bounds, preserving the existing contract.
       return {
         tag: el.tag,
         role: el.role || '',
@@ -2781,6 +2826,49 @@ export class CdpSnapshotService {
 
       if (typeof win.__agentRefCounter !== 'number') win.__agentRefCounter = 0;
       if (!win.__agentFingerprintMap) win.__agentFingerprintMap = new Map();
+
+      // Live scroll offset for document→viewport conversion.
+      //
+      // CDP DOMSnapshot.bounds is document-relative. elementsFromPoint
+      // and getBoundingClientRect are viewport-relative. We subtract
+      // live `win.scrollX/Y` once here, then ALL downstream math in
+      // this evaluate body (bboxScore comparisons, elementsFromPoint
+      // calls, IoU calculations) runs in viewport space — consistent
+      // with the page's live coordinate system.
+      //
+      // Live (not snapshot) scroll is the right choice: between
+      // captureSnapshot (Node side) and this evaluate (page side) the
+      // page may scroll. `getBoundingClientRect` reads from the LIVE
+      // DOM, so we must subtract the LIVE scroll to keep both sides in
+      // the same space. Snapshot-time scroll is stashed on
+      // LiteElement.__docScrollY for forensic comparison only.
+      //
+      // Defaults to 0 if win has no scrollX/Y (test mocks, exotic
+      // contexts). Safe: 0 means "no offset", matches pre-fix behaviour
+      // on the common scrollY=0 case.
+      const liveScrollX: number = typeof win.scrollX === 'number'
+        ? win.scrollX
+        : (typeof win.pageXOffset === 'number' ? win.pageXOffset : 0);
+      const liveScrollY: number = typeof win.scrollY === 'number'
+        ? win.scrollY
+        : (typeof win.pageYOffset === 'number' ? win.pageYOffset : 0);
+
+      // Normalize bounds in-place: every downstream consumer of
+      // req.bboxX/Y assumes viewport space from this point. We do this
+      // BEFORE the helper closures (bboxScore, findElement) capture
+      // `reqs` so they see the normalized values automatically.
+      if (liveScrollX !== 0 || liveScrollY !== 0) {
+        for (let i = 0; i < reqs.length; i++) {
+          // Skip rescue-mode entries with empty bbox — they go through
+          // Stage A (id/testId/name) or Stage C (descriptor) which
+          // don't read bboxX/Y. Subtracting scroll from 0/0 would just
+          // create misleading negative coords in diag logs.
+          if (reqs[i].bboxW > 0 || reqs[i].bboxH > 0) {
+            reqs[i].bboxX = reqs[i].bboxX - liveScrollX;
+            reqs[i].bboxY = reqs[i].bboxY - liveScrollY;
+          }
+        }
+      }
 
       const out: string[] = [];
       // Per-request diagnostics. Same length as `out` / `reqs` — index aligns.

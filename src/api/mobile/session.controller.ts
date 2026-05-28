@@ -400,7 +400,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // that the runner's TTL/unplug-watchdog will reap anyway.
           await redisConnection.del(redisKey);
           try {
-            await client.destroySession(existing.sessionId);
+            await client.destroySession(existing.sessionId, { userId });
           } catch (err) {
             logger.warn('[MOBILE_SESSION] destroySession during selector-switch failed (non-fatal)', {
               sessionId: existing.sessionId,
@@ -506,10 +506,11 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       session = await time('create_session_pinned', () => client.createSession(platform, {
         ownerId: effectiveOwnerId,
         deviceSelector,
+        userId,
       }));
     } else {
       try {
-        session = await time('pool_claim', () => client.claimSession(platform, { ownerId: effectiveOwnerId }));
+        session = await time('pool_claim', () => client.claimSession(platform, { ownerId: effectiveOwnerId, userId }));
         logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
           projectId,
           sessionId: session.sessionId,
@@ -525,6 +526,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         session = await time('create_session_cold', () => client.createSession(platform, {
           ownerId: effectiveOwnerId,
           deviceSelector,
+          userId,
         }));
       }
     }
@@ -660,7 +662,7 @@ export async function destroySession(req: Request, res: Response): Promise<void>
     // Destroy on runner
     const client = getMobileRunnerClient();
     try {
-      await client.destroySession(sessionId);
+      await client.destroySession(sessionId, { userId });
     } catch (err) {
       // Session may already be expired/destroyed on runner — non-fatal
       logger.warn('[MOBILE_SESSION] Runner destroy returned error (may be expired)', {
@@ -726,7 +728,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'tap', params: { x: Math.round(x), y: Math.round(y) }, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Tap failed', {
@@ -792,7 +794,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
         },
         _skipWait: true,
       },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Swipe failed', {
@@ -828,7 +830,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'go_home', params: {}, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Go home failed', {
@@ -864,7 +866,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'go_back', params: {}, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Go back failed', {
@@ -907,7 +909,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'type_text', params: { text }, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Type text failed', {
@@ -950,7 +952,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'press_key', params: { keycode }, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Key press failed', {
@@ -994,7 +996,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
     const client = getMobileRunnerClient();
     const result = await client.executeBatchCommands(sessionId, [
       { type, params: params ?? {}, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true, data: result?.results?.[0] });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Command failed', {
@@ -1117,7 +1119,7 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
 
     // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
     // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
-    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints);
+    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints, { userId: req.user.id });
 
     // Log the result for debugging element resolution issues
     trace.writeMobileLintResult({
@@ -1133,6 +1135,9 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         elementType: lintResult.elementType,
         boundingBox: lintResult.boundingBox,
         message: lintResult.message,
+        visibleNodeCount: lintResult.visibleNodeCount,
+        topNodes: lintResult.topNodes,
+        intentWords: lintResult.intentWords,
       },
     });
 
@@ -1433,7 +1438,7 @@ export async function autoBootAndInstall(
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
       const autoBootOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-      const session = await client.createSession(platform, { ownerId: autoBootOwnerId });
+      const session = await client.createSession(platform, { ownerId: autoBootOwnerId, userId });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID
@@ -1488,7 +1493,7 @@ export async function autoBootAndInstall(
         await client.executeBatchCommands(sessionId, [
           { type: 'close_app', params: { packageName: installedPackage, hard: true } },
           { type: 'launch_app', params: { packageName: installedPackage } },
-        ], { timeoutMs: 60_000 });
+        ], { timeoutMs: 60_000, userId });
         logger.info('[MOBILE_AUTO_BOOT] App wiped + launched on warmup', {
           projectId,
           sessionId,
@@ -1774,7 +1779,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         // Only for steps WITHOUT a compiled plan (first run / manual adds).
         if (!hasCompiled && description && LINT_TYPES.has(rawType)) {
           const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
-          const lintResult = await client.lintElement(sessionId, description, lintActionType);
+          const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, { userId });
 
           if (lintResult.status === 'resolved' && lintResult.boundingBox) {
             const bb = lintResult.boundingBox;
@@ -1827,7 +1832,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams } });
             }
 
-            await client.executeBatchCommands(sessionId, commands);
+            await client.executeBatchCommands(sessionId, commands, { userId });
             const durationMs = Date.now() - stepStart;
             stepResults.push({ stepId: step.id, success: true, durationMs });
             passedSteps++;
@@ -1859,6 +1864,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         const result = await client.runSteps(sessionId, [intentStep], {
           screenshotEachStep: true,
           stopOnFailure: true,
+          userId,
         });
 
         const stepResult = result.steps?.[0];

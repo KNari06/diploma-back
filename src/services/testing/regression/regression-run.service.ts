@@ -38,7 +38,7 @@ import {
 } from './regression-report-assembler.service';
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
-import { RegressionTestQueryService } from './regression-test-query.service';
+import { RegressionTestQueryService } from './db/regression-test-query.db';
 import { TestExecutionOrchestratorService } from './test-execution-orchestrator.service';
 
 /**

@@ -85,6 +85,116 @@ describe('CdpSnapshotService — real Chromium integration', () => {
       expect(snapshot.transientState?.isTransient).toBe(false);
     }, PER_TEST_TIMEOUT_MS);
 
+    // ──────────────────────────────────────────────────────────────────
+    // Regression test for May 2026 bi.group "Астана" incident:
+    //   CDP DOMSnapshot.bounds is document-relative. The refAssign phase
+    //   calls `elementsFromPoint(cx, cy)` and `getBoundingClientRect()`
+    //   which are viewport-relative. Without subtracting scrollY, any
+    //   button below the fold gets dropped at refAssign with
+    //   `findElementReturnedNull / atPoint: null`.
+    //
+    //   Forensic evidence from production capture (preview_db408e1b…):
+    //     scrollY=500, 543/639 refAssign rejections had bbox.y > 720.
+    //     Target button "Астана" at doc-y=792.5 was one of them.
+    //
+    //   This test reproduces the scenario in isolation:
+    //   - Tall page (force scrollbar).
+    //   - Button placed well below the first viewport.
+    //   - Scroll the page so the button is INSIDE the viewport after scroll.
+    //   - Collect snapshot → assert the button survived with a ref.
+    //
+    // If the scroll fix regresses, the button gets `ref=''` and is
+    // filtered out by the post-refAssign defense — total ref count drops
+    // and this assertion fails.
+    it('preserves below-the-fold buttons after page scroll (refAssign coord-space fix)', async () => {
+      // 3000px tall page; target button at y≈1200 in DOCUMENT space.
+      // Viewport is 1280×720 by default. After scrollTo(0, 500) the
+      // button sits at y≈700 in viewport — visible — but document
+      // coordinates are still y=1200. The pre-fix code passed y=1200
+      // to elementsFromPoint, hitting empty space (> 720), and dropped.
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await page.setContent(`
+        <div style="height: 1100px; background: linear-gradient(#eef,#fff);">
+          <p style="padding-top: 200px;">filler above</p>
+        </div>
+        <button id="target-astana" data-testid="city-astana"
+                style="display:block; width:300px; height:44px;">
+          Астана
+        </button>
+        <div style="height: 1500px;">filler below</div>
+      `);
+      await page.evaluate(() => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, 500));
+      // Settle layout + ensure scroll actually applied.
+      await page.waitForFunction(() => (globalThis as unknown as { scrollY: number }).scrollY === 500);
+
+      const snapshot = await CdpSnapshotService.collect(page);
+
+      // The button MUST appear with a ref (i.e. it survived refAssign).
+      const astana = snapshot.elements.find(
+        (e) => e.tag === 'button' && (e.htmlId === 'target-astana' || e.testIdAttr === 'city-astana'),
+      );
+      expect(astana).toBeDefined();
+      expect(astana?.ref).toMatch(/^e\d+$/);
+      // Bounds in the public LiteElement contract MUST stay
+      // document-relative (we subtract scroll only inside refAssign,
+      // not on the public field) — this is part of the API stability
+      // promise to downstream consumers like the resolver and traces.
+      expect(astana?.bounds?.y).toBeGreaterThanOrEqual(1000);
+    }, PER_TEST_TIMEOUT_MS);
+
+    // Race regression: scroll changes BETWEEN captureSnapshot (Node side,
+    // which records scrollOffset in the DS document) and the in-page
+    // refAssign evaluate. If we subtract snapshot-time scroll, the bbox
+    // we hand to elementsFromPoint is off by `(liveScroll - snapshotScroll)`
+    // px — when that delta exceeds TOL_EXACT (10px), bboxScore returns
+    // 'mismatch' and the element drops. Subtracting LIVE scroll inside
+    // the evaluate body (the only safe place) keeps both sides in sync.
+    //
+    // Repro: scroll to 500, kick off the collect (captureSnapshot reads
+    // scrollOffset=500), then immediately scroll to 600. By the time
+    // refAssign runs ~50ms later, win.scrollY=600 but DS bounds were
+    // captured at scroll=500. Pre-fix or with snapshot-scroll subtraction
+    // the button drops. With live-scroll subtraction it survives.
+    it('survives scroll-during-collect race (live scroll, not snapshot scroll)', async () => {
+      await page.setViewportSize({ width: 1280, height: 720 });
+      await page.setContent(`
+        <div style="height: 1100px; background:#eef;"></div>
+        <button id="race-target" style="display:block; width:300px; height:44px;">
+          Race Target
+        </button>
+        <div style="height: 1500px;"></div>
+      `);
+      await page.evaluate(() => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, 500));
+      await page.waitForFunction(() => (globalThis as unknown as { scrollY: number }).scrollY === 500);
+
+      // Kick off collect AND a scroll concurrently. The exact timing
+      // varies; what matters is that AT LEAST ONE run lands in the
+      // race window where snapshot scroll != live scroll. We do 3
+      // independent collects with mid-flight scrolls — at least one
+      // should hit the race.
+      let foundCount = 0;
+      for (const targetScroll of [600, 450, 550]) {
+        const collectPromise = CdpSnapshotService.collect(page);
+        // Best-effort race: fire the scroll immediately. May land
+        // before captureSnapshot starts (no race) or during refAssign
+        // (race we want to test).
+        page.evaluate((y) => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, y), targetScroll).catch(() => {});
+        const snap = await collectPromise;
+        const found = snap.elements.find((e) => e.htmlId === 'race-target');
+        if (found?.ref) foundCount++;
+        // restabilize
+        await page.evaluate(() => (globalThis as unknown as { scrollTo: (x: number, y: number) => void }).scrollTo(0, 500));
+        await page.waitForFunction(() => (globalThis as unknown as { scrollY: number }).scrollY === 500);
+      }
+
+      // Even in the worst case, the live-scroll fix should preserve
+      // the target on at least 2/3 collects. With the OLD bug (no
+      // scroll subtraction) we'd see 0/3 because target is always
+      // below the fold. With snapshot-scroll subtraction we'd see 1/3
+      // at best (only the non-racing run survives).
+      expect(foundCount).toBeGreaterThanOrEqual(2);
+    }, PER_TEST_TIMEOUT_MS);
+
     it('every interactive element has a ref starting with "e"', async () => {
       await page.setContent(`
         <button>A</button><button>B</button><button>C</button>

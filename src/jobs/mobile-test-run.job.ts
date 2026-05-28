@@ -26,6 +26,7 @@ import { Job } from 'bullmq';
 import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
@@ -602,12 +603,22 @@ export class MobileTestRunJobHandler {
       // Don't keep the worker process alive just for this timer.
       cancelPoller.unref?.();
 
+      // open_app/close_app: rewrite stale display labels (e.g. "ANDROID") to
+      // the resolved package so the runner acts on the app under test instead
+      // of failing on a non-existent package. Done here, at the single mobile
+      // job consumer, so every dispatch path (regression/CI/chat/preview) is
+      // covered in one place. Runs after resource-step compilation so injected
+      // setup steps are normalised too. Empty `appPackage` → blank value →
+      // runner falls back to session.packageName.
+      sanitizeMobileAppPackageSteps(intentSteps, appPackage);
+
       let runResult: MobileRunStepsResponse;
       try {
         runResult = await client.runSteps(sessionId, intentSteps, {
           screenshotEachStep: true,
           metadata,
           signal: runStepsAbort.signal,
+          userId,
         });
       } catch (err) {
         clearInterval(cancelPoller);
@@ -1142,10 +1153,10 @@ export class MobileTestRunJobHandler {
       if (sessionId) {
         try {
           if (sessionSource === 'pool') {
-            await client.releaseSession(sessionId);
+            await client.releaseSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
           } else {
-            await client.destroySession(sessionId);
+            await client.destroySession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
           }
         } catch (err) {

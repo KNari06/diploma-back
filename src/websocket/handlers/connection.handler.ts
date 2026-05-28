@@ -48,7 +48,7 @@ async function performDisconnectCleanup(userId: string): Promise<void> {
       await Promise.allSettled(
         sessionIds.map(async (sid) => {
           try {
-            await client.destroySession(sid);
+            await client.destroySession(sid, { userId });
           } catch (err) {
             logger.warn('[WebSocket] Cleanup destroy failed (runner TTL will reclaim)', {
               sessionId: sid,

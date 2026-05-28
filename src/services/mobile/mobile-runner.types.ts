@@ -377,6 +377,25 @@ export interface MobileHealthResponse {
 // because the backend only reads these fields — we don't want to import
 // the runner's A11yTree type into the backend just to re-export it.
 
+/** Window summary inside `actualForeground.windows[]`. Mirror of runner shape. */
+export interface MobileForegroundWindow {
+  packageName: string;
+  activityName: string | null;
+  kind: 'app' | 'launcher' | 'system_ui' | 'system_settings' | 'recents' | 'unknown';
+  isFocused: boolean;
+  isResumed: boolean;
+}
+
+/** Device-fresh foreground truth (dumpsys-derived). */
+export interface MobileActualForeground {
+  screenState: 'awake' | 'locked' | 'aod' | 'off' | 'unknown';
+  windows: MobileForegroundWindow[];
+  /** The single most-likely-foreground window. Null when nothing resolvable. */
+  primary: MobileForegroundWindow | null;
+  capturedAt: string;
+  durationMs: number;
+}
+
 export interface MobileUiState {
   sessionId: string;
   platform: 'android' | 'ios';
@@ -391,6 +410,109 @@ export interface MobileUiState {
   tree?: unknown;
   /** base64-encoded PNG. Omit with ?includeScreenshot=false. */
   screenshotBase64?: string;
+  capturedAt: string;
+  /**
+   * Alias for the legacy `app` field — what the runner *expected* to be
+   * foregrounded based on the session's launched package. Compare against
+   * `actualForeground.primary.packageName` to detect drift.
+   */
+  expectedApp?: string;
+  /**
+   * Device-fresh truth via dumpsys (Android) / equivalent (iOS). What is
+   * ACTUALLY on screen right now, independent of the a11y dump. Used to
+   * detect cases where the user wandered out of the app under test
+   * (settings, launcher, another app).
+   */
+  actualForeground?: MobileActualForeground;
+  /**
+   * Populated when `expectedApp` and `actualForeground.primary.packageName`
+   * disagree. Null when they match. Drives the LLM "user left the app"
+   * warning in mobile chat.
+   */
+  foregroundMismatch?: { expected: string; actual: string } | null;
+  /**
+   * Recent crash / ANR captured from logcat (Android) within the runner's
+   * observation window. Null when none observed. Lets the LLM surface
+   * "the app just crashed" instead of guessing from an unstable tree.
+   */
+  recentDisruption?: {
+    type: 'crash' | 'anr';
+    packageName: string;
+    snippet: string;
+    capturedAt: string;
+  } | null;
+  /**
+   * WebView heuristics. `detected=true` means the screen has at least one
+   * WebView host (Capacitor / Cordova / RN-WebView / hybrid). The runner
+   * suggests which context the LLM should drive — `webview` flips
+   * tap_element to DOM mode after switch_to_webview.
+   */
+  webView?: { detected: boolean; suggestedContext: 'native' | 'webview' };
+}
+
+// ── Phase B5 — runner observation endpoints ──────────────────────
+
+/**
+ * Response shape from runner `GET /api/sessions/:id/foreground`.
+ * Mirrors what `qait-mobile-runner/src/api/routes/session.routes.ts`
+ * emits — keep in sync if the runner contract evolves.
+ *
+ * `foreground` is intentionally typed as the same `MobileActualForeground`
+ * we already use inside `MobileUiState` — the runner returns the same
+ * shape from both endpoints so backend tools can swap eager-inject and
+ * tool-call paths without re-mapping.
+ */
+export interface MobileForegroundResponse {
+  sessionId: string;
+  platform: 'android' | 'ios';
+  expectedApp?: string;
+  foreground: MobileActualForeground;
+  mismatch: { expected: string; actual: string } | null;
+  capturedAt: string;
+}
+
+/**
+ * Single step entry in `MobileStepHistoryResponse.steps`. Mirrors the
+ * runner's `RedactedStepSummary` from `runner/step-history.ts` — the
+ * sensitive field (`type_text.text`) has already been replaced with
+ * `{ inputLength, inputClass }` upstream. Backend may still apply an
+ * additional layer of PII redaction defence-in-depth (Phase B-SEC).
+ */
+export interface MobileStepSummary {
+  stepIndex: number;
+  commandType: string;
+  paramsSummary: Record<string, unknown>;
+  success: boolean;
+  durationMs: number;
+  errorMessage?: string;
+  startedAt: number;
+  completedAt: number;
+}
+
+export interface MobileStepHistoryResponse {
+  sessionId: string;
+  steps: MobileStepSummary[];
+  /** False ⇒ caller passed `?includeRawInputs=true`. */
+  redacted: boolean;
+  capturedAt: string;
+}
+
+export type MobileLogLevel = 'verbose' | 'debug' | 'info' | 'warn' | 'error';
+
+/**
+ * Response shape from runner `GET /api/sessions/:id/logs`. The runner
+ * already caps payload at ~2KB and applies the requested `level` filter
+ * before returning. Lines are unparsed (raw `adb logcat -d` output for
+ * Android, `xcrun simctl log show` for iOS sim, `go-ios syslog` for
+ * physical iOS).
+ */
+export interface MobileLogsResponse {
+  sessionId: string;
+  platform: 'android' | 'ios';
+  level: MobileLogLevel;
+  lines: string[];
+  /** True when the runner's 2KB cap kicked in OR a single line was character-truncated. */
+  truncated: boolean;
   capturedAt: string;
 }
 

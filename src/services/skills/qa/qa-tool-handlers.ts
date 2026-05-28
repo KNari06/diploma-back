@@ -1177,7 +1177,13 @@ export async function handleListTestFindings(
     if (days) {
       const sinceDate = new Date();
       sinceDate.setDate(sinceDate.getDate() - days);
-      sessionsQuery = sessionsQuery.gte('created_at', sinceDate.toISOString());
+      // Column is `started_at`, not `created_at` — see schema in
+      // supabase-migrations/features/intelligent-test-scenarios.sql:46.
+      // Every other call site in the codebase (analytics-query.service.ts,
+      // ai-analysis.job.ts, intelligentTest.controller.ts) uses
+      // `started_at` for this table; this handler was added later and
+      // missed the convention.
+      sessionsQuery = sessionsQuery.gte('started_at', sinceDate.toISOString());
     }
 
     const { data: sessions, error: sessionsError } = await sessionsQuery;

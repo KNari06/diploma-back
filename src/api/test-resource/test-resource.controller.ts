@@ -478,7 +478,7 @@ export async function captureMobileSnapshot(req: Request, res: Response): Promis
   try {
     const { getMobileRunnerClient } = await import('@/services/mobile');
     const mobileClient = getMobileRunnerClient();
-    const captured = await mobileClient.captureAppData(runnerSessionId, packageName);
+    const captured = await mobileClient.captureAppData(runnerSessionId, packageName, { userId });
 
     // Build the snapshot envelope the auth adapter validates. `capturedAt`
     // is server-side wall clock — the runner doesn't return one and we
