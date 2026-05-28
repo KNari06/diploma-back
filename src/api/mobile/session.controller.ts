@@ -231,6 +231,24 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     };
   }
 
+  // iOS-specific default: when the frontend doesn't pin a deviceSelector,
+  // assume simulator. Why this is here and not at the runner: the runner's
+  // default-source policy can flip to 'local-physical' when an iPhone is
+  // hotplugged via USB (the iOS device watcher reports it). For a *create-
+  // test* warmup that's never what the user wants — they want a fresh
+  // simulator. Backend is the right layer to disambiguate because it's the
+  // first stop where we know "this is a warmup, not a debug-physical-device
+  // session". Android is left alone (the Android default already lands on
+  // an emulator). Physical-iOS callers must pin `source: 'local-physical'`
+  // explicitly; this default never overrides that.
+  if (platform === 'ios' && deviceSelector === undefined) {
+    deviceSelector = { source: 'local-emulator' };
+    logger.debug('[MOBILE_SESSION] defaulting iOS deviceSelector to local-emulator', {
+      userId,
+      projectId,
+    });
+  }
+
   logger.info('[MOBILE_SESSION] warmup request', {
     userId,
     projectId,
