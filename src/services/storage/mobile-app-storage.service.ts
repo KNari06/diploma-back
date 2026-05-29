@@ -753,6 +753,45 @@ export class MobileAppStorageService {
       } as unknown as MobileAppBuildRecord;
     }
 
+    // 6. Flutter → Android binary fallback. A Flutter Android build IS a
+    //    plain .apk, recorded/uploaded under platform 'android' (there is no
+    //    separate flutter artifact). When a flutter run found nothing above,
+    //    reuse the project's latest android build / legacy android slot —
+    //    same .apk an android session would install. iOS never falls through
+    //    here (an .ipa and .apk are genuinely different binaries).
+    if (ctx.platform === 'flutter') {
+      const { data: androidBuild } = await supabaseAdmin
+        .from('mobile_app_builds')
+        .select('*')
+        .eq('project_id', ctx.projectId)
+        .eq('platform', 'android')
+        .order('uploaded_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (androidBuild) {
+        logger.info('[MOBILE_APP_STORAGE] flutter resolver fell back to android build', {
+          projectId: ctx.projectId,
+          buildId: androidBuild.id,
+        });
+        return this.mapBuildRow(androidBuild);
+      }
+      if (legacy && legacy.storagePath && (legacy.platform ?? 'android') === 'android') {
+        logger.info('[MOBILE_APP_STORAGE] flutter resolver fell back to legacy android mobileApp', {
+          projectId: ctx.projectId,
+        });
+        return {
+          id: 'legacy-settings',
+          project_id: ctx.projectId as any,
+          ...legacy,
+          branch: null,
+          commitSha: null,
+          buildNumber: null,
+          ciRunId: null,
+          source: 'manual',
+        } as unknown as MobileAppBuildRecord;
+      }
+    }
+
     return null;
   }
 
