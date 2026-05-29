@@ -53,6 +53,12 @@ const RAW_CMD_MAP: Record<string, string> = {
 // REPLACE an existing one in the DB. Higher rank = more reliable strategy.
 //
 // Why each rank:
+//   creation_location (9) — Flutter widget's source creation site
+//     (file:line:col from the Widget Inspector). Deterministic across runs,
+//     label-independent (works for icon-only widgets), and survives layout
+//     rewrites + translations. The strongest Flutter key — ranked ABOVE
+//     resource_id so a Flutter creation_location plan is never downgraded to
+//     a weaker strategy.
 //   resource_id / accessibility_id (8) — developer-controlled IDs, stable
 //     across translations / DPI changes / minor refactors. The strongest
 //     signal we have on Android (`android:id`) and iOS
@@ -68,6 +74,7 @@ const RAW_CMD_MAP: Record<string, string> = {
 //
 // Numbers are gaps so a future strategy can slot in without renumbering.
 const MOBILE_STRATEGY_RANK: Record<string, number> = {
+  creation_location: 9,
   resource_id: 8,
   accessibility_id: 8,
   label_exact: 5,
