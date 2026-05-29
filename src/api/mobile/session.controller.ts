@@ -14,6 +14,7 @@
 import { env } from '@/config/environment/env';
 import { redisConnection } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
 import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
@@ -197,6 +198,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  // Flutter sessions are created as a NATIVE android session first, then
+  // upgraded via `attachFlutter` (install → launch → VM Service detect).
+  // The runner's direct `createSession('flutter')` probes the VM Service
+  // before the app is installed (chicken-and-egg → always fails), and the
+  // pool never warms 'flutter' anyway. So we always ask the runner for
+  // 'android' and keep `platform` ('flutter') only as the logical label
+  // stored in Redis + returned to the frontend.
+  const isFlutter = platform === 'flutter';
+  const sessionCreatePlatform: MobilePlatform = isFlutter ? 'android' : platform;
 
   // Phase 2.6: validate `deviceSelector` if present. Inline validator to
   // match this file's existing style (no zod). Rejects malformed selectors
@@ -427,6 +437,27 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             });
           }
           // Fall through to create a new session below
+        } else if (isFlutter && existing.platform !== 'flutter') {
+          // A Flutter warmup can't reuse a non-Flutter session (e.g. the
+          // upload-time android pre-warm from autoBootAndInstall): it has
+          // no Dart VM Service connection. Invalidate and fall through to a
+          // fresh create, which does android → install → attachFlutter.
+          logger.info('[MOBILE_SESSION] Flutter request but cached session is non-flutter — recreating', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+            cachedPlatform: existing.platform,
+          });
+          await redisConnection.del(redisKey);
+          try {
+            await client.destroySession(existing.sessionId, { userId });
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] destroySession during flutter-mismatch invalidation failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Fall through to create a new session below
         } else {
           logger.debug('[MOBILE_SESSION] Reusing existing warmed session', {
             projectId,
@@ -438,23 +469,29 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // the app already open. On a reused session this usually hits the fast
           // path (Redis match or device check) and just issues launch_app.
           emitWarmupProgress(userId, 'launching_browser', 15);
-          try {
-            await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
-              client,
-              sessionId: existing.sessionId,
-              projectId,
-              userId,
-              appPackage,
-              platform,
-              skipLaunch: !prelaunch,
-              onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
-            }));
-          } catch (err) {
-            logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
-              sessionId: existing.sessionId,
-              projectId,
-              error: err instanceof Error ? err.message : String(err),
-            });
+          // Skip re-prep for a reused Flutter session: it's already a live,
+          // attached Flutter session (app installed + running + VM Service
+          // connected). Re-running install/launch here would reinstall over
+          // the running app and tear down the FlutterClient connection.
+          if (!isFlutter) {
+            try {
+              await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
+                client,
+                sessionId: existing.sessionId,
+                projectId,
+                userId,
+                appPackage,
+                platform,
+                skipLaunch: !prelaunch,
+                onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
+              }));
+            } catch (err) {
+              logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
+                sessionId: existing.sessionId,
+                projectId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
           emitWarmupProgress(userId, 'ready', 100);
 
@@ -523,14 +560,14 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         projectId,
         deviceSelector,
       });
-      session = await time('create_session_pinned', () => client.createSession(platform, {
+      session = await time('create_session_pinned', () => client.createSession(sessionCreatePlatform, {
         ownerId: effectiveOwnerId,
         deviceSelector,
         userId,
       }));
     } else {
       try {
-        session = await time('pool_claim', () => client.claimSession(platform, { ownerId: effectiveOwnerId, userId }));
+        session = await time('pool_claim', () => client.claimSession(sessionCreatePlatform, { ownerId: effectiveOwnerId, userId }));
         logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
           projectId,
           sessionId: session.sessionId,
@@ -543,7 +580,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           projectId,
           error: poolErr instanceof Error ? poolErr.message : String(poolErr),
         });
-        session = await time('create_session_cold', () => client.createSession(platform, {
+        session = await time('create_session_cold', () => client.createSession(sessionCreatePlatform, {
           ownerId: effectiveOwnerId,
           deviceSelector,
           userId,
@@ -603,15 +640,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // Install the project's mobile app and run launch_app BEFORE returning, so the
     // preview stream shows the app already open when the frontend connects.
     // Non-fatal: on failure we still return the session so the user can retry.
+    // For Flutter we install but DON'T launch here — `attachFlutter` below
+    // clears logcat and launches so the one-time VM Service log line is
+    // inside the detection window.
+    let preppedPackage: string | undefined;
     try {
-      await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
+      preppedPackage = await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
         client,
         sessionId: session.sessionId,
         projectId,
         userId,
         appPackage,
         platform,
-        skipLaunch: !prelaunch,
+        skipLaunch: isFlutter ? true : !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
       }));
     } catch (err) {
@@ -620,6 +661,46 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         projectId,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Flutter: upgrade the native session into a Flutter session (launch →
+    // VM Service detect → connect). FATAL — a Flutter test can't run without
+    // the driver connection, and the runner destroys the native session on
+    // failure, so drop the Redis pointer and surface the runner's status
+    // (422 FLUTTER_NOT_DETECTED when the build isn't debug/profile).
+    if (isFlutter) {
+      const flutterPackage = appPackage || preppedPackage;
+      if (!flutterPackage) {
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        res.status(400).json({
+          success: false,
+          error: 'No mobile app uploaded for this project — cannot start a Flutter session.',
+        });
+        return;
+      }
+      try {
+        await time('attach_flutter', () => client.attachFlutter(
+          session.sessionId,
+          { packageName: flutterPackage },
+          { userId },
+        ));
+      } catch (err) {
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        const status = (err instanceof MobileRunnerError && err.statusCode) ? err.statusCode : 500;
+        logger.warn('[MOBILE_SESSION] Flutter attach failed during warmup', {
+          sessionId: session.sessionId,
+          projectId,
+          userId,
+          status,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        res.status(status).json({
+          success: false,
+          error: err instanceof Error ? err.message : 'Flutter attach failed',
+          ...(err instanceof MobileRunnerError ? { code: err.code } : {}),
+        });
+        return;
+      }
     }
     emitWarmupProgress(userId, 'ready', 100);
 

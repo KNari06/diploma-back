@@ -269,6 +269,14 @@ export class MobileTestRunJobHandler {
       client.setGeminiApiKey(geminiApiKey);
     }
 
+    // Flutter runs as a NATIVE android session that we upgrade via
+    // `attachFlutter` after install+launch. The runner's direct
+    // createSession('flutter') probes the VM Service before the app is
+    // installed (chicken-and-egg → always fails), and the pool only warms
+    // android, so we acquire 'android' here and attach below.
+    const isFlutter = platform === 'flutter';
+    const acquirePlatform = isFlutter ? 'android' : platform;
+
     let sessionId: string | null = null;
     let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
     // Fast-auth: filled from compileResult.fastAuthRestores. Each entry is a
@@ -394,7 +402,7 @@ export class MobileTestRunJobHandler {
       const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
         client,
         testId,
-        platform,
+        platform: acquirePlatform,
         browser,
         userId,
         projectId,
@@ -509,6 +517,9 @@ export class MobileTestRunJobHandler {
             appPackage,
             appStoragePathOverride: appStoragePath,
             appOriginalNameOverride: appOriginalName,
+            // Flutter: install only — attachFlutter (below) clears logcat
+            // and launches so the VM Service log line is in the scan window.
+            skipLaunch: isFlutter,
             onProgress: (stage, _progress) => {
               switch (stage) {
                 case 'launching_browser':
@@ -555,6 +566,21 @@ export class MobileTestRunJobHandler {
         if (!fastAuthResult.fastAuthUsed) {
           tlm.fastAuthFallbackReason = fastAuthResult.fastAuthFallbackReason;
         }
+      }
+
+      // ── Phase 3d: Flutter attach ──────────────────────────────
+      // Upgrade the native android session into a Flutter session: launch
+      // the app (now that install + fast-auth restore are done), detect the
+      // Dart VM Service, and connect. FATAL — a Flutter test can't run
+      // without the driver connection. Throwing here routes into the outer
+      // catch, which marks the test failed with the runner's message
+      // (e.g. FLUTTER_NOT_DETECTED when the build isn't debug/profile).
+      if (isFlutter && sessionId) {
+        if (!appPackage) {
+          throw new Error('Flutter test has no resolved package name — cannot attach the Dart VM Service.');
+        }
+        await client.attachFlutter(sessionId, { packageName: appPackage }, { userId });
+        logger.info('[MOBILE-TEST] Flutter session attached', { testId, sessionId, appPackage });
       }
 
 

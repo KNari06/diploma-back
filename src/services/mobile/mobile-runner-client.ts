@@ -437,6 +437,39 @@ export class MobileRunnerClient {
     );
   }
 
+  // ── Flutter attach (native session → flutter session) ──────────
+
+  /**
+   * Upgrade an already-installed native android session into a Flutter
+   * session. The caller must have installed the APK on `sessionId` first
+   * (normal `install_app`); the runner then launches the app, detects the
+   * Dart VM Service, connects, and keeps the SAME session id.
+   *
+   * Throws `MobileRunnerError` with status 422 / code `FLUTTER_NOT_DETECTED`
+   * when the build isn't debug/profile or doesn't call
+   * `enableFlutterDriverExtension()` — that's a rebuild-required failure,
+   * not transient, so `noRetry`.
+   *
+   * 45 s timeout covers `logcat -c` + launch + the 20 s VM-Service scan +
+   * FlutterClient connect, with headroom for a slow/cold emulator.
+   */
+  async attachFlutter(
+    sessionId: string,
+    input: { packageName: string },
+    opts?: { userId?: string },
+  ): Promise<{ sessionId: string; platform: string }> {
+    return this.request<{ sessionId: string; platform: string }>(
+      'POST',
+      `/api/sessions/${sessionId}/attach-flutter`,
+      {
+        body: input,
+        timeoutMs: 45_000,
+        noRetry: true,
+        userId: opts?.userId,
+      },
+    );
+  }
+
   // ── App upload (multipart → runner) ────────────────────────────
 
   /**
