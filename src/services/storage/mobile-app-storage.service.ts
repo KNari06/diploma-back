@@ -778,6 +778,33 @@ export class MobileAppStorageService {
     return (data || []).map((row) => this.mapBuildRow(row));
   }
 
+  /**
+   * Read the app framework detected at upload time for a project, independent
+   * of platform. Source of truth is `projects.settings.mobileApp.detectedFramework`
+   * (set by `uploadApp`); the `mobile_app_builds` table does not persist it.
+   *
+   * Returns undefined when no app has been uploaded or detection didn't run
+   * (older uploads). Callers should treat undefined as "assume native android".
+   *
+   * Used by the test-case save path to keep Flutter apps on `mobile_flutter`
+   * even though the runner's live ui-state only ever reports the host platform.
+   */
+  static async getDetectedFramework(
+    projectId: string,
+  ): Promise<MobileAppMetadata['detectedFramework'] | undefined> {
+    const { data: project, error } = await supabaseAdmin
+      .from('projects')
+      .select('settings')
+      .eq('id', projectId)
+      .maybeSingle();
+    if (error) {
+      logger.warn('[MOBILE_APP_STORAGE] getDetectedFramework failed', { projectId, error });
+      return undefined;
+    }
+    const legacy = (project?.settings as any)?.mobileApp as MobileAppMetadata | undefined;
+    return legacy?.detectedFramework;
+  }
+
   /** Convert a raw `mobile_app_builds` row into the service shape. */
   private static mapBuildRow(row: any): MobileAppBuildRecord {
     return {

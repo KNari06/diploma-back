@@ -11,6 +11,9 @@ jest.mock('../db/regression.db', () => ({
 jest.mock('@/services/storage/mobile-app-storage.service', () => ({
   MobileAppStorageService: {
     resolveAppForRun: jest.fn().mockResolvedValue(null),
+    // Default: framework unknown → dispatcher keeps the stored platform.
+    // Flutter-upgrade behaviour is asserted in its own test below.
+    getDetectedFramework: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -131,6 +134,44 @@ describe('platform and browser mapping', () => {
     const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
     expect(jobData.platform).toBe('android');
     expect(jobData.browser).toBe('mobile-android');
+  });
+
+  it('upgrades android→flutter when the project app is detected as Flutter', async () => {
+    (MobileAppStorageService.getDetectedFramework as jest.Mock).mockResolvedValueOnce('flutter');
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_android' }),
+      'user-1',
+      'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.platform).toBe('flutter');
+    expect(jobData.browser).toBe('mobile-flutter');
+  });
+
+  it('keeps android when detected framework is not Flutter', async () => {
+    (MobileAppStorageService.getDetectedFramework as jest.Mock).mockResolvedValueOnce('android');
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_android' }),
+      'user-1',
+      'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.platform).toBe('android');
+    expect(jobData.browser).toBe('mobile-android');
+  });
+
+  it('does not downgrade an explicit flutter case even if framework read fails', async () => {
+    (MobileAppStorageService.getDetectedFramework as jest.Mock).mockRejectedValueOnce(
+      new Error('db down'),
+    );
+    await MobileTestDispatcherService.dispatchMobileTest(
+      baseCase({ platform: 'mobile_flutter' }),
+      'user-1',
+      'manual',
+    );
+    const jobData = QueueManager.addMobileTestRunJob.mock.calls[0][0];
+    expect(jobData.platform).toBe('flutter');
+    expect(jobData.browser).toBe('mobile-flutter');
   });
 });
 
