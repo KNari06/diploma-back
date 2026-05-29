@@ -244,6 +244,8 @@ export async function finalizeMobileAppUpload(
     versionName: finalVersionName,
     versionCode: finalVersionCode,
     detectedFramework: parsed.framework,
+    flutterBuildMode: parsed.flutterBuildMode,
+    debuggable: parsed.debuggable,
   });
 
   // 1. Build row FIRST — if this fails the legacy slot must not point

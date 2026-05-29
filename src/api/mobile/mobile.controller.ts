@@ -20,6 +20,10 @@ import { Request, Response } from 'express';
 import * as MobileAppService from '@/services/mobile/mobile-app.service';
 import { MobileAppStorageService, trimMobileBuildField } from '@/services/storage/mobile-app-storage.service';
 import { VALID_PERMISSION_POLICIES } from '@/services/mobile/permission-policy.service';
+import {
+  MobileDriverProbeService,
+  MobileDriverProbeError,
+} from '@/services/mobile/mobile-driver-probe.service';
 
 import {
   parseContentLength,
@@ -167,6 +171,38 @@ export async function getMobileApp(req: Request, res: Response): Promise<void> {
     mobileApp: result.mobileApp,
     ...(result.mobileApps ? { mobileApps: result.mobileApps } : {}),
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROBE FLUTTER DRIVER EXTENSION
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/app/probe-driver-extension
+ *
+ * User-triggered probe: ask the runner to verify whether the stored
+ * Flutter APK actually wires up `enableFlutterDriverExtension()`.
+ * Thin controller — all logic in `MobileDriverProbeService`.
+ */
+export async function probeDriverExtension(req: Request, res: Response): Promise<void> {
+  const userId = requireUserId(req, res);
+  if (!userId) return;
+
+  const { projectId } = req.params;
+  try {
+    const result = await MobileDriverProbeService.probe(projectId, userId);
+    res.json({ success: true, result });
+  } catch (err) {
+    if (err instanceof MobileDriverProbeError) {
+      res.status(err.status).json({ success: false, error: err.message });
+      return;
+    }
+    logger.error('[MOBILE_API] driver-extension probe failed', {
+      projectId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({ success: false, error: 'Driver-extension probe failed' });
+  }
 }
 
 /** GET /api/v1/mobile/projects/:projectId/builds?platform=android&limit=20 */

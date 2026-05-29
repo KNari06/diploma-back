@@ -21,6 +21,7 @@ import {
   getProjectPermissionPolicy,
   listMobileAppBuilds,
   patchMobileApp,
+  probeDriverExtension,
   setProjectPermissionPolicy,
 } from './mobile.controller';
 import { generateCiKey, revokeCiKey, getCiKeyStatus } from './ci-key.controller';
@@ -91,6 +92,18 @@ router.delete(
   '/projects/:projectId/app',
   requireAuth,
   asyncHandler(deleteMobileApp),
+);
+
+/**
+ * POST /api/v1/mobile/projects/:projectId/app/probe-driver-extension
+ * User-triggered probe — boots an emulator, installs the stored Flutter
+ * APK, watches logcat for the Dart VM Service URL. Returns the verdict
+ * and persists it on `projects.settings.mobileApp` for later reads.
+ */
+router.post(
+  '/projects/:projectId/app/probe-driver-extension',
+  requireAuth,
+  asyncHandler(probeDriverExtension),
 );
 
 /**

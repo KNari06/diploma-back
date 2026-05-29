@@ -13,7 +13,11 @@
 
 import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
-import { detectFrameworkFromArchive, DetectedFramework } from '@/services/mobile/archive-platform-detect';
+import {
+  detectBuildInfoFromArchive,
+  DetectedFramework,
+  FlutterBuildMode,
+} from '@/services/mobile/archive-platform-detect';
 import { logger } from '@/utils/core/logger';
 import crypto from 'crypto';
 import fs from 'fs/promises';
@@ -39,6 +43,18 @@ export interface ParsedAppInfo {
    * NEVER let parser failures block the upload.
    */
   framework?: DetectedFramework;
+  /**
+   * Flutter build flavor (debug vs aot) inferred from the archive. Only set
+   * when `framework === 'flutter'`. Used by the Settings UI to render the
+   * Flutter banner with the right severity (debug → automatable; aot →
+   * profile-or-release, runtime check required).
+   */
+  flutterBuildMode?: FlutterBuildMode;
+  /**
+   * `android:debuggable` flag from AndroidManifest.xml. True signals a
+   * debug build on the Android side — orthogonal to `flutterBuildMode`.
+   */
+  debuggable?: boolean;
 }
 
 function coerceVersionCode(raw: unknown): number | undefined {
@@ -67,6 +83,18 @@ function coerceString(raw: unknown): string | undefined {
  * Pluck fields out of whatever shape app-info-parser returned. APK/AAB and
  * IPA emit different keys; we try both and pick the first non-empty value.
  */
+function coerceDebuggable(raw: unknown): boolean | undefined {
+  // app-info-parser surfaces android:debuggable as either a boolean or the
+  // string "true"/"false" depending on parser version. Anything else → undefined.
+  if (typeof raw === 'boolean') return raw;
+  if (typeof raw === 'string') {
+    const t = raw.trim().toLowerCase();
+    if (t === 'true') return true;
+    if (t === 'false') return false;
+  }
+  return undefined;
+}
+
 function extractFields(parsed: any, platform: MobilePlatform): ParsedAppInfo {
   if (!parsed || typeof parsed !== 'object') return {};
 
@@ -78,6 +106,10 @@ function extractFields(parsed: any, platform: MobilePlatform): ParsedAppInfo {
     ?? coerceVersionCode(parsed?.application?.versionCode);
   const androidPackage = coerceString(parsed.package)
     ?? coerceString(parsed?.application?.package);
+  // android:debuggable lives on the <application> element. Some parser
+  // versions expose it at the top level, others only on `.application`.
+  const debuggable = coerceDebuggable(parsed.debuggable)
+    ?? coerceDebuggable(parsed?.application?.debuggable);
 
   // iOS (ipa): Info.plist keys.
   const iosVersionName = coerceString(parsed.CFBundleShortVersionString);
@@ -96,6 +128,7 @@ function extractFields(parsed: any, platform: MobilePlatform): ParsedAppInfo {
     versionName: androidVersionName ?? iosVersionName,
     versionCode: androidVersionCode ?? iosVersionCode,
     packageName: androidPackage ?? iosPackage,
+    debuggable,
   };
 }
 
@@ -124,22 +157,26 @@ export async function parseFromStorage(
 
     const fields = extractFields(result, platform);
 
-    // Framework detection runs against the same local temp file — no
-    // extra Supabase download. Detector is hard-contract non-throwing by
-    // design, but we still isolate it in a local try/catch so a future
-    // regression (or a transient fs failure that bubbles past the
-    // detector's own swallow) can't take down the parser's version /
-    // packageName result. The caller's finalize flow critically depends
-    // on those fields; framework is just a hint.
+    // Framework + build-mode detection runs against the same local temp
+    // file — no extra Supabase download. Detector is hard-contract
+    // non-throwing by design, but we still isolate it in a local
+    // try/catch so a future regression (or a transient fs failure that
+    // bubbles past the detector's own swallow) can't take down the
+    // parser's version / packageName result. The caller's finalize flow
+    // critically depends on those fields; framework + buildMode are hints.
     let framework: DetectedFramework | undefined;
+    let flutterBuildMode: FlutterBuildMode | undefined;
     try {
-      framework = await detectFrameworkFromArchive(tempPath, storagePath);
+      const buildInfo = await detectBuildInfoFromArchive(tempPath, storagePath);
+      framework = buildInfo?.framework;
+      flutterBuildMode = buildInfo?.flutterBuildMode;
     } catch (err) {
       logger.debug('[MOBILE_APP_PARSER] detector threw — swallowing', {
         storagePath,
         error: err instanceof Error ? err.message : String(err),
       });
       framework = undefined;
+      flutterBuildMode = undefined;
     }
 
     logger.info('[MOBILE_APP_PARSER] Parsed binary', {
@@ -149,8 +186,10 @@ export async function parseFromStorage(
       versionCode: fields.versionCode,
       packageName: fields.packageName,
       framework: framework ?? null,
+      flutterBuildMode: flutterBuildMode ?? null,
+      debuggable: fields.debuggable ?? null,
     });
-    return { ...fields, framework };
+    return { ...fields, framework, flutterBuildMode };
   } catch (err) {
     logger.warn('[MOBILE_APP_PARSER] Parse failed — returning empty result', {
       storagePath,
