@@ -13,6 +13,7 @@ import path from 'path';
 import {
   detectFrameworkFromArchive,
   detectFrameworkFromBuffer,
+  detectBuildInfoFromArchive,
 } from '../archive-platform-detect';
 
 /**
@@ -323,5 +324,80 @@ describe('detectFrameworkFromBuffer — CI upload wrapper', () => {
 
   it('returns undefined for a corrupt buffer (no ZIP EOCD)', async () => {
     expect(await detectFrameworkFromBuffer(Buffer.from('not a real zip'), 'corrupt.apk')).toBeUndefined();
+  });
+});
+
+describe('detectBuildInfoFromArchive — Flutter build mode', () => {
+  // Debug builds ship `assets/flutter_assets/kernel_blob.bin` because the
+  // Dart VM still loads kernel at startup for the JIT path. AOT (release /
+  // profile) replaces the kernel blob with a pre-compiled snapshot inside
+  // libapp.so, so the kernel file is absent.
+  it('reports debug when an APK ships kernel_blob.bin', async () => {
+    const p = writeFixture('flutter-debug.apk', [
+      'AndroidManifest.xml',
+      'lib/arm64-v8a/libflutter.so',
+      'lib/arm64-v8a/libapp.so',
+      'assets/flutter_assets/kernel_blob.bin',
+      'assets/flutter_assets/AssetManifest.json',
+    ]);
+    const info = await detectBuildInfoFromArchive(p, 'flutter-debug.apk');
+    expect(info).toEqual({ framework: 'flutter', flutterBuildMode: 'debug' });
+  });
+
+  it('reports aot when a Flutter APK has libapp.so but no kernel_blob.bin', async () => {
+    const p = writeFixture('flutter-release.apk', [
+      'AndroidManifest.xml',
+      'lib/arm64-v8a/libflutter.so',
+      'lib/arm64-v8a/libapp.so',
+      'assets/flutter_assets/AssetManifest.json',
+    ]);
+    const info = await detectBuildInfoFromArchive(p, 'flutter-release.apk');
+    expect(info).toEqual({ framework: 'flutter', flutterBuildMode: 'aot' });
+  });
+
+  it('reports debug for an AAB whose base ships kernel_blob.bin', async () => {
+    const p = writeFixture('flutter-debug.aab', [
+      'BundleConfig.pb',
+      'base/lib/arm64-v8a/libflutter.so',
+      'base/assets/flutter_assets/kernel_blob.bin',
+    ]);
+    const info = await detectBuildInfoFromArchive(p, 'flutter-debug.aab');
+    expect(info).toEqual({ framework: 'flutter', flutterBuildMode: 'debug' });
+  });
+
+  it('reports debug for an IPA shipping App.framework/flutter_assets/kernel_blob.bin', async () => {
+    const p = writeFixture('flutter-debug.ipa', [
+      'Payload/Runner.app/Info.plist',
+      'Payload/Runner.app/Frameworks/Flutter.framework/Flutter',
+      'Payload/Runner.app/Frameworks/App.framework/App',
+      'Payload/Runner.app/Frameworks/App.framework/flutter_assets/kernel_blob.bin',
+    ]);
+    const info = await detectBuildInfoFromArchive(p, 'flutter-debug.ipa');
+    expect(info).toEqual({ framework: 'flutter', flutterBuildMode: 'debug' });
+  });
+
+  it('reports aot for a release IPA without kernel_blob.bin', async () => {
+    const p = writeFixture('flutter-release.ipa', [
+      'Payload/Runner.app/Info.plist',
+      'Payload/Runner.app/Frameworks/Flutter.framework/Flutter',
+      'Payload/Runner.app/Frameworks/App.framework/App',
+    ]);
+    const info = await detectBuildInfoFromArchive(p, 'flutter-release.ipa');
+    expect(info).toEqual({ framework: 'flutter', flutterBuildMode: 'aot' });
+  });
+
+  it('does not stamp flutterBuildMode on non-Flutter archives', async () => {
+    const p = writeFixture('native.apk', ['AndroidManifest.xml', 'classes.dex']);
+    const info = await detectBuildInfoFromArchive(p, 'native.apk');
+    expect(info).toEqual({ framework: 'android' });
+  });
+
+  it('does not stamp flutterBuildMode on React Native archives', async () => {
+    const p = writeFixture('rn.apk', [
+      'AndroidManifest.xml',
+      'lib/arm64-v8a/libreactnativejni.so',
+    ]);
+    const info = await detectBuildInfoFromArchive(p, 'rn.apk');
+    expect(info).toEqual({ framework: 'react-native' });
   });
 });

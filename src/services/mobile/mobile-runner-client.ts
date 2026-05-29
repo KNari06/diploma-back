@@ -402,6 +402,41 @@ export class MobileRunnerClient {
     );
   }
 
+  // ── Flutter driver-extension probe ─────────────────────────────
+
+  /**
+   * Ask the runner to verify whether the user's Flutter APK actually
+   * calls `enableFlutterDriverExtension()`. The APK is delivered the same
+   * way as a normal run — the caller first pushes the bytes via
+   * `uploadApp()` and passes the resulting on-disk `apkPath` here; the
+   * runner boots an emulator, installs + launches the APK, watches logcat
+   * for the Dart VM Service URL, and tears down the session.
+   *
+   * Always resolves to a verdict; the runner never throws an error to
+   * the HTTP layer.
+   *
+   * 240 s timeout: a cold probe pays full session bring-up — emulator
+   * connect/boot (can be ~90 s), the APK install, app launch, the 10 s
+   * VM-Service log scan, then teardown. Measured cold runs land around
+   * 120-130 s, so 240 s leaves headroom for a genuinely cold emulator
+   * without hanging the request forever.
+   */
+  async probeFlutterDriverExtension(
+    input: { packageName: string; apkPath: string },
+    opts?: { userId?: string },
+  ): Promise<{ detected: boolean; vmServiceUrl?: string; detail: string }> {
+    return this.request<{ detected: boolean; vmServiceUrl?: string; detail: string }>(
+      'POST',
+      '/api/probe/driver-extension',
+      {
+        body: input,
+        timeoutMs: 240_000,
+        noRetry: true,
+        userId: opts?.userId,
+      },
+    );
+  }
+
   // ── App upload (multipart → runner) ────────────────────────────
 
   /**
