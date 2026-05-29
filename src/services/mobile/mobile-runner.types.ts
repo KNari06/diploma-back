@@ -48,8 +48,10 @@ export function frameworkToMobilePlatformKey(
 ): MobilePlatformKey {
   if (framework === 'flutter') return 'mobile_flutter';
   if (framework === 'ios') return 'mobile_ios';
+  // React-Native runs on either host — respect hostPlatform so RN-on-iOS
+  // isn't mislabeled mobile_android. Falls through to the host check below.
   if (hostPlatform === 'ios') return 'mobile_ios';
-  // 'android', 'react-native', or unknown → native android stack.
+  // 'android', 'react-native' on android, or unknown → native android stack.
   return 'mobile_android';
 }
 

@@ -85,6 +85,10 @@ beforeEach(() => {
   jest.clearAllMocks();
   (regressionDb.getProjectWorkspaceId as jest.Mock).mockResolvedValue('ws-1');
   MobileAppStorageService.resolveAppForRun.mockResolvedValue(null);
+  // Default: framework unknown → no platform upgrade. Reset explicitly each
+  // test (clearAllMocks wipes the factory default) so a per-test
+  // mockResolvedValueOnce can't bleed into a later test.
+  MobileAppStorageService.getDetectedFramework.mockResolvedValue(undefined);
   dbAdminService.createTest.mockResolvedValue(undefined);
   QueueManager.addMobileTestRunJob.mockResolvedValue(undefined);
 });

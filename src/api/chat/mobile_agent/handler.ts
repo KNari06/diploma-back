@@ -32,6 +32,7 @@ import {
   assertMobileSessionOwnership,
   MobileSessionAuthzError,
 } from '@/services/mobile/mobile-session-authz';
+import { GLOBAL_STORE, type ChatStore } from '@/services/utils/chat-store';
 
 interface MobileAgentParams {
   message: string;
@@ -43,6 +44,13 @@ interface MobileAgentParams {
   context?: any;
   abortSignal?: AbortSignal;
   mode?: 'lite' | 'pro' | 'editor';
+  /**
+   * Persistence backend for this turn. TESTCASE_STORE when the mobile
+   * editor is scoped to a saved test case, GLOBAL_STORE otherwise. Threaded
+   * to `saveMobileChatTurn` so test-case turns don't leak into the global
+   * chat tables (parallel to web editor_action). Defaults to GLOBAL_STORE.
+   */
+  chatStore?: ChatStore;
 }
 
 export async function handleMobileAgent(
@@ -51,6 +59,7 @@ export async function handleMobileAgent(
   params: MobileAgentParams,
 ): Promise<void> {
   const { message, userId, chatSessionId, context, abortSignal } = params;
+  const chatStore: ChatStore = params.chatStore ?? GLOBAL_STORE;
   const startedAt = Date.now();
 
   const ctxObj = parseMobileContext(context);
@@ -64,6 +73,7 @@ export async function handleMobileAgent(
       NO_SESSION_REPLY,
       { noSession: true },
       'mobile_agent',
+      chatStore,
     );
     res.json({
       success: false,
@@ -103,6 +113,7 @@ export async function handleMobileAgent(
         NO_SESSION_REPLY,
         { noSession: true, authzRejected: true },
         'mobile_agent',
+        chatStore,
       );
       res.status(403).json({
         success: false,
@@ -250,6 +261,7 @@ export async function handleMobileAgent(
         ...(reasoningTrace.length > 0 ? { reasoningTrace } : {}),
       },
       'mobile_agent',
+      chatStore,
     );
 
     res.json({
@@ -300,6 +312,7 @@ export async function handleMobileAgent(
         ...(reasoningTrace.length > 0 ? { reasoningTrace } : {}),
       },
       'mobile_agent',
+      chatStore,
     );
 
     // Pipeline failures are user-visible text, not 5xx — the chat already

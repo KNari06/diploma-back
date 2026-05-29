@@ -451,6 +451,13 @@ describe('Intent test-case scope partition', () => {
     'analyze_failure',
     'coverage_analysis',
     'test_recommendations',
+    // Mobile editor agents — parallel to web's editor_action. They operate
+    // on the LIVE emulator attached to the test-case editor, so they must
+    // work in test-case scope. Migrated to ChatPersistence (store threaded
+    // through saveMobileChatTurn → handler → registry wrapper), so their
+    // turns land in the test-case store, not the global tables.
+    'mobile_action',
+    'mobile_agent',
   ]);
 
   it('every registered intent is either explicitly blocked or explicitly allowed', () => {
