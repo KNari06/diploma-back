@@ -278,9 +278,21 @@ export class MobileStepApplyService {
           // can decide whether to trust these coords on the next replay or
           // re-resolve via vision/LLM (release-build layout shifts, DPR
           // changes, etc.). See runner TapParams.coordsConfidence.
-          const coordsConfidence = typeof lintResult.confidence === 'number'
+          let coordsConfidence = typeof lintResult.confidence === 'number'
             ? lintResult.confidence
             : undefined;
+          // Vision-sourced coords are low-trust by nature: the element was
+          // resolved from a screenshot (no a11y/inspector text match), so the
+          // point is a best-guess pixel, not a tree-anchored node. Common on
+          // Semantics-less Flutter screens. The vision model often reports high
+          // confidence (~0.9) even when it grabbed the wrong widget, which would
+          // trip the runner's TRUST_COORDS_THRESHOLD (≥0.9) and dispatch the bad
+          // point blindly. Demote below that threshold so smartResolve re-fetches
+          // a fresh (now inspector-sourced) tree and re-resolves by text/keys
+          // instead of tapping the stale vision pixel.
+          if (lintResult.visionMode) {
+            coordsConfidence = Math.min(coordsConfidence ?? 0.5, 0.5);
+          }
           // Pass `intent` (the normalized description) alongside the
           // coordinates so the runner's smartResolve can re-validate the
           // target if `coordsConfidence < 0.9`. Without intent, smartResolve

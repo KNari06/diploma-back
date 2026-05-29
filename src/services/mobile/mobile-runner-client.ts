@@ -575,6 +575,13 @@ export class MobileRunnerClient {
     screenSize?: { width: number; height: number };
     confidence?: number;
     resolvedVia?: string;
+    /**
+     * True when the bounding box came from the vision model (screenshot pixels)
+     * rather than an a11y/inspector tree node — common on Semantics-less Flutter
+     * screens. These coords are low-trust: callers should demote coordsConfidence
+     * so the runner re-resolves by text/keys instead of tapping the pixel blindly.
+     */
+    visionMode?: boolean;
     elementText?: string;
     elementType?: string;
     screenshot?: string;
