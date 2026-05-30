@@ -19,9 +19,20 @@
  */
 
 import { ProjectService } from '@/services/core/project.service';
+import { WorkspaceAccessService, PERMISSIONS } from '@/services/core/workspace-access.service';
 import { MobileAppStorageService, type MobileAppMetadata } from '@/services/storage/mobile-app-storage.service';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { redisConnection } from '@/config/infrastructure/queues';
 import { logger } from '@/utils/core/logger';
+
+/**
+ * Per-project in-flight lock TTL. The probe boots a real emulator and can
+ * run ~2–6 min on a cold device; the TTL must outlive the slowest probe so
+ * a concurrent click is rejected for the whole duration, but still expire
+ * if the process dies mid-probe (no permanent lock). Released explicitly in
+ * `finally` on the normal path.
+ */
+const PROBE_LOCK_TTL_SEC = 420;
 
 export type DriverExtensionVerdict = 'detected' | 'not_detected' | 'error';
 
@@ -43,13 +54,35 @@ export const MobileDriverProbeService = {
   /**
    * Run the probe against the project's currently uploaded app. Throws
    * `MobileDriverProbeError` with an explicit HTTP status when the pre-
-   * conditions aren't met (no app / not Flutter / project not found).
-   * Runner-side failures never throw — they map to `verdict: 'error'`.
+   * conditions aren't met (no app / not Flutter / project not found /
+   * no write access / probe already running). Runner-side failures never
+   * throw — they map to `verdict: 'error'`.
+   *
+   * TIMING / CLIENT TIMEOUT: APK delivery (`uploadApp`) + the runner probe
+   * are sequential and can exceed a typical 300s sync request cap (Node
+   * `server.requestTimeout`, Cloud Run) on a cold emulator. The verdict is
+   * ALWAYS persisted to `projects.settings.mobileApp` (see `persistVerdict`),
+   * so even if the client socket resets the result is recoverable via
+   * `GET /app` — the frontend hook re-reads it on completion/error. The
+   * per-project lock below also prevents a timed-out-but-still-running probe
+   * from being re-triggered into a pile-up.
    */
   async probe(projectId: string, userId: string): Promise<DriverExtensionProbeResponse> {
     const project = await ProjectService.getProject(projectId, userId);
     if (!project) {
       throw new MobileDriverProbeError(404, 'Project not found or access denied');
+    }
+
+    // Write-access gate. `getProject` only requires read membership, so
+    // without this a `view`-role user could boot an emulator. Booting
+    // hardware is a write-class side-effect — require PROJECT_WRITE.
+    const canWrite = await WorkspaceAccessService.hasPermission(
+      userId,
+      project.workspace_id,
+      PERMISSIONS.PROJECT_WRITE,
+    );
+    if (!canWrite) {
+      throw new MobileDriverProbeError(403, 'Write access is required to run the driver-extension probe');
     }
 
     const mobileApp = project.settings?.mobileApp as MobileAppMetadata | undefined;
@@ -75,74 +108,89 @@ export const MobileDriverProbeService = {
     const probedStoragePath = mobileApp.storagePath;
     const runner = getMobileRunnerClient();
 
-    // Deliver the APK to the runner the same way a normal run does: read
-    // the bytes from storage here (the backend has storage access) and
-    // push them to the runner's /upload/apk endpoint, which streams them
-    // to disk. The runner never fetches storage itself — keeps its
-    // network surface identical to the test path and avoids buffering a
-    // large download inside the runner process.
-    let apkPath: string;
-    try {
-      const buffer = await MobileAppStorageService.downloadApp(probedStoragePath);
-      const originalName = mobileApp.originalName
-        || (probedStoragePath.includes('/')
-          ? probedStoragePath.slice(probedStoragePath.lastIndexOf('/') + 1)
-          : probedStoragePath)
-        || 'app.apk';
-      const uploaded = await runner.uploadApp(buffer, originalName, { userId });
-      apkPath = uploaded.path;
-    } catch (err) {
-      // Download or runner-upload failed — surface as a structured
-      // 'error' verdict, same as a runner-unreachable failure below.
-      const detail = err instanceof Error ? err.message : String(err);
-      logger.warn('[DRIVER_PROBE] apk delivery failed', { projectId, detail });
-      const errorVerdict: DriverExtensionProbeResponse = {
-        verdict: 'error',
-        detail: `failed to deliver app to runner: ${detail}`,
-        probedAt: new Date().toISOString(),
-      };
-      await persistVerdict(projectId, userId, probedStoragePath, errorVerdict);
-      return errorVerdict;
+    // Concurrency guard: the probe boots a real emulator, so unguarded
+    // spam-clicks (or a timed-out-but-still-running probe being re-fired)
+    // would saturate the runner pool. `SET NX` gives a per-project in-flight
+    // lock across API instances; reject the duplicate with 409. Released in
+    // `finally`; TTL is a backstop for a crashed process.
+    const lockKey = `mobile:probe:lock:${projectId}`;
+    const lockAcquired = await redisConnection.set(lockKey, '1', 'EX', PROBE_LOCK_TTL_SEC, 'NX');
+    if (!lockAcquired) {
+      throw new MobileDriverProbeError(409, 'A driver-extension probe is already running for this project');
     }
 
-    let runnerResult: { detected: boolean; vmServiceUrl?: string; detail: string };
     try {
-      runnerResult = await runner.probeFlutterDriverExtension(
-        { packageName: mobileApp.packageName, apkPath },
-        { userId },
-      );
-    } catch (err) {
-      // Runner round-trip failed (network, 5xx, timeout). Surface this
-      // as `verdict: 'error'` instead of bubbling — the UI prefers a
-      // structured verdict to a thrown error so the button can show a
-      // grey "unreachable" badge rather than a red toast.
-      const detail = err instanceof Error ? err.message : String(err);
-      logger.warn('[DRIVER_PROBE] runner unreachable', { projectId, detail });
-      const errorVerdict: DriverExtensionProbeResponse = {
-        verdict: 'error',
-        detail: `runner unreachable: ${detail}`,
+      // Deliver the APK to the runner the same way a normal run does: read
+      // the bytes from storage here (the backend has storage access) and
+      // push them to the runner's /upload/apk endpoint, which streams them
+      // to disk. The runner never fetches storage itself — keeps its
+      // network surface identical to the test path and avoids buffering a
+      // large download inside the runner process.
+      let apkPath: string;
+      try {
+        const buffer = await MobileAppStorageService.downloadApp(probedStoragePath);
+        const originalName = mobileApp.originalName
+          || (probedStoragePath.includes('/')
+            ? probedStoragePath.slice(probedStoragePath.lastIndexOf('/') + 1)
+            : probedStoragePath)
+          || 'app.apk';
+        const uploaded = await runner.uploadApp(buffer, originalName, { userId });
+        apkPath = uploaded.path;
+      } catch (err) {
+        // Download or runner-upload failed — surface as a structured
+        // 'error' verdict, same as a runner-unreachable failure below.
+        const detail = err instanceof Error ? err.message : String(err);
+        logger.warn('[DRIVER_PROBE] apk delivery failed', { projectId, detail });
+        const errorVerdict: DriverExtensionProbeResponse = {
+          verdict: 'error',
+          detail: `failed to deliver app to runner: ${detail}`,
+          probedAt: new Date().toISOString(),
+        };
+        await persistVerdict(projectId, userId, probedStoragePath, errorVerdict);
+        return errorVerdict;
+      }
+
+      let runnerResult: { detected: boolean; vmServiceUrl?: string; detail: string };
+      try {
+        runnerResult = await runner.probeFlutterDriverExtension(
+          { packageName: mobileApp.packageName, apkPath },
+          { userId },
+        );
+      } catch (err) {
+        // Runner round-trip failed (network, 5xx, timeout). Surface this
+        // as `verdict: 'error'` instead of bubbling — the UI prefers a
+        // structured verdict to a thrown error so the button can show a
+        // grey "unreachable" badge rather than a red toast.
+        const detail = err instanceof Error ? err.message : String(err);
+        logger.warn('[DRIVER_PROBE] runner unreachable', { projectId, detail });
+        const errorVerdict: DriverExtensionProbeResponse = {
+          verdict: 'error',
+          detail: `runner unreachable: ${detail}`,
+          probedAt: new Date().toISOString(),
+        };
+        await persistVerdict(projectId, userId, probedStoragePath, errorVerdict);
+        return errorVerdict;
+      }
+
+      const verdict: DriverExtensionVerdict = runnerResult.detected ? 'detected' : 'not_detected';
+      const response: DriverExtensionProbeResponse = {
+        verdict,
+        detail: runnerResult.detail,
+        vmServiceUrl: runnerResult.vmServiceUrl,
         probedAt: new Date().toISOString(),
       };
-      await persistVerdict(projectId, userId, probedStoragePath, errorVerdict);
-      return errorVerdict;
+
+      await persistVerdict(projectId, userId, probedStoragePath, response);
+
+      logger.info('[DRIVER_PROBE] complete', {
+        projectId,
+        packageName: mobileApp.packageName,
+        verdict,
+      });
+      return response;
+    } finally {
+      await redisConnection.del(lockKey).catch(() => {});
     }
-
-    const verdict: DriverExtensionVerdict = runnerResult.detected ? 'detected' : 'not_detected';
-    const response: DriverExtensionProbeResponse = {
-      verdict,
-      detail: runnerResult.detail,
-      vmServiceUrl: runnerResult.vmServiceUrl,
-      probedAt: new Date().toISOString(),
-    };
-
-    await persistVerdict(projectId, userId, probedStoragePath, response);
-
-    logger.info('[DRIVER_PROBE] complete', {
-      projectId,
-      packageName: mobileApp.packageName,
-      verdict,
-    });
-    return response;
   },
 };
 
