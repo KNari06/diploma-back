@@ -431,6 +431,10 @@ export class MobileStepApplyService {
     // locking in an incorrect element pick.
     const PROVEN_RESOLVED_VIA: ReadonlySet<string> = new Set([
       'compiled', 'compiled_fast_path', 'cache',
+      // text_match: resolved by a direct, unambiguous tree text match (LLM-free).
+      // It picks a real node, so its compiled plan is just as trustworthy to
+      // persist as the compiled/cache paths — and lets the next run skip the LLM.
+      'text_match',
     ]);
     const planIsProven = !!stepResult?.resolvedVia
       && PROVEN_RESOLVED_VIA.has(stepResult.resolvedVia);
