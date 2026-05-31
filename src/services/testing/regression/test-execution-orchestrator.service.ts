@@ -846,12 +846,12 @@ export class TestExecutionOrchestratorService {
             }
           }
           // Narrow the emitter status to the FE's union. `executionCompletionEmitter`
-          // returns strings that may include 'cancelled' / 'pending' — collapse
-          // everything non-pass/non-fail to 'skipped' so the FE state machine stays
-          // three-valued.
+          // returns strings that may include 'cancelled' / 'pending' / 'timeout' —
+          // collapse everything non-pass to 'failed' or 'skipped' so the FE state
+          // machine stays three-valued. 'timeout' counts as a failure.
           const mappedStatus: 'passed' | 'failed' | 'skipped' =
             result.status === 'passed' ? 'passed'
-            : result.status === 'failed' ? 'failed'
+            : result.status === 'failed' || result.status === 'timeout' ? 'failed'
             : 'skipped';
           const fa = result.execId ? fastAuthByExecId.get(result.execId) : undefined;
           emitProgress('test_completed', `UI test ${result.status} (${completedCount}/${totalTests})`, {
@@ -866,6 +866,28 @@ export class TestExecutionOrchestratorService {
               ...(fa ? { fastAuth: fa } : {}),
             },
           });
+        }
+
+        // Stamp timed-out executions in the DB so they are never left as 'running'.
+        // The emitter resolved with 'timeout' (not a real signal) — the DB row was
+        // never updated by the worker. Best-effort: a failure here is logged and
+        // swallowed; the 30-minute force-fail in recomputeRunStatus is the backstop.
+        const timedOutExecIds = results
+          .filter((r) => r.status === 'timeout' && r.execId)
+          .map((r) => r.execId as string);
+
+        for (const execId of timedOutExecIds) {
+          await ExecutionService.updateStatus({
+            id: execId,
+            status: 'timeout',
+            errorMessage: 'Mobile job not processed within 10 minutes',
+          }).catch((err) =>
+            logger.warn('[REGRESSION_RUN] Failed to stamp timed-out execution in DB', {
+              runId,
+              execId,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
         }
       }
 
