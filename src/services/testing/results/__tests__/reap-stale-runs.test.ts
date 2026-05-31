@@ -1,9 +1,9 @@
 /**
- * Tests for `TestCompletionHandlerService.reapStaleRuns` — the
- * orchestration the stale-run reaper relies on. The DB read is stubbed at
- * the `db/` boundary (`findStaleRuns`) per the repo's mock-boundary rule;
- * `recomputeRunStatus` is spied so we assert the loop behaviour without
- * touching Supabase.
+ * Tests for `StaleReaperService.reapStaleRuns` — the orchestration the
+ * stale-run reaper relies on. The DB read is stubbed at the `db/` boundary
+ * (`findStaleRuns`) per the repo's mock-boundary rule; the run-finalization
+ * funnel `TestCompletionHandlerService.recomputeRunStatus` is spied so we
+ * assert the loop behaviour without touching Supabase.
  *
  * What's pinned here is the contract the reaper depends on:
  *   - every stale run is finalized with side effects SUPPRESSED, and
@@ -27,6 +27,7 @@ import {
   getRunsByIds,
 } from '@/services/testing/results/db/test-completion.db';
 import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
+import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 
 const mockFindStaleRuns = findStaleRuns as jest.MockedFunction<typeof findStaleRuns>;
 const mockFindExecRunIds = findRunIdsWithStaleExecutions as jest.MockedFunction<
@@ -46,14 +47,12 @@ const makeRun = (id: string): StaleRunRow => ({
   test_ids: ['t1'],
 });
 
-describe('TestCompletionHandlerService.reapStaleRuns', () => {
-  // recomputeRunStatus is a private static; private is compile-time only, so
-  // it's a normal runtime property we can spy on.
+describe('StaleReaperService.reapStaleRuns', () => {
   let recomputeSpy: jest.SpyInstance;
 
   beforeEach(() => {
     recomputeSpy = jest
-      .spyOn(TestCompletionHandlerService as any, 'recomputeRunStatus')
+      .spyOn(TestCompletionHandlerService, 'recomputeRunStatus')
       .mockResolvedValue(undefined);
     // Default every db boundary to "nothing found"; each test overrides.
     mockFindStaleRuns.mockResolvedValue([]);
@@ -69,7 +68,7 @@ describe('TestCompletionHandlerService.reapStaleRuns', () => {
   });
 
   it('does nothing and reports zero when there are no stale runs', async () => {
-    const result = await TestCompletionHandlerService.reapStaleRuns();
+    const result = await StaleReaperService.reapStaleRuns();
 
     expect(result).toEqual({ scanned: 0 });
     expect(recomputeSpy).not.toHaveBeenCalled();
@@ -78,7 +77,7 @@ describe('TestCompletionHandlerService.reapStaleRuns', () => {
   it('finalizes every parent-level stale run with side effects suppressed', async () => {
     mockFindStaleRuns.mockResolvedValue([makeRun('r1'), makeRun('r2')]);
 
-    const result = await TestCompletionHandlerService.reapStaleRuns();
+    const result = await StaleReaperService.reapStaleRuns();
 
     expect(result).toEqual({ scanned: 2 });
     expect(recomputeSpy).toHaveBeenCalledTimes(2);
@@ -94,7 +93,7 @@ describe('TestCompletionHandlerService.reapStaleRuns', () => {
     mockFindExecRunIds.mockResolvedValue(['rX']);
     mockGetRunsByIds.mockResolvedValue([makeRun('rX')]);
 
-    const result = await TestCompletionHandlerService.reapStaleRuns();
+    const result = await StaleReaperService.reapStaleRuns();
 
     expect(result).toEqual({ scanned: 1 });
     expect(mockGetRunsByIds).toHaveBeenCalledWith(['rX']);
@@ -107,7 +106,7 @@ describe('TestCompletionHandlerService.reapStaleRuns', () => {
     mockFindStaleRuns.mockResolvedValue([makeRun('r1')]);
     mockFindExecRunIds.mockResolvedValue(['r1']); // same run
 
-    const result = await TestCompletionHandlerService.reapStaleRuns();
+    const result = await StaleReaperService.reapStaleRuns();
 
     // r1 is already covered by the parent query → not re-hydrated, not double-recomputed.
     expect(mockGetRunsByIds).toHaveBeenCalledWith([]);
@@ -122,7 +121,7 @@ describe('TestCompletionHandlerService.reapStaleRuns', () => {
       .mockRejectedValueOnce(new Error('boom'))
       .mockResolvedValueOnce(undefined);
 
-    const result = await TestCompletionHandlerService.reapStaleRuns();
+    const result = await StaleReaperService.reapStaleRuns();
 
     // All three are still counted as scanned; the failure is isolated.
     expect(result).toEqual({ scanned: 3 });
@@ -132,7 +131,7 @@ describe('TestCompletionHandlerService.reapStaleRuns', () => {
   it('reports zero (and does not throw) when a db query fails', async () => {
     mockFindStaleRuns.mockRejectedValue(new Error('db down'));
 
-    const result = await TestCompletionHandlerService.reapStaleRuns();
+    const result = await StaleReaperService.reapStaleRuns();
 
     expect(result).toEqual({ scanned: 0 });
     expect(recomputeSpy).not.toHaveBeenCalled();
