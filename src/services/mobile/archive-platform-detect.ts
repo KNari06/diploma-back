@@ -26,6 +26,25 @@ import { logger } from '@/utils/core/logger';
  */
 export type DetectedFramework = 'android' | 'ios' | 'flutter' | 'react-native';
 
+/**
+ * Flutter build flavor inferred from archive contents.
+ *
+ *   - `'debug'`  — Dart kernel + JIT VM (debug builds ship `kernel_blob.bin`).
+ *                  Driver extension is wireable; automation supported.
+ *   - `'aot'`    — Profile or release. AOT-compiled snapshot, no JIT.
+ *                  Profile is automatable, release is not — we can't tell
+ *                  them apart from the archive alone (the difference is
+ *                  whether the VM Service is enabled, which is a runtime
+ *                  signal).
+ *   - `undefined` for non-Flutter archives.
+ */
+export type FlutterBuildMode = 'debug' | 'aot';
+
+export interface DetectedBuildInfo {
+  framework: DetectedFramework;
+  flutterBuildMode?: FlutterBuildMode;
+}
+
 /** Hard cap on detection time. Bounded fs.read calls anyway, but on slow
  * disk we don't want to stall finalize. */
 const DETECT_TIMEOUT_MS = 2000;
@@ -61,6 +80,21 @@ export async function detectFrameworkFromArchive(
   filePath: string,
   originalName: string,
 ): Promise<DetectedFramework | undefined> {
+  const info = await detectBuildInfoFromArchive(filePath, originalName);
+  return info?.framework;
+}
+
+/**
+ * Like `detectFrameworkFromArchive`, but also returns the Flutter build
+ * flavor (debug vs aot) when the archive is a Flutter app. Single ZIP
+ * Central Directory scan — same I/O budget as the framework-only variant.
+ *
+ * Hard-contract non-throwing — any failure returns `undefined`.
+ */
+export async function detectBuildInfoFromArchive(
+  filePath: string,
+  originalName: string,
+): Promise<DetectedBuildInfo | undefined> {
   // path.extname handles trailing-junk / unicode quirks better than .endsWith().
   const ext = path.extname(originalName).toLowerCase();
   const isIpa = ext === '.ipa';
@@ -104,7 +138,18 @@ export async function detectFrameworkFromBuffer(
   buffer: Buffer,
   originalName: string,
 ): Promise<DetectedFramework | undefined> {
-  // Fast-fail on invalid input — saves the temp-file dance entirely.
+  const info = await detectBuildInfoFromBuffer(buffer, originalName);
+  return info?.framework;
+}
+
+/**
+ * Buffer-input wrapper around `detectBuildInfoFromArchive`. Same temp-file
+ * dance as `detectFrameworkFromBuffer`, but exposes the Flutter build flavor.
+ */
+export async function detectBuildInfoFromBuffer(
+  buffer: Buffer,
+  originalName: string,
+): Promise<DetectedBuildInfo | undefined> {
   if (!buffer || buffer.length === 0) return undefined;
   const ext = path.extname(originalName).toLowerCase();
   if (ext !== '.apk' && ext !== '.aab' && ext !== '.ipa') return undefined;
@@ -112,19 +157,14 @@ export async function detectFrameworkFromBuffer(
   let tmpDir: string | undefined;
   try {
     tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'archive-detect-'));
-    // Keep the extension on the temp file so detectFrameworkFromArchive's
-    // own extension check (which gates on originalName, not the path)
-    // stays consistent with what we're about to feed it.
     const tmpPath = path.join(tmpDir, `${crypto.randomBytes(6).toString('hex')}${ext}`);
     await fs.promises.writeFile(tmpPath, buffer);
-    return await detectFrameworkFromArchive(tmpPath, originalName);
+    return await detectBuildInfoFromArchive(tmpPath, originalName);
   } catch (err) {
     logger.debug(`[archive-detect] buffer wrapper failed for ${originalName}: ${(err as Error).message}`);
     return undefined;
   } finally {
     if (tmpDir) {
-      // Best-effort cleanup. tmpdir gets rotated by the OS anyway, but
-      // we don't want to leak temp files on a busy server.
       fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => { /* swallow */ });
     }
   }
@@ -134,7 +174,7 @@ async function inspect(
   filePath: string,
   originalName: string,
   isIpa: boolean,
-): Promise<DetectedFramework | undefined> {
+): Promise<DetectedBuildInfo | undefined> {
   try {
     const names = await readZipEntryNames(filePath);
     if (!names) {
@@ -144,12 +184,12 @@ async function inspect(
 
     if (isIpa) {
       if (names.some((n) => /^Payload\/[^/]+\.app\/Frameworks\/Flutter\.framework\//i.test(n))) {
-        return 'flutter';
+        return { framework: 'flutter', flutterBuildMode: ipaFlutterBuildMode(names) };
       }
       if (names.some((n) => /^Payload\/[^/]+\.app\/Frameworks\/(React|hermes)\.framework\//i.test(n))) {
-        return 'react-native';
+        return { framework: 'react-native' };
       }
-      return 'ios';
+      return { framework: 'ios' };
     }
 
     // APK / AAB — same matchers, but AAB nests under `base/` (and `splits/<config>/`).
@@ -158,13 +198,42 @@ async function inspect(
     const flutterAssetRe = /(^|^base\/)assets\/flutter_assets\//i;
     const rnAssetRe = /(^|^base\/)assets\/index\.android\.bundle$/i;
 
-    if (names.some((n) => flutterLibRe.test(n) || flutterAssetRe.test(n))) return 'flutter';
-    if (names.some((n) => rnLibRe.test(n) || rnAssetRe.test(n))) return 'react-native';
-    return 'android';
+    if (names.some((n) => flutterLibRe.test(n) || flutterAssetRe.test(n))) {
+      return { framework: 'flutter', flutterBuildMode: apkFlutterBuildMode(names) };
+    }
+    if (names.some((n) => rnLibRe.test(n) || rnAssetRe.test(n))) return { framework: 'react-native' };
+    return { framework: 'android' };
   } catch (err) {
     logger.debug(`[archive-detect] inspection failed for ${originalName}: ${(err as Error).message}`);
     return undefined;
   }
+}
+
+/**
+ * Distinguish a Flutter APK's build flavor from its archive contents.
+ *
+ *   - **Debug**: ships `flutter_assets/kernel_blob.bin` (the Dart kernel for
+ *     the JIT VM). Releases / profiles never ship it.
+ *   - **AOT** (profile or release): no `kernel_blob.bin`, just the
+ *     AOT-compiled `lib/<abi>/libapp.so`. We cannot tell profile from
+ *     release without runtime VM Service probing.
+ */
+function apkFlutterBuildMode(names: string[]): FlutterBuildMode {
+  const kernelRe = /(^|^base\/|^splits\/[^/]+\/)assets\/flutter_assets\/kernel_blob\.bin$/i;
+  if (names.some((n) => kernelRe.test(n))) return 'debug';
+  return 'aot';
+}
+
+/**
+ * iOS counterpart: debug builds embed `flutter_assets/kernel_blob.bin` under
+ * `App.framework/`. Release / profile ship the AOT snapshot inside the
+ * `App.framework/App` binary, which is always present, so its absence alone
+ * is not a reliable signal — the kernel blob is.
+ */
+function ipaFlutterBuildMode(names: string[]): FlutterBuildMode {
+  const kernelRe = /^Payload\/[^/]+\.app\/Frameworks\/App\.framework\/flutter_assets\/kernel_blob\.bin$/i;
+  if (names.some((n) => kernelRe.test(n))) return 'debug';
+  return 'aot';
 }
 
 /**

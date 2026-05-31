@@ -365,8 +365,24 @@ export interface ProjectCreateRequest {
     common_elements?: Record<string, string>;
     common_scope?: string;
     defaultBrowsers?: BrowserType[];
-    /** Mobile app metadata (APK/IPA) — set via mobile upload API */
+    /**
+     * Legacy single-app metadata (APK/IPA). Kept for back-compat with
+     * pre-multi-platform code paths. New code should prefer `mobileApps`.
+     * Writers continue to mirror the latest upload here so the legacy
+     * editor + resolveAppForRun fallback keep working unchanged.
+     */
     mobileApp?: Record<string, unknown> | null;
+    /**
+     * Per-platform mobile app metadata. Lets a project ship Android and
+     * iOS (and Flutter) builds side by side without one overwriting
+     * the other. Each key is optional — the absence of, say, `ios`
+     * means "no .ipa uploaded yet for this project".
+     */
+    mobileApps?: {
+      android?: Record<string, unknown>;
+      ios?: Record<string, unknown>;
+      flutter?: Record<string, unknown>;
+    } | null;
     /** CI/CD API key metadata — set via CI key management API */
     ciApiKey?: { hash: string; prefix: string; createdAt: string } | null;
     /** Project-level runtime-permission policy for Android sessions. */

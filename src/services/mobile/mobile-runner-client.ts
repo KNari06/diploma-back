@@ -402,6 +402,74 @@ export class MobileRunnerClient {
     );
   }
 
+  // ── Flutter driver-extension probe ─────────────────────────────
+
+  /**
+   * Ask the runner to verify whether the user's Flutter APK actually
+   * calls `enableFlutterDriverExtension()`. The APK is delivered the same
+   * way as a normal run — the caller first pushes the bytes via
+   * `uploadApp()` and passes the resulting on-disk `apkPath` here; the
+   * runner boots an emulator, installs + launches the APK, watches logcat
+   * for the Dart VM Service URL, and tears down the session.
+   *
+   * Always resolves to a verdict; the runner never throws an error to
+   * the HTTP layer.
+   *
+   * 240 s timeout: a cold probe pays full session bring-up — emulator
+   * connect/boot (can be ~90 s), the APK install, app launch, the 10 s
+   * VM-Service log scan, then teardown. Measured cold runs land around
+   * 120-130 s, so 240 s leaves headroom for a genuinely cold emulator
+   * without hanging the request forever.
+   */
+  async probeFlutterDriverExtension(
+    input: { packageName: string; apkPath: string },
+    opts?: { userId?: string },
+  ): Promise<{ detected: boolean; vmServiceUrl?: string; detail: string }> {
+    return this.request<{ detected: boolean; vmServiceUrl?: string; detail: string }>(
+      'POST',
+      '/api/probe/driver-extension',
+      {
+        body: input,
+        timeoutMs: 240_000,
+        noRetry: true,
+        userId: opts?.userId,
+      },
+    );
+  }
+
+  // ── Flutter attach (native session → flutter session) ──────────
+
+  /**
+   * Upgrade an already-installed native android session into a Flutter
+   * session. The caller must have installed the APK on `sessionId` first
+   * (normal `install_app`); the runner then launches the app, detects the
+   * Dart VM Service, connects, and keeps the SAME session id.
+   *
+   * Throws `MobileRunnerError` with status 422 / code `FLUTTER_NOT_DETECTED`
+   * when the build isn't debug/profile or doesn't call
+   * `enableFlutterDriverExtension()` — that's a rebuild-required failure,
+   * not transient, so `noRetry`.
+   *
+   * 45 s timeout covers `logcat -c` + launch + the 20 s VM-Service scan +
+   * FlutterClient connect, with headroom for a slow/cold emulator.
+   */
+  async attachFlutter(
+    sessionId: string,
+    input: { packageName: string },
+    opts?: { userId?: string },
+  ): Promise<{ sessionId: string; platform: string }> {
+    return this.request<{ sessionId: string; platform: string }>(
+      'POST',
+      `/api/sessions/${sessionId}/attach-flutter`,
+      {
+        body: input,
+        timeoutMs: 45_000,
+        noRetry: true,
+        userId: opts?.userId,
+      },
+    );
+  }
+
   // ── App upload (multipart → runner) ────────────────────────────
 
   /**
