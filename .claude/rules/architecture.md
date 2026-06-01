@@ -54,9 +54,10 @@ Extract the concern you're working on, don't perpetuate the violation. If a serv
 | File | What it holds |
 |---|---|
 | `regression-test-query.db.ts` | Test case query helpers (moved from `regression-test-query.service.ts`) |
-| `regression.db.ts` | Query functions for priority resolver, web builder, save service, and mobile dispatcher |
+| `regression.db.ts` | Query functions for priority resolver, web builder, save service, mobile dispatcher, and workspace-member resolution |
+| `regression-report.db.ts` | Run-report read queries (run lookup, batch enrichment of names / results / steps / negative-meta / phase-info) for `regression-report-assembler.service.ts` |
 
-Three service files in the same folder still import `supabaseAdmin` directly
-(`test-execution-orchestrator.service.ts`, `regression-report-assembler.service.ts`,
-`regression-run.service.ts`) — they predate the pattern and need a follow-up
-extraction before their unit tests can be written.
+Two service files in the same folder still import `supabaseAdmin` directly
+(`test-execution-orchestrator.service.ts`, `regression-run.service.ts`) — they
+predate the pattern and need a follow-up extraction before their unit tests can be
+written. (`regression-report-assembler.service.ts` was migrated and is now unit-tested.)

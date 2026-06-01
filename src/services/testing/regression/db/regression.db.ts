@@ -129,3 +129,19 @@ export async function getProjectWorkspaceId(projectId: string): Promise<string |
 
   return (data as any)?.workspace_id ?? null;
 }
+
+/**
+ * Get active member user_ids for a workspace.
+ * Returns an empty array when the workspace has no active members.
+ */
+export async function getActiveWorkspaceMemberIds(workspaceId: string): Promise<string[]> {
+  const { data } = await supabaseAdmin
+    .from('workspace_members')
+    .select('user_id')
+    .eq('workspace_id', workspaceId)
+    .eq('status', 'active');
+
+  return (data || [])
+    .map((m: any) => m?.user_id as string | undefined)
+    .filter((id): id is string => !!id);
+}

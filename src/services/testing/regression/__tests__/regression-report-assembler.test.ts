@@ -1,0 +1,268 @@
+/**
+ * Tests for RegressionReportAssemblerService — the run-report assembly that
+ * was untestable until its Supabase queries moved behind the `db/` sublayer.
+ * DB reads are stubbed at the `db/` boundary; service collaborators
+ * (ExecutionService, report generator, health aggregator) are stubbed too.
+ * No Supabase is mocked directly, per the repo's mock-boundary rule.
+ */
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+jest.mock('@/services/testing/regression/db/regression-report.db', () => ({
+  getRunWithOwnership: jest.fn(),
+  getRunByShareToken: jest.fn(),
+  getTestCaseNamesByIds: jest.fn(),
+  getTestResultsByTestIds: jest.fn(),
+  getExecutedStepsByTestIds: jest.fn(),
+  getNegativeMetaByIds: jest.fn(),
+  getTestCasePhaseInfoByIds: jest.fn(),
+}));
+
+jest.mock('@/services/testing/regression/db/regression.db', () => ({
+  getProjectWorkspaceId: jest.fn(),
+  getActiveWorkspaceMemberIds: jest.fn(),
+}));
+
+jest.mock('@/services/testing/executions/execution.service', () => ({
+  ExecutionService: { getStats: jest.fn(), getByRunId: jest.fn() },
+}));
+
+jest.mock('@/services/testing/results/test-report-generator.service', () => ({
+  TestReportGeneratorService: { batchGetReportsByTestIds: jest.fn() },
+}));
+
+jest.mock('@/services/testing/regression/health-check-aggregator.service', () => ({
+  HealthCheckAggregatorService: {
+    aggregateFromTestResult: jest.fn(),
+    buildHealthSummary: jest.fn(),
+  },
+}));
+
+import {
+  getTestCaseNamesByIds,
+  getTestResultsByTestIds,
+  getExecutedStepsByTestIds,
+  getNegativeMetaByIds,
+  getTestCasePhaseInfoByIds,
+} from '@/services/testing/regression/db/regression-report.db';
+import {
+  getProjectWorkspaceId,
+  getActiveWorkspaceMemberIds,
+} from '@/services/testing/regression/db/regression.db';
+import { ExecutionService } from '@/services/testing/executions/execution.service';
+import { TestReportGeneratorService } from '@/services/testing/results/test-report-generator.service';
+import { HealthCheckAggregatorService } from '@/services/testing/regression/health-check-aggregator.service';
+import {
+  RegressionReportAssemblerService,
+  getProjectWorkspaceMemberIds,
+} from '@/services/testing/regression/regression-report-assembler.service';
+import type { TestExecution, ExecutionStats } from '@/types/testing.types';
+
+const mockGetTestCaseNames = getTestCaseNamesByIds as jest.MockedFunction<typeof getTestCaseNamesByIds>;
+const mockGetTestResults = getTestResultsByTestIds as jest.MockedFunction<typeof getTestResultsByTestIds>;
+const mockGetExecutedSteps = getExecutedStepsByTestIds as jest.MockedFunction<typeof getExecutedStepsByTestIds>;
+const mockGetNegativeMeta = getNegativeMetaByIds as jest.MockedFunction<typeof getNegativeMetaByIds>;
+const mockGetPhaseInfo = getTestCasePhaseInfoByIds as jest.MockedFunction<typeof getTestCasePhaseInfoByIds>;
+const mockGetWorkspaceId = getProjectWorkspaceId as jest.MockedFunction<typeof getProjectWorkspaceId>;
+const mockGetMembers = getActiveWorkspaceMemberIds as jest.MockedFunction<typeof getActiveWorkspaceMemberIds>;
+const mockGetStats = ExecutionService.getStats as jest.MockedFunction<typeof ExecutionService.getStats>;
+const mockGetByRunId = ExecutionService.getByRunId as jest.MockedFunction<typeof ExecutionService.getByRunId>;
+const mockBatchReports = TestReportGeneratorService.batchGetReportsByTestIds as jest.MockedFunction<
+  typeof TestReportGeneratorService.batchGetReportsByTestIds
+>;
+const mockBuildHealthSummary = HealthCheckAggregatorService.buildHealthSummary as jest.MockedFunction<
+  typeof HealthCheckAggregatorService.buildHealthSummary
+>;
+const mockAggHealth = HealthCheckAggregatorService.aggregateFromTestResult as jest.MockedFunction<
+  typeof HealthCheckAggregatorService.aggregateFromTestResult
+>;
+
+function makeExec(over: Partial<TestExecution> = {}): TestExecution {
+  return {
+    id: 'exec-1',
+    runId: 'run-1',
+    testType: 'ui',
+    testCaseId: 'tc-1',
+    status: 'passed',
+    durationMs: 100,
+    result: { testId: 'test-1' },
+    browser: 'chrome',
+    createdAt: '2026-01-01T00:00:00Z',
+    ...over,
+  } as TestExecution;
+}
+
+function makeStats(over: Partial<ExecutionStats> = {}): ExecutionStats {
+  return {
+    total: 1,
+    passed: 1,
+    failed: 0,
+    skipped: 0,
+    pending: 0,
+    running: 0,
+    cancelled: 0,
+    passRate: 100,
+    ...over,
+  };
+}
+
+const baseRun = {
+  id: 'run-1',
+  plan_id: 'plan-1',
+  regression_plans: { name: 'Smoke' },
+  trigger: 'manual',
+  started_at: '2026-01-01T00:00:00Z',
+  completed_at: '2026-01-01T00:01:00Z',
+  status: 'completed',
+};
+
+describe('RegressionReportAssemblerService.assembleReport', () => {
+  beforeEach(() => {
+    // Sensible empty defaults; individual tests override what they assert on.
+    mockGetTestCaseNames.mockResolvedValue([]);
+    mockGetTestResults.mockResolvedValue([]);
+    mockGetExecutedSteps.mockResolvedValue([]);
+    mockGetNegativeMeta.mockResolvedValue([]);
+    mockGetPhaseInfo.mockResolvedValue([]);
+    mockBatchReports.mockResolvedValue([]);
+    mockAggHealth.mockReturnValue(undefined as any);
+    mockBuildHealthSummary.mockReturnValue(undefined as any);
+    mockGetStats.mockResolvedValue(makeStats());
+    mockGetByRunId.mockResolvedValue([]);
+  });
+
+  afterEach(() => jest.clearAllMocks());
+
+  it('aggregates bug counts by severity and category from ai_summary', async () => {
+    mockGetStats.mockResolvedValue(makeStats({ total: 1, passed: 0, failed: 1 }));
+    mockGetByRunId.mockResolvedValue([makeExec({ status: 'failed' })]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetTestResults.mockResolvedValue([
+      {
+        test_id: 'test-1',
+        ai_summary: {
+          bugs: [
+            { title: 'Crash', severity: 'critical', category: 'functional' },
+            { title: 'Slow', severity: 'low', category: 'performance' },
+            { title: 'Weird color', severity: 'unknown', category: 'bogus' }, // → defaults
+          ],
+        },
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    expect(report.summary.totalBugs).toBe(3);
+    expect(report.summary.bySeverity).toEqual({ critical: 1, low: 1, medium: 1 });
+    expect(report.summary.byCategory).toEqual({ functional: 2, performance: 1 });
+    expect(report.bugs).toHaveLength(3);
+  });
+
+  it('reconstructs setup/main/teardown phases by executed-step index', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetPhaseInfo.mockResolvedValue([
+      { id: 'tc-1', setup_steps: ['s'], steps_json: ['m'], teardown_steps: ['t'], priority: 'high' },
+    ]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          { type: 'step_completed', data: { success: true, step: 'open' } },
+          { type: 'step_completed', data: { success: true, step: 'act' } },
+          { type: 'step_completed', data: { success: true, step: 'cleanup' } },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    const phases = report.executions[0].steps.map((s) => (s as any).phase);
+    expect(phases).toEqual(['setup', 'main', 'teardown']);
+    expect(report.executions[0].priority).toBe('high');
+  });
+
+  it('omits phase for legacy cases with no setup/teardown steps', async () => {
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetPhaseInfo.mockResolvedValue([
+      { id: 'tc-1', setup_steps: [], steps_json: ['m'], teardown_steps: [], priority: null },
+    ]);
+    mockGetExecutedSteps.mockResolvedValue([
+      { id: 'test-1', executed_steps: [{ type: 'step_completed', data: { success: true } }] },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    expect((report.executions[0].steps[0] as any).phase).toBeUndefined();
+    expect(report.executions[0].priority).toBeNull();
+  });
+
+  it('splits negative executions into a separate negativeSummary', async () => {
+    mockGetStats.mockResolvedValue(makeStats({ total: 2, passed: 1, failed: 1 }));
+    mockGetByRunId.mockResolvedValue([
+      makeExec({ id: 'pos', testCaseId: 'tc-pos', status: 'passed', result: { testId: 'test-pos' } }),
+      makeExec({ id: 'neg', testCaseId: 'tc-neg', status: 'failed', isNegative: true, result: { testId: 'test-neg' } }),
+    ]);
+    mockGetTestCaseNames.mockResolvedValue([
+      { id: 'tc-pos', name: 'Positive' },
+      { id: 'tc-neg', name: 'Negative' },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    expect(report.executions).toHaveLength(1); // positive only
+    expect(report.negativeSummary).toEqual({ total: 1, passed: 0, failed: 1, skipped: 0 });
+    expect(report.negativeExecutions).toHaveLength(1);
+  });
+
+  it('buckets platformBreakdown by platform string and api-by-absent-steps', async () => {
+    mockGetStats.mockResolvedValue(makeStats({ total: 3, passed: 3 }));
+    mockGetByRunId.mockResolvedValue([
+      makeExec({ id: 'web', testCaseId: 'tc-web', platform: 'web', result: { testId: 'test-web' } }),
+      makeExec({ id: 'mob', testCaseId: 'tc-mob', platform: 'mobile_android', result: { testId: 'test-mob' } }),
+      makeExec({ id: 'api', testCaseId: 'tc-api', testType: 'api', result: {} }), // no testId → no steps → api
+    ]);
+    mockGetTestCaseNames.mockResolvedValue([
+      { id: 'tc-web', name: 'Web' },
+      { id: 'tc-mob', name: 'Mob' },
+      { id: 'tc-api', name: 'Api' },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    expect(report.summary.platformBreakdown.web.total).toBe(1);
+    expect(report.summary.platformBreakdown.mobile.total).toBe(1);
+    expect(report.summary.platformBreakdown.api.total).toBe(1);
+  });
+});
+
+describe('getProjectWorkspaceMemberIds', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('returns just the owner when the project has no workspace', async () => {
+    mockGetWorkspaceId.mockResolvedValue(null);
+
+    const ids = await getProjectWorkspaceMemberIds('proj-1', 'owner-1');
+
+    expect(ids).toEqual(['owner-1']);
+    expect(mockGetMembers).not.toHaveBeenCalled();
+  });
+
+  it('merges active members with the owner and dedups', async () => {
+    mockGetWorkspaceId.mockResolvedValue('ws-1');
+    mockGetMembers.mockResolvedValue(['owner-1', 'member-2', 'member-3']);
+
+    const ids = await getProjectWorkspaceMemberIds('proj-1', 'owner-1');
+
+    expect(ids.sort()).toEqual(['member-2', 'member-3', 'owner-1']);
+  });
+
+  it('falls back to [ownerId] when a db call throws', async () => {
+    mockGetWorkspaceId.mockRejectedValue(new Error('db down'));
+
+    const ids = await getProjectWorkspaceMemberIds('proj-1', 'owner-1');
+
+    expect(ids).toEqual(['owner-1']);
+  });
+});
