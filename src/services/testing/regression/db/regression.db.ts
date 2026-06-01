@@ -117,6 +117,23 @@ export async function insertIntentTestCase(
 // ── mobile-test-dispatcher ────────────────────────────────────────────────────
 
 /**
+ * Get owner + workspace for a project (access verification).
+ * Returns null when not found or on query error — the caller treats both as
+ * "not found".
+ */
+export async function getProjectForAccess(
+  projectId: string,
+): Promise<{ user_id: string; workspace_id: string | null } | null> {
+  const { data } = await supabaseAdmin
+    .from('projects')
+    .select('user_id, workspace_id')
+    .eq('id', projectId)
+    .maybeSingle();
+
+  return (data as { user_id: string; workspace_id: string | null }) ?? null;
+}
+
+/**
  * Get the workspace_id for a project.
  * Returns null when not found.
  */

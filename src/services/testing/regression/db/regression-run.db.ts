@@ -105,3 +105,72 @@ export async function updateRunByIdIfActive(
 
   return { error };
 }
+
+/**
+ * Insert a regression_runs row. The full column payload is built by the caller
+ * (run kind, status, timestamps). Returns the new id + the query error so the
+ * caller can throw its own kind-specific message.
+ */
+export async function insertRun(
+  values: Record<string, unknown>,
+): Promise<{ data: { id: string } | null; error: unknown }> {
+  const { data, error } = await supabaseAdmin
+    .from('regression_runs')
+    .insert(values)
+    .select('id')
+    .single();
+
+  return { data: (data as { id: string } | null) ?? null, error };
+}
+
+/**
+ * Force-fail runs stuck in pending/running past the given cutoff (zombie sweep).
+ * Returns the ids that were updated + the query error.
+ */
+export async function failZombieRuns(
+  cutoffIso: string,
+): Promise<{ ids: string[]; error: unknown }> {
+  const { data, error } = await supabaseAdmin
+    .from('regression_runs')
+    .update({
+      status: 'failed',
+      completed_at: new Date().toISOString(),
+    })
+    .in('status', ['running', 'pending'])
+    .lt('started_at', cutoffIso)
+    .select('id');
+
+  return { ids: ((data as Array<{ id: string }>) || []).map((r) => r.id), error };
+}
+
+/**
+ * List runs for a project (newest first) including plan name.
+ */
+export async function listRunsByProject(
+  projectId: string,
+  limit: number,
+): Promise<{ data: any[] | null; error: unknown }> {
+  const { data, error } = await supabaseAdmin
+    .from('regression_runs')
+    .select('*, regression_plans(name)')
+    .eq('project_id', projectId)
+    .order('started_at', { ascending: false })
+    .limit(limit);
+
+  return { data: (data as any[]) ?? null, error };
+}
+
+/**
+ * Fetch execution rows for the given runs (for list-level stats + platform
+ * breakdown). Empty input → empty array.
+ */
+export async function getRunExecutionStatsRows(runIds: string[]): Promise<any[]> {
+  if (!runIds.length) return [];
+
+  const { data } = await supabaseAdmin
+    .from('test_executions')
+    .select('run_id, status, duration_ms, platform, test_type')
+    .in('run_id', runIds);
+
+  return (data as any[]) || [];
+}
