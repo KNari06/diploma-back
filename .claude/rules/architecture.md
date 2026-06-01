@@ -56,8 +56,9 @@ Extract the concern you're working on, don't perpetuate the violation. If a serv
 | `regression-test-query.db.ts` | Test case query helpers (moved from `regression-test-query.service.ts`) |
 | `regression.db.ts` | Query functions for priority resolver, web builder, save service, mobile dispatcher, and workspace-member resolution |
 | `regression-report.db.ts` | Run-report read queries (run lookup, batch enrichment of names / results / steps / negative-meta / phase-info) for `regression-report-assembler.service.ts` |
+| `regression-run.db.ts` | Shared `regression_runs` / `test_executions` reads + writes (routing info, execution-ref preload, fast-auth telemetry, run patch/finalize) for the orchestrator and run service |
 
-Two service files in the same folder still import `supabaseAdmin` directly
-(`test-execution-orchestrator.service.ts`, `regression-run.service.ts`) — they
-predate the pattern and need a follow-up extraction before their unit tests can be
-written. (`regression-report-assembler.service.ts` was migrated and is now unit-tested.)
+One service file in the same folder still imports `supabaseAdmin` directly
+(`regression-run.service.ts`) — it predates the pattern and needs a follow-up
+extraction before its unit tests can be written. (`regression-report-assembler.service.ts`
+and `test-execution-orchestrator.service.ts` were migrated and are now unit-tested.)
