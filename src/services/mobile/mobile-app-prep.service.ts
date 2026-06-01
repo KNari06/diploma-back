@@ -128,6 +128,34 @@ export interface PrepAppArgs {
  * project has no mobile-app configured (and no override was supplied).
  */
 export class MobileAppPrepService {
+  /**
+   * Cheap on-device package existence check (~50ms `pm path` via the runner's
+   * `check_package` command). Returns false on ANY error so callers treat
+   * "couldn't confirm" as "not installed" and fall through to a full install —
+   * safer than trusting a cache an emulator wipe may have silently invalidated.
+   */
+  private static async isPackageOnDevice(
+    client: MobileRunnerClient,
+    sessionId: string,
+    userId: string,
+    packageName: string,
+  ): Promise<boolean> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const res = await client.executeBatchCommands(sessionId, [
+        { type: 'check_package', params: { packageName } },
+      ], { timeoutMs: 10_000, userId }) as any;
+      return !!res?.results?.[0]?.data?.installed;
+    } catch (err) {
+      logger.debug('[MOBILE_APP_PREP] check_package failed (treating as not-installed)', {
+        sessionId,
+        packageName,
+        error: (err as Error).message,
+      });
+      return false;
+    }
+  }
+
   static async prepApp(args: PrepAppArgs): Promise<string | undefined> {
     const {
       client,
@@ -141,6 +169,16 @@ export class MobileAppPrepService {
       onProgress,
       platform,
     } = args;
+
+    // A Flutter(-on-Android) build is delivered AS an Android APK: upload
+    // stores it under the `android` slot (mobile-app.service finalize) and the
+    // session is created as android (`sessionCreatePlatform`). Resolve AND
+    // persist the app metadata against that same slot. Without this, a flutter
+    // prep looks up a `flutter` slot that upload never writes → finds nothing →
+    // `effectiveStoragePath` stays undefined → install is skipped entirely, so
+    // the app is never reinstalled after the emulator is wiped.
+    const appSlotPlatform: MobilePlatform | undefined =
+      platform === 'flutter' ? 'android' : platform;
 
     const emit = (stage: AppPrepStage, progress: number): void => {
       if (onProgress) onProgress(stage, progress);
@@ -178,8 +216,8 @@ export class MobileAppPrepService {
     // is undefined we read the legacy singular slot for back-compat with
     // any caller that hasn't been wired through yet.
     const project = await time('project_load', () => ProjectService.getProject(projectId, userId));
-    const sharded = platform
-      ? getProjectMobileApp(project?.settings, platform)
+    const sharded = appSlotPlatform
+      ? getProjectMobileApp(project?.settings, appSlotPlatform)
       : undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const legacy = (project?.settings as any)?.mobileApp;
@@ -191,7 +229,7 @@ export class MobileAppPrepService {
     // "Mach error -308" or the new install_app guard in step-dispatcher).
     // For unspecified-platform callers (legacy code paths) we keep the
     // historical behaviour of consulting `mobileApp` directly.
-    const projectMobileApp = sharded ?? (platform ? undefined : legacy) ?? {};
+    const projectMobileApp = sharded ?? (appSlotPlatform ? undefined : legacy) ?? {};
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const projectAny = projectMobileApp as any;
 
@@ -247,32 +285,53 @@ export class MobileAppPrepService {
       && warmup?.installedPackage
     ) {
       const cachedPackage = appPackageOverride || warmup.installedPackage;
-      logger.debug('[MOBILE_APP_PREP] Same APK already installed (Redis), hard-reset + relaunch', {
+      // The Redis cache can lie after an emulator wipe / factory-reset: it
+      // still records the app as installed when the device no longer has it.
+      // Confirm on-device (~50ms) before trusting it — otherwise we skip the
+      // reinstall and the caller's launch/attach fails on a missing package
+      // (the exact symptom when a user cleans their emulator). If it's gone,
+      // drop the stale cache and fall through to Branch 2/3 to reinstall.
+      const onDevice = await time('branch1_verify', () =>
+        this.isPackageOnDevice(client, sessionId, userId, cachedPackage));
+      if (onDevice) {
+        logger.debug('[MOBILE_APP_PREP] Same APK installed (Redis) and present on device, hard-reset + relaunch', {
+          sessionId,
+          projectId,
+          package: cachedPackage,
+          skipLaunch: skipLaunch === true,
+        });
+        emit('launching_app', 80);
+        if (!skipLaunch) {
+          // Hard reset on every prep: `pm clear --user N` wipes the app's
+          // data dir + revokes runtime perms (auto-re-granted by the runner
+          // per session policy), then cold-launch lands on first-run UI.
+          // 60s budget: pm clear 5–15s + cold am start with first-launch dex
+          // opt 10–20s = ~15-35s typical. Tighter than the legacy 90s so the
+          // user sees a clear failure faster when the runner is wedged
+          // (circuit breaker now propagates failure within ~30s).
+          await time('branch1_close_launch', () => client.executeBatchCommands(sessionId, [
+            { type: 'close_app', params: { packageName: cachedPackage, hard: true } },
+            { type: 'launch_app', params: { packageName: cachedPackage } },
+          ], { timeoutMs: 60_000, userId }));
+        }
+        branchTaken = 'cached_fast_path';
+        logger.info('[MOBILE_APP_PREP] timing', {
+          sessionId, projectId, branch: branchTaken,
+          totalMs: Date.now() - prepStart, timings,
+        });
+        return cachedPackage;
+      }
+      logger.info('[MOBILE_APP_PREP] Redis cache hit but package missing on device (emulator wiped?) — forcing reinstall', {
         sessionId,
         projectId,
         package: cachedPackage,
-        skipLaunch: skipLaunch === true,
       });
-      emit('launching_app', 80);
-      if (!skipLaunch) {
-        // Hard reset on every prep: `pm clear --user N` wipes the app's
-        // data dir + revokes runtime perms (auto-re-granted by the runner
-        // per session policy), then cold-launch lands on first-run UI.
-        // 60s budget: pm clear 5–15s + cold am start with first-launch dex
-        // opt 10–20s = ~15-35s typical. Tighter than the legacy 90s so the
-        // user sees a clear failure faster when the runner is wedged
-        // (circuit breaker now propagates failure within ~30s).
-        await time('branch1_close_launch', () => client.executeBatchCommands(sessionId, [
-          { type: 'close_app', params: { packageName: cachedPackage, hard: true } },
-          { type: 'launch_app', params: { packageName: cachedPackage } },
-        ], { timeoutMs: 60_000, userId }));
-      }
-      branchTaken = 'cached_fast_path';
-      logger.info('[MOBILE_APP_PREP] timing', {
-        sessionId, projectId, branch: branchTaken,
-        totalMs: Date.now() - prepStart, timings,
+      // Drop the stale cache so a retry doesn't re-take this branch.
+      await redisConnection.del(redisKey).catch((err) => {
+        logger.debug('[MOBILE_APP_PREP] Failed to clear stale warmup key (non-fatal)', {
+          error: (err as Error).message,
+        });
       });
-      return cachedPackage;
     }
     if (cachedMismatch) {
       logger.info('[MOBILE_APP_PREP] Cached package differs from override — forcing full install', {
@@ -289,54 +348,45 @@ export class MobileAppPrepService {
     // trust device state in that case).
     const knownPackage = appPackageOverride || projectAny.packageName;
     if (knownPackage && !hasPendingInstall) {
-      try {
-        const checkResult = await time('branch2_check_package', () => client.executeBatchCommands(sessionId, [
-          { type: 'check_package', params: { packageName: knownPackage } },
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        ], { timeoutMs: 10_000, userId })) as any;
-        const isInstalled = !!checkResult?.results?.[0]?.data?.installed;
-        if (isInstalled) {
-          logger.info('[MOBILE_APP_PREP] Package still on device (Redis expired), hard-reset + relaunch without reinstall', {
-            sessionId,
-            projectId,
-            package: knownPackage,
-            skipLaunch: skipLaunch === true,
-          });
-          emit('launching_app', 80);
-          if (!skipLaunch) {
-            // Same hard-reset as the Redis fast path above — keeps the prep
-            // contract consistent: every successful prep leaves the app in
-            // a freshly-data-wiped state regardless of which install
-            // branch fired. Same 60s budget as branch 1.
-            await time('branch2_close_launch', () => client.executeBatchCommands(sessionId, [
-              { type: 'close_app', params: { packageName: knownPackage, hard: true } },
-              { type: 'launch_app', params: { packageName: knownPackage } },
-            ], { timeoutMs: 60_000, userId }));
-          }
-
-          // Restore Redis cache so the next prep skips this branch too.
-          if (warmup) {
-            warmup.installedPackage = knownPackage;
-            warmup.appStoragePath = effectiveStoragePath;
-            await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
-          }
-
-          // Persist packageName to project settings so future preps can
-          // hit this fast path even after Redis expires (knownPackage may
-          // have come from appPackageOverride when packageName was null).
-          await persistPackageName(projectId, userId, projectMobileApp, knownPackage, platform, project?.settings);
-
-          branchTaken = 'device_check_fast_path';
-          logger.info('[MOBILE_APP_PREP] timing', {
-            sessionId, projectId, branch: branchTaken,
-            totalMs: Date.now() - prepStart, timings,
-          });
-          return knownPackage;
-        }
-      } catch (err) {
-        logger.debug('[MOBILE_APP_PREP] Device package check failed, proceeding with install', {
-          error: (err as Error).message,
+      const isInstalled = await time('branch2_check_package', () =>
+        this.isPackageOnDevice(client, sessionId, userId, knownPackage));
+      if (isInstalled) {
+        logger.info('[MOBILE_APP_PREP] Package still on device (Redis expired), hard-reset + relaunch without reinstall', {
+          sessionId,
+          projectId,
+          package: knownPackage,
+          skipLaunch: skipLaunch === true,
         });
+        emit('launching_app', 80);
+        if (!skipLaunch) {
+          // Same hard-reset as the Redis fast path above — keeps the prep
+          // contract consistent: every successful prep leaves the app in
+          // a freshly-data-wiped state regardless of which install
+          // branch fired. Same 60s budget as branch 1.
+          await time('branch2_close_launch', () => client.executeBatchCommands(sessionId, [
+            { type: 'close_app', params: { packageName: knownPackage, hard: true } },
+            { type: 'launch_app', params: { packageName: knownPackage } },
+          ], { timeoutMs: 60_000, userId }));
+        }
+
+        // Restore Redis cache so the next prep skips this branch too.
+        if (warmup) {
+          warmup.installedPackage = knownPackage;
+          warmup.appStoragePath = effectiveStoragePath;
+          await redisConnection.set(redisKey, JSON.stringify(warmup), 'EX', WARMUP_TTL);
+        }
+
+        // Persist packageName to project settings so future preps can
+        // hit this fast path even after Redis expires (knownPackage may
+        // have come from appPackageOverride when packageName was null).
+        await persistPackageName(projectId, userId, projectMobileApp, knownPackage, appSlotPlatform, project?.settings);
+
+        branchTaken = 'device_check_fast_path';
+        logger.info('[MOBILE_APP_PREP] timing', {
+          sessionId, projectId, branch: branchTaken,
+          totalMs: Date.now() - prepStart, timings,
+        });
+        return knownPackage;
       }
     }
 
@@ -433,7 +483,7 @@ export class MobileAppPrepService {
     // platform passed through, the write goes to mobileApps[platform]
     // (and mirrors to legacy) instead of clobbering the legacy slot.
     if (packageName) {
-      await persistPackageName(projectId, userId, projectMobileApp, packageName, platform, project?.settings);
+      await persistPackageName(projectId, userId, projectMobileApp, packageName, appSlotPlatform, project?.settings);
     }
 
     // Pending-install flag (if any) has now been consumed — clear it.

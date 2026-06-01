@@ -458,16 +458,24 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
             });
           }
           // Fall through to create a new session below
-        } else if (isFlutter && existing.platform !== 'flutter') {
-          // A Flutter warmup can't reuse a non-Flutter session (e.g. the
-          // upload-time android pre-warm from autoBootAndInstall): it has
-          // no Dart VM Service connection. Invalidate and fall through to a
-          // fresh create, which does android → install → attachFlutter.
-          logger.info('[MOBILE_SESSION] Flutter request but cached session is non-flutter — recreating', {
+        } else if (existing.platform !== platform) {
+          // Platform mismatch — the cached session's platform must match the
+          // requested one, in BOTH directions:
+          //   - Flutter request, non-flutter cached: a plain android/ios
+          //     session has no Dart VM Service connection.
+          //   - Non-flutter request, flutter cached: a flutter session
+          //     (android host upgraded via attachFlutter) reports
+          //     platform='flutter' and must NOT be handed to an android/ios
+          //     run. (The earlier one-directional check missed this case and
+          //     reused a flutter session for an android request.)
+          // Invalidate and fall through to a fresh create. For flutter the
+          // create path does android → install → attachFlutter.
+          logger.info('[MOBILE_SESSION] Cached session platform mismatch — recreating', {
             projectId,
             userId,
             staleSessionId: existing.sessionId,
             cachedPlatform: existing.platform,
+            requestedPlatform: platform,
           });
           await redisConnection.del(redisKey);
           try {

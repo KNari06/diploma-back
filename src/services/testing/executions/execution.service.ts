@@ -150,7 +150,7 @@ export class ExecutionService {
     // Set timestamps based on status
     if (status === 'running') {
       updates.started_at = new Date().toISOString();
-    } else if (['passed', 'failed', 'skipped', 'cancelled'].includes(status)) {
+    } else if (['passed', 'failed', 'skipped', 'cancelled', 'timeout'].includes(status)) {
       updates.completed_at = new Date().toISOString();
     }
 

@@ -10,6 +10,7 @@
 import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
+import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
 import { initLogBridge } from '@/utils/core/log-bridge';
@@ -41,12 +42,19 @@ async function main(): Promise<void> {
   // copies in parallel.
   AccountDeletionPurgeJob.start();
 
+  // Stale-run reaper. Finalizes regression runs orphaned in
+  // 'running'/'pending' when no test-completion event ever fires (worker
+  // crash, queue stall, mobile runner unreachable). Single-instance only,
+  // same Cloud Run reasoning as the purge sweep above.
+  StaleRunReaperJob.start();
+
   const shutdown = (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
       TestSchedulerJobHandler.stop();
       AutoLearnRetireJob.stop();
       AccountDeletionPurgeJob.stop();
+      StaleRunReaperJob.stop();
     } finally {
       process.exit(0);
     }

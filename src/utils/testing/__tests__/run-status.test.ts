@@ -15,6 +15,16 @@ describe('deriveRunStatus', () => {
     ).toBe('failed');
   });
 
+  // ── Stuck-execution guard ───────────────────────────────────────────────────
+
+  it('returns "running" when cached status is "completed" but an execution is still running', () => {
+    // Regression: force-fail DB write failed → execution stays 'running' in DB.
+    // deriveRunStatus must surface the inconsistency rather than masking it as 'passed'.
+    expect(
+      deriveRunStatus({ cachedStatus: 'completed', execStats: { total: 2, failed: 0, running: 1 } }),
+    ).toBe('running');
+  });
+
   // ── Correct terminal states ─────────────────────────────────────────────────
 
   it('returns "passed" when cached status is "completed" and no executions failed', () => {

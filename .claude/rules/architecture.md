@@ -53,10 +53,12 @@ Extract the concern you're working on, don't perpetuate the violation. If a serv
 
 | File | What it holds |
 |---|---|
-| `regression-test-query.db.ts` | Test case query helpers (moved from `regression-test-query.service.ts`) |
-| `regression.db.ts` | Query functions for priority resolver, web builder, save service, and mobile dispatcher |
+| `regression-test-query.db.ts` | Test-case / module / flow resolution reads (test cases, depends_on, step counts, module+flow access, tag/priority filters) |
+| `regression.db.ts` | Query functions for priority resolver, web builder, save service, mobile dispatcher, project access, and workspace-member resolution |
+| `regression-report.db.ts` | Run-report read queries (run lookup, batch enrichment of names / results / steps / negative-meta / phase-info) for `regression-report-assembler.service.ts` |
+| `regression-run.db.ts` | Shared `regression_runs` / `test_executions` reads + writes (routing info, execution-ref preload, fast-auth telemetry, run insert, patch/finalize, zombie sweep, run listing) for the orchestrator and run service |
 
-Three service files in the same folder still import `supabaseAdmin` directly
-(`test-execution-orchestrator.service.ts`, `regression-report-assembler.service.ts`,
-`regression-run.service.ts`) — they predate the pattern and need a follow-up
-extraction before their unit tests can be written.
+All three regression services (`regression-report-assembler.service.ts`,
+`test-execution-orchestrator.service.ts`, `regression-run.service.ts`) now go
+through `./db/` — none imports `supabaseAdmin` directly, and each is unit-tested.
+This is the reference example for the `db/` sublayer pattern across the codebase.
