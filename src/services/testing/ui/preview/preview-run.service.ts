@@ -377,7 +377,7 @@ function detectInitialUrlMismatch(
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'wait_for_email', 'dialog', 'download', 'switch_tab']);
+const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'timeout', 'wait_for_email', 'dialog', 'download', 'switch_tab']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;

@@ -341,6 +341,8 @@ export type IntentActionType =
   | 'type'
   | 'click'
   | 'wait'
+  // Real sleep/pause: wait N milliseconds, no element, no URL matcher
+  | 'timeout'
   | 'assert'
   | 'navigate'
   | 'select'

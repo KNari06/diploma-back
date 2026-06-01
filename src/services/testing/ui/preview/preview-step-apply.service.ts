@@ -370,7 +370,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'timeout', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -2421,7 +2421,7 @@ async function executeAction(
     // Build selector (unless we have a pre-resolved locator from compiled plan)
     const selector = preResolvedLocator ? '' : buildSelector(step, candidate);
 
-    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'scroll', 'press'].includes(step.type)) {
+    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'timeout', 'scroll', 'press'].includes(step.type)) {
       return { success: false, error: 'No valid selector for element', urlChanged: false };
     }
 
@@ -2434,7 +2434,7 @@ async function executeAction(
 
     // Scroll element into viewport before action (fullPage snapshots can resolve off-screen elements)
     // Skip for non-targeting actions that don't need a visible element
-    if (locator && !['navigate', 'wait', 'wait_for', 'scroll'].includes(step.type)) {
+    if (locator && !['navigate', 'wait', 'timeout', 'wait_for', 'scroll'].includes(step.type)) {
       await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
     }
 
@@ -2817,6 +2817,13 @@ async function executeAction(
       case 'wait': {
         const waitTimeout = step.options?.timeout || 1000;
         await page.waitForTimeout(waitTimeout);
+        break;
+      }
+
+      case 'timeout': {
+        // Explicit sleep/pause: ms lives in step.value (number of ms to wait)
+        const ms = Number(step.value) || step.options?.timeout || 1000;
+        await page.waitForTimeout(ms);
         break;
       }
 
@@ -3502,9 +3509,9 @@ export class PreviewStepApplyService {
         };
       }
 
-      // Handle non-targeting actions (navigate, wait, scroll)
+      // Handle non-targeting actions (navigate, wait, timeout, scroll)
       // Scroll is page-level: uses step.value (deltaY) without targeting a DOM element
-      if (['navigate', 'wait', 'scroll'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'timeout', 'scroll'].includes(stepDraft.type)) {
         // V5: Capture URL BEFORE action for accurate compiled context
         // This is important for auto-wait-for-url injection which compares adjacent pageUrls
         const urlBeforeAction = page.url();
