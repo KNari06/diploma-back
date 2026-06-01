@@ -53,12 +53,12 @@ Extract the concern you're working on, don't perpetuate the violation. If a serv
 
 | File | What it holds |
 |---|---|
-| `regression-test-query.db.ts` | Test case query helpers (moved from `regression-test-query.service.ts`) |
-| `regression.db.ts` | Query functions for priority resolver, web builder, save service, mobile dispatcher, and workspace-member resolution |
+| `regression-test-query.db.ts` | Test-case / module / flow resolution reads (test cases, depends_on, step counts, module+flow access, tag/priority filters) |
+| `regression.db.ts` | Query functions for priority resolver, web builder, save service, mobile dispatcher, project access, and workspace-member resolution |
 | `regression-report.db.ts` | Run-report read queries (run lookup, batch enrichment of names / results / steps / negative-meta / phase-info) for `regression-report-assembler.service.ts` |
-| `regression-run.db.ts` | Shared `regression_runs` / `test_executions` reads + writes (routing info, execution-ref preload, fast-auth telemetry, run patch/finalize) for the orchestrator and run service |
+| `regression-run.db.ts` | Shared `regression_runs` / `test_executions` reads + writes (routing info, execution-ref preload, fast-auth telemetry, run insert, patch/finalize, zombie sweep, run listing) for the orchestrator and run service |
 
-One service file in the same folder still imports `supabaseAdmin` directly
-(`regression-run.service.ts`) — it predates the pattern and needs a follow-up
-extraction before its unit tests can be written. (`regression-report-assembler.service.ts`
-and `test-execution-orchestrator.service.ts` were migrated and are now unit-tested.)
+All three regression services (`regression-report-assembler.service.ts`,
+`test-execution-orchestrator.service.ts`, `regression-run.service.ts`) now go
+through `./db/` — none imports `supabaseAdmin` directly, and each is unit-tested.
+This is the reference example for the `db/` sublayer pattern across the codebase.
