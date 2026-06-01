@@ -550,11 +550,17 @@ class WebSocketService {
   }
 
   public emitTestStepCompleted(testId: string, payload: TestStepCompletedPayload): void {
+    // Broadcast only. Step persistence to the Redis buffer is owned by the
+    // PRODUCER (the executor / job that runs the test, in its own process) via
+    // TestExecutedStepsRedisService.appendStepCompleted — see test-executor.ts
+    // and mobile-test-run.job.ts. Appending here would only ever fire on the
+    // main process via a pub/sub re-emit of a worker event, which left the
+    // append racing (or never happening) for background runs. Do NOT re-add an
+    // append in this method; it would also double-count the producer's append.
     this.emitWithFallback(
       'test:step:completed',
       payload,
       () => {
-        void TestExecutedStepsRedisService.appendStepCompleted(testId, payload);
         this.emitToTest(testId, 'test:step:completed', payload);
       },
       { testId }
