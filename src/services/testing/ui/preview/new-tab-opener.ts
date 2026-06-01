@@ -203,7 +203,7 @@ export function shouldOpenAsNewTab(
  * honest breakdown of which channel fired — `_blank` attribute on the
  * anchor, cross-site link convention, or a held Cmd/Ctrl modifier.
  */
-export type NewTabReason = 'explicit_target' | 'cross_origin_anchor' | 'modifier_driven';
+export type NewTabReason = 'explicit_target' | 'cross_origin_anchor' | 'modifier_driven' | 'programmatic';
 
 export interface OpenNewTabResult {
   opened: true;

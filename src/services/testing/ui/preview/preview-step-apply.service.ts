@@ -3473,6 +3473,32 @@ export class PreviewStepApplyService {
         };
       }
 
+      // open_tab action — create a new tab and navigate it to `value` (URL).
+      // The new tab becomes active (popup-adoption semantics). A URL is
+      // required; openTab refuses an empty value because a blank tab is
+      // auto-closed by the popup handler.
+      if (stepDraft.type === 'open_tab') {
+        const url = (stepDraft.value || '').trim();
+        const opened = await sessionService.openTab(previewSessionId, userId, url);
+
+        // V18: Lightweight settle after open — domcontentloaded only. Full
+        // readiness for the new page is handled by the lookahead before the
+        // next step (same pattern as switch_tab).
+        if (opened) {
+          const newPage = sessionService.getPage(previewSessionId, userId);
+          if (newPage) {
+            try { await newPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
+          }
+        }
+
+        return {
+          success: opened,
+          error: opened ? undefined : (url ? `Could not open new tab at ${url}` : 'open_tab requires a URL'),
+          url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+          attempts: 1,
+        };
+      }
+
       // V15: Auto-switch tab if step targets a different tab than currently active
       const session = sessionService.getSession(previewSessionId);
       if (session && stepDraft.tabIndex !== undefined && stepDraft.tabIndex !== session.activeTabIndex) {

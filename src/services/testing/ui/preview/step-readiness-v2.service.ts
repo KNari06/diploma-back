@@ -105,7 +105,7 @@ export interface ReadinessV2Result {
 
 const NON_TARGETING: ReadonlySet<IntentActionType> = new Set([
   'wait', 'wait_for', 'ai_check', 'wait_for_email',
-  'dialog', 'download', 'switch_tab',
+  'dialog', 'download', 'switch_tab', 'close_tab', 'open_tab',
 ]);
 
 const NEEDS_VISIBLE_ENABLED: ReadonlySet<IntentActionType> = new Set([
