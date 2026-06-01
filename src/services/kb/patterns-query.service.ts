@@ -140,11 +140,16 @@ export class PatternsQueryService {
       for (let i = 0; i < sessionIds.length; i += batchSize) {
         const batch = sessionIds.slice(i, i + batchSize);
         visitsBatches.push(
+          // Column is `visited_at`, not `created_at` — see schema in
+          // supabase-migrations/features/intelligent-test-scenarios.sql:84.
+          // The mistake produced `column intelligent_page_visits.created_at
+          // does not exist` on every prod call and silently returned 0
+          // visits → degraded KB pattern signal.
           supabaseAdmin
             .from('intelligent_page_visits')
-            .select('url, page_type, created_at')
+            .select('url, page_type, visited_at')
             .in('session_id', batch)
-            .order('created_at', { ascending: false })
+            .order('visited_at', { ascending: false })
         );
       }
       const visitsResults = await Promise.all(visitsBatches);
@@ -168,15 +173,17 @@ export class PatternsQueryService {
         const existing = urlMap.get(visit.url);
         if (existing) {
           existing.count++;
-          // Keep the most recent visit date
-          if (visit.created_at > existing.lastVisited) {
-            existing.lastVisited = visit.created_at;
+          // Keep the most recent visit date.
+          // Field is `visited_at` per schema; aliasing to `lastVisited`
+          // here for the result struct so external API stays stable.
+          if (visit.visited_at > existing.lastVisited) {
+            existing.lastVisited = visit.visited_at;
           }
         } else {
           urlMap.set(visit.url, {
             count: 1,
             pageType: visit.page_type,
-            lastVisited: visit.created_at,
+            lastVisited: visit.visited_at,
           });
         }
       }
@@ -321,9 +328,12 @@ export class PatternsQueryService {
       for (let i = 0; i < pageVisitIds.length; i += batchSize) {
         const batch = pageVisitIds.slice(i, i + batchSize);
         actionsBatches.push(
+          // Column is `executed_at`, not `created_at` — see schema in
+          // supabase-migrations/features/intelligent-test-scenarios.sql.
+          // Same mistake as the page-visits query above.
           supabaseAdmin
             .from('intelligent_test_actions')
-            .select('action_type, selector, success, created_at')
+            .select('action_type, selector, success, executed_at')
             .in('page_visit_id', batch)
         );
       }
@@ -357,8 +367,10 @@ export class PatternsQueryService {
         if (existing) {
           existing.total++;
           if (action.success) existing.successes++;
-          if (action.created_at > existing.lastUsed) {
-            existing.lastUsed = action.created_at;
+          // Field is `executed_at` per schema; aliasing to `lastUsed`
+          // here for the result struct so external API stays stable.
+          if (action.executed_at > existing.lastUsed) {
+            existing.lastUsed = action.executed_at;
           }
         } else {
           elementMap.set(groupKey, {
@@ -366,7 +378,7 @@ export class PatternsQueryService {
             actionType: action.action_type || 'unknown',
             total: 1,
             successes: action.success ? 1 : 0,
-            lastUsed: action.created_at,
+            lastUsed: action.executed_at,
           });
         }
       }

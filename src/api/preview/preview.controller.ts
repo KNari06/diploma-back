@@ -7,6 +7,7 @@ import { supabaseAdmin } from '@/db/supabase';
 import { dbAdminService } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
 import { IntentStepConverterService } from '@/services/testing/ui/preview/intent-step-converter.service';
 import { injectAutoWaitForSteps } from '@/services/testing/ui/preview/auto-wait-for.utils';
@@ -638,9 +639,13 @@ export async function runIntentTestCase(req: Request, res: Response): Promise<vo
         .eq('id', projectId)
         .single();
 
-      const mobileApp = project?.settings?.mobileApp;
       const PLATFORM_MAP: Record<string, MobilePlatform> = { mobile_ios: 'ios', mobile_flutter: 'flutter' };
       const mobilePlatform: MobilePlatform = PLATFORM_MAP[platform ?? ''] ?? 'android';
+      // Read the platform-sharded slot, not the legacy singular one — for
+      // dual-platform projects the legacy slot mirrors the latest upload
+      // across platforms, so an iOS preview run could otherwise pick up
+      // an Android .apk and try to install it.
+      const mobileApp = getProjectMobileApp(project?.settings, mobilePlatform);
       const BROWSER_MAP: Record<string, string> = { mobile_ios: 'mobile-ios', mobile_flutter: 'mobile-flutter' };
       const browser = BROWSER_MAP[platform ?? ''] ?? 'mobile-android';
 

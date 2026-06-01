@@ -378,6 +378,11 @@ export interface ServerToClientEvents {
 
   // Preview page switch events (popup/new tab auto-switch)
   'preview:page:navigated': (data: { previewSessionId: string; url: string; previousUrl: string; reason: string; timestamp: string }) => void;
+  // Emitted when the active preview tab lands on a browser load-failure
+  // page (chrome-error://chromewebdata/ — network blip / DNS / TLS /
+  // site outage). Frontend should show a network-error toast / banner.
+  // See preview/page-load-error.util.ts for detection logic.
+  'preview:page:load-error': (data: { previewSessionId: string; url: string; message: string; timestamp: string }) => void;
 
   // V15: Multi-tab events
   'preview:tab:opened': (data: { previewSessionId: string; tabs: Array<{ tabIndex: number; url: string; title?: string; isActive: boolean }>; activeTabIndex: number; timestamp: string }) => void;

@@ -46,6 +46,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -82,6 +83,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="update">Update</button>
         <script>
           document.getElementById('update').addEventListener('click', async () => {
@@ -112,6 +114,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="patch">Patch</button>
         <script>
           document.getElementById('patch').addEventListener('click', async () => {
@@ -153,6 +156,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -188,6 +192,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -222,6 +227,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -269,6 +275,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -313,6 +320,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -351,6 +359,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -385,6 +394,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -420,6 +430,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -455,6 +466,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -468,7 +480,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
 
       const errors = tracker.getValidationErrorsSince(0);
       expect(errors.length).toBeGreaterThan(0);
-      expect(errors[0].authErrorHint).toBe('token_expired');
+      expect(errors[0].authErrorHint).toBe('TOKEN_EXPIRED');
     });
 
     it('should detect invalid_credentials hint', async () => {
@@ -483,6 +495,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -515,6 +528,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -541,6 +555,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -569,6 +584,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -601,6 +617,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -627,6 +644,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -653,6 +671,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {
@@ -685,6 +704,7 @@ describe('NetworkTracker - Request Interception (P1)', () => {
       });
 
       await page.setContent(`
+        <base href="http://localhost/">
         <button id="submit">Submit</button>
         <script>
           document.getElementById('submit').addEventListener('click', async () => {

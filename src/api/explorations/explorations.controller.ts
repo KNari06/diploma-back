@@ -6,6 +6,8 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
+import { NotFoundError, ValidationError } from '@/types';
+import { ExplorationRunService } from '@/services/testing/exploration/exploration-run.service';
 
 interface AuthenticatedRequest extends Request {
   user?: { id: string; email: string; role: string };
@@ -290,5 +292,40 @@ export async function getExplorationState(req: AuthenticatedRequest, res: Respon
     res.json({ success: true, data: state });
   } catch (error) {
     handleError(res, error, 'Failed to get exploration state');
+  }
+}
+
+/**
+ * Run the test cases discovered by an exploration in one click. Wraps them in
+ * a throwaway regression plan and starts a run; the client then navigates to
+ * /runs/:runId for live progress + video.
+ *
+ * POST /api/v1/explorations/:explorationId/run-discovered
+ * Body: { testCaseIds: string[] }
+ * Returns 202 { runId, planId, totalTests }
+ */
+export async function runDiscoveredTestCases(req: AuthenticatedRequest, res: Response): Promise<void> {
+  try {
+    const { explorationId } = req.params;
+    const userId = getUserId(req);
+    const { testCaseIds } = req.body ?? {};
+
+    const result = await ExplorationRunService.runDiscovered({
+      explorationId,
+      userId,
+      testCaseIds,
+    });
+
+    res.status(202).json({ success: true, data: result });
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      res.status(400).json({ success: false, error: error.message });
+      return;
+    }
+    if (error instanceof NotFoundError) {
+      res.status(404).json({ success: false, error: error.message });
+      return;
+    }
+    handleError(res, error, 'Failed to run discovered test cases');
   }
 }

@@ -11,6 +11,7 @@ import { ManualTestResultJobHandler, ManualTestRunJobHandler } from '@/jobs/manu
 import { MobileTestRunJobHandler } from '@/jobs/mobile-test-run.job';
 import { processNegativeGeneration } from '@/jobs/negative-generation.job';
 import { RegressionDoctorJobHandler } from '@/jobs/regression-doctor.job';
+import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 import { logger } from '@/utils/core/logger';
 import { Worker } from 'bullmq';
 import { queueMonitor } from './queue-monitor';
@@ -475,6 +476,24 @@ const setupWorkerEvents = (worker: Worker, workerName: string) => {
       attemptsMade: job.attemptsMade,
       jobData: job.data ? JSON.stringify(job.data).substring(0, 200) : 'N/A',
     });
+
+    // Root-cause finalization: if a test-owning job dies without writing a
+    // terminal status (process killed / stall-death), its own catch/finally
+    // never ran — so the `tests` row would stay 'running' forever. Finalize it
+    // here from the surviving worker. The guarded DB write makes this a no-op
+    // for jobs that already finalized gracefully. Never throw out of the listener.
+    const testId = (job.data as { testId?: string } | undefined)?.testId;
+    if ((workerName === 'TestRun' || workerName === 'MobileTestRun') && testId) {
+      StaleReaperService.handleAbandonedTest(
+        testId,
+        `Job failed: ${err instanceof Error ? err.message : 'worker died'}`,
+      ).catch((e) => {
+        logger.error(`❌ [${workerName}] handleAbandonedTest threw`, {
+          testId,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      });
+    }
   });
 
   worker.on('error', (err) => {

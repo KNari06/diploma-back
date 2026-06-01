@@ -18,6 +18,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { IntentTestCaseService } from './intent-test-case.service';
 import { PreviewStepApplyService } from './preview-step-apply.service';
 import { getPreviewSessionService } from './preview-session.service';
+import { detectPageLoadError } from './page-load-error.util';
 import type { IntentActionType, IntentStep } from './preview.types';
 import { shouldSkipLookaheadAfter, waitForStepReadiness, waitForApiIdle } from './step-readiness.service';
 import { runV1WithShadow } from './step-readiness-v2.service';
@@ -1455,6 +1456,12 @@ export class PreviewRunService {
         runState.currentStepIndex = i;
         const step = stepsToExecute[i];
 
+        // NOTE: the chrome-error short-circuit moved to AFTER apply
+        // (around the `status: 'pass'` emit). A pre-step check at
+        // iteration N+1 would incorrectly mark step N+1 as failed for
+        // a problem that originated in step N's navigation. Detecting
+        // post-apply attributes the failure to the actual culprit.
+
         logger.info('[PreviewRun] Executing step', {
           previewSessionId,
           stepIndex: originalStepIndex,
@@ -2057,6 +2064,56 @@ export class PreviewRunService {
                 retried,
               },
             });
+
+            // POST-APPLY chrome-error detection. The apply pipeline
+            // returns success:true when click → nav fired, even if the
+            // destination URL ended up as Chromium's error page. We
+            // attribute the failure to THIS step (the click that caused
+            // the navigation), not to the innocent step N+1 that would
+            // have run next. Without this, the user sees step N green
+            // and step N+1 red — wrong blame.
+            const postApplyLoadErr = detectPageLoadError(result.url ?? session.page.url());
+            if (postApplyLoadErr.isLoadError) {
+              logger.warn('[PreviewRun] Step navigated to browser load-error page — aborting run', {
+                previewSessionId,
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                url: postApplyLoadErr.url,
+              });
+              webSocketService.emitToUser(userId, 'preview:page:load-error', {
+                previewSessionId,
+                url: postApplyLoadErr.url,
+                message: postApplyLoadErr.message,
+                timestamp: new Date().toISOString(),
+              });
+              // Mark CURRENT step failed (it caused the bad nav), rest skipped.
+              webSocketService.emitToUser(userId, 'preview:run:step', {
+                previewSessionId,
+                stepIndex: originalStepIndex,
+                stepId: step.id,
+                status: 'failed',
+                action: step.type,
+                description: step.description,
+                error: postApplyLoadErr.message,
+                timestamp: new Date().toISOString(),
+                ...(result.url ? { url: result.url } : {}),
+              });
+              failedSteps++;
+              for (let j = i + 1; j < stepsToExecute.length; j++) {
+                const skipStep = stepsToExecute[j];
+                webSocketService.emitToUser(userId, 'preview:run:step', {
+                  previewSessionId,
+                  stepIndex: startFromIndex + j,
+                  stepId: skipStep.id,
+                  status: 'skipped',
+                  action: skipStep.type,
+                  description: skipStep.description,
+                  timestamp: new Date().toISOString(),
+                });
+                skippedSteps++;
+              }
+              break;
+            }
 
             // Emit pass (include appliedStep so frontend can enrich the UI step).
             // `url` is included so the editor's preview URL bar tracks the live

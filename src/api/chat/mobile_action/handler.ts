@@ -46,6 +46,11 @@ import {
   emitMobileToolStep,
 } from '../mobile_agent/progress';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import {
+  assertMobileSessionOwnership,
+  MobileSessionAuthzError,
+} from '@/services/mobile/mobile-session-authz';
+import { incCounter } from '@/utils/core/mobile-chat-metrics';
 
 interface MobileActionParams {
   message: string;
@@ -109,6 +114,39 @@ export async function handleMobileAction(
     return;
   }
 
+  // HIGH-1 fix: same ownership check as mobile_agent's handler. The
+  // fast-path also fetches the runner snapshot at line ~132 with the
+  // client-supplied `mobileSessionId`; without this guard a forged id
+  // would be honoured. Performed BEFORE constructing the blackboard so
+  // the foreign id is never recorded in the turn's state.
+  try {
+    await assertMobileSessionOwnership(userId, mobileSessionId);
+  } catch (authzErr) {
+    if (authzErr instanceof MobileSessionAuthzError) {
+      incCounter('mobile_chat.authz_rejection', authzErr.reason);
+      logger.warn('[MOBILE_ACTION] Rejected unauthorised mobileSessionId', {
+        userId,
+        mobileSessionId,
+        reason: authzErr.reason,
+      });
+      await saveMobileChatTurn(
+        chatSessionId,
+        message,
+        NO_SESSION_REPLY,
+        { noSession: true, authzRejected: true },
+        'mobile_action',
+      );
+      res.status(403).json({
+        success: false,
+        reply: NO_SESSION_REPLY,
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
+    }
+    throw authzErr;
+  }
+
   const blackboard = new MobileBlackboard({
     goal: message,
     mobileSessionId,
@@ -133,6 +171,7 @@ export async function handleMobileAction(
       includeTree: false,
       includeScreenshot: false, // fast-path skips the screenshot — text tree is enough
       signal: abortSignal,
+      userId,
     });
     blackboard.setSnapshot(snap);
     snapshotHeader = formatSnapshotForPrompt(snap);

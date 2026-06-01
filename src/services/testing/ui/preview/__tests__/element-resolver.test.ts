@@ -145,7 +145,7 @@ describe('ElementResolverService', () => {
       expect(text).toContain('<input role=textbox type=email>');
     });
 
-    it('should cap text at 200 characters', () => {
+    it('should cap text at 280 characters', () => {
       const node: InteractiveNode = {
         tag: 'input',
         containerTitles: ['Very Long Container Title That Takes Up Space', 'Another Long Title'],
@@ -158,7 +158,7 @@ describe('ElementResolverService', () => {
       };
 
       const text = buildCandidateText(node);
-      expect(text.length).toBeLessThanOrEqual(200);
+      expect(text.length).toBeLessThanOrEqual(280);
     });
 
     // Multilingual tests
@@ -531,9 +531,9 @@ describe('ElementResolverService', () => {
       expect(result.status).toBe('not_found');
     });
 
-    it('should return resolved when LLM returns confidence at threshold (0.4)', async () => {
+    it('should return resolved when LLM returns confidence at threshold (0.55)', async () => {
       mockGetChatCompletion.mockResolvedValue({
-        content: JSON.stringify({ ref: 'e2', confidence: 0.4, reason: 'partial match — password field' }),
+        content: JSON.stringify({ ref: 'e2', confidence: 0.55, reason: 'partial match — password field' }),
       } as any);
 
       const result = await resolveElement({
@@ -544,7 +544,7 @@ describe('ElementResolverService', () => {
       });
 
       expect(result.status).toBe('resolved');
-      expect(result.confidence).toBeGreaterThanOrEqual(0.4);
+      expect(result.confidence).toBeGreaterThanOrEqual(0.55);
     });
 
     it('should return resolved for cross-language match when LLM correctly identifies element', async () => {

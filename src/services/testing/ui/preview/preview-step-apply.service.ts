@@ -4243,12 +4243,26 @@ export class PreviewStepApplyService {
           let compiled;
           if (resolvedNode) {
             try {
+              // Local trace handle — the outer scope's `editorTrace`
+              // (defined ~4379) hasn't been initialised yet at this
+              // call site. Get a fresh handle so the validation event
+              // lands on the same JSONL.
+              const localTrace = EditorTraceService.get(previewSessionId);
               compiled = await LocatorPlanBuilder.buildCompiledPlan({
                 step: stepDraft,
                 resolvedNode,
                 pageUrl: urlBeforeAction,
                 pageTitle: await page.title().catch(() => undefined),
                 page,
+                // May 2026 — emit `compiled_validation` per-build so
+                // forensic analysts can tell "plan was dead on arrival"
+                // from a single JSONL line instead of cross-referencing
+                // multiple compiled_attempt rows.
+                onValidation: (stats) => {
+                  try {
+                    localTrace?.writeCompiledValidation({ stepId: stepDraft.id, ...stats });
+                  } catch { /* trace never breaks apply path */ }
+                },
               });
             } catch (compileError) {
               logger.warn('[PREVIEW_APPLY] Failed to generate compiled plan for user-confirmed selection', {
@@ -5849,6 +5863,12 @@ export class PreviewStepApplyService {
                 pageTitle: await page.title().catch(() => undefined),
                 pageSignature,
                 page,
+                onValidation: (stats) => {
+                  try {
+                    const t = EditorTraceService.get(previewSessionId);
+                    t?.writeCompiledValidation({ stepId: stepDraft.id, ...stats });
+                  } catch { /* never breaks apply */ }
+                },
               });
               logger.debug('[PREVIEW_APPLY] Compiled plan generated', {
                 stepId: stepDraft.id,

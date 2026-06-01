@@ -26,6 +26,7 @@ import { Job } from 'bullmq';
 import type { MobileTestJobData, MobileRunStepsResponse, MobileIntentStep } from '@/services/mobile/mobile-runner.types';
 import type { IntentStep } from '@/services/testing/ui/preview/preview.types';
 import { IntentTestCaseService } from '@/services/testing/ui/preview/intent-test-case.service';
+import { sanitizeMobileAppPackageSteps } from '@/services/testing/regression/intent-step-dispatch.service';
 import { MobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
@@ -34,6 +35,10 @@ import { env } from '@/config/environment/env';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
 // module so unit tests can exercise them without booting supabase/BullMQ.
 import { sumStepDurations } from './helpers/telemetry';
+import { classifyStepResults } from '@/utils/testing/step-result-classifier';
+import { CompiledPlanPersistenceService } from '@/services/testing/ui/preview/compiled-plan-persistence.service';
+import { MobileSessionAcquisitionService } from '@/services/mobile/session-acquisition.service';
+import { FastAuthOrchestratorService } from '@/services/mobile/fast-auth-orchestrator.service';
 
 // ============================================================================
 // JOB HANDLER
@@ -264,6 +269,14 @@ export class MobileTestRunJobHandler {
       client.setGeminiApiKey(geminiApiKey);
     }
 
+    // Flutter runs as a NATIVE android session that we upgrade via
+    // `attachFlutter` after install+launch. The runner's direct
+    // createSession('flutter') probes the VM Service before the app is
+    // installed (chicken-and-egg → always fails), and the pool only warms
+    // android, so we acquire 'android' here and attach below.
+    const isFlutter = platform === 'flutter';
+    const acquirePlatform = isFlutter ? 'android' : platform;
+
     let sessionId: string | null = null;
     let sessionSource: 'pool' | 'warmup' | 'cold' = 'cold';
     // Fast-auth: filled from compileResult.fastAuthRestores. Each entry is a
@@ -386,117 +399,20 @@ export class MobileTestRunJobHandler {
       await this.updateTestStatus(testId, 'running', browser);
 
       // ── Phase 3: Acquire session — Pool → Warmup → Cold Start ─
-      try {
-        webSocketService.emitTestProgress(testId, {
-          testId,
-          browser,
-          progress: 10,
-          phase: 'initializing',
-          currentStep: `Starting ${platform} session...`,
-          status: 'running',
-          timestamp: new Date().toISOString(),
-          userId,
-          sessionId: chatSessionId,
-        });
-      } catch { /* non-fatal */ }
+      const sessionAcq = await MobileSessionAcquisitionService.acquireSession({
+        client,
+        testId,
+        platform: acquirePlatform,
+        browser,
+        userId,
+        projectId,
+        chatSessionId,
+      });
+      sessionId = sessionAcq.sessionId;
+      sessionSource = sessionAcq.sessionSource;
+      tlm.sessionClaimMs = sessionAcq.sessionClaimMs;
+      tlm.coldStartUsed = sessionAcq.coldStartUsed;
 
-      // Phase 6: Session acquisition can take up to ~60s on a cold start.
-      // Progressively tell the frontend which fallback we're on so "Starting
-      // mobile session…" doesn't feel like a freeze. Progress stays in the
-      // 10-15% band — we're still in the initializing phase, not executing.
-      const emitSessionPhase = (step: string, pct: number) => {
-        try {
-          webSocketService.emitTestProgress(testId, {
-            testId,
-            browser,
-            progress: pct,
-            phase: 'initializing',
-            currentStep: step,
-            status: 'running',
-            timestamp: new Date().toISOString(),
-            userId,
-            sessionId: chatSessionId,
-          });
-        } catch { /* non-fatal */ }
-      };
-
-      // Phase 2 telemetry: timer wraps the entire pool->warmup->cold
-      // ladder so cold-start dominated runs surface in `session_claim_ms`.
-      // Date.now() is good enough at millisecond granularity for human-
-      // observable infrastructure wait times.
-      const sessionClaimT0 = Date.now();
-      try {
-      // Try 1: Pool claim (runner pre-booted sessions, fastest path ~0-15s).
-      // Pass `ownerId: userId` so the runner switches to this user's
-      // dedicated Android multi-user — apps from other owners are hidden.
-      // Gated by MOBILE_MULTI_USER_ISOLATION (default OFF for shared
-      // workspace; skipping `ownerId` shaves 5-15s and avoids
-      // "Maximum user limit is reached" on long-running redroid hosts).
-      const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-      try {
-        const claimed = await client.claimSession(platform, { ownerId: effectiveOwnerId });
-        sessionId = claimed.sessionId;
-        sessionSource = 'pool';
-        logger.info('[MOBILE-TEST] Pool session claimed', {
-          testId, sessionId, platform,
-          ownerId: effectiveOwnerId ?? null,
-          multiUserIsolation: env.MOBILE_MULTI_USER_ISOLATION,
-        });
-      } catch (poolErr) {
-        // Pool exhausted, disabled, or runner unreachable — try next
-        logger.debug('[MOBILE-TEST] Pool claim failed, trying warmup', {
-          testId,
-          error: poolErr instanceof Error ? poolErr.message : String(poolErr),
-        });
-      }
-
-      // Try 2: Warmed session (editor eager start)
-      if (!sessionId && projectId) {
-        emitSessionPhase(`Checking warmed ${platform} session…`, 11);
-        const warmed = await claimWarmedSession(projectId, userId);
-        if (warmed && warmed.platform === platform) {
-          sessionId = warmed.sessionId;
-          sessionSource = 'warmup';
-          logger.info('[MOBILE-TEST] Warmed session claimed', { testId, sessionId, platform });
-        } else if (warmed && warmed.platform !== platform) {
-          // Pre-fix this branch was silent — a warmup existed but for a
-          // different platform (e.g. user warmed mobile_android in the
-          // editor, then ran a mobile_ios regression). The cold-start
-          // tax then applies anyway. Warn so operators can spot wasted
-          // warmups and tune the editor's eager-start heuristics.
-          logger.warn('[MOBILE-TEST] Warmed session discarded — platform mismatch', {
-            testId,
-            warmedSessionId: warmed.sessionId,
-            warmedPlatform: warmed.platform,
-            requestedPlatform: platform,
-          });
-        }
-      }
-
-      // Try 3: Cold start (fallback — creates new emulator/simulator ~60s)
-      if (!sessionId) {
-        // Explicit heads-up: cold starts can take up to a minute, so users
-        // see "Booting emulator…" instead of a long silent pause after 10%.
-        emitSessionPhase(`Booting ${platform} emulator (cold start, up to 60s)…`, 12);
-        const session = await client.createSession(platform, { ownerId: effectiveOwnerId });
-        sessionId = session.sessionId;
-        sessionSource = 'cold';
-        logger.info('[MOBILE-TEST] Session created (cold start)', {
-          testId,
-          sessionId,
-          platform,
-          ownerId: effectiveOwnerId ?? null,
-        });
-      }
-      } finally {
-        // Phase 2: record claim wallclock regardless of outcome. A
-        // cold-start that succeeded after pool failure has the full
-        // ladder time, which is the honest number to expose. We also
-        // record coldStartUsed here so the value is set even if a
-        // subsequent prepApp throw skips later instrumentation.
-        tlm.sessionClaimMs = Math.max(0, Date.now() - sessionClaimT0);
-        tlm.coldStartUsed = sessionSource === 'cold';
-      }
 
       // ── Phase 3a: Apply project-level runtime-permission policy ────
       // Editor warmup applies this during the warmup HTTP handler, but
@@ -601,6 +517,9 @@ export class MobileTestRunJobHandler {
             appPackage,
             appStoragePathOverride: appStoragePath,
             appOriginalNameOverride: appOriginalName,
+            // Flutter: install only — attachFlutter (below) clears logcat
+            // and launches so the VM Service log line is in the scan window.
+            skipLaunch: isFlutter,
             onProgress: (stage, _progress) => {
               switch (stage) {
                 case 'launching_browser':
@@ -626,224 +545,44 @@ export class MobileTestRunJobHandler {
         }
       }
 
+
       // ── Phase 3c: Fast-auth restore (May 2026) ────────────────────
-      // Replays a previously-captured app-data snapshot to skip the login
-      // recipe entirely. Runs AFTER prepApp because prepApp's `pm clear +
-      // install + launch` would wipe whatever we restored, and BEFORE
-      // runSteps because the test body assumes the app is on-screen and
-      // logged in.
-      //
-      // Multiple snapshots in one run only happen if a test binds more
-      // than one auth resource (rare today — bindings dedupe by kind via
-      // workspace defaults). We restore them sequentially; only the last
-      // one applied to the same package wins, which is fine — there's no
-      // sensible meaning of "two logins in one app" anyway.
-      //
-      // Failure handling (Q2): each restore is independent. If one fails:
-      //   1. Log loudly with the reason (privilege / not launched / 5xx).
-      //   2. Mark this snapshot as broken via TestResourceService so the
-      //      NEXT test in this regression compiles to recipe replay
-      //      instead — the regression self-heals one test at a time.
-      //   3. Set telemetry `fastAuthUsed = false` and a one-line reason.
-      //   4. Continue — test body still runs. It will MOST LIKELY fail
-      //      on step 1 (login screen visible, expected dashboard) but
-      //      that's strictly better than aborting: the user sees a real
-      //      "login required" failure mode they can act on, not a
-      //      mysterious "snapshot couldn't restore" infra error.
-      //
-      // Counting: with N entries, at most ONE will succeed in the common
-      // case (each fastAuthRestore is a different auth resource → different
-      // package OR same package + later one overwrites). Telemetry counts
-      // total ATTEMPTS, not entries; the success boolean is a single value.
       if (sessionId && fastAuthRestores.length > 0) {
-        // Early cancellation check — restore can take up to 30s per binding
-        // on a multi-MB tarball, so we don't want to start if the user has
-        // already given up. Throws so the outer catch emits the proper
-        // cancellation WS event uniformly with the Phase 4 cancel check.
-        if (await this.isTestCancelled(testId)) {
+        const fastAuthResult = await FastAuthOrchestratorService.restoreSnapshots({
+          client,
+          sessionId,
+          fastAuthRestores,
+          testId,
+          browser,
+          userId,
+          chatSessionId,
+          checkCancelled: () => this.isTestCancelled(testId),
+        });
+        if (fastAuthResult.cancelled) {
           throw new MobileTestCancelledError(testId, browser);
         }
-
-        // Local abort controller scoped to Phase 3c only. Phase 4 has its
-        // own (`runStepsAbort`) — keeping them separate avoids leaking the
-        // cancel-poller's lifecycle into the restore loop, and means a
-        // restore cancellation doesn't also force-abort the runSteps fetch
-        // that hasn't started yet.
-        const restoreAbort = new AbortController();
-        const restoreCancelPoller = setInterval(async () => {
-          try {
-            if (await this.isTestCancelled(testId)) restoreAbort.abort();
-          } catch { /* polling errors are non-fatal */ }
-        }, 2_000);
-        restoreCancelPoller.unref?.();
-
-        // Emit a progress marker so the UI doesn't show a silent ~200ms
-        // gap between "Launching app…" (17%) and "Executing steps…" (20%).
-        // On a 200-test regression this is 200 events the user would
-        // otherwise wonder about. Non-fatal: WS failures never block restore.
-        try {
-          webSocketService.emitTestProgress(testId, {
-            testId,
-            browser,
-            progress: 18,
-            phase: 'initializing',
-            currentStep: 'Restoring saved session (fast-auth)…',
-            status: 'running',
-            timestamp: new Date().toISOString(),
-            userId,
-            sessionId: chatSessionId,
-          });
-        } catch { /* non-fatal */ }
-
-        const fastAuthT0 = Date.now();
-        let anySuccess = false;
-        let lastFailureReason: string | null = null;
-
-        for (const restore of fastAuthRestores) {
-          try {
-            const result = await client.restoreAppData(
-              sessionId,
-              restore.packageName,
-              restore.dataTarballBase64,
-              { signal: restoreAbort.signal },
-            );
-            if (!result.launched) {
-              // Data was laid down but launch didn't confirm. Treat as
-              // partial-failure — the activity entry might have moved
-              // between snapshot and current build. Don't trust the
-              // snapshot any more; fall back so the next test recompiles.
-              lastFailureReason = `restore wrote data but app launch did not confirm (${result.restoredVia})`;
-              await MobileTestRunJobHandler.markSnapshotBroken(
-                restore.resourceId,
-                userId,
-                lastFailureReason,
-              );
-              logger.warn(
-                '[FAST_AUTH] Restore wrote data but launch unconfirmed — marking broken',
-                {
-                  testId,
-                  resourceId: restore.resourceId,
-                  resourceName: restore.resourceName,
-                  packageName: restore.packageName,
-                },
-              );
-              continue;
-            }
-            anySuccess = true;
-            logger.info('[FAST_AUTH] Snapshot restored, app launched', {
-              testId,
-              resourceId: restore.resourceId,
-              resourceName: restore.resourceName,
-              packageName: restore.packageName,
-              restoredVia: result.restoredVia,
-              restoreMs: result.restoreMs,
-              sizeBytes: restore.sizeBytes,
-            });
-          } catch (err) {
-            // Runner returned non-2xx OR network blip. Decide whether to
-            // INVALIDATE the snapshot or just record the failure:
-            //
-            //   413 SNAPSHOT_TOO_LARGE  → snapshot itself is the problem; strip it.
-            //   409 SNAPSHOT_PRIVILEGE  → device-specific; strip it. Other
-            //                             devices in the pool might work, but
-            //                             on a single-emulator deployment the
-            //                             next test would hit the same wall.
-            //                             Telemetry will tell us if we
-            //                             should soften this to "device
-            //                             marker" instead of full strip.
-            //   400 PACKAGE_NAME_MISMATCH → snapshot is fine, just wrong target.
-            //                              DO NOT strip — user's config bug,
-            //                              not snapshot rot.
-            //   400 PLATFORM_UNSUPPORTED  → same as above — config bug.
-            //   500+ / network / timeout → transient. DO NOT strip — a
-            //                              flaky runner would erase all
-            //                              snapshots within minutes.
-            //
-            // The error's `code` field (set by MobileRunnerError) is the
-            // authoritative signal; status alone isn't (the runner could
-            // ship a 400 for a non-config issue in future).
-            const code = err instanceof MobileRunnerError ? err.code : undefined;
-            const statusCode = err instanceof MobileRunnerError ? err.statusCode : undefined;
-            const reason = err instanceof Error ? err.message : String(err);
-            lastFailureReason = reason.slice(0, 200);
-
-            const shouldInvalidate =
-              code === 'SNAPSHOT_TOO_LARGE' || code === 'SNAPSHOT_PRIVILEGE';
-            const isConfigBug =
-              code === 'PACKAGE_NAME_MISMATCH' || code === 'PLATFORM_UNSUPPORTED';
-            const isTransient =
-              !code && (!statusCode || statusCode >= 500);
-
-            if (shouldInvalidate) {
-              await MobileTestRunJobHandler.markSnapshotBroken(
-                restore.resourceId,
-                userId,
-                lastFailureReason,
-              );
-              logger.warn(
-                '[FAST_AUTH] Restore failed — snapshot stripped, next test falls back to recipe',
-                {
-                  testId,
-                  resourceId: restore.resourceId,
-                  packageName: restore.packageName,
-                  code,
-                  error: reason,
-                },
-              );
-            } else if (isConfigBug) {
-              logger.warn(
-                '[FAST_AUTH] Restore rejected by runner config check — snapshot left intact',
-                {
-                  testId,
-                  resourceId: restore.resourceId,
-                  packageName: restore.packageName,
-                  code,
-                },
-              );
-            } else if (isTransient) {
-              logger.warn(
-                '[FAST_AUTH] Restore failed (transient) — snapshot left intact, will retry next run',
-                {
-                  testId,
-                  resourceId: restore.resourceId,
-                  packageName: restore.packageName,
-                  statusCode,
-                  error: reason,
-                },
-              );
-            } else {
-              // Unknown shape — be conservative, log and leave the snapshot.
-              // Better to retry a snapshot we don't understand than to
-              // strip one that might be fine.
-              logger.warn(
-                '[FAST_AUTH] Restore failed with unrecognised error — snapshot left intact',
-                {
-                  testId,
-                  resourceId: restore.resourceId,
-                  packageName: restore.packageName,
-                  code,
-                  statusCode,
-                  error: reason,
-                },
-              );
-            }
-          }
-        }
-
-        clearInterval(restoreCancelPoller);
-
-        // If the abort came from our cancel poller mid-restore, surface as
-        // typed cancellation for the outer catch — same shape Phase 4 uses.
-        if (restoreAbort.signal.aborted) {
-          throw new MobileTestCancelledError(testId, browser);
-        }
-
-        tlm.fastAuthUsed = anySuccess;
-        tlm.fastAuthRestoreMs = Math.max(0, Date.now() - fastAuthT0);
-        if (!anySuccess) {
-          tlm.fastAuthFallbackReason = lastFailureReason ?? 'restore failed for all bindings';
+        tlm.fastAuthUsed = fastAuthResult.fastAuthUsed;
+        tlm.fastAuthRestoreMs = fastAuthResult.fastAuthRestoreMs;
+        if (!fastAuthResult.fastAuthUsed) {
+          tlm.fastAuthFallbackReason = fastAuthResult.fastAuthFallbackReason;
         }
       }
+
+      // ── Phase 3d: Flutter attach ──────────────────────────────
+      // Upgrade the native android session into a Flutter session: launch
+      // the app (now that install + fast-auth restore are done), detect the
+      // Dart VM Service, and connect. FATAL — a Flutter test can't run
+      // without the driver connection. Throwing here routes into the outer
+      // catch, which marks the test failed with the runner's message
+      // (e.g. FLUTTER_NOT_DETECTED when the build isn't debug/profile).
+      if (isFlutter && sessionId) {
+        if (!appPackage) {
+          throw new Error('Flutter test has no resolved package name — cannot attach the Dart VM Service.');
+        }
+        await client.attachFlutter(sessionId, { packageName: appPackage }, { userId });
+        logger.info('[MOBILE-TEST] Flutter session attached', { testId, sessionId, appPackage });
+      }
+
 
       // ── Phase 4: Run steps ────────────────────────────────────
       try {
@@ -890,12 +629,22 @@ export class MobileTestRunJobHandler {
       // Don't keep the worker process alive just for this timer.
       cancelPoller.unref?.();
 
+      // open_app/close_app: rewrite stale display labels (e.g. "ANDROID") to
+      // the resolved package so the runner acts on the app under test instead
+      // of failing on a non-existent package. Done here, at the single mobile
+      // job consumer, so every dispatch path (regression/CI/chat/preview) is
+      // covered in one place. Runs after resource-step compilation so injected
+      // setup steps are normalised too. Empty `appPackage` → blank value →
+      // runner falls back to session.packageName.
+      sanitizeMobileAppPackageSteps(intentSteps, appPackage);
+
       let runResult: MobileRunStepsResponse;
       try {
         runResult = await client.runSteps(sessionId, intentSteps, {
           screenshotEachStep: true,
           metadata,
           signal: runStepsAbort.signal,
+          userId,
         });
       } catch (err) {
         clearInterval(cancelPoller);
@@ -990,29 +739,13 @@ export class MobileTestRunJobHandler {
       //
       // `isAutoInjected` (auto-wait, recovery, etc.) is also tolerable —
       // mirrors run.routes.ts:553's `shouldContinue` rule.
-      const tolerableFailureStepIds = new Set<string>();
-      const knownStepIds = new Set<string>();
-      for (const s of intentSteps) {
-        knownStepIds.add(s.id);
-        if (s.options?.continueOnError === true || s.isAutoInjected === true) {
-          tolerableFailureStepIds.add(s.id);
-        }
-      }
-      const isTolerableFailure = (stepId: string): boolean => {
-        // Auto-injected steps the runner adds itself (not in our intentSteps)
-        // are also tolerable — they're infrastructure helpers, not user steps.
-        if (!knownStepIds.has(stepId)) return true;
-        return tolerableFailureStepIds.has(stepId);
-      };
-      const realFailures = runResult.steps.filter(
-        (s) => !s.success && !isTolerableFailure(s.stepId),
-      );
-      const optionalFailures = runResult.steps.filter(
-        (s) => !s.success && isTolerableFailure(s.stepId),
-      );
-      const allStepsActuallyPassed = realFailures.length === 0;
-      const runnerSaidPassed = runResult.status === 'passed';
-      const aggregateMismatch = runnerSaidPassed && runResult.steps.some((s) => !s.success);
+      const {
+        testPassed: allStepsActuallyPassed,
+        mandatoryFailures: realFailures,
+        optionalFailures,
+        aggregateMismatch,
+        isTolerableFailure,
+      } = classifyStepResults(runResult.steps, intentSteps, runResult.status);
       if (aggregateMismatch) {
         logger.error('[MOBILE-TEST] Runner aggregate disagrees with per-step truth — downgrading', {
           testId,
@@ -1114,7 +847,7 @@ export class MobileTestRunJobHandler {
       // Mutex-safe: batchUpdateStepsFromRun takes withTestCaseMutex, so it
       // serializes against updateStepFromPreviewApply / updateStepAfterHeal
       // that fire from apply and in-run heal paths.
-      await MobileTestRunJobHandler.persistCompiledPlansFromRun(
+      await CompiledPlanPersistenceService.persistFromRun(
         intentTestCaseId,
         intentSteps,
         runResult,
@@ -1446,10 +1179,10 @@ export class MobileTestRunJobHandler {
       if (sessionId) {
         try {
           if (sessionSource === 'pool') {
-            await client.releaseSession(sessionId);
+            await client.releaseSession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Pool session released', { testId, sessionId });
           } else {
-            await client.destroySession(sessionId);
+            await client.destroySession(sessionId, { userId });
             logger.debug('[MOBILE-TEST] Session destroyed', { testId, sessionId, sessionSource });
           }
         } catch (err) {
@@ -1469,126 +1202,6 @@ export class MobileTestRunJobHandler {
     }
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────
-
-  /**
-   * Persist freshly-built compiled plans from a completed run onto the
-   * IntentTestCase.steps_json. Idempotent, non-fatal, mutex-safe.
-   *
-   * Persistence rules (revised):
-   *   1. Step succeeded AND has a compiledPlan → persist (canonical case).
-   *   2. Step FAILED but the resolve went through compiled_fast_path or
-   *      cache → persist. Reason: those resolves only succeed when an
-   *      already-validated plan still matches the current tree. The plan
-   *      itself is not the cause of the failure (some downstream step in
-   *      dispatch / VTE / app crash failed instead). Throwing the plan
-   *      away here forces the next regression run to re-pay full LLM cost
-   *      even though the plan is fine.
-   *   3. Step failed and resolveVia was a fresh LLM/vision/thinking pass →
-   *      do NOT persist. We don't know whether the LLM picked the right
-   *      element or not, so we won't lock in a possibly-wrong plan.
-   *
-   * Original step fields (description, value, options, user-set
-   * bindingHints) are preserved via spread; runner-emitted evidence is
-   * attached under a `runtime` namespace to match the shape
-   * MobileStepApplyService already writes for apply.
-   */
-  private static async persistCompiledPlansFromRun(
-    intentTestCaseId: string | undefined,
-    intentSteps: MobileIntentStep[],
-    runResult: MobileRunStepsResponse,
-  ): Promise<void> {
-    if (!runResult?.steps?.length) return;
-    // intentTestCaseId is the `intent_test_cases.id` (NOT `tests.id`).
-    // The chat dispatch path doesn't populate it yet, in which case we
-    // skip the persist — without the test-case PK there's nothing to
-    // merge into. Regression and editor paths always pass it.
-    if (!intentTestCaseId) {
-      logger.debug('[MOBILE-TEST] Skipping compiled-plan persist — no intent_test_cases.id provided', {
-        runStepsCount: runResult.steps.length,
-      });
-      return;
-    }
-
-    try {
-      const originalById = new Map<string, MobileIntentStep>();
-      for (const s of intentSteps) originalById.set(s.id, s);
-
-      const enrichedSteps = new Map<string, IntentStep>();
-
-      // resolvedVia values that mean "this plan was already proven against
-      // the current tree before the run started". Safe to persist on failure
-      // because the plan is independently validated.
-      const PROVEN_RESOLVED_VIA = new Set<string>(['compiled', 'compiled_fast_path', 'cache']);
-
-      for (const result of runResult.steps) {
-        if (!result.compiledPlan) continue;
-        // Runner can flag a plan as stale post-dispatch (VTE caught text in
-        // wrong field, or foreground mismatch with no relaunch). Skip
-        // persistence — the plan is "successful at dispatch level" but
-        // points at the wrong element. Saving it locks in the bug.
-        if (result.planStaleReason) {
-          logger.debug('[MOBILE-TEST] Skipping plan persist — runner flagged stale', {
-            stepId: result.stepId,
-            reason: result.planStaleReason,
-          });
-          continue;
-        }
-        const planIsProven =
-          result.resolvedVia !== undefined && PROVEN_RESOLVED_VIA.has(result.resolvedVia);
-        if (!result.success && !planIsProven) continue;
-        const original = originalById.get(result.stepId);
-        if (!original) continue;
-
-        // Start from the original step to preserve user-supplied fields
-        // (description, value, options, assertionText, bindingHints, etc.),
-        // then overlay runner-emitted artifacts. Cast is safe because
-        // IntentStep is the structural superset used across web and mobile.
-        const enriched: IntentStep = {
-          ...(original as unknown as IntentStep),
-          compiled: result.compiledPlan as unknown as IntentStep['compiled'],
-        };
-
-        if (result.evidence) {
-          enriched.evidence = {
-            ...(original as unknown as IntentStep).evidence,
-            resolvedVia: result.resolvedVia,
-            appliedAt: new Date().toISOString(),
-            // Keep runner-collected logs/console/network errors under a
-            // dedicated key so they don't collide with web StepEvidence fields.
-            runtime: result.evidence,
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any;
-        }
-
-        enrichedSteps.set(result.stepId, enriched);
-      }
-
-      if (enrichedSteps.size === 0) {
-        logger.debug('[MOBILE-TEST] No compiled plans to persist', { intentTestCaseId });
-        return;
-      }
-
-      const ok = await IntentTestCaseService.batchUpdateStepsFromRun({
-        intentTestCaseId,
-        enrichedSteps,
-      });
-
-      if (ok) {
-        logger.info('[MOBILE-TEST] Persisted compiled plans from run', {
-          intentTestCaseId,
-          persistedCount: enrichedSteps.size,
-          totalSteps: runResult.steps.length,
-        });
-      }
-    } catch (error) {
-      // Non-fatal: run already succeeded, test_results will still be created.
-      logger.warn('[MOBILE-TEST] Failed to persist compiled plans (non-fatal)', {
-        intentTestCaseId,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
 
   private static async updateTestStatus(
     testId: string,
@@ -1948,34 +1561,4 @@ export class MobileTestRunJobHandler {
     }
   }
 
-  /**
-   * Fast-auth: strip a now-suspect mobileSnapshot from its auth resource
-   * so the NEXT test in this regression compiles to recipe replay instead
-   * of trying the same broken snapshot again. Best-effort, never throws —
-   * a failed strip just means one more test pays the restore-retry cost.
-   */
-  private static async markSnapshotBroken(
-    resourceId: string,
-    userId: string,
-    reason: string,
-  ): Promise<void> {
-    try {
-      const { clearMobileSnapshot } = await import(
-        '@/services/test-resource/test-resource.service'
-      );
-      // markBrokenIfNoRecipe: runtime invalidation = "snapshot is gone AND
-      // there's nothing to fall back to". If the resource has a recipe we
-      // leave it active (recipe path still works). If not, mark broken so
-      // the Logins UI surfaces a re-record CTA — without this the user
-      // would silently see "active" resources whose every test fails.
-      await clearMobileSnapshot(resourceId, userId, reason, {
-        markBrokenIfNoRecipe: true,
-      });
-    } catch (err) {
-      logger.warn('[MOBILE-TEST] markSnapshotBroken threw', {
-        resourceId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 }

@@ -1,4 +1,8 @@
 import { supabaseAdmin } from '@/db/supabase';
+import {
+  forceFailStuckExecutions,
+  forceFailStuckTests,
+} from '@/services/testing/results/db/test-completion.db';
 import { executionCompletionEmitter } from '@/services/testing/executions/execution-completion-emitter';
 import { TestResultsFormatterService } from '@/services/testing/results/test-results-formatter.service';
 import { TestChatMappingService } from '@/services/testing/shared/test-chat-mapping.service';
@@ -12,7 +16,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
 import { env } from '@/config/environment/env';
 import { AutomationActionService } from '@/services/automation/automation-action.service';
-import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-run.service';
+import { getProjectWorkspaceMemberIds } from '@/services/testing/regression/regression-report-assembler.service';
 import * as crypto from 'crypto';
 
 /**
@@ -845,7 +849,20 @@ export class TestCompletionHandlerService {
    *
    * @param run - Regression run record with test_id or test_ids
    */
-  private static async recomputeRunStatus(run: any): Promise<void> {
+  /**
+   * Public because `StaleReaperService` drives it for orphaned runs. It remains
+   * the single funnel for run finalization + telemetry aggregation (invariant 11).
+   */
+  static async recomputeRunStatus(
+    run: any,
+    options: { suppressSideEffects?: boolean } = {},
+  ): Promise<void> {
+    // `suppressSideEffects` is set by the stale-run reaper: finalizing a
+    // run that's been orphaned for hours/days must NOT fire fresh "run
+    // failed" notifications, automation actions (Jira/Telegram), flaky
+    // retries, or Regression Doctor — those are noise long after the fact.
+    // The DB status update + WS sync (live UI refresh) still happen.
+    const { suppressSideEffects = false } = options;
     try {
       // Prefer unified executions if present (covers UI + API and avoids relying only on tests table)
       const { data: unifiedExecutions, error: execError } = await supabaseAdmin
@@ -892,14 +909,21 @@ export class TestCompletionHandlerService {
                 stuckCount: stillStuck.length,
               });
               const stuckIds = stillStuck.map((e: any) => e.id);
-              await supabaseAdmin
-                .from('test_executions')
-                .update({
-                  status: 'failed',
-                  error_message: 'Execution timed out (stuck for >30 minutes)',
-                  completed_at: new Date().toISOString(),
-                })
-                .in('id', stuckIds);
+              const { error: forceFailError } = await forceFailStuckExecutions(
+                stuckIds,
+                'Execution timed out (stuck for >30 minutes)',
+              );
+
+              if (forceFailError) {
+                // Log but do NOT return — the in-memory statuses remap below is
+                // independent of the DB write. Bailing here would leave the run
+                // in 'running' indefinitely with no future trigger to finalise it.
+                logger.error('[TEST_COMPLETION] Force-fail update failed — execution row may stay dirty', {
+                  runId: run.id,
+                  stuckIds,
+                  error: forceFailError,
+                });
+              }
 
               // Refresh statuses after force-fail
               statuses = (freshExecs || []).map((e: any) => {
@@ -1121,25 +1145,27 @@ export class TestCompletionHandlerService {
             }
           } catch { /* non-fatal */ }
 
-          // Create notification for regression run
-          await this.createRegressionRunNotification(run, finalStatus, summary);
+          if (!suppressSideEffects) {
+            // Create notification for regression run
+            await this.createRegressionRunNotification(run, finalStatus, summary);
 
-          // Fire automation actions for run-level events (non-blocking)
-          AutomationActionService.fireEvent({
-            triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
-            sourceEntityType: 'regression_run',
-            sourceEntityId: run.id,
-            userId: run.user_id,
-            projectId: run.project_id,
-            planId: run.plan_id,
-            eventData: {
-              status: finalStatus,
-              runId: run.id,
-              summary,
-              title: `Regression ${finalStatus}`,
-              message: `${summary.passed}/${summary.total} passed`,
-            },
-          }).catch(() => {});
+            // Fire automation actions for run-level events (non-blocking)
+            AutomationActionService.fireEvent({
+              triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
+              sourceEntityType: 'regression_run',
+              sourceEntityId: run.id,
+              userId: run.user_id,
+              projectId: run.project_id,
+              planId: run.plan_id,
+              eventData: {
+                status: finalStatus,
+                runId: run.id,
+                summary,
+                title: `Regression ${finalStatus}`,
+                message: `${summary.passed}/${summary.total} passed`,
+              },
+            }).catch(() => {});
+          }
         }
 
         return;
@@ -1184,7 +1210,7 @@ export class TestCompletionHandlerService {
       }
 
       // Check if all tests are complete
-      const statuses = tests.map(t => t.status);
+      let statuses = tests.map(t => t.status);
       const hasRunning = statuses.some(s => s === 'running' || s === 'pending');
 
       if (hasRunning) {
@@ -1201,10 +1227,34 @@ export class TestCompletionHandlerService {
           return; // Don't update yet
         }
 
+        // Actually force-fail the stuck `tests` rows — otherwise the status
+        // computation below would treat lingering 'running' as a non-failure
+        // and finalize the run as 'passed' with the rows left dirty. Mirrors
+        // the unified (test_executions) path above.
+        const stuckTestIds = tests
+          .filter(t => t.status === 'running' || t.status === 'pending')
+          .map(t => t.id);
+
         logger.warn('[TEST_COMPLETION] Force-failing stale run with stuck tests', {
           runId: run.id,
-          stuckCount: statuses.filter(s => s === 'running' || s === 'pending').length,
+          stuckCount: stuckTestIds.length,
         });
+
+        const { error: forceFailError } = await forceFailStuckTests(stuckTestIds);
+
+        if (forceFailError) {
+          // Log but don't bail — the in-memory remap below keeps the run
+          // finalization correct even if the row write failed.
+          logger.error('[TEST_COMPLETION] Force-fail of stuck tests failed — rows may stay dirty', {
+            runId: run.id,
+            stuckTestIds,
+            error: forceFailError,
+          });
+        }
+
+        // Reflect the force-fail in the local snapshot so the status
+        // computation below sees them as terminal.
+        statuses = statuses.map(s => (s === 'running' || s === 'pending' ? 'timeout' : s));
       }
 
       // All tests are complete - compute final status
@@ -1290,28 +1340,30 @@ export class TestCompletionHandlerService {
           });
         } catch { /* non-fatal */ }
 
-        // Create notification for regression run
-        await this.createRegressionRunNotification(run, finalStatus, summary);
+        if (!suppressSideEffects) {
+          // Create notification for regression run
+          await this.createRegressionRunNotification(run, finalStatus, summary);
 
-        // Fire automation actions for run-level events (non-blocking)
-        AutomationActionService.fireEvent({
-          triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
-          sourceEntityType: 'regression_run',
-          sourceEntityId: run.id,
-          userId: run.user_id,
-          projectId: run.project_id,
-          planId: run.plan_id,
-          eventData: {
-            status: finalStatus,
-            runId: run.id,
-            summary,
-            title: `Regression ${finalStatus}`,
-            message: `${passed}/${tests.length} passed`,
-          },
-        }).catch(() => {});
+          // Fire automation actions for run-level events (non-blocking)
+          AutomationActionService.fireEvent({
+            triggerEvent: finalStatus === 'passed' ? 'run_passed' : finalStatus === 'failed' ? 'run_failed' : 'run_completed',
+            sourceEntityType: 'regression_run',
+            sourceEntityId: run.id,
+            userId: run.user_id,
+            projectId: run.project_id,
+            planId: run.plan_id,
+            eventData: {
+              status: finalStatus,
+              runId: run.id,
+              summary,
+              title: `Regression ${finalStatus}`,
+              message: `${passed}/${tests.length} passed`,
+            },
+          }).catch(() => {});
+        }
 
         // V14: Auto-retry flaky tests (non-blocking, best-effort)
-        if (finalStatus === 'failed' && run.plan_id) {
+        if (!suppressSideEffects && finalStatus === 'failed' && run.plan_id) {
           this.maybeRetryFlakyTests(run, tests).catch(err => {
             logger.warn('[TEST_COMPLETION] Auto-retry flaky check failed (non-fatal)', {
               runId: run.id,
@@ -1331,7 +1383,7 @@ export class TestCompletionHandlerService {
         // `doctor-${runId}` jobId inside addRegressionDoctorJob — if this
         // hook fires twice (e.g. retry), BullMQ silently rejects the
         // duplicate instead of running the LLM twice.
-        if (finalStatus === 'failed' && failed >= 2) {
+        if (!suppressSideEffects && finalStatus === 'failed' && failed >= 2) {
           this.maybeEnqueueRegressionDoctor(run, failed).catch(err => {
             logger.warn('[TEST_COMPLETION] Failed to enqueue Regression Doctor (non-fatal)', {
               runId: run.id,

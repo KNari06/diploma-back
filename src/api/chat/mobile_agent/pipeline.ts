@@ -31,6 +31,10 @@ import {
   emitMobileToolStep,
   mobileToolProgress,
 } from './progress';
+import {
+  formatMobileSnapshotForChat,
+  type MobileSnapshot,
+} from '@/services/chat/mobile-context.service';
 
 // Upper bound on "LLM → tool dispatch" rounds in a single turn.
 //
@@ -77,14 +81,41 @@ export interface MobileAgentResult {
   durationMs: number;
 }
 
+export interface RunMobileAgentPipelineOpts {
+  abortSignal?: AbortSignal;
+  /**
+   * Phase B2-B4 eager-inject: pre-fetched runner snapshot. When present,
+   * the pipeline pushes it into the system prompt as a second system
+   * message BEFORE the first LLM call — same pattern web uses with
+   * `getPageContext` in `general/handler.ts`. The LLM sees device-fresh
+   * foreground + a11y tree without needing the observe_mobile_page tool
+   * roundtrip.
+   *
+   * Null/undefined = legacy PULL behaviour (LLM must call
+   * observe_mobile_page if it wants to see the screen). The tool stays
+   * available either way; this only controls whether the pre-fetch
+   * fires.
+   */
+  snapshot?: MobileSnapshot | null;
+}
+
 export async function runMobileAgentPipeline(
   blackboard: MobileBlackboard,
-  opts?: { abortSignal?: AbortSignal },
+  opts?: RunMobileAgentPipelineOpts,
 ): Promise<MobileAgentResult> {
   const startedAt = Date.now();
 
+  // Eager-inject the runner snapshot as a SECOND system message when
+  // the handler pre-fetched it. We put it AFTER the base system prompt
+  // so the agent's identity / tool guidance always lands first, then
+  // the situational "here's what's on the screen right now" context.
+  // The order matters for prompt-cache hits — the static base prompt
+  // stays at index 0, only index 1 changes per turn.
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: buildMobileAgentSystemPrompt() },
+    ...(opts?.snapshot
+      ? [{ role: 'system' as const, content: formatMobileSnapshotForChat(opts.snapshot) }]
+      : []),
     { role: 'user', content: blackboard.goal },
   ];
 
@@ -239,6 +270,42 @@ export async function runMobileAgentPipeline(
         tool_call_id: tc.id,
         content: safeResult.content,
       });
+
+      // Phase B5: `take_screenshot` returns the captured PNG as base64 in
+      // `data.screenshotBase64`, but the OpenAI tool-message protocol only
+      // accepts text content. To actually let the LLM see the pixels, we
+      // emit a follow-up `user` message with a multimodal content array
+      // (text + image_url). Vision-capable models (gpt-4o, gpt-4.1) read
+      // both parts; non-vision models silently ignore the image part and
+      // still get the text breadcrumb.
+      //
+      // Failure paths (budget exceeded, runner returned no screenshot,
+      // network error) leave `data` either undefined or without
+      // `screenshotBase64`, so this branch never fires on the unhappy
+      // path — the `tool` message above already explained what happened.
+      const screenshotData = safeResult.data as { screenshotBase64?: string; capturedAt?: string } | undefined;
+      if (safeResult.ok && screenshotData?.screenshotBase64) {
+        messages.push({
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `[Screenshot attached from take_screenshot at ${screenshotData.capturedAt ?? 'now'}]`,
+            },
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:image/png;base64,${screenshotData.screenshotBase64}`,
+                // "low" detail keeps cost predictable — ~85 tokens vs
+                // ~1500-3000 for "high". The screenshot tool exists for
+                // quick visual sanity checks, not pixel-perfect inspection;
+                // bumping to "high" would defeat the per-turn budget guard.
+                detail: 'low',
+              },
+            },
+          ],
+        });
+      }
     }
     // Loop: next LLM round will see the tool results and either answer
     // directly or call another tool.

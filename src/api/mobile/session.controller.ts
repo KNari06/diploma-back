@@ -14,8 +14,10 @@
 import { env } from '@/config/environment/env';
 import { redisConnection } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import type { MobileIntentActionType, MobilePlatform } from '@/services/mobile/mobile-runner.types';
 import { ProjectService } from '@/services/core/project.service';
+import { getProjectMobileApp } from '@/services/mobile/project-mobile-app.helper';
 import { EditorTraceService } from '@/services/testing/ui/preview/editor-trace.service';
 import { refreshIdle, cancelIdle } from '@/services/mobile/mobile-idle.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
@@ -196,6 +198,15 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
   const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  // Flutter sessions are created as a NATIVE android session first, then
+  // upgraded via `attachFlutter` (install → launch → VM Service detect).
+  // The runner's direct `createSession('flutter')` probes the VM Service
+  // before the app is installed (chicken-and-egg → always fails), and the
+  // pool never warms 'flutter' anyway. So we always ask the runner for
+  // 'android' and keep `platform` ('flutter') only as the logical label
+  // stored in Redis + returned to the frontend.
+  const isFlutter = platform === 'flutter';
+  const sessionCreatePlatform: MobilePlatform = isFlutter ? 'android' : platform;
 
   // Phase 2.6: validate `deviceSelector` if present. Inline validator to
   // match this file's existing style (no zod). Rejects malformed selectors
@@ -229,6 +240,24 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       source: sel.source as 'local-emulator' | 'local-physical' | 'cloud' | undefined,
       serial: typeof sel.serial === 'string' ? sel.serial : undefined,
     };
+  }
+
+  // iOS-specific default: when the frontend doesn't pin a deviceSelector,
+  // assume simulator. Why this is here and not at the runner: the runner's
+  // default-source policy can flip to 'local-physical' when an iPhone is
+  // hotplugged via USB (the iOS device watcher reports it). For a *create-
+  // test* warmup that's never what the user wants — they want a fresh
+  // simulator. Backend is the right layer to disambiguate because it's the
+  // first stop where we know "this is a warmup, not a debug-physical-device
+  // session". Android is left alone (the Android default already lands on
+  // an emulator). Physical-iOS callers must pin `source: 'local-physical'`
+  // explicitly; this default never overrides that.
+  if (platform === 'ios' && deviceSelector === undefined) {
+    deviceSelector = { source: 'local-emulator' };
+    logger.debug('[MOBILE_SESSION] defaulting iOS deviceSelector to local-emulator', {
+      userId,
+      projectId,
+    });
   }
 
   logger.info('[MOBILE_SESSION] warmup request', {
@@ -400,9 +429,38 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // that the runner's TTL/unplug-watchdog will reap anyway.
           await redisConnection.del(redisKey);
           try {
-            await client.destroySession(existing.sessionId);
+            await client.destroySession(existing.sessionId, { userId });
           } catch (err) {
             logger.warn('[MOBILE_SESSION] destroySession during selector-switch failed (non-fatal)', {
+              sessionId: existing.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+          // Fall through to create a new session below
+        } else if (existing.platform !== platform) {
+          // Platform mismatch — the cached session's platform must match the
+          // requested one, in BOTH directions:
+          //   - Flutter request, non-flutter cached: a plain android/ios
+          //     session has no Dart VM Service connection.
+          //   - Non-flutter request, flutter cached: a flutter session
+          //     (android host upgraded via attachFlutter) reports
+          //     platform='flutter' and must NOT be handed to an android/ios
+          //     run. (The earlier one-directional check missed this case and
+          //     reused a flutter session for an android request.)
+          // Invalidate and fall through to a fresh create. For flutter the
+          // create path does android → install → attachFlutter.
+          logger.info('[MOBILE_SESSION] Cached session platform mismatch — recreating', {
+            projectId,
+            userId,
+            staleSessionId: existing.sessionId,
+            cachedPlatform: existing.platform,
+            requestedPlatform: platform,
+          });
+          await redisConnection.del(redisKey);
+          try {
+            await client.destroySession(existing.sessionId, { userId });
+          } catch (err) {
+            logger.warn('[MOBILE_SESSION] destroySession during flutter-mismatch invalidation failed (non-fatal)', {
               sessionId: existing.sessionId,
               error: err instanceof Error ? err.message : String(err),
             });
@@ -419,22 +477,29 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // the app already open. On a reused session this usually hits the fast
           // path (Redis match or device check) and just issues launch_app.
           emitWarmupProgress(userId, 'launching_browser', 15);
-          try {
-            await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
-              client,
-              sessionId: existing.sessionId,
-              projectId,
-              userId,
-              appPackage,
-              skipLaunch: !prelaunch,
-              onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
-            }));
-          } catch (err) {
-            logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
-              sessionId: existing.sessionId,
-              projectId,
-              error: err instanceof Error ? err.message : String(err),
-            });
+          // Skip re-prep for a reused Flutter session: it's already a live,
+          // attached Flutter session (app installed + running + VM Service
+          // connected). Re-running install/launch here would reinstall over
+          // the running app and tear down the FlutterClient connection.
+          if (!isFlutter) {
+            try {
+              await time('prep_app_reuse', () => MobileAppPrepService.prepApp({
+                client,
+                sessionId: existing.sessionId,
+                projectId,
+                userId,
+                appPackage,
+                platform,
+                skipLaunch: !prelaunch,
+                onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
+              }));
+            } catch (err) {
+              logger.warn('[MOBILE_SESSION] App install/launch on reused session failed (non-fatal)', {
+                sessionId: existing.sessionId,
+                projectId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
           emitWarmupProgress(userId, 'ready', 100);
 
@@ -503,13 +568,14 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         projectId,
         deviceSelector,
       });
-      session = await time('create_session_pinned', () => client.createSession(platform, {
+      session = await time('create_session_pinned', () => client.createSession(sessionCreatePlatform, {
         ownerId: effectiveOwnerId,
         deviceSelector,
+        userId,
       }));
     } else {
       try {
-        session = await time('pool_claim', () => client.claimSession(platform, { ownerId: effectiveOwnerId }));
+        session = await time('pool_claim', () => client.claimSession(sessionCreatePlatform, { ownerId: effectiveOwnerId, userId }));
         logger.info('[MOBILE_SESSION] Pool session claimed for warmup', {
           projectId,
           sessionId: session.sessionId,
@@ -522,9 +588,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           projectId,
           error: poolErr instanceof Error ? poolErr.message : String(poolErr),
         });
-        session = await time('create_session_cold', () => client.createSession(platform, {
+        session = await time('create_session_cold', () => client.createSession(sessionCreatePlatform, {
           ownerId: effectiveOwnerId,
           deviceSelector,
+          userId,
         }));
       }
     }
@@ -581,14 +648,19 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     // Install the project's mobile app and run launch_app BEFORE returning, so the
     // preview stream shows the app already open when the frontend connects.
     // Non-fatal: on failure we still return the session so the user can retry.
+    // For Flutter we install but DON'T launch here — `attachFlutter` below
+    // clears logcat and launches so the one-time VM Service log line is
+    // inside the detection window.
+    let preppedPackage: string | undefined;
     try {
-      await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
+      preppedPackage = await time('prep_app_fresh', () => MobileAppPrepService.prepApp({
         client,
         sessionId: session.sessionId,
         projectId,
         userId,
         appPackage,
-        skipLaunch: !prelaunch,
+        platform,
+        skipLaunch: isFlutter ? true : !prelaunch,
         onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
       }));
     } catch (err) {
@@ -597,6 +669,46 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         projectId,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    // Flutter: upgrade the native session into a Flutter session (launch →
+    // VM Service detect → connect). FATAL — a Flutter test can't run without
+    // the driver connection, and the runner destroys the native session on
+    // failure, so drop the Redis pointer and surface the runner's status
+    // (422 FLUTTER_NOT_DETECTED when the build isn't debug/profile).
+    if (isFlutter) {
+      const flutterPackage = appPackage || preppedPackage;
+      if (!flutterPackage) {
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        res.status(400).json({
+          success: false,
+          error: 'No mobile app uploaded for this project — cannot start a Flutter session.',
+        });
+        return;
+      }
+      try {
+        await time('attach_flutter', () => client.attachFlutter(
+          session.sessionId,
+          { packageName: flutterPackage },
+          { userId },
+        ));
+      } catch (err) {
+        await redisConnection.del(`${WARMUP_PREFIX}${projectId}:${userId}`).catch(() => {});
+        const status = (err instanceof MobileRunnerError && err.statusCode) ? err.statusCode : 500;
+        logger.warn('[MOBILE_SESSION] Flutter attach failed during warmup', {
+          sessionId: session.sessionId,
+          projectId,
+          userId,
+          status,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        res.status(status).json({
+          success: false,
+          error: err instanceof Error ? err.message : 'Flutter attach failed',
+          ...(err instanceof MobileRunnerError ? { code: err.code } : {}),
+        });
+        return;
+      }
     }
     emitWarmupProgress(userId, 'ready', 100);
 
@@ -660,7 +772,7 @@ export async function destroySession(req: Request, res: Response): Promise<void>
     // Destroy on runner
     const client = getMobileRunnerClient();
     try {
-      await client.destroySession(sessionId);
+      await client.destroySession(sessionId, { userId });
     } catch (err) {
       // Session may already be expired/destroyed on runner — non-fatal
       logger.warn('[MOBILE_SESSION] Runner destroy returned error (may be expired)', {
@@ -726,7 +838,7 @@ export async function tapSession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'tap', params: { x: Math.round(x), y: Math.round(y) }, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Tap failed', {
@@ -792,7 +904,7 @@ export async function swipeSession(req: Request, res: Response): Promise<void> {
         },
         _skipWait: true,
       },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Swipe failed', {
@@ -828,7 +940,7 @@ export async function goHomeSession(req: Request, res: Response): Promise<void> 
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'go_home', params: {}, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Go home failed', {
@@ -864,7 +976,7 @@ export async function goBackSession(req: Request, res: Response): Promise<void> 
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'go_back', params: {}, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Go back failed', {
@@ -907,7 +1019,7 @@ export async function typeSession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'type_text', params: { text }, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Type text failed', {
@@ -950,7 +1062,7 @@ export async function keySession(req: Request, res: Response): Promise<void> {
     const client = getMobileRunnerClient();
     await client.executeBatchCommands(sessionId, [
       { type: 'press_key', params: { keycode }, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Key press failed', {
@@ -994,7 +1106,7 @@ export async function commandSession(req: Request, res: Response): Promise<void>
     const client = getMobileRunnerClient();
     const result = await client.executeBatchCommands(sessionId, [
       { type, params: params ?? {}, _skipWait: true },
-    ], { interactive: true });
+    ], { interactive: true, userId: req.user.id });
     res.json({ success: true, data: result?.results?.[0] });
   } catch (error) {
     logger.warn('[MOBILE_SESSION] Command failed', {
@@ -1117,7 +1229,7 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
 
     // Use the dedicated lint endpoint — fast, non-destructive, returns bounding box.
     // This replaces the old runSteps(assert_visible) approach which was 3-5x slower.
-    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints);
+    const lintResult = await client.lintElement(sessionId, description, actionType, bindingHints, { userId: req.user.id });
 
     // Log the result for debugging element resolution issues
     trace.writeMobileLintResult({
@@ -1133,6 +1245,9 @@ export async function lintSession(req: Request, res: Response): Promise<void> {
         elementType: lintResult.elementType,
         boundingBox: lintResult.boundingBox,
         message: lintResult.message,
+        visibleNodeCount: lintResult.visibleNodeCount,
+        topNodes: lintResult.topNodes,
+        intentWords: lintResult.intentWords,
       },
     });
 
@@ -1387,9 +1502,15 @@ export async function autoBootAndInstall(
     const client = getMobileRunnerClient();
     const redisKey = `${WARMUP_PREFIX}${projectId}:${userId}`;
 
-    // Load app so we know which storagePath to pend if we fail early
+    // Load app so we know which storagePath to pend if we fail early.
+    // Reads the platform-sharded slot when available so an Android+iOS
+    // dual-platform project pends the correct binary instead of always
+    // the legacy singular one (which is whatever was uploaded last).
     const project = await ProjectService.getProject(projectId, userId);
-    const appStoragePath = project?.settings?.mobileApp?.storagePath;
+    const projectAppForPend = getProjectMobileApp(project?.settings, platform);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const legacyApp = (project?.settings as any)?.mobileApp;
+    const appStoragePath = projectAppForPend?.storagePath ?? legacyApp?.storagePath;
 
     // Check for existing session
     let sessionId: string | null = null;
@@ -1433,7 +1554,7 @@ export async function autoBootAndInstall(
       await redisConnection.set(redisKey, JSON.stringify(bootingData), 'EX', WARMUP_TTL);
 
       const autoBootOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
-      const session = await client.createSession(platform, { ownerId: autoBootOwnerId });
+      const session = await client.createSession(platform, { ownerId: autoBootOwnerId, userId });
       sessionId = session.sessionId;
 
       // Update Redis with the real session ID
@@ -1460,6 +1581,7 @@ export async function autoBootAndInstall(
       sessionId,
       projectId,
       userId,
+      platform,
       skipLaunch: true,
       onProgress: (stage, progress) => emitWarmupProgress(userId, stage, progress),
     });
@@ -1488,7 +1610,7 @@ export async function autoBootAndInstall(
         await client.executeBatchCommands(sessionId, [
           { type: 'close_app', params: { packageName: installedPackage, hard: true } },
           { type: 'launch_app', params: { packageName: installedPackage } },
-        ], { timeoutMs: 60_000 });
+        ], { timeoutMs: 60_000, userId });
         logger.info('[MOBILE_AUTO_BOOT] App wiped + launched on warmup', {
           projectId,
           sessionId,
@@ -1521,9 +1643,18 @@ export async function autoBootAndInstall(
     logger.error('[MOBILE_AUTO_BOOT] Failed', { projectId, userId, error: message });
 
     // Mark APK as pending so the next warmup re-attempts the install.
+    // CRITICAL: read the platform-sharded slot, not the legacy singular
+    // one. The legacy slot mirrors the latest upload across all
+    // platforms, so on a dual-platform project this could point at the
+    // wrong-platform binary — pending-install would then force-install
+    // an .apk on an iOS session (or vice versa) on the next warmup.
     try {
       const project = await ProjectService.getProject(projectId, userId);
-      await setPendingInstall(project?.settings?.mobileApp?.storagePath);
+      const shardedApp = getProjectMobileApp(project?.settings, platform);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const legacyApp = (project?.settings as any)?.mobileApp;
+      const pendingPath = shardedApp?.storagePath ?? legacyApp?.storagePath;
+      await setPendingInstall(pendingPath);
     } catch { /* best-effort */ }
 
     // Clean up the _booting placeholder so warmup doesn't wait forever
@@ -1774,7 +1905,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         // Only for steps WITHOUT a compiled plan (first run / manual adds).
         if (!hasCompiled && description && LINT_TYPES.has(rawType)) {
           const lintActionType = ACTION_TYPE_MAP[rawType] || 'tap';
-          const lintResult = await client.lintElement(sessionId, description, lintActionType);
+          const lintResult = await client.lintElement(sessionId, description, lintActionType, undefined, { userId });
 
           if (lintResult.status === 'resolved' && lintResult.boundingBox) {
             const bb = lintResult.boundingBox;
@@ -1827,7 +1958,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
               commands.push({ type: RAW_CMD_MAP[rawType] || 'tap', params: { ...coordParams } });
             }
 
-            await client.executeBatchCommands(sessionId, commands);
+            await client.executeBatchCommands(sessionId, commands, { userId });
             const durationMs = Date.now() - stepStart;
             stepResults.push({ stepId: step.id, success: true, durationMs });
             passedSteps++;
@@ -1859,6 +1990,7 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
         const result = await client.runSteps(sessionId, [intentStep], {
           screenshotEachStep: true,
           stopOnFailure: true,
+          userId,
         });
 
         const stepResult = result.steps?.[0];

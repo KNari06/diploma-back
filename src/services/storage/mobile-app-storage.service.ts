@@ -11,6 +11,7 @@
 import { supabaseAdmin } from '@/db/supabase';
 import { env } from '@/config/environment/env';
 import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
+import { detectBuildInfoFromBuffer } from '@/services/mobile/archive-platform-detect';
 import { logger } from '@/utils/core/logger';
 import path from 'path';
 
@@ -34,6 +35,36 @@ export interface MobileAppMetadata {
   versionName?: string;
   /** Integer build code (Android versionCode / iOS CFBundleVersion). */
   versionCode?: number;
+  /**
+   * Framework detected from the archive itself (`flutter` / `react-native` /
+   * `android` / `ios`). Stamped at upload time by the ZIP-CD inspector so
+   * the editor + runner can route accordingly even when `platform` was
+   * filled from the file-extension heuristic. `undefined` only when the
+   * archive predates this feature or detection failed.
+   */
+  detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
+  /**
+   * Flutter build flavor inferred from archive contents:
+   *   - `'debug'` — kernel_blob.bin present; JIT VM; driver extension wireable.
+   *   - `'aot'`   — profile or release (not distinguishable statically).
+   * Only set when `detectedFramework === 'flutter'`.
+   */
+  flutterBuildMode?: 'debug' | 'aot';
+  /**
+   * `android:debuggable` flag from AndroidManifest.xml. True signals a
+   * debug build on the Android side. Orthogonal to `flutterBuildMode`.
+   */
+  debuggable?: boolean;
+  /**
+   * Result of the last user-triggered enableFlutterDriverExtension probe.
+   * Persisted so the Settings UI can show the verdict across reloads
+   * without re-running the runner round-trip.
+   */
+  driverExtensionDetected?: 'detected' | 'not_detected' | 'error';
+  /** Short human-readable reason for the verdict above. */
+  driverExtensionDetail?: string;
+  /** ISO timestamp of the probe that produced the verdict. */
+  driverExtensionDetectedAt?: string;
 }
 
 /**
@@ -183,6 +214,19 @@ export class MobileAppStorageService {
       .from(BUCKET)
       .getPublicUrl(storagePath);
 
+    // Run framework + Flutter-build-mode detection on the in-memory buffer
+    // BEFORE building the metadata. We do it here (inside uploadApp) so the
+    // CI upload-from-URL path gets the same `detectedFramework` /
+    // `flutterBuildMode` stamp that the signed-URL + finalize flow produces
+    // — with ZERO extra I/O (the buffer is already in memory) — without
+    // forcing every caller to wire detection by hand. Detection is hard-
+    // contract non-throwing, so any failure just leaves the fields unset.
+    const buildInfo = file.buffer
+      ? await detectBuildInfoFromBuffer(file.buffer, file.originalname)
+      : undefined;
+    const detectedFramework = buildInfo?.framework;
+    const flutterBuildMode = buildInfo?.flutterBuildMode;
+
     const metadata: MobileAppMetadata = {
       platform,
       packageName,
@@ -191,6 +235,8 @@ export class MobileAppStorageService {
       originalName: file.originalname,
       fileSize: file.size,
       uploadedAt: new Date().toISOString(),
+      ...(detectedFramework ? { detectedFramework } : {}),
+      ...(flutterBuildMode ? { flutterBuildMode } : {}),
     };
 
     logger.info('[MOBILE_APP_STORAGE] Upload successful', {
@@ -317,6 +363,9 @@ export class MobileAppStorageService {
     fileSize: number;
     versionName?: string;
     versionCode?: number;
+    detectedFramework?: 'android' | 'ios' | 'flutter' | 'react-native';
+    flutterBuildMode?: 'debug' | 'aot';
+    debuggable?: boolean;
   }): MobileAppMetadata {
     const { data: urlData } = supabaseAdmin.storage
       .from(BUCKET)
@@ -332,6 +381,9 @@ export class MobileAppStorageService {
       uploadedAt: new Date().toISOString(),
       ...(params.versionName ? { versionName: params.versionName } : {}),
       ...(typeof params.versionCode === 'number' ? { versionCode: params.versionCode } : {}),
+      ...(params.detectedFramework ? { detectedFramework: params.detectedFramework } : {}),
+      ...(params.flutterBuildMode ? { flutterBuildMode: params.flutterBuildMode } : {}),
+      ...(typeof params.debuggable === 'boolean' ? { debuggable: params.debuggable } : {}),
     };
   }
 
