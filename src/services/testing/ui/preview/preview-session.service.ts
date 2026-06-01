@@ -3762,6 +3762,41 @@ export class PreviewSessionService {
   }
 
   /**
+   * Open a new tab and navigate it to `url`. The new page is created in the
+   * session's BrowserContext, so `attachPopupHandler` (context.on('page'))
+   * adopts it automatically — pushes it to `session.pages`, makes it active,
+   * restarts the screencast and emits `preview:tab:opened`. We just wait
+   * briefly for that adoption so the caller's follow-up reads see the new page.
+   *
+   * A URL is REQUIRED: a tab left at about:blank is auto-closed by
+   * `attachPopupHandler`'s blank-popup guard, so an empty open is a no-op.
+   */
+  async openTab(sessionId: string, userId: string, url?: string): Promise<boolean> {
+    const session = this.getAuthorizedSession(sessionId, userId);
+    if (!session) return false;
+
+    const target = (url || '').trim();
+    if (!target) {
+      logger.warn('[PREVIEW_SESSION] openTab: missing URL — skipping (blank tabs are auto-closed)', { sessionId });
+      return false;
+    }
+
+    const { openHrefInNewTab } = await import('./new-tab-opener');
+    const result = await openHrefInNewTab(session.context, target, 'programmatic');
+    if (!result) return false;
+
+    // attachPopupHandler runs concurrently on the 'page' event. Wait (≤2s) for
+    // it to finish adopting the new page so getPage() returns the right tab.
+    const newPage = result.newPage;
+    for (let i = 0; i < 20; i++) {
+      if (session.pages.includes(newPage) && session.page === newPage) return true;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    // Adoption lagged but the page exists and will be adopted — report success.
+    return true;
+  }
+
+  /**
    * Get tab info list for frontend.
    */
   getTabsInfo(sessionId: string, userId?: string): import('./preview.types').PreviewTabInfo[] {

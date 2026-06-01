@@ -732,7 +732,7 @@ export class IntentStepLintService {
       const domNodes = snapshot.domNodes ?? [];
 
       // Non-targeting actions — page-level steps that don't target a specific DOM element
-      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
         return {
           status: 'resolved',
           message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1033,7 +1033,7 @@ export class IntentStepLintService {
     });
 
     // Non-targeting actions don't need element resolution
-    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab'].includes(stepDraft.type)) {
+    if (['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
       return {
         status: 'resolved',
         message: `Action "${stepDraft.type}" does not require element targeting`,
@@ -1129,7 +1129,7 @@ export class IntentStepLintService {
     //   - Hash routing: normalizer strips hash. Known limitation, same as
     //     evidence-shortcut.
     // ═══════════════════════════════════════════════════════════════════════════
-    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'wait_for_email']);
+    const NON_TARGETING_FOR_URL_GUARD = new Set(['navigate', 'wait', 'wait_for', 'ai_check', 'scroll', 'switch_tab', 'close_tab', 'open_tab', 'wait_for_email']);
     if (!NON_TARGETING_FOR_URL_GUARD.has(stepDraft.type)) {
       // Priority order matters. `evidence.pageUrl` is set by the recorder at
       // capture time (the URL the user was actually on when they clicked) and

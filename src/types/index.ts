@@ -1075,6 +1075,10 @@ export type PlaywrightActionType =
   | 'press'             // Press keyboard key
   | 'focus'             // Focus element
   | 'blur'              // Blur element
+  // Multi-tab
+  | 'switchTab'         // Switch active tab by index
+  | 'closeTab'          // Close tab by index
+  | 'openTab'           // Open a new tab and navigate it to a URL
   // Touch/Mobile
   | 'dragAndDrop'       // Drag and drop element
   | 'swipe'             // Swipe gesture (mobile)
