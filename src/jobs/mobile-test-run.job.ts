@@ -38,6 +38,8 @@ import { sumStepDurations } from './helpers/telemetry';
 import { classifyStepResults } from '@/utils/testing/step-result-classifier';
 import { CompiledPlanPersistenceService } from '@/services/testing/ui/preview/compiled-plan-persistence.service';
 import { MobileSessionAcquisitionService } from '@/services/mobile/session-acquisition.service';
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
+import type { TestStepCompletedPayload } from '@/websocket/types/types';
 import { FastAuthOrchestratorService } from '@/services/mobile/fast-auth-orchestrator.service';
 
 // ============================================================================
@@ -798,7 +800,10 @@ export class MobileTestRunJobHandler {
               : isSoftFailure
                 ? 'soft-failed'
                 : 'failed';
-          webSocketService.emitTestStepCompleted(testId, {
+          // Persist to the Redis buffer in-process (the worker owns step
+          // persistence), then broadcast. The job's finally drains this buffer
+          // via finalizeToDb — no cross-process append round-trip.
+          const mobileStepEvent: TestStepCompletedPayload = {
             testId,
             browser,
             step: i + 1,
@@ -830,7 +835,9 @@ export class MobileTestRunJobHandler {
                 ? { warnings: stepResult.warnings }
                 : {}),
             },
-          });
+          };
+          await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);
+          webSocketService.emitTestStepCompleted(testId, mobileStepEvent);
         } catch { /* non-fatal */ }
       }
 
@@ -1173,6 +1180,18 @@ export class MobileTestRunJobHandler {
       // failures still produce partial-but-honest analytics.
       if (testId) {
         await MobileTestRunJobHandler.persistTelemetrySnapshot(testId, tlm);
+      }
+
+      // ── Persist executed steps from Redis → tests.executed_steps ──
+      // The worker owns the completed run, so it drains its own step buffer
+      // here rather than relying on the main API process reacting to the
+      // pub/sub `test:completed` event (that reactive finalize never runs
+      // when the API process isn't subscribed, stranding steps in Redis and
+      // leaving the run report with no step timeline). Mobile emits per-step
+      // events via `emitTestStepCompleted` the same way web does. Idempotent
+      // (distributed lock) and best-effort (never throws).
+      if (testId) {
+        await TestExecutedStepsRedisService.finalizeToDb(testId);
       }
 
       // ── Cleanup: release pooled session or destroy adhoc/warmed ──

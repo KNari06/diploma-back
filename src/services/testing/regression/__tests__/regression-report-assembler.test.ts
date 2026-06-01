@@ -198,6 +198,35 @@ describe('RegressionReportAssemblerService.assembleReport', () => {
     expect(report.executions[0].priority).toBeNull();
   });
 
+  it('collapses duplicate step indices (retry / double-append), keeping the last event', async () => {
+    // The Redis buffer accumulates every attempt's steps in order. A retried
+    // run (or a transient worker/API double-append during deploy) leaves two
+    // events for the same step index. The report must show one step per index,
+    // reflecting the FINAL attempt's outcome — not a doubled timeline.
+    mockGetByRunId.mockResolvedValue([makeExec()]);
+    mockGetTestCaseNames.mockResolvedValue([{ id: 'tc-1', name: 'Login' }]);
+    mockGetExecutedSteps.mockResolvedValue([
+      {
+        id: 'test-1',
+        executed_steps: [
+          // attempt 0 — both steps failed
+          { type: 'step_completed', data: { success: false, step: 0, stepDescription: 'open (a0)' } },
+          { type: 'step_completed', data: { success: false, step: 1, stepDescription: 'click (a0)' } },
+          // attempt 1 (retry) — both passed
+          { type: 'step_completed', data: { success: true, step: 0, stepDescription: 'open (a1)' } },
+          { type: 'step_completed', data: { success: true, step: 1, stepDescription: 'click (a1)' } },
+        ],
+      },
+    ]);
+
+    const report = await RegressionReportAssemblerService.assembleReport({ ...baseRun });
+
+    const steps = report.executions[0].steps;
+    expect(steps).toHaveLength(2); // not 4
+    expect(steps.map((s) => s.description)).toEqual(['open (a1)', 'click (a1)']);
+    expect(steps.map((s) => s.status)).toEqual(['passed', 'passed']); // final attempt wins
+  });
+
   it('splits negative executions into a separate negativeSummary', async () => {
     mockGetStats.mockResolvedValue(makeStats({ total: 2, passed: 1, failed: 1 }));
     mockGetByRunId.mockResolvedValue([

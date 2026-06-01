@@ -260,7 +260,21 @@ export class RegressionReportAssemblerService {
       if (testId && exec.testType === 'ui') {
         // Build steps
         const rawSteps = executedStepsMap.get(testId) || [];
-        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        const allCompletedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        // Collapse by step index, keeping the LAST event per index. The Redis
+        // buffer accumulates every attempt's steps in order (attempt 0, then
+        // attempt 1 on retry), and — during a worker/API mixed-version deploy —
+        // a step can be appended twice. Keeping the last occurrence per step
+        // index yields the final attempt's outcome and a single, un-doubled
+        // timeline. A Map preserves first-seen position, so steps stay ordered
+        // 0..n and the phase indexing below stays aligned. Events without a
+        // numeric step index keep a positional key so they are never merged.
+        const byStepIndex = new Map<string, any>();
+        allCompletedSteps.forEach((s: any, i: number) => {
+          const key = typeof s.data?.step === 'number' ? `step-${s.data.step}` : `pos-${i}`;
+          byStepIndex.set(key, s);
+        });
+        const completedSteps = [...byStepIndex.values()];
         // Reconstruct phase from the test case's setup_steps / steps_json /
         // teardown_steps counts. Indexed by executed-step position so as
         // long as the executor fires step_completed events in order (it does),

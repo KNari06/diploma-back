@@ -3,6 +3,7 @@ import { env } from '@/config/environment/env';
 import { QueueManager } from '@/config/infrastructure/queues';
 import { dbAdminService } from '@/db/supabase';
 import { resolveTestCasePriorityForTestId } from '@/services/testing/regression/resolve-test-case-priority.util';
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { AgentResponse, TestJobData } from '@/types';
 import { calculateRetryDelay, handleAgentError, shouldRetry } from '@/utils/core/error-handler';
 import { logQueueEvent, logger } from '@/utils/core/logger';
@@ -336,6 +337,15 @@ export class ManualTestRunJobHandler {
       await this.sendFailureNotification(testId, error);
 
       throw handleAgentError(error as Error);
+    } finally {
+      // Persist executed steps from the Redis buffer to `tests.executed_steps`.
+      // The worker owns the completed run, so it must drain its own buffer here
+      // rather than relying on the main API process reacting to the pub/sub
+      // `test:completed` event — that reactive finalize never runs when the API
+      // process isn't subscribed, stranding steps in Redis until TTL and leaving
+      // the run report with no step timeline. Idempotent (distributed lock), so
+      // it's safe alongside the main-process call; best-effort (never throws).
+      await TestExecutedStepsRedisService.finalizeToDb(testId);
     }
   }
 
