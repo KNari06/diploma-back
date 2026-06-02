@@ -403,11 +403,15 @@ export class TestCompletionHandlerService {
     try {
       const testId = test.id;
 
+      // `timeout` maps to `failed`: the `test_executions.status` CHECK
+      // constraint has no `timeout` value, and nothing downstream distinguishes
+      // a timeout from a failure (every consumer groups them). Mapping to
+      // `timeout` here raised a 23514 constraint violation and left the run dirty.
       const mappedStatus =
         test.status === 'completed'
           ? 'passed'
           : test.status === 'timeout'
-            ? 'timeout'
+            ? 'failed'
             : test.status === 'failed'
               ? 'failed'
               : test.status === 'cancelled'
