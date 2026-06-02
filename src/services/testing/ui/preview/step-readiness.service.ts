@@ -166,6 +166,8 @@ const NON_TARGETING_ACTIONS: Set<IntentActionType> = new Set([
   'dialog',          // V14: Pre-installs handler, no element target
   'download',        // V14: Waits for download event, no element target
   'switch_tab',      // V15: Tab switch, no element target
+  'close_tab',       // Tab close, no element target
+  'open_tab',        // Tab open (new page + goto), no element target
 ]);
 
 /**

@@ -376,6 +376,10 @@ export type IntentActionType =
   // the same tabIndex; if it's already gone the step soft-succeeds (the
   // intent — "this tab should not exist anymore" — is already true).
   | 'close_tab'
+  // Multi-tab — open a new tab and navigate it to a URL. The new tab becomes
+  // active (matches popup adoption). Requires a URL: a tab left at about:blank
+  // is auto-closed by `attachPopupHandler`. URL travels in `step.value`.
+  | 'open_tab'
   // V16: Gesture and coordinate actions (carousels, canvas, maps)
   | 'swipe'
   | 'click_at'

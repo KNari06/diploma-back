@@ -163,6 +163,12 @@ The hot path — called by recording handlers, apply/run, lint, periodic DOM tic
 - **Side-effects:** closes the page, removes from `pages`. If was active, switches to adjacent tab and triggers `onPageSwitch`.
 - **Invariant:** at least one tab always remains open; closing the last tab returns `false`.
 
+### `openTab(sessionId, userId, url?): Promise<boolean>`
+
+- **Side-effects:** opens a new page in the session context via [`new-tab-opener.openHrefInNewTab`](../new-tab-opener.ts) (reason `'programmatic'`); `attachPopupHandler` adopts it (push to `pages`, make active, restart screencast, emit `preview:tab:opened`). Waits ≤2s for adoption.
+- **Invariant:** a URL is **required** — a tab left at `about:blank` is auto-closed by the popup handler's blank guard, so an empty URL returns `false`.
+- Backs the `open_tab` step type (live apply branch in [preview-step-apply.service.ts](../preview-step-apply.service.ts); replay via `openTab` action in [command-executor.ts](../../../../../agent/execution/command-executor.ts)).
+
 ### `executeMouseAction({ sessionId, userId, action, x, y, button?, clickCount? })`
 
 - WS `preview:mouse:click` / `:down` / `:up`. (Move events are coalesced in the handler before reaching this method.)
@@ -224,6 +230,8 @@ The hot path — called by recording handlers, apply/run, lint, periodic DOM tic
 - `BrowserContext` may have multiple pages. Popups (window.open / `target=_blank`) auto-added via `context.on('page')`.
 - `switchTab` swaps active page, invalidates snapshot, fires `onPageSwitch` callback (video/devtools follow).
 - `closeTab` prevents closing the last remaining tab.
+- `openTab` creates a new page + navigates it (programmatic); adoption goes through the same `context.on('page')` path as popups.
+- The `switch_tab` / `close_tab` / `open_tab` step types drive these three methods on the live-apply path and are surfaced in the editor's step picker (web + desktop).
 
 ## Native dialogs
 
