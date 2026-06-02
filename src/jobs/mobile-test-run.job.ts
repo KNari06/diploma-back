@@ -765,6 +765,14 @@ export class MobileTestRunJobHandler {
         });
       }
 
+      // Human-readable step labels: the runner returns per-step results keyed
+      // by `stepId`, but only the original `intentSteps` carry the authored
+      // `description` ("Click Login button", "Email input"). Map id → description
+      // so the WS event below shows a meaningful name instead of the raw UUID.
+      const stepDescriptionById = new Map(
+        intentSteps.map((s) => [s.id, s.description]),
+      );
+
       // Emit step-level progress
       for (let i = 0; i < runResult.steps.length; i++) {
         const stepResult = runResult.steps[i];
@@ -804,7 +812,8 @@ export class MobileTestRunJobHandler {
             testId,
             browser,
             step: i + 1,
-            stepDescription: `Step: ${stepResult.stepId}`,
+            stepDescription:
+              stepDescriptionById.get(stepResult.stepId) || `Step: ${stepResult.stepId}`,
             // For soft-fails the per-step result remains `success: false`
             // (the action did fail), but the UI should not flag it as a
             // failure — `softFailure: true` on runtimeMeta is the signal
