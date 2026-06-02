@@ -44,9 +44,21 @@ export class ScheduleService {
     // controllers also validate, but other internal callers (e.g.
     // RegressionPlanService.syncSchedule) may bypass them and we don't
     // want a bad row that fires every hour forever via the fallback in
-    // calculateNextRun.
+    // calculateNextRun. Checked before the (DB-touching) ownership check so a
+    // bad cron returns the precise error without a needless query.
     if (!this.parseCron(cronExpression)) {
       throw new Error(`Invalid cron expression: "${cronExpression}"`);
+    }
+
+    // Verify the target exists AND the user may access it. Without this a
+    // schedule could be created against a foreign/non-existent module or plan;
+    // it would then fail at run time and self-deactivate with a misleading
+    // message — and it's an authorization gap (scheduling someone else's target).
+    const ownsTarget = await this.userOwnsTarget(userId, { moduleId, planId });
+    if (!ownsTarget) {
+      throw new Error(
+        `Schedule target not found or access denied: ${moduleId ? `module ${moduleId}` : `plan ${planId}`}`
+      );
     }
 
     logger.info('[SCHEDULE_SERVICE] Creating schedule', {
@@ -250,14 +262,42 @@ export class ScheduleService {
       throw new Error(`Failed to get due schedules: ${error.message}`);
     }
 
-    return (data || []).map((row: any) => ({
-      scheduleId: row.id,
-      projectId: row.project_id,
-      userId: row.user_id,
-      targetType: row.module_id ? 'module' : 'plan',
-      targetId: row.module_id || row.plan_id,
-      parameters: row.parameters || {},
-    }));
+    return (data || []).map((row: any): DueSchedule => {
+      // Resolve the target explicitly. The table permits three target columns
+      // (module_id / suite_id / plan_id) but only module + plan have a runnable
+      // path. Suites are surfaced as 'suite' so the scheduler can reject them
+      // with a correct reason instead of misrouting to runPlan(undefined) — the
+      // old `row.module_id ? 'module' : 'plan'` mapped a suite row to 'plan'
+      // with a null targetId, which then self-deactivated as "target deleted".
+      if (row.module_id) {
+        return {
+          scheduleId: row.id,
+          projectId: row.project_id,
+          userId: row.user_id,
+          targetType: 'module',
+          targetId: row.module_id,
+          parameters: row.parameters || {},
+        };
+      }
+      if (row.plan_id) {
+        return {
+          scheduleId: row.id,
+          projectId: row.project_id,
+          userId: row.user_id,
+          targetType: 'plan',
+          targetId: row.plan_id,
+          parameters: row.parameters || {},
+        };
+      }
+      return {
+        scheduleId: row.id,
+        projectId: row.project_id,
+        userId: row.user_id,
+        targetType: 'suite',
+        targetId: row.suite_id || null,
+        parameters: row.parameters || {},
+      };
+    });
   }
 
   /**
@@ -583,6 +623,45 @@ export class ScheduleService {
       return new Date(0);
     }
     return result;
+  }
+
+  /**
+   * Verify a schedule target (module or plan) exists and the user may access it.
+   * Delegates to each domain's own access-checked getById — which return null
+   * when the row is missing OR the user has no access — so the authorization
+   * model stays identical to how the same target is authorized at run time
+   * (modules: owner; plans: workspace membership). Reusing those avoids a
+   * second, divergent access rule living here.
+   */
+  private static async userOwnsTarget(
+    userId: string,
+    target: { moduleId?: string; planId?: string }
+  ): Promise<boolean> {
+    try {
+      if (target.moduleId) {
+        // Lazy import: RegressionPlanService imports ScheduleService, so a
+        // top-level import back would create a require cycle. These run at
+        // call time only, so a dynamic import is both safe and sufficient.
+        const { ModuleService } = await import('@/services/testing/modules/module.service');
+        const mod = await ModuleService.getById(target.moduleId, userId);
+        return !!mod;
+      }
+      if (target.planId) {
+        const { RegressionPlanService } = await import(
+          '@/services/testing/plans/regression-plan.service'
+        );
+        const plan = await RegressionPlanService.getById(target.planId, userId);
+        return !!plan;
+      }
+      return false;
+    } catch (error) {
+      logger.error('[SCHEDULE_SERVICE] userOwnsTarget check failed', {
+        error: error instanceof Error ? error.message : String(error),
+        userId,
+        target,
+      });
+      return false;
+    }
   }
 
   /**

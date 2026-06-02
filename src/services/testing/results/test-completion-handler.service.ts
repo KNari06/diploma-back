@@ -410,15 +410,13 @@ export class TestCompletionHandlerService {
       const mappedStatus =
         test.status === 'completed'
           ? 'passed'
-          : test.status === 'timeout'
+          : test.status === 'timeout' || test.status === 'failed'
             ? 'failed'
-            : test.status === 'failed'
-              ? 'failed'
-              : test.status === 'cancelled'
-                ? 'cancelled'
-                : test.status === 'running' || test.status === 'pending'
-                  ? 'running'
-                  : 'failed';
+            : test.status === 'cancelled'
+              ? 'cancelled'
+              : test.status === 'running' || test.status === 'pending'
+                ? 'running'
+                : 'failed';
 
       const durationMs =
         test.created_at && test.completed_at

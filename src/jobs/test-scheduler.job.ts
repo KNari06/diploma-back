@@ -13,6 +13,7 @@ import { logger } from '@/utils/core/logger';
 import { NotificationService } from '@/services/notifications/notification.service';
 import { testRunQueue } from '@/config/infrastructure/queues';
 import { env } from '@/config/environment/env';
+import type { DueSchedule } from '@/types/testing.types';
 
 /**
  * Redis key holding the scheduler's last-tick wall-clock (ms).
@@ -163,15 +164,28 @@ export class TestSchedulerJobHandler {
   /**
    * Execute a single schedule
    */
-  private static async executeSchedule(schedule: {
-    scheduleId: string;
-    projectId: string;
-    userId: string;
-    targetType: 'module' | 'plan';
-    targetId: string;
-    parameters: Record<string, any>;
-  }): Promise<void> {
+  private static async executeSchedule(schedule: DueSchedule): Promise<void> {
     const { targetType, targetId, userId, parameters } = schedule;
+
+    // Guard: an unrunnable schedule (suite target, or any row with no resolvable
+    // target id). There is no runSuite() path. Deactivate so it stops occupying
+    // the due-sweep forever and tell the user WHY — instead of misrouting it to
+    // runPlan(undefined), which used to fail as "not found" and self-deactivate
+    // with a misleading "target was deleted" message.
+    if (targetType === 'suite' || !targetId) {
+      logger.warn('[TEST_SCHEDULER] Unrunnable schedule — deactivating', {
+        scheduleId: schedule.scheduleId,
+        targetType,
+        targetId,
+      });
+      await this.deactivateUnrunnable(
+        schedule,
+        targetType === 'suite'
+          ? 'Scheduling regression suites is not supported. Please schedule a plan or module instead.'
+          : 'This schedule has no valid target. It has been disabled.'
+      );
+      return;
+    }
 
     try {
       switch (targetType) {
@@ -332,6 +346,48 @@ export class TestSchedulerJobHandler {
       // Re-throw to let the caller (processSchedules loop) record it
       // and continue with the next schedule.
       throw error;
+    }
+  }
+
+  /**
+   * Deactivate a schedule that can never run (unsupported suite target or a
+   * row with no resolvable target) and notify the user with the real reason.
+   * Best-effort: failures here are logged but never re-thrown — the schedule
+   * has already been claimed, so the loop should simply move on.
+   */
+  private static async deactivateUnrunnable(
+    schedule: DueSchedule,
+    message: string
+  ): Promise<void> {
+    try {
+      await ScheduleService.deactivate(schedule.scheduleId, schedule.userId);
+    } catch (deactivateError) {
+      logger.error('[TEST_SCHEDULER] Failed to deactivate unrunnable schedule', {
+        error: deactivateError instanceof Error ? deactivateError.message : String(deactivateError),
+        scheduleId: schedule.scheduleId,
+      });
+    }
+
+    try {
+      await NotificationService.createNotification({
+        userId: schedule.userId,
+        type: 'personal',
+        category: 'system',
+        title: 'Scheduled run disabled',
+        message,
+        metadata: {
+          scheduleId: schedule.scheduleId,
+          targetType: schedule.targetType,
+          targetId: schedule.targetId,
+          projectId: schedule.projectId,
+          dedupeKey: `schedule:${schedule.scheduleId}:unrunnable`,
+        },
+      });
+    } catch (notifError) {
+      logger.error('[TEST_SCHEDULER] Failed to create unrunnable-schedule notification', {
+        error: notifError instanceof Error ? notifError.message : String(notifError),
+        userId: schedule.userId,
+      });
     }
   }
 
