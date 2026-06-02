@@ -251,3 +251,9 @@ aws-*
 azure-*
 id_rsa*
 id_ed25519*
+
+# Local Claude config — launch.json holds machine-specific absolute paths;
+# worktrees/ are local git checkouts with their own gitdir (committing them
+# as gitlinks pointed at a machine-local path and broke `git status`).
+.claude/launch.json
+.claude/worktrees/
