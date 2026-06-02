@@ -19,7 +19,7 @@ import { logIntentResolveLint } from './intent-resolve-audit';
 import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { isDynamicId } from './dynamic-id.util';
-import { compareRecordedIdentity } from './recorded-identity.util';
+import { recordedFingerprintHasStrongIdentity, nodeToIdentityProbe, hasStrongIdentityContradiction } from './recorded-identity.util';
 import { getPreviewSessionService } from './preview-session.service';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
@@ -1279,16 +1279,18 @@ export class IntentStepLintService {
 
         if (
           compat.ok
-          && compareRecordedIdentity(cachedNode, stepDraft.recordedFingerprint, stepDraft.type) === 'mismatch'
+          && recordedFingerprintHasStrongIdentity(stepDraft.recordedFingerprint)
+          && hasStrongIdentityContradiction(nodeToIdentityProbe(cachedNode), stepDraft.recordedFingerprint)
         ) {
           // Recorded-identity guard: the cached lastSuccessRef still exists and
-          // is action-compatible, but it no longer matches the ORIGINAL recorded
-          // identity — the page drifted and the ref now resolves a DIFFERENT
-          // element than a fresh resolution would pick. Bypass the cache so a
-          // full Run converges on the same element as single-step Apply (which
-          // never carries evidence and always resolves fresh). Fail-open when
-          // the fingerprint lacks strong identity (verdict is then never
-          // 'mismatch') — manual-add steps are untouched.
+          // is action-compatible, but a recorded STRONG identifier (id / testId /
+          // name / href / svgIcon / routerLink) now resolves to a DIFFERENT value
+          // — the page drifted and the ref points at another element than a fresh
+          // resolution would pick. Bypass the cache so a full Run converges on the
+          // same element as single-step Apply (which never carries evidence and
+          // always resolves fresh). Same comparator (hasStrongIdentityContradiction,
+          // URL-normalized) as the compiled path. Fail-open on weak fingerprints —
+          // manual-add steps are untouched.
           logger.info('[INTENT_LINT_V5] Evidence shortcut bypass — recorded-identity mismatch', {
             previewSessionId,
             cachedRef,

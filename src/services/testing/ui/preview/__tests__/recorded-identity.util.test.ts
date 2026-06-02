@@ -1,6 +1,7 @@
 import {
-  compareRecordedIdentity,
   recordedFingerprintHasStrongIdentity,
+  nodeToIdentityProbe,
+  hasStrongIdentityContradiction,
 } from '../recorded-identity.util';
 import type { TargetFingerprint } from '../preview.types';
 
@@ -9,71 +10,83 @@ describe('recordedFingerprintHasStrongIdentity', () => {
     expect(recordedFingerprintHasStrongIdentity(undefined)).toBe(false);
   });
 
-  it('returns false for a weak fingerprint (tag only)', () => {
-    expect(recordedFingerprintHasStrongIdentity({ tag: 'button' })).toBe(false);
+  it('returns false for a weak fingerprint (tag/role/text only)', () => {
+    expect(recordedFingerprintHasStrongIdentity({ tag: 'a', role: 'link', text: 'Алматы' })).toBe(false);
   });
 
-  it('returns true when a stable testId is present', () => {
-    expect(recordedFingerprintHasStrongIdentity({ tag: 'button', testIdAttr: 'submit-btn' })).toBe(true);
+  it('returns true when a stable strong identifier is present', () => {
+    expect(recordedFingerprintHasStrongIdentity({ testIdAttr: 'submit' })).toBe(true);
+    expect(recordedFingerprintHasStrongIdentity({ href: '/courses/math' })).toBe(true);
+    expect(recordedFingerprintHasStrongIdentity({ name: 'email' })).toBe(true);
   });
 
   it('ignores a dynamic elementId but accepts a stable one', () => {
     expect(recordedFingerprintHasStrongIdentity({ elementId: ':r3:' })).toBe(false);
     expect(recordedFingerprintHasStrongIdentity({ elementId: 'login-email' })).toBe(true);
   });
+});
 
-  it('accepts the tag+role+text triple', () => {
-    expect(recordedFingerprintHasStrongIdentity({ tag: 'a', role: 'link', text: 'Алматы' })).toBe(true);
-    // text too short → not enough signal
-    expect(recordedFingerprintHasStrongIdentity({ tag: 'a', role: 'link', text: 'A' })).toBe(false);
+describe('nodeToIdentityProbe', () => {
+  it('maps node fields and id -> elementId', () => {
+    const probe = nodeToIdentityProbe({ id: 'x', testIdAttr: 't', href: '/a', name: 'n', tag: 'a' });
+    expect(probe.elementId).toBe('x');
+    expect(probe.testIdAttr).toBe('t');
+    expect(probe.href).toBe('/a');
+    expect(probe.name).toBe('n');
+  });
+
+  it('drops a dynamic live id (symmetric with probeIdentity)', () => {
+    expect(nodeToIdentityProbe({ id: ':r9:' }).elementId).toBeUndefined();
+  });
+
+  it('normalizes empty strings to undefined', () => {
+    const probe = nodeToIdentityProbe({ testIdAttr: '', text: '' });
+    expect(probe.testIdAttr).toBeUndefined();
+    expect(probe.text).toBeUndefined();
   });
 });
 
-describe('compareRecordedIdentity', () => {
-  it('returns no_signal when the fingerprint is too weak to validate', () => {
-    expect(compareRecordedIdentity({ tag: 'button', id: 'x' }, { tag: 'button' }, 'click')).toBe('no_signal');
+describe('hasStrongIdentityContradiction (via nodeToIdentityProbe)', () => {
+  const contradicts = (node: Parameters<typeof nodeToIdentityProbe>[0], fp: TargetFingerprint) =>
+    hasStrongIdentityContradiction(nodeToIdentityProbe(node), fp);
+
+  it('returns false when no probe is supplied', () => {
+    expect(hasStrongIdentityContradiction(null, { testIdAttr: 'submit' })).toBe(false);
   });
 
-  it('returns match when the live testId equals the recorded one', () => {
-    const fp: TargetFingerprint = { tag: 'button', testIdAttr: 'submit' };
-    expect(compareRecordedIdentity({ tag: 'button', testIdAttr: 'submit' }, fp, 'click')).toBe('match');
+  it('returns true when a strong testId differs', () => {
+    expect(contradicts({ testIdAttr: 'cancel' }, { testIdAttr: 'submit' })).toBe(true);
   });
 
-  it('returns mismatch when the live testId differs from the recorded one', () => {
-    const fp: TargetFingerprint = { tag: 'button', testIdAttr: 'submit' };
-    expect(compareRecordedIdentity({ tag: 'button', testIdAttr: 'cancel' }, fp, 'click')).toBe('mismatch');
+  it('returns false when the strong testId matches', () => {
+    expect(contradicts({ testIdAttr: 'submit' }, { testIdAttr: 'submit' })).toBe(false);
   });
 
   it('treats a missing live value as neutral, not a contradiction', () => {
-    const fp: TargetFingerprint = { testIdAttr: 'submit' };
-    // node lacks testId entirely and nothing else to compare → fail-open
-    expect(compareRecordedIdentity({ tag: 'button' }, fp, 'click')).toBe('no_signal');
+    expect(contradicts({ tag: 'button' }, { testIdAttr: 'submit' })).toBe(false);
   });
 
-  it('returns mismatch on a contradicting href even if tag matches', () => {
-    const fp: TargetFingerprint = { tag: 'a', href: '/courses/math' };
-    expect(compareRecordedIdentity({ tag: 'a', href: '/courses/physics' }, fp, 'click')).toBe('mismatch');
+  // 🔴3: recorder stores the relative href attribute; the live probe reads the
+  // absolute IDL .href. normUrlLike drops the origin so the same target matches.
+  it('does NOT flag relative-recorded vs absolute-live href for the same target', () => {
+    expect(contradicts({ href: 'https://site.com/courses/math' }, { href: '/courses/math' })).toBe(false);
   });
 
-  it('ignores a dynamic recorded elementId rather than contradicting on it', () => {
-    const fp: TargetFingerprint = { elementId: ':r7:', testIdAttr: 'submit' };
-    // dynamic id skipped; testId matches → match
-    expect(compareRecordedIdentity({ id: ':r9:', testIdAttr: 'submit' }, fp, 'click')).toBe('match');
+  it('flags a genuinely different href', () => {
+    expect(contradicts({ href: 'https://site.com/courses/physics' }, { href: '/courses/math' })).toBe(true);
   });
 
-  describe('tag+role+text triple', () => {
-    const fp: TargetFingerprint = { tag: 'a', role: 'link', text: 'Алматы' };
+  it('tolerates a trailing-slash-only href difference', () => {
+    expect(contradicts({ href: 'https://site.com/dir/' }, { href: '/dir' })).toBe(false);
+  });
 
-    it('matches when tag, role and text all agree (click)', () => {
-      expect(compareRecordedIdentity({ tag: 'a', role: 'link', text: 'Алматы' }, fp, 'click')).toBe('match');
-    });
+  // 🔴4: text is a WEAK field — its drift must never cause a hard reject when a
+  // strong identifier still matches.
+  it('does not contradict on text drift when a strong id still matches', () => {
+    expect(contradicts({ testIdAttr: 'submit', text: 'Астана' }, { testIdAttr: 'submit', text: 'Алматы' })).toBe(false);
+  });
 
-    it('mismatches when the text differs (click)', () => {
-      expect(compareRecordedIdentity({ tag: 'a', role: 'link', text: 'Астана' }, fp, 'click')).toBe('mismatch');
-    });
-
-    it('does not enforce the triple for non-click actions', () => {
-      expect(compareRecordedIdentity({ tag: 'a', role: 'link', text: 'Астана' }, fp, 'type')).toBe('no_signal');
-    });
+  it('drops a dynamic live id so it cannot contradict a stable recorded id', () => {
+    expect(contradicts({ id: ':r9:' }, { elementId: 'login-email' })).toBe(false);
   });
 });
