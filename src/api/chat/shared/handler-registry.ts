@@ -211,6 +211,9 @@ const handleMobileAgent: IntentHandler = async (req, res, params) => {
     context: params.context,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    // Forward the persistence backend so test-case-scoped mobile chats
+    // land in the test-case store instead of leaking to the global tables.
+    chatStore: params.chatStore,
   });
 };
 
@@ -229,6 +232,8 @@ const handleMobileAction: IntentHandler = async (req, res, params) => {
     context: params.context,
     abortSignal: params.abortSignal,
     mode: params.mode,
+    // Forward the persistence backend (see handleMobileAgent above).
+    chatStore: params.chatStore,
   });
 };
 

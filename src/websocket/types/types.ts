@@ -400,8 +400,21 @@ export interface ServerToClientEvents {
   }) => void;
 
   // Preview session startup progress (emitted to user room — client not yet subscribed to preview room)
+  //
+  // Two stage vocabularies share this event:
+  //   • Web preview  — launching_browser / loading_page / extracting_elements
+  //   • Mobile warmup — boot_emulator / installing_app / launching_app /
+  //                      waiting_first_frame
+  // Both terminate in `ready`. The mobile names mirror the actual warmup
+  // steps (emulator boot → APK/IPA install → cold launch → first video
+  // frame) instead of reusing the web names, so the editor's loading bar
+  // can show truthful per-step copy. The frontend maps unknown stages to
+  // its timer fallback, so adding mobile stages is backward-compatible.
   'preview:session:progress': (data: {
-    stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready';
+    stage:
+      | 'launching_browser' | 'loading_page' | 'extracting_elements'
+      | 'boot_emulator' | 'installing_app' | 'launching_app' | 'waiting_first_frame'
+      | 'ready';
     progress: number;     // 0-100
     url?: string;
     elapsedMs: number;

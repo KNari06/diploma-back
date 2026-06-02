@@ -524,13 +524,10 @@ export class MobileTestRunJobHandler {
             skipLaunch: isFlutter,
             onProgress: (stage, _progress) => {
               switch (stage) {
-                case 'launching_browser':
-                  emitInstallStep(`Preparing app on ${platform} runner…`, 13);
-                  break;
-                case 'loading_page':
+                case 'installing_app':
                   emitInstallStep(`Downloading + installing app binary…`, 15);
                   break;
-                case 'extracting_elements':
+                case 'launching_app':
                   emitInstallStep(`Launching ${appPackage}…`, 17);
                   break;
                 default:

@@ -22,6 +22,39 @@ export function toMobilePlatformKey(platform: MobilePlatform): MobilePlatformKey
     : 'mobile_android';
 }
 
+/**
+ * The app framework detected at APK/IPA upload time
+ * (`mobile_app_builds.detectedFramework` / `projects.settings.mobileApp`).
+ */
+export type DetectedFramework = 'android' | 'ios' | 'flutter' | 'react-native';
+
+/**
+ * Derive the test-case storage platform from the app's detected framework.
+ *
+ * Why this exists: a Flutter app's UI is one opaque canvas, so the runner's
+ * live ui-state reports the HOST platform (`android`/`ios`), never `flutter`.
+ * If we save a test case using that host value it becomes `mobile_android`,
+ * and the regression/warmup paths then create a plain Android session and
+ * SKIP `attach-flutter` — so the Flutter VM is never connected and element
+ * resolution reads an empty native tree. Deriving the key from the upload-time
+ * `detectedFramework` keeps Flutter apps on the Flutter path.
+ *
+ * `hostPlatform` only disambiguates non-flutter cases (e.g. react-native on
+ * iOS → mobile_ios). Defaults to android when nothing is known.
+ */
+export function frameworkToMobilePlatformKey(
+  framework: DetectedFramework | undefined,
+  hostPlatform?: 'android' | 'ios',
+): MobilePlatformKey {
+  if (framework === 'flutter') return 'mobile_flutter';
+  if (framework === 'ios') return 'mobile_ios';
+  // React-Native runs on either host — respect hostPlatform so RN-on-iOS
+  // isn't mislabeled mobile_android. Falls through to the host check below.
+  if (hostPlatform === 'ios') return 'mobile_ios';
+  // 'android', 'react-native' on android, or unknown → native android stack.
+  return 'mobile_android';
+}
+
 // ── Session ──────────────────────────────────────────────────────
 
 export interface MobileSessionResponse {

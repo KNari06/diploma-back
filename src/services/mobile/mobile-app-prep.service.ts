@@ -52,8 +52,16 @@ import type { MobilePlatform } from '@/services/mobile/mobile-runner.types';
 /**
  * Stage labels recognised by the editor's loading-bar component. The worker
  * doesn't render these but the type lets editor callers stay type-safe.
+ *
+ * These are the MOBILE warmup stages — they mirror the real prep steps the
+ * editor's loading bar shows (APK/IPA install → cold launch). The emulator
+ * boot stage (`boot_emulator`) is emitted by the warmup controller before
+ * prepApp runs; `waiting_first_frame` is driven by the frontend off the
+ * live video stream. The legacy web stage names (`launching_browser`, …)
+ * are intentionally NOT part of this union anymore — mobile prep no longer
+ * borrows them.
  */
-export type AppPrepStage = 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready';
+export type AppPrepStage = 'installing_app' | 'launching_app' | 'ready';
 
 export interface PrepAppArgs {
   client: MobileRunnerClient;
@@ -191,8 +199,8 @@ export class MobileAppPrepService {
     };
     let branchTaken = 'unknown';
 
-    // Nudge the UI past "preparing env" as soon as install logic starts.
-    emit('launching_browser', 25);
+    // Nudge the UI past "boot emulator" as soon as install logic starts.
+    emit('installing_app', 35);
 
     // Load the project's app config. Worker callers usually supply their
     // own storagePath/originalName/packageName via overrides — we still
@@ -292,7 +300,7 @@ export class MobileAppPrepService {
           package: cachedPackage,
           skipLaunch: skipLaunch === true,
         });
-        emit('extracting_elements', 75);
+        emit('launching_app', 80);
         if (!skipLaunch) {
           // Hard reset on every prep: `pm clear --user N` wipes the app's
           // data dir + revokes runtime perms (auto-re-granted by the runner
@@ -349,7 +357,7 @@ export class MobileAppPrepService {
           package: knownPackage,
           skipLaunch: skipLaunch === true,
         });
-        emit('extracting_elements', 75);
+        emit('launching_app', 80);
         if (!skipLaunch) {
           // Same hard-reset as the Redis fast path above — keeps the prep
           // contract consistent: every successful prep leaves the app in
@@ -389,7 +397,7 @@ export class MobileAppPrepService {
       originalName: effectiveOriginalName,
       oldPackage: warmup?.installedPackage || '(none)',
     });
-    emit('loading_page', 45);
+    emit('installing_app', 55);
 
     const fileBuffer = await time('storage_download', () => MobileAppStorageService.downloadApp(effectiveStoragePath));
     const uploaded = await time('runner_upload', () => client.uploadApp(fileBuffer, effectiveOriginalName ?? 'app.apk', { userId }));
@@ -437,7 +445,7 @@ export class MobileAppPrepService {
     // whether we knew the package name up front. Skipped when caller
     // passes `skipLaunch: true` (autoBootAndInstall pattern).
     if (packageName && !skipLaunch) {
-      emit('extracting_elements', 75);
+      emit('launching_app', 80);
       // launch_app timeout: 90s. Fresh-install + permission pre-grant + RN/
       // Flutter first-run init can briefly exceed 60s; 90s covers the long
       // tail while still failing-fast half as long as the legacy 180s when

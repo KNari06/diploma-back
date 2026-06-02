@@ -30,6 +30,7 @@ import { Request, Response } from 'express';
 // `WarmupData` interface remain exported from this file because the
 // service imports them.
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
+import { MobileAppStorageService } from '@/services/storage/mobile-app-storage.service';
 import { applyProjectPolicyToSession } from '@/services/mobile/permission-policy.service';
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -120,15 +121,19 @@ export interface WarmupData {
  * the emulator warms up. Mirrors the event shape already used by the web
  * preview path. Non-fatal — a socket hiccup must never fail warmup.
  *
- * Stage strings recognised by the frontend (in order):
- *   launching_browser → stage 1 (emulator ready)
- *   loading_page      → stage 2 (APK install in progress)
- *   extracting_elements → stage 3 (launching app)
- *   ready             → stage 4 (complete)
+ * Mobile warmup stages (in order) — each maps to a real step so the
+ * editor's loading bar shows truthful copy instead of borrowed web names:
+ *   boot_emulator       → emulator/simulator is booting or being claimed
+ *   installing_app      → APK/IPA install in progress
+ *   launching_app       → cold-launching the app
+ *   waiting_first_frame → app launched; waiting for the first video frame
+ *                         (the frontend flips this to `ready` itself when
+ *                          the live stream delivers frame #1)
+ *   ready               → complete
  */
 function emitWarmupProgress(
   userId: string,
-  stage: 'launching_browser' | 'loading_page' | 'extracting_elements' | 'ready',
+  stage: 'boot_emulator' | 'installing_app' | 'launching_app' | 'waiting_first_frame' | 'ready',
   progress: number,
 ): void {
   try {
@@ -197,7 +202,23 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
   }
 
   const VALID_PLATFORMS: Record<string, MobilePlatform> = { android: 'android', ios: 'ios', flutter: 'flutter' };
-  const platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  let platform: MobilePlatform = VALID_PLATFORMS[rawPlatform ?? ''] ?? 'android';
+  // Self-correct: the editor may warm up with platform='android' for a project
+  // whose app is actually Flutter (e.g. opened from an old android-typed test
+  // case). Without upgrading here, the warmup creates a plain android session,
+  // skips attach-flutter below, and the preview/editor reads an empty native
+  // tree. Upgrade android→flutter from the detected framework; never downgrade.
+  if (platform === 'android') {
+    const framework = await MobileAppStorageService.getDetectedFramework(projectId).catch(
+      () => undefined,
+    );
+    if (framework === 'flutter') {
+      logger.info('[MOBILE_SESSION] warmup upgrading android→flutter from detectedFramework', {
+        projectId,
+      });
+      platform = 'flutter';
+    }
+  }
   // Flutter sessions are created as a NATIVE android session first, then
   // upgraded via `attachFlutter` (install → launch → VM Service detect).
   // The runner's direct `createSession('flutter')` probes the VM Service
@@ -476,7 +497,7 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
           // Run install+launch_app BEFORE responding, so the preview stream shows
           // the app already open. On a reused session this usually hits the fast
           // path (Redis match or device check) and just issues launch_app.
-          emitWarmupProgress(userId, 'launching_browser', 15);
+          emitWarmupProgress(userId, 'boot_emulator', 15);
           // Skip re-prep for a reused Flutter session: it's already a live,
           // attached Flutter session (app installed + running + VM Service
           // connected). Re-running install/launch here would reinstall over
@@ -501,7 +522,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
               });
             }
           }
-          emitWarmupProgress(userId, 'ready', 100);
+          // App is launched; the response goes out next and the frontend
+          // subscribes to the video stream. It flips to `ready` (100%)
+          // itself on the first real frame, so we stop at 95% here.
+          emitWarmupProgress(userId, 'waiting_first_frame', 95);
 
           const runnerSocketUrl = currentRunnerSocketUrl();
           logger.info('[MOBILE_SESSION] warmup response (path=cached_reuse)', {
@@ -596,8 +620,8 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       }
     }
 
-    // Emulator is up — nudge the loader past the "preparing env" stage.
-    emitWarmupProgress(userId, 'launching_browser', 15);
+    // Emulator/simulator is up — nudge the loader past the boot stage.
+    emitWarmupProgress(userId, 'boot_emulator', 15);
 
     // Propagate project-level permission policy to the runner. Delegates
     // to the shared service so warmup, regression worker, and CI runs
@@ -710,7 +734,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
         return;
       }
     }
-    emitWarmupProgress(userId, 'ready', 100);
+    // App launched on the fresh session; warmup is about to respond and the
+    // frontend will subscribe to the live stream. It promotes this to
+    // `ready` (100%) on the first decoded frame.
+    emitWarmupProgress(userId, 'waiting_first_frame', 95);
 
     logger.info('[MOBILE_SESSION] warmup response (path=fresh_create)', {
       userId, projectId,

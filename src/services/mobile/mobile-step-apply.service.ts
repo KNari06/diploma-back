@@ -53,6 +53,12 @@ const RAW_CMD_MAP: Record<string, string> = {
 // REPLACE an existing one in the DB. Higher rank = more reliable strategy.
 //
 // Why each rank:
+//   creation_location (9) — Flutter widget's source creation site
+//     (file:line:col from the Widget Inspector). Deterministic across runs,
+//     label-independent (works for icon-only widgets), and survives layout
+//     rewrites + translations. The strongest Flutter key — ranked ABOVE
+//     resource_id so a Flutter creation_location plan is never downgraded to
+//     a weaker strategy.
 //   resource_id / accessibility_id (8) — developer-controlled IDs, stable
 //     across translations / DPI changes / minor refactors. The strongest
 //     signal we have on Android (`android:id`) and iOS
@@ -68,6 +74,7 @@ const RAW_CMD_MAP: Record<string, string> = {
 //
 // Numbers are gaps so a future strategy can slot in without renumbering.
 const MOBILE_STRATEGY_RANK: Record<string, number> = {
+  creation_location: 9,
   resource_id: 8,
   accessibility_id: 8,
   label_exact: 5,
@@ -271,9 +278,21 @@ export class MobileStepApplyService {
           // can decide whether to trust these coords on the next replay or
           // re-resolve via vision/LLM (release-build layout shifts, DPR
           // changes, etc.). See runner TapParams.coordsConfidence.
-          const coordsConfidence = typeof lintResult.confidence === 'number'
+          let coordsConfidence = typeof lintResult.confidence === 'number'
             ? lintResult.confidence
             : undefined;
+          // Vision-sourced coords are low-trust by nature: the element was
+          // resolved from a screenshot (no a11y/inspector text match), so the
+          // point is a best-guess pixel, not a tree-anchored node. Common on
+          // Semantics-less Flutter screens. The vision model often reports high
+          // confidence (~0.9) even when it grabbed the wrong widget, which would
+          // trip the runner's TRUST_COORDS_THRESHOLD (≥0.9) and dispatch the bad
+          // point blindly. Demote below that threshold so smartResolve re-fetches
+          // a fresh (now inspector-sourced) tree and re-resolves by text/keys
+          // instead of tapping the stale vision pixel.
+          if (lintResult.visionMode) {
+            coordsConfidence = Math.min(coordsConfidence ?? 0.5, 0.5);
+          }
           // Pass `intent` (the normalized description) alongside the
           // coordinates so the runner's smartResolve can re-validate the
           // target if `coordsConfidence < 0.9`. Without intent, smartResolve
@@ -412,6 +431,10 @@ export class MobileStepApplyService {
     // locking in an incorrect element pick.
     const PROVEN_RESOLVED_VIA: ReadonlySet<string> = new Set([
       'compiled', 'compiled_fast_path', 'cache',
+      // text_match: resolved by a direct, unambiguous tree text match (LLM-free).
+      // It picks a real node, so its compiled plan is just as trustworthy to
+      // persist as the compiled/cache paths — and lets the next run skip the LLM.
+      'text_match',
     ]);
     const planIsProven = !!stepResult?.resolvedVia
       && PROVEN_RESOLVED_VIA.has(stepResult.resolvedVia);
