@@ -36,6 +36,7 @@ import type {
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { recordedFingerprintHasStrongIdentity } from './recorded-identity.util';
 import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
 import { smartStepWait } from '../smart-step-wait.service';
 
@@ -384,6 +385,15 @@ const DOM_MUTATING_ACTIONS = new Set(['hover', 'click', 'open', 'close', 'toggle
  * Anything not in this set keeps the old (full) post-action behaviour.
  */
 const POST_ACTION_BUFFER_ACTIONS = new Set(['click', 'dblclick', 'contextmenu', 'press', 'type', 'toggle', 'check', 'uncheck', 'open', 'close']);
+
+/**
+ * Minimum `quickFingerprintCheck` score (vs the ORIGINAL recordedFingerprint)
+ * required to accept a compiled fast-path hit. Below this the compiled plan
+ * resolved a different element than a fresh resolution would — fall through to
+ * lint so Run converges on the same element as single-step Apply. Only enforced
+ * when the recorded fingerprint carries strong identity (see recorded-identity.util).
+ */
+const COMPILED_RECORDED_IDENTITY_MIN_SCORE = 0.5;
 
 /**
  * V11: Detect if a modal/popup/overlay is currently blocking the page.
@@ -1366,7 +1376,9 @@ interface StepDecisionTrace {
     locatorCount?: number;
     succeededStrategy?: string;
     succeededWithFingerprintMatch?: number;
-    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | null;
+    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | 'recorded_identity_mismatch' | null;
+    /** quickFingerprintCheck score vs the ORIGINAL recordedFingerprint when the recorded-identity guard ran. */
+    recordedIdentityScore?: number;
   };
   /** Identity fast-path diagnostic (id/testId/name match against live DOM). */
   identity?: {
@@ -4403,7 +4415,7 @@ export class PreviewStepApplyService {
 
         try {
           // Import and execute compiled plan
-          const { executeCompiledLocatorPlan } = await import('@/agent/execution/compiled-locator-executor');
+          const { executeCompiledLocatorPlan, quickFingerprintCheck } = await import('@/agent/execution/compiled-locator-executor');
 
           // V15: Route per-attempt events into the trace file — answers "which
           // strategy from the plan actually worked, and how long did losers take?"
@@ -4436,6 +4448,52 @@ export class PreviewStepApplyService {
               succeededWithFingerprintMatch: compiledResult.confidence,
               fellThroughTo: null,
             });
+
+            // ── Recorded-identity guard ──────────────────────────────────
+            // `executeCompiledLocatorPlan` only validated the match against the
+            // plan's OWN `targetFingerprint` — a self-echo of a PRIOR resolver
+            // decision (invariant #15), with a loose 0.3 floor. It never
+            // re-checks the ORIGINAL recorded identity, so a drifted text/label
+            // strategy can "succeed" on a different element than a fresh
+            // single-step Apply (which always resolves via the LLM, because the
+            // editor sends no compiled plan). Re-validate against
+            // `recordedFingerprint`; on mismatch, throw to fall through to lint
+            // so Run and Apply converge on the same element. Only fires when the
+            // fingerprint carries strong identity — manual-add steps (no
+            // fingerprint, before first-run synthesis) are untouched.
+            if (recordedFingerprintHasStrongIdentity(stepDraft.recordedFingerprint)) {
+              let identityScore = 1;
+              try {
+                identityScore = await quickFingerprintCheck(page, compiledResult.locator, stepDraft.recordedFingerprint!);
+              } catch {
+                identityScore = 1; // probe failed — fail-open, never block a real hit
+              }
+              if (identityScore < COMPILED_RECORDED_IDENTITY_MIN_SCORE) {
+                const rounded = Math.round(identityScore * 100) / 100;
+                logger.info('[PREVIEW_APPLY] Compiled hit rejected — recorded-identity mismatch, falling through to lint', {
+                  previewSessionId,
+                  stepId: stepDraft.id,
+                  strategy: compiledResult.usedStrategy,
+                  identityScore: rounded,
+                  minScore: COMPILED_RECORDED_IDENTITY_MIN_SCORE,
+                });
+                setTraceCompiled({ fellThroughTo: 'recorded_identity_mismatch', recordedIdentityScore: rounded });
+                try {
+                  EditorTraceService.get(previewSessionId)?.writeCompiledPostcondition({
+                    stepId: stepDraft.id,
+                    expectsNavigation: false,
+                    urlChanged: false,
+                    accepted: false,
+                    reason: 'recorded_identity_mismatch',
+                  });
+                } catch { /* non-fatal */ }
+                compiledWasTried = true;
+                // Break out of the success path; the surrounding try/catch turns
+                // this into a `compiledWasTried = true` fall-through to lint —
+                // same idiom as the compiled-click-no-effect bail below.
+                throw new Error('compiled-recorded-identity-mismatch');
+              }
+            }
 
             // Build candidate from compiled result
             // V15: Extract data-agent-ref from resolved element so evidence shortcut
