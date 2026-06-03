@@ -1,4 +1,3 @@
-import { supabaseAdmin } from '@/db/supabase';
 import { ApiConfigService } from '@/services/api/api-config.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TokenCalculatorService } from '@/services/core/token-calculator.service';
@@ -9,8 +8,7 @@ import { webSocketService } from '@/websocket/core/websocket.service';
 import { executionCompletionEmitter } from '../executions/execution-completion-emitter';
 import { ExecutionService } from '../executions/execution.service';
 import { ManualTestService } from '../ui/manualTest.service';
-import { env } from '@/config/environment/env';
-import { QueueManager, mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
+import { mobileTestRunQueue, mobileTestRunQueueEvents } from '@/config/infrastructure/queues';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
 import type { ExecutableTestCase } from '@/types/testing.types';
 import type { RegressionRunProgressPayload } from '@/websocket/types/types';
@@ -18,6 +16,13 @@ import { getProjectWorkspaceMemberIds } from './regression-report-assembler.serv
 import { MobileTestDispatcherService } from './mobile-test-dispatcher.service';
 import { WebTestRequestBuilderService } from './web-test-request-builder.service';
 import { RegressionTestQueryService } from './db/regression-test-query.db';
+import {
+  getRunRoutingInfo,
+  getExecutionRefsForRun,
+  getFastAuthByExecIds,
+  updateRunById,
+  updateRunByIdIfActive,
+} from './db/regression-run.db';
 import {
   decideMaxMobileInFlight,
   countMobileTests,
@@ -68,13 +73,9 @@ export class TestExecutionOrchestratorService {
     let projectIdForWs: string | null = null;
     let progressRecipients: string[] = [userId];
     try {
-      const { data: runRow } = await supabaseAdmin
-        .from('regression_runs')
-        .select('plan_id, project_id, user_id')
-        .eq('id', runId)
-        .maybeSingle();
-      planIdForWs = (runRow?.plan_id as string | null) ?? null;
-      projectIdForWs = (runRow?.project_id as string | null) ?? null;
+      const runRow = await getRunRoutingInfo(runId);
+      planIdForWs = runRow?.plan_id ?? null;
+      projectIdForWs = runRow?.project_id ?? null;
 
       if (projectIdForWs) {
         progressRecipients = await getProjectWorkspaceMemberIds(projectIdForWs, userId);
@@ -84,10 +85,7 @@ export class TestExecutionOrchestratorService {
     }
 
     // Preload executions to avoid per-test lookups
-    const { data: executions, error: execError } = await supabaseAdmin
-      .from('test_executions')
-      .select('id, test_case_id, test_type')
-      .eq('run_id', runId);
+    const { rows: executions, error: execError } = await getExecutionRefsForRun(runId);
 
     if (execError) {
       // Pre-fix this was a silent `return` — left the run row orphan in
@@ -97,19 +95,15 @@ export class TestExecutionOrchestratorService {
       // doesn't show a forever-running run.
       logger.error('[REGRESSION_RUN] Failed to preload executions', { error: execError, runId });
       try {
-        await supabaseAdmin
-          .from('regression_runs')
-          .update({
-            status: 'failed',
+        await updateRunByIdIfActive(runId, {
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          summary: {
+            total: testCases.length,
+            error: `Failed to preload executions: ${(execError as any)?.message ?? 'unknown'}`,
             completed_at: new Date().toISOString(),
-            summary: {
-              total: testCases.length,
-              error: `Failed to preload executions: ${execError.message ?? 'unknown'}`,
-              completed_at: new Date().toISOString(),
-            },
-          })
-          .eq('id', runId)
-          .in('status', ['pending', 'running']);
+          },
+        });
       } catch (finalizeErr) {
         logger.error('[REGRESSION_RUN] Failed to finalize run after preload failure', {
           runId,
@@ -120,7 +114,7 @@ export class TestExecutionOrchestratorService {
     }
 
     const execByKey = new Map<string, string>();
-    for (const e of executions || []) {
+    for (const e of executions) {
       execByKey.set(`${e.test_type}:${e.test_case_id}`, e.id);
     }
 
@@ -803,24 +797,15 @@ export class TestExecutionOrchestratorService {
           const execIdsForFastAuth = results
             .map((r) => r.execId)
             .filter((id): id is string => typeof id === 'string' && id.length > 0);
-          if (execIdsForFastAuth.length > 0) {
-            const { data: faRows } = await supabaseAdmin
-              .from('test_executions')
-              .select('id, fast_auth_used, fast_auth_restore_ms')
-              .in('id', execIdsForFastAuth);
-            for (const row of (faRows ?? []) as Array<{
-              id: string;
-              fast_auth_used: boolean | null;
-              fast_auth_restore_ms: number | null;
-            }>) {
-              if (row.fast_auth_used === null) continue;
-              fastAuthByExecId.set(row.id, {
-                used: row.fast_auth_used,
-                ...(typeof row.fast_auth_restore_ms === 'number'
-                  ? { restoreMs: row.fast_auth_restore_ms }
-                  : {}),
-              });
-            }
+          const faRows = await getFastAuthByExecIds(execIdsForFastAuth);
+          for (const row of faRows) {
+            if (row.fast_auth_used === null) continue;
+            fastAuthByExecId.set(row.id, {
+              used: row.fast_auth_used,
+              ...(typeof row.fast_auth_restore_ms === 'number'
+                ? { restoreMs: row.fast_auth_restore_ms }
+                : {}),
+            });
           }
         } catch (err) {
           logger.warn(
@@ -954,24 +939,21 @@ export class TestExecutionOrchestratorService {
         }
       }
 
-      await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          status: 'failed',
-          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
-          summary: {
-            total: testCases.length,
-            api_passed: apiPassed,
-            api_failed: apiFailed,
-            skipped: skippedCount,
-            failFastTriggered: true,
-            failFastTriggerTestCaseId,
-            started_at: startedAt,
-            completed_at: new Date().toISOString(),
-          },
+      await updateRunById(runId, {
+        status: 'failed',
+        test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+        summary: {
+          total: testCases.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          skipped: skippedCount,
+          failFastTriggered: true,
+          failFastTriggerTestCaseId,
+          started_at: startedAt,
           completed_at: new Date().toISOString(),
-        })
-        .eq('id', runId);
+        },
+        completed_at: new Date().toISOString(),
+      });
 
       return;
     }
@@ -993,43 +975,37 @@ export class TestExecutionOrchestratorService {
         }
       }
 
-      await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          status: 'failed',
-          test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
-          summary: {
-            total: testCases.length,
-            api_passed: apiPassed,
-            api_failed: apiFailed,
-            skipped: skippedCount,
-            creditExhausted: true,
-            started_at: startedAt,
-            completed_at: new Date().toISOString(),
-          },
+      await updateRunById(runId, {
+        status: 'failed',
+        test_ids: uiTestIds.length > 0 ? uiTestIds : undefined,
+        summary: {
+          total: testCases.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          skipped: skippedCount,
+          creditExhausted: true,
+          started_at: startedAt,
           completed_at: new Date().toISOString(),
-        })
-        .eq('id', runId);
+        },
+        completed_at: new Date().toISOString(),
+      });
 
       return;
     }
 
     // Link UI test IDs to regression_runs so existing completion pipeline can update the run
     if (uiTestIds.length > 0) {
-      const { error: updateError } = await supabaseAdmin
-        .from('regression_runs')
-        .update({
-          test_ids: uiTestIds,
-          summary: {
-            total: testCases.length,
-            ui_started: uiTestIds.length,
-            api_passed: apiPassed,
-            api_failed: apiFailed,
-            skipped: skippedCount,
-            started_at: startedAt,
-          },
-        })
-        .eq('id', runId);
+      const { error: updateError } = await updateRunById(runId, {
+        test_ids: uiTestIds,
+        summary: {
+          total: testCases.length,
+          ui_started: uiTestIds.length,
+          api_passed: apiPassed,
+          api_failed: apiFailed,
+          skipped: skippedCount,
+          started_at: startedAt,
+        },
+      });
 
       if (updateError) {
         logger.warn('[REGRESSION_RUN] Failed to update run with UI test_ids', {
@@ -1048,22 +1024,19 @@ export class TestExecutionOrchestratorService {
     // NOTE: regression_runs.status uses 'completed' (not 'passed') for success — match DB convention.
     const hasFails = apiFailed > 0;
     const persistedStatus = hasFails ? 'failed' : 'completed';
-    await supabaseAdmin
-      .from('regression_runs')
-      .update({
-        status: persistedStatus,
-        summary: {
-          total: testCases.length,
-          passed: apiPassed,
-          failed: apiFailed,
-          api_passed: apiPassed,
-          api_failed: apiFailed,
-          skipped: skippedCount,
-          completed_at: new Date().toISOString(),
-        },
+    await updateRunById(runId, {
+      status: persistedStatus,
+      summary: {
+        total: testCases.length,
+        passed: apiPassed,
+        failed: apiFailed,
+        api_passed: apiPassed,
+        api_failed: apiFailed,
+        skipped: skippedCount,
         completed_at: new Date().toISOString(),
-      })
-      .eq('id', runId);
+      },
+      completed_at: new Date().toISOString(),
+    });
 
     emitProgress(
       persistedStatus === 'completed' ? 'completed' : 'failed',

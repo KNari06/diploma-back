@@ -6,6 +6,7 @@ import {
   getExplorationTestCases,
   getExplorationState,
   addToRegressionPlan,
+  runDiscoveredTestCases,
 } from './explorations.controller';
 
 const router = Router();
@@ -24,5 +25,8 @@ router.get('/:explorationId/state', requireAuth, getExplorationState);
 
 // Add selected test cases to a regression plan
 router.post('/:explorationId/add-to-regression', requireAuth, addToRegressionPlan);
+
+// Run the discovered test cases in one click (creates a throwaway plan + run)
+router.post('/:explorationId/run-discovered', requireAuth, runDiscoveredTestCases);
 
 export default router;

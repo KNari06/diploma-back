@@ -6,6 +6,7 @@
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
 import { TOKENS_PER_CREDIT } from '@/services/core/token-calculator.service';
 import type { ApiAgentLevel, ApiAgentSummary } from './api-agent.types';
 import { getBaselineCredits } from './api-agent-policy';
@@ -81,6 +82,59 @@ export class ApiAgentCreditsService {
         credits: 0,
         error: error instanceof Error ? error.message : 'Unknown error',
       };
+    }
+  }
+
+  /**
+   * Refund the baseline credits charged for a level.
+   * Called when the agent run fails before delivering any result, so the user
+   * is not billed for a test that produced nothing. Best-effort: a failed
+   * refund is logged but never re-thrown (it must not mask the original error).
+   */
+  static async refundBaselineCredits(
+    userId: string,
+    level: ApiAgentLevel,
+    testId: string,
+    reason: string
+  ): Promise<{ success: boolean; credits: number }> {
+    const credits = getBaselineCredits(level);
+
+    if (credits <= 0) {
+      return { success: true, credits: 0 };
+    }
+
+    try {
+      const result = await UserCreditsService.addCredits(
+        userId,
+        credits,
+        'refund',
+        `Refund: API Agent (${level.toUpperCase()}) test failed — ${reason}`,
+        { test_type: 'api', test_id: testId, refund_reason: reason }
+      );
+
+      if (result.success) {
+        logger.info('[API_AGENT_CREDITS] Baseline credits refunded', {
+          userId: userId.substring(0, 8) + '...',
+          level,
+          credits,
+          newBalance: result.newBalance,
+        });
+      } else {
+        logger.warn('[API_AGENT_CREDITS] Failed to refund baseline credits', {
+          userId: userId.substring(0, 8) + '...',
+          level,
+          credits,
+        });
+      }
+
+      return { success: result.success, credits };
+    } catch (error) {
+      logger.error('[API_AGENT_CREDITS] Error refunding baseline credits', {
+        error: error instanceof Error ? error.message : String(error),
+        userId: userId.substring(0, 8) + '...',
+        level,
+      });
+      return { success: false, credits: 0 };
     }
   }
 

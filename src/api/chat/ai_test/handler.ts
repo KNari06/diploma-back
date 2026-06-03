@@ -198,26 +198,32 @@ export async function handlePlatformTest(
     // ═══════════════════════════════════════════════════════════════════════
     // STEP 0: EARLY CREDIT CHECK (before any processing)
     // ═══════════════════════════════════════════════════════════════════════
-    // Soft credit check — verify user has at least 1 credit to start
-    // Actual credits are deducted per-step during execution
+    // Soft credit check — verify user can start a test.
+    // Actual credits are deducted per-step during execution.
+    // Gate on `hasEnough` (grace-inclusive), NOT raw `available`: a user funded
+    // only via grace_limit has available<1 but is still allowed to run, matching
+    // the per-step deduction path which permits a negative balance down to
+    // -grace_limit. Gating on `available` here wrongly 402s grace-funded users.
     const effectiveMode = mode || 'lite';
     const baseCreditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
 
-    if (baseCreditCheck.available < 1) {
+    if (!baseCreditCheck.hasEnough) {
       logger.warn('[PLATFORM_TEST] Insufficient credits (soft check)', {
         userId,
         available: baseCreditCheck.available,
+        required: baseCreditCheck.required,
+        inGracePeriod: baseCreditCheck.inGracePeriod,
       });
 
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',
         code: 'INSUFFICIENT_CREDITS',
-        message: `❌ Insufficient credits. You need at least 1 credit to start a test, but you have ${baseCreditCheck.available}. Credits are deducted per step during execution.`,
-        creditsRequired: 1,
+        message: `❌ Insufficient credits. You need at least ${baseCreditCheck.required} credit(s) to start a test, but you have ${baseCreditCheck.available}. Credits are deducted per step during execution.`,
+        creditsRequired: baseCreditCheck.required,
         creditsAvailable: baseCreditCheck.available,
-        shortage: 1 - baseCreditCheck.available,
-        details: { required: 1, available: baseCreditCheck.available },
+        shortage: baseCreditCheck.shortage,
+        details: { required: baseCreditCheck.required, available: baseCreditCheck.available },
         timestamp: new Date().toISOString(),
         sessionId: chatSessionId,
       });

@@ -118,6 +118,8 @@ function mapActionType(intentAction: IntentActionType): string {
       return 'click';
     case 'wait':
       return 'wait';
+    case 'timeout':
+      return 'wait'; // Explicit sleep — reuses the executor's waitForTimeout command
     case 'assert':
       return 'assert'; // Dispatcher in executor: delegates by assertion.type (visible/text/value/etc)
     case 'navigate':
@@ -174,6 +176,10 @@ function mapActionType(intentAction: IntentActionType): string {
     // command-executor branch that handles the live preview path.
     case 'close_tab':
       return 'closeTab';
+    // Multi-tab open — symmetric with switch/close. Background replay maps
+    // this to the `openTab` Playwright action (context.newPage + goto).
+    case 'open_tab':
+      return 'openTab';
     // V16: Gestures and coordinates
     case 'swipe':
       return 'swipe';
@@ -347,8 +353,9 @@ export function convertIntentStepToCommand(
       command.value = step.value || '';
       break;
 
-    case 'wait': {
-      // For wait, value might be time in ms
+    case 'wait':
+    case 'timeout': {
+      // For wait/timeout, value is the time in ms to pause
       // ESLint: wrap in block to avoid no-case-declarations
       const waitTimeMsRaw = step.value ?? '1000';
       const waitTimeMs = typeof waitTimeMsRaw === 'number' ? waitTimeMsRaw : Number(waitTimeMsRaw);
@@ -464,6 +471,12 @@ export function convertIntentStepToCommand(
     // Multi-tab close — target tab index in `value`, same shape as switch.
     case 'close_tab':
       command.value = step.value || '0';
+      break;
+
+    // Multi-tab open — destination URL in `value`. CommandExecutor opens a new
+    // page in the context and navigates it there.
+    case 'open_tab':
+      command.value = step.value || '';
       break;
 
     // V18: Coordinate-based swipe gesture (mobile)

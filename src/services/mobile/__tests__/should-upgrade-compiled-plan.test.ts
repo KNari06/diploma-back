@@ -212,3 +212,24 @@ describe('shouldUpgradeCompiledPlan — unknown strategy kinds (forward compat)'
     expect(shouldUpgradeCompiledPlan(existing, candidate)).toBe(false);
   });
 });
+
+describe('shouldUpgradeCompiledPlan — creation_location ranking (Flutter)', () => {
+  it('upgrades a bounds_region plan to a creation_location plan', () => {
+    const existing = plan([{ kind: 'bounds_region', region: 'c-c' }]);
+    const candidate = plan([{ kind: 'creation_location', value: 'home.dart:17:4' }]);
+    expect(shouldUpgradeCompiledPlan(existing, candidate)).toBe(true);
+  });
+
+  it('does NOT downgrade a creation_location plan to bounds_region', () => {
+    const existing = plan([{ kind: 'creation_location', value: 'home.dart:17:4' }]);
+    const candidate = plan([{ kind: 'bounds_region', region: 'c-c' }]);
+    expect(shouldUpgradeCompiledPlan(existing, candidate)).toBe(false);
+  });
+
+  it('ranks creation_location at least as strong as resource_id', () => {
+    // A creation_location plan must not be downgraded to resource_id.
+    const existing = plan([{ kind: 'creation_location', value: 'home.dart:17:4' }]);
+    const candidate = plan([{ kind: 'resource_id', value: 'btn' }]);
+    expect(shouldUpgradeCompiledPlan(existing, candidate)).toBe(false);
+  });
+});

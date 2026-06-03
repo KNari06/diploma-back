@@ -67,6 +67,15 @@ export interface MobileAppsByPlatform {
  * explicitly — this helper never silently substitutes (otherwise we'd
  * reintroduce the bug we're fixing: install Android APK on an iOS
  * session because that's what happened to be uploaded).
+ *
+ * Flutter exception: a Flutter app's installable artifact on an emulator
+ * IS an Android `.apk` (Flutter compiles to a native APK; the runner hosts
+ * Flutter sessions on top of an Android device). Projects upload that APK
+ * as `android` — there is no separate "flutter" binary. So when `flutter`
+ * is requested and no flutter-specific slot exists, we DO fall back to the
+ * android slot/legacy. This is safe (same .apk, same `pm install`) and is
+ * NOT the cross-platform bug — that bug is about iOS, where an .ipa and an
+ * .apk are genuinely different binaries. Android↔Flutter share the binary.
  */
 export function getProjectMobileApp(
   settings: ProjectSettings | undefined | null,
@@ -74,23 +83,27 @@ export function getProjectMobileApp(
 ): MobileAppMetadata | undefined {
   if (!settings) return undefined;
 
-  // 1. New sharded slot.
-  // The cast is needed because ProjectSettings doesn't (yet) type
-  // `mobileApps` — settings is `Record<string, unknown>` historically.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const apps = (settings as any).mobileApps as MobileAppsByPlatform | undefined;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const legacy = (settings as any).mobileApp as MobileAppMetadata | undefined;
+
+  // 1. New sharded slot for the exact platform.
   const fromShard = apps?.[platform];
   if (fromShard) return fromShard;
 
-  // 2. Legacy singular slot — only honour when its `platform` matches.
-  // Note: legacy uploads sometimes have `platform` missing (very old
-  // records); treat missing as "android" because that's what every
-  // pre-multi-platform upload de-facto was.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const legacy = (settings as any).mobileApp as MobileAppMetadata | undefined;
-  if (legacy) {
-    const legacyPlatform = legacy.platform ?? 'android';
-    if (legacyPlatform === platform) return legacy;
+  // 2. Legacy singular slot — only when its own `platform` matches.
+  // Missing `platform` on very old records is treated as "android".
+  if (legacy && (legacy.platform ?? 'android') === platform) return legacy;
+
+  // 3. Flutter → Android binary fallback. A Flutter Android build is a
+  //    plain .apk stored under the `android` slot/legacy; there is no
+  //    distinct flutter artifact. Reuse it so Flutter warmups install the
+  //    same APK an android session would. (iOS never falls back here.)
+  if (platform === 'flutter') {
+    const androidShard = apps?.android;
+    if (androidShard) return androidShard;
+    if (legacy && (legacy.platform ?? 'android') === 'android') return legacy;
   }
 
   return undefined;

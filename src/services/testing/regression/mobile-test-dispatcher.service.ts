@@ -58,13 +58,33 @@ export class MobileTestDispatcherService {
       mobile_ios: 'ios',
       mobile_flutter: 'flutter',
     };
-    const platform: MobilePlatform = PLATFORM_MAP[intentCase.platform] ?? 'android';
+    let platform: MobilePlatform = PLATFORM_MAP[intentCase.platform] ?? 'android';
 
-    const BROWSER_MAP: Record<string, 'mobile-android' | 'mobile-ios' | 'mobile-flutter'> = {
-      mobile_ios: 'mobile-ios',
-      mobile_flutter: 'mobile-flutter',
-    };
-    const browser = BROWSER_MAP[intentCase.platform] ?? 'mobile-android';
+    // Self-correct stale platform: a test case saved before the
+    // detectedFramework-aware save (or saved while the runner reported the
+    // host platform) can be `mobile_android` for what is actually a Flutter
+    // app. Running it as `android` skips attach-flutter and leaves element
+    // resolution blind. If the project's app is detected as Flutter, upgrade
+    // an android-typed case to flutter here. Never downgrade — an explicit
+    // ios/flutter label wins. Read failure is non-fatal (keep stored value).
+    if (platform === 'android') {
+      const framework = await MobileAppStorageService.getDetectedFramework(
+        intentCase.project_id,
+      ).catch(() => undefined);
+      if (framework === 'flutter') {
+        logger.warn('[MOBILE-DISPATCH] Upgrading android→flutter from detectedFramework', {
+          testCaseId: intentCase.id,
+          projectId: intentCase.project_id,
+          storedPlatform: intentCase.platform,
+        });
+        platform = 'flutter';
+      }
+    }
+
+    const browser: 'mobile-android' | 'mobile-ios' | 'mobile-flutter' =
+      platform === 'ios' ? 'mobile-ios'
+      : platform === 'flutter' ? 'mobile-flutter'
+      : 'mobile-android';
 
     // 2. Fetch project workspace (needed for MobileTestJobData; the APK
     // itself comes from the resolver below, not from project settings).

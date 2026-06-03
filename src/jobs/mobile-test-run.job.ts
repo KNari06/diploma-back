@@ -38,6 +38,8 @@ import { sumStepDurations } from './helpers/telemetry';
 import { classifyStepResults } from '@/utils/testing/step-result-classifier';
 import { CompiledPlanPersistenceService } from '@/services/testing/ui/preview/compiled-plan-persistence.service';
 import { MobileSessionAcquisitionService } from '@/services/mobile/session-acquisition.service';
+import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
+import type { TestStepCompletedPayload } from '@/websocket/types/types';
 import { FastAuthOrchestratorService } from '@/services/mobile/fast-auth-orchestrator.service';
 
 // ============================================================================
@@ -522,13 +524,10 @@ export class MobileTestRunJobHandler {
             skipLaunch: isFlutter,
             onProgress: (stage, _progress) => {
               switch (stage) {
-                case 'launching_browser':
-                  emitInstallStep(`Preparing app on ${platform} runner…`, 13);
-                  break;
-                case 'loading_page':
+                case 'installing_app':
                   emitInstallStep(`Downloading + installing app binary…`, 15);
                   break;
-                case 'extracting_elements':
+                case 'launching_app':
                   emitInstallStep(`Launching ${appPackage}…`, 17);
                   break;
                 default:
@@ -766,6 +765,14 @@ export class MobileTestRunJobHandler {
         });
       }
 
+      // Human-readable step labels: the runner returns per-step results keyed
+      // by `stepId`, but only the original `intentSteps` carry the authored
+      // `description` ("Click Login button", "Email input"). Map id → description
+      // so the WS event below shows a meaningful name instead of the raw UUID.
+      const stepDescriptionById = new Map(
+        intentSteps.map((s) => [s.id, s.description]),
+      );
+
       // Emit step-level progress
       for (let i = 0; i < runResult.steps.length; i++) {
         const stepResult = runResult.steps[i];
@@ -798,11 +805,15 @@ export class MobileTestRunJobHandler {
               : isSoftFailure
                 ? 'soft-failed'
                 : 'failed';
-          webSocketService.emitTestStepCompleted(testId, {
+          // Persist to the Redis buffer in-process (the worker owns step
+          // persistence), then broadcast. The job's finally drains this buffer
+          // via finalizeToDb — no cross-process append round-trip.
+          const mobileStepEvent: TestStepCompletedPayload = {
             testId,
             browser,
             step: i + 1,
-            stepDescription: `Step: ${stepResult.stepId}`,
+            stepDescription:
+              stepDescriptionById.get(stepResult.stepId) || `Step: ${stepResult.stepId}`,
             // For soft-fails the per-step result remains `success: false`
             // (the action did fail), but the UI should not flag it as a
             // failure — `softFailure: true` on runtimeMeta is the signal
@@ -830,7 +841,9 @@ export class MobileTestRunJobHandler {
                 ? { warnings: stepResult.warnings }
                 : {}),
             },
-          });
+          };
+          await TestExecutedStepsRedisService.appendStepCompleted(testId, mobileStepEvent);
+          webSocketService.emitTestStepCompleted(testId, mobileStepEvent);
         } catch { /* non-fatal */ }
       }
 
@@ -1173,6 +1186,18 @@ export class MobileTestRunJobHandler {
       // failures still produce partial-but-honest analytics.
       if (testId) {
         await MobileTestRunJobHandler.persistTelemetrySnapshot(testId, tlm);
+      }
+
+      // ── Persist executed steps from Redis → tests.executed_steps ──
+      // The worker owns the completed run, so it drains its own step buffer
+      // here rather than relying on the main API process reacting to the
+      // pub/sub `test:completed` event (that reactive finalize never runs
+      // when the API process isn't subscribed, stranding steps in Redis and
+      // leaving the run report with no step timeline). Mobile emits per-step
+      // events via `emitTestStepCompleted` the same way web does. Idempotent
+      // (distributed lock) and best-effort (never throws).
+      if (testId) {
+        await TestExecutedStepsRedisService.finalizeToDb(testId);
       }
 
       // ── Cleanup: release pooled session or destroy adhoc/warmed ──

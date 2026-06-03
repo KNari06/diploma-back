@@ -34,9 +34,14 @@ export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
   'platform_test',  // creates a brand-new test from a URL — pointless inside a test case
   'api_test',       // creates a new API test — same reason
   'api_flow_test',  // multi-step API integration tests; runs against workspace, not a single test case
-  'mobile_test',
-  'mobile_action',
-  'mobile_agent',
+  'mobile_test',     // creates a brand-new mobile test — pointless inside a test case
+  // mobile_action + mobile_agent are NOT blocked: they operate on the LIVE
+  // emulator attached to the test-case editor (parallel to web's
+  // editor_action), so they must work in test-case scope. Their chat turns
+  // route to the test-case store via the threaded ChatStore (see
+  // mobile_agent/shared.ts saveMobileChatTurn). Removing them lets the
+  // classifier-fallback path reach them too — the force-route path
+  // (chat.controller.ts decideForceRoute) already bypasses this guard.
   'run_regression',
   'run_plan',
   'run_module',

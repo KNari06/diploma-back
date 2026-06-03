@@ -55,7 +55,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- ========================================
 
 CREATE TYPE user_role AS ENUM ('user', 'admin', 'moderator');
-CREATE TYPE test_status AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled');
+CREATE TYPE test_status AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled', 'timeout');
 CREATE TYPE browser_type AS ENUM ('chromium', 'firefox', 'webkit');
 CREATE TYPE chat_role AS ENUM ('user', 'ai', 'system');
 

@@ -15,6 +15,7 @@ import { RegressionPlanService } from '@/services/testing/plans/regression-plan.
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for add_to_plan intent
@@ -51,23 +52,27 @@ export async function handleAddToPlanIntent(
     const moduleName = parsedIntent?.moduleName;
     const flowName = parsedIntent?.flowName;
 
-    // Get project from workspace
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('id')
-      .eq('workspace_id', workspace_id)
-      .eq('user_id', userId)
-      .limit(1)
-      .maybeSingle();
+    // Resolve the target project (workspace-membership scoped — see resolver).
+    const projectId = await resolveProjectId(params);
 
-    if (!project) {
+    if (!projectId) {
       throw new NotFoundError('Project', workspace_id);
     }
 
     // Find plan by ID or name
-    let targetPlanId = planId;
+    let targetPlanId: string | undefined;
+    if (planId) {
+      // A plan id from the parsed intent is attacker-controllable — authorize it
+      // through getById (workspace-membership check) before trusting it. Without
+      // this, any authenticated user could add items to a plan they cannot read.
+      const authorizedPlan = await RegressionPlanService.getById(planId, userId);
+      if (!authorizedPlan) {
+        throw new NotFoundError('Plan', planId);
+      }
+      targetPlanId = authorizedPlan.id;
+    }
     if (!targetPlanId && planName) {
-      const plans = await RegressionPlanService.listByProject(project.id, userId);
+      const plans = await RegressionPlanService.listByProject(projectId, userId);
       const matchedPlan = plans.find(
         (p) => p.name.toLowerCase() === planName.toLowerCase()
       );
@@ -99,7 +104,7 @@ export async function handleAddToPlanIntent(
       const { data: mod } = await supabaseAdmin
         .from('test_modules')
         .select('id, name')
-        .eq('project_id', project.id)
+        .eq('project_id', projectId)
         .ilike('name', moduleName)
         .limit(1)
         .maybeSingle();
@@ -120,7 +125,7 @@ export async function handleAddToPlanIntent(
       const { data: flow } = await supabaseAdmin
         .from('test_flows')
         .select('id, name, test_modules!inner(project_id)')
-        .eq('test_modules.project_id', project.id)
+        .eq('test_modules.project_id', projectId)
         .ilike('name', flowName)
         .limit(1)
         .maybeSingle();

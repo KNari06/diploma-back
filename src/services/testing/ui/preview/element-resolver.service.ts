@@ -3938,7 +3938,7 @@ export async function resolveElement(params: {
   });
 
   // Non-targeting actions don't need element resolution
-  if (['navigate', 'wait', 'wait_for', 'ai_check', 'switch_tab'].includes(stepDraft.type)) {
+  if (['navigate', 'wait', 'wait_for', 'ai_check', 'switch_tab', 'close_tab', 'open_tab'].includes(stepDraft.type)) {
     return {
       status: 'resolved',
       message: `Action "${stepDraft.type}" does not require element targeting`,

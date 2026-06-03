@@ -1,5 +1,13 @@
-import { supabaseAdmin } from '@/db/supabase';
-import { logger } from '@/utils/core/logger';
+import {
+  getRunWithOwnership,
+  getRunByShareToken,
+  getTestCaseNamesByIds,
+  getTestResultsByTestIds,
+  getExecutedStepsByTestIds,
+  getNegativeMetaByIds,
+  getTestCasePhaseInfoByIds,
+} from './db/regression-report.db';
+import { getProjectWorkspaceId, getActiveWorkspaceMemberIds } from './db/regression.db';
 import { ExecutionService } from '../executions/execution.service';
 import { HealthCheckAggregatorService } from './health-check-aggregator.service';
 import { TestReportGeneratorService } from '../results/test-report-generator.service';
@@ -27,35 +35,14 @@ export class RegressionReportAssemblerService {
     runId: string,
     userId: string,
   ): Promise<any | null> {
-    const { data, error } = await supabaseAdmin
-      .from('regression_runs')
-      .select('*, regression_plans(name)')
-      .eq('id', runId)
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    if (error) {
-      logger.error('[REGRESSION_RUN] Failed to get run', { error, runId });
-      return null;
-    }
-    return data;
+    return getRunWithOwnership(runId, userId);
   }
 
   /**
    * Fetch a run by its public share token (no ownership check)
    */
   static async getRunByShareToken(shareToken: string): Promise<any | null> {
-    const { data, error } = await supabaseAdmin
-      .from('regression_runs')
-      .select('*, regression_plans(name)')
-      .eq('share_token', shareToken)
-      .maybeSingle();
-
-    if (error) {
-      logger.error('[REGRESSION_RUN] Failed to get run by share token', { error, shareToken });
-      return null;
-    }
-    return data;
+    return getRunByShareToken(shareToken);
   }
 
   /**
@@ -67,16 +54,8 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, string>();
     if (!testCaseIds.length) return map;
 
-    const { data, error } = await supabaseAdmin
-      .from('intent_test_cases')
-      .select('id, name')
-      .in('id', testCaseIds);
-
-    if (error) {
-      logger.warn('[REGRESSION_RUN] Failed to fetch test case names', { error, count: testCaseIds.length });
-    }
-
-    for (const row of data || []) {
+    const rows = await getTestCaseNamesByIds(testCaseIds);
+    for (const row of rows) {
       map.set(row.id, row.name);
     }
     return map;
@@ -93,17 +72,8 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, any>();
     if (!testIds.length) return map;
 
-    const { data, error } = await supabaseAdmin
-      .from('test_results')
-      .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
-      .in('test_id', testIds)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      logger.warn('[REGRESSION_RUN] Failed to fetch test results', { error, count: testIds.length });
-    }
-
-    for (const row of data || []) {
+    const rows = await getTestResultsByTestIds(testIds);
+    for (const row of rows) {
       // Prefer the result that has ai_summary
       const existing = map.get(row.test_id);
       if (!existing || (!existing.ai_summary && row.ai_summary)) {
@@ -122,16 +92,8 @@ export class RegressionReportAssemblerService {
     const map = new Map<string, any[]>();
     if (!testIds.length) return map;
 
-    const { data, error } = await supabaseAdmin
-      .from('tests')
-      .select('id, executed_steps')
-      .in('id', testIds);
-
-    if (error) {
-      logger.warn('[REGRESSION_RUN] Failed to fetch executed steps', { error, count: testIds.length });
-    }
-
-    for (const row of data || []) {
+    const rows = await getExecutedStepsByTestIds(testIds);
+    for (const row of rows) {
       map.set(row.id, row.executed_steps || []);
     }
     return map;
@@ -188,11 +150,8 @@ export class RegressionReportAssemblerService {
     const negativeTestCaseIds = executions.filter((e) => e.isNegative).map((e) => e.testCaseId);
     const negativeMetaMap = new Map<string, import('@/types/testing.types').NegativeMeta>();
     if (negativeTestCaseIds.length > 0) {
-      const { data: negRows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, negative_meta')
-        .in('id', negativeTestCaseIds);
-      for (const row of negRows || []) {
+      const negRows = await getNegativeMetaByIds(negativeTestCaseIds);
+      for (const row of negRows) {
         if (row.negative_meta) {
           negativeMetaMap.set(row.id, row.negative_meta as import('@/types/testing.types').NegativeMeta);
         }
@@ -225,11 +184,8 @@ export class RegressionReportAssemblerService {
     const priorityByTestCaseId = new Map<string, 'critical' | 'high' | 'medium' | 'low'>();
     const VALID_PRIORITY = new Set(['critical', 'high', 'medium', 'low']);
     if (testCaseIds.length > 0) {
-      const { data: caseRows } = await supabaseAdmin
-        .from('intent_test_cases')
-        .select('id, setup_steps, teardown_steps, steps_json, priority')
-        .in('id', testCaseIds);
-      for (const row of caseRows || []) {
+      const caseRows = await getTestCasePhaseInfoByIds(testCaseIds);
+      for (const row of caseRows) {
         if (row.priority && VALID_PRIORITY.has(row.priority)) {
           priorityByTestCaseId.set(row.id, row.priority as 'critical' | 'high' | 'medium' | 'low');
         }
@@ -304,7 +260,21 @@ export class RegressionReportAssemblerService {
       if (testId && exec.testType === 'ui') {
         // Build steps
         const rawSteps = executedStepsMap.get(testId) || [];
-        const completedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        const allCompletedSteps = rawSteps.filter((s: any) => s.type === 'step_completed');
+        // Collapse by step index, keeping the LAST event per index. The Redis
+        // buffer accumulates every attempt's steps in order (attempt 0, then
+        // attempt 1 on retry), and — during a worker/API mixed-version deploy —
+        // a step can be appended twice. Keeping the last occurrence per step
+        // index yields the final attempt's outcome and a single, un-doubled
+        // timeline. A Map preserves first-seen position, so steps stay ordered
+        // 0..n and the phase indexing below stays aligned. Events without a
+        // numeric step index keep a positional key so they are never merged.
+        const byStepIndex = new Map<string, any>();
+        allCompletedSteps.forEach((s: any, i: number) => {
+          const key = typeof s.data?.step === 'number' ? `step-${s.data.step}` : `pos-${i}`;
+          byStepIndex.set(key, s);
+        });
+        const completedSteps = [...byStepIndex.values()];
         // Reconstruct phase from the test case's setup_steps / steps_json /
         // teardown_steps counts. Indexed by executed-step position so as
         // long as the executor fires step_completed events in order (it does),
@@ -642,26 +612,15 @@ export class RegressionReportAssemblerService {
  */
 export async function getProjectWorkspaceMemberIds(projectId: string, ownerId: string): Promise<string[]> {
   try {
-    const { data: projRow } = await supabaseAdmin
-      .from('projects')
-      .select('workspace_id')
-      .eq('id', projectId)
-      .maybeSingle();
-
-    const workspaceId = (projRow as any)?.workspace_id as string | undefined;
+    const workspaceId = await getProjectWorkspaceId(projectId);
     if (!workspaceId) return [ownerId];
 
-    const { data: members } = await supabaseAdmin
-      .from('workspace_members')
-      .select('user_id')
-      .eq('workspace_id', workspaceId)
-      .eq('status', 'active');
+    const memberIds = await getActiveWorkspaceMemberIds(workspaceId);
 
     const ids = new Set<string>();
     ids.add(ownerId);
-    for (const m of members || []) {
-      const uid = (m as any)?.user_id as string | undefined;
-      if (uid) ids.add(uid);
+    for (const uid of memberIds) {
+      ids.add(uid);
     }
     return Array.from(ids);
   } catch {

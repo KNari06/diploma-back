@@ -1029,20 +1029,25 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                 },
               });
 
+              // Persist to the Redis buffer in-process (the worker owns step
+              // persistence), then broadcast. The job's finally drains this
+              // buffer via finalizeToDb — no cross-process append round-trip.
+              const networkFailStepEvent = {
+                testId: testData.testId,
+                browser: testData.browser,
+                step: currentStepIndex,
+                // Attempt number (0 = first run, 1+ = retries). Frontend uses
+                // (attempt, step) as dedup key and resets the step list when
+                // attempt changes, so retries don't look like mysterious cycles.
+                attempt: retryAttempt,
+                stepDescription,
+                success: false,
+                timestamp: new Date().toISOString(),
+                runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
+              };
+              await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, networkFailStepEvent);
               try {
-                webSocketService.emitTestStepCompleted(testData.testId, {
-                  testId: testData.testId,
-                  browser: testData.browser,
-                  step: currentStepIndex,
-                  // Attempt number (0 = first run, 1+ = retries). Frontend uses
-                  // (attempt, step) as dedup key and resets the step list when
-                  // attempt changes, so retries don't look like mysterious cycles.
-                  attempt: retryAttempt,
-                  stepDescription,
-                  success: false,
-                  timestamp: new Date().toISOString(),
-                  runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
-                });
+                webSocketService.emitTestStepCompleted(testData.testId, networkFailStepEvent);
               } catch (wsError) {
                 logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/network-fail)', {
                   testId: testData.testId, step: currentStepIndex,
@@ -1200,17 +1205,20 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   },
                 });
 
+                // Persist in-process (worker owns persistence), then broadcast.
+                const validationFailStepEvent = {
+                  testId: testData.testId,
+                  browser: testData.browser,
+                  step: currentStepIndex,
+                  attempt: retryAttempt,
+                  stepDescription,
+                  success: false,
+                  timestamp: new Date().toISOString(),
+                  runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
+                };
+                await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, validationFailStepEvent);
                 try {
-                  webSocketService.emitTestStepCompleted(testData.testId, {
-                    testId: testData.testId,
-                    browser: testData.browser,
-                    step: currentStepIndex,
-                    attempt: retryAttempt,
-                    stepDescription,
-                    success: false,
-                    timestamp: new Date().toISOString(),
-                    runtimeMeta: executor.redactRuntimeMeta(enrichedMeta),
-                  });
+                  webSocketService.emitTestStepCompleted(testData.testId, validationFailStepEvent);
                 } catch (wsError) {
                   logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/validation-fail)', {
                     testId: testData.testId, step: currentStepIndex,
@@ -1330,20 +1338,23 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
+            // Persist in-process (worker owns persistence), then broadcast.
+            const completedStepEvent = {
+              testId: testData.testId,
+              browser: testData.browser,
+              step: currentStepIndex,
+              attempt: retryAttempt,
+              stepDescription,
+              success: stepResult.success,
+              // V16: Surface soft failure so frontend can show warning instead of error
+              ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),
+              timestamp: new Date().toISOString(),
+              runtimeMeta: stepResult.runtimeMeta,
+            };
+            await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, completedStepEvent);
             // Emit test:step:completed (non-fatal)
             try {
-              webSocketService.emitTestStepCompleted(testData.testId, {
-                testId: testData.testId,
-                browser: testData.browser,
-                step: currentStepIndex,
-                attempt: retryAttempt,
-                stepDescription,
-                success: stepResult.success,
-                // V16: Surface soft failure so frontend can show warning instead of error
-                ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),
-                timestamp: new Date().toISOString(),
-                runtimeMeta: stepResult.runtimeMeta,
-              });
+              webSocketService.emitTestStepCompleted(testData.testId, completedStepEvent);
             } catch (wsError) {
               logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed)', {
                 testId: testData.testId, step: currentStepIndex,
@@ -1595,18 +1606,21 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               },
             });
 
+            // Persist in-process (worker owns persistence), then broadcast.
+            const failureStepEvent = {
+              testId: testData.testId,
+              browser: testData.browser,
+              step: currentStepIndex,
+              attempt: retryAttempt,
+              stepDescription: intentMeta?.elementDescription || action,
+              success: false,
+              timestamp: new Date().toISOString(),
+              runtimeMeta: executor.redactRuntimeMeta(finalMeta),
+            };
+            await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, failureStepEvent);
             // Emit test:step:completed with failure (non-fatal)
             try {
-              webSocketService.emitTestStepCompleted(testData.testId, {
-                testId: testData.testId,
-                browser: testData.browser,
-                step: currentStepIndex,
-                attempt: retryAttempt,
-                stepDescription: intentMeta?.elementDescription || action,
-                success: false,
-                timestamp: new Date().toISOString(),
-                runtimeMeta: executor.redactRuntimeMeta(finalMeta),
-              });
+              webSocketService.emitTestStepCompleted(testData.testId, failureStepEvent);
             } catch (wsError) {
               logger.warn('[PLAYWRIGHT] WebSocket emit failed (step:completed/failure)', {
                 testId: testData.testId, step: currentStepIndex,

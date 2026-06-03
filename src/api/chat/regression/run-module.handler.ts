@@ -16,6 +16,7 @@ import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for run_module intent
@@ -36,7 +37,7 @@ export async function handleRunModuleIntent(
     abortSignal?: AbortSignal;
   }
 ): Promise<void> {
-  const { parsedIntent, userId, workspace_id } = params;
+  const { parsedIntent, userId } = params;
 
   const userLanguage = parsedIntent?.userLanguage || 'neutral';
   const localized = getLocalizedMessages(userLanguage);
@@ -54,19 +55,13 @@ export async function handleRunModuleIntent(
 
     // Find module by name if no ID
     if (!targetModuleId && moduleName) {
-      const { data: project } = await supabaseAdmin
-        .from('projects')
-        .select('id')
-        .eq('workspace_id', workspace_id)
-        .eq('user_id', userId)
-        .limit(1)
-        .maybeSingle();
+      const projectId = await resolveProjectId(params);
 
-      if (project) {
+      if (projectId) {
         const { data: mod } = await supabaseAdmin
           .from('test_modules')
           .select('id')
-          .eq('project_id', project.id)
+          .eq('project_id', projectId)
           .ilike('name', moduleName)
           .limit(1)
           .maybeSingle();

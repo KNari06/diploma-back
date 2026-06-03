@@ -36,6 +36,8 @@ import type {
 import { STEP_APPLY_CONFIG, STEP_READINESS_CONFIG, COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { executeCoordinateDrag, parseDragCoordinates } from '@/agent/playwright/core/drag-helpers';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
+import { recordedFingerprintHasStrongIdentity, hasStrongIdentityContradiction } from './recorded-identity.util';
+import { probeIdentity } from './step-readiness-v2.service';
 import { waitForHoverEffect } from '../wait-phases/hover-effect-settle';
 import { smartStepWait } from '../smart-step-wait.service';
 
@@ -370,7 +372,7 @@ const POST_ACTION_SETTLE_TIMEOUT = STEP_APPLY_CONFIG.postActionSettleTimeoutMs;
 const STATE_VERIFIABLE_ACTIONS = new Set(['check', 'uncheck', 'toggle', 'open', 'close', 'type', 'click', 'upload']);
 
 // V11: Actions that don't target elements — skip modal check
-const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
+const NON_TARGETING_ACTIONS = new Set(['navigate', 'wait', 'timeout', 'scroll', 'wait_for', 'ai_check', 'wait_for_email', 'dialog', 'download']);
 
 // Actions that mutate DOM and require a fresh snapshot for the next step's lint.
 // After these, we invalidate the cached snapshot so hover→click sequences get fresh nodes.
@@ -384,6 +386,13 @@ const DOM_MUTATING_ACTIONS = new Set(['hover', 'click', 'open', 'close', 'toggle
  * Anything not in this set keeps the old (full) post-action behaviour.
  */
 const POST_ACTION_BUFFER_ACTIONS = new Set(['click', 'dblclick', 'contextmenu', 'press', 'type', 'toggle', 'check', 'uncheck', 'open', 'close']);
+
+/**
+ * Cap (ms) for the live identity probe used by the compiled fast-path
+ * recorded-identity guard. The element was just resolved, so the probe is fast;
+ * on timeout `probeIdentity` returns null → guard fails open (never blocks a hit).
+ */
+const RECORDED_IDENTITY_PROBE_CAP_MS = 1000;
 
 /**
  * V11: Detect if a modal/popup/overlay is currently blocking the page.
@@ -1366,7 +1375,7 @@ interface StepDecisionTrace {
     locatorCount?: number;
     succeededStrategy?: string;
     succeededWithFingerprintMatch?: number;
-    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | null;
+    fellThroughTo?: 'lint' | 'click_no_effect' | 'click_failed' | 'postcondition' | 'skipped' | 'recorded_identity_mismatch' | null;
   };
   /** Identity fast-path diagnostic (id/testId/name match against live DOM). */
   identity?: {
@@ -2421,7 +2430,7 @@ async function executeAction(
     // Build selector (unless we have a pre-resolved locator from compiled plan)
     const selector = preResolvedLocator ? '' : buildSelector(step, candidate);
 
-    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'scroll', 'press'].includes(step.type)) {
+    if (!selector && !preResolvedLocator && !['navigate', 'wait', 'timeout', 'scroll', 'press'].includes(step.type)) {
       return { success: false, error: 'No valid selector for element', urlChanged: false };
     }
 
@@ -2434,7 +2443,7 @@ async function executeAction(
 
     // Scroll element into viewport before action (fullPage snapshots can resolve off-screen elements)
     // Skip for non-targeting actions that don't need a visible element
-    if (locator && !['navigate', 'wait', 'wait_for', 'scroll'].includes(step.type)) {
+    if (locator && !['navigate', 'wait', 'timeout', 'wait_for', 'scroll'].includes(step.type)) {
       await locator.scrollIntoViewIfNeeded({ timeout }).catch(() => {});
     }
 
@@ -2817,6 +2826,13 @@ async function executeAction(
       case 'wait': {
         const waitTimeout = step.options?.timeout || 1000;
         await page.waitForTimeout(waitTimeout);
+        break;
+      }
+
+      case 'timeout': {
+        // Explicit sleep/pause: ms lives in step.value (number of ms to wait)
+        const ms = Number(step.value) || step.options?.timeout || 1000;
+        await page.waitForTimeout(ms);
         break;
       }
 
@@ -3466,6 +3482,32 @@ export class PreviewStepApplyService {
         };
       }
 
+      // open_tab action — create a new tab and navigate it to `value` (URL).
+      // The new tab becomes active (popup-adoption semantics). A URL is
+      // required; openTab refuses an empty value because a blank tab is
+      // auto-closed by the popup handler.
+      if (stepDraft.type === 'open_tab') {
+        const url = (stepDraft.value || '').trim();
+        const opened = await sessionService.openTab(previewSessionId, userId, url);
+
+        // V18: Lightweight settle after open — domcontentloaded only. Full
+        // readiness for the new page is handled by the lookahead before the
+        // next step (same pattern as switch_tab).
+        if (opened) {
+          const newPage = sessionService.getPage(previewSessionId, userId);
+          if (newPage) {
+            try { await newPage.waitForLoadState('domcontentloaded', { timeout: 5_000 }); } catch { /* proceed */ }
+          }
+        }
+
+        return {
+          success: opened,
+          error: opened ? undefined : (url ? `Could not open new tab at ${url}` : 'open_tab requires a URL'),
+          url: sessionService.getPage(previewSessionId, userId)?.url() || '',
+          attempts: 1,
+        };
+      }
+
       // V15: Auto-switch tab if step targets a different tab than currently active
       const session = sessionService.getSession(previewSessionId);
       if (session && stepDraft.tabIndex !== undefined && stepDraft.tabIndex !== session.activeTabIndex) {
@@ -3502,9 +3544,9 @@ export class PreviewStepApplyService {
         };
       }
 
-      // Handle non-targeting actions (navigate, wait, scroll)
+      // Handle non-targeting actions (navigate, wait, timeout, scroll)
       // Scroll is page-level: uses step.value (deltaY) without targeting a DOM element
-      if (['navigate', 'wait', 'scroll'].includes(stepDraft.type)) {
+      if (['navigate', 'wait', 'timeout', 'scroll'].includes(stepDraft.type)) {
         // V5: Capture URL BEFORE action for accurate compiled context
         // This is important for auto-wait-for-url injection which compares adjacent pageUrls
         const urlBeforeAction = page.url();
@@ -4410,6 +4452,46 @@ export class PreviewStepApplyService {
               succeededWithFingerprintMatch: compiledResult.confidence,
               fellThroughTo: null,
             });
+
+            // ── Recorded-identity guard ──────────────────────────────────
+            // `executeCompiledLocatorPlan` only validated the match against the
+            // plan's OWN `targetFingerprint` — a self-echo of a PRIOR resolver
+            // decision (invariant #15). It never re-checks the ORIGINAL recorded
+            // identity, so a drifted text/label strategy can "succeed" on a
+            // different element than a fresh single-step Apply (which always
+            // resolves via the LLM, because the editor sends no compiled plan).
+            // Re-probe the resolved element and reject when a recorded STRONG
+            // identifier (id/testId/name/href/svgIcon/routerLink, URL-normalized)
+            // contradicts it — throw to fall through to lint so Run and Apply
+            // converge. SAME comparator as the evidence path and the readiness
+            // gate (hasStrongIdentityContradiction). Only probes when the
+            // fingerprint has strong identity; manual-add steps (no fingerprint)
+            // and probe failures fail open.
+            if (recordedFingerprintHasStrongIdentity(stepDraft.recordedFingerprint)) {
+              const identityProbe = await probeIdentity(compiledResult.locator, RECORDED_IDENTITY_PROBE_CAP_MS).catch(() => null);
+              if (hasStrongIdentityContradiction(identityProbe, stepDraft.recordedFingerprint)) {
+                logger.info('[PREVIEW_APPLY] Compiled hit rejected — recorded-identity contradiction, falling through to lint', {
+                  previewSessionId,
+                  stepId: stepDraft.id,
+                  strategy: compiledResult.usedStrategy,
+                });
+                setTraceCompiled({ fellThroughTo: 'recorded_identity_mismatch' });
+                try {
+                  EditorTraceService.get(previewSessionId)?.writeCompiledPostcondition({
+                    stepId: stepDraft.id,
+                    expectsNavigation: false,
+                    urlChanged: false,
+                    accepted: false,
+                    reason: 'recorded_identity_mismatch',
+                  });
+                } catch { /* non-fatal */ }
+                compiledWasTried = true;
+                // Break out of the success path; the surrounding try/catch turns
+                // this into a `compiledWasTried = true` fall-through to lint —
+                // same idiom as the compiled-click-no-effect bail below.
+                throw new Error('compiled-recorded-identity-mismatch');
+              }
+            }
 
             // Build candidate from compiled result
             // V15: Extract data-agent-ref from resolved element so evidence shortcut

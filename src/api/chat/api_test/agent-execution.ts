@@ -41,6 +41,7 @@ export async function executeApiAgentTestFlow(
     projectId?: string;
     workspaceId?: string;
     userMessage?: string;
+    abortSignal?: AbortSignal;
   }
 ): Promise<void> {
   const {
@@ -54,8 +55,8 @@ export async function executeApiAgentTestFlow(
     userId,
     chatSessionId,
     projectId,
-    workspaceId,
     userMessage,
+    abortSignal,
   } = params;
 
   // If UI didn't provide explicit expectedBehavior, fallback to a trimmed user message.
@@ -143,10 +144,29 @@ export async function executeApiAgentTestFlow(
       chatSessionId,
       projectId,
       userMessage,
+      abortSignal,
     };
 
     // Run the agent
     const agentResponse = await ApiAgentOrchestratorService.run(agentRequest);
+
+    // If the user cancelled mid-run, refund the baseline and skip billing/
+    // persistence — the run was halted and produced no deliverable result.
+    if (abortSignal?.aborted) {
+      await ApiAgentCreditsService.refundBaselineCredits(
+        userId,
+        level,
+        testId,
+        'cancelled by user'
+      );
+      res.status(499).json({
+        success: false,
+        error: 'Request was cancelled by user',
+        timestamp: new Date().toISOString(),
+        sessionId: chatSessionId,
+      });
+      return;
+    }
 
     // Deduct incremental credits for AI usage (if exceeded baseline)
     const incrementalResult = await ApiAgentCreditsService.deductIncrementalCredits(
@@ -200,6 +220,10 @@ export async function executeApiAgentTestFlow(
     });
 
     const errorMsg = error instanceof Error ? error.message : 'API Agent test failed';
+
+    // Refund the baseline credits — the run failed before producing any result,
+    // so the user should not be billed for it. Best-effort; never masks errorMsg.
+    await ApiAgentCreditsService.refundBaselineCredits(userId, level, testId, errorMsg);
 
     if (chatSessionId) {
       await ChatService.saveChatMessages(chatSessionId, [

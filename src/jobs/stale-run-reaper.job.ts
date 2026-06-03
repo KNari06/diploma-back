@@ -1,10 +1,10 @@
 /**
  * Stale-Run Reaper Job
  *
- * Periodic sweep that finalizes regression runs stuck in 'running' /
- * 'pending'. Companion to `TestCompletionHandlerService.reapStaleRuns` —
- * this file is just the scheduler + error isolation; all the logic lives
- * in the service so it can also be triggered ad-hoc from a script.
+ * Periodic sweep that finalizes regression runs and standalone tests stuck
+ * in 'running'/'pending'. Companion to `StaleReaperService` — this file is
+ * just the scheduler + error isolation; all the logic lives in the service
+ * so it can also be triggered ad-hoc from a script.
  *
  * ──────────────────────────────────────────────────────────────────────
  * Why it exists
@@ -27,7 +27,7 @@
  */
 
 import { logger } from '@/utils/core/logger';
-import { TestCompletionHandlerService } from '@/services/testing/results/test-completion-handler.service';
+import { StaleReaperService } from '@/services/testing/results/stale-reaper.service';
 
 /** Tick interval — default 5 min. Frequent enough to clear orphans fast,
  *  cheap enough (one indexed query returning ~0 rows in the common case). */
@@ -91,8 +91,10 @@ export class StaleRunReaperJob {
     }
   }
 
-  /** Process one tick. Delegates to the service; never throws. */
-  static async tick(): Promise<{ scanned: number }> {
-    return TestCompletionHandlerService.reapStaleRuns(THRESHOLD_MINUTES);
+  /** Process one tick — sweep orphaned regression runs AND standalone tests. */
+  static async tick(): Promise<{ runs: number; tests: number }> {
+    const runs = await StaleReaperService.reapStaleRuns(THRESHOLD_MINUTES);
+    const tests = await StaleReaperService.reapStaleTests(THRESHOLD_MINUTES);
+    return { runs: runs.scanned, tests: tests.scanned };
   }
 }

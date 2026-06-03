@@ -212,4 +212,127 @@ export class RegressionTestQueryService {
 
     return (configs || []).map((c: any) => ({ id: c.id, flow_id: c.flow_id || undefined }));
   }
+
+  /**
+   * Step-count source rows for credit estimation. Empty input → empty array.
+   */
+  static async getUiStepCountRows(uiIds: string[]): Promise<any[]> {
+    if (uiIds.length === 0) return [];
+
+    const { data } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, commands, graph_ref, steps_json, setup_steps, teardown_steps, replay_strategy')
+      .in('id', uiIds);
+
+    return data || [];
+  }
+
+  /**
+   * List intent test cases for a project (newest first), optionally filtered by
+   * platform. Surfaces the query error so the caller can throw.
+   */
+  static async listByProject(
+    projectId: string,
+    limit: number,
+    platform?: string,
+  ): Promise<{ data: any[] | null; error: unknown }> {
+    let query = supabaseAdmin
+      .from('intent_test_cases')
+      .select('*')
+      .eq('project_id', projectId);
+
+    if (platform) {
+      query = query.eq('platform', platform);
+    }
+
+    const { data, error } = await query
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    return { data: (data as any[]) ?? null, error };
+  }
+
+  /**
+   * depends_on arrays for the given UI test case ids. Empty input → empty array.
+   */
+  static async getDependsOnRows(
+    uiCaseIds: string[],
+  ): Promise<Array<{ id: string; depends_on: string[] | null }>> {
+    if (uiCaseIds.length === 0) return [];
+
+    const { data } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, depends_on')
+      .in('id', uiCaseIds);
+
+    return (data as Array<{ id: string; depends_on: string[] | null }>) || [];
+  }
+
+  /**
+   * Module row with owner + platform join (for access check + platform resolve).
+   */
+  static async getModuleWithAccess(
+    moduleId: string,
+  ): Promise<{ data: any | null; error: unknown }> {
+    const { data, error } = await supabaseAdmin
+      .from('test_modules')
+      .select('*, projects!inner(user_id), test_platforms!inner(platform_key)')
+      .eq('id', moduleId)
+      .single();
+
+    return { data: data ?? null, error };
+  }
+
+  /**
+   * Flow ids within a module. Empty result → empty array.
+   */
+  static async getFlowIdsByModule(moduleId: string): Promise<string[]> {
+    const { data } = await supabaseAdmin
+      .from('test_flows')
+      .select('id')
+      .eq('module_id', moduleId);
+
+    return ((data as Array<{ id: string }>) || []).map((f) => f.id);
+  }
+
+  /**
+   * Flow row with module + owner join (for access check).
+   */
+  static async getFlowWithAccess(
+    flowId: string,
+  ): Promise<{ data: any | null; error: unknown }> {
+    const { data, error } = await supabaseAdmin
+      .from('test_flows')
+      .select('*, test_modules!inner(project_id, projects!inner(user_id))')
+      .eq('id', flowId)
+      .single();
+
+    return { data: data ?? null, error };
+  }
+
+  /**
+   * UI test cases for a project carrying a given tag. Empty result → empty array.
+   */
+  static async getUiTestCasesByTag(projectId: string, tag: string): Promise<any[]> {
+    const { data } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, flow_id, depends_on, platform, priority')
+      .eq('project_id', projectId)
+      .contains('tags', [tag]);
+
+    return data || [];
+  }
+
+  /**
+   * UI test cases for a project at a given priority. Empty result → empty array.
+   */
+  static async getUiTestCasesByPriority(projectId: string, priority: Priority): Promise<any[]> {
+    const { data } = await supabaseAdmin
+      .from('intent_test_cases')
+      .select('id, flow_id, depends_on, platform')
+      .eq('project_id', projectId)
+      .eq('priority', priority);
+
+    return data || [];
+  }
 }

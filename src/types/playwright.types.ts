@@ -32,6 +32,7 @@ export type PlaywrightStepType =
   | 'tap'               // Tap gesture (mobile)
   // Wait & Scroll
   | 'wait'              // Wait for timeout (ms)
+  | 'timeout'           // Explicit sleep/pause for N ms (maps to waitForTimeout)
   | 'waitForSelector'   // Wait for element to appear
   | 'waitForTimeout'    // Wait for specific timeout (alias for wait)
   | 'waitForLoadState'  // Wait for page load state

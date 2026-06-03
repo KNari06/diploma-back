@@ -103,6 +103,36 @@ export async function getRunsByIds(ids: string[]): Promise<StaleRunRow[]> {
   return (data ?? []) as StaleRunRow[];
 }
 
+// ── stale standalone tests ────────────────────────────────────────────────────
+
+/**
+ * Standalone `tests` rows stuck 'running' past `cutoffIso` (the job started —
+ * `started_at` is set — but never finalized; e.g. the worker process died
+ * mid-run). 'running'-only by design: a 'running' row provably began, so after
+ * the threshold it's dead; 'pending' is left alone to avoid killing work
+ * legitimately queued behind a busy worker.
+ *
+ * Throws on DB/network error — the caller wraps this in try/catch.
+ */
+export async function findStaleRunningTests(
+  cutoffIso: string,
+  limit = 100,
+): Promise<Array<{ id: string }>> {
+  const { data, error } = await supabaseAdmin
+    .from('tests')
+    .select('id')
+    .eq('status', 'running')
+    .lt('started_at', cutoffIso)
+    .order('started_at', { ascending: true })
+    .limit(limit);
+
+  if (error) {
+    throw new Error(`findStaleRunningTests failed: ${error.message}`);
+  }
+
+  return (data ?? []) as Array<{ id: string }>;
+}
+
 // ── force-fail stuck rows ─────────────────────────────────────────────────────
 
 /**
@@ -144,4 +174,30 @@ export async function forceFailStuckTests(
     .in('id', testIds);
 
   return { error };
+}
+
+/**
+ * Guarded terminal write for a single `tests` row abandoned by a dead job.
+ * The `.in('status', ['running','pending'])` guard makes this idempotent and
+ * race-safe: it only flips a still-live row, so it's a no-op when the job
+ * already finalized gracefully or when a concurrent worker replica won the
+ * race. `flipped` tells the caller whether THIS call did the transition.
+ */
+export async function finalizeAbandonedTest(
+  testId: string,
+  status: 'failed' | 'timeout',
+  reason: string,
+): Promise<{ flipped: boolean; error: unknown }> {
+  const { data, error } = await supabaseAdmin
+    .from('tests')
+    .update({
+      status,
+      error_message: reason,
+      completed_at: new Date().toISOString(),
+    })
+    .eq('id', testId)
+    .in('status', ['running', 'pending'])
+    .select('id');
+
+  return { flipped: !!(data && data.length > 0), error };
 }
