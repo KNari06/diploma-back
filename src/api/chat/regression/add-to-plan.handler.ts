@@ -65,7 +65,17 @@ export async function handleAddToPlanIntent(
     }
 
     // Find plan by ID or name
-    let targetPlanId = planId;
+    let targetPlanId: string | undefined;
+    if (planId) {
+      // A plan id from the parsed intent is attacker-controllable — authorize it
+      // through getById (workspace-membership check) before trusting it. Without
+      // this, any authenticated user could add items to a plan they cannot read.
+      const authorizedPlan = await RegressionPlanService.getById(planId, userId);
+      if (!authorizedPlan) {
+        throw new NotFoundError('Plan', planId);
+      }
+      targetPlanId = authorizedPlan.id;
+    }
     if (!targetPlanId && planName) {
       const plans = await RegressionPlanService.listByProject(project.id, userId);
       const matchedPlan = plans.find(

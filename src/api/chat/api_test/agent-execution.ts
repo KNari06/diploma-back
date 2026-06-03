@@ -201,6 +201,10 @@ export async function executeApiAgentTestFlow(
 
     const errorMsg = error instanceof Error ? error.message : 'API Agent test failed';
 
+    // Refund the baseline credits — the run failed before producing any result,
+    // so the user should not be billed for it. Best-effort; never masks errorMsg.
+    await ApiAgentCreditsService.refundBaselineCredits(userId, level, testId, errorMsg);
+
     if (chatSessionId) {
       await ChatService.saveChatMessages(chatSessionId, [
         { role: 'ai', content: `❌ Error: ${errorMsg}` },
