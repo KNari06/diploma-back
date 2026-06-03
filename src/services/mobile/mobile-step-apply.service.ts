@@ -330,6 +330,10 @@ export class MobileStepApplyService {
                   ...coordParams,
                   text: stepDraft.value,
                   clearFirst: !!(stepDraft.options?.replaceContent),
+                  // Editor "type like a human" toggle. Forwarded to the runner,
+                  // which on Flutter types per-character ('human') / atomically
+                  // ('instant'), or applies its heuristic ('auto'/undefined).
+                  ...(stepDraft.options?.typeMode ? { typeMode: stepDraft.options.typeMode } : {}),
                 },
               });
               if (stepDraft.options?.pressEnter) {

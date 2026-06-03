@@ -1975,6 +1975,8 @@ export async function runTestCaseOnSession(req: Request, res: Response): Promise
                     ...coordParams,
                     text: step.value,
                     clearFirst: !!(step.options?.replaceContent),
+                    // Editor "type like a human" toggle → runner typing realism.
+                    ...(step.options?.typeMode ? { typeMode: step.options.typeMode } : {}),
                   },
                 });
                 if (step.options?.pressEnter) {

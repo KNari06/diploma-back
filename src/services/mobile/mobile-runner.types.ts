@@ -137,6 +137,13 @@ export interface MobileIntentStepOptions {
   timeout?: number;
   replaceContent?: boolean;
   pressEnter?: boolean;
+  /**
+   * Typing realism for a type step (editor "type like a human" toggle).
+   * 'human' = per-character, 'instant' = atomic, 'auto'/undefined = the runner's
+   * heuristic. Forwarded verbatim into the runner type_text command's typeMode.
+   * Flutter-only effect; native typing is always per-key.
+   */
+  typeMode?: 'auto' | 'human' | 'instant';
   scrollDirection?: 'up' | 'down' | 'left' | 'right';
   scrollAmount?: number;
   /** Swipe direction (mobile swipe step). Distinct from scrollDirection so
