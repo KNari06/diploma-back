@@ -66,6 +66,7 @@ Element resolution and auto-healing serve all three.
 | [page-load-error.util.ts](page-load-error.util.ts) | Pure detector for browser load-failure pages (`chrome-error://chromewebdata/`, etc.). Single source of truth used by apply handler and run loop to surface `preview:page:load-error` instead of timing out for 60s on a blank error page. |
 | [new-tab-opener.ts](new-tab-opener.ts) | Promotes anchor clicks to real new tabs via `context.newPage() + goto(href)` when `<a target="...">` is set, when the href is cross-origin, or when modifier keys request a new tab (Cmd/Ctrl/Shift). Used by `CommandExecutor.performClick`, preview-step-apply `executeAction` click branch, preview-session live `executeMouseAction`, and `PreviewSessionService.openTab` (reason `'programmatic'`, backing the `open_tab` step type). The new page is adopted by `attachPopupHandler` like any other popup. |
 | [evidence-shortcut.utils.ts](evidence-shortcut.utils.ts) | Cached "this evidence already worked" shortcut to skip resolver. |
+| [recorded-identity.util.ts](recorded-identity.util.ts) | `recordedFingerprintHasStrongIdentity` (cheap pre-gate) + `nodeToIdentityProbe` (InteractiveNode → canonical `IdentityProbe`) + re-export of `hasStrongIdentityContradiction`. Re-validate compiled / evidence cache hits against the ORIGINAL `recordedFingerprint` (not the plan's self-echoed `targetFingerprint`). Comparison delegates to the SAME normalized primitive the readiness gate uses (`hasStrongIdentityContradiction` in [step-readiness-v2.service.ts](step-readiness-v2.service.ts), `fieldEq`/`normUrlLike`). Fail-open when the fingerprint is weak. |
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
 | [page-interactive.utils.ts](page-interactive.utils.ts) | "Is page interactive yet" heuristic. |
 | [text-normalizer.util.ts](text-normalizer.util.ts) | Unicode/whitespace normalization for label matching. |
@@ -299,10 +300,26 @@ buildAllowedSets(snapshot, intent)
 (1) Evidence shortcut
     if step has lastSuccessRef and that node is still findable → use it.
     → resolverPath = 'evidence_shortcut'
+    GUARD: hasStrongIdentityContradiction(nodeToIdentityProbe(cachedNode),
+    recordedFingerprint) — if a recorded STRONG identifier (id/testId/name/href/
+    svgIcon/routerLink, URL-normalized) now resolves to a different value, bypass
+    the cache (fall to LLM).
 
 (2) Compiled plan
     iterate role → testId → label → placeholder → text → css.
     → resolverPath = 'compiled'
+    GUARD: after the plan resolves, re-probe the element (probeIdentity) and run
+    the SAME hasStrongIdentityContradiction vs the ORIGINAL recordedFingerprint
+    (NOT the plan's self-echoed targetFingerprint). Contradiction → throw → fall
+    through to lint. Closes the Run-vs-Apply divergence: a single-step Apply
+    sends no compiled/evidence so it always resolves fresh, while Run replays the
+    cache — without this guard a drifted plan clicks a different element in Run
+    than Apply. Both guards share ONE comparator (step-readiness-v2
+    `hasStrongIdentityContradiction`, `fieldEq`/`normUrlLike`) so they never
+    disagree. Only enforced when the fingerprint has strong identity
+    (recordedFingerprintHasStrongIdentity); weak fingerprints / probe failures
+    fail open (manual-add steps untouched). Text/label drift is WEAK → never a
+    hard reject.
 
 (3) LLM resolver (Gemini Flash)
     input: intent text, action type, candidates (top-K), scene summary.

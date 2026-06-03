@@ -19,6 +19,7 @@ import { logIntentResolveLint } from './intent-resolve-audit';
 import { collectSecretValues } from '@/utils/interpolation/redact-secrets';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { isDynamicId } from './dynamic-id.util';
+import { recordedFingerprintHasStrongIdentity, nodeToIdentityProbe, hasStrongIdentityContradiction } from './recorded-identity.util';
 import { getPreviewSessionService } from './preview-session.service';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import type {
@@ -1276,7 +1277,38 @@ export class IntentStepLintService {
         // isVisible !== false heuristic) so it stays here and NOT in the utility.
         const compat = this.isEvidenceShortcutNodeCompatible(stepDraft, cachedNode, snapshot.url);
 
-        if (compat.ok) {
+        if (
+          compat.ok
+          && recordedFingerprintHasStrongIdentity(stepDraft.recordedFingerprint)
+          && hasStrongIdentityContradiction(nodeToIdentityProbe(cachedNode), stepDraft.recordedFingerprint)
+        ) {
+          // Recorded-identity guard: the cached lastSuccessRef still exists and
+          // is action-compatible, but a recorded STRONG identifier (id / testId /
+          // name / href / svgIcon / routerLink) now resolves to a DIFFERENT value
+          // — the page drifted and the ref points at another element than a fresh
+          // resolution would pick. Bypass the cache so a full Run converges on the
+          // same element as single-step Apply (which never carries evidence and
+          // always resolves fresh). Same comparator (hasStrongIdentityContradiction,
+          // URL-normalized) as the compiled path. Fail-open on weak fingerprints —
+          // manual-add steps are untouched.
+          logger.info('[INTENT_LINT_V5] Evidence shortcut bypass — recorded-identity mismatch', {
+            previewSessionId,
+            cachedRef,
+            actionType: stepDraft.type,
+            nodeTag: cachedNode.tag,
+            nodeText: cachedNode.text ? cachedNode.text.slice(0, 40) : undefined,
+          });
+          cacheMetrics.inc('evidence-shortcut', 'identity_mismatch');
+          cacheMetrics.inc('evidence-shortcut', 'miss');
+          try {
+            EditorTraceService.get(previewSessionId)?.writeEvidenceShortcut({
+              stepId: stepDraft.id,
+              hit: false,
+              cachedRef,
+              reason: 'recorded_identity_mismatch',
+            });
+          } catch { /* trace logging must never break resolution */ }
+        } else if (compat.ok) {
           logger.debug('[INTENT_LINT_V5] Evidence shortcut hit', {
             previewSessionId,
             cachedRef,
@@ -1334,17 +1366,21 @@ export class IntentStepLintService {
         }
 
         // Passed shared checks but failed action-type compat — bypass cache.
-        logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - node incompatible with action', {
-          previewSessionId,
-          cachedRef,
-          actionType: stepDraft.type,
-          nodeTag: cachedNode.tag,
-          nodeRole: cachedNode.role,
-          nodeType: cachedNode.type || cachedNode.inputType,
-          reason: compat.reason,
-        });
-        cacheMetrics.inc('evidence-shortcut', 'compat_mismatch');
-        cacheMetrics.inc('evidence-shortcut', 'miss');
+        // Guarded so the recorded-identity-mismatch branch above (which also
+        // leaves compat.ok true) doesn't double-count as a compat mismatch.
+        if (!compat.ok) {
+          logger.debug('[INTENT_LINT_V5] Evidence shortcut bypass - node incompatible with action', {
+            previewSessionId,
+            cachedRef,
+            actionType: stepDraft.type,
+            nodeTag: cachedNode.tag,
+            nodeRole: cachedNode.role,
+            nodeType: cachedNode.type || cachedNode.inputType,
+            reason: compat.reason,
+          });
+          cacheMetrics.inc('evidence-shortcut', 'compat_mismatch');
+          cacheMetrics.inc('evidence-shortcut', 'miss');
+        }
       }
     }
 

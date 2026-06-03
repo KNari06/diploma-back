@@ -394,7 +394,7 @@ async function checkLevel2(
 // LEVEL 3 — IDENTITY (recordedFingerprint match)
 // ═══════════════════════════════════════════════════════════════════════════
 
-interface IdentityProbe {
+export interface IdentityProbe {
   elementId?: string;
   testIdAttr?: string;
   name?: string;
@@ -409,7 +409,7 @@ interface IdentityProbe {
   tag?: string;
 }
 
-async function probeIdentity(loc: Locator, capMs: number): Promise<IdentityProbe | null> {
+export async function probeIdentity(loc: Locator, capMs: number): Promise<IdentityProbe | null> {
   return withCap(
     () =>
       // @ts-ignore
@@ -463,16 +463,25 @@ async function probeIdentity(loc: Locator, capMs: number): Promise<IdentityProbe
   );
 }
 
-/** Нормализация URL-подобных полей перед сравнением (#10 fix). */
+/**
+ * Нормализация URL-подобных полей перед сравнением (#10 fix).
+ *
+ * Origin is intentionally DROPPED. The recorder stores the raw `href`
+ * ATTRIBUTE (often relative, e.g. `/courses/math` — recording-capture.ts) while
+ * live probes read the IDL `.href` (always absolute, e.g.
+ * `https://site/courses/math`). Comparing origin-less path+search+hash makes the
+ * same target match across that asymmetry; genuinely different paths still
+ * differ. Same target on a different origin is treated as equal — acceptable
+ * for identity matching (href is one of several strong signals).
+ */
 function normUrlLike(s: string): string {
   try {
     const u = new URL(s);
-    // strip trailing slash on pathname; keep search/hash
     const path = u.pathname.replace(/\/+$/, '') || '/';
-    return `${u.origin}${path}${u.search}${u.hash}`;
+    return `${path}${u.search}${u.hash}`;
   } catch {
-    // not a full URL — strip trailing slash
-    return s.replace(/\/+$/, '');
+    // Relative href (no origin) — strip trailing slash, keep path+query.
+    return s.replace(/\/+$/, '') || '/';
   }
 }
 
@@ -544,6 +553,32 @@ function classifyIdentityRaw(
   }
 
   return { match: 'weak', score };
+}
+
+/**
+ * True iff a recorded STRONG identifier (elementId / testIdAttr / name / href /
+ * svgIcon / routerLink) has a DIFFERENT non-empty value on the probed element.
+ * URL-like fields are normalized via `fieldEq` (`normUrlLike`). Missing live
+ * values are neutral — only a genuine contradiction counts.
+ *
+ * Single comparison primitive shared by the readiness gate and the cache-hit
+ * recorded-identity guard (`recorded-identity.util`), so a full Run rejects a
+ * drifted compiled/evidence hit and re-resolves like single-step Apply instead
+ * of clicking a different element.
+ */
+export function hasStrongIdentityContradiction(
+  probe: IdentityProbe | null,
+  fp: TargetFingerprint | undefined,
+): boolean {
+  if (!fp || !probe) return false;
+  for (const f of V2.identity.strongFields) {
+    const want = (fp as any)[f];
+    const got = (probe as any)[f];
+    if (want === undefined || want === null || want === '') continue;
+    if (got === undefined || got === null || got === '') continue;
+    if (!fieldEq(f, want, got)) return true;
+  }
+  return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
