@@ -118,6 +118,8 @@ function mapActionType(intentAction: IntentActionType): string {
       return 'click';
     case 'wait':
       return 'wait';
+    case 'timeout':
+      return 'wait'; // Explicit sleep — reuses the executor's waitForTimeout command
     case 'assert':
       return 'assert'; // Dispatcher in executor: delegates by assertion.type (visible/text/value/etc)
     case 'navigate':
@@ -351,8 +353,9 @@ export function convertIntentStepToCommand(
       command.value = step.value || '';
       break;
 
-    case 'wait': {
-      // For wait, value might be time in ms
+    case 'wait':
+    case 'timeout': {
+      // For wait/timeout, value is the time in ms to pause
       // ESLint: wrap in block to avoid no-case-declarations
       const waitTimeMsRaw = step.value ?? '1000';
       const waitTimeMs = typeof waitTimeMsRaw === 'number' ? waitTimeMsRaw : Number(waitTimeMsRaw);
