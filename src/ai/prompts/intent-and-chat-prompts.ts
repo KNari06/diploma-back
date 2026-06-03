@@ -9,6 +9,8 @@
  * - Approval detection
  */
 
+import { buildUnderstandingExtension } from './request-understanding-prompts';
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SHARED — SCOPE GUARD (used by every user-facing chat prompt)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -592,6 +594,11 @@ Ex36: "fix it" / "сделай нормально" (mobileSessionId in context, 
       prompt += `\nPROJECT: ${context.projectInfo}`;
     }
   }
+
+  // Request-understanding extension: ANALYZE (decompose / targetSelector /
+  // executionModifiers) + IMPROVE (routeHint) added to the SAME JSON output,
+  // so there is no extra LLM round-trip for the common case.
+  prompt += `\n${buildUnderstandingExtension()}`;
 
   prompt += `\nRETURN ONLY VALID JSON (no markdown):`;
 

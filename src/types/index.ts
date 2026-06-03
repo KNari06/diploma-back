@@ -1029,6 +1029,22 @@ export interface IntentResult {
   // false → pipeline skips Router agent (~600ms saved), goes directly to Responder.
   // true/undefined → normal Router flow (backward compatible).
   needsTools?: boolean;
+
+  // Request-understanding layer (Phase 1). Populated from the ANALYZE block of
+  // the intent classification call. Optional + additive — existing handlers
+  // ignore these; the post-parse enrichment stage in intent-parsing.ts consumes
+  // them. Full analysis (isCompound/subRequests/routeHint) lives in
+  // metadata.analysis; these two are lifted out for typed access.
+  targetSelector?: {
+    type: 'test_case' | 'module' | 'plan' | 'flow' | 'tag' | 'keyword' | 'url' | 'element' | 'none';
+    value: string;
+  } | null;
+  executionModifiers?: {
+    browser?: 'chromium' | 'firefox' | 'webkit';
+    device?: string;
+    env?: 'local' | 'staging' | 'prod';
+    build?: string;
+  } | null;
 }
 
 // Playwright Command types

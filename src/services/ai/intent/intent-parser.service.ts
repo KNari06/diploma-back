@@ -1373,6 +1373,12 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
     });
   }
 
+  // Step 4b: Lift the request-understanding ANALYZE block (if the LLM returned
+  // one) into typed fields + metadata. Purely additive — never throws, and a
+  // missing/malformed analysis object is simply ignored so the 19 existing
+  // intents are unaffected.
+  liftAnalysisBlock(parsed, parsedAny);
+
   // Step 5: Normalize and clean fields based on intent type
   if (parsed.intent === 'api_test') {
     // Tokenize on Unicode word boundaries via splitting on
@@ -1686,6 +1692,67 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
   });
 
   return parsed;
+}
+
+/**
+ * Lift the request-understanding ANALYZE block from the raw LLM JSON into typed
+ * IntentResult fields. Defensive: validates each piece independently so a
+ * partial/garbage `analysis` never corrupts the result or throws.
+ */
+function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
+  const analysis = parsedAny?.analysis;
+  if (!analysis || typeof analysis !== 'object') return;
+
+  if (!parsed.metadata) parsed.metadata = {};
+
+  // Compound decomposition → metadata.analysis (consumed by the splitter later).
+  const subRequests = Array.isArray(analysis.subRequests)
+    ? analysis.subRequests
+        .filter((s: any) => s && typeof s.text === 'string' && s.text.trim().length > 0)
+        .map((s: any, i: number) => ({
+          text: String(s.text).trim(),
+          order: Number.isFinite(s.order) ? Number(s.order) : i + 1,
+          dependsOnPrevious: s.dependsOnPrevious === true,
+        }))
+    : [];
+  parsed.metadata.analysis = {
+    isCompound: analysis.isCompound === true && subRequests.length > 1,
+    subRequests,
+    routeHint: analysis.routeHint === 'dedicated' || analysis.routeHint === 'tool'
+      ? analysis.routeHint
+      : undefined,
+  };
+
+  // Target selector → typed field.
+  const sel = analysis.targetSelector;
+  const VALID_SELECTOR_TYPES = new Set([
+    'test_case', 'module', 'plan', 'flow', 'tag', 'keyword', 'url', 'element', 'none',
+  ]);
+  if (
+    sel &&
+    typeof sel === 'object' &&
+    VALID_SELECTOR_TYPES.has(sel.type) &&
+    typeof sel.value === 'string' &&
+    sel.value.trim().length > 0 &&
+    sel.type !== 'none'
+  ) {
+    parsed.targetSelector = { type: sel.type, value: sel.value.trim() };
+  }
+
+  // Execution modifiers → typed field (only keep recognized, well-formed keys).
+  const mods = analysis.executionModifiers;
+  if (mods && typeof mods === 'object') {
+    const clean: NonNullable<IntentResult['executionModifiers']> = {};
+    if (mods.browser === 'chromium' || mods.browser === 'firefox' || mods.browser === 'webkit') {
+      clean.browser = mods.browser;
+    }
+    if (mods.env === 'local' || mods.env === 'staging' || mods.env === 'prod') {
+      clean.env = mods.env;
+    }
+    if (typeof mods.device === 'string' && mods.device.trim()) clean.device = mods.device.trim();
+    if (typeof mods.build === 'string' && mods.build.trim()) clean.build = mods.build.trim();
+    if (Object.keys(clean).length > 0) parsed.executionModifiers = clean;
+  }
 }
 
 /**

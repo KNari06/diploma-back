@@ -9,6 +9,7 @@ import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
 import { getAvailableIntents, hasHandler } from './handler-registry';
+import { attachResolvedTargets } from './intent-target-resolution';
 import { buildRegressionContext } from './regression-context';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
@@ -601,6 +602,17 @@ export async function parseIntent(
           parsedIntent.intent = 'general_chat';
         }
       }
+
+      // Post-parse enrichment: resolve a descriptor-style targetSelector
+      // ("payment tests", "smoke-tagged", "Release v2 plan") to concrete IDs so
+      // descriptor-based requests are actionable. Best-effort, additive, scoped
+      // to the resolved project — runs AFTER the guards so it acts on the final
+      // intent and never resurrects a blocked one.
+      await attachResolvedTargets({
+        parsedIntent,
+        projectId: projectId ?? undefined,
+        currentUrl: contextObj?.currentUrl,
+      });
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
         error: intentError instanceof Error ? intentError.message : String(intentError),
