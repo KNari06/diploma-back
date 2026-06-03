@@ -15,6 +15,7 @@ import { RegressionPlanService } from '@/services/testing/plans/regression-plan.
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
+import { getResolvedTargets } from '../shared/intent-target-resolution';
 import { resolveProjectId } from './project-resolver';
 
 /**
@@ -78,6 +79,19 @@ export async function handleAddToPlanIntent(
       );
       if (matchedPlan) {
         targetPlanId = matchedPlan.id;
+      }
+    }
+    // Fall back to the understanding layer: when the user named the plan only
+    // descriptively ("add ... to my nightly regression"), the resolver may have
+    // uniquely identified it. Still authorize via getById — the resolved id is
+    // project-scoped but we keep the single authorization path.
+    if (!targetPlanId) {
+      const resolved = getResolvedTargets(parsedIntent);
+      if (resolved?.selectorType === 'plan' && resolved.resolution === 'unique' && resolved.topId) {
+        const authorizedPlan = await RegressionPlanService.getById(resolved.topId, userId);
+        if (authorizedPlan) {
+          targetPlanId = authorizedPlan.id;
+        }
       }
     }
 

@@ -105,11 +105,13 @@ export class RegressionRunService {
     userId: string;
     trigger: 'manual' | 'chat' | 'scheduled' | 'webhook';
     parameters?: Record<string, any>;
+    /** Optional Playwright browser override (chromium | firefox | webkit). */
+    browserOverride?: string;
   }): Promise<{
     runId: string;
     testId: string;
   }> {
-    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {} } = params;
+    const { savedTestCaseId: intentTestCaseId, userId, trigger, parameters = {}, browserOverride } = params;
 
     try {
       logger.info('[REGRESSION_RUN] Running intent test case', {
@@ -162,7 +164,7 @@ export class RegressionRunService {
           testId = mobileResult.testId;
         } else {
           // Web test → dispatch to Playwright queue
-          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, undefined, trigger);
+          const testRequest = await WebTestRequestBuilderService.buildTestRequest(intentCase, userId, parameters, browserOverride, trigger);
           const testResult = await ManualTestService.runTest(testRequest);
 
           if (!testResult.success || !testResult.data?.id) {

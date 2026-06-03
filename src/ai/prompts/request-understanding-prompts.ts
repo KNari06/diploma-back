@@ -180,6 +180,14 @@ CONTEXT: conversational, no entities, no actions.
 
 // ============================================================================
 // ENRICH — conditional second call
+//
+// STATUS (Phase 1): authored + unit-tested, NOT yet wired into the pipeline.
+// The deterministic resolver (TestQueryResolverService) covers the common
+// unique/none cases; ENRICH is the planned Phase-2 step that disambiguates the
+// `resolution: 'ambiguous'` path via one extra LLM call (candidate pick +
+// referential grounding). Until wired, ambiguous descriptors fall through to
+// the handler's own clarification. Kept here so Phase 2 is a wiring change, not
+// a rewrite. Do NOT delete as "dead code".
 // ============================================================================
 
 /**

@@ -19,8 +19,8 @@
  * service never widens scope beyond that project — it only reads, never writes.
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { logger } from '@/utils/core/logger';
+import { fetchResolverEntities, type ResolverEntityRow } from './db/resolver-query.db';
 import {
   combinedScore,
   computeNameSimilarity,
@@ -62,17 +62,7 @@ export interface ResolveQueryParams {
   selectorType: QuerySelectorType;
   /** Already workspace-validated by the caller. */
   projectId: string;
-  /** Current page URL, if the request came from the editor — boosts URL relevance. */
-  currentUrl?: string;
   maxCandidates?: number;
-}
-
-interface EntityRow {
-  id: string;
-  name: string;
-  description?: string;
-  url?: string;
-  tags?: string[];
 }
 
 export class TestQueryResolverService {
@@ -85,7 +75,7 @@ export class TestQueryResolverService {
     const maxCandidates = params.maxCandidates ?? DEFAULT_MAX_CANDIDATES;
 
     try {
-      const rows = await this.fetchEntities(params.selectorType, params.projectId);
+      const rows = await fetchResolverEntities(params.selectorType, params.projectId);
       if (rows.length === 0) {
         return { candidates: [], resolution: 'none' };
       }
@@ -95,12 +85,7 @@ export class TestQueryResolverService {
         return this.resolveByTag(params.descriptor, rows, maxCandidates);
       }
 
-      const scored = await this.scoreRows(
-        params.descriptor,
-        rows,
-        params.selectorType,
-        params.currentUrl,
-      );
+      const scored = await this.scoreRows(params.descriptor, rows, params.selectorType);
       return this.finalize(scored, maxCandidates);
     } catch (err) {
       logger.warn('[TEST_QUERY_RESOLVER] resolve failed', {
@@ -112,66 +97,12 @@ export class TestQueryResolverService {
   }
 
   // --------------------------------------------------------------------------
-  // Fetch (scoped to project)
-  // --------------------------------------------------------------------------
-
-  private static async fetchEntities(
-    selectorType: QuerySelectorType,
-    projectId: string,
-  ): Promise<EntityRow[]> {
-    switch (selectorType) {
-      case 'module': {
-        const { data } = await supabaseAdmin
-          .from('test_modules')
-          .select('id, name')
-          .eq('project_id', projectId);
-        return (data || []).map((r: any) => ({ id: r.id, name: r.name }));
-      }
-      case 'flow': {
-        // Flows are scoped to the project via their module.
-        const { data } = await supabaseAdmin
-          .from('test_flows')
-          .select('id, name, test_modules!inner(project_id)')
-          .eq('test_modules.project_id', projectId);
-        return (data || []).map((r: any) => ({ id: r.id, name: r.name }));
-      }
-      case 'plan': {
-        const { data } = await supabaseAdmin
-          .from('regression_plans')
-          .select('id, name, description, tags')
-          .eq('project_id', projectId);
-        return (data || []).map((r: any) => ({
-          id: r.id,
-          name: r.name,
-          description: r.description || '',
-          tags: Array.isArray(r.tags) ? r.tags : [],
-        }));
-      }
-      // test_case, keyword, tag all read published test cases.
-      default: {
-        const { data } = await supabaseAdmin
-          .from('intent_test_cases')
-          .select('id, name, description, url, start_url, tags')
-          .eq('project_id', projectId)
-          .eq('status', 'published');
-        return (data || []).map((r: any) => ({
-          id: r.id,
-          name: r.name,
-          description: r.description || '',
-          url: r.url || r.start_url || '',
-          tags: Array.isArray(r.tags) ? r.tags : [],
-        }));
-      }
-    }
-  }
-
-  // --------------------------------------------------------------------------
   // Tag membership
   // --------------------------------------------------------------------------
 
   private static resolveByTag(
     descriptor: string,
-    rows: EntityRow[],
+    rows: ResolverEntityRow[],
     maxCandidates: number,
   ): TestQueryResult {
     // Normalize the descriptor into one-or-more candidate tag tokens.
@@ -208,9 +139,8 @@ export class TestQueryResolverService {
 
   private static async scoreRows(
     descriptor: string,
-    rows: EntityRow[],
+    rows: ResolverEntityRow[],
     selectorType: QuerySelectorType,
-    _currentUrl?: string,
   ): Promise<QueryCandidate[]> {
     const useEmbeddings = EMBEDDING_TYPES.has(selectorType);
 
@@ -257,7 +187,7 @@ export class TestQueryResolverService {
 
   private static async embedAll(
     descriptor: string,
-    rows: EntityRow[],
+    rows: ResolverEntityRow[],
   ): Promise<{ message: number[]; candidates: (number[] | null)[] }> {
     const [message, candidates] = await Promise.all([
       generateEmbedding(descriptor),

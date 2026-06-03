@@ -16,6 +16,7 @@ import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { getResolvedTargets } from '../shared/intent-target-resolution';
 import { resolveProjectId } from './project-resolver';
 
 /**
@@ -49,9 +50,16 @@ export async function handleRunModuleIntent(
     });
 
     const moduleId = parsedIntent?.moduleId;
-    const moduleName = parsedIntent?.moduleName || parsedIntent?.target;
+    const resolved = getResolvedTargets(parsedIntent);
+    const resolvedModule = resolved?.selectorType === 'module' ? resolved : undefined;
+    // The understanding layer may have already resolved the module the user
+    // described ("run the checkout module"); prefer its unique id, and use its
+    // descriptor as a name fallback when no explicit name was extracted.
+    const moduleName = parsedIntent?.moduleName || parsedIntent?.target || resolvedModule?.descriptor;
 
-    let targetModuleId = moduleId;
+    let targetModuleId =
+      moduleId ||
+      (resolvedModule?.resolution === 'unique' ? resolvedModule.topId : undefined);
 
     // Find module by name if no ID
     if (!targetModuleId && moduleName) {

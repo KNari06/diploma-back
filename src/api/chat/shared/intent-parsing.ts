@@ -611,7 +611,6 @@ export async function parseIntent(
       await attachResolvedTargets({
         parsedIntent,
         projectId: projectId ?? undefined,
-        currentUrl: contextObj?.currentUrl,
       });
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {

@@ -35,7 +35,24 @@ const RESOLVABLE_TYPES: ReadonlySet<string> = new Set<QuerySelectorType>([
 export interface ResolveTargetParams {
   parsedIntent: IntentResult;
   projectId?: string;
-  currentUrl?: string;
+}
+
+/**
+ * The shape attached to `metadata.resolvedTargets`. Handlers should read it via
+ * `getResolvedTargets()` rather than reaching into untyped metadata.
+ */
+export interface ResolvedTargets {
+  selectorType: string;
+  descriptor: string;
+  resolution: 'unique' | 'ambiguous' | 'none';
+  ids: string[];
+  topId?: string;
+  candidates: Array<{ id: string; name: string }>;
+}
+
+/** Typed accessor for the resolver output a handler may consume. */
+export function getResolvedTargets(parsedIntent: IntentResult): ResolvedTargets | undefined {
+  return parsedIntent.metadata?.resolvedTargets as ResolvedTargets | undefined;
 }
 
 /**
@@ -54,7 +71,7 @@ export function shouldResolveTarget(parsedIntent: IntentResult, projectId?: stri
  * intent-parsing.ts). No-op + return when there is nothing to resolve.
  */
 export async function attachResolvedTargets(params: ResolveTargetParams): Promise<void> {
-  const { parsedIntent, projectId, currentUrl } = params;
+  const { parsedIntent, projectId } = params;
   if (!shouldResolveTarget(parsedIntent, projectId)) return;
 
   const sel = parsedIntent.targetSelector!;
@@ -65,7 +82,6 @@ export async function attachResolvedTargets(params: ResolveTargetParams): Promis
       descriptor: sel.value,
       selectorType: sel.type as QuerySelectorType,
       projectId: projectId!,
-      currentUrl,
     });
   } catch (err) {
     // Best-effort: a resolver failure must not break intent handling.

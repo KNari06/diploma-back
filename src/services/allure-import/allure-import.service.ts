@@ -343,6 +343,16 @@ export async function processAllureImport(
           // default branch (`start_url = null`) instead of writing a literal
           // "null" string. Identical end state, but the explicit `undefined`
           // documents intent and matches the function signature.
+          // `defaultStartUrl` is null when the user didn't supply one — pass
+          // `undefined` (not `null`) so the service falls through to its own
+          // default branch (`start_url = null`).
+          //
+          // priority + preconditions are written in this single create() call:
+          // create() accepts both (priority natively, preconditions via the
+          // `preconditions` TEXT[] column). Only `tags` still needs a follow-up
+          // update() because create() doesn't accept it. This removes a write
+          // for priority-only tests and closes the old bug where preconditions
+          // were built but silently dropped (update() never accepted them).
           const created = await IntentTestCaseService.create({
             projectId: mapped.createParams.projectId,
             userId: mapped.createParams.userId,
@@ -354,37 +364,32 @@ export async function processAllureImport(
             status: mapped.createParams.status,
             kind: mapped.createParams.kind,
             platform: mapped.createParams.platform,
+            priority: mapped.createParams.priority,
+            ...(mapped.createParams.preconditions.length > 0 && {
+              preconditions: mapped.createParams.preconditions,
+            }),
           });
 
-          // Update tags, priority, preconditions via update()
-          const hasExtra =
-            mapped.createParams.tags.length > 0 ||
-            mapped.createParams.priority !== 'medium' ||
-            mapped.createParams.preconditions.length > 0;
-
-          if (hasExtra) {
+          // Tags are the only field create() doesn't accept — set via update().
+          if (mapped.createParams.tags.length > 0) {
             try {
               await IntentTestCaseService.update({
                 id: created.id,
                 userId,
-                tags: mapped.createParams.tags.length > 0
-                  ? mapped.createParams.tags
-                  : undefined,
-                priority: mapped.createParams.priority,
+                tags: mapped.createParams.tags,
               });
             } catch (updateErr) {
-              // Non-fatal — the test case itself was created. We surface the
-              // failure both in the per-import error log AND `stats.errors`
-              // so the user sees it in the results panel ("warnings"
-              // section) instead of having tags/priority silently dropped
-              // with no UI indication.
+              // Non-fatal — the test case itself was created (with priority +
+              // preconditions already persisted). Surface in `stats.errors` so
+              // the user sees the warning in the results panel instead of
+              // having tags silently dropped with no UI indication.
               const errMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
-              logger.warn('[AllureImport] Could not update tags/priority for test case', {
+              logger.warn('[AllureImport] Could not update tags for test case', {
                 testCaseId: created.id,
                 error: errMsg,
               });
               stats.errors.push(
-                `Tags/priority not saved for "${created.name}": ${errMsg}`,
+                `Tags not saved for "${created.name}": ${errMsg}`,
               );
             }
           }
@@ -669,6 +674,14 @@ async function processCsvPdfImport(
           // CSV/PDF imports also benefit from a default start URL — symmetric
           // with the ZIP path above. See note there for why we pass `undefined`
           // instead of `null` when the option is unset.
+          //
+          // priority + preconditions go in this single create() call (mirror of
+          // the ZIP path). The preconditions also remain inlined in the markdown
+          // `description` above for human readability; the structured column is
+          // what downstream tooling reads.
+          const tags = tc.tags ?? [];
+          const priority = tc.priority ?? 'medium';
+          const preconditions = tc.preconditions ?? [];
           const created = await IntentTestCaseService.create({
             projectId,
             userId,
@@ -680,30 +693,28 @@ async function processCsvPdfImport(
             status: 'draft',
             kind: 'standalone',
             platform: 'web',
+            priority,
+            ...(preconditions.length > 0 && { preconditions }),
           });
 
-          // Update tags/priority via update()
-          const tags = tc.tags ?? [];
-          const priority = tc.priority ?? 'medium';
-          if (tags.length > 0 || priority !== 'medium') {
+          // Tags are the only field create() doesn't accept — set via update().
+          if (tags.length > 0) {
             try {
               await IntentTestCaseService.update({
                 id: created.id,
                 userId,
-                tags: tags.length > 0 ? tags : undefined,
-                priority,
+                tags,
               });
             } catch (updateErr) {
-              // Mirror of the ZIP-path handling above: surface in
-              // stats.errors so the user sees the warning in the results
-              // panel instead of silently losing tags/priority.
+              // Mirror of the ZIP-path handling above: surface in stats.errors
+              // so the user sees the warning instead of silently losing tags.
               const errMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
-              logger.warn('[AllureCsvPdfImport] Could not update tags/priority', {
+              logger.warn('[AllureCsvPdfImport] Could not update tags', {
                 testCaseId: created.id,
                 error: errMsg,
               });
               stats.errors.push(
-                `Tags/priority not saved for "${created.name}": ${errMsg}`,
+                `Tags not saved for "${created.name}": ${errMsg}`,
               );
             }
           }

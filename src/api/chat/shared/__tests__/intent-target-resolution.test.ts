@@ -1,4 +1,8 @@
-import { attachResolvedTargets, shouldResolveTarget } from '../intent-target-resolution';
+import {
+  attachResolvedTargets,
+  getResolvedTargets,
+  shouldResolveTarget,
+} from '../intent-target-resolution';
 import { TestQueryResolverService } from '@/services/testing/resolver';
 import type { IntentResult } from '@/types';
 
@@ -101,5 +105,22 @@ describe('attachResolvedTargets', () => {
     const intent = intentWith({ type: 'keyword', value: 'x' });
     await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1' });
     expect(intent.metadata?.resolvedTargets.candidates).toEqual([{ id: 'a', name: 'X' }]);
+  });
+});
+
+describe('getResolvedTargets', () => {
+  it('returns undefined when nothing was attached', () => {
+    expect(getResolvedTargets({ intent: 'run_by_tag' })).toBeUndefined();
+    expect(getResolvedTargets({ intent: 'run_by_tag', metadata: {} })).toBeUndefined();
+  });
+
+  it('returns the attached resolved-targets object', () => {
+    const intent: IntentResult = {
+      intent: 'run_by_tag',
+      metadata: { resolvedTargets: { selectorType: 'tag', descriptor: 'smoke', resolution: 'ambiguous', ids: ['a'], candidates: [{ id: 'a', name: 'A' }] } },
+    };
+    expect(getResolvedTargets(intent)).toEqual(
+      expect.objectContaining({ selectorType: 'tag', descriptor: 'smoke', ids: ['a'] }),
+    );
   });
 });

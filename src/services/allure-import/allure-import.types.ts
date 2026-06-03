@@ -417,6 +417,14 @@ export interface AllureImportStats {
   kbDocumentsCreated: number;
   filesSkipped: number;
   videosSkipped: number;
+  /**
+   * Number of imported tests whose steps were produced by the deterministic
+   * fallback (every step → 'click') because AI step conversion failed for at
+   * least one batch. These tests imported successfully but their step TYPES are
+   * unreliable and likely need manual review before they'll replay correctly.
+   * Surfaced to the user so a degraded import isn't mistaken for a clean one.
+   */
+  testsWithDegradedSteps: number;
   /** Non-fatal errors (one string per issue). */
   errors: string[];
 }

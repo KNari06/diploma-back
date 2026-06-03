@@ -94,6 +94,9 @@ export async function handleRunRegressionIntent(
         savedTestCaseId,
         userId,
         trigger: 'chat',
+        // Honor a browser override the user requested ("run it on firefox").
+        // env/device/build modifiers are not yet plumbed into the runner.
+        browserOverride: parsedIntent?.executionModifiers?.browser,
       });
 
       logger.info('[RUN_REGRESSION_HANDLER] Saved test case started', {

@@ -166,8 +166,3 @@ export async function getCachedEmbedding(
 
 /** Re-export so the hybrid path can compute message-vs-candidate similarity. */
 export { generateEmbedding, cosineSimilarity };
-
-/** Test-only: clear the embedding cache between cases. */
-export function _clearEmbeddingCache(): void {
-  embeddingCache.clear();
-}

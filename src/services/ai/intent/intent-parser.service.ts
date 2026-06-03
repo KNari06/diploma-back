@@ -1705,7 +1705,12 @@ function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
 
   if (!parsed.metadata) parsed.metadata = {};
 
-  // Compound decomposition → metadata.analysis (consumed by the splitter later).
+  // Compound decomposition → metadata.analysis.
+  // STATUS (Phase 1): captured but NOT yet executed. The compound splitter that
+  // runs subRequests sequentially is Phase-3 work; today a compound message is
+  // still handled as its single primary intent. Captured now so the splitter is
+  // a consumer-only change. routeHint (IMPROVE) is likewise captured for the
+  // future management-intent router.
   const subRequests = Array.isArray(analysis.subRequests)
     ? analysis.subRequests
         .filter((s: any) => s && typeof s.text === 'string' && s.text.trim().length > 0)
