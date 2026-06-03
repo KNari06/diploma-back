@@ -211,6 +211,14 @@ export class ApiAgentOrchestratorService {
       const elapsed = Date.now() - startTime;
       updateConsumedTime(state, elapsed);
 
+      // Honor cancellation — halt between steps when the caller aborts
+      // (e.g. user hit /chat/cancel). Stops further HTTP/AI work mid-run.
+      if (request.abortSignal?.aborted) {
+        logger.info('[API_AGENT] Stopping due to cancellation', { iteration });
+        markStopped(state, 'user_cancelled');
+        return;
+      }
+
       // Check stopping conditions
       const stopCheck = ApiAgentEvaluatorService.shouldStop(state, policy, elapsed);
       if (stopCheck.shouldStop) {

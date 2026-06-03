@@ -13,11 +13,11 @@
  * - "рекомендации по тестам"
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { TestRecommendationService } from '@/services/testing/analysis/test-recommendation.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for test_recommendations intent
@@ -50,12 +50,8 @@ export async function handleTestRecommendationsIntent(
       userLanguage,
     });
 
-    // Get project ID: try frontend context, then parsedIntent, then look up from chat session
-    let projectId = params.context?.projectId || parsedIntent?.projectId;
-
-    if (!projectId && params.chatSessionId) {
-      projectId = await getProjectIdFromSession(params.chatSessionId);
-    }
+    // Resolve the target project (workspace-membership scoped + validated).
+    const projectId = await resolveProjectId(params);
 
     if (!projectId) {
       res.json({
@@ -123,25 +119,5 @@ export async function handleTestRecommendationsIntent(
       details: error instanceof Error ? error.message : 'Unknown error',
       timestamp: new Date().toISOString(),
     });
-  }
-}
-
-/**
- * Fallback: get project_id from chat session record.
- * The intent parsing logic fetches this but doesn't pass it to handlers,
- * so we look it up independently.
- */
-async function getProjectIdFromSession(chatSessionId: string): Promise<string | null> {
-  try {
-    const { data } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('project_id')
-      .eq('id', chatSessionId)
-      .maybeSingle();
-
-    return data?.project_id || null;
-  } catch (error) {
-    logger.warn('[TEST_RECOMMENDATIONS_HANDLER] Failed to get projectId from session', { error });
-    return null;
   }
 }

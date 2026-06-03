@@ -15,6 +15,7 @@ import { RegressionPlanService } from '@/services/testing/plans/regression-plan.
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for create_plan intent
@@ -66,22 +67,16 @@ export async function handleCreatePlanIntent(
       return;
     }
 
-    // Get project from workspace
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('id')
-      .eq('workspace_id', workspace_id)
-      .eq('user_id', userId)
-      .limit(1)
-      .maybeSingle();
+    // Resolve the target project (workspace-membership scoped — see resolver).
+    const projectId = await resolveProjectId(params);
 
-    if (!project) {
+    if (!projectId) {
       throw new NotFoundError('Project', workspace_id);
     }
 
     // Create the plan
     const plan = await RegressionPlanService.create({
-      projectId: project.id,
+      projectId,
       userId,
       name: planName,
       description,
@@ -92,7 +87,7 @@ export async function handleCreatePlanIntent(
       const { data: mod } = await supabaseAdmin
         .from('test_modules')
         .select('id')
-        .eq('project_id', project.id)
+        .eq('project_id', projectId)
         .ilike('name', moduleName)
         .limit(1)
         .maybeSingle();

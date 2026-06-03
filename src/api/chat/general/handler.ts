@@ -1425,6 +1425,18 @@ You can still help with general questions, saved test cases, and test management
     testCaseId,
   );
 
+  // Honor cancellation BEFORE deducting credits. If the user aborted after the
+  // response was generated, this throws and the reply is neither saved nor
+  // delivered — so charging for it would lose the user a credit for nothing.
+  // Checking here (not after deduction) keeps "no charge" and "no save"
+  // consistent on the cancel path.
+  if (abortSignal) {
+    const checkRequestAbortedWithLogging = functionLogger
+      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
+      : checkRequestAborted;
+    checkRequestAbortedWithLogging(abortSignal);
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 3.5: DEDUCT CREDITS AFTER SUCCESSFUL RESPONSE
   // ═══════════════════════════════════════════════════════════════════════
@@ -1447,13 +1459,6 @@ You can still help with general questions, saved test cases, and test management
         chatSessionId,
       });
     }
-  }
-
-  if (abortSignal) {
-    const checkRequestAbortedWithLogging = functionLogger
-      ? withFunctionLogging(checkRequestAborted, 'checkRequestAborted', functionLogger)
-      : checkRequestAborted;
-    checkRequestAbortedWithLogging(abortSignal);
   }
 
   // ═══════════════════════════════════════════════════════════════════════

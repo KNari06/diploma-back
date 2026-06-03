@@ -193,8 +193,10 @@ export async function handleMobileTest(
     }
 
     // ── Step 2: Credit check ──────────────────────────────────────
+    // Gate on effectiveAvailable (balance + grace), not raw balance, so a
+    // grace-funded user is not wrongly rejected (matches the per-step path).
     const creditCheck = await CreditCostTrackerService.checkCreditsForTest(userId, 'intelligent');
-    if (creditCheck.available < 3) {
+    if (creditCheck.effectiveAvailable < 3) {
       res.status(402).json({
         success: false,
         error: 'Insufficient credits',

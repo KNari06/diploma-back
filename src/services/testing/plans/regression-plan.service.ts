@@ -260,11 +260,37 @@ export class RegressionPlanService {
     projectId: string,
     userId: string
   ): Promise<RegressionPlanWithStats[]> {
+    // Access model mirrors getById: plans are readable by any active member of
+    // the workspace that owns the project — NOT only by the creator. The legacy
+    // `user_id` filter (removed below) caused two bugs: (a) non-owner members
+    // saw zero plans; (b) callers that pass an unvalidated projectId (e.g. the
+    // REST listPlans controller) relied on that filter as their only scoping,
+    // so authorizing on workspace membership here also closes that gap.
+    const { data: project } = await supabaseAdmin
+      .from('projects')
+      .select('workspace_id')
+      .eq('id', projectId)
+      .maybeSingle();
+
+    const workspaceId = (project as { workspace_id?: string } | null)?.workspace_id;
+    if (!workspaceId) {
+      // Unknown project, or project mid-cascade-delete — no access, no leak.
+      return [];
+    }
+
+    const allowed = await WorkspaceAccessService.hasPermission(
+      userId,
+      workspaceId,
+      PERMISSIONS.PROJECT_READ,
+    );
+    if (!allowed) {
+      return [];
+    }
+
     const { data, error } = await supabaseAdmin
       .from('regression_plans')
       .select('*')
       .eq('project_id', projectId)
-      .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) {

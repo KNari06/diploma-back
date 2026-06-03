@@ -43,8 +43,13 @@ export interface TestCostBreakdown {
 export interface CreditCheck {
   hasEnough: boolean;
   required: number;
+  /** Raw credits_balance — does NOT include grace headroom. */
   available: number;
   shortage: number;
+  /** V16: grace allowance (grace_limit). Spendable below zero balance. */
+  graceLimit: number;
+  /** V16: available + graceLimit — the true spendable amount. Gate on this. */
+  effectiveAvailable: number;
   /** V16: True when user's balance is negative (using grace period credits) */
   inGracePeriod?: boolean;
 }
@@ -360,6 +365,8 @@ export class CreditCostTrackerService {
           required: 0,
           available: 0,
           shortage: 0,
+          graceLimit: 0,
+          effectiveAvailable: 0,
         };
       }
 
@@ -393,6 +400,8 @@ export class CreditCostTrackerService {
         required: requiredCredits,
         available: availableCredits,
         shortage,
+        graceLimit,
+        effectiveAvailable,
         inGracePeriod,
       };
     } catch (error) {
@@ -407,6 +416,8 @@ export class CreditCostTrackerService {
         required: TokenCalculatorService.getTestCreditCost(testType),
         available: 0,
         shortage: TokenCalculatorService.getTestCreditCost(testType),
+        graceLimit: 0,
+        effectiveAvailable: 0,
       };
     }
   }
