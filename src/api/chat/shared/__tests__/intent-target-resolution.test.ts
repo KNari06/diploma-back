@@ -10,6 +10,11 @@ jest.mock('@/services/testing/resolver', () => ({
   TestQueryResolverService: { resolve: jest.fn() },
 }));
 
+const mockLlm = jest.fn();
+jest.mock('@/services/ai/core/openai.service', () => ({
+  getChatCompletionWithMessages: (...a: any[]) => mockLlm(...a),
+}));
+
 const resolveMock = TestQueryResolverService.resolve as jest.Mock;
 
 const intentWith = (sel?: IntentResult['targetSelector']): IntentResult => ({
@@ -38,7 +43,7 @@ describe('shouldResolveTarget', () => {
 });
 
 describe('attachResolvedTargets', () => {
-  beforeEach(() => resolveMock.mockReset());
+  beforeEach(() => { resolveMock.mockReset(); mockLlm.mockReset(); });
 
   it('no-ops when nothing to resolve (resolver not called)', async () => {
     const intent = intentWith(undefined);
@@ -105,6 +110,73 @@ describe('attachResolvedTargets', () => {
     const intent = intentWith({ type: 'keyword', value: 'x' });
     await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1' });
     expect(intent.metadata?.resolvedTargets.candidates).toEqual([{ id: 'a', name: 'X' }]);
+  });
+
+  // ── ENRICH disambiguation (2nd LLM call on ambiguous) ──
+  const ambiguous = () =>
+    resolveMock.mockResolvedValue({
+      resolution: 'ambiguous',
+      candidates: [
+        { id: 'a', name: 'Checkout guest', score: 0.6 },
+        { id: 'b', name: 'Checkout logged-in', score: 0.55 },
+      ],
+    });
+
+  it('ENRICH narrows ambiguous → unique when it picks one candidate', async () => {
+    ambiguous();
+    mockLlm.mockResolvedValue({ content: JSON.stringify({ resolvedTargetIds: ['b'] }) });
+    const intent = intentWith({ type: 'keyword', value: 'checkout' });
+    await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1', message: 'the logged-in one' });
+
+    expect(mockLlm).toHaveBeenCalledTimes(1);
+    expect(intent.metadata?.resolvedTargets.resolution).toBe('unique');
+    expect(intent.metadata?.resolvedTargets.topId).toBe('b');
+    expect(intent.metadata?.resolvedTargets.ids).toEqual(['b']);
+  });
+
+  it('ENRICH keeps multiple → stays ambiguous when it picks several', async () => {
+    ambiguous();
+    mockLlm.mockResolvedValue({ content: JSON.stringify({ resolvedTargetIds: ['a', 'b'] }) });
+    const intent = intentWith({ type: 'keyword', value: 'checkout' });
+    await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1', message: 'both' });
+    expect(intent.metadata?.resolvedTargets.resolution).toBe('ambiguous');
+    expect(intent.metadata?.resolvedTargets.ids).toEqual(['a', 'b']);
+  });
+
+  it('ENRICH never invents ids — a hallucinated id is dropped, original kept', async () => {
+    ambiguous();
+    mockLlm.mockResolvedValue({ content: JSON.stringify({ resolvedTargetIds: ['ZZZ'] }) });
+    const intent = intentWith({ type: 'keyword', value: 'checkout' });
+    await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1', message: 'x' });
+    // no valid pick → fall back to deterministic ambiguous set
+    expect(intent.metadata?.resolvedTargets.resolution).toBe('ambiguous');
+    expect(intent.metadata?.resolvedTargets.ids).toEqual(['a', 'b']);
+  });
+
+  it('ENRICH failure is swallowed — keeps the deterministic ambiguous result', async () => {
+    ambiguous();
+    mockLlm.mockRejectedValue(new Error('llm down'));
+    const intent = intentWith({ type: 'keyword', value: 'checkout' });
+    await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1', message: 'x' });
+    expect(intent.metadata?.resolvedTargets.resolution).toBe('ambiguous');
+  });
+
+  it('ENRICH is NOT called without a message (e.g. non-chat callers)', async () => {
+    ambiguous();
+    const intent = intentWith({ type: 'keyword', value: 'checkout' });
+    await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1' });
+    expect(mockLlm).not.toHaveBeenCalled();
+    expect(intent.metadata?.resolvedTargets.resolution).toBe('ambiguous');
+  });
+
+  it('ENRICH is NOT called when resolution is already unique', async () => {
+    resolveMock.mockResolvedValue({
+      resolution: 'unique', topId: 'a',
+      candidates: [{ id: 'a', name: 'Only', score: 0.9 }],
+    });
+    const intent = intentWith({ type: 'keyword', value: 'x' });
+    await attachResolvedTargets({ parsedIntent: intent, projectId: 'p1', message: 'x' });
+    expect(mockLlm).not.toHaveBeenCalled();
   });
 });
 

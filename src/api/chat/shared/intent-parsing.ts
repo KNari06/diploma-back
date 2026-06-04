@@ -615,6 +615,13 @@ export async function parseIntent(
       await attachResolvedTargets({
         parsedIntent,
         projectId: projectId ?? undefined,
+        message: validMessage,
+        session: {
+          lastTestId: regressionContext.lastTestId,
+          lastTestGoal: regressionContext.lastTestGoal,
+          lastFailedTestId: regressionContext.lastFailedTestId,
+          recentTestIds: regressionContext.recentTestIds,
+        },
       });
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {

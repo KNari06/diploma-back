@@ -106,3 +106,39 @@ describe('IntentTestCaseService.create — priority + preconditions', () => {
     expect(created.preconditions).toEqual(['Precondition A']);
   });
 });
+
+describe('IntentTestCaseService.create — import provenance', () => {
+  it('writes import_id, source_status and steps_degraded when supplied', async () => {
+    await IntentTestCaseService.create({
+      ...baseParams,
+      importId: 'imp-123',
+      sourceStatus: 'failed',
+      stepsDegraded: true,
+    });
+
+    expect(__capturedInsert!.import_id).toBe('imp-123');
+    expect(__capturedInsert!.source_status).toBe('failed');
+    expect(__capturedInsert!.steps_degraded).toBe(true);
+  });
+
+  it('omits all provenance columns for a normal (non-import) create', async () => {
+    await IntentTestCaseService.create({ ...baseParams });
+
+    expect(__capturedInsert).not.toHaveProperty('import_id');
+    expect(__capturedInsert).not.toHaveProperty('source_status');
+    expect(__capturedInsert).not.toHaveProperty('steps_degraded');
+  });
+
+  it('writes steps_degraded=false explicitly when an import passes false', async () => {
+    await IntentTestCaseService.create({
+      ...baseParams,
+      importId: 'imp-9',
+      stepsDegraded: false,
+    });
+
+    expect(__capturedInsert!.import_id).toBe('imp-9');
+    expect(__capturedInsert!.steps_degraded).toBe(false);
+    // sourceStatus not passed (e.g. CSV/PDF) → column omitted
+    expect(__capturedInsert).not.toHaveProperty('source_status');
+  });
+});

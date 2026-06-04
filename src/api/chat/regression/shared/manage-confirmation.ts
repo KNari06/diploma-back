@@ -21,6 +21,7 @@ import { executeTool } from '@/services/skills/tool-executor';
 import type { SkillContext } from '@/services/skills/types';
 import { logger } from '@/utils/core/logger';
 import { classifyConfirmation } from '../../shared/confirmation-classifier';
+import { clearPendingCompound, completeStep, peekCurrentStep } from '../../shared/compound-queue';
 
 const PENDING_MANAGE_PREFIX = 'pending_manage:';
 const PENDING_TTL_SECONDS = 300; // 5min — matches the SkillRegistry confirm guard TTL.
@@ -95,6 +96,13 @@ export async function handlePendingManageConfirmation(
   await redisConnection.del(key).catch(() => {});
 
   if (intent === 'decline') {
+    // The declined write may have been the CURRENT step of a compound chain
+    // (its confirm-preview stored a pending_manage AND left the compound queue
+    // un-advanced). Rejecting it abandons the whole chain — otherwise the queue
+    // would survive and hijack the user's next message as a step retry.
+    if (chatSessionId && (await peekCurrentStep(chatSessionId))) {
+      await clearPendingCompound(chatSessionId);
+    }
     res.json({
       success: true,
       message: 'Okay, cancelled — no changes made. What would you like to do instead?',
@@ -120,6 +128,25 @@ export async function handlePendingManageConfirmation(
       skillContext: pending.skillContext,
     });
     const result = callResult.toolResult;
+
+    // Two-queue desync fix: when this confirmed write was the CURRENT step of a
+    // compound chain, its confirm-preview turn left the compound queue
+    // un-advanced (advance-after-success saw needsConfirmation) while storing
+    // the pending_manage op handled here. Because this interceptor runs BEFORE
+    // the compound-continuation block and returns, that block never advances
+    // the queue. Advance it here on success — mirrors the completeStep call the
+    // compound block would have made. Best-effort; never fails the write path.
+    if (result.success && chatSessionId) {
+      try {
+        if (await peekCurrentStep(chatSessionId)) {
+          await completeStep(chatSessionId);
+        }
+      } catch (e) {
+        logger.warn('[MANAGE_CONFIRM] compound advance after confirmed write failed', {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
 
     res.json({
       success: result.success,

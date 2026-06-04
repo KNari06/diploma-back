@@ -55,6 +55,10 @@ When you need to… | Open
 …add a new resource kind (env/secret/fixture/...) | [src/services/test-resource/CLAUDE.md](src/services/test-resource/CLAUDE.md)
 …change LLM behaviour for element resolution | `preview/element-resolver.service.ts`, `preview/intent-step-lint.service.ts`
 …change a prompt | `src/ai/prompts/*.ts`
+…add/change a chat intent | `src/api/chat/<intent>/handler.ts` + register in `shared/handler-registry.ts` (map + descriptions) + routing message in `shared/routing.ts`
+…resolve a descriptor ("payment tests","smoke") → test IDs | `src/services/testing/resolver/test-query-resolver.service.ts`; consumed via `shared/intent-target-resolution.ts`
+…change request-understanding (ANALYZE/ENRICH/IMPROVE) | `src/ai/prompts/request-understanding-prompts.ts`
+…add a chat management op (schedule/module/plan) | new `manage_*` intent calling `qa_manage_*` through `executeTool` (see `regression/shared/manage-tool.helper.ts`)
 …add/modify a BullMQ job | `src/jobs/<name>.job.ts` and register in `src/worker/index.ts`
 …add a REST route | `src/api/<domain>/` (route + controller + service), wire in `src/index.ts`
 …add a WS event | `src/websocket/handlers/<handler>.ts`. Preview events go in `preview.handler.ts`.
@@ -127,11 +131,24 @@ finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 → routes to `RegressionRunService.runPlan() | runModule() | runFlow()`
 → same web / mobile branches as above.
 
-### Chat → test creation
-POST `/api/chat/message`
-→ `IntentParserService.parse()` ([src/services/ai/intent/](src/services/ai/intent/))
-→ routing in `src/api/chat/shared/routing.ts`
-→ creates intent test case / api test / general chat reply.
+### Chat → test creation / management (intent-driven router)
+POST `/api/chat/message` → `handleChat()` ([src/api/chat/chat.controller.ts](src/api/chat/chat.controller.ts))
+→ pending-state interceptors (run BEFORE parsing, global chat only):
+   exploration-confirm → manage-confirm ([regression/shared/manage-confirmation.ts](src/api/chat/regression/shared/manage-confirmation.ts)) → compound-continuation ([shared/compound-queue.ts](src/api/chat/shared/compound-queue.ts))
+→ `parseUserIntent()` ([src/services/ai/intent/intent-parser.service.ts](src/services/ai/intent/intent-parser.service.ts)) — one LLM call now ALSO returns an `analysis` block
+   (ANALYZE + IMPROVE folded in, see [src/ai/prompts/request-understanding-prompts.ts](src/ai/prompts/request-understanding-prompts.ts)):
+   `targetSelector{type,value}` (descriptor), `executionModifiers{browser,…}`, `isCompound/subRequests`, `manage{…}`, `lookbackDays`.
+→ post-parse enrichment ([shared/intent-target-resolution.ts](src/api/chat/shared/intent-target-resolution.ts)):
+   `TestQueryResolver` resolves a descriptor → concrete IDs ([src/services/testing/resolver/test-query-resolver.service.ts](src/services/testing/resolver/test-query-resolver.service.ts));
+   on ambiguity, a conditional 2nd LLM call (ENRICH) narrows candidates.
+→ compound splitter (if `isCompound`): run step 1, queue the rest; advance-after-success per turn.
+→ `routeToHandler()` ([shared/routing.ts](src/api/chat/shared/routing.ts)) → handler from `INTENT_HANDLERS` registry.
+
+**Intents (23)** in [shared/handler-registry.ts](src/api/chat/shared/handler-registry.ts): platform_test, api_test, api_flow_test,
+general_chat, needs_clarification, save_test, run_regression, run_plan, run_module, run_by_tag, create_plan,
+add_to_plan, analyze_failure, test_recommendations, coverage_analysis, editor_action, mobile_test, mobile_action,
+mobile_agent, **flaky_report, manage_schedule, manage_module, manage_plan** (the last 4 added in the management phase;
+they call existing `qa_manage_*` tools through `executeTool`, not the SubAgentPipeline).
 
 ---
 
@@ -151,6 +168,9 @@ These are codified across the codebase. Also see [.claude/rules/critical-pattern
 10. **Anywhere that EMITS, LOGS, or PERSISTS a step body after interpolation must redact `secrets.*` values.** Helpers: `resolvePlaceholders` (substitution) is paired with `redactSecrets` / `buildStepRedactor` ([src/utils/interpolation/redact-step.ts](src/utils/interpolation/redact-step.ts)) and `executor.redactString` / `executor.redactRuntimeMeta` (for background replay). When you add a new sink (WS event, JSONL writer, DB column, third-party API call, LLM prompt) carrying interpolated `value`/`url`/`assertionText`/`description`, run it through one of these. **DB persistence is the special case:** store the original `{{...}}` placeholder, not the resolved value (see `preserveOriginalStep` in `preview-run.service.ts`). Otherwise re-runs see a stale literal forever.
 11. **Telemetry writes are best-effort — NEVER fail the test path.** Phase 2 (May 2026) instrumentation writes per-test wallclock to `test_executions` and per-run aggregates to `regression_runs`. Every write is wrapped in try/catch that `logger.warn`s and swallows. A row that's missing analytics columns is a degraded audit trail, NOT a failed test. New telemetry sinks added by anyone MUST follow the same pattern. Single funnel for the per-run aggregation: `TestCompletionHandlerService.recomputeRunStatus()` — no other code path may write to `regression_runs.total_*_ms` columns.
 12. **Step persistence (`tests.executed_steps`) is owned by the PRODUCER, in-process.** Whoever runs the test appends each step to the Redis buffer via `TestExecutedStepsRedisService.appendStepCompleted` in its own process — `test-executor.ts` (background replay + lite) and `mobile-test-run.job.ts`. The worker then drains the buffer to Postgres via `finalizeToDb` in the job's `finally` ([manual-test-run.job.ts](src/jobs/manual-test-run.job.ts), [mobile-test-run.job.ts](src/jobs/mobile-test-run.job.ts)). `webSocketService.emitTestStepCompleted` is **broadcast-only** — do NOT re-add an `appendStepCompleted` call there: it would only fire on the main process via a pub/sub re-emit (racy / absent for background runs) AND double-count the producer's append. The report assembler collapses duplicate step indices (keep-last) as a safety net, but the contract is one in-process append per step.
+13. **Chat write/management ops go through `executeTool`, never the raw skill or a hand-rolled confirm.** The `manage_*` intent handlers call `qa_manage_*` via `executeTool` ([src/services/skills/tool-executor.ts](src/services/skills/tool-executor.ts)) so the centralized confirm-preview guard (in `SkillRegistry`, keyed `sessionId:toolName`), loop-detection, retry, and timeout all apply. Two-phase confirm is deterministic: turn 1 → `confirm:false` (preview, op cached in Redis via [manage-confirmation.ts](src/api/chat/regression/shared/manage-confirmation.ts)), turn 2 "yes" → re-run the SAME cached args with `confirm:true`. Never write on the first turn; never echo the tool's LLM-targeted "WRITE operation requires confirmation" message to the user (surface a human preview instead).
+14. **Chat pending-state (manage-confirm / compound-queue) is Redis-keyed by `chatSessionId` ONLY (no userId fallback) and MUST be cleared on cancel + error.** A userId fallback leaks a pending flow across the user's other sessions. `/chat/cancel` and the controller's error path both call `clearPendingCompound`. The compound splitter advances **after** a step succeeds — never before (a clarification/confirm answer must retry the same step, not drive the next one).
+15. **Unicode word boundaries: use `(?![\p{L}\p{N}])`, never `\b`, for affirmative/cancel/keyword regex.** JS `\b` is ASCII-only, so `\bда\b` / `\bхватит\b` never match Cyrillic. This bit the confirmation classifier and the compound cancel-phrase regex; both now use the unicode lookahead.
 
 ---
 

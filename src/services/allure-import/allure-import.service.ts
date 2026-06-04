@@ -368,6 +368,11 @@ export async function processAllureImport(
             ...(mapped.createParams.preconditions.length > 0 && {
               preconditions: mapped.createParams.preconditions,
             }),
+            // Import provenance — links the test to this import, records the
+            // Allure run verdict, and flags unreliable (all-click) steps.
+            importId,
+            sourceStatus: result.status,
+            stepsDegraded: mapped.stepsDegraded,
           });
 
           // Tags are the only field create() doesn't accept — set via update().
@@ -706,6 +711,11 @@ async function processCsvPdfImport(
             platform: 'web',
             priority,
             ...(preconditions.length > 0 && { preconditions }),
+            // Import provenance. CSV/PDF are design-time exports with no run
+            // verdict, so sourceStatus stays unset (NULL) — only importId +
+            // the degraded flag apply here.
+            importId,
+            stepsDegraded,
           });
 
           // Tags are the only field create() doesn't accept — set via update().
