@@ -6,6 +6,7 @@ import { OpenAI } from 'openai';
 import { ChatCompletionMessageParam, ChatCompletionTool, ChatCompletionMessageToolCall } from 'openai/resources/chat/completions';
 import { AIUsageTracker, calculateOpenAICost } from '../tracking/ai-usage-tracker';
 import { recordAILog } from '../logging/ai-action-logger';
+import { persistLLMCall } from '../logging/llm-io-persistence';
 
 /**
  * ✅ FIX: Configure OpenAI client with timeout and retry settings
@@ -358,6 +359,18 @@ export async function getChatCompletionWithMessages(
       },
     });
 
+    // Full redacted prompt+completion store (opt-in, off by default).
+    persistLLMCall({
+      provider: 'openai',
+      model: actualModel,
+      status: 'succeeded',
+      prompt: messages,
+      completion: reply,
+      tokensIn: result.usage.inputTokens,
+      tokensOut: result.usage.outputTokens,
+      durationMs: Date.now() - _aiLogStartedAt,
+    });
+
     return result;
   } catch (error: unknown) {
     // Handle abort signal errors (client closed connection, timeout, etc.)
@@ -376,6 +389,17 @@ export async function getChatCompletionWithMessages(
       durationMs: Date.now() - _aiLogStartedAt,
       error: errorMessage,
       detail: { code: errorCode, status: errorStatus, type: errorType, message_count: messages?.length ?? 0 },
+    });
+
+    // Persist the failed call too — a hallucination/timeout on a specific
+    // prompt is exactly what we want to inspect later.
+    persistLLMCall({
+      provider: 'openai',
+      model: options?.model || AI_MODELS.fast,
+      status: 'failed',
+      prompt: messages,
+      errorMessage,
+      durationMs: Date.now() - _aiLogStartedAt,
     });
 
     if (errorMessage.includes('aborted') || errorMessage.includes('signal')) {
