@@ -50,6 +50,10 @@ export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
   'create_plan',
   'add_to_plan',
   'save_test',      // we ARE the test case — nowhere to save TO
+  // Management ops are workspace/project-level, not per-test-case.
+  'manage_schedule',
+  'manage_module',
+  'manage_plan',
 ]);
 
 /**

@@ -400,7 +400,7 @@ If the user provides login+password in their message (ANY language), extract int
 
 REQUIRED FIELDS (always include):
 {
-  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "flaky_report" | "editor_action" | "mobile_test" | "mobile_action" | "mobile_agent" | "api_flow_test",
+  "intent": "platform_test" | "api_test" | "general_chat" | "needs_clarification" | "save_test" | "run_regression" | "analyze_failure" | "test_recommendations" | "coverage_analysis" | "flaky_report" | "manage_schedule" | "manage_module" | "manage_plan" | "editor_action" | "mobile_test" | "mobile_action" | "mobile_agent" | "api_flow_test",
   "intent_confidence": 0.0-1.0,
   "rawText": string
 }

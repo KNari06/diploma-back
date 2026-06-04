@@ -42,6 +42,39 @@ export interface RunManageToolInput {
   res: Response;
   /** Tag used in the WS/log channel and the (rare) error fallback. */
   logTag: string;
+  /**
+   * Human-readable description of what the WRITE will do, e.g.
+   * 'create schedule "Nightly" running plan "Smoke" at 0 9 * * * (Asia/Almaty)'.
+   * Surfaced to the user (with a confirm question) when the tool returns its
+   * confirm-required signal on the preview turn — replacing the tool's
+   * LLM-targeted instruction. Omit for read-only tools.
+   */
+  previewDescription?: string;
+}
+
+/**
+ * The write tools all reply with a `success:false` message that begins with
+ * this phrase when invoked with confirm:false (or when the registry overrode
+ * confirm:true → false because no prior preview existed). That message is
+ * written FOR THE LLM ("You MUST describe ... to the user"), so we must NOT
+ * show it to the user verbatim — see replacePreviewMessage.
+ */
+const CONFIRM_REQUIRED_PREFIX = 'WRITE operation requires confirmation';
+
+/** True when a SkillResult is the confirm-required preview signal. Pure. */
+export function isConfirmRequired(result: SkillResult): boolean {
+  return result.success === false && (result.message || '').startsWith(CONFIRM_REQUIRED_PREFIX);
+}
+
+/**
+ * Turn the tool's LLM-targeted confirm message into a user-facing preview +
+ * approval prompt. Pure. Falls back to a generic prompt when no description
+ * was supplied.
+ */
+export function buildPreviewMessage(previewDescription?: string): string {
+  return previewDescription
+    ? `I'm about to ${previewDescription}.\n\nShould I go ahead? (reply "yes" to confirm)`
+    : 'This will make a change to your workspace. Should I go ahead? (reply "yes" to confirm)';
 }
 
 /**
@@ -92,7 +125,7 @@ export function resolveConfirmation(input: {
  * SkillResult so callers can branch if they need to (most don't).
  */
 export async function runManageTool(input: RunManageToolInput): Promise<SkillResult> {
-  const { toolName, args, params, res, logTag } = input;
+  const { toolName, args, params, res, logTag, previewDescription } = input;
 
   const skillContext = buildSkillContext(params);
 
@@ -120,9 +153,22 @@ export async function runManageTool(input: RunManageToolInput): Promise<SkillRes
     return { success: false, message: 'execution failed' };
   }
 
-  // Map SkillResult → chat response. A confirm:false preview comes back as
-  // success:false with an instructional message — surface it as a normal
-  // assistant turn (not an error), so the user sees the "approve?" prompt.
+  // Confirm-required preview turn: the tool's message is an LLM-targeted
+  // instruction ("You MUST describe ... to the user"). Because we call the tool
+  // directly (no LLM to rephrase it), replace it with a deterministic,
+  // user-facing preview + approval prompt. Surfaced as a normal assistant turn
+  // (success:true, needsConfirmation flag) — it is a question, not an error.
+  if (isConfirmRequired(result)) {
+    res.json({
+      success: true,
+      message: buildPreviewMessage(previewDescription),
+      data: { needsConfirmation: true },
+      timestamp: new Date().toISOString(),
+      sessionId: params.chatSessionId,
+    });
+    return result;
+  }
+
   res.json({
     success: result.success,
     message: result.message,

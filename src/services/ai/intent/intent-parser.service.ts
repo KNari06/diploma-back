@@ -1728,6 +1728,18 @@ function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
       : undefined,
   };
 
+  // Management params (IMPROVE) → metadata.manage. Consumed by the first-class
+  // management handlers (manage_schedule/module/plan). Shallow string-only copy
+  // so a malformed object can't smuggle structures into the tool args.
+  const manage = analysis.manage;
+  if (manage && typeof manage === 'object' && typeof manage.action === 'string') {
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(manage)) {
+      if (typeof v === 'string' && v.trim().length > 0) clean[k] = v.trim();
+    }
+    if (clean.action) parsed.metadata.manage = clean;
+  }
+
   // Target selector → typed field.
   const sel = analysis.targetSelector;
   const VALID_SELECTOR_TYPES = new Set([

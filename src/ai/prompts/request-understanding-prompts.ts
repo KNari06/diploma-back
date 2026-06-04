@@ -139,6 +139,21 @@ Think about what the user actually wants — do NOT pattern-match on words.
      • "tool"       → general_chat tool-pipeline is the right place (open-ended data/analysis)
    Omit when not a management/query request.
 
+5) MANAGEMENT PARAMS (IMPROVE) — "analysis.manage"
+   ONLY when the intent is a management op (manage_schedule / manage_module /
+   manage_plan), extract the typed params the handler needs. Omit otherwise.
+     • action: the operation — schedule: create|update|activate|deactivate|delete;
+       module: create|update; plan: create|update|add_item|remove_item.
+     • name: entity name when stated ("a plan called Auth Smoke" → "Auth Smoke").
+     • cronExpression: for schedules, a cron string when derivable ("every day at
+       9am" → "0 9 * * *"); else omit and let the handler ask.
+     • timezone: IANA tz when stated ("Almaty time" → "Asia/Almaty").
+     • planName / moduleName: the plan/module the op targets, by name.
+     • platformKey: module platform — web_ui | api | mobile.
+     • priority: critical | high | medium | low (modules).
+     • itemType / itemName: for plan add_item/remove_item (module|flow|test_case + its name).
+   Use plain names, NEVER invent ids — the handler resolves names to ids.
+
 Place all of the above under a single "analysis" object. Examples:
 
 Ex(compound): "test app.io login and signup, then save both as a plan called Auth Smoke"

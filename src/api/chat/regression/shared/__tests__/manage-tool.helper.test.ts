@@ -1,4 +1,9 @@
-import { buildSkillContext, resolveConfirmation } from '../manage-tool.helper';
+import {
+  buildPreviewMessage,
+  buildSkillContext,
+  isConfirmRequired,
+  resolveConfirmation,
+} from '../manage-tool.helper';
 
 describe('resolveConfirmation', () => {
   it('honors an explicit structured confirm flag from the frontend', () => {
@@ -45,5 +50,40 @@ describe('buildSkillContext', () => {
     expect(ctx.userId).toBe('u1');
     expect(ctx.workspaceId).toBe('w1');
     expect(ctx.projectId).toBeUndefined();
+  });
+});
+
+describe('isConfirmRequired', () => {
+  it('detects the tool\'s confirm-required preview signal', () => {
+    expect(isConfirmRequired({
+      success: false,
+      message: 'WRITE operation requires confirmation. You MUST first describe...',
+    })).toBe(true);
+    // also matches the shorter variant used by some tools
+    expect(isConfirmRequired({
+      success: false,
+      message: 'WRITE operation requires confirmation. Describe the exact changes...',
+    })).toBe(true);
+  });
+
+  it('is false for a real success or a different failure', () => {
+    expect(isConfirmRequired({ success: true, message: 'Created schedule' })).toBe(false);
+    expect(isConfirmRequired({ success: false, message: 'Missing required field: name' })).toBe(false);
+  });
+});
+
+describe('buildPreviewMessage', () => {
+  it('embeds the human description and asks for confirmation', () => {
+    const msg = buildPreviewMessage('create schedule "Nightly" at 0 9 * * *');
+    expect(msg).toContain('create schedule "Nightly" at 0 9 * * *');
+    expect(msg.toLowerCase()).toContain('yes');
+    // never leaks the LLM-targeted instruction
+    expect(msg).not.toContain('You MUST');
+  });
+
+  it('falls back to a generic prompt without a description', () => {
+    const msg = buildPreviewMessage();
+    expect(msg.toLowerCase()).toContain('go ahead');
+    expect(msg).not.toContain('You MUST');
   });
 });
