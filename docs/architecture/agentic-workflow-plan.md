@@ -45,6 +45,52 @@ The work splits cleanly into two stages. Stage 2 *requires* Stage 1 to land firs
 
 ---
 
+## 0.5 Changelog — what shipped since this plan was written
+
+> This block is reconciled against `git log` on `dev`. When code and plan disagree, **trust the code** (per the header rule). The plan below (§1–§16) is the original design; this section records where the shipped code has already moved past it — and, more importantly, where it took a **different path** than the plan assumed.
+
+### The pragmatic divergence (read this first)
+
+The plan's Stage-1 spine is **Phase 2: "kill `parseIntent`, route every turn through `SubAgentPipeline`."** The shipped code did **not** do that. Instead it **hardened and extended the intent-router**:
+
+- Kept `parseIntent` as the front door, but folded ANALYZE + IMPROVE into a **single LLM call** that now also returns an `analysis` block — `targetSelector`, `executionModifiers`, `isCompound/subRequests`, `manage{…}`, `lookbackDays` ([request-understanding-prompts.ts](../../src/ai/prompts/request-understanding-prompts.ts)).
+- Added **4 new first-class intents** (`flaky_report`, `manage_schedule`, `manage_module`, `manage_plan`) → registry now ~23–27 intents, not 17 ([handler-registry.ts](../../src/api/chat/shared/handler-registry.ts)).
+- Built a **compound queue** ([compound-queue.ts](../../src/api/chat/shared/compound-queue.ts)) for multi-step requests ("test A and B, then save as a plan") — Redis-backed, **advance-after-success**, session-keyed only.
+- Built a **deterministic two-phase confirm** for write ops ([manage-confirmation.ts](../../src/api/chat/regression/shared/manage-confirmation.ts), [manage-tool.helper.ts](../../src/api/chat/regression/shared/manage-tool.helper.ts)): turn 1 preview (`confirm:false`, cached in Redis), turn 2 "yes" re-runs the **same cached args** with `confirm:true` via `executeTool` (so the central SkillRegistry confirm-gate applies). This is **Phase-5 Governor machinery arriving early**, scoped to management writes.
+
+**Implication for the plan:** Phase 2 (unify pipeline) is effectively **deferred / partially obsoleted**. The team chose "smarter router + per-intent handlers + shared confirm/compound infra" over "one pipeline for all turns." Pillar 1 ("one loop, every door", §16.1) is therefore **not yet met via Phase 2** — it would now be met via Phase 4 (webhooks → `processChatTurn`) instead. Decide explicitly whether Phase 2 is still wanted or whether the router-centric path is the new target.
+
+### Phase-by-phase status (vs §6)
+
+| Phase | Plan goal | Shipped status |
+|---|---|---|
+| **0 — Stop the bleeding** | Thread collected context into LiteEngine; `correlation_id`; readiness 2-read gate; scroll stasis | **Partial.** Readiness/scroll/preview hardening landed ([step-readiness-v2](../../src/services/testing/ui/preview/step-readiness-v2.service.ts), recorded-identity comparator consolidation). `priorKnowledge` into LiteEngine + `correlation_id` propagation **not confirmed** — verify before claiming done. |
+| **1 — QA execution as tools** | `qa-execution`/`qa-context`/`qa-collab`/`qa-auth` skills; `run_*` callable | **Partial / sideways.** No new `qa-*.skill.ts` files added in this window. Instead, **management** ops were exposed as chat intents calling existing `qa_manage_*` tools via `executeTool`. TOTP/2FA (1.16), `preview_action` (1.17), `fill_form` (1.14), `read_pdf` (1.15) **not shipped.** |
+| **2 — Unify pipeline** | Kill `parseIntent`, one pipeline | **Not done — divergent (see above).** Router was extended, not removed. |
+| **3 — Durable missions** | `missions` table, orchestrator, resumable ticks | **Not started.** No `missions` table / `mission.service.ts` / `mission-tick` queue. Compound queue is a *turn-scoped* substitute, not a durable mission. |
+| **4 — Triggers from the world** | Jira/Telegram/git webhooks → mission start | **Infra groundwork only.** `qait-infra`: Cloud Run Jobs for scheduler ticks + daily tasks (Terraform). Telegram still **outbound-only** (`chat_id` validation added, no inbound webhook). |
+| **5 — Control plane (Governor)** | Policy/budget/kill/confidence/audit around tools | **Early slice shipped.** Two-phase confirm + central confirm-gate + Unicode-safe affirm/cancel classifier ([confirmation-classifier.ts](../../src/api/chat/shared/confirmation-classifier.ts)) are the first Governor primitives. **Missing:** budget regimes (5.5), kill-switch (5.3), audit `step_log` sink (5.1/5.7), `team_routing` (5.4). Credit pre-checks + **refund-on-failure** + idempotent `cancelRun` landed alongside ([chat.controller](../../src/api/chat/chat.controller.ts)). |
+| **6 — Memory & reflection** | Closed loop: flaky/recurring → plan/schedule changes | **Read side only.** `flaky_report` detects (with `lookbackDays`); **nothing closes the loop** to `manage_plan`/`manage_schedule`. This is the single highest-leverage missing piece (see below). |
+
+### New invariants now codified (CLAUDE.md §Hard invariants 13–15)
+
+13. Chat write/management ops go through `executeTool`, never the raw skill or a hand-rolled confirm.
+14. Chat pending-state (manage-confirm / compound-queue) is Redis-keyed by `chatSessionId` **only** (no userId fallback) and cleared on cancel + error; compound advances **after** a step succeeds.
+15. Unicode word boundaries: use `(?![\p{L}\p{N}])`, never `\b`, for affirmative/cancel/keyword regex (ASCII `\b` never matches Cyrillic).
+
+### The one gap that most blocks "really autonomous"
+
+All three pieces of a self-improving loop now **exist independently** but are **not wired together**:
+
+```
+flaky_report (detect)  ──✗──►  analyze/decide  ──✗──►  manage_plan / manage_schedule (act)
+   read-only today                missing               write path exists (2-phase confirm)
+```
+
+Closing this — `flaky_report` output → reasoning step → proposed plan/schedule change → existing two-phase confirm → execute — is the **smallest change that turns "assisted" into "autonomous"** under §16.1 Pillar 5. It reuses machinery that already shipped; it needs an orchestration step, not new infrastructure. **Recommend this as the next concrete work item.**
+
+---
+
 ## 1. What exists today, in code
 
 Verified counts (May 2026):
@@ -1357,6 +1403,8 @@ These are cheap to follow and catastrophic to ignore (Manus measured ~10× cost 
 - **Ahead on QA-specifics** — recording, mobile (scrcpy/redroid), regression scheduling, AI bug analysis, video screencast. None of the hyped general agents (OpenHands/Devin/Manus) do these.
 - **Our `step-readiness-v2` already exceeds** k-kolomeitsev's content-readiness poll (causal multi-signal consensus vs symptomatic text-length).
 - **Behind on, and this plan closes:** the unified mission layer (Phase 2-3), the deterministic Governor shell (Phase 5), 2FA/TOTP (B19/1.16), explicit `observe`/`preview_action` primitive (1.17), per-domain procedural memory (6.5).
+
+> **Update (see §0.5):** since this was written, the shipped code moved **sideways** on Pillar 4 (deterministic shell) and Pillar 2 (every layer a tool) rather than along Phase 2/3. A real **two-phase confirm + central confirm-gate** now exists for management writes (early Governor), and **management itself is exposed as chat intents** (`manage_schedule/module/plan`, `flaky_report`). What did *not* happen: the Phase-2 pipeline unification and the Phase-3 durable mission layer. Pillar 1 (one loop, every door) and Pillar 3 (durable + cheap missions) remain **unmet**. Pillar 5 (closed memory loop) has its read side (`flaky_report`) but no act side — closing `detect → decide → act` is the recommended next step.
 
 ### 16.4 The single most important sentence
 
