@@ -1811,6 +1811,39 @@ export class SnapshotCollector {
               ? (hitTestTopEl === el || (hitTestTopEl !== null && el.contains(hitTestTopEl)))
               : undefined;
 
+            // ═══════════════════════════════════════════════════════════════
+            // Floating corner widget — geometry-only (chat/assistant bubble,
+            // support launcher). Inline copy of `isFloatingCornerWidget` in
+            // floating-widget.util.ts — KEEP IN SYNC (constants:
+            // FLOATING_WIDGET_EDGE_MARGIN_PX=24, FLOATING_WIDGET_MAX_COVERAGE=0.30).
+            // We walk to the nearest position:fixed ancestor (or self) and test
+            // THAT container, so a widget's child buttons inherit the flag and
+            // get deprioritized in the resolver. Never flags modal contents.
+            // ═══════════════════════════════════════════════════════════════
+            let floatingWidget = false;
+            if (!isInsideActiveModal) {
+              let fixedAncestor: Element | null = null;
+              let walk: Element | null = el;
+              for (let depth = 0; walk && depth < 12; depth++) {
+                try {
+                  if (window.getComputedStyle(walk).position === 'fixed') { fixedAncestor = walk; break; }
+                } catch { break; }
+                walk = walk.parentElement;
+              }
+              if (fixedAncestor) {
+                const fr = fixedAncestor.getBoundingClientRect();
+                if (fr.width > 0 && fr.height > 0 && __vw > 0 && __vh > 0) {
+                  const coverage = (fr.width * fr.height) / (__vw * __vh);
+                  if (coverage < 0.30) {
+                    const m = 24;
+                    const hugsH = fr.left <= m || fr.left + fr.width >= __vw - m;
+                    const hugsV = fr.top <= m || fr.top + fr.height >= __vh - m;
+                    floatingWidget = hugsH && hugsV;
+                  }
+                }
+              }
+            }
+
             // SECURITY: Redact sensitive input values to prevent credential leakage
             // Password fields and credential-related inputs should never have values in snapshot
             // ✅ FIX: Use token-level matching for autocomplete (space-separated per spec)
@@ -2574,6 +2607,7 @@ export class SnapshotCollector {
               computedZIndex,
               isPositioned,
               isTopMostAtCenter,
+              floatingWidget,
               // Visual Anchors: Bounding box for spatial lookup
               bounds: {
                 x: rect.left,

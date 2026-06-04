@@ -40,6 +40,11 @@ import type {
 import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { pruneCandidatesViaLLM } from './candidate-pruner-llm.service';
+import {
+  recordedFingerprintHasStrongIdentity,
+  hasStrongIdentityContradiction,
+  nodeToIdentityProbe,
+} from './recorded-identity.util';
 
 const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
 const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
@@ -222,10 +227,21 @@ export function buildAllowedSets(
   // `{ width: window.innerWidth, height: window.innerHeight }` from the
   // snapshot collector.
   viewport?: { width: number; height: number },
+  // Recorded fingerprint of the step's intended target. Used only by the
+  // floating-widget rule's escape-hatch: when the step actually targets a
+  // node inside a corner widget (close-hint / open-chat), we must NOT
+  // deprioritize it. Optional — manual-add steps have none (fail-open: no
+  // escape-hatch, widget children still soft-penalized).
+  recordedFingerprint?: TargetFingerprint,
 ): AllowedSetResult {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
   const ruleTrace: RuleTraceEntry[] = [];
+  const widgetSoftRefs: string[] = [];
+  // Only honor the escape-hatch when the fingerprint carries a strong
+  // identifier — a weak (text-only) fingerprint can't reliably claim a
+  // widget node IS the target, so such nodes stay soft-penalized.
+  const fpHasStrongIdentity = recordedFingerprintHasStrongIdentity(recordedFingerprint);
 
   // P1+P2 CRITICAL: Position-aware modal/dialog/popup layer detection
   // If a modal is present, visible, AND covers a significant portion of the viewport,
@@ -382,6 +398,62 @@ export function buildAllowedSets(
         evidence: 'Modal active, node outside modal and covered (isTopMostAtCenter=false) — hard excluded',
         affectedRefs: [node.ref],
       });
+    }
+
+    // Rule 0b: Floating corner widget. A small fixed widget pinned to a
+    // viewport corner (chat/assistant bubble, support launcher) is NOT a
+    // modal — its interactive children would otherwise pollute the candidate
+    // set and the resolver can pick "close hint" / "send message" instead of
+    // the real target. This is the Run-vs-Apply divergence: Run All snapshots
+    // before the widget animates out, so its buttons are present and compete.
+    //
+    // `floatingWidget` is geometry-derived in BOTH collectors (snapshot-collector
+    // + cdp-snapshot) — see floating-widget.util.ts. Three cases by physical
+    // clickability + intent, mirroring Rule 0's precision:
+    //   1. Widget covers the target (isTopMostAtCenter=false, not inside a
+    //      modal) → hard-exclude: it physically intercepts the click.
+    //   2. Widget node IS the step's target (strong-identity fingerprint match)
+    //      → escape-hatch: keep it, no penalty (close-hint / open-chat steps).
+    //   3. Otherwise a floating widget node, not the target → soft-penalty:
+    //      drops below page content in the prompt but stays selectable
+    //      (fail-open — LLM can still pick it if nothing better exists).
+    if (!excluded && node.floatingWidget === true) {
+      if (node.isInsideActiveModal !== true && node.isTopMostAtCenter === false) {
+        excluded = true;
+        nodeRules.push({
+          ruleId: 'widget.covers_target_excluded',
+          version: 'v1',
+          action: 'exclude',
+          evidence: 'Floating corner widget covering target center (isTopMostAtCenter=false) — hard excluded',
+          affectedRefs: [node.ref],
+        });
+      } else {
+        // Escape-hatch: is THIS node the step's intended target? Reuse the
+        // SAME comparator the cache-hit guards use — if the node does not
+        // strongly contradict the recorded fingerprint, treat it as the
+        // target and keep it unpenalized.
+        const isTarget = fpHasStrongIdentity
+          && !hasStrongIdentityContradiction(nodeToIdentityProbe(node), recordedFingerprint);
+        if (isTarget) {
+          nodeRules.push({
+            ruleId: 'widget.target_escape_hatch',
+            version: 'v1',
+            action: 'boost',
+            evidence: 'Floating widget node matches recorded target fingerprint — kept unpenalized (step targets the widget)',
+            affectedRefs: [node.ref],
+          });
+        } else {
+          isSoft = true;
+          widgetSoftRefs.push(node.ref);
+          nodeRules.push({
+            ruleId: 'widget.floating_deprioritized',
+            version: 'v1',
+            action: 'penalize',
+            evidence: 'Inside floating corner widget, not the recorded target — soft penalty',
+            affectedRefs: [node.ref],
+          });
+        }
+      }
     }
 
     // Rule 1: Visibility check
@@ -731,6 +803,18 @@ export function buildAllowedSets(
     });
   }
 
+  // Summary entry for the floating-widget rule so dashboards / traces show it
+  // fired and which refs were deprioritized (mirrors `modal.detected`).
+  if (widgetSoftRefs.length > 0) {
+    ruleTrace.push({
+      ruleId: 'widget.floating_detected',
+      version: 'v1',
+      action: 'penalize',
+      evidence: `Floating corner widget detected — soft-penalized ${widgetSoftRefs.length} widget ref(s)`,
+      affectedRefs: widgetSoftRefs,
+    });
+  }
+
   // Log rule trace summary
   const modalElementCount = hasVisibleModal
     ? [...hardAllowed, ...softAllowed].filter(n => n.isInsideActiveModal).length
@@ -952,15 +1036,35 @@ export function nodeIdentityTokens(node: InteractiveNode | undefined | null): Se
 
   // type / inputType — only when specific.
   const typeVal = (node.type || node.inputType || '').toLowerCase();
-  if (typeVal && SPECIFIC_INPUT_TYPES.has(typeVal)) out.add(typeVal);
+  const typeIsSpecific = !!typeVal && SPECIFIC_INPUT_TYPES.has(typeVal);
+  if (typeIsSpecific) out.add(typeVal);
 
   // name — strong, author-chosen identity. Drop generic UI tokens.
   add(node.name, { dropGeneric: true });
 
-  // autocomplete — only meaningful tokens (drops on/off and layout values).
+  // autocomplete — only meaningful tokens, AND only when it does NOT
+  // CONTRADICT the field's type. Real client pages put anti-autofill
+  // `autocomplete="new-password"` on plain text SEARCH boxes (observed:
+  // documentolog `folder_search`, type=text). Trusting that would mint a
+  // bogus `password` identity token for a search field → intent "password"
+  // would falsely match it. Rule: a password/email autocomplete token is
+  // only honoured when the element's type agrees (or is unset/specific-
+  // matching). For a non-specific type (text/none) we DROP password/email
+  // autocomplete tokens — they are almost always autofill-suppression noise.
   if (node.autocomplete) {
+    const contradicts = (token: string): boolean => {
+      // token claims password/email but type says otherwise → contradiction.
+      if (token === 'password' && typeVal && typeVal !== 'password') return true;
+      if (token === 'email' && typeVal && typeVal !== 'email') return true;
+      // generic text / no type carrying a credential autocomplete = noise.
+      if ((token === 'password' || token === 'email') && (!typeVal || typeVal === 'text')) return true;
+      return false;
+    };
     for (const part of splitIdentifier(node.autocomplete)) {
-      if (part.length >= 3 && MEANINGFUL_AUTOCOMPLETE_TOKENS.has(part)) out.add(part);
+      if (part.length < 3) continue;
+      if (!MEANINGFUL_AUTOCOMPLETE_TOKENS.has(part)) continue;
+      if (contradicts(part)) continue;
+      out.add(part);
     }
   }
 
@@ -4049,7 +4153,7 @@ export async function resolveElement(params: {
   const intentText = sanitizeIntent(stepDraft);
 
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
-  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport);
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport, stepDraft.recordedFingerprint);
   const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
 
   // V27 — Empty-fillable guard for type/fill/clear actions (root cause #3
