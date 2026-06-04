@@ -397,6 +397,7 @@ export async function processAllureImport(
           // Register name in dedup set to avoid same-batch duplicates
           existingNames.add(result.name.toLowerCase());
           stats.testsImported++;
+          if (mapped.stepsDegraded) stats.testsWithDegradedSteps++;
 
           // Track in hierarchy tree for the frontend popup
           hierarchyCache.addTestNode(
@@ -430,11 +431,21 @@ export async function processAllureImport(
       stats.modulesCreated = hierarchyCache.modulesCreated;
       stats.flowsCreated = hierarchyCache.flowsCreated;
 
+      // One summary warning for degraded tests (not one per test) so the
+      // warnings panel stays readable. The exact tests are flagged in logs.
+      if (stats.testsWithDegradedSteps > 0) {
+        stats.errors.push(
+          `${stats.testsWithDegradedSteps} test(s) imported with unreliable step types ` +
+          `(AI step conversion failed — all steps defaulted to "click"). Review these before running.`,
+        );
+      }
+
       logger.info('[AllureImport] Test case import phase complete', {
         imported: stats.testsImported,
         skipped: stats.testsSkipped,
         modulesCreated: stats.modulesCreated,
         flowsCreated: stats.flowsCreated,
+        degraded: stats.testsWithDegradedSteps,
         errors: stats.errors.length,
       });
     } catch (phaseErr) {
@@ -641,8 +652,8 @@ async function processCsvPdfImport(
           }
 
           // Convert steps using AI (determines correct action types, cleans descriptions)
-          // Falls back to 'click' type for all steps if AI fails
-          const steps = await convertImportedStepsWithAI(tc.name, tc.steps);
+          // Falls back to 'click' type for all steps if AI fails (degraded).
+          const { steps, degraded: stepsDegraded } = await convertImportedStepsWithAI(tc.name, tc.steps);
 
           // Resolve hierarchy (module + flow) via cache
           const { moduleId, flowId } = await resolveHierarchy(
@@ -721,6 +732,7 @@ async function processCsvPdfImport(
 
           existingNames.add(tc.name.toLowerCase());
           stats.testsImported++;
+          if (stepsDegraded) stats.testsWithDegradedSteps++;
 
           hierarchyCache.addTestNode(
             {
@@ -752,11 +764,20 @@ async function processCsvPdfImport(
       stats.modulesCreated = hierarchyCache.modulesCreated;
       stats.flowsCreated = hierarchyCache.flowsCreated;
 
+      // Mirror of the ZIP path — one summary warning for degraded tests.
+      if (stats.testsWithDegradedSteps > 0) {
+        stats.errors.push(
+          `${stats.testsWithDegradedSteps} test(s) imported with unreliable step types ` +
+          `(AI step conversion failed — all steps defaulted to "click"). Review these before running.`,
+        );
+      }
+
       logger.info('[AllureCsvPdfImport] Test case import phase complete', {
         imported: stats.testsImported,
         skipped: stats.testsSkipped,
         modulesCreated: stats.modulesCreated,
         flowsCreated: stats.flowsCreated,
+        degraded: stats.testsWithDegradedSteps,
       });
     } catch (phaseErr) {
       const msg = `Test case import phase failed: ${phaseErr instanceof Error ? phaseErr.message : String(phaseErr)}`;

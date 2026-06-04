@@ -8,6 +8,7 @@ import { handleAddToPlanIntent } from '../regression/add-to-plan.handler';
 import { handleAnalyzeFailureIntent } from '../regression/analyze-failure.handler';
 import { handleCoverageAnalysisIntent } from '../regression/coverage-analysis.handler';
 import { handleCreatePlanIntent } from '../regression/create-plan.handler';
+import { handleFlakyReportIntent } from '../regression/flaky-report.handler';
 import { handleRunByTagIntent } from '../regression/run-by-tag.handler';
 import { handleRunModuleIntent } from '../regression/run-module.handler';
 import { handleRunPlanIntent } from '../regression/run-plan.handler';
@@ -263,6 +264,7 @@ export const INTENT_HANDLERS: Record<string, IntentHandler> = {
   analyze_failure: handleAnalyzeFailureIntent,
   test_recommendations: handleTestRecommendationsIntent,
   coverage_analysis: handleCoverageAnalysisIntent,
+  flaky_report: handleFlakyReportIntent,
 
   // Editor mode intent
   editor_action: handleEditorAction,
@@ -335,6 +337,7 @@ export function getIntentDescriptions(): Record<string, string> {
     analyze_failure: 'User wants to understand why a test failed (root-cause analysis)',
     test_recommendations: 'User wants suggestions on what to test next',
     coverage_analysis: 'User wants to see test coverage gaps and what\'s not tested',
+    flaky_report: 'User wants to find flaky / unreliable tests (inconsistent pass-fail history)',
     editor_action: 'User wants to perform a direct action on the live page in editor mode',
     mobile_test: 'User wants to run a mobile (Android/iOS) test on recorded steps',
     mobile_action: 'User is in the mobile editor and wants ONE direct action on the current screen: tap, swipe, type, scroll, press key, back. Executed immediately, no planning.',

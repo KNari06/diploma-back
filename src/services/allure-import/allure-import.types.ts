@@ -478,6 +478,7 @@ export function emptyStats(): AllureImportStats {
     kbDocumentsCreated: 0,
     filesSkipped: 0,
     videosSkipped: 0,
+    testsWithDegradedSteps: 0,
     errors: [],
   };
 }

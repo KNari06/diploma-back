@@ -143,6 +143,8 @@ function getRoutingMessage(intent: string): string {
       return 'Starting failure analysis...';
     case 'coverage_analysis':
       return 'Analyzing coverage...';
+    case 'flaky_report':
+      return 'Scanning for flaky tests...';
     case 'test_recommendations':
       return 'Generating recommendations...';
     case 'create_plan':
