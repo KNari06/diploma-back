@@ -288,17 +288,24 @@ export class RegressionRunService {
       apiCreditCost,
       bugReportBudget,
       available: creditCheck.available,
+      graceLimit: creditCheck.graceLimit,
+      effectiveAvailable: creditCheck.effectiveAvailable,
       uiTestCount: uiCases.length,
     });
-    if (creditCheck.available < totalRequired) {
+    // Gate on effectiveAvailable (balance + grace_limit), matching the runtime
+    // per-step gate in CreditCostTrackerService. Using raw `available` here made
+    // the pre-flight reject grace-eligible users (e.g. Pro/Ultra) that the
+    // runtime would have allowed — surfacing "insufficient credits" despite a
+    // positive balance + grace headroom.
+    if (creditCheck.effectiveAvailable < totalRequired) {
       // Use the dedicated error class so the controller can surface a stable
       // `code: 'INSUFFICIENT_CREDITS'` to the frontend (which then flips the
       // global "credits exhausted" banner instead of a generic toast).
       throw new InsufficientCreditsError(
-        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.available}`,
+        `Insufficient credits. Required: ${totalRequired} (${uiStepCredits} UI step credits + ${apiCount} API × ${apiCreditCost} + ${bugReportBudget} bug-report budget), Available: ${creditCheck.effectiveAvailable}`,
         {
           required: totalRequired,
-          available: creditCheck.available,
+          available: creditCheck.effectiveAvailable,
           breakdown: {
             uiStepCredits,
             apiCount,
