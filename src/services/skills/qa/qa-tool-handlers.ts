@@ -5027,6 +5027,18 @@ export async function handleGetRunStatus(
       planName = plan?.name;
     }
 
+    // [CHAIN] trace: the agent checked this run's status. Keyed by runId so
+    // `rg "<runId>"` reconstructs the full run→status→notify chain across
+    // processes/turns. [REGRESSION_RUN] already logs the start with runId.
+    logger.info('[CHAIN] status_checked', {
+      runId: run.id,
+      status: run.status,
+      passed: progress.passed,
+      failed: progress.failed,
+      total: progress.total,
+      userId: context.userId,
+    });
+
     return {
       success: true,
       data: {
