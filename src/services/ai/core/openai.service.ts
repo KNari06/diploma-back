@@ -75,9 +75,9 @@ export function getSharedOpenAIClient(): OpenAI {
  * confirmed in logs).
  *
  * The fix: when we see a 400 invalid-model error, transparently retry the
- * SAME request once with a known-good fallback model (`gpt-4.1-mini` — already
- * the default for OPENAI_MODEL_FAST and `AI_MODELS.classify`, so we know it's
- * always reachable). The retry result is returned to the caller as if the
+ * SAME request once with a known-good fallback model (`gpt-4.1-mini` — still
+ * the default for OPENAI_MODEL_FAST, so we know it's always reachable). The
+ * retry result is returned to the caller as if the
  * primary model had succeeded — the circuit breaker never triggers, accuracy
  * is preserved, and prod (where the primary model works) is unaffected
  * because the fallback never activates there.

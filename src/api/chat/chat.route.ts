@@ -544,6 +544,15 @@ router.post('/cancel',
       // Continue - try to cancel tests anyway
     }
 
+    // Abandon any pending compound queue for this session so a cancel also stops
+    // a multi-step flow (otherwise the next message would resume it).
+    try {
+      const { clearPendingCompound } = await import('./shared/compound-queue');
+      await clearPendingCompound(chatSessionId);
+    } catch {
+      /* best-effort */
+    }
+
     // Cancel running tests (chatSessionId is guaranteed to be set at this point)
     // ✅ FIX: If testId is provided, cancel it directly (safe fallback when mapping is missing)
     const testCancelResult = { success: true, cancelledCount: 0, errors: [] as string[] };

@@ -1373,6 +1373,12 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
     });
   }
 
+  // Step 4b: Lift the request-understanding ANALYZE block (if the LLM returned
+  // one) into typed fields + metadata. Purely additive — never throws, and a
+  // missing/malformed analysis object is simply ignored so the 19 existing
+  // intents are unaffected.
+  liftAnalysisBlock(parsed, parsedAny);
+
   // Step 5: Normalize and clean fields based on intent type
   if (parsed.intent === 'api_test') {
     // Tokenize on Unicode word boundaries via splitting on
@@ -1686,6 +1692,89 @@ function finalizeIntentResult(parsed: IntentResult, message: string): IntentResu
   });
 
   return parsed;
+}
+
+/**
+ * Lift the request-understanding ANALYZE block from the raw LLM JSON into typed
+ * IntentResult fields. Defensive: validates each piece independently so a
+ * partial/garbage `analysis` never corrupts the result or throws.
+ */
+function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
+  const analysis = parsedAny?.analysis;
+  if (!analysis || typeof analysis !== 'object') return;
+
+  if (!parsed.metadata) parsed.metadata = {};
+
+  // Compound decomposition → metadata.analysis.
+  // STATUS (Phase 1): captured but NOT yet executed. The compound splitter that
+  // runs subRequests sequentially is Phase-3 work; today a compound message is
+  // still handled as its single primary intent. Captured now so the splitter is
+  // a consumer-only change. routeHint (IMPROVE) is likewise captured for the
+  // future management-intent router.
+  const subRequests = Array.isArray(analysis.subRequests)
+    ? analysis.subRequests
+        .filter((s: any) => s && typeof s.text === 'string' && s.text.trim().length > 0)
+        .map((s: any, i: number) => ({
+          text: String(s.text).trim(),
+          order: Number.isFinite(s.order) ? Number(s.order) : i + 1,
+          dependsOnPrevious: s.dependsOnPrevious === true,
+        }))
+    : [];
+  // Optional lookback window (history/analysis time range), positive int only.
+  const rawDays = Number(analysis.lookbackDays);
+  const lookbackDays = Number.isFinite(rawDays) && rawDays > 0 ? Math.floor(rawDays) : undefined;
+
+  parsed.metadata.analysis = {
+    isCompound: analysis.isCompound === true && subRequests.length > 1,
+    subRequests,
+    routeHint: analysis.routeHint === 'dedicated' || analysis.routeHint === 'tool'
+      ? analysis.routeHint
+      : undefined,
+    lookbackDays,
+  };
+
+  // Management params (IMPROVE) → metadata.manage. Consumed by the first-class
+  // management handlers (manage_schedule/module/plan). Shallow string-only copy
+  // so a malformed object can't smuggle structures into the tool args.
+  const manage = analysis.manage;
+  if (manage && typeof manage === 'object' && typeof manage.action === 'string') {
+    const clean: Record<string, string> = {};
+    for (const [k, v] of Object.entries(manage)) {
+      if (typeof v === 'string' && v.trim().length > 0) clean[k] = v.trim();
+    }
+    if (clean.action) parsed.metadata.manage = clean;
+  }
+
+  // Target selector → typed field.
+  const sel = analysis.targetSelector;
+  const VALID_SELECTOR_TYPES = new Set([
+    'test_case', 'module', 'plan', 'flow', 'tag', 'keyword', 'url', 'element', 'none',
+  ]);
+  if (
+    sel &&
+    typeof sel === 'object' &&
+    VALID_SELECTOR_TYPES.has(sel.type) &&
+    typeof sel.value === 'string' &&
+    sel.value.trim().length > 0 &&
+    sel.type !== 'none'
+  ) {
+    parsed.targetSelector = { type: sel.type, value: sel.value.trim() };
+  }
+
+  // Execution modifiers → typed field (only keep recognized, well-formed keys).
+  const mods = analysis.executionModifiers;
+  if (mods && typeof mods === 'object') {
+    const clean: NonNullable<IntentResult['executionModifiers']> = {};
+    if (mods.browser === 'chromium' || mods.browser === 'firefox' || mods.browser === 'webkit') {
+      clean.browser = mods.browser;
+    }
+    if (mods.env === 'local' || mods.env === 'staging' || mods.env === 'prod') {
+      clean.env = mods.env;
+    }
+    if (typeof mods.device === 'string' && mods.device.trim()) clean.device = mods.device.trim();
+    if (typeof mods.build === 'string' && mods.build.trim()) clean.build = mods.build.trim();
+    if (Object.keys(clean).length > 0) parsed.executionModifiers = clean;
+  }
 }
 
 /**

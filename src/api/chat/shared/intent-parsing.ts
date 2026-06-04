@@ -9,6 +9,7 @@ import { convertRoleForOpenAI } from '@/utils/helpers/chat-helpers';
 import { isValidUUID } from '@/utils/validation/validation';
 import { CONSTANTS, FAST_PATH_COMMANDS, PROGRESS } from './constants';
 import { getAvailableIntents, hasHandler } from './handler-registry';
+import { attachResolvedTargets } from './intent-target-resolution';
 import { buildRegressionContext } from './regression-context';
 import { checkRequestAborted } from './request-cancellation';
 import { emitProcessingStep } from './utils';
@@ -49,6 +50,10 @@ export const BLOCKED_IN_TEST_CASE_SCOPE: ReadonlySet<string> = new Set([
   'create_plan',
   'add_to_plan',
   'save_test',      // we ARE the test case — nowhere to save TO
+  // Management ops are workspace/project-level, not per-test-case.
+  'manage_schedule',
+  'manage_module',
+  'manage_plan',
 ]);
 
 /**
@@ -601,6 +606,23 @@ export async function parseIntent(
           parsedIntent.intent = 'general_chat';
         }
       }
+
+      // Post-parse enrichment: resolve a descriptor-style targetSelector
+      // ("payment tests", "smoke-tagged", "Release v2 plan") to concrete IDs so
+      // descriptor-based requests are actionable. Best-effort, additive, scoped
+      // to the resolved project — runs AFTER the guards so it acts on the final
+      // intent and never resurrects a blocked one.
+      await attachResolvedTargets({
+        parsedIntent,
+        projectId: projectId ?? undefined,
+        message: validMessage,
+        session: {
+          lastTestId: regressionContext.lastTestId,
+          lastTestGoal: regressionContext.lastTestGoal,
+          lastFailedTestId: regressionContext.lastFailedTestId,
+          recentTestIds: regressionContext.recentTestIds,
+        },
+      });
     } catch (intentError) {
       logger.error('[CHAT] parseUserIntent failed', {
         error: intentError instanceof Error ? intentError.message : String(intentError),
@@ -721,6 +743,18 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
 
     case 'coverage_analysis':
       return 'Got it! Calculating coverage...';
+
+    case 'flaky_report':
+      return 'Got it! Scanning for flaky tests...';
+
+    case 'manage_schedule':
+      return 'Got it! Updating the schedule...';
+
+    case 'manage_module':
+      return 'Got it! Updating the module...';
+
+    case 'manage_plan':
+      return 'Got it! Updating the regression plan...';
 
     case 'create_plan':
       return 'Got it! Creating regression plan...';

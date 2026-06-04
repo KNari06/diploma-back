@@ -22,6 +22,7 @@
  * so it works with subsets, supersets, and reordered columns.
  */
 
+import { parse } from 'csv-parse/sync';
 import { logger } from '@/utils/core/logger';
 import type { ParsedTestCaseFromLLM } from './allure-import.types';
 
@@ -58,17 +59,24 @@ const COLUMN_ALIASES: Record<string, string[]> = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CSV Parsing (RFC 4180 compliant)
+// CSV Parsing (delegated to csv-parse — RFC 4180 compliant)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Detect delimiter from the header row.
- * Tries semicolon first (Allure TestOps default), then comma, then tab.
+ * Detect the delimiter from the first physical line.
+ *
+ * csv-parse needs to be told the delimiter up front; it can't sniff. We count
+ * separators on the raw header line (before any quoted multi-line content can
+ * appear) and prefer semicolon (Allure TestOps default), then comma, then tab.
+ *
+ * Counting on a quoted header is theoretically lossy, but Allure TestOps headers
+ * are never quoted, so the first physical line is always the true header row.
  */
-function detectDelimiter(headerLine: string): string {
-  const semicolons = (headerLine.match(/;/g) ?? []).length;
-  const commas = (headerLine.match(/,/g) ?? []).length;
-  const tabs = (headerLine.match(/\t/g) ?? []).length;
+function detectDelimiter(csvContent: string): string {
+  const firstLine = csvContent.split(/\r?\n/, 1)[0] ?? '';
+  const semicolons = (firstLine.match(/;/g) ?? []).length;
+  const commas = (firstLine.match(/,/g) ?? []).length;
+  const tabs = (firstLine.match(/\t/g) ?? []).length;
 
   if (semicolons >= commas && semicolons >= tabs) return ';';
   if (commas >= tabs) return ',';
@@ -76,97 +84,30 @@ function detectDelimiter(headerLine: string): string {
 }
 
 /**
- * Parse a single CSV field that may be quoted.
- * Handles escaped double-quotes ("") inside quoted fields per RFC 4180.
- */
-function unquoteField(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    // Remove outer quotes and unescape inner double-quotes
-    return trimmed.slice(1, -1).replace(/""/g, '"');
-  }
-  return trimmed;
-}
-
-/**
- * Split a CSV line by delimiter, respecting quoted fields.
- * Handles multi-line fields that were already joined by splitCsvIntoRows().
- */
-function splitCsvLine(line: string, delimiter: string): string[] {
-  const fields: string[] = [];
-  let current = '';
-  let insideQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-
-    if (ch === '"') {
-      if (insideQuotes && i + 1 < line.length && line[i + 1] === '"') {
-        // Escaped quote ""
-        current += '"';
-        i++; // skip next quote
-      } else {
-        insideQuotes = !insideQuotes;
-        current += ch;
-      }
-    } else if (ch === delimiter && !insideQuotes) {
-      fields.push(unquoteField(current));
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-
-  fields.push(unquoteField(current));
-  return fields;
-}
-
-/**
- * Split raw CSV content into logical rows, handling multi-line quoted fields.
+ * Parse raw CSV content into a header row + data rows using csv-parse.
  *
- * Uses proper character-by-character state tracking (not quote-count parity)
- * to correctly handle escaped quotes ("") inside fields per RFC 4180.
+ * csv-parse handles the parts a hand-rolled parser gets subtly wrong:
+ *   - quoted fields containing the delimiter, newlines, or escaped `""`
+ *   - BOM stripping (`bom: true`)
+ *   - CRLF / LF line endings
+ *   - preservation of intentional whitespace inside quoted fields
+ *     (we do NOT trim here — callers decide; see `col()`)
+ *
+ * `relax_column_count` keeps a short/long row from aborting the whole parse;
+ * `skip_empty_lines` drops blank trailing lines. Returns the header as the
+ * first element and the remaining rows after it.
  */
-function splitCsvIntoRows(csvContent: string): { headerLine: string; rowLines: string[] } {
-  // Strip BOM if present
-  const content = csvContent.charCodeAt(0) === 0xFEFF ? csvContent.slice(1) : csvContent;
+function readCsvRows(csvContent: string, delimiter: string): string[][] {
+  const records = parse(csvContent, {
+    delimiter,
+    bom: true,
+    relax_column_count: true,
+    relax_quotes: true,
+    skip_empty_lines: true,
+    trim: false,
+  }) as string[][];
 
-  if (!content.trim()) return { headerLine: '', rowLines: [] };
-
-  const rowLines: string[] = [];
-  let currentRow = '';
-  let insideQuotes = false;
-
-  for (let i = 0; i < content.length; i++) {
-    const ch = content[i];
-
-    if (ch === '"') {
-      if (insideQuotes && i + 1 < content.length && content[i + 1] === '"') {
-        // Escaped quote "" → keep both chars, stay inside quotes
-        currentRow += '""';
-        i++;
-      } else {
-        // Toggle quote state
-        insideQuotes = !insideQuotes;
-        currentRow += ch;
-      }
-    } else if (ch === '\n' && !insideQuotes) {
-      // End of logical row
-      rowLines.push(currentRow.replace(/\r$/, ''));
-      currentRow = '';
-    } else {
-      currentRow += ch;
-    }
-  }
-
-  // Push the last row
-  if (currentRow.trim()) {
-    rowLines.push(currentRow.replace(/\r$/, ''));
-  }
-
-  // First row is the header, rest are data
-  const headerLine = rowLines[0] ?? '';
-  return { headerLine, rowLines: rowLines.slice(1).filter((r) => r.trim()) };
+  return records;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,11 +137,19 @@ function buildColumnMap(headers: string[]): ColumnMap {
   return map;
 }
 
-/** Get a column value by logical name, or empty string if missing. */
+/**
+ * Get a column value by logical name, or empty string if missing.
+ *
+ * Trims the OUTER edges of the field only. Since csv-parse already preserves
+ * quoted content faithfully (`trim: false`), this single trim just strips
+ * incidental padding around a value — it does not corrupt interior whitespace
+ * (e.g. the tab-indented attachment lines inside a multi-line `scenario`
+ * field, which `parseScenario` relies on, are untouched).
+ */
 function col(fields: string[], colMap: ColumnMap, logical: string): string {
   const idx = colMap.get(logical);
   if (idx === undefined || idx >= fields.length) return '';
-  return fields[idx].trim();
+  return (fields[idx] ?? '').trim();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -230,7 +179,7 @@ function parseScenario(scenario: string): ParsedStep[] {
   if (!scenario?.trim()) return [];
 
   const steps: ParsedStep[] = [];
-  const lines = scenario.split('\n');
+  const lines = scenario.split(/\r?\n/);
 
   // Regex patterns for step detection (ordered by specificity)
   const stepPatterns = [
@@ -444,22 +393,43 @@ export async function parseAllureCsv(
 ): Promise<CsvParseResult> {
   const result: CsvParseResult = { testCases: [], errors: [] };
 
-  // 1. Split into rows (handles multi-line quoted fields)
-  const { headerLine, rowLines } = splitCsvIntoRows(csvContent);
+  if (!csvContent.trim()) {
+    logger.info('[AllureCsvParser] Empty CSV content');
+    return result;
+  }
 
-  if (!headerLine || rowLines.length === 0) {
+  // 1. Detect delimiter from the first physical line, then let csv-parse do
+  //    the full RFC 4180 parse (quotes, multi-line fields, escaped "", BOM).
+  const delimiter = detectDelimiter(csvContent);
+
+  let records: string[][];
+  try {
+    records = readCsvRows(csvContent, delimiter);
+  } catch (err) {
+    const msg = `CSV parse failed: ${err instanceof Error ? err.message : String(err)}`;
+    result.errors.push(msg);
+    logger.error('[AllureCsvParser] ' + msg);
+    return result;
+  }
+
+  if (records.length === 0) {
+    logger.info('[AllureCsvParser] No rows found in CSV');
+    return result;
+  }
+
+  // 2. First record is the header, the rest are data rows.
+  const headers = records[0];
+  const rows = records.slice(1);
+
+  if (rows.length === 0) {
     logger.info('[AllureCsvParser] No data rows found in CSV');
     return result;
   }
 
-  // 2. Detect delimiter and parse header
-  const delimiter = detectDelimiter(headerLine);
-  const headers = splitCsvLine(headerLine, delimiter);
-
   logger.info('[AllureCsvParser] Starting CSV parse', {
     delimiter: delimiter === ';' ? 'semicolon' : delimiter === ',' ? 'comma' : 'tab',
     columns: headers.length,
-    dataRows: rowLines.length,
+    dataRows: rows.length,
     detectedHeaders: headers.slice(0, 5).join(', ') + '…',
   });
 
@@ -477,13 +447,12 @@ export async function parseAllureCsv(
     mapped: Object.fromEntries(colMap),
   });
 
-  // 4. Parse each row
-  for (let i = 0; i < rowLines.length; i++) {
-    onProgress?.(i + 1, rowLines.length);
+  // 4. Map each row → test case
+  for (let i = 0; i < rows.length; i++) {
+    onProgress?.(i + 1, rows.length);
 
     try {
-      const fields = splitCsvLine(rowLines[i], delimiter);
-      const testCase = mapRowToTestCase(fields, colMap);
+      const testCase = mapRowToTestCase(rows[i], colMap);
 
       if (testCase) {
         result.testCases.push(testCase);
@@ -497,7 +466,7 @@ export async function parseAllureCsv(
 
   logger.info('[AllureCsvParser] CSV parse complete', {
     testCases: result.testCases.length,
-    skippedRows: rowLines.length - result.testCases.length,
+    skippedRows: rows.length - result.testCases.length,
     errors: result.errors.length,
   });
 

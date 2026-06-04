@@ -387,36 +387,50 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
       return;
     }
 
-    // 2. Fetch test cases created during this import window
+    // 2. Fetch test cases belonging to this import.
     //
-    //    Match by project_id + user_id + created_at BETWEEN start..end. The
-    //    user_id filter is critical: without it any test case created by a
-    //    teammate in the same project during the import window would leak
-    //    into "this user's import details" — a real privacy/correctness bug
-    //    we hit when two teammates import in parallel. The current approach
-    //    has a small false-negative (a teammate's parallel import in the
-    //    same project won't include the importing user's manual creates),
-    //    which is the safe direction. A future migration adding
-    //    `intent_test_cases.import_id` would let us filter exactly.
+    //    Primary path: filter by `import_id` (exact — set by the import on each
+    //    created test). This is precise: no leakage from a teammate's parallel
+    //    import, no leakage from the user's own manual creates during the
+    //    import window, and no over-capture for an import still `processing`.
     //
-    //    Cap of 500 is also intentional — we don't want to ship a 10 MB
-    //    response for a 5000-test-case import. Frontend gets a banner when
-    //    the count is hit so the user knows the table isn't the full set.
+    //    Fallback path: imports created before the 20260604 provenance
+    //    migration have no `import_id` on their tests. For those we fall back to
+    //    the legacy project_id + user_id + created_at-window match (its
+    //    known caveat: a teammate's parallel import isn't included, which is the
+    //    safe direction). Detected by `import_id` query returning zero rows.
+    //
+    //    Cap of 500 is intentional — we don't ship a 10 MB response for a
+    //    5000-test import. Frontend shows a banner when the count is hit.
     const projectId = importRecord.project_id;
     const importUserId = (importRecord as { user_id?: string }).user_id ?? userId;
-    const importStart = importRecord.created_at;
-    const importEnd = importRecord.completed_at ?? new Date().toISOString();
     const TEST_CASE_HARD_LIMIT = 500;
+    const SELECT_COLS =
+      'id, name, description, steps_json, preconditions, flow_id, tags, priority, status, source_status, steps_degraded, created_at, test_flows(name, module_id, test_modules(name))';
 
-    const { data: testCases, error: tcError } = await supabaseAdmin
+    let { data: testCases, error: tcError } = await supabaseAdmin
       .from('intent_test_cases')
-      .select('id, name, description, steps_json, flow_id, tags, priority, status, created_at, test_flows(name, module_id, test_modules(name))')
-      .eq('project_id', projectId)
-      .eq('user_id', importUserId)
-      .gte('created_at', importStart)
-      .lte('created_at', importEnd)
+      .select(SELECT_COLS)
+      .eq('import_id', importId)
       .order('created_at', { ascending: true })
       .limit(TEST_CASE_HARD_LIMIT);
+
+    // Legacy fallback: pre-migration import with no import_id on its tests.
+    if (!tcError && (!testCases || testCases.length === 0)) {
+      const importStart = importRecord.created_at;
+      const importEnd = importRecord.completed_at ?? new Date().toISOString();
+      const legacy = await supabaseAdmin
+        .from('intent_test_cases')
+        .select(SELECT_COLS)
+        .eq('project_id', projectId)
+        .eq('user_id', importUserId)
+        .gte('created_at', importStart)
+        .lte('created_at', importEnd)
+        .order('created_at', { ascending: true })
+        .limit(TEST_CASE_HARD_LIMIT);
+      testCases = legacy.data;
+      tcError = legacy.error;
+    }
 
     if (tcError) {
       logger.warn('[AllureImportController] Failed to fetch test cases for import', {
@@ -436,12 +450,16 @@ export async function getImportDetails(req: Request, res: Response): Promise<voi
         description: s.description,
         value: s.value ?? undefined,
       })) : [],
+      preconditions: Array.isArray(tc.preconditions) ? tc.preconditions : [],
       flowId: tc.flow_id ?? null,
       flowName: tc.test_flows?.name ?? null,
       moduleName: tc.test_flows?.test_modules?.name ?? null,
       tags: tc.tags ?? [],
       priority: tc.priority ?? 'medium',
       status: tc.status ?? 'draft',
+      // Provenance (null for pre-migration / non-Allure tests).
+      sourceStatus: tc.source_status ?? null,
+      stepsDegraded: tc.steps_degraded ?? false,
       createdAt: tc.created_at,
     }));
 

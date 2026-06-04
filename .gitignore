@@ -255,5 +255,8 @@ id_ed25519*
 # Local Claude config — launch.json holds machine-specific absolute paths;
 # worktrees/ are local git checkouts with their own gitdir (committing them
 # as gitlinks pointed at a machine-local path and broke `git status`).
+# scheduled_tasks.lock is a per-machine runtime lock (sessionId + pid) for the
+# scheduled-task runner — never share it.
 .claude/launch.json
 .claude/worktrees/
+.claude/scheduled_tasks.lock
