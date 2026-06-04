@@ -11,6 +11,7 @@ import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
+import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
 import { initLogBridge } from '@/utils/core/log-bridge';
@@ -48,6 +49,10 @@ async function main(): Promise<void> {
   // same Cloud Run reasoning as the purge sweep above.
   StaleRunReaperJob.start();
 
+  // Daily TTL sweep for ai_call_logs (redacted LLM I/O store). Same
+  // single-instance reasoning as the sweeps above.
+  AiCallLogsRetentionJob.start();
+
   const shutdown = (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
@@ -55,6 +60,7 @@ async function main(): Promise<void> {
       AutoLearnRetireJob.stop();
       AccountDeletionPurgeJob.stop();
       StaleRunReaperJob.stop();
+      AiCallLogsRetentionJob.stop();
     } finally {
       process.exit(0);
     }
