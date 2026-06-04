@@ -1,9 +1,17 @@
 import {
   buildPreviewMessage,
   buildSkillContext,
+  clarify,
   isConfirmRequired,
   resolveConfirmation,
 } from '../manage-tool.helper';
+
+function mockRes() {
+  const res: any = {};
+  res.status = jest.fn(() => res);
+  res.json = jest.fn(() => res);
+  return res;
+}
 
 describe('resolveConfirmation', () => {
   it('honors an explicit structured confirm flag from the frontend', () => {
@@ -85,5 +93,21 @@ describe('buildPreviewMessage', () => {
     const msg = buildPreviewMessage();
     expect(msg.toLowerCase()).toContain('go ahead');
     expect(msg).not.toContain('You MUST');
+  });
+});
+
+describe('clarify', () => {
+  it('emits a clarification turn (success + needsClarification) and never an error', () => {
+    const res = mockRes();
+    clarify(res, 's1', 'What should the plan be called?');
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: true,
+        message: 'What should the plan be called?',
+        data: { needsClarification: true },
+        sessionId: 's1',
+      }),
+    );
   });
 });

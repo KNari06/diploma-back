@@ -16,6 +16,7 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { resolveProjectId } from './project-resolver';
 import {
+  clarify,
   resolveConfirmation,
   runManageTool,
   type ManageToolParams,
@@ -28,6 +29,25 @@ interface ManageModuleParams extends ManageToolParams {
 }
 
 const VALID_ACTIONS = new Set(['create', 'update']);
+
+/**
+ * Pre-flight required-field check for modules. `create` needs a name + a valid
+ * platform; `update` needs to know which module. Returns a clarifying question
+ * or null. Mirrors qa_manage_module's required fields.
+ */
+function missingFieldQuestion(action: string, manage: Record<string, any>): string | null {
+  const VALID_PLATFORMS = new Set(['web_ui', 'api', 'mobile']);
+  if (action === 'create') {
+    if (!manage.name) return 'What should the new module be called?';
+    if (!manage.platformKey || !VALID_PLATFORMS.has(manage.platformKey)) {
+      return 'What platform is this module for — web_ui, api, or mobile?';
+    }
+  }
+  if (action === 'update' && !manage.moduleName) {
+    return 'Which module would you like to update?';
+  }
+  return null;
+}
 
 /** Human-readable preview of the pending module change (for the confirm prompt). */
 function describeModuleChange(action: string, manage: Record<string, any>): string {
@@ -50,13 +70,15 @@ export async function handleManageModuleIntent(
     const action = manage.action;
 
     if (!action || !VALID_ACTIONS.has(action)) {
-      res.json({
-        success: true,
-        message: 'Would you like to create a new module or update an existing one?',
-        data: { needsClarification: true },
-        timestamp: new Date().toISOString(),
-        sessionId: params.chatSessionId,
-      });
+      clarify(res, params.chatSessionId, 'Would you like to create a new module or update an existing one?');
+      return;
+    }
+
+    // Pre-flight: ask for the one missing required field rather than leaking the
+    // tool's raw "Missing required field" error to the user.
+    const missing = missingFieldQuestion(action, manage);
+    if (missing) {
+      clarify(res, params.chatSessionId, missing);
       return;
     }
 

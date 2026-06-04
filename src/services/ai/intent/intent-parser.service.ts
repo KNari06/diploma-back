@@ -1720,12 +1720,17 @@ function liftAnalysisBlock(parsed: IntentResult, parsedAny: any): void {
           dependsOnPrevious: s.dependsOnPrevious === true,
         }))
     : [];
+  // Optional lookback window (history/analysis time range), positive int only.
+  const rawDays = Number(analysis.lookbackDays);
+  const lookbackDays = Number.isFinite(rawDays) && rawDays > 0 ? Math.floor(rawDays) : undefined;
+
   parsed.metadata.analysis = {
     isCompound: analysis.isCompound === true && subRequests.length > 1,
     subRequests,
     routeHint: analysis.routeHint === 'dedicated' || analysis.routeHint === 'tool'
       ? analysis.routeHint
       : undefined,
+    lookbackDays,
   };
 
   // Management params (IMPROVE) → metadata.manage. Consumed by the first-class

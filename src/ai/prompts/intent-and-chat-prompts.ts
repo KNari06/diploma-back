@@ -547,7 +547,22 @@ Ex35: "запусти сохраненный мобильный тест abc-123
 → {"intent": "run_regression", "intent_confidence": 0.92, "savedTestCaseId": "abc-123", "rawText": "..."}
 
 Ex36: "fix it" / "сделай нормально" (mobileSessionId in context, ambiguous)
-→ {"intent": "needs_clarification", "intent_confidence": 0.55, "clarificationQuestion": "What exactly would you like me to do on this screen?", "possibleIntents": ["mobile_action", "mobile_agent"], "clarificationReason": "Request too vague for a mobile action or flow", "rawText": "..."}`;
+→ {"intent": "needs_clarification", "intent_confidence": 0.55, "clarificationQuestion": "What exactly would you like me to do on this screen?", "possibleIntents": ["mobile_action", "mobile_agent"], "clarificationReason": "Request too vague for a mobile action or flow", "rawText": "..."}
+
+Ex37: "show me flaky tests" / "покажи нестабильные тесты за последние 2 недели"
+→ {"intent": "flaky_report", "intent_confidence": 0.9, "analysis": {"lookbackDays": 14}, "rawText": "..."}
+
+Ex38: "schedule the nightly plan every day at 9am" / "запускай smoke план каждый день в 9 утра"
+→ {"intent": "manage_schedule", "intent_confidence": 0.9, "analysis": {"manage": {"action": "create", "planName": "nightly", "cronExpression": "0 9 * * *"}}, "rawText": "..."}
+
+Ex39: "rename the smoke module to Smoke - Critical" / "переименуй модуль Orders"
+→ {"intent": "manage_module", "intent_confidence": 0.88, "analysis": {"manage": {"action": "update", "moduleName": "smoke", "name": "Smoke - Critical"}}, "rawText": "..."}
+
+Ex40: "create a regression plan called Release v2" / "создай план Release v2"
+→ {"intent": "manage_plan", "intent_confidence": 0.9, "analysis": {"manage": {"action": "create", "name": "Release v2"}}, "rawText": "..."}
+
+Ex41: "add the checkout module to my Release plan"
+→ {"intent": "manage_plan", "intent_confidence": 0.88, "analysis": {"manage": {"action": "add_item", "itemType": "module", "itemName": "checkout", "planName": "Release"}}, "rawText": "..."}`;
 
   // ─────────────────────────────────────────────────────────────────────
   // DYNAMIC SECTIONS (appended AFTER the static prefix on purpose)

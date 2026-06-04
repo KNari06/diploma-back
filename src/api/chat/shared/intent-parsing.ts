@@ -737,6 +737,18 @@ export function buildIntentMessage(parsedIntent: IntentResult | null | undefined
     case 'coverage_analysis':
       return 'Got it! Calculating coverage...';
 
+    case 'flaky_report':
+      return 'Got it! Scanning for flaky tests...';
+
+    case 'manage_schedule':
+      return 'Got it! Updating the schedule...';
+
+    case 'manage_module':
+      return 'Got it! Updating the module...';
+
+    case 'manage_plan':
+      return 'Got it! Updating the regression plan...';
+
     case 'create_plan':
       return 'Got it! Creating regression plan...';
 

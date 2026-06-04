@@ -40,8 +40,9 @@ export async function handleFlakyReportIntent(
       throw new NotFoundError('Project', workspace_id);
     }
 
-    // Optional lookback window from the parsed params, clamped to the tool's max.
-    const requestedDays = Number(parsedIntent?.metadata?.manage?.days);
+    // Optional lookback window the classifier extracted (e.g. "last 2 weeks" →
+    // analysis.lookbackDays=14), clamped to the tool's max. Defaults to 30.
+    const requestedDays = parsedIntent?.metadata?.analysis?.lookbackDays;
     const days = Number.isFinite(requestedDays) && requestedDays > 0
       ? Math.min(requestedDays, MAX_LOOKBACK_DAYS)
       : DEFAULT_LOOKBACK_DAYS;

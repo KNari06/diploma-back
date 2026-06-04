@@ -26,6 +26,7 @@ import { parseMobileContext } from './mobile_agent/shared';
 import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
+import { handlePendingManageConfirmation } from './regression/shared/manage-confirmation';
 import {
   TestCaseNotFoundError,
   assertCanAccessTestCase,
@@ -399,6 +400,18 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         req, res, message, chatSessionId!, userId, workspace_id,
       );
       if (explorationHandled) {
+        const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+        await unregisterActiveRequestWithLogging(chatSessionId, userId);
+        return;
+      }
+
+      // Two-phase confirm for management ops: a bare "yes" replying to a
+      // manage_* preview would otherwise be classified as general_chat and the
+      // approval lost. Intercept it here and re-run the stored op.
+      const manageHandled = await handlePendingManageConfirmation(
+        req, res, message, chatSessionId!, userId,
+      );
+      if (manageHandled) {
         const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
         await unregisterActiveRequestWithLogging(chatSessionId, userId);
         return;

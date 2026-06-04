@@ -25,6 +25,7 @@ import { executeTool } from '@/services/skills/tool-executor';
 import type { SkillContext, SkillResult } from '@/services/skills/types';
 import { logger } from '@/utils/core/logger';
 import { Response } from 'express';
+import { storePendingManageOp } from './manage-confirmation';
 
 /** The handler params subset the helper needs to build a SkillContext. */
 export interface ManageToolParams {
@@ -64,6 +65,21 @@ const CONFIRM_REQUIRED_PREFIX = 'WRITE operation requires confirmation';
 /** True when a SkillResult is the confirm-required preview signal. Pure. */
 export function isConfirmRequired(result: SkillResult): boolean {
   return result.success === false && (result.message || '').startsWith(CONFIRM_REQUIRED_PREFIX);
+}
+
+/**
+ * Emit a clarification turn (a question, not an error) and end the request.
+ * Shared by the management handlers' pre-flight required-field checks so a
+ * missing field becomes a friendly question instead of a raw tool error.
+ */
+export function clarify(res: Response, chatSessionId: string | undefined, question: string): void {
+  res.json({
+    success: true,
+    message: question,
+    data: { needsClarification: true },
+    timestamp: new Date().toISOString(),
+    sessionId: chatSessionId,
+  });
 }
 
 /**
@@ -159,6 +175,15 @@ export async function runManageTool(input: RunManageToolInput): Promise<SkillRes
   // user-facing preview + approval prompt. Surfaced as a normal assistant turn
   // (success:true, needsConfirmation flag) — it is a question, not an error.
   if (isConfirmRequired(result)) {
+    // Persist the pending op so the next turn's approval can re-run THIS exact
+    // tool+args with confirm:true (the classifier would otherwise route a bare
+    // "yes" to general_chat). See manage-confirmation.ts.
+    await storePendingManageOp(params.chatSessionId, params.userId, {
+      toolName,
+      args,
+      skillContext,
+      previewDescription,
+    });
     res.json({
       success: true,
       message: buildPreviewMessage(previewDescription),

@@ -133,6 +133,11 @@ Think about what the user actually wants — do NOT pattern-match on words.
      • build:   app build id / version string
    Only include keys that are actually stated.
 
+3b) LOOKBACK WINDOW — "analysis.lookbackDays"
+   For history/analysis requests over a time range ("flaky tests in the last 2
+   weeks", "failures за последние 7 дней"), set the number of DAYS as an integer
+   (2 weeks → 14, last week → 7, last month → 30). Omit when no range is stated.
+
 4) ROUTE HINT (IMPROVE) — "analysis.routeHint"
    For management/query requests, hint how to route:
      • "dedicated"  → a first-class intent should handle it (run/save/plan/module/schedule)

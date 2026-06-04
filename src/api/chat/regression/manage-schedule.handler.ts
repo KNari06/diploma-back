@@ -16,6 +16,7 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { resolveProjectId } from './project-resolver';
 import {
+  clarify,
   resolveConfirmation,
   runManageTool,
   type ManageToolParams,
@@ -28,6 +29,26 @@ interface ManageScheduleParams extends ManageToolParams {
 }
 
 const VALID_ACTIONS = new Set(['create', 'update', 'activate', 'deactivate', 'delete']);
+
+/**
+ * Pre-flight required-field check for schedules. `create` needs a cron and a
+ * single run target (plan OR module); the id-based actions need a schedule name.
+ * Returns a clarifying question or null. Mirrors the tool's required fields.
+ */
+function missingFieldQuestion(action: string, manage: Record<string, any>): string | null {
+  if (action === 'create') {
+    if (!manage.cronExpression) {
+      return 'When should this schedule run? (e.g. "every day at 9am", "every Monday")';
+    }
+    if (!manage.planName && !manage.moduleName) {
+      return 'What should the schedule run — a plan or a module? Please name it.';
+    }
+  }
+  if ((action === 'update' || action === 'activate' || action === 'deactivate' || action === 'delete') && !manage.name) {
+    return 'Which schedule do you mean? Please give its name.';
+  }
+  return null;
+}
 
 /** Human-readable preview of the pending schedule change (for the confirm prompt). */
 function describeScheduleChange(action: string, manage: Record<string, any>): string {
@@ -66,13 +87,15 @@ export async function handleManageScheduleIntent(
     const action = manage.action;
 
     if (!action || !VALID_ACTIONS.has(action)) {
-      res.json({
-        success: true,
-        message: 'What should I do with the schedule — create, update, activate, deactivate, or delete it?',
-        data: { needsClarification: true },
-        timestamp: new Date().toISOString(),
-        sessionId: params.chatSessionId,
-      });
+      clarify(res, params.chatSessionId, 'What should I do with the schedule — create, update, activate, deactivate, or delete it?');
+      return;
+    }
+
+    // Pre-flight: ask for the one missing required field rather than surfacing
+    // the tool's raw "Missing required field" error to the user.
+    const missing = missingFieldQuestion(action, manage);
+    if (missing) {
+      clarify(res, params.chatSessionId, missing);
       return;
     }
 

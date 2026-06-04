@@ -18,6 +18,7 @@ import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { resolveProjectId } from './project-resolver';
 import {
+  clarify,
   resolveConfirmation,
   runManageTool,
   type ManageToolParams,
@@ -30,6 +31,29 @@ interface ManagePlanParams extends ManageToolParams {
 }
 
 const VALID_ACTIONS = new Set(['create', 'update', 'add_item', 'remove_item']);
+
+/**
+ * Pre-flight required-field check. Returns a clarifying question when a field
+ * the tool requires for this action is missing, else null. Mirrors the tool's
+ * own required-field rules so the user gets a friendly prompt, not a raw error.
+ */
+function missingFieldQuestion(action: string, manage: Record<string, any>): string | null {
+  if (action === 'create' && !manage.name) {
+    return 'What should the new plan be called?';
+  }
+  if ((action === 'add_item' || action === 'remove_item')) {
+    if (!manage.itemName) {
+      return `Which ${manage.itemType || 'item'} should I ${action === 'add_item' ? 'add' : 'remove'}?`;
+    }
+    if (!manage.planName) {
+      return 'Which plan should I modify?';
+    }
+  }
+  if (action === 'update' && !manage.planName) {
+    return 'Which plan would you like to update?';
+  }
+  return null;
+}
 
 /** Human-readable preview of the pending plan change (for the confirm prompt). */
 function describePlanChange(action: string, manage: Record<string, any>): string {
@@ -61,13 +85,15 @@ export async function handleManagePlanIntent(
     const action = manage.action;
 
     if (!action || !VALID_ACTIONS.has(action)) {
-      res.json({
-        success: true,
-        message: 'What would you like to do with the plan — create, update, or add/remove an item?',
-        data: { needsClarification: true },
-        timestamp: new Date().toISOString(),
-        sessionId: params.chatSessionId,
-      });
+      clarify(res, params.chatSessionId, 'What would you like to do with the plan — create, update, or add/remove an item?');
+      return;
+    }
+
+    // Pre-flight: ask for the one missing required field rather than letting the
+    // tool return its LLM-targeted "Missing required field" error to the user.
+    const missing = missingFieldQuestion(action, manage);
+    if (missing) {
+      clarify(res, params.chatSessionId, missing);
       return;
     }
 
