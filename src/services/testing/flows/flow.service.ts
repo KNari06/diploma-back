@@ -167,6 +167,19 @@ export class FlowService {
       throw new Error('No fields to update');
     }
 
+    // When renaming, read the OLD flow name first so we can cascade the rename
+    // to the flow's intent_test_cases that were in lockstep with it (see below).
+    let previousName: string | undefined;
+    if (name !== undefined) {
+      const { data: prev } = await supabaseAdmin
+        .from('test_flows')
+        .select('name')
+        .eq('id', id)
+        .eq('user_id', userId)
+        .single();
+      previousName = prev?.name ?? undefined;
+    }
+
     logger.info('[FLOW_SERVICE] Updating flow', {
       id,
       updatedFields: Object.keys(updates),
@@ -183,6 +196,29 @@ export class FlowService {
     if (error) {
       logger.error('[FLOW_SERVICE] Failed to update flow', { error, id });
       throw new Error(`Failed to update flow: ${error.message}`);
+    }
+
+    // Cascade the rename to the flow's intent_test_cases. A flow and its test
+    // case(s) are created with the SAME name, and the editor breadcrumb collapses
+    // to one segment while they match; renaming only the flow row left the test
+    // case on its old name (e.g. "Billz #2 > Billz"). We rename only the test
+    // cases whose current name still equals the flow's OLD name, so a test case
+    // the user deliberately renamed to something else is never clobbered.
+    // Best-effort: a failure here is logged, not thrown — the flow rename stands.
+    if (name !== undefined && previousName !== undefined && previousName !== name) {
+      const { error: tcErr } = await supabaseAdmin
+        .from('intent_test_cases')
+        .update({ name })
+        .eq('flow_id', id)
+        .eq('user_id', userId)
+        .eq('name', previousName);
+
+      if (tcErr) {
+        logger.warn('[FLOW_SERVICE] Flow renamed but test-case cascade failed', {
+          id,
+          error: tcErr.message,
+        });
+      }
     }
 
     // Invalidate module mode cache (flow metadata changed)
@@ -358,7 +394,13 @@ export class FlowService {
     if (sourceTestCases && sourceTestCases.length > 0) {
       const copies = sourceTestCases.map((tc) => {
         const { id, created_at, updated_at, flow_id, ...rest } = tc;
-        return { ...rest, flow_id: newFlow.id };
+        // Keep the test case name in lockstep with the duplicated flow name:
+        // a test case that matched the source flow name gets the same " (Copy)"
+        // suffix. Without this the flow becomes "X (Copy)" while its test case
+        // stays "X", which (a) breaks the breadcrumb's single-segment collapse
+        // and (b) defeats the rename cascade's lockstep guard in update().
+        const copiedTcName = tc.name === source.name ? copiedName : tc.name;
+        return { ...rest, name: copiedTcName, flow_id: newFlow.id };
       });
 
       const { error: tcInsErr } = await supabaseAdmin.from('intent_test_cases').insert(copies);

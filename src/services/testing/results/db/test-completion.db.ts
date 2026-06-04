@@ -160,8 +160,14 @@ export async function forceFailStuckExecutions(
 }
 
 /**
- * Mark stuck `tests` rows as timed-out (legacy, pre-`test_executions` runs).
+ * Mark stuck `tests` rows as failed (legacy, pre-`test_executions` runs).
  * Same non-bailing contract as `forceFailStuckExecutions`.
+ *
+ * Writes `failed` rather than a distinct `timeout` status: nothing downstream
+ * reads `timeout` separately (every consumer groups it with `failed`), and the
+ * mirrored `test_executions.status` CHECK constraint forbids `timeout` — so a
+ * `timeout` write propagated to `test_executions` raised 23514 and left the run
+ * dirty. `failed` is valid in both vocabularies and carries the same meaning.
  */
 export async function forceFailStuckTests(
   testIds: string[],
@@ -170,7 +176,7 @@ export async function forceFailStuckTests(
 
   const { error } = await supabaseAdmin
     .from('tests')
-    .update({ status: 'timeout', completed_at: new Date().toISOString() })
+    .update({ status: 'failed', completed_at: new Date().toISOString() })
     .in('id', testIds);
 
   return { error };
