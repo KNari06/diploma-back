@@ -853,6 +853,143 @@ export function getEffectiveLabel(node: InteractiveNode | undefined | null): str
 }
 
 /**
+ * Cyrillic→Latin glyph fold (М↔M, А↔A, Т↔T, …). Shared by the semantic-
+ * floor guards so "MAT-SMART" and "МАТ-SMART" tokenize identically.
+ * Single source of truth — both `evaluateHonestyGuard` and the inline
+ * guard in `selectElementWithLLM` call this instead of re-declaring it.
+ */
+export function cyrFold(s: string): string {
+  let out = '';
+  for (const ch of s) {
+    const code = ch.charCodeAt(0);
+    switch (code) {
+      case 0x0410: case 0x0430: out += 'a'; break;
+      case 0x0412: case 0x0432: out += 'b'; break;
+      case 0x0415: case 0x0435: out += 'e'; break;
+      case 0x041A: case 0x043A: out += 'k'; break;
+      case 0x041C: case 0x043C: out += 'm'; break;
+      case 0x041D: case 0x043D: out += 'h'; break;
+      case 0x041E: case 0x043E: out += 'o'; break;
+      case 0x0420: case 0x0440: out += 'p'; break;
+      case 0x0421: case 0x0441: out += 'c'; break;
+      case 0x0422: case 0x0442: out += 't'; break;
+      case 0x0425: case 0x0445: out += 'x'; break;
+      case 0x0423: case 0x0443: out += 'y'; break;
+      default: out += ch;
+    }
+  }
+  return out;
+}
+
+/** Tokenize: cyr-fold, split on non-alphanumerics, keep ≥3-char tokens. */
+export function semanticTokens(s: string): Set<string> {
+  return new Set(cyrFold(s.toLowerCase()).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
+}
+
+// Input `type`/`inputType` values specific enough to be a semantic anchor.
+// Generic ones (text, button, submit, hidden, …) appear on most elements
+// and would create false matches ("text" intent → any text input), so they
+// are EXCLUDED. Only these carry intent-disambiguating meaning.
+const SPECIFIC_INPUT_TYPES = new Set([
+  'password', 'email', 'tel', 'url', 'number', 'search',
+  'date', 'month', 'week', 'time', 'datetime-local',
+  'checkbox', 'radio', 'color', 'file', 'range',
+]);
+
+// Valid HTML autocomplete tokens worth matching against intent. Junk
+// values ("on"/"off" — note "off" is 3 chars and would pass the length
+// filter) and layout-only values are excluded.
+const MEANINGFUL_AUTOCOMPLETE_TOKENS = new Set([
+  'password', 'email', 'username', 'tel', 'url', 'search',
+  'current', 'new', 'name', 'organization', 'address',
+  'phone', 'country', 'postal', 'credit', 'card',
+]);
+
+// Generic UI tokens that show up in testIds/ids/names across unrelated
+// controls (submitButton, closeModal, …). Matching on them would let
+// intent "submit" grab a random element whose testId merely contains
+// "submit". Dropped from identity tokens.
+const GENERIC_IDENTITY_TOKENS = new Set([
+  'button', 'btn', 'input', 'field', 'element', 'control', 'icon',
+  'modal', 'dialog', 'panel', 'container', 'wrapper', 'root', 'item',
+  'submit', 'cancel', 'close', 'next', 'back', 'prev', 'open', 'toggle',
+  'link', 'menu', 'list', 'row', 'cell', 'col', 'box', 'group', 'form',
+  'label', 'text', 'value', 'data', 'test', 'qa', 'auto',
+]);
+
+/** camelCase / snake / kebab → lowercase word parts. */
+function splitIdentifier(raw: string): string[] {
+  return raw
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .split(/[^\p{L}\p{N}]+/u)
+    .map(t => t.toLowerCase())
+    .filter(Boolean);
+}
+
+/**
+ * Build the set of TECHNICAL-identity tokens for a node — the signals the
+ * LLM already sees in the candidate line (type, name, autocomplete,
+ * testId, id) but that the visible-label-only semantic floor ignored.
+ * This is what lets an English intent ("password") match a Cyrillic-
+ * labelled field whose `type="password" / name="password" /
+ * autocomplete="current-password"` makes the meaning unambiguous.
+ *
+ * Heavily filtered (see the three allow/deny sets above) so it adds
+ * REAL disambiguating tokens without re-opening the hallucination hole:
+ * generic types, junk autocomplete, and generic UI tokens are dropped.
+ */
+export function nodeIdentityTokens(node: InteractiveNode | undefined | null): Set<string> {
+  const out = new Set<string>();
+  if (!node) return out;
+  const add = (raw: string | undefined, opts: { dropGeneric?: boolean } = {}) => {
+    if (!raw) return;
+    for (const part of splitIdentifier(raw)) {
+      if (part.length < 3) continue;
+      if (opts.dropGeneric && GENERIC_IDENTITY_TOKENS.has(part)) continue;
+      out.add(part);
+    }
+  };
+
+  // type / inputType — only when specific.
+  const typeVal = (node.type || node.inputType || '').toLowerCase();
+  if (typeVal && SPECIFIC_INPUT_TYPES.has(typeVal)) out.add(typeVal);
+
+  // name — strong, author-chosen identity. Drop generic UI tokens.
+  add(node.name, { dropGeneric: true });
+
+  // autocomplete — only meaningful tokens (drops on/off and layout values).
+  if (node.autocomplete) {
+    for (const part of splitIdentifier(node.autocomplete)) {
+      if (part.length >= 3 && MEANINGFUL_AUTOCOMPLETE_TOKENS.has(part)) out.add(part);
+    }
+  }
+
+  // testId — author-chosen, but strip generic UI scaffolding tokens.
+  add(node.testIdAttr, { dropGeneric: true });
+
+  // id — only stable ids (framework-generated ones are noise); drop generic.
+  if (node.id && !node.isDynamicId) add(node.id, { dropGeneric: true });
+
+  return new Set(Array.from(out).map(t => cyrFold(t)));
+}
+
+/**
+ * True if any intent token shares an exact-or-substring (≥3 char, both
+ * directions) overlap with any token in `against`. Same matching rule the
+ * semantic floor uses for labels.
+ */
+export function hasTokenOverlap(intentTokens: Set<string>, against: Set<string>): boolean {
+  if (intentTokens.size === 0 || against.size === 0) return false;
+  for (const i of intentTokens) {
+    for (const c of against) {
+      if (i === c) return true;
+      if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Honesty guard — verify that a chosen candidate's effective label is
  * compatible with the user's intent text. Catches two hallucination
  * classes that escape min-confidence and producer-side validation:
@@ -908,67 +1045,43 @@ export function evaluateHonestyGuard(args: {
   // Guard 2 (token-overlap) stays — fires only when chosen DOES have a
   // label, so safe and complementary.
 
-  // Guard 2 — token-overlap floor. Tokenization mirrors the inline
-  // version that used to live in selectElementWithLLM:
-  //   - Cyrillic glyph fold (M↔М, A↔А, T↔Т, ...) — covers MAT-SMART
-  //     ↔ МАТ-SMART parity.
-  //   - Unicode word splitter with 3-char minimum (drops "по", "за"
-  //     etc. that would falsely overlap unrelated text).
-  //   - "shared" means exact OR substring (≥3 chars both ways) — so
-  //     "папка" intent vs "папкалар" chosen counts as shared (Kazakh
-  //     morphology), but "ok" inside "Bookmark" does NOT.
-  const cyrFold = (s: string): string => {
-    let out = '';
-    for (const ch of s) {
-      const code = ch.charCodeAt(0);
-      switch (code) {
-        case 0x0410: case 0x0430: out += 'a'; break;
-        case 0x0412: case 0x0432: out += 'b'; break;
-        case 0x0415: case 0x0435: out += 'e'; break;
-        case 0x041A: case 0x043A: out += 'k'; break;
-        case 0x041C: case 0x043C: out += 'm'; break;
-        case 0x041D: case 0x043D: out += 'h'; break;
-        case 0x041E: case 0x043E: out += 'o'; break;
-        case 0x0420: case 0x0440: out += 'p'; break;
-        case 0x0421: case 0x0441: out += 'c'; break;
-        case 0x0422: case 0x0442: out += 't'; break;
-        case 0x0425: case 0x0445: out += 'x'; break;
-        case 0x0423: case 0x0443: out += 'y'; break;
-        default: out += ch;
-      }
-    }
-    return out;
+  // Guard 2 — token-overlap floor. Tokenization via shared `semanticTokens`
+  // (Cyrillic-fold + unicode split + 3-char min). "shared" means exact OR
+  // substring (≥3 chars both ways) so "папка" intent vs "папкалар" chosen
+  // counts (Kazakh morphology) but "ok" inside "Bookmark" does NOT.
+  const intentTokens = semanticTokens(intentLower);
+  if (intentTokens.size === 0) return null;
+
+  const chosenTokens = semanticTokens(chosenLabel);
+
+  // RECALL GUARD (unchanged from the original): a label-less chosen element
+  // (icon-only "›", "✓", bare <svg> button) has no visible tokens to judge.
+  // The original guard passed these unconditionally — rejecting them is the
+  // recall-killer pattern removed elsewhere. We KEEP that: the floor only
+  // fires when the visible label has content. Technical identity is used
+  // ONLY as an extra ACCEPT signal below — never to newly REJECT a case the
+  // original let through.
+  if (chosenTokens.size === 0) return null;
+
+  // Match against the visible label first (the common path).
+  if (hasTokenOverlap(intentTokens, chosenTokens)) return null;
+
+  const identityTokens = nodeIdentityTokens(chosenNode);
+
+  // CROSS-LANGUAGE / TECHNICAL-IDENTITY ESCAPE HATCH (2026-06):
+  // The visible label may be in a different language than the intent
+  // (English "password" vs placeholder "Пароль") yet the element's
+  // technical identity (type=password, name=password,
+  // autocomplete=current-password, testId=passwordField) unambiguously
+  // matches. The LLM already sees those signals in the candidate line and
+  // picks correctly; the label-only floor must not override it. Accept
+  // when the intent overlaps the (heavily-filtered) identity tokens.
+  if (hasTokenOverlap(intentTokens, identityTokens)) return null;
+
+  return {
+    kind: 'semanticFloor',
+    reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
   };
-  const tok = (s: string): Set<string> =>
-    new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
-
-  const intentTokens = tok(intentLower);
-  const chosenTokens = tok(chosenLabel.toLowerCase());
-
-  // Both sides MUST have content for a meaningful overlap check —
-  // chosenTokens empty after fold means the label was punctuation /
-  // emoji / single chars (e.g. "›", "✓") which the guard above
-  // already let through deliberately.
-  if (intentTokens.size === 0 || chosenTokens.size === 0) return null;
-
-  let shared = 0;
-  outer: for (const i of intentTokens) {
-    for (const c of chosenTokens) {
-      if (i === c) { shared = 1; break outer; }
-      if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
-        shared = 1; break outer;
-      }
-    }
-  }
-
-  if (shared === 0) {
-    return {
-      kind: 'semanticFloor',
-      reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
-    };
-  }
-
-  return null;
 }
 
 /**
@@ -1075,6 +1188,16 @@ export function buildCandidateText(node: InteractiveNode): string {
   }
 
   // Structural hints (lower priority)
+  // Specific input type — a strong semantic anchor for cross-language
+  // intents (e.g. English "password" vs a Cyrillic-labelled field). Only
+  // emitted for SPECIFIC types; generic text/button/submit/hidden carry no
+  // disambiguating meaning and would just bloat the prompt. Mirrors the
+  // `SPECIFIC_INPUT_TYPES` set the semantic-floor guard trusts, so the LLM
+  // and the guard reason from the same signal.
+  {
+    const t = (node.type || node.inputType || '').toLowerCase();
+    if (t && SPECIFIC_INPUT_TYPES.has(t)) parts.push(`type: ${t}`);
+  }
   if (node.autocomplete) {
     parts.push(`autocomplete: ${node.autocomplete}`);
   }
@@ -3457,63 +3580,23 @@ Select the single best matching element, or return ref=null if the intent does n
       // gets the "shares no tokens" rejection, above-0.85 only triggers when both
       // sides have content AND zero shared tokens (handled by the inner
       // `intentTokens.size > 0 && chosenTokens.size > 0` guard already).
-      if (mode !== 'heal') {
+      // Semantic floor — DELEGATED to the shared `evaluateHonestyGuard` so
+      // this inline path and the vision-rescue path use ONE implementation
+      // (previously two byte-identical copies). The guard folds Cyrillic
+      // glyphs, tokenizes label + technical identity, and only rejects when
+      // the intent overlaps NEITHER the visible label NOR the element's
+      // type/name/autocomplete/testId/id (the cross-language escape hatch —
+      // English "password" vs placeholder "Пароль" is no longer a false
+      // reject because `type=password / autocomplete=current-password`
+      // match). Heal mode + <3-char intents are bypassed inside the guard.
+      {
         const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
-        // V23: use the universal `getEffectiveLabel` so semantic floor sees
-        // identity that lives on title/alt/iconLabel/svgIcon/etc., not just
-        // labelText|ariaLabel|text|placeholder. Without this, an Angular
-        // routerLink `<a title="Папкалар">` would falsely fail the semantic
-        // floor because none of the four read fields were populated.
-        const chosenText = getEffectiveLabel(chosenCandidate?.node).toLowerCase();
-        // Same Cyrillic↔Latin glyph fold the apply-time guard uses (M↔М,
-        // A↔А, T↔Т, …) so "MAT-SMART" and "МАТ-SMART" agree on tokens.
-        // Cheap inline copy — pulling the helper out of preview-step-apply
-        // would create a circular import; the duplication is fine for two
-        // sites and lets each guard stay self-contained.
-        const cyrFold = (s: string): string => {
-          let out = '';
-          for (const ch of s) {
-            const code = ch.charCodeAt(0);
-            switch (code) {
-              case 0x0410: case 0x0430: out += 'a'; break;
-              case 0x0412: case 0x0432: out += 'b'; break;
-              case 0x0415: case 0x0435: out += 'e'; break;
-              case 0x041A: case 0x043A: out += 'k'; break;
-              case 0x041C: case 0x043C: out += 'm'; break;
-              case 0x041D: case 0x043D: out += 'h'; break;
-              case 0x041E: case 0x043E: out += 'o'; break;
-              case 0x0420: case 0x0440: out += 'p'; break;
-              case 0x0421: case 0x0441: out += 'c'; break;
-              case 0x0422: case 0x0442: out += 't'; break;
-              case 0x0425: case 0x0445: out += 'x'; break;
-              case 0x0423: case 0x0443: out += 'y'; break;
-              default: out += ch;
-            }
-          }
-          return out;
-        };
-        const tok = (s: string): Set<string> =>
-          new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
-        const intentTokens = tok(intentText.toLowerCase());
-        const chosenTokens = tok(chosenText);
-        if (intentTokens.size > 0 && chosenTokens.size > 0) {
-          // V23: shared = exact OR substring (≥3 chars). Russian/Kazakh/etc.
-          // morphology means "папка" (intent) vs "папкалар" (label) are
-          // semantically the same word but fail set equality. Substring with
-          // a 3-char floor catches morphological variants without globbing
-          // unrelated tokens (e.g. "ok" inside "Bookmark").
-          let shared = 0;
-          outer: for (const i of intentTokens) {
-            for (const c of chosenTokens) {
-              if (i === c) { shared = 1; break outer; }
-              // Prefix-or-substring overlap, both directions, min 3 chars.
-              if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
-                shared = 1; break outer;
-              }
-            }
-          }
-          if (shared === 0) semanticFloorRejected = true;
-        }
+        const honesty = evaluateHonestyGuard({
+          intentText,
+          chosenNode: chosenCandidate?.node,
+          mode: mode === 'heal' ? 'heal' : 'apply',
+        });
+        if (honesty) semanticFloorRejected = true;
       }
       if (confidence < minConfidence || semanticFloorRejected) {
         const reason = semanticFloorRejected

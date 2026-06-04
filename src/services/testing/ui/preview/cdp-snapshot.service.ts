@@ -382,6 +382,63 @@ function liteElementToForensic(el: LiteElement): ForensicNode {
  * Errors are swallowed — forensic logging must NEVER fail a snapshot
  * collect (CLAUDE.md invariant 11: telemetry writes are best-effort).
  */
+/**
+ * Quality score for dedup-survivor selection. Higher wins.
+ * A noBounds-rescue node (DS had no layout row — decorative/offscreen
+ * glyph kept only for id-fallback) or a zero-area box scores 0; a node
+ * with a real rendered box scores 1. Used by `dedupeElementsByRef` to
+ * pick which element survives when two share a ref. See the doculite
+ * incident note at that call site.
+ */
+function dedupSurvivorScore(el: LiteElement): number {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const rescued = (el as any).__noBoundsRescued === true;
+  const w = el.bounds?.width ?? 0;
+  const h = el.bounds?.height ?? 0;
+  if (rescued || w <= 0 || h <= 0) return 0;
+  return 1;
+}
+
+/**
+ * Resolve ref collisions in place: for every `ref` that appears more than
+ * once, keep the single highest-scoring element (real bbox beats
+ * noBounds/zero-area; ties keep the earliest array index for stable,
+ * deterministic output) and return the dropped entries' indices.
+ *
+ * Pure helper extracted from `collect()` so the keep-winner policy is
+ * unit-testable. MUTATES `elements` (splices losers out) and returns the
+ * losers so the caller can emit forensic rejections. Entries without a
+ * `ref` are left untouched.
+ */
+function dedupeElementsByRef(elements: LiteElement[]): LiteElement[] {
+  const winnerByRef = new Map<string, number>(); // ref -> winning index
+  for (let i = 0; i < elements.length; i++) {
+    const ref = elements[i].ref;
+    if (!ref) continue;
+    const prev = winnerByRef.get(ref);
+    if (prev === undefined) {
+      winnerByRef.set(ref, i);
+    } else if (dedupSurvivorScore(elements[i]) > dedupSurvivorScore(elements[prev])) {
+      // Strictly-better candidate replaces the incumbent. `>` (not `>=`)
+      // keeps the earlier index on ties — stable and deterministic.
+      winnerByRef.set(ref, i);
+    }
+  }
+  const losers: LiteElement[] = [];
+  // Iterate high→low so splices don't shift indices we still need to test.
+  for (let i = elements.length - 1; i >= 0; i--) {
+    const ref = elements[i].ref;
+    if (!ref) continue;
+    if (winnerByRef.get(ref) === i) continue; // the survivor
+    losers.push(elements[i]);
+    elements.splice(i, 1);
+  }
+  // `losers` was built high→low; reverse to document order for stable
+  // forensic output.
+  losers.reverse();
+  return losers;
+}
+
 function writeForensicJsonl(collector: ForensicCollector): void {
   if (collector.stages.length === 0 && !collector.summary && !collector.final) return;
   // Serialize on the caller thread (cheap CPU work) so the snapshot of
@@ -1455,35 +1512,39 @@ export class CdpSnapshotService {
       // a real regression we need to chase.
       const beforeDedup = elements.length;
       const dedupStart = forensic ? Date.now() : 0;
-      const seenRefs = new Set<string>();
       const dupSamples: Array<{ ref: string; tag: string; text: string }> = [];
       const dedupRejected: ForensicRejection[] = [];
-      for (let i = elements.length - 1; i >= 0; i--) {
-        const ref = elements[i].ref;
-        if (!ref) continue;
-        if (seenRefs.has(ref)) {
-          if (dupSamples.length < 5) {
-            dupSamples.push({
-              ref,
-              tag: elements[i].tag,
-              text: (elements[i].text || elements[i].name || '').slice(0, 30),
-            });
-          }
-          if (forensic) {
-            const el = elements[i];
-            dedupRejected.push({
-              ...liteElementToForensic(el),
-              reason: 'dedup.duplicateRef',
-              diag: {
-                collidedWithRef: ref,
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                docIdx: (el as any).__docIndex,
-              },
-            });
-          }
-          elements.splice(i, 1);
-        } else {
-          seenRefs.add(ref);
+      // QUALITY-AWARE keep-winner (2026-06): when two elements share a ref,
+      // the previous "keep the first in array order" rule let a zero-bbox
+      // noBounds-rescue node (DS had no layout row for it — typically a
+      // decorative/offscreen glyph) win over a fully-rendered element. The
+      // doculite incident: a hidden iframe's noBounds <svg> at array index
+      // 0 evicted the visible password <input>. Array position is NOT a
+      // correctness signal. `dedupeElementsByRef` scores each entry and
+      // keeps the highest (real bbox > noBounds/zero-area; ties → earliest
+      // index). The cross-frame `d{docIdx}_` prefix above makes real
+      // collisions rare now; this stays as defense-in-depth for same-frame
+      // collisions (cache-key clash, overlay re-render race).
+      const dedupLosers = dedupeElementsByRef(elements);
+      for (const el of dedupLosers) {
+        const ref = el.ref ?? '';
+        if (dupSamples.length < 5) {
+          dupSamples.push({
+            ref,
+            tag: el.tag,
+            text: (el.text || el.name || '').slice(0, 30),
+          });
+        }
+        if (forensic) {
+          dedupRejected.push({
+            ...liteElementToForensic(el),
+            reason: 'dedup.duplicateRef',
+            diag: {
+              collidedWithRef: ref,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              docIdx: (el as any).__docIndex,
+            },
+          });
         }
       }
       const droppedDupes = beforeDedup - elements.length;
@@ -2593,11 +2654,33 @@ export class CdpSnapshotService {
       // Compact in place: assign refs and drop entries whose findElement
       // returned null in-page (empty ref). The same loop as before, just
       // applied to whichever per-doc array we processed.
+      //
+      // CROSS-FRAME REF UNIQUENESS (2026-06 doculite login fix):
+      //   Each frame runs `runRefAssignmentInFrame` in ITS OWN execution
+      //   context with ITS OWN `window.__agentRefCounter`, so EVERY frame
+      //   restarts numbering at `e0`. With ≥2 frames the same ref string
+      //   (`e0`, `e1`, …) is minted independently in each — violating the
+      //   snapshot-global invariant "each ref identifies exactly ONE
+      //   LiteElement" (see the dedup block in collect()). Real incident:
+      //   doculite OAuth login renders a hidden `oauth/integration` iframe
+      //   whose lone noBounds <svg ArrowDropDownIcon> took `e0` — colliding
+      //   with the main-frame password <input> (also `e0`). The global
+      //   dedup then dropped the password field and the resolver never saw
+      //   it ("element not found" on a plainly-visible field).
+      //
+      //   Fix: namespace non-main frames with a `d{docIdx}_` prefix so refs
+      //   are globally unique across the snapshot. The MAIN frame (docIdx=0)
+      //   keeps its bare `eN` refs — it holds ~all real targets, and bare
+      //   refs are what every existing recording/evidence already carries.
+      //   This is safe because `eN`-shaped refs are explicitly treated as
+      //   DOM-counter-unstable and never persisted as a cross-run cache key
+      //   (see step-readiness.service.ts guard `^(e\d+|s\d+|bg-\d+)$`).
+      const refPrefix = docIdx === 0 ? '' : `d${docIdx}_`;
       let writeIdx = 0;
       for (let i = 0; i < docElements.length; i++) {
         const ref = refsByIndex[i] ?? '';
         if (!ref) continue;
-        docElements[i].ref = ref;
+        docElements[i].ref = refPrefix ? `${refPrefix}${ref}` : ref;
         docElements[writeIdx++] = docElements[i];
       }
       docElements.length = writeIdx;
@@ -3462,7 +3545,14 @@ export class CdpSnapshotService {
     };
 
     const requests: RuntimeEnrichmentRequest[] = elements.map((el) => ({
-      ref: el.ref,
+      // Non-main-frame elements carry a `d{docIdx}_` prefix and their
+      // `data-agent-ref` attribute lives in the iframe DOM, not the main
+      // page this evaluate runs on. Blank the ref so the in-page lookup
+      // short-circuits to null (handled by the `!req.ref` guard) instead
+      // of matching a same-numbered MAIN-frame element and copying the
+      // wrong runtime state. `isSensitiveInput` is computed here in Node
+      // from the element's own attrs, so password detection is unaffected.
+      ref: /^d\d+_/.test(el.ref) ? '' : el.ref,
       isSensitiveInput: computeIsSensitiveInput(el),
       isInputLike: el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select',
     }));
@@ -3938,7 +4028,19 @@ export class CdpSnapshotService {
    */
   private static async enrichWithDomWalkFields(page: Page, elements: LiteElement[]): Promise<void> {
     if (elements.length === 0) return;
-    const refs = elements.map((e) => e.ref).filter((r): r is string => !!r);
+    // This DOM walk runs on the MAIN page document only and re-finds each
+    // element by `[data-agent-ref="<ref>"]`. Non-main-frame elements carry
+    // a `d{docIdx}_` prefix (see assignAgentRefs cross-frame uniqueness) and
+    // their `data-agent-ref` attribute lives in the IFRAME's DOM, not the
+    // main page — a main-page querySelector for `d1_e0` would never match.
+    // Skip them: attempting the lookup would either no-op (post-fix) or,
+    // worse, historically matched a same-numbered MAIN-frame element and
+    // copied the WRONG element's fields onto the iframe node. Iframe DOM-walk
+    // enrichment is a separate concern (currently unimplemented) — not
+    // silently-corrupt cross-frame enrichment.
+    const refs = elements
+      .map((e) => e.ref)
+      .filter((r): r is string => !!r && !/^d\d+_/.test(r));
     if (refs.length === 0) return;
 
     type DomWalkResult = {
@@ -5568,4 +5670,6 @@ export const __internalsForTesting = {
   tagToImplicitLandmarkRole,
   computeIsSensitiveInput,
   detectAttributeBasedFramework,
+  dedupSurvivorScore,
+  dedupeElementsByRef,
 };
