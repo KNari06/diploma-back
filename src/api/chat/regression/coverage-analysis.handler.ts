@@ -13,11 +13,11 @@
  * - "что не покрыто?"
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { CoverageAnalysisService } from '@/services/testing/analysis/coverage-analysis.service';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for coverage_analysis intent
@@ -50,12 +50,8 @@ export async function handleCoverageAnalysisIntent(
       userLanguage,
     });
 
-    // Get project ID: try frontend context, then parsedIntent, then look up from chat session
-    let projectId = params.context?.projectId || parsedIntent?.projectId;
-
-    if (!projectId && params.chatSessionId) {
-      projectId = await getProjectIdFromSession(params.chatSessionId);
-    }
+    // Resolve the target project (workspace-membership scoped + validated).
+    const projectId = await resolveProjectId(params);
 
     if (!projectId) {
       res.json({
@@ -134,23 +130,5 @@ export async function handleCoverageAnalysisIntent(
       details: error instanceof Error ? error.message : 'Unknown error',
       timestamp: new Date().toISOString(),
     });
-  }
-}
-
-/**
- * Fallback: get project_id from chat session record
- */
-async function getProjectIdFromSession(chatSessionId: string): Promise<string | null> {
-  try {
-    const { data } = await supabaseAdmin
-      .from('chat_sessions')
-      .select('project_id')
-      .eq('id', chatSessionId)
-      .maybeSingle();
-
-    return data?.project_id || null;
-  } catch (error) {
-    logger.warn('[COVERAGE_ANALYSIS_HANDLER] Failed to get projectId from session', { error });
-    return null;
   }
 }

@@ -10,12 +10,12 @@
  * - "запусти критические тесты"
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for run_by_tag intent
@@ -65,21 +65,15 @@ export async function handleRunByTagIntent(
       return;
     }
 
-    // Get project from workspace
-    const { data: project } = await supabaseAdmin
-      .from('projects')
-      .select('id')
-      .eq('workspace_id', workspace_id)
-      .eq('user_id', userId)
-      .limit(1)
-      .maybeSingle();
+    // Resolve the target project (workspace-membership scoped — see resolver).
+    const projectId = await resolveProjectId(params);
 
-    if (!project) {
+    if (!projectId) {
       throw new NotFoundError('Project', workspace_id);
     }
 
     const result = await RegressionRunService.runByTag({
-      projectId: project.id,
+      projectId,
       tag,
       userId,
       trigger: 'chat',

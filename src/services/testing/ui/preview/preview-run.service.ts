@@ -377,7 +377,7 @@ function detectInitialUrlMismatch(
 // ── Step-Level Retry ───────────────────────────────────────────────────────
 
 /** Step types that should NOT be retried on failure — either non-recoverable or LLM-evaluated */
-const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'wait_for_email', 'dialog', 'download', 'switch_tab', 'close_tab', 'open_tab']);
+const NO_RETRY_STEP_TYPES = new Set(['ai_check', 'wait', 'timeout', 'wait_for_email', 'dialog', 'download', 'switch_tab', 'close_tab', 'open_tab']);
 
 /** Wait time (ms) for DOM stability before retry attempt */
 const RETRY_SETTLE_MS = 1500;
@@ -3093,15 +3093,23 @@ export class PreviewRunService {
   }
 
   /**
-   * Cancel active run for session
-   * Sets cancellation flag, main loop will handle skipping remaining steps
+   * Cancel active run for session.
+   * Sets cancellation flag, main loop will handle skipping remaining steps.
+   *
+   * Idempotent: cancelling when there is no active run is a no-op that returns
+   * `false` (NOT an error). The frontend fires this on editor/preview close as
+   * best-effort cleanup, by which point the run has usually already finished —
+   * treating "nothing to cancel" as an error produced noisy `error` logs and a
+   * spurious INTERNAL_ERROR on the socket for a perfectly normal close.
+   *
    * @param previewSessionId - Preview session ID
    * @param userId - User ID for ownership verification
+   * @returns true if an active run was cancelled, false if there was nothing to cancel
    */
-  static cancelRun(previewSessionId: string, userId: string): void {
+  static cancelRun(previewSessionId: string, userId: string): boolean {
     const runState = activeRuns.get(previewSessionId);
     if (!runState) {
-      throw new Error('No active run for this session');
+      return false;
     }
 
     const sessionService = getPreviewSessionService();
@@ -3116,6 +3124,7 @@ export class PreviewRunService {
       userId,
       currentStepIndex: runState.currentStepIndex,
     });
+    return true;
   }
 
   /**

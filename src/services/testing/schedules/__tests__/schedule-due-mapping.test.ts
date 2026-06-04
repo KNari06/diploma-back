@@ -1,15 +1,11 @@
 /**
  * Tests for ScheduleService.getDueSchedules() target resolution.
  *
- * Regression guard: the old mapping was
- *   targetType: row.module_id ? 'module' : 'plan'
- *   targetId:   row.module_id || row.plan_id
- * which mapped a SUITE row (only suite_id set) to targetType 'plan' with a
- * null targetId. The scheduler then called runPlan(undefined) → "not found" →
- * self-deactivated the schedule with a misleading "target was deleted" message.
- *
- * The fix resolves the target explicitly and surfaces 'suite' so the scheduler
- * can reject it with the correct reason. These tests pin that contract.
+ * Regression guard: the old mapping `row.module_id ? 'module' : 'plan'` mapped a
+ * SUITE row (only suite_id set) to 'plan' with a null targetId → the scheduler
+ * called runPlan(undefined) → "not found" → self-deactivated with a misleading
+ * "target was deleted" message. The fix resolves the target explicitly and
+ * surfaces 'suite' so the scheduler rejects it with the correct reason.
  */
 
 const __dueRows: { data: any[]; error: any } = { data: [], error: null };
@@ -19,7 +15,6 @@ jest.mock('@/db/supabase', () => ({
     from: jest.fn(() => ({
       select: jest.fn(() => ({
         eq: jest.fn(() => ({
-          // getDueSchedules: .select().eq('is_active', true).lte('next_run_at', now)
           lte: jest.fn(async () => ({ data: __dueRows.data, error: __dueRows.error })),
         })),
       })),
@@ -48,7 +43,6 @@ function baseRow(overrides: Record<string, any>) {
 
 describe('ScheduleService.getDueSchedules — target resolution', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
     __dueRows.data = [];
     __dueRows.error = null;
   });
@@ -67,15 +61,14 @@ describe('ScheduleService.getDueSchedules — target resolution', () => {
     expect(due.targetId).toBe('plan-1');
   });
 
-  it('maps a suite row to targetType "suite" (NOT "plan") with its suite id', async () => {
+  it('maps a suite row to "suite" (NOT "plan") with its suite id', async () => {
     __dueRows.data = [baseRow({ suite_id: 'suite-1' })];
     const [due] = await ScheduleService.getDueSchedules();
-    // Regression: previously this returned 'plan' with a null targetId.
     expect(due.targetType).toBe('suite');
     expect(due.targetId).toBe('suite-1');
   });
 
-  it('maps a row with no resolvable target to suite/null (handled as unrunnable)', async () => {
+  it('maps a row with no resolvable target to suite/null', async () => {
     __dueRows.data = [baseRow({})];
     const [due] = await ScheduleService.getDueSchedules();
     expect(due.targetId).toBeNull();

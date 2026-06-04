@@ -1,10 +1,10 @@
 /**
  * Tests for TestSchedulerJobHandler dispatch behaviour.
  *
- * Focus: the routing decisions made per due schedule — claim gating, suite
- * rejection (no runSuite() path), and correct dispatch for module/plan. The
- * cron engine itself is covered by schedule-cron.test.ts; here we stub
- * ScheduleService entirely and assert how the handler reacts.
+ * Focus: routing per due schedule — claim gating, suite/null rejection (no
+ * runSuite path), owner-access revalidation (E1), and correct module/plan
+ * dispatch. The cron engine is covered by schedule-cron.test.ts; here we stub
+ * ScheduleService entirely.
  */
 
 jest.mock('@/services/testing/schedules/schedule.service', () => ({
@@ -12,27 +12,21 @@ jest.mock('@/services/testing/schedules/schedule.service', () => ({
     getDueSchedules: jest.fn(),
     claimDueSchedule: jest.fn(),
     deactivate: jest.fn(),
+    userOwnsTarget: jest.fn(),
   },
 }));
 
 jest.mock('@/services/testing/regression/regression-run.service', () => ({
-  RegressionRunService: {
-    runModule: jest.fn(),
-    runPlan: jest.fn(),
-  },
+  RegressionRunService: { runModule: jest.fn(), runPlan: jest.fn() },
 }));
 
 jest.mock('@/services/notifications/notification.service', () => ({
   NotificationService: { createNotification: jest.fn() },
 }));
 
-// Heartbeat writes to Redis — stub the queue client so no real Redis is hit.
 jest.mock('@/config/infrastructure/queues', () => ({
   testRunQueue: {
-    client: Promise.resolve({
-      set: jest.fn(async () => 'OK'),
-      get: jest.fn(async () => null),
-    }),
+    client: Promise.resolve({ set: jest.fn(async () => 'OK'), get: jest.fn(async () => null) }),
   },
 }));
 
@@ -49,6 +43,7 @@ import { RegressionRunService } from '@/services/testing/regression/regression-r
 const mockGetDue = ScheduleService.getDueSchedules as jest.Mock;
 const mockClaim = ScheduleService.claimDueSchedule as jest.Mock;
 const mockDeactivate = ScheduleService.deactivate as jest.Mock;
+const mockOwns = ScheduleService.userOwnsTarget as jest.Mock;
 const mockRunModule = RegressionRunService.runModule as jest.Mock;
 const mockRunPlan = RegressionRunService.runPlan as jest.Mock;
 
@@ -69,6 +64,7 @@ describe('TestSchedulerJobHandler.processSchedules', () => {
     jest.clearAllMocks();
     mockClaim.mockResolvedValue(true);
     mockDeactivate.mockResolvedValue(undefined);
+    mockOwns.mockResolvedValue(true); // owner still has access by default
     mockRunModule.mockResolvedValue({ runId: 'r1' });
     mockRunPlan.mockResolvedValue({ runId: 'r1' });
   });
@@ -103,10 +99,9 @@ describe('TestSchedulerJobHandler.processSchedules', () => {
     );
   });
 
-  it('rejects a suite schedule: deactivates it and never calls runPlan', async () => {
+  it('rejects a suite schedule: deactivates it, never calls runPlan', async () => {
     mockGetDue.mockResolvedValue([due({ targetType: 'suite', targetId: 'suite-9' })]);
     await TestSchedulerJobHandler.processSchedules();
-    // Regression: a suite must NOT be misrouted to runPlan(undefined).
     expect(mockRunPlan).not.toHaveBeenCalled();
     expect(mockRunModule).not.toHaveBeenCalled();
     expect(mockDeactivate).toHaveBeenCalledWith('sched-1', 'user-1');
@@ -117,6 +112,24 @@ describe('TestSchedulerJobHandler.processSchedules', () => {
     await TestSchedulerJobHandler.processSchedules();
     expect(mockRunPlan).not.toHaveBeenCalled();
     expect(mockDeactivate).toHaveBeenCalledWith('sched-1', 'user-1');
+  });
+
+  it('(E1) deactivates and does NOT dispatch when the owner DEFINITIVELY lost access', async () => {
+    mockGetDue.mockResolvedValue([due({ targetType: 'plan', targetId: 'plan-9' })]);
+    mockOwns.mockResolvedValue(false); // definitive "no access"
+    await TestSchedulerJobHandler.processSchedules();
+    expect(mockRunPlan).not.toHaveBeenCalled();
+    expect(mockDeactivate).toHaveBeenCalledWith('sched-1', 'user-1');
+  });
+
+  it('(E1) on a TRANSIENT access-check error: skips the tick, does NOT deactivate, does NOT dispatch', async () => {
+    // A DB blip during the ownership check must never permanently disable a
+    // valid schedule. userOwnsTarget throws → skip this occurrence, retry next.
+    mockGetDue.mockResolvedValue([due({ targetType: 'plan', targetId: 'plan-9' })]);
+    mockOwns.mockRejectedValue(new Error('supabase timeout'));
+    await TestSchedulerJobHandler.processSchedules();
+    expect(mockRunPlan).not.toHaveBeenCalled();
+    expect(mockDeactivate).not.toHaveBeenCalled(); // the critical assertion
   });
 
   it('continues to the next schedule when one dispatch throws', async () => {

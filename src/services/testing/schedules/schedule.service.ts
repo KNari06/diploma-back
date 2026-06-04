@@ -44,8 +44,7 @@ export class ScheduleService {
     // controllers also validate, but other internal callers (e.g.
     // RegressionPlanService.syncSchedule) may bypass them and we don't
     // want a bad row that fires every hour forever via the fallback in
-    // calculateNextRun. Checked before the (DB-touching) ownership check so a
-    // bad cron returns the precise error without a needless query.
+    // calculateNextRun.
     if (!this.parseCron(cronExpression)) {
       throw new Error(`Invalid cron expression: "${cronExpression}"`);
     }
@@ -54,6 +53,7 @@ export class ScheduleService {
     // schedule could be created against a foreign/non-existent module or plan;
     // it would then fail at run time and self-deactivate with a misleading
     // message — and it's an authorization gap (scheduling someone else's target).
+    // Runs AFTER cron validation so a bad cron returns its precise error first.
     const ownsTarget = await this.userOwnsTarget(userId, { moduleId, planId });
     if (!ownsTarget) {
       throw new Error(
@@ -269,34 +269,19 @@ export class ScheduleService {
       // with a correct reason instead of misrouting to runPlan(undefined) — the
       // old `row.module_id ? 'module' : 'plan'` mapped a suite row to 'plan'
       // with a null targetId, which then self-deactivated as "target deleted".
-      if (row.module_id) {
-        return {
-          scheduleId: row.id,
-          projectId: row.project_id,
-          userId: row.user_id,
-          targetType: 'module',
-          targetId: row.module_id,
-          parameters: row.parameters || {},
-        };
-      }
-      if (row.plan_id) {
-        return {
-          scheduleId: row.id,
-          projectId: row.project_id,
-          userId: row.user_id,
-          targetType: 'plan',
-          targetId: row.plan_id,
-          parameters: row.parameters || {},
-        };
-      }
-      return {
+      const base = {
         scheduleId: row.id,
         projectId: row.project_id,
         userId: row.user_id,
-        targetType: 'suite',
-        targetId: row.suite_id || null,
         parameters: row.parameters || {},
       };
+      if (row.module_id) {
+        return { ...base, targetType: 'module', targetId: row.module_id };
+      }
+      if (row.plan_id) {
+        return { ...base, targetType: 'plan', targetId: row.plan_id };
+      }
+      return { ...base, targetType: 'suite', targetId: row.suite_id || null };
     });
   }
 
@@ -322,10 +307,26 @@ export class ScheduleService {
       return false;
     }
 
-    const nextRunAt = this.calculateNextRun(
+    const nextRunAt = this.calculateNextRunOrNull(
       schedule.cron_expression,
       schedule.timezone
     );
+
+    // Unsatisfiable cron (e.g. "0 9 30 2 *"). Don't advance next_run_at (that
+    // would fire it daily forever via a stale value) — deactivate so it stops
+    // being due. The scheduler's pre-claim guard normally catches this first
+    // and notifies the user; this is the defensive backstop.
+    if (nextRunAt === null) {
+      logger.warn('[SCHEDULE_SERVICE] Unsatisfiable cron — deactivating schedule', {
+        id,
+        cronExpression: schedule.cron_expression,
+      });
+      await supabaseAdmin
+        .from('test_schedules')
+        .update({ is_active: false })
+        .eq('id', id);
+      return false;
+    }
 
     // Include cron_expression in WHERE to guard against concurrent config changes.
     // If the user updated the cron between our SELECT and this UPDATE, the row
@@ -373,14 +374,28 @@ export class ScheduleService {
   //
   // Public so RegressionPlanService.syncSchedule can reuse the same logic.
   static calculateNextRun(cronExpression: string, timezone: string): string {
+    const next = this.calculateNextRunOrNull(cronExpression, timezone);
+    if (next === null) {
+      // The cron is structurally valid but can NEVER occur (e.g. "0 9 30 2 *"
+      // — Feb 30). Previously this fell through to a now+24h fallback, so an
+      // impossible cron silently ran every single day forever. Throw instead so
+      // the persisting layer (create/update) rejects it, and the scheduler's
+      // claim path deactivates it rather than firing daily. See callers.
+      throw new Error(`Unsatisfiable cron expression: "${cronExpression}"`);
+    }
+    return next;
+  }
+
+  // Like calculateNextRun but returns null instead of throwing when the cron is
+  // unsatisfiable. The scheduler uses this to deactivate impossible schedules
+  // without try/catch; create/update go through the throwing wrapper above.
+  static calculateNextRunOrNull(cronExpression: string, timezone: string): string | null {
     const now = new Date();
 
     const parsed = this.parseCron(cronExpression);
     if (!parsed) {
-      // Truly invalid cron — log loudly. Persisting layer (controllers)
-      // should reject before this is ever reached, but keep a safe
-      // fallback so production never explodes on a bad row that
-      // pre-dates validation.
+      // Structurally invalid — log loudly. Persisting layers reject before this,
+      // but keep a safe +1h fallback so a bad legacy row never explodes.
       logger.error('[SCHEDULE_SERVICE] calculateNextRun: invalid cron — falling back to +1h', {
         cronExpression,
       });
@@ -392,14 +407,28 @@ export class ScheduleService {
     const sortedMinutes = [...minutes].sort((a, b) => a - b);
     const sortedHours = [...hours].sort((a, b) => a - b);
 
-    // Scan up to 400 days to cover monthly/yearly patterns
-    for (let dayOffset = 0; dayOffset <= 400; dayOffset++) {
+    // POSIX cron day semantics: when BOTH day-of-month and day-of-week are
+    // restricted (neither is '*'), a day matches if EITHER matches (OR). When
+    // only one is restricted, it alone gates the day (the other being '*' = all
+    // days). Detect "restricted" by comparing to the full materialised range:
+    // dom '*' → 31 values (1..31); dow '*' → 7 values (0..6) after 7→0 normalise.
+    const domRestricted = doms.size !== 31;
+    const dowRestricted = dows.size !== 7;
+
+    // Scan up to 1500 days (>4 years) so legitimate leap-day crons ("0 9 29 2 *")
+    // resolve to the next real Feb 29 (up to ~1461 days out) instead of being
+    // misclassified as unsatisfiable.
+    for (let dayOffset = 0; dayOffset <= 1500; dayOffset++) {
       const candidate = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
       const candidateParts = this.datePartsInTimezone(candidate, tz);
 
       if (!months.has(candidateParts.month)) continue;
-      if (!doms.has(candidateParts.day)) continue;
-      if (!dows.has(candidateParts.dow)) continue;
+
+      const domMatch = doms.has(candidateParts.day);
+      const dowMatch = dows.has(candidateParts.dow);
+      const dayMatch =
+        domRestricted && dowRestricted ? domMatch || dowMatch : domMatch && dowMatch;
+      if (!dayMatch) continue;
 
       // Try each allowed hour:minute combination on this day
       for (const hour of sortedHours) {
@@ -420,8 +449,9 @@ export class ScheduleService {
       }
     }
 
-    // Fallback (should never reach here for valid cron)
-    return new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+    // Scan exhausted → the cron can never occur within the horizon. Signal
+    // unsatisfiable (caller decides: throw on create, deactivate in scheduler).
+    return null;
   }
 
   /**
@@ -632,36 +662,35 @@ export class ScheduleService {
    * model stays identical to how the same target is authorized at run time
    * (modules: owner; plans: workspace membership). Reusing those avoids a
    * second, divergent access rule living here.
+   *
+   * Lazy imports: RegressionPlanService imports ScheduleService, so a top-level
+   * import back would create a require cycle. These run at call time only.
+   *
+   * Returns `false` ONLY for a definitive "missing or no access" (getById → null).
+   * A transient/unexpected error (DB blip, WorkspaceAccess hiccup) is RE-THROWN,
+   * NOT collapsed to false — because callers act irreversibly on false (the
+   * scheduler deactivates the schedule). The caller must distinguish "the user
+   * genuinely lost access" (deactivate) from "we couldn't check right now"
+   * (skip this tick, retry next time). Swallowing here once permanently disabled
+   * valid schedules on a momentary blip.
    */
-  private static async userOwnsTarget(
+  static async userOwnsTarget(
     userId: string,
     target: { moduleId?: string; planId?: string }
   ): Promise<boolean> {
-    try {
-      if (target.moduleId) {
-        // Lazy import: RegressionPlanService imports ScheduleService, so a
-        // top-level import back would create a require cycle. These run at
-        // call time only, so a dynamic import is both safe and sufficient.
-        const { ModuleService } = await import('@/services/testing/modules/module.service');
-        const mod = await ModuleService.getById(target.moduleId, userId);
-        return !!mod;
-      }
-      if (target.planId) {
-        const { RegressionPlanService } = await import(
-          '@/services/testing/plans/regression-plan.service'
-        );
-        const plan = await RegressionPlanService.getById(target.planId, userId);
-        return !!plan;
-      }
-      return false;
-    } catch (error) {
-      logger.error('[SCHEDULE_SERVICE] userOwnsTarget check failed', {
-        error: error instanceof Error ? error.message : String(error),
-        userId,
-        target,
-      });
-      return false;
+    if (target.moduleId) {
+      const { ModuleService } = await import('@/services/testing/modules/module.service');
+      const mod = await ModuleService.getById(target.moduleId, userId);
+      return !!mod;
     }
+    if (target.planId) {
+      const { RegressionPlanService } = await import(
+        '@/services/testing/plans/regression-plan.service'
+      );
+      const plan = await RegressionPlanService.getById(target.planId, userId);
+      return !!plan;
+    }
+    return false;
   }
 
   /**

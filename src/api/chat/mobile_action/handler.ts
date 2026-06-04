@@ -46,6 +46,9 @@ import {
   emitMobileToolStep,
 } from '../mobile_agent/progress';
 import { getMobileRunnerClient } from '@/services/mobile/mobile-runner-client';
+import { redactPii } from '@/services/chat/pii-redactor';
+import { wrapUntrusted, UNTRUSTED_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
+import { env } from '@/config/environment/env';
 import {
   assertMobileSessionOwnership,
   MobileSessionAuthzError,
@@ -91,6 +94,8 @@ const SYSTEM_PROMPT = [
   '  the FIRST reasonable single action; the caller will follow up.',
   '- If you truly cannot decide, still call the most plausible tool — never reply',
   '  with plain text from this handler.',
+  '',
+  UNTRUSTED_CONTENT_INSTRUCTION,
 ].join('\n');
 
 export async function handleMobileAction(
@@ -406,7 +411,18 @@ function formatSnapshotForPrompt(
   ]
     .filter(Boolean)
     .join('\n');
-  return `${header}\n${snap.formattedTree}`;
+
+  // Parity with the agentic path (tools.ts:formatSnapshotForLlm). The a11y
+  // tree is user-controlled content from arbitrary apps — it may carry PII
+  // (emails / OTPs / cards inside EditText) AND prompt-injection payloads.
+  // Redact FIRST so PII never sits between the untrusted markers, then wrap.
+  // The header is OUR text (runner-controlled fields), so it is not wrapped.
+  let body = snap.formattedTree ?? '';
+  if (env.MOBILE_CHAT_PII_REDACTION) {
+    body = redactPii(body);
+  }
+  const wrappedBody = wrapUntrusted(body);
+  return `${header}\n${wrappedBody}`;
 }
 
 async function respondError(

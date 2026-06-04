@@ -111,7 +111,7 @@ describe('error-handler', () => {
     it('should handle QAIError correctly', () => {
       const error = new QAIError('Custom error', 'CUSTOM_ERROR', 422, { field: 'test' });
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(422);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -128,7 +128,7 @@ describe('error-handler', () => {
       const error = new Error('Validation failed');
       error.name = 'ValidationError';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(400);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -144,7 +144,7 @@ describe('error-handler', () => {
       const error = new Error('invalid token');
       error.name = 'JsonWebTokenError';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -160,7 +160,7 @@ describe('error-handler', () => {
       const error = new Error('jwt expired');
       error.name = 'TokenExpiredError';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(401);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -176,7 +176,7 @@ describe('error-handler', () => {
       const error = new Error('Database constraint violated');
       error.name = 'PostgrestError';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(400);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -191,7 +191,7 @@ describe('error-handler', () => {
     it('should handle Redis errors (503)', () => {
       const error = new Error('Redis connection failed');
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(503);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -206,7 +206,7 @@ describe('error-handler', () => {
     it('should handle OpenAI errors (503)', () => {
       const error = new Error('OpenAI API rate limit exceeded');
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(503);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -221,7 +221,7 @@ describe('error-handler', () => {
     it('should handle Agent errors (503)', () => {
       const error = new Error('Agent connection timeout');
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(503);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -237,7 +237,7 @@ describe('error-handler', () => {
       const error = new Error('connect ECONNREFUSED') as any;
       error.code = 'ECONNREFUSED';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(502);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -253,7 +253,7 @@ describe('error-handler', () => {
       const error = new Error('Connection timed out') as any;
       error.code = 'ETIMEDOUT';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(502);
     });
@@ -262,7 +262,7 @@ describe('error-handler', () => {
       const error = new Error('getaddrinfo ENOTFOUND') as any;
       error.code = 'ENOTFOUND';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(502);
     });
@@ -271,7 +271,7 @@ describe('error-handler', () => {
       const error = new Error('Connection reset') as any;
       error.code = 'ECONNRESET';
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(502);
     });
@@ -279,7 +279,7 @@ describe('error-handler', () => {
     it('should handle 502 message as 502', () => {
       const error = new Error('502 Bad Gateway from upstream');
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(502);
     });
@@ -287,7 +287,7 @@ describe('error-handler', () => {
     it('should return 500 for unknown errors', () => {
       const error = new Error('Something unexpected happened');
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.status).toHaveBeenCalledWith(500);
       expect(mockRes.json).toHaveBeenCalledWith(
@@ -302,7 +302,7 @@ describe('error-handler', () => {
       process.env.NODE_ENV = 'production';
       const error = new Error('Sensitive internal error details');
 
-      errorHandler(error, mockReq as Request, mockRes as Response);
+      errorHandler(error, mockReq as Request, mockRes as Response, mockNext);
 
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({

@@ -167,22 +167,48 @@ export class TestSchedulerJobHandler {
   private static async executeSchedule(schedule: DueSchedule): Promise<void> {
     const { targetType, targetId, userId, parameters } = schedule;
 
-    // Guard: an unrunnable schedule (suite target, or any row with no resolvable
-    // target id). There is no runSuite() path. Deactivate so it stops occupying
-    // the due-sweep forever and tell the user WHY — instead of misrouting it to
-    // runPlan(undefined), which used to fail as "not found" and self-deactivate
-    // with a misleading "target was deleted" message.
+    // Guard 1: unrunnable target. Suites have no runSuite() path, and a null
+    // targetId means the row resolved to nothing. Deactivate with the real
+    // reason instead of misrouting to runPlan(undefined) → "not found" →
+    // misleading "target was deleted" self-deactivation.
     if (targetType === 'suite' || !targetId) {
-      logger.warn('[TEST_SCHEDULER] Unrunnable schedule — deactivating', {
-        scheduleId: schedule.scheduleId,
-        targetType,
-        targetId,
-      });
       await this.deactivateUnrunnable(
         schedule,
         targetType === 'suite'
-          ? 'Scheduling regression suites is not supported. Please schedule a plan or module instead.'
+          ? 'Scheduling regression suites is not supported. Schedule a plan or module instead.'
           : 'This schedule has no valid target. It has been disabled.'
+      );
+      return;
+    }
+
+    // Guard 2 (E1): the owner must STILL have access to the target. The schedule
+    // stores user_id and would otherwise run forever as a user who may have lost
+    // access (left the workspace, plan moved, etc.) — silently spending credits.
+    //
+    // CRITICAL: only a DEFINITIVE "no access" (userOwnsTarget → false) deactivates.
+    // A thrown error means we COULDN'T determine access (DB blip, WorkspaceAccess
+    // hiccup) — in that case skip this tick and retry next minute. Do NOT
+    // deactivate: a momentary error must never permanently disable a valid
+    // schedule. next_run_at was already advanced by claimDueSchedule, so the user
+    // misses at most this one occurrence (logged for visibility).
+    let stillOwns: boolean;
+    try {
+      stillOwns = await ScheduleService.userOwnsTarget(userId, {
+        ...(targetType === 'module' ? { moduleId: targetId } : { planId: targetId }),
+      });
+    } catch (accessError) {
+      logger.error('[TEST_SCHEDULER] Owner access check failed (transient) — skipping this tick, NOT deactivating', {
+        scheduleId: schedule.scheduleId,
+        targetType,
+        targetId,
+        error: accessError instanceof Error ? accessError.message : String(accessError),
+      });
+      return;
+    }
+    if (!stillOwns) {
+      await this.deactivateUnrunnable(
+        schedule,
+        'The owner no longer has access to this schedule\'s target. The schedule has been disabled.'
       );
       return;
     }
@@ -350,15 +376,21 @@ export class TestSchedulerJobHandler {
   }
 
   /**
-   * Deactivate a schedule that can never run (unsupported suite target or a
-   * row with no resolvable target) and notify the user with the real reason.
-   * Best-effort: failures here are logged but never re-thrown — the schedule
-   * has already been claimed, so the loop should simply move on.
+   * Deactivate a schedule that can never run (unsupported suite target, a row
+   * with no resolvable target, or an owner who lost access) and notify the user
+   * with the real reason. Best-effort: failures here are logged but never
+   * re-thrown — the schedule was already claimed, so the loop should move on.
    */
   private static async deactivateUnrunnable(
     schedule: DueSchedule,
     message: string
   ): Promise<void> {
+    logger.warn('[TEST_SCHEDULER] Unrunnable schedule — deactivating', {
+      scheduleId: schedule.scheduleId,
+      targetType: schedule.targetType,
+      targetId: schedule.targetId,
+    });
+
     try {
       await ScheduleService.deactivate(schedule.scheduleId, schedule.userId);
     } catch (deactivateError) {

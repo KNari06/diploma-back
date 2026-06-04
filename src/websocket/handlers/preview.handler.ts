@@ -113,8 +113,8 @@ const RECORDING_MAX_TIME_MS = (() => {
  * Override via `WEB_RECORDING_MAX_STEPS`; set to 0 to disable.
  */
 const RECORDING_MAX_STEPS = (() => {
-  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '50', 10);
-  return Number.isFinite(raw) && raw >= 0 ? raw : 50;
+  const raw = parseInt(process.env.WEB_RECORDING_MAX_STEPS || '25', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 25;
 })();
 
 /**

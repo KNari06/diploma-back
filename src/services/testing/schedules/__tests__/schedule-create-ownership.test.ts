@@ -1,15 +1,10 @@
 /**
  * Tests for the target-ownership gate on ScheduleService.create().
  *
- * Before this change, create() validated the cron + that exactly one target
- * was set, but never that the module/plan actually existed or belonged to the
- * caller. A schedule against a foreign/non-existent target was happily
- * persisted, then failed at run time and self-deactivated with a misleading
- * message — and it was an authorization gap.
- *
- * create() now delegates the access check to each domain's own getById
- * (dynamically imported to avoid the require cycle with RegressionPlanService).
- * These tests mock those modules and pin the gate.
+ * create() now verifies the module/plan exists AND the caller can access it,
+ * delegating to each domain's own access-checked getById (dynamically imported
+ * to avoid the require cycle with RegressionPlanService). Cron validation runs
+ * first so a bad cron returns its precise error before the ownership check.
  */
 
 const __insertResult: { data: any; error: any } = { data: null, error: null };
@@ -77,36 +72,35 @@ describe('ScheduleService.create — target ownership', () => {
   });
 
   it('rejects when neither moduleId nor planId is set', async () => {
-    await expect(ScheduleService.create(params({}))).rejects.toThrow(
+    await expect(ScheduleService.create(params({}))).rejects.toThrow(/Exactly one of moduleId or planId/);
+  });
+
+  it('rejects when both are set', async () => {
+    await expect(ScheduleService.create(params({ moduleId: 'm', planId: 'p' }))).rejects.toThrow(
       /Exactly one of moduleId or planId/,
     );
   });
 
-  it('rejects when both moduleId and planId are set', async () => {
-    await expect(
-      ScheduleService.create(params({ moduleId: 'm', planId: 'p' })),
-    ).rejects.toThrow(/Exactly one of moduleId or planId/);
-  });
-
-  it('rejects an invalid cron before touching the DB', async () => {
+  it('rejects an invalid cron before touching ownership/DB', async () => {
     await expect(
       ScheduleService.create(params({ planId: 'plan-1', cronExpression: 'nope' })),
     ).rejects.toThrow(/Invalid cron expression/);
+    expect(mockPlanGetById).not.toHaveBeenCalled();
   });
 
   it('rejects a plan target the user cannot access', async () => {
-    mockPlanGetById.mockResolvedValue(null); // no access / not found
-    await expect(
-      ScheduleService.create(params({ planId: 'plan-1' })),
-    ).rejects.toThrow(/not found or access denied/);
+    mockPlanGetById.mockResolvedValue(null);
+    await expect(ScheduleService.create(params({ planId: 'plan-1' }))).rejects.toThrow(
+      /not found or access denied/,
+    );
     expect(mockPlanGetById).toHaveBeenCalledWith('plan-1', 'user-1');
   });
 
   it('rejects a module target the user cannot access', async () => {
     mockModuleGetById.mockResolvedValue(null);
-    await expect(
-      ScheduleService.create(params({ moduleId: 'mod-1' })),
-    ).rejects.toThrow(/not found or access denied/);
+    await expect(ScheduleService.create(params({ moduleId: 'mod-1' }))).rejects.toThrow(
+      /not found or access denied/,
+    );
     expect(mockModuleGetById).toHaveBeenCalledWith('mod-1', 'user-1');
   });
 
@@ -115,5 +109,14 @@ describe('ScheduleService.create — target ownership', () => {
     const result = await ScheduleService.create(params({ planId: 'plan-1' }));
     expect(result.id).toBe('sched-1');
     expect(result.planId).toBe('plan-1');
+  });
+
+  it('propagates a transient ownership-check error (does NOT mask it as access-denied)', async () => {
+    // userOwnsTarget rethrows transient errors; create surfaces them as a real
+    // failure rather than a misleading "not found or access denied".
+    mockPlanGetById.mockRejectedValue(new Error('supabase timeout'));
+    await expect(ScheduleService.create(params({ planId: 'plan-1' }))).rejects.toThrow(
+      /supabase timeout/,
+    );
   });
 });

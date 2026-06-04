@@ -10,13 +10,13 @@
  * - "запусти план Pre-release"
  */
 
-import { supabaseAdmin } from '@/db/supabase';
 import { RegressionPlanService } from '@/services/testing/plans/regression-plan.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
 import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { resolveProjectId } from './project-resolver';
 
 /**
  * Handler for run_plan intent
@@ -37,7 +37,7 @@ export async function handleRunPlanIntent(
     abortSignal?: AbortSignal;
   }
 ): Promise<void> {
-  const { parsedIntent, userId, workspace_id } = params;
+  const { parsedIntent, userId } = params;
 
   const userLanguage = parsedIntent?.userLanguage || 'neutral';
   const localized = getLocalizedMessages(userLanguage);
@@ -56,17 +56,10 @@ export async function handleRunPlanIntent(
 
     // If no ID but name provided, search for plan
     if (!targetPlanId && planName) {
-      // Get project from workspace
-      const { data: project } = await supabaseAdmin
-        .from('projects')
-        .select('id')
-        .eq('workspace_id', workspace_id)
-        .eq('user_id', userId)
-        .limit(1)
-        .maybeSingle();
+      const projectId = await resolveProjectId(params);
 
-      if (project) {
-        const plans = await RegressionPlanService.listByProject(project.id, userId);
+      if (projectId) {
+        const plans = await RegressionPlanService.listByProject(projectId, userId);
         const matchedPlan = plans.find(
           (p) => p.name.toLowerCase() === planName.toLowerCase()
         );

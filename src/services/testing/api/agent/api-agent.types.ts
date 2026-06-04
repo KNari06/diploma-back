@@ -79,6 +79,11 @@ export interface ApiAgentRequest {
    * - 'nonprod': allows mutations and aggressive testing
    */
   executionProfile?: ExecutionProfile;
+  /**
+   * Cancellation signal. When aborted (e.g. user hits /chat/cancel), the
+   * orchestrator halts the run between steps with stopReason 'user_cancelled'.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export type ApiAgentExpectationResponseType = 'list' | 'object' | 'primitive' | 'unknown';

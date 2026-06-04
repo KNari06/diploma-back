@@ -1338,8 +1338,8 @@ export interface DueSchedule {
   // no runSuite() execution path, so a suite schedule must NOT be silently
   // misrouted to runPlan() (which would self-deactivate it as "target deleted").
   targetType: 'module' | 'plan' | 'suite';
-  // null when a schedule row has none of module_id/plan_id/suite_id resolvable
-  // to a runnable target. The scheduler treats a null targetId as unrunnable.
+  // null when a schedule row has no resolvable runnable target. The scheduler
+  // treats a null targetId as unrunnable and deactivates the schedule.
   targetId: string | null;
   parameters: Record<string, any>;
 }

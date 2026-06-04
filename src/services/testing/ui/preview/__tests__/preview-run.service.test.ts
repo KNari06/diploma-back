@@ -437,10 +437,10 @@ describe('PreviewRunService', () => {
       await runPromise;
     });
 
-    it('should throw error if no active run', () => {
-      expect(() => {
-        PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId);
-      }).toThrow('No active run for this session');
+    it('returns false (idempotent no-op) if no active run', () => {
+      // Cancelling with nothing running is a normal close-time cleanup, not an
+      // error — it must not throw and should report "nothing cancelled".
+      expect(PreviewRunService.cancelRun(mockPreviewSessionId, mockUserId)).toBe(false);
     });
 
     it('should throw error if session not owned', async () => {

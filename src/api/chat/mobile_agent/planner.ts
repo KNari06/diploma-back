@@ -31,6 +31,9 @@ import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service
 import { AI_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
 import type { MobileUiState } from '@/services/mobile/mobile-runner.types';
+import { redactPii } from '@/services/chat/pii-redactor';
+import { wrapUntrusted, UNTRUSTED_CONTENT_INSTRUCTION } from '@/services/chat/untrusted-content-wrapper';
+import { env } from '@/config/environment/env';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Schema — every field the executor needs to drive one step.
@@ -106,6 +109,8 @@ const PLANNER_SYSTEM_PROMPT = [
   '  ],',
   '  "assumesCredentialsFromUser": true|false',
   '}',
+  '',
+  UNTRUSTED_CONTENT_INSTRUCTION,
 ].join('\n');
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -219,10 +224,24 @@ function formatScreenForPlanner(snap: MobileUiState): string {
   ]
     .filter(Boolean)
     .join(', ');
+  // The a11y tree is user-controlled content from arbitrary apps — it may
+  // carry PII (emails / OTPs / cards inside EditText) AND prompt-injection
+  // payloads. Mirror the observe path (tools.ts:formatSnapshotForLlm):
+  // redact FIRST (so PII never survives into the prompt, even truncated),
+  // then trim, then wrap so the markers frame the final body. The header is
+  // OUR text (runner-controlled fields), so it is not wrapped.
+  let tree = snap.formattedTree ?? '';
+  if (env.MOBILE_CHAT_PII_REDACTION) {
+    tree = redactPii(tree);
+  }
   // Feed only a trimmed tree — the planner operates at a higher level than
   // the executor and doesn't need every leaf.
-  const treePreview = snap.formattedTree.slice(0, 2000);
-  return `${header}\n${treePreview}${snap.formattedTree.length > 2000 ? '\n…(tree truncated for planner)' : ''}`;
+  const truncated = tree.length > 2000;
+  const treePreview = tree.slice(0, 2000);
+  const wrappedTree = wrapUntrusted(
+    `${treePreview}${truncated ? '\n…(tree truncated for planner)' : ''}`,
+  );
+  return `${header}\n${wrappedTree}`;
 }
 
 /**

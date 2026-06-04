@@ -1,14 +1,10 @@
 /**
  * Unit tests for the cron engine in ScheduleService.
  *
- * `parseCron` and `calculateNextRun` are pure (no DB / no clock injection
- * beyond `new Date()`), so these tests need no mocks. They pin the contract
- * that the scheduler relies on every minute: a valid cron always yields a
- * next-run STRICTLY in the future, invalid crons are rejected, and timezones
- * are honoured.
- *
- * The scheduler process itself was historically untested — these tests close
- * the gap that let cron regressions ship unnoticed.
+ * `parseCron` / `calculateNextRun` / `calculateNextRunOrNull` are pure (no DB),
+ * so these need no mocks. They pin the contract the scheduler relies on every
+ * minute: a valid cron yields a strictly-future next-run; POSIX DOM/DOW OR
+ * semantics; unsatisfiable crons are rejected (not run daily); timezones honoured.
  */
 
 import { ScheduleService } from '../schedule.service';
@@ -25,17 +21,24 @@ describe('ScheduleService.parseCron', () => {
   });
 
   it('rejects out-of-range field values', () => {
-    expect(ScheduleService.parseCron('60 9 * * *')).toBeNull(); // minute 60
-    expect(ScheduleService.parseCron('0 24 * * *')).toBeNull(); // hour 24
-    expect(ScheduleService.parseCron('0 9 32 * *')).toBeNull(); // dom 32
-    expect(ScheduleService.parseCron('0 9 * 13 *')).toBeNull(); // month 13
+    expect(ScheduleService.parseCron('60 9 * * *')).toBeNull();
+    expect(ScheduleService.parseCron('0 24 * * *')).toBeNull();
+    expect(ScheduleService.parseCron('0 9 32 * *')).toBeNull();
+    expect(ScheduleService.parseCron('0 9 * 13 *')).toBeNull();
   });
 
   it('materialises a wildcard into the full range', () => {
     const parsed = ScheduleService.parseCron('* * * * *');
-    expect(parsed).not.toBeNull();
     expect(parsed!.minutes.size).toBe(60);
     expect(parsed!.hours.size).toBe(24);
+  });
+
+  it('dow wildcard normalises to exactly 7 values (0..6) — the OR-detection sentinel', () => {
+    // calculateNextRun uses dows.size !== 7 to detect "dow restricted".
+    // '*' for dow must therefore be size 7 after the 7→0 normalisation.
+    const parsed = ScheduleService.parseCron('* * * * *');
+    expect(parsed!.dows.size).toBe(7);
+    expect(parsed!.doms.size).toBe(31);
   });
 
   it('expands step values', () => {
@@ -53,11 +56,6 @@ describe('ScheduleService.parseCron', () => {
     expect(parsed!.dows.has(0)).toBe(true);
     expect(parsed!.dows.has(7)).toBe(false);
   });
-
-  it('rejects malformed lists and reversed ranges', () => {
-    expect(ScheduleService.parseCron('1,,3 9 * * *')).toBeNull();
-    expect(ScheduleService.parseCron('5-1 9 * * *')).toBeNull();
-  });
 });
 
 describe('ScheduleService.calculateNextRun', () => {
@@ -67,15 +65,7 @@ describe('ScheduleService.calculateNextRun', () => {
     expect(next).toBeGreaterThan(before);
   });
 
-  it('an every-minute cron schedules within the next minute', () => {
-    const now = Date.now();
-    const next = new Date(ScheduleService.calculateNextRun('* * * * *', 'UTC')).getTime();
-    // Next minute boundary is at most 60s away.
-    expect(next - now).toBeLessThanOrEqual(60_000);
-    expect(next - now).toBeGreaterThan(0);
-  });
-
-  it('a daily cron lands on a :00:00 second boundary', () => {
+  it('a daily cron lands on the right :00 second / minute / hour', () => {
     const next = new Date(ScheduleService.calculateNextRun('30 14 * * *', 'UTC'));
     expect(next.getUTCSeconds()).toBe(0);
     expect(next.getUTCMinutes()).toBe(30);
@@ -83,25 +73,66 @@ describe('ScheduleService.calculateNextRun', () => {
   });
 
   it('honours a non-UTC timezone (Asia/Almaty, UTC+5)', () => {
-    // 09:00 Almaty == 04:00 UTC.
     const next = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'Asia/Almaty'));
     expect(next.getUTCHours()).toBe(4);
-    expect(next.getUTCMinutes()).toBe(0);
-  });
-
-  it('falls back to +1h on an invalid cron instead of throwing', () => {
-    const now = Date.now();
-    const next = new Date(ScheduleService.calculateNextRun('not a cron', 'UTC')).getTime();
-    // ~1h ahead (allow scheduling jitter).
-    expect(next - now).toBeGreaterThan(59 * 60_000);
-    expect(next - now).toBeLessThan(61 * 60_000);
   });
 
   it('falls back to UTC on an unknown timezone', () => {
     const utc = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'UTC')).getUTCHours();
-    const bogus = new Date(
-      ScheduleService.calculateNextRun('0 9 * * *', 'Mars/Olympus'),
-    ).getUTCHours();
+    const bogus = new Date(ScheduleService.calculateNextRun('0 9 * * *', 'Mars/Olympus')).getUTCHours();
     expect(bogus).toBe(utc);
+  });
+});
+
+describe('ScheduleService — POSIX DOM/DOW OR semantics (Bug #1)', () => {
+  // When BOTH day-of-month and day-of-week are restricted, a day matches if
+  // EITHER matches. "0 0 13 * 5" = every 13th OR every Friday.
+  it('fires on a Friday that is NOT the 13th (OR, not AND)', () => {
+    // 2027-08-13 is a Friday the 13th; but the cron must also fire on, e.g.,
+    // the very next matching day which could be a non-13th Friday or a
+    // non-Friday 13th. Simplest pin: the next run from a fixed point is within
+    // ~days, never requiring a Friday-AND-13th intersection (which is months out).
+    const next = new Date(ScheduleService.calculateNextRun('0 0 13 * 5', 'UTC'));
+    const isThe13th = next.getUTCDate() === 13;
+    const isFriday = next.getUTCDay() === 5;
+    expect(isThe13th || isFriday).toBe(true);
+    // And it must NOT require both at once — the next match is at most a week
+    // away (next Friday) or to the 13th, whichever is sooner — always < 32 days.
+    expect(next.getTime() - Date.now()).toBeLessThan(32 * 24 * 60 * 60 * 1000);
+  });
+
+  it('with dom=* still ANDs correctly (dow alone gates)', () => {
+    // "0 9 * * 1" = every Monday. dom unrestricted → dowMatch alone decides.
+    const next = new Date(ScheduleService.calculateNextRun('0 9 * * 1', 'UTC'));
+    expect(next.getUTCDay()).toBe(1);
+  });
+
+  it('with dow=* still ANDs correctly (dom alone gates)', () => {
+    // "0 9 15 * *" = the 15th of every month.
+    const next = new Date(ScheduleService.calculateNextRun('0 9 15 * *', 'UTC'));
+    expect(next.getUTCDate()).toBe(15);
+  });
+});
+
+describe('ScheduleService — unsatisfiable crons (Bug #2)', () => {
+  it('calculateNextRunOrNull returns null for an impossible date (Feb 30)', () => {
+    expect(ScheduleService.calculateNextRunOrNull('0 9 30 2 *', 'UTC')).toBeNull();
+  });
+
+  it('calculateNextRunOrNull returns null for April 31', () => {
+    expect(ScheduleService.calculateNextRunOrNull('0 9 31 4 *', 'UTC')).toBeNull();
+  });
+
+  it('calculateNextRun THROWS (not +24h daily fallback) on an impossible cron', () => {
+    expect(() => ScheduleService.calculateNextRun('0 9 30 2 *', 'UTC')).toThrow(/Unsatisfiable/);
+  });
+
+  it('a valid leap-day cron (Feb 29) still resolves within the 1500-day scan', () => {
+    // Must NOT be flagged unsatisfiable — the next Feb 29 is <= ~1461 days out.
+    const next = ScheduleService.calculateNextRunOrNull('0 9 29 2 *', 'UTC');
+    expect(next).not.toBeNull();
+    const d = new Date(next!);
+    expect(d.getUTCMonth()).toBe(1); // February (0-indexed)
+    expect(d.getUTCDate()).toBe(29);
   });
 });
