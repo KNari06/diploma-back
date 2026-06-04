@@ -9,7 +9,7 @@ export interface LocalKBChunk {
   content: string;
   embedding: number[];
   source_file: string;
-  language: string; // 'en', 'ru', 'neutral'
+  language: string; // 'en', 'ru', 'kk', 'neutral'
   tags?: string[];
   /**
    * Stable slug of the parent section heading. Chunks in the same section
@@ -212,7 +212,7 @@ export async function searchLocalGlobalKB(
   options: {
     threshold?: number;
     limit?: number;
-    language?: 'en' | 'ru' | 'neutral'; // Filter by language
+    language?: 'en' | 'ru' | 'kk' | 'neutral'; // Filter by language
   } = {}
 ): Promise<LocalKBChunk[]> {
   // Validate queryEmbedding
@@ -235,6 +235,9 @@ export async function searchLocalGlobalKB(
   // Validate and clamp options
   const threshold = Math.max(0, Math.min(1, options.threshold || 0.7));
   const limit = Math.max(1, Math.min(100, Math.floor(options.limit || 5)));
+  // KB content exists only in en/ru today. 'kk' (Kazakh) intentionally falls
+  // through to `undefined` → unfiltered search, so Kazakh users still get the
+  // closest relevant ru/en chunks instead of an empty result.
   const language = options.language && ['en', 'ru', 'neutral'].includes(options.language)
     ? options.language
     : undefined;
@@ -337,7 +340,7 @@ export async function searchLocalGlobalKBHybrid(
   options: {
     threshold?: number;
     limit?: number;
-    language?: 'en' | 'ru' | 'neutral';
+    language?: 'en' | 'ru' | 'kk' | 'neutral';
     /** Pool size pulled from each retriever before RRF merge. Default 20. */
     poolSize?: number;
   } = {}

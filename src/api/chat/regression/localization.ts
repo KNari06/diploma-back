@@ -10,7 +10,7 @@
  * the language the user is communicating in.
  */
 
-export type Language = 'en' | 'ru' | 'neutral';
+export type Language = 'en' | 'ru' | 'kk' | 'neutral';
 
 interface LocalizedMessages {
   saveTest: {
@@ -72,7 +72,7 @@ const messages: Record<Language, LocalizedMessages> = {
     testRecommendations: {
       noProject: 'No project context found. Please run a test first so I can understand your project.',
       success: (formattedList) =>
-        `📋 **Test Recommendations**\n\nHere\'s what I recommend testing next:\n\n${formattedList}`,
+        `📋 **Test Recommendations**\n\nHere's what I recommend testing next:\n\n${formattedList}`,
       error: 'Failed to generate test recommendations. Please try again.',
     },
     coverageAnalysis: {
@@ -120,6 +120,41 @@ const messages: Record<Language, LocalizedMessages> = {
       error: 'Не удалось проанализировать покрытие. Пожалуйста, попробуйте снова.',
     },
   },
+  kk: {
+    saveTest: {
+      noTestId: 'Тестті сақтау үшін соңғы орындалған тесттің ID-і қажет. Алдымен тестті іске қосыңыз.',
+      success: (name, id, paramsCount) =>
+        `✅ Тест сәтті сақталды!\n\n**Атауы:** ${name}\n**ID:** ${id}\n**Параметрлер:** ${paramsCount}\n\nБұл тестті былай іске қоса аласыз: "run saved test ${id}"`,
+      error: 'Тестті сақтау мүмкін болмады. Қайталап көріңіз.',
+    },
+    runRegression: {
+      noId: 'Регрессиялық тестті іске қосу үшін сақталған тесттің ID-і қажет.',
+      testStarted: (runId, testId) =>
+        `✅ Сақталған тест іске қосылды!\n\n**Run ID:** ${runId}\n**Test ID:** ${testId}\n\nТест фонда орындалып жатыр. Аяқталғанда нәтижені аласыз.`,
+      error: 'Регрессиялық тестті іске қосу мүмкін болмады. Қайталап көріңіз.',
+    },
+    analyzeFailure: {
+      noTestId: 'Жақында сәтсіз аяқталған тест табылмады. Алдымен тестті іске қосыңыз немесе тест ID-ін көрсетіңіз.',
+      success: (rootCause, category, severity, suggestions) =>
+        `🔍 **Қате талдауы**\n\n**Себебі:** ${rootCause}\n**Санаты:** ${category}\n**Маңыздылығы:** ${severity}\n\n**Ұсыныстар:**\n${suggestions}`,
+      error: 'Тест қатесін талдау мүмкін болмады. Қайталап көріңіз.',
+    },
+    testRecommendations: {
+      noProject: 'Жоба контексті табылмады. Жобаңызды түсіну үшін алдымен тестті іске қосыңыз.',
+      success: (formattedList) =>
+        `📋 **Тестілеу ұсыныстары**\n\nКелесіні тестілеуді ұсынамын:\n\n${formattedList}`,
+      error: 'Ұсыныстарды құру мүмкін болмады. Қайталап көріңіз.',
+    },
+    coverageAnalysis: {
+      noProject: 'Жоба контексті табылмады. Қамтуды талдау үшін алдымен тестті іске қосыңыз.',
+      success: (scoreBadge, score, coveredUrls, totalUrls, totalTestCases, staleTestCases, gapList, summary) =>
+        `${scoreBadge} **Қамту: ${score}/100**\n\n` +
+        `**URL:** ${coveredUrls}/${totalUrls} қамтылды | **Тест-кейстер:** ${totalTestCases} барлығы, ${staleTestCases} ескірген\n\n` +
+        `---\n\n${summary}\n\n` +
+        `---\n\n**Қамтудағы олқылықтар:**\n\n${gapList}`,
+      error: 'Қамтуды талдау мүмкін болмады. Қайталап көріңіз.',
+    },
+  },
   neutral: {
     saveTest: {
       noTestId: 'To save a test, you need the ID of the last executed test. Please run a test first.',
@@ -142,7 +177,7 @@ const messages: Record<Language, LocalizedMessages> = {
     testRecommendations: {
       noProject: 'No project context found. Please run a test first so I can understand your project.',
       success: (formattedList) =>
-        `📋 **Test Recommendations**\n\nHere\'s what I recommend testing next:\n\n${formattedList}`,
+        `📋 **Test Recommendations**\n\nHere's what I recommend testing next:\n\n${formattedList}`,
       error: 'Failed to generate test recommendations. Please try again.',
     },
     coverageAnalysis: {
@@ -167,7 +202,7 @@ const messages: Record<Language, LocalizedMessages> = {
  */
 export function getLocalizedMessages(language?: string): LocalizedMessages {
   // Validate language is a known type, otherwise use neutral
-  const validLangs: Language[] = ['en', 'ru', 'neutral'];
+  const validLangs: Language[] = ['en', 'ru', 'kk', 'neutral'];
   const lang = validLangs.includes(language as Language) ? (language as Language) : 'neutral';
   return messages[lang];
 }

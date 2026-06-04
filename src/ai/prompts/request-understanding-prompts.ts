@@ -220,7 +220,7 @@ export function buildEnrichPrompt(params: {
   candidates: EnrichInputCandidate[];
   session: EnrichSessionContext;
   missingModifiers?: Array<keyof ExecutionModifiers>;
-  userLanguage?: 'en' | 'ru' | 'neutral';
+  userLanguage?: 'en' | 'ru' | 'kk' | 'neutral';
 }): string {
   const { message, descriptor, candidates, session, missingModifiers } = params;
 
