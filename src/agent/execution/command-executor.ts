@@ -3690,6 +3690,12 @@ export class CommandExecutor {
               description: intentMeta.intentDescription,
               bindingHints: intentMeta.bindingHints,
               evidence: intentMeta.evidence,
+              // Strong recorded identity for the heal resolver. Previously
+              // omitted — regression heals ran blind on description + soft
+              // hints only. With this, heal uses the same id/testId/name/text/
+              // ancestor fingerprint the editor captured (heal-context #2 fix).
+              recordedFingerprint: intentMeta.recordedFingerprint,
+              recordedDescription: intentMeta.recordedDescription,
             },
             domNodes,
             pageUrl: this.page.url(),

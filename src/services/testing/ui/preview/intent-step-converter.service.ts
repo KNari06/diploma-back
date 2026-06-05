@@ -13,7 +13,7 @@
 
 import { PlaywrightCommand } from '@/types';
 import { logger } from '@/utils/core/logger';
-import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence } from './preview.types';
+import type { BindingHints, CompiledStepPlan, ExpectedStepOutcome, IntentActionType, IntentStep, StepEvidence, TargetFingerprint } from './preview.types';
 // Step.options.* forwarding (replaceContent, keyPressDelay, cssSelector,
 // disableStabilityChecks, disableCaching) lives in a dedicated module so
 // this converter stays focused on the action→command shape.
@@ -38,6 +38,15 @@ export interface IntentPlaywrightCommand extends PlaywrightCommand {
     evidence?: StepEvidence;
     /** Binding hints for resolution */
     bindingHints?: BindingHints;
+    /**
+     * Recorded element fingerprint (id/testId/name/text/ancestor/landmark/…).
+     * Forwarded so the AUTO-HEAL resolver gets the same strong identity the
+     * editor had. Without this, a regression heal resolved blind (only
+     * description + soft bindingHints) — the #2 heal-context gap (2026-06).
+     */
+    recordedFingerprint?: TargetFingerprint;
+    /** Recorded natural-language description (record-time LLM note) — soft heal hint. */
+    recordedDescription?: string;
     /** Step index in the test case */
     stepIndex: number;
     /** V2: Parent IntentTestCase ID for heal persistence */
@@ -287,6 +296,10 @@ export function convertIntentStepToCommand(
       compiled: step.compiled,
       evidence: step.evidence,
       bindingHints: step.bindingHints,
+      // Forward recorded identity so auto-heal resolves with the same strong
+      // fingerprint the editor had (regression-heal #2 gap fix, 2026-06).
+      recordedFingerprint: step.recordedFingerprint,
+      recordedDescription: step.recordedDescription,
       stepIndex,
       // V6: Action type for lookahead checks
       actionType: step.type,

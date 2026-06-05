@@ -2798,8 +2798,10 @@ async function selectElementWithLLM(params: {
    *     finding the closest match using recordedFingerprint identity.
    */
   mode?: 'apply' | 'heal';
+  /** Heal-only journey context (test goal + last successful step descriptions). */
+  healContext?: { testGoal?: string; priorSteps?: string[]; stepIndex?: number; totalSteps?: number };
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply' } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply', healContext } = params;
   const startTime = Date.now();
 
   // Check cache
@@ -2945,6 +2947,26 @@ async function selectElementWithLLM(params: {
   // Build page scene summary for top-down context
   const sceneSummary = buildSceneSummary(candidates);
   const sceneContext = sceneSummary ? `\nPAGE STATE: ${sceneSummary}` : '';
+
+  // Heal-only journey context — the "user narrative". Helps disambiguate drift
+  // (e.g. login submit vs settings submit) by telling the model the test goal
+  // and the steps already completed. Descriptions only — never input values.
+  // Empty/absent → no block (fail-open). Only meaningful in heal mode.
+  let journeyContext = '';
+  if (mode === 'heal' && healContext) {
+    const parts: string[] = [];
+    if (healContext.testGoal) parts.push(`TEST GOAL: "${String(healContext.testGoal).slice(0, 120)}"`);
+    const prior = (healContext.priorSteps || []).filter(Boolean).slice(-3);
+    if (prior.length > 0) {
+      const posLabel = (typeof healContext.stepIndex === 'number' && typeof healContext.totalSteps === 'number')
+        ? ` (now on step ${healContext.stepIndex + 1}/${healContext.totalSteps})`
+        : '';
+      parts.push(`STEPS DONE SO FAR${posLabel}: ${prior.map((s, i) => `${i + 1}. ${String(s).slice(0, 60)}`).join(' → ')}`);
+    }
+    if (parts.length > 0) {
+      journeyContext = `\n${parts.join('\n')}\nUse this journey to disambiguate which screen/section you are on; the failing step follows the steps above.`;
+    }
+  }
 
   // Detect if duplicates exist (marked as [N of M] by the dedup logic above)
   const hasDuplicates = candidates.some(c => /\[\d+ of \d+\]/.test(c.candidateText));
@@ -3190,7 +3212,7 @@ async function selectElementWithLLM(params: {
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
 PAGE: ${pageUrl}
-VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}${fpHint}
+VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${journeyContext}${dupHint}${fpHint}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
@@ -3961,6 +3983,20 @@ export async function resolveElement(params: {
    *  high-water-mark heuristic when absent (works on most pages, fails on
    *  long scrollable pages where modal coverage gets underestimated). */
   viewport?: { width: number; height: number };
+  /**
+   * Heal-only journey context (2026-06). Gives the heal resolver the "user's
+   * narrative" a human tester would have: the overall test goal and the last
+   * few successful step descriptions. Lets it disambiguate drift — e.g. "we
+   * just logged in, so this is the login submit, not the settings submit".
+   * Descriptions ONLY (never input values — those may carry secrets). Ignored
+   * in apply mode. Fail-open: absent → prompt unchanged.
+   */
+  healContext?: {
+    testGoal?: string;
+    priorSteps?: string[];
+    stepIndex?: number;
+    totalSteps?: number;
+  };
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -3968,6 +4004,7 @@ export async function resolveElement(params: {
     domNodes,
     pageUrl,
     includeAlternatives = false,
+    healContext,
     screenshot: screenshotOrFnRaw,
     viewport,
   } = params;
@@ -5115,6 +5152,9 @@ export async function resolveElement(params: {
         // V22: route to apply / heal prompt — derived from previewSessionId
         // legacy convention or explicit caller flag, see resolveMode above.
         mode: resolveMode,
+        // 2026-06: heal-only journey context (test goal + last steps). Lets the
+        // heal prompt disambiguate which screen/section the failing step is on.
+        healContext,
       });
 
       cacheHit = llmResult.cacheHit;
@@ -5428,6 +5468,8 @@ export async function resolveElement(params: {
             recordedDescription: stepDraft.recordedDescription,
             // V22: route to apply / heal prompt (overflow path inherits parent mode).
             mode: resolveMode,
+            // 2026-06: same heal journey context as the primary batch.
+            healContext,
           });
 
           if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {
