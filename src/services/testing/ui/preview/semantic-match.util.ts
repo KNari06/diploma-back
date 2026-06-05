@@ -119,6 +119,60 @@ const GENERIC_IDENTITY_TOKENS = new Set([
   'label', 'text', 'value', 'data', 'test', 'qa', 'auto',
 ]);
 
+// W3C ARIA roles that carry input/widget SEMANTICS worth matching an intent
+// against (language-agnostic, author-set). Deliberately EXCLUDES the generic
+// container/navigation roles — especially `button` and `link` — because the
+// English word "button"/"link" frequently appears in intents ("delete button")
+// and matching it against role=button would let ANY button satisfy ANY
+// button-mentioning intent (a hallucination hole). Only specific widget roles
+// that genuinely disambiguate are included.
+const SEMANTIC_IDENTITY_ROLES = new Set([
+  'textbox', 'searchbox', 'combobox', 'checkbox', 'radio',
+  'tab', 'slider', 'switch', 'spinbutton',
+]);
+
+/**
+ * Is `node` a form-submit primary — the kind of button a generic "proceed"
+ * intent targets? True for `type=submit` (input or button) and for a bare
+ * `<button>` with no explicit non-button role and an undefined/submit type
+ * (HTML defaults a button inside a form to type=submit).
+ */
+function isSubmitPrimary(node: InteractiveNode | undefined | null): boolean {
+  if (!node) return false;
+  const type = (node.type || node.inputType || '').toLowerCase();
+  if (type === 'submit') return true;
+  const tag = (node.tag || '').toLowerCase();
+  const role = (node.role || '').toLowerCase();
+  // Bare <button> (implicit submit). Exclude explicit type=button/reset and
+  // any non-button ARIA role (e.g. role=tab on a styled button).
+  if (tag === 'button' && (type === '' || type === 'submit') && (role === '' || role === 'button')) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * True when `chosen` is a submit primary AND it is the ONLY submit primary in
+ * `siblings`. "Sole submit" is the structural signal that lets a generic
+ * proceed intent resolve to it without ambiguity — on a page with two submit
+ * buttons we cannot tell which one a language-mismatched intent means, so we
+ * decline (fall back to the other guard layers).
+ */
+export function isSoleSubmitButton(
+  chosen: InteractiveNode | undefined | null,
+  siblings: InteractiveNode[],
+): boolean {
+  if (!isSubmitPrimary(chosen)) return false;
+  let count = 0;
+  for (const n of siblings) {
+    if (isSubmitPrimary(n)) {
+      count++;
+      if (count > 1) return false;
+    }
+  }
+  return count === 1;
+}
+
 /** camelCase / snake / kebab → lowercase word parts. */
 function splitIdentifier(raw: string): string[] {
   return raw
@@ -187,6 +241,16 @@ export function nodeIdentityTokens(node: InteractiveNode | undefined | null): Se
   // id — only stable ids (framework-generated ones are noise); drop generic.
   if (node.id && !node.isDynamicId) add(node.id, { dropGeneric: true });
 
+  // role — ONLY specific input/widget-semantic W3C roles (textbox, combobox,
+  // checkbox, …). These are English, author-set, and disambiguate across
+  // languages. `button`/`link`/`menuitem` are deliberately excluded (see
+  // SEMANTIC_IDENTITY_ROLES) so a "button"/"link" word in the intent can't
+  // blanket-match every button/link on the page.
+  {
+    const role = (node.role || '').toLowerCase();
+    if (SEMANTIC_IDENTITY_ROLES.has(role)) out.add(role);
+  }
+
   return new Set(Array.from(out).map(t => cyrFold(t)));
 }
 
@@ -216,19 +280,32 @@ export function hasTokenOverlap(intentTokens: Set<string>, against: Set<string>)
  *   - { kind:'semanticFloor', reason } when it fails (caller treats as
  *     not_found and falls through)
  *
- * Logic:
+ * Logic (cheap → expensive, first match wins):
  *   - heal mode + <3-char intent → bypass (permissive; fingerprint is truth).
  *   - label-less chosen (icon-only) → pass (recall guard — never reject blind).
- *   - else reject ONLY when intent overlaps NEITHER the visible label NOR the
- *     node's technical identity (the cross-language escape hatch: English
- *     "password" vs placeholder "Пароль" passes via type=password).
+ *   - LEXICAL: intent overlaps the visible label OR the node's technical
+ *     identity (cross-language hatch: English "password" vs "Пароль" via
+ *     type=password / role=textbox).
+ *   - STRUCTURAL (pure, zero word lists → any-language): a click intent whose
+ *     chosen node is the page's SOLE submit button AND that matched no OTHER
+ *     candidate (by label or identity) → accept. On a one-submit form, a click
+ *     intent matching nothing more specific can only mean "proceed", whatever
+ *     language it's written in ("signin"/"войти"/"connexion"/"登录"). The
+ *     "no better candidate" gate makes a specific intent decline IF a better
+ *     match exists on the page.
+ *   - else reject (confident-but-unrelated hallucination).
+ *
+ * `action` / `siblingNodes` are optional for backward compatibility; without
+ * them the structural branch never fires (conservative legacy behavior).
  */
 export function evaluateHonestyGuard(args: {
   intentText: string;
   chosenNode: InteractiveNode | undefined | null;
   mode: 'apply' | 'heal';
+  action?: string;
+  siblingNodes?: InteractiveNode[];
 }): { kind: 'semanticFloor'; reason: string } | null {
-  const { intentText, chosenNode, mode } = args;
+  const { intentText, chosenNode, mode, action, siblingNodes } = args;
 
   if (mode === 'heal') return null;
 
@@ -248,15 +325,54 @@ export function evaluateHonestyGuard(args: {
   // below — never used to newly REJECT a case the label path would let through.
   if (chosenTokens.size === 0) return null;
 
-  // Match against the visible label first (the common path).
+  // LEXICAL — match against the visible label first (the common path).
   if (hasTokenOverlap(intentTokens, chosenTokens)) return null;
 
-  // CROSS-LANGUAGE / TECHNICAL-IDENTITY ESCAPE HATCH: the visible label may be
-  // in a different language than the intent yet the technical identity matches.
+  // LEXICAL — cross-language / technical-identity escape hatch: the visible
+  // label may be in a different language than the intent yet the technical
+  // identity matches (type=password / role=textbox / name=email / testId).
   if (hasTokenOverlap(intentTokens, nodeIdentityTokens(chosenNode))) return null;
+
+  // STRUCTURAL — sole submit, no better candidate. PURE STRUCTURE, zero word
+  // lists (any-language intent). A click intent whose chosen node is the page's
+  // ONLY submit button is the right target when the intent ALSO failed to match
+  // any OTHER candidate (by label or technical identity). Reasoning: on a form
+  // with one submit button, a click intent that matches nothing more specific
+  // can only mean "proceed" — regardless of the language the intent or the
+  // button label is written in. The "no better candidate" gate is what keeps a
+  // SPECIFIC intent (e.g. "delete account") from grabbing the submit: if a
+  // more-matching element exists, this branch declines and the guard rejects.
+  if (
+    (action === undefined || action === 'click')
+    && isSoleSubmitButton(chosenNode, siblingNodes || [])
+    && !intentMatchesAnySibling(intentTokens, chosenNode, siblingNodes || [])
+  ) {
+    return null;
+  }
 
   return {
     kind: 'semanticFloor',
     reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
   };
+}
+
+/**
+ * True if the intent lexically matches ANY sibling OTHER than `chosen` — by
+ * visible label OR technical identity. Used by the sole-submit structural
+ * branch: if some other candidate matches the intent, the submit button is NOT
+ * the obvious target and the branch must decline. Language-agnostic (token
+ * overlap with cyr-fold), no word lists.
+ */
+function intentMatchesAnySibling(
+  intentTokens: Set<string>,
+  chosen: InteractiveNode | undefined | null,
+  siblings: InteractiveNode[],
+): boolean {
+  for (const sib of siblings) {
+    if (sib === chosen) continue;
+    const labelTokens = semanticTokens((getEffectiveLabel(sib) || '').trim());
+    if (hasTokenOverlap(intentTokens, labelTokens)) return true;
+    if (hasTokenOverlap(intentTokens, nodeIdentityTokens(sib))) return true;
+  }
+  return false;
 }

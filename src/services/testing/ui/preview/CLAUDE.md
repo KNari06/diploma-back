@@ -330,8 +330,32 @@ buildAllowedSets(snapshot, intent, viewport?, recordedFingerprint?)
 (3) LLM resolver (Gemini Flash)
     input: intent text, action type, candidates (top-K), scene summary.
     rules 1–18 in apply prompt: no loudest-CTA fallback, slug intents,
-    adjacency≠function, etc.
+    adjacency≠function, etc. Rule 1 also carries CAPOT-OVER-LABEL: match by
+    English technical identity (type/role/name/testid) when intent language
+    ≠ label language.
     → resolverPath = 'llm'
+    HONESTY GUARD (evaluateHonestyGuard, semantic-match.util.ts) — post-LLM,
+    rejects confident-but-unrelated picks. Layers (first match accepts):
+      • lexical: intent overlaps the visible label OR nodeIdentityTokens
+        (type/role-widget/name/autocomplete/testId/id — the cross-language
+        capot channel; English "password" ↔ "Пароль" via type=password).
+      • structural (PURE — zero word lists, any-language): a CLICK intent whose
+        chosen node is the page's SOLE submit button (isSoleSubmitButton) AND
+        that matched no OTHER candidate by label/identity (intentMatchesAnySibling
+        is false) → accept, even when the label is localized ("Войти"). On a
+        one-submit form a click intent matching nothing more specific can only
+        mean "proceed", in any language. The "no better sibling" gate is what
+        makes a specific intent decline when a better match exists; a
+        multi-submit page declines via sole-submit. This is the signin→Войти fix.
+      heal mode / <3-char intent / label-less node bypass. Caller passes
+      `action` + `siblingNodes` (candidates); omitting them disables the
+      structural branch (conservative legacy default). NOTE: `submit`/`button`
+      stay in the generic blacklists — the structural branch, NOT blacklist
+      removal, is what bridges submit buttons. Known trade-off: a SPECIFIC
+      intent with no matching element on a one-submit page (e.g. "delete
+      account" on a login form) is accepted onto the submit rather than
+      "not found" — acceptable vs the cross-language recall loss; Layer 3
+      (embedding cosine for localized links/synonyms) is PLANNED, not wired.
 
 (4) Vision rescue
     take screenshot, send to vision LLM with click target hints.

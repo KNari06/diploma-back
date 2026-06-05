@@ -1914,6 +1914,18 @@ const LLM_SHARED_RULES = `RULES:
    Cart, Profile), prefer the section over a superficially-similar
    action button on an unrelated concept.
 
+   CAPOT-OVER-LABEL (cross-language anchor): a candidate's visible label
+   is localized to the page's language, but its TECHNICAL IDENTITY —
+   type=, role=, name=, testid=, autocomplete= — is authored in English
+   and stable across locales. When the intent's language differs from a
+   candidate's visible label, anchor the match on this English technical
+   identity, not on surface text. Example: intent "signin button" on a
+   Russian page → the <button type=submit> labelled "Войти" is the match
+   (type=submit + sole form-submit button bridge the languages). This does
+   NOT override the rules below: prominence alone is never a reason to pick
+   (no loudest-CTA), and the technical identity itself — not mere visual
+   weight — must correspond to the intent.
+
 2. ACTION-TYPE SEMANTICS:
    - click: prefer buttons, links, interactive elements
    - type: prefer inputs, textareas, [contenteditable=true]
@@ -3426,6 +3438,8 @@ Select the single best matching element, or return ref=null if the intent does n
           intentText,
           chosenNode: chosenCandidate?.node,
           mode: mode === 'heal' ? 'heal' : 'apply',
+          action: actionType,
+          siblingNodes: candidates.map(c => c.node),
         });
         if (honesty) semanticFloorRejected = true;
       }
@@ -5183,6 +5197,8 @@ export async function resolveElement(params: {
                   intentText,
                   chosenNode: visionNode.node,
                   mode: resolveMode,
+                  action: stepDraft.type,
+                  siblingNodes: allAllowed,
                 });
                 if (guard) {
                   logger.info('[ELEMENT_RESOLVER] Vision second opinion rejected by honesty guard', {

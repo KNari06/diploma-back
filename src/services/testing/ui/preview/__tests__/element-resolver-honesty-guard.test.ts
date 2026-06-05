@@ -5,6 +5,7 @@ import {
   semanticTokens,
   hasTokenOverlap,
 } from '../element-resolver.service';
+import { isSoleSubmitButton } from '../semantic-match.util';
 
 function node(partial: Partial<InteractiveNode>): InteractiveNode {
   return { tag: 'input', ...partial } as InteractiveNode;
@@ -191,5 +192,103 @@ describe('evaluateHonestyGuard — adversarial edge cases', () => {
     expect(hasTokenOverlap(new Set(['pass']), new Set(['password']))).toBe(true); // substring
     expect(hasTokenOverlap(new Set(['password']), new Set(['email']))).toBe(false);
     expect(hasTokenOverlap(new Set(['password']), new Set())).toBe(false);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Structural escape: action-verb → sole submit button (the signin→Войти fix)
+// ═══════════════════════════════════════════════════════════════════════════
+describe('evaluateHonestyGuard — structural sole-submit escape', () => {
+  // The doculite login page: localized "Войти" submit + email/password inputs.
+  const loginBtn = node({ tag: 'button', type: 'submit', text: 'Войти' });
+  const emailInput = node({ tag: 'input', type: 'text', name: 'email' });
+  const passwordInput = node({ tag: 'input', type: 'password', name: 'password' });
+  const siblings = [emailInput, passwordInput, loginBtn];
+
+  it('ACCEPTS "signin button" → sole submit button labelled "Войти"', () => {
+    pass(evaluateHonestyGuard({
+      intentText: 'signin button', chosenNode: loginBtn, mode: 'apply',
+      action: 'click', siblingNodes: siblings,
+    }));
+  });
+
+  it('ACCEPTS proceed-ish intents in ANY language (no word list)', () => {
+    // Pure structure: sole submit + no better sibling match → accept,
+    // regardless of intent language. No hardcoded verb set.
+    for (const intent of ['login', 'continue', 'connexion', 'кіру', '登录确认']) {
+      pass(evaluateHonestyGuard({
+        intentText: intent, chosenNode: loginBtn, mode: 'apply',
+        action: 'click', siblingNodes: siblings,
+      }));
+    }
+  });
+
+  it('ACCEPTS Cyrillic "войти" via the label path (same node, different channel)', () => {
+    pass(evaluateHonestyGuard({
+      intentText: 'войти', chosenNode: loginBtn, mode: 'apply',
+      action: 'click', siblingNodes: siblings,
+    }));
+  });
+
+  it('DECLINES the sole-submit branch when a sibling matches the intent better', () => {
+    // "register" matches the register link → submit is NOT the obvious target.
+    const registerLink = node({ tag: 'a', text: 'Register', name: 'register' });
+    reject(evaluateHonestyGuard({
+      intentText: 'register', chosenNode: loginBtn, mode: 'apply',
+      action: 'click', siblingNodes: [...siblings, registerLink],
+    }));
+  });
+
+  it('REJECTS when there are TWO submit buttons (not sole)', () => {
+    const secondSubmit = node({ tag: 'button', type: 'submit', text: 'Регистрация' });
+    reject(evaluateHonestyGuard({
+      intentText: 'login', chosenNode: loginBtn, mode: 'apply',
+      action: 'click', siblingNodes: [...siblings, secondSubmit],
+    }));
+  });
+
+  it('REJECTS for non-click actions (escape is click-only)', () => {
+    reject(evaluateHonestyGuard({
+      intentText: 'login', chosenNode: loginBtn, mode: 'apply',
+      action: 'type', siblingNodes: siblings,
+    }));
+  });
+
+  it('backward-compatible: omitting action/siblingNodes never fires the branch', () => {
+    // Legacy 3-arg call → no siblings → not sole → falls through to reject.
+    reject(evaluateHonestyGuard({ intentText: 'login', chosenNode: loginBtn, mode: 'apply' }));
+  });
+});
+
+describe('isSoleSubmitButton', () => {
+  const btnSubmit = node({ tag: 'button', type: 'submit', text: 'Go' });
+  const inputSubmit = node({ tag: 'input', type: 'submit' });
+  const bareButton = node({ tag: 'button', text: 'OK' }); // implicit submit
+  const typeButton = node({ tag: 'button', type: 'button', text: 'Cancel' });
+
+  it('treats type=submit (button and input) as submit primary; sole → true', () => {
+    expect(isSoleSubmitButton(btnSubmit, [btnSubmit, typeButton])).toBe(true);
+    expect(isSoleSubmitButton(inputSubmit, [inputSubmit, typeButton])).toBe(true);
+  });
+
+  it('treats a bare <button> as implicit submit', () => {
+    expect(isSoleSubmitButton(bareButton, [bareButton, typeButton])).toBe(true);
+  });
+
+  it('returns false for type=button', () => {
+    expect(isSoleSubmitButton(typeButton, [typeButton])).toBe(false);
+  });
+
+  it('returns false when two submit primaries exist', () => {
+    expect(isSoleSubmitButton(btnSubmit, [btnSubmit, inputSubmit])).toBe(false);
+  });
+});
+
+describe('nodeIdentityTokens — role channel', () => {
+  it('includes specific widget roles (textbox, combobox) but not button/link', () => {
+    expect(nodeIdentityTokens(node({ tag: 'div', role: 'textbox' })).has('textbox')).toBe(true);
+    expect(nodeIdentityTokens(node({ tag: 'div', role: 'combobox' })).has('combobox')).toBe(true);
+    expect(nodeIdentityTokens(node({ tag: 'button', role: 'button' })).has('button')).toBe(false);
+    expect(nodeIdentityTokens(node({ tag: 'a', role: 'link' })).has('link')).toBe(false);
   });
 });
