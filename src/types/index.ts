@@ -997,7 +997,7 @@ export interface IntentResult {
 
   // Optional fields (all intents)
   urgency?: 'high' | 'normal' | null; // Detect: "urgent", "ASAP", "critical", "quick"
-  userLanguage?: 'en' | 'ru' | 'neutral'; // User's language for localization
+  userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'; // User's language for localization
 
   selector?: string; // For UI testing intents
   // Playwright commands generated from intent

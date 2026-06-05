@@ -3,6 +3,7 @@ import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
 import { AIUsageTracker, calculateGeminiCost } from '../tracking/ai-usage-tracker';
 import { recordAILog } from '../logging/ai-action-logger';
+import { persistLLMCall } from '../logging/llm-io-persistence';
 
 /**
  * Gemini AI Service
@@ -134,6 +135,17 @@ export async function generateTextWithGemini(params: {
       detail: { prompt_excerpt: prompt, response_excerpt: text },
     });
 
+    persistLLMCall({
+      provider: 'gemini',
+      model,
+      status: 'succeeded',
+      prompt,
+      completion: text,
+      tokensIn: result.usage.inputTokens,
+      tokensOut: result.usage.outputTokens,
+      durationMs: Date.now() - _aiLogStartedAt,
+    });
+
     return result;
   } catch (error) {
     recordAILog({
@@ -146,6 +158,14 @@ export async function generateTextWithGemini(params: {
       durationMs: Date.now() - _aiLogStartedAt,
       error: error instanceof Error ? error.message : String(error),
       detail: { prompt_excerpt: prompt },
+    });
+    persistLLMCall({
+      provider: 'gemini',
+      model,
+      status: 'failed',
+      prompt,
+      errorMessage: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - _aiLogStartedAt,
     });
     logger.error('[GEMINI] Text generation failed', {
       error: error instanceof Error ? error.message : String(error),
@@ -324,6 +344,17 @@ export async function getChatCompletionWithGemini(params: {
       detail: { message_count: messages.length, response_excerpt: text },
     });
 
+    persistLLMCall({
+      provider: 'gemini',
+      model,
+      status: 'succeeded',
+      prompt: messages.map((m) => `[${m.role}] ${m.content}`).join('\n'),
+      completion: text,
+      tokensIn: result.usage.inputTokens,
+      tokensOut: result.usage.outputTokens,
+      durationMs: Date.now() - _aiLogStartedAt,
+    });
+
     return result;
   } catch (error) {
     recordAILog({
@@ -336,6 +367,14 @@ export async function getChatCompletionWithGemini(params: {
       durationMs: Date.now() - _aiLogStartedAt,
       error: error instanceof Error ? error.message : String(error),
       detail: { message_count: messages.length },
+    });
+    persistLLMCall({
+      provider: 'gemini',
+      model,
+      status: 'failed',
+      prompt: messages.map((m) => `[${m.role}] ${m.content}`).join('\n'),
+      errorMessage: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - _aiLogStartedAt,
     });
     logger.error('[GEMINI] Chat completion failed', {
       error: error instanceof Error ? error.message : String(error),

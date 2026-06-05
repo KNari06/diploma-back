@@ -780,6 +780,7 @@ export async function hardPurgeAccount(userId: string): Promise<{
     'automation_action_logs',
     'automation_actions',
     'ai_usage_log',
+    'ai_call_logs',
     'trace_files',
     'traces',
     'exploration_runs',

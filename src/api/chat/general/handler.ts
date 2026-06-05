@@ -194,7 +194,7 @@ export async function handleGeneralChat(
     chatSessionId?: string;
     context?: any;
     workspace_id?: string; // Workspace ID from validated route params (primary source)
-    userLanguage?: 'en' | 'ru' | 'neutral'; // Language from intent parser (avoid re-detection)
+    userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'; // Language from intent parser (avoid re-detection)
     abortSignal?: AbortSignal;
     logger?: FunctionLogger;
     mode?: 'lite' | 'pro' | 'editor'; // Test execution mode
