@@ -85,17 +85,17 @@ describe('evaluateHonestyGuard', () => {
   const pwd = node({ type: 'password', name: 'password', testIdAttr: 'passwordField', placeholder: 'Пароль' });
   const email = node({ type: 'text', name: 'email', placeholder: 'Email' });
 
-  it('accepts English "password" on a Cyrillic-labelled password field', () => {
-    expect(evaluateHonestyGuard({ intentText: 'password', chosenNode: pwd, mode: 'apply' })).toBeNull();
+  it('accepts English "password" on a Cyrillic-labelled password field', async () => {
+    expect(await evaluateHonestyGuard({ intentText: 'password', chosenNode: pwd, mode: 'apply' })).toBeNull();
   });
-  it('rejects "password" pointed at the Email input', () => {
-    expect(evaluateHonestyGuard({ intentText: 'password', chosenNode: email, mode: 'apply' })).not.toBeNull();
+  it('rejects "password" pointed at the Email input', async () => {
+    expect(await evaluateHonestyGuard({ intentText: 'password', chosenNode: email, mode: 'apply' })).not.toBeNull();
   });
-  it('bypasses in heal mode and for <3-char intents', () => {
-    expect(evaluateHonestyGuard({ intentText: 'Панорама 360', chosenNode: email, mode: 'heal' })).toBeNull();
-    expect(evaluateHonestyGuard({ intentText: 'ok', chosenNode: email, mode: 'apply' })).toBeNull();
+  it('bypasses in heal mode and for <3-char intents', async () => {
+    expect(await evaluateHonestyGuard({ intentText: 'Панорама 360', chosenNode: email, mode: 'heal' })).toBeNull();
+    expect(await evaluateHonestyGuard({ intentText: 'ok', chosenNode: email, mode: 'apply' })).toBeNull();
   });
-  it('passes label-less elements (recall guard)', () => {
-    expect(evaluateHonestyGuard({ intentText: 'next page', chosenNode: node({ tag: 'button', text: '›' }), mode: 'apply' })).toBeNull();
+  it('passes label-less elements (recall guard)', async () => {
+    expect(await evaluateHonestyGuard({ intentText: 'next page', chosenNode: node({ tag: 'button', text: '›' }), mode: 'apply' })).toBeNull();
   });
 });

@@ -107,10 +107,14 @@ const MEANINGFUL_AUTOCOMPLETE_TOKENS = new Set([
   'otp', 'webauthn', 'nickname', 'given', 'family',
 ]);
 
-// Generic UI tokens that show up in testIds/ids/names across unrelated controls
-// (submitButton, closeModal, …). Matching on them would let intent "submit"
-// grab a random element whose testId merely contains "submit". Dropped from
-// identity tokens.
+// LEGACY fallback list of generic UI tokens (English). The LIVE resolver path
+// no longer consults this — it passes a page-FREQUENCY predicate
+// (`buildGenericTokenPredicate`) so "generic" = "recurs across many controls on
+// THIS page", which is language-agnostic and self-adapting. This static set is
+// kept ONLY for the no-frequency-context call path (single-node callers / unit
+// tests): without a page to measure against, we fall back to this list so
+// `nodeIdentityTokens(node)` still drops obvious scaffolding tokens. Do NOT add
+// to this list to fix a resolution bug — tune the frequency predicate instead.
 const GENERIC_IDENTITY_TOKENS = new Set([
   'button', 'btn', 'input', 'field', 'element', 'control', 'icon',
   'modal', 'dialog', 'panel', 'container', 'wrapper', 'root', 'item',
@@ -118,6 +122,63 @@ const GENERIC_IDENTITY_TOKENS = new Set([
   'link', 'menu', 'list', 'row', 'cell', 'col', 'box', 'group', 'form',
   'label', 'text', 'value', 'data', 'test', 'qa', 'auto',
 ]);
+
+// Frequency-filter constants (replace the static list on the live path).
+// A token is "generic" when it recurs across many controls on the page:
+//   ≥ max(GENERIC_FLOOR, ceil(N * GENERIC_FRACTION))   where N = node count.
+// The fraction adapts to page size; the floor stops sparse candidate sets
+// (e.g. a 6-field login form where "login" legitimately appears on 2 nodes)
+// from false-positiving. Both are structural numbers, NOT a word list.
+const GENERIC_FRACTION = 0.25;
+const GENERIC_FLOOR = 4;
+
+/**
+ * Tokenize a node's IDENTIFIER fields (name/testId/stable-id) the same way the
+ * identity channel does — pure, reused for both the frequency map and the
+ * per-node token extraction so they can never diverge. Excludes type/role/
+ * autocomplete (those are spec channels, not free-form identifiers).
+ */
+function nodeIdentifierTokens(node: InteractiveNode | undefined | null): Set<string> {
+  const out = new Set<string>();
+  if (!node) return out;
+  const eat = (raw: string | undefined) => {
+    if (!raw) return;
+    for (const part of splitIdentifier(raw)) {
+      if (part.length >= 3) out.add(part);
+    }
+  };
+  eat(node.name);
+  eat(node.testIdAttr);
+  if (node.id && !node.isDynamicId) eat(node.id);
+  return out;
+}
+
+/**
+ * Build a token → distinct-node-count map across a page's candidate nodes.
+ * "Distinct node count" (a token on the same node many times counts once) =
+ * document frequency: how many CONTROLS carry the token.
+ */
+export function buildIdentityTokenFrequency(nodes: InteractiveNode[]): Map<string, number> {
+  const freq = new Map<string, number>();
+  for (const node of nodes) {
+    for (const token of nodeIdentifierTokens(node)) {
+      freq.set(token, (freq.get(token) || 0) + 1);
+    }
+  }
+  return freq;
+}
+
+/**
+ * Build the live-path generic predicate from a frequency map + node count.
+ * A token is generic when it recurs on many controls (see constants above).
+ */
+export function buildGenericTokenPredicate(
+  freq: Map<string, number>,
+  nodeCount: number,
+): (token: string) => boolean {
+  const threshold = Math.max(GENERIC_FLOOR, Math.ceil(nodeCount * GENERIC_FRACTION));
+  return (token: string) => (freq.get(token) || 0) >= threshold;
+}
 
 // W3C ARIA roles that carry input/widget SEMANTICS worth matching an intent
 // against (language-agnostic, author-set). Deliberately EXCLUDES the generic
@@ -194,14 +255,20 @@ function splitIdentifier(raw: string): string[] {
  * dropped) so it adds REAL disambiguating tokens without re-opening the
  * hallucination hole.
  */
-export function nodeIdentityTokens(node: InteractiveNode | undefined | null): Set<string> {
+export function nodeIdentityTokens(
+  node: InteractiveNode | undefined | null,
+  opts?: { isGeneric?: (token: string) => boolean },
+): Set<string> {
   const out = new Set<string>();
   if (!node) return out;
-  const add = (raw: string | undefined, opts: { dropGeneric?: boolean } = {}) => {
+  // Live path: caller passes a page-frequency predicate. No-context path
+  // (single-node callers / unit tests): fall back to the static legacy list.
+  const isGeneric = opts?.isGeneric ?? ((t: string) => GENERIC_IDENTITY_TOKENS.has(t));
+  const add = (raw: string | undefined, o: { dropGeneric?: boolean } = {}) => {
     if (!raw) return;
     for (const part of splitIdentifier(raw)) {
       if (part.length < 3) continue;
-      if (opts.dropGeneric && GENERIC_IDENTITY_TOKENS.has(part)) continue;
+      if (o.dropGeneric && isGeneric(part)) continue;
       out.add(part);
     }
   };
@@ -295,17 +362,44 @@ export function hasTokenOverlap(intentTokens: Set<string>, against: Set<string>)
  *     match exists on the page.
  *   - else reject (confident-but-unrelated hallucination).
  *
- * `action` / `siblingNodes` are optional for backward compatibility; without
- * them the structural branch never fires (conservative legacy behavior).
+ *   - L2 SEMANTIC (optional, injected): when lexical+structural fail, an
+ *     embedding-cosine accept (intent ↔ label ≥ τ_embed) catches localized
+ *     synonyms/links the token paths can't reach (войти↔signin, выход↔logout).
+ *   - L3 LLM-JUDGE (optional, injected, flag-gated): only in the ambiguous band
+ *     (τ_judge_low ≤ sim < τ_embed) a cheap yes/no arbitrates. Outside the band
+ *     no judge runs (below → reject; above → already accepted at L2).
+ *
+ * L2/L3 are dependency-INJECTED (embed/cosine/ask closures) so this module
+ * stays pure — no network import. Both fail-OPEN: a thrown closure degrades to
+ * the pre-L2 verdict and NEVER blocks resolve. Omitting `semantic`/`judge`
+ * disables L2/L3 (legacy behavior — unit tests rely on this).
+ *
+ * `action` / `siblingNodes` / `identityFreq` are optional for backward compat.
  */
-export function evaluateHonestyGuard(args: {
+const TAU_EMBED = 0.62;       // cosine ≥ this → accept (cross-language paraphrase)
+const TAU_JUDGE_LOW = 0.45;   // [low, embed) → ambiguous band → judge; below → reject
+
+export interface HonestySemanticDeps {
+  embed: (text: string) => Promise<number[]>;       // throws → caught, fail-open
+  cosine: (a: number[], b: number[]) => number;
+}
+export interface HonestyJudgeDeps {
+  // returns true=accept, false=reject, null=inconclusive (→ band default reject)
+  ask: (intent: string, label: string) => Promise<boolean | null>;
+}
+
+export async function evaluateHonestyGuard(args: {
   intentText: string;
   chosenNode: InteractiveNode | undefined | null;
   mode: 'apply' | 'heal';
   action?: string;
   siblingNodes?: InteractiveNode[];
-}): { kind: 'semanticFloor'; reason: string } | null {
-  const { intentText, chosenNode, mode, action, siblingNodes } = args;
+  identityFreq?: (token: string) => boolean;
+  semantic?: HonestySemanticDeps;
+  judge?: HonestyJudgeDeps;
+}): Promise<{ kind: 'semanticFloor'; reason: string } | null> {
+  const { intentText, chosenNode, mode, action, siblingNodes, identityFreq, semantic, judge } = args;
+  const idOpts = identityFreq ? { isGeneric: identityFreq } : undefined;
 
   if (mode === 'heal') return null;
 
@@ -325,35 +419,60 @@ export function evaluateHonestyGuard(args: {
   // below — never used to newly REJECT a case the label path would let through.
   if (chosenTokens.size === 0) return null;
 
-  // LEXICAL — match against the visible label first (the common path).
+  // L1 LEXICAL — match against the visible label first (the common path).
   if (hasTokenOverlap(intentTokens, chosenTokens)) return null;
 
-  // LEXICAL — cross-language / technical-identity escape hatch: the visible
+  // L1 LEXICAL — cross-language / technical-identity escape hatch: the visible
   // label may be in a different language than the intent yet the technical
   // identity matches (type=password / role=textbox / name=email / testId).
-  if (hasTokenOverlap(intentTokens, nodeIdentityTokens(chosenNode))) return null;
+  if (hasTokenOverlap(intentTokens, nodeIdentityTokens(chosenNode, idOpts))) return null;
 
-  // STRUCTURAL — sole submit, no better candidate. PURE STRUCTURE, zero word
+  // L0 STRUCTURAL — sole submit, no better candidate. PURE STRUCTURE, zero word
   // lists (any-language intent). A click intent whose chosen node is the page's
   // ONLY submit button is the right target when the intent ALSO failed to match
-  // any OTHER candidate (by label or technical identity). Reasoning: on a form
-  // with one submit button, a click intent that matches nothing more specific
-  // can only mean "proceed" — regardless of the language the intent or the
-  // button label is written in. The "no better candidate" gate is what keeps a
-  // SPECIFIC intent (e.g. "delete account") from grabbing the submit: if a
-  // more-matching element exists, this branch declines and the guard rejects.
+  // any OTHER candidate (by label or technical identity). The "no better
+  // candidate" gate keeps a SPECIFIC intent (e.g. "delete account") from
+  // grabbing the submit: if a more-matching element exists, this branch declines.
   if (
     (action === undefined || action === 'click')
     && isSoleSubmitButton(chosenNode, siblingNodes || [])
-    && !intentMatchesAnySibling(intentTokens, chosenNode, siblingNodes || [])
+    && !intentMatchesAnySibling(intentTokens, chosenNode, siblingNodes || [], idOpts)
   ) {
     return null;
   }
 
-  return {
-    kind: 'semanticFloor',
+  const reject = {
+    kind: 'semanticFloor' as const,
     reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
   };
+
+  // L2 SEMANTIC — embedding cosine intent ↔ label. Fail-OPEN: any closure throw
+  // degrades to the lexical reject (never blocks, never newly-accepts blindly).
+  let sim: number | null = null;
+  if (semantic) {
+    try {
+      const [iv, lv] = await Promise.all([semantic.embed(intentLower), semantic.embed(chosenLabel)]);
+      sim = semantic.cosine(iv, lv);
+      if (sim >= TAU_EMBED) return null; // confident semantic match
+    } catch {
+      sim = null; // fail-open → fall through to reject (or judge if band unknown)
+    }
+  }
+
+  // L3 LLM-JUDGE — only in the ambiguous band [TAU_JUDGE_LOW, TAU_EMBED). Below
+  // the band the embedding is confident the texts are unrelated → reject without
+  // a judge call (this is what keeps the judge rare on the hot path). Inconclusive
+  // / error → band default = reject.
+  if (judge && sim !== null && sim >= TAU_JUDGE_LOW && sim < TAU_EMBED) {
+    try {
+      const verdict = await judge.ask(intentText, chosenLabel);
+      if (verdict === true) return null;
+    } catch {
+      /* fail-open to reject (band default) */
+    }
+  }
+
+  return reject;
 }
 
 /**
@@ -367,12 +486,13 @@ function intentMatchesAnySibling(
   intentTokens: Set<string>,
   chosen: InteractiveNode | undefined | null,
   siblings: InteractiveNode[],
+  idOpts?: { isGeneric?: (token: string) => boolean },
 ): boolean {
   for (const sib of siblings) {
     if (sib === chosen) continue;
     const labelTokens = semanticTokens((getEffectiveLabel(sib) || '').trim());
     if (hasTokenOverlap(intentTokens, labelTokens)) return true;
-    if (hasTokenOverlap(intentTokens, nodeIdentityTokens(sib))) return true;
+    if (hasTokenOverlap(intentTokens, nodeIdentityTokens(sib, idOpts))) return true;
   }
   return false;
 }

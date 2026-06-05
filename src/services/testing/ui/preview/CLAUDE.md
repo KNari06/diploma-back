@@ -67,6 +67,8 @@ Element resolution and auto-healing serve all three.
 | [new-tab-opener.ts](new-tab-opener.ts) | Promotes anchor clicks to real new tabs via `context.newPage() + goto(href)` when `<a target="...">` is set, when the href is cross-origin, or when modifier keys request a new tab (Cmd/Ctrl/Shift). Used by `CommandExecutor.performClick`, preview-step-apply `executeAction` click branch, preview-session live `executeMouseAction`, and `PreviewSessionService.openTab` (reason `'programmatic'`, backing the `open_tab` step type). The new page is adopted by `attachPopupHandler` like any other popup. |
 | [evidence-shortcut.utils.ts](evidence-shortcut.utils.ts) | Cached "this evidence already worked" shortcut to skip resolver. |
 | [recorded-identity.util.ts](recorded-identity.util.ts) | `recordedFingerprintHasStrongIdentity` (cheap pre-gate) + `nodeToIdentityProbe` (InteractiveNode → canonical `IdentityProbe`) + re-export of `hasStrongIdentityContradiction`. Re-validate compiled / evidence cache hits against the ORIGINAL `recordedFingerprint` (not the plan's self-echoed `targetFingerprint`). Comparison delegates to the SAME normalized primitive the readiness gate uses (`hasStrongIdentityContradiction` in [step-readiness-v2.service.ts](step-readiness-v2.service.ts), `fieldEq`/`normUrlLike`). Fail-open when the fingerprint is weak. |
+| [semantic-match.util.ts](semantic-match.util.ts) | Pure semantic-match helpers for the honesty guard: tokenizer (`semanticTokens`/`cyrFold`), `nodeIdentityTokens` (capot channel, optional frequency predicate), `buildIdentityTokenFrequency`/`buildGenericTokenPredicate` (data-driven generic filter), `isSoleSubmitButton`, and the async `evaluateHonestyGuard` (4-layer: lexical → structural → embedding → judge, L2/L3 via injected closures). No network — closures injected. |
+| [honesty-guard-deps.ts](honesty-guard-deps.ts) | Builds the L2 (embedding) + L3 (judge) closures the guard consumes — keeps the AI stack OUT of the pure module. Redis-cached embeddings, in-process judge cache, best-effort cost, `isJudgeEnabled()` (flag `HONESTY_GUARD_JUDGE`, default OFF). |
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
 | [page-interactive.utils.ts](page-interactive.utils.ts) | "Is page interactive yet" heuristic. |
 | [text-normalizer.util.ts](text-normalizer.util.ts) | Unicode/whitespace normalization for label matching. |
@@ -334,28 +336,38 @@ buildAllowedSets(snapshot, intent, viewport?, recordedFingerprint?)
     English technical identity (type/role/name/testid) when intent language
     ≠ label language.
     → resolverPath = 'llm'
-    HONESTY GUARD (evaluateHonestyGuard, semantic-match.util.ts) — post-LLM,
-    rejects confident-but-unrelated picks. Layers (first match accepts):
-      • lexical: intent overlaps the visible label OR nodeIdentityTokens
+    HONESTY GUARD (async evaluateHonestyGuard, semantic-match.util.ts) —
+    post-LLM, rejects confident-but-unrelated picks. 4 layers, cheap→expensive,
+    first-accept-wins; bypass on heal / <3-char intent / label-less node:
+      • L1 LEXICAL: intent overlaps the visible label OR nodeIdentityTokens
         (type/role-widget/name/autocomplete/testId/id — the cross-language
-        capot channel; English "password" ↔ "Пароль" via type=password).
-      • structural (PURE — zero word lists, any-language): a CLICK intent whose
+        capot channel; English "password" ↔ "Пароль" via type=password). The
+        identity GENERIC filter is now DATA-DRIVEN: `buildIdentityTokenFrequency`
+        over the full page + `buildGenericTokenPredicate` (token is generic when
+        it recurs on ≥ max(4, 25%) of controls). Replaces the static
+        `GENERIC_IDENTITY_TOKENS` word list on the live path — that list is kept
+        ONLY as a fallback for single-node callers (tests). Spec lists
+        (GENERIC_INPUT_TYPES, MEANINGFUL_AUTOCOMPLETE_TOKENS, SEMANTIC_IDENTITY_ROLES)
+        stay (HTML/W3C, not language).
+      • L0 STRUCTURAL (pure, zero word lists, any-language): a CLICK intent whose
         chosen node is the page's SOLE submit button (isSoleSubmitButton) AND
-        that matched no OTHER candidate by label/identity (intentMatchesAnySibling
-        is false) → accept, even when the label is localized ("Войти"). On a
-        one-submit form a click intent matching nothing more specific can only
-        mean "proceed", in any language. The "no better sibling" gate is what
-        makes a specific intent decline when a better match exists; a
-        multi-submit page declines via sole-submit. This is the signin→Войти fix.
-      heal mode / <3-char intent / label-less node bypass. Caller passes
-      `action` + `siblingNodes` (candidates); omitting them disables the
-      structural branch (conservative legacy default). NOTE: `submit`/`button`
-      stay in the generic blacklists — the structural branch, NOT blacklist
-      removal, is what bridges submit buttons. Known trade-off: a SPECIFIC
-      intent with no matching element on a one-submit page (e.g. "delete
-      account" on a login form) is accepted onto the submit rather than
-      "not found" — acceptable vs the cross-language recall loss; Layer 3
-      (embedding cosine for localized links/synonyms) is PLANNED, not wired.
+        matched no OTHER candidate (intentMatchesAnySibling=false) → accept even
+        when the label is localized ("Войти"). signin→Войти fix.
+      • L2 SEMANTIC (deterministic-given-cache): embedding cosine(intent,label)
+        ≥ 0.62 → accept. Catches localized links/synonyms the token paths miss
+        (выход↔logout). DI closures (generateEmbedding + cosineSimilarity),
+        Redis-cached (1h, content-addressed), fail-OPEN.
+      • L3 LLM-JUDGE (NON-deterministic, FLAG-GATED default OFF via
+        HONESTY_GUARD_JUDGE): only in the band 0.45 ≤ sim < 0.62 a cheap yes/no
+        arbitrates. Below band → reject (no judge); fail-OPEN to reject.
+      Closures live in honesty-guard-deps.ts (kept out of the pure module);
+      built ONCE per resolve in resolveElement over `allAllowed` and threaded
+      through selectElementWithLLM (the inline guard only sees top-K). Cost
+      (embedding/judge) recorded best-effort via optional `testId`. Caller passes
+      `action`+`siblingNodes`; omitting deps disables L2/L3 (legacy = tests).
+      Known trade-off: a SPECIFIC intent with no matching element on a one-submit
+      page (e.g. "delete account" on a login form) is accepted onto the submit
+      via L0 rather than "not found" — accepted vs the cross-language recall win.
 
 (4) Vision rescue
     take screenshot, send to vision LLM with click target hints.

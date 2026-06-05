@@ -49,7 +49,12 @@ import {
   nodeIdentityTokens,
   hasTokenOverlap,
   evaluateHonestyGuard,
+  buildIdentityTokenFrequency,
+  buildGenericTokenPredicate,
+  type HonestySemanticDeps,
+  type HonestyJudgeDeps,
 } from './semantic-match.util';
+import { buildSemanticDeps, buildJudgeDeps, isJudgeEnabled } from './honesty-guard-deps';
 import {
   recordedFingerprintHasStrongIdentity,
   hasStrongIdentityContradiction,
@@ -2621,8 +2626,13 @@ async function selectElementWithLLM(params: {
   mode?: 'apply' | 'heal';
   /** Heal-only journey context (test goal + last successful step descriptions). */
   healContext?: { testGoal?: string; priorSteps?: string[]; stepIndex?: number; totalSteps?: number };
+  /** Honesty-guard deps, built once in resolveElement over the full page set
+   *  and threaded down (the inline guard only sees top-K candidates). */
+  identityFreq?: (token: string) => boolean;
+  honestySemantic?: HonestySemanticDeps;
+  honestyJudge?: HonestyJudgeDeps;
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply', healContext } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply', healContext, identityFreq, honestySemantic, honestyJudge } = params;
   const startTime = Date.now();
 
   // Check cache
@@ -3434,12 +3444,15 @@ Select the single best matching element, or return ref=null if the intent does n
       // match). Heal mode + <3-char intents are bypassed inside the guard.
       {
         const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
-        const honesty = evaluateHonestyGuard({
+        const honesty = await evaluateHonestyGuard({
           intentText,
           chosenNode: chosenCandidate?.node,
           mode: mode === 'heal' ? 'heal' : 'apply',
           action: actionType,
           siblingNodes: candidates.map(c => c.node),
+          identityFreq,
+          semantic: honestySemantic,
+          judge: honestyJudge,
         });
         if (honesty) semanticFloorRejected = true;
       }
@@ -3820,6 +3833,12 @@ export async function resolveElement(params: {
     stepIndex?: number;
     totalSteps?: number;
   };
+  /**
+   * Optional test/run id for best-effort cost attribution of the honesty
+   * guard's embedding / judge calls (L2/L3). Absent → cost recording skipped
+   * (interactive authoring calls are low-volume). Never affects resolution.
+   */
+  testId?: string;
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -3830,6 +3849,7 @@ export async function resolveElement(params: {
     healContext,
     screenshot: screenshotOrFnRaw,
     viewport,
+    testId,
   } = params;
   // V22: derive heal-mode from explicit param OR the legacy
   // `previewSessionId === 'background'` convention used by command-executor.
@@ -4000,6 +4020,21 @@ export async function resolveElement(params: {
   // Combine allowed sets (hardAllowed first, then softAllowed)
   const allAllowed = [...hardAllowed, ...softAllowed];
   const allowedCount = allAllowed.length;
+
+  // Honesty-guard L1+L2+L3 dependencies, built ONCE per resolve over the full
+  // page set (the inline guard inside selectElementWithLLM only sees the top-K
+  // candidates, so the frequency predicate must be computed here and threaded
+  // down). L1: page-frequency generic predicate replaces the static word list.
+  // L2/L3: embedding + judge closures (judge flag-gated, default OFF).
+  const identityFreqPredicate = buildGenericTokenPredicate(
+    buildIdentityTokenFrequency(allAllowed),
+    allAllowed.length,
+  );
+  const honestySemantic: HonestySemanticDeps = buildSemanticDeps(testId);
+  const honestyPageKey = computePageSignature(pageUrl, domNodes);
+  const honestyJudge: HonestyJudgeDeps | undefined = isJudgeEnabled()
+    ? buildJudgeDeps(honestyPageKey, testId)
+    : undefined;
 
   logger.debug('[ELEMENT_RESOLVER] Allowed sets built', {
     previewSessionId,
@@ -4978,6 +5013,10 @@ export async function resolveElement(params: {
         // 2026-06: heal-only journey context (test goal + last steps). Lets the
         // heal prompt disambiguate which screen/section the failing step is on.
         healContext,
+        // Honesty-guard deps (built once over the full page set above).
+        identityFreq: identityFreqPredicate,
+        honestySemantic,
+        honestyJudge,
       });
 
       cacheHit = llmResult.cacheHit;
@@ -5193,12 +5232,15 @@ export async function resolveElement(params: {
                 // gated. Other vision paths (proactive icon-only at ~4524,
                 // early bbox-only at ~4116) keep prior behaviour until we
                 // have prod data showing they need the same protection.
-                const guard = evaluateHonestyGuard({
+                const guard = await evaluateHonestyGuard({
                   intentText,
                   chosenNode: visionNode.node,
                   mode: resolveMode,
                   action: stepDraft.type,
                   siblingNodes: allAllowed,
+                  identityFreq: identityFreqPredicate,
+                  semantic: honestySemantic,
+                  judge: honestyJudge,
                 });
                 if (guard) {
                   logger.info('[ELEMENT_RESOLVER] Vision second opinion rejected by honesty guard', {
