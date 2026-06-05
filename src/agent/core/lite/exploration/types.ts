@@ -29,7 +29,7 @@ export type ExplorationProgressEvent = {
   explorationId: string;
   phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
   event:
-    | 'page_discovered' | 'survey_complete'
+    | 'page_discovered' | 'page_skipped' | 'survey_complete'
     | 'strategy_planned'
     | 'auth_started' | 'auth_completed'
     | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'flow_step' | 'branch_found'

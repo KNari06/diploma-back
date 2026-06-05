@@ -87,6 +87,21 @@ export class SurveyAgent {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
+   * Surface a survey dedup/skip to the UI (frontend reads data.url / data.reason
+   * in its `page_skipped` branch). Paired with the trace's writePageDedupSkipped.
+   */
+  private emitPageSkipped(url: string, reason: 'same_url' | 'same_content' | 'same_template'): void {
+    this.config.onProgress?.({
+      explorationId: this.config.explorationId,
+      phase: 'survey',
+      event: 'page_skipped',
+      data: { url, reason },
+      progressPercent: 0,
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
    * Get full URL including hash fragment.
    * Playwright's page.url() strips hash — we need window.location.href
    * for hash-routed SPAs (e.g. /#/dashboard, /#/settings).
@@ -314,6 +329,7 @@ export class SurveyAgent {
       // Skip if already visited
       if (this.tree.isVisited(item.url)) {
         this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_url' });
+        this.emitPageSkipped(item.url, 'same_url');
         continue;
       }
 
@@ -456,6 +472,7 @@ export class SurveyAgent {
       // Check for same-template page (pagination/lists)
       if (item.parentNodeId && this.tree.registerAndCheckSameTemplate(item.parentNodeId, snapshot)) {
         this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_template' });
+        this.emitPageSkipped(item.url, 'same_template');
         logger.debug('[SURVEY] Skipping same-template page', { url: item.url });
         continue;
       }
@@ -463,6 +480,7 @@ export class SurveyAgent {
       // Check for SPA content dedup
       if (this.tree.isContentVisited(snapshot)) {
         this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_content' });
+        this.emitPageSkipped(item.url, 'same_content');
         logger.debug('[SURVEY] Skipping duplicate content page', { url: item.url });
         continue;
       }
