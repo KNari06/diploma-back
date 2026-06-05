@@ -88,6 +88,14 @@ export interface InteractiveNode {
   isTopMostAtCenter?: boolean;
   /** True if element is inside the active modal/popup/overlay layer */
   isInsideActiveModal?: boolean;
+  /**
+   * True if element lies in a small fixed corner widget layer (geometry-derived,
+   * e.g. a chat/assistant bubble). Mirrors LiteElement.floatingWidget; computed
+   * in-page (viewport-relative) and symmetric across both collectors. The
+   * resolver deprioritizes such nodes so a corner widget's buttons don't pollute
+   * the candidate set (escape-hatch when the step actually targets the widget).
+   */
+  floatingWidget?: boolean;
   /** True if id looks like a dynamic GUID/random string */
   isDynamicId?: boolean;
 

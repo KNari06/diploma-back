@@ -1340,14 +1340,29 @@ export class PreviewRunService {
         if (['assert', 'ai_check'].includes(actionType)) return 'assertion';
         return 'default';
       };
+      // Category-aware lower floor. Navigation-class actions (click/open/toggle/
+      // select) can mount late overlays — a floating corner widget (chat bubble)
+      // typically slides in over ~300-500ms AFTER the click. The lookahead
+      // snapshot that feeds element resolution runs as soon as the page looks
+      // settled, so an over-eager adaptive floor (150ms) snapshots the widget
+      // mid-animation and its buttons pollute the candidate set (the Run-vs-Apply
+      // divergence: single Apply runs the full post-action settle). A 450ms floor
+      // for navigation gives the entry animation time to finish. Input/assertion
+      // stay at 150ms — they don't spawn corner widgets and shouldn't slow down.
+      const getSettleFloorMs = (category: string): number =>
+        category === 'navigation' ? 450 : 150;
       const getAdaptiveSettleMs = (prevActionType?: IntentActionType | string): number => {
         const category = prevActionType ? getActionCategory(prevActionType) : 'default';
+        const floor = getSettleFloorMs(category);
         const samples = adaptiveSettleByCategory.get(category);
-        if (!samples || samples.length < 2) return STEP_READINESS_CONFIG.defaults.settleMs; // Not enough data
-        // p75 × 1.5 safety margin, clamped to [150, 3000]
+        if (!samples || samples.length < 2) {
+          // Not enough data — use the configured default, but never below the floor.
+          return Math.max(floor, STEP_READINESS_CONFIG.defaults.settleMs);
+        }
+        // p75 × 1.5 safety margin, clamped to [floor, 3000]
         const sorted = [...samples].sort((a, b) => a - b);
         const p75 = sorted[Math.floor(sorted.length * 0.75)];
-        return Math.max(150, Math.min(3000, Math.round(p75 * 1.5)));
+        return Math.max(floor, Math.min(3000, Math.round(p75 * 1.5)));
       };
       const recordSettleTime = (prevActionType: IntentActionType | string, waitedMs: number): void => {
         const category = getActionCategory(prevActionType);

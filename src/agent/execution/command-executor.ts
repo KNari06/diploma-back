@@ -260,6 +260,9 @@ function buildPostStep(
 export class CommandExecutor {
   private page: Page;
   private extractedData: Map<string, any> = new Map();
+  /** Per-run budget for the LLM tier of blocking-overlay clearing (tier3). */
+  private static readonly MAX_LLM_OVERLAY_CLEARS = 3;
+  private llmOverlayClears = 0;
   private selfHealingEnabled: boolean = true;
   private metadata: { url: string; projectId?: string; userId?: string };
   private abortController: AbortController;
@@ -5263,6 +5266,17 @@ export class CommandExecutor {
       return;
     }
 
+    // Deterministic obstacle-clear (regression path): we attempt to dismiss a
+    // BLOCKING overlay AT MOST ONCE per call, only when the target is actually
+    // covered. This unblocks unexpected modals/cookie banners/onboarding that
+    // would otherwise fail the step, WITHOUT disturbing steps that legitimately
+    // target a modal (if the step's own element is the modal, it IS topmost and
+    // we never enter the clear branch). `flow` mode is conservative — it never
+    // touches sticky headers/footers, chat widgets, tooltips, toasts or
+    // unclassified containers (see OverlayDismisser.filterDismissible). Fail-open:
+    // any error in the clear path leaves the original timeout/throw behaviour.
+    let obstacleClearTried = false;
+
     try {
       while (Date.now() - startTime < timeout) {
         try {
@@ -5292,6 +5306,16 @@ export class CommandExecutor {
             return;
           }
 
+          // Target is covered. Try clearing a blocking overlay once before we
+          // keep polling toward the timeout. This is the deterministic
+          // "clear-on-block" recovery — no LLM, conservative flow mode.
+          if (!obstacleClearTried) {
+            obstacleClearTried = true;
+            await this.tryClearBlockingOverlay();
+            // Loop continues → re-checks topmost on the next iteration.
+            continue;
+          }
+
           logger.debug('[COMMAND_EXECUTOR] Element not topmost, waiting...', {
             elapsed: Date.now() - startTime,
           });
@@ -5312,6 +5336,98 @@ export class CommandExecutor {
       // Always clean up the marker attribute
       await locator.evaluate((el, attr) => el.removeAttribute(attr), marker).catch(() => {});
     }
+  }
+
+  /**
+   * Best-effort, deterministic clearing of a BLOCKING overlay that is covering
+   * the current target. Reuses the LLM-free `OverlayDismisser` in `flow` mode
+   * (only modal / cookie_consent / loading_overlay / onboarding / paywall — never
+   * sticky chrome, chat widgets, tooltips, toasts, or unclassified containers).
+   * One pass, short budget. Fully fail-open: never throws, so the caller's
+   * timeout/throw contract is unchanged when nothing can be cleared.
+   */
+  private async tryClearBlockingOverlay(): Promise<void> {
+    // 2-tier escalation, both LANGUAGE-AGNOSTIC (no hardcoded close-word lists).
+    // Each tier is best-effort; the method is fully fail-open — a covered target
+    // that can't be cleared just falls back to the original timeout/throw in
+    // ensureTopMostAtCenter.
+    //
+    //   Tier 1 (deterministic): OverlayDismisser flow-mode — type-classified
+    //           recovery (Escape / click-away / type-specific) for genuinely-
+    //           blocking overlays only. Classification is geometry + ARIA based,
+    //           not word-matching.
+    //   Tier 2 (LLM, last resort, capped): ask the resolver to find a
+    //           "close the blocking popup" control and click it. Language- and
+    //           structure-agnostic; runs ONLY after tier 1 failed AND at most
+    //           `MAX_LLM_OVERLAY_CLEARS` times per run to bound cost/latency.
+    //
+    // NOTE: a previous text-pattern "generic close-button" tier was REMOVED —
+    // it hardcoded close-word lists (close/закрыть/жабу/…) which can never be
+    // complete across languages/sites. Structural (tier1) + LLM (tier2) cover
+    // the same ground without a brittle wordlist.
+    try {
+      const { OverlayDismisser } = await import('@/agent/core/lite/exploration/overlay-dismisser');
+      const result = await OverlayDismisser.dismissOverlays(this.page, {
+        mode: 'flow',
+        maxPasses: 1,
+        maxTimeMs: 2500,
+      });
+      const dismissed = result?.attempts?.filter((a) => a.dismissed).length ?? 0;
+      if (dismissed > 0) {
+        logger.warn('[COMMAND_EXECUTOR] Auto-dismissed a blocking overlay (tier1 deterministic)', {
+          dismissed,
+          overlaysDetected: result.overlaysDetected,
+        });
+        return;
+      }
+    } catch (err) {
+      logger.debug('[COMMAND_EXECUTOR] Tier1 overlay clear failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    // Tier 2 — LLM last resort, capped per run.
+    if (this.llmOverlayClears >= CommandExecutor.MAX_LLM_OVERLAY_CLEARS) {
+      logger.debug('[COMMAND_EXECUTOR] LLM overlay-clear budget exhausted, skipping tier2');
+      return;
+    }
+    try {
+      this.llmOverlayClears++;
+      const cleared = await this.clearOverlayWithLLM();
+      if (cleared) {
+        logger.warn('[COMMAND_EXECUTOR] Auto-dismissed a blocking overlay (tier2 LLM)', {
+          llmClearsUsed: this.llmOverlayClears,
+        });
+      }
+    } catch (err) {
+      logger.debug('[COMMAND_EXECUTOR] Tier2 LLM overlay clear failed (non-fatal)', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Tier 2 — LLM last resort. Re-resolve a "close the blocking popup" control
+   * via the same resolver the self-heal path uses, then click it. Language- and
+   * structure-agnostic (no hardcoded close-word list). Capped by the caller.
+   * Returns true if it clicked a resolved element.
+   */
+  private async clearOverlayWithLLM(): Promise<boolean> {
+    const { resolveElement } = await import('@/services/testing/ui/preview/element-resolver.service');
+    const { collectInteractiveNodes } = await import('./background-dom-collector');
+    const nodes = await collectInteractiveNodes(this.page, this.maxDomNodes);
+    const res = await resolveElement({
+      previewSessionId: 'background',
+      mode: 'heal',
+      stepDraft: { id: 'overlay-clear', type: 'click', description: 'close or dismiss the blocking popup / modal / cookie banner' } as IntentStep,
+      domNodes: nodes,
+      pageUrl: this.page.url(),
+      includeAlternatives: false,
+    });
+    const ref = res.highlight?.find((h) => h.type === 'success')?.ref ?? res.candidates?.[0]?.ref;
+    if (res.status !== 'resolved' || !ref) return false;
+    await this.page.locator(`[data-agent-ref="${ref}"]`).first().click({ timeout: 2000 }).catch(() => {});
+    return true;
   }
 
   /**

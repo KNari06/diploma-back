@@ -4081,6 +4081,11 @@ export class CdpSnapshotService {
       // and Web-Component-heavy apps the moment SNAPSHOT_USE_CDP_PREVIEW
       // is flipped. Now populated identically here.
       isTopMostAtCenter?: boolean;
+      // floatingWidget — element lies in a small fixed corner widget layer
+      // (chat/assistant bubble). Geometry-only; mirrors the eval collector
+      // (snapshot-collector.ts) and the canonical rule in floating-widget.util.ts.
+      // Consumer: element-resolver buildAllowedSets (widget.* rules).
+      floatingWidget?: boolean;
       childTestId?: string;
       iconClasses?: string;
       iconLabel?: string;
@@ -4386,6 +4391,42 @@ export class CdpSnapshotService {
           if (!top) return undefined;
           return top === el || el.contains(top);
         } catch { return undefined; }
+      };
+
+      // ── floatingWidget — small fixed corner widget layer ────────
+      // Geometry-only (chat/assistant bubble, support launcher). Inline
+      // copy of `isFloatingCornerWidget` in floating-widget.util.ts and the
+      // eval collector (snapshot-collector.ts) — KEEP IN SYNC (constants:
+      // FLOATING_WIDGET_EDGE_MARGIN_PX=24, FLOATING_WIDGET_MAX_COVERAGE=0.30).
+      // Walk to the nearest position:fixed ancestor (or self) and test THAT
+      // container, so a widget's child buttons inherit the flag. Never flags
+      // modal contents (role=dialog/alertdialog/aria-modal ancestor).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const computeFloatingWidget = (el: any): boolean => {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const w = (globalThis as any).window;
+          const vw = w.innerWidth; const vh = w.innerHeight;
+          if (!(vw > 0) || !(vh > 0)) return false;
+          let fixedAncestor: any = null;
+          let walk: any = el;
+          for (let depth = 0; walk && depth < 12; depth++) {
+            const cs = w.getComputedStyle(walk);
+            const role = (walk.getAttribute && walk.getAttribute('role')) || '';
+            if (role === 'dialog' || role === 'alertdialog' || walk.getAttribute?.('aria-modal') === 'true') return false;
+            if (cs.position === 'fixed') { fixedAncestor = walk; break; }
+            walk = walk.parentElement;
+          }
+          if (!fixedAncestor) return false;
+          const fr = fixedAncestor.getBoundingClientRect();
+          if (!(fr.width > 0) || !(fr.height > 0)) return false;
+          const coverage = (fr.width * fr.height) / (vw * vh);
+          if (coverage >= 0.30) return false;
+          const m = 24;
+          const hugsH = fr.left <= m || fr.left + fr.width >= vw - m;
+          const hugsV = fr.top <= m || fr.top + fr.height >= vh - m;
+          return hugsH && hugsV;
+        } catch { return false; }
       };
 
       // ── childTestId — fallback testId from unique direct child ──
@@ -4765,6 +4806,7 @@ export class CdpSnapshotService {
           labelText: getLabelText(el),
           nearestRowText: getNearestRowText(el),
           isTopMostAtCenter: computeIsTopMostAtCenter(el),
+          floatingWidget: computeFloatingWidget(el),
           childTestId: computeChildTestId(el),
           iconClasses: computeIconClasses(el),
           // Collector gates iconLabel on isIconButton — mirror that
@@ -4823,6 +4865,7 @@ export class CdpSnapshotService {
       if (typeof result.isTopMostAtCenter === 'boolean') {
         el.isTopMostAtCenter = result.isTopMostAtCenter;
       }
+      if (result.floatingWidget) el.floatingWidget = true;
       if (result.childTestId) el.childTestId = result.childTestId;
       if (result.iconClasses) el.iconClasses = result.iconClasses;
       if (result.iconLabel) el.iconLabel = result.iconLabel;

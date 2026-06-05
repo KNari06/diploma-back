@@ -236,6 +236,11 @@ function elementToInteractiveNode(element: LiteElement): InteractiveNode {
     node.isInsideActiveModal = true;
   }
 
+  // Carry floating-corner-widget flag (geometry-derived, both collectors)
+  if (element.floatingWidget) {
+    node.floatingWidget = true;
+  }
+
   // Phase 4: Propagate custom component interactivity signals
   if (element.frameworkClickable) {
     node.frameworkClickable = element.frameworkClickable;
