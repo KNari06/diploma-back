@@ -4,6 +4,7 @@ import { Request, Response } from 'express';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { logger } from '@/utils/core/logger';
+import { PublicChatPersistence } from './public-chat-persistence';
 
 /**
  * Public B2C "Ask Me Anything" chat — product Q&A only.
@@ -99,6 +100,13 @@ const MAX_HISTORY_TURNS = 6; // cap context the client can send
 export async function handlePublicChat(req: Request, res: Response): Promise<void> {
   const rawMessage = typeof req.body?.message === 'string' ? req.body.message.trim() : '';
   const lang = typeof req.body?.lang === 'string' ? req.body.lang : 'en';
+  // Client-generated session id groups a visitor's turns into one conversation
+  // for the admin audit trail. Falls back to a per-request id (still logs the
+  // turn, just won't thread) so persistence never depends on the client.
+  const sessionId =
+    typeof req.body?.sessionId === 'string' && req.body.sessionId.trim()
+      ? req.body.sessionId.trim().slice(0, 100)
+      : `anon-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   if (!rawMessage) {
     res.status(400).json({ success: false, error: 'Message is required' });
@@ -143,7 +151,23 @@ export async function handlePublicChat(req: Request, res: Response): Promise<voi
       // No `tools` → the model literally cannot call anything. Answer-only.
     });
 
-    res.json({ success: true, reply: response.content ?? '' });
+    const reply = response.content ?? '';
+    res.json({ success: true, reply }); // frontend needs the raw marker to render the CTA button
+
+    // Persist the exchange for the admin audit trail — fire-and-forget AFTER
+    // the response is sent, so it never adds latency or can fail the reply.
+    // Strip the [[cta:book_demo]] marker before storing: it's a frontend
+    // render directive, not content, and admins shouldn't see the raw token.
+    const replyForStorage = reply.replace(/\s*\[\[cta:book_demo\]\]\s*/g, ' ').trim();
+    void PublicChatPersistence.recordTurn({
+      sessionId,
+      lang,
+      ip: req.socket.remoteAddress, // socket peer (not the spoofable XFF)
+      country: typeof req.headers['cf-ipcountry'] === 'string' ? req.headers['cf-ipcountry'] : undefined,
+      userAgent: req.headers['user-agent'],
+      userMessage: rawMessage,
+      assistantMessage: replyForStorage,
+    });
   } catch (err) {
     logger.error('[PUBLIC_CHAT] LLM call failed', {
       error: err instanceof Error ? err.message : String(err),
