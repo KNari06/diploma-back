@@ -100,10 +100,29 @@ export class IntentTestCaseService {
      * import paths that genuinely want "no opinion").
      */
     priority?: 'critical' | 'high' | 'medium' | 'low' | null;
+    /**
+     * Preconditions (free-text bullets) persisted to the `preconditions`
+     * TEXT[] column. Used by import paths (e.g. Allure) that carry
+     * before-fixture / prerequisite text. Omitted → column defaults to `{}`.
+     */
+    preconditions?: string[];
+    /**
+     * Import provenance (set only by import paths — Allure, etc.):
+     * - importId       → FK to allure_imports; lets /details filter exactly by
+     *                     import instead of a created_at window.
+     * - sourceStatus   → source run verdict (Allure passed/failed/broken/skipped),
+     *                     distinct from the lifecycle `status` column.
+     * - stepsDegraded  → AI step conversion fell back to all-'click'; types unreliable.
+     * All omitted for normal (non-import) creates → columns stay NULL / default false.
+     */
+    importId?: string;
+    sourceStatus?: string;
+    stepsDegraded?: boolean;
   }): Promise<IntentTestCase> {
     const {
       projectId, userId, name, description, startUrl, steps, flowId,
       status = 'draft', kind = 'standalone', platform = 'web',
+      preconditions, importId, sourceStatus, stepsDegraded,
     } = params;
     // Explicit `null` from the caller means "no opinion" → store NULL.
     // Anything else (undefined / valid enum) falls back to 'medium'.
@@ -176,6 +195,14 @@ export class IntentTestCaseService {
         // 'medium' by default (see params.priority comment above);
         // explicit null leaves the DB column NULL.
         priority,
+        // Only set when the caller supplied preconditions — otherwise let the
+        // column default ('{}') apply rather than writing an explicit empty array.
+        ...(preconditions !== undefined && { preconditions }),
+        // Import provenance — only written by import paths; omitted otherwise so
+        // the columns stay NULL / default for manually-created tests.
+        ...(importId !== undefined && { import_id: importId }),
+        ...(sourceStatus !== undefined && { source_status: sourceStatus }),
+        ...(stepsDegraded !== undefined && { steps_degraded: stepsDegraded }),
         resource_bindings: resourceBindings,
       })
       .select('*')

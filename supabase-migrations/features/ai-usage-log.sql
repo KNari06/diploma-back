@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS ai_usage_log (
   workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   user_id TEXT,                      -- User who triggered the operation
   test_id UUID,                      -- NULL for non-test operations (chat, plan gen)
+  run_id UUID,                       -- Regression run ID for correlation; NULL for chat/preview (see 20260605 migration)
 
   -- Operation context
   operation_type TEXT NOT NULL,       -- 'lite-test', 'pro-test', 'chat', 'test-plan', 'api-test', 'analysis'

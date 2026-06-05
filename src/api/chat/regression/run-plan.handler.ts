@@ -16,6 +16,7 @@ import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { getResolvedTargets } from '../shared/intent-target-resolution';
 import { resolveProjectId } from './project-resolver';
 
 /**
@@ -65,6 +66,17 @@ export async function handleRunPlanIntent(
         );
         if (matchedPlan) {
           targetPlanId = matchedPlan.id;
+        }
+      }
+    }
+    // Fall back to the understanding layer's uniquely-resolved plan
+    // ("run my nightly regression"). Authorize via getById (single auth path).
+    if (!targetPlanId) {
+      const resolved = getResolvedTargets(parsedIntent);
+      if (resolved?.selectorType === 'plan' && resolved.resolution === 'unique' && resolved.topId) {
+        const authorizedPlan = await RegressionPlanService.getById(resolved.topId, userId);
+        if (authorizedPlan) {
+          targetPlanId = authorizedPlan.id;
         }
       }
     }

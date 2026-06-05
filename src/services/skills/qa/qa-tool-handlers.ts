@@ -101,6 +101,26 @@ async function resolveFlowByName(name: string, moduleId: string): Promise<Resolv
   return { error: `Multiple flows match "${name}":\n${list}\nPlease specify the exact name or ID.` };
 }
 
+/**
+ * Resolve a flow by name within a PROJECT (flows are module-scoped, so we join
+ * through test_modules). Used by add_item, where only a project is in scope —
+ * not a specific module. Mirrors the resolveByName contract.
+ */
+async function resolveFlowByNameInProject(name: string, projectId: string): Promise<ResolveResult> {
+  const { data, error } = await supabaseAdmin
+    .from('test_flows')
+    .select('id, name, test_modules!inner(project_id)')
+    .eq('test_modules.project_id', projectId)
+    .ilike('name', `%${name}%`) as { data: any[] | null; error: any };
+
+  if (error) return { error: `Failed to search flow: ${error.message}` };
+  if (!data || data.length === 0) return { error: `No flow found matching "${name}"` };
+  if (data.length === 1) return { id: data[0].id };
+
+  const list = data.slice(0, 5).map((r: any) => `• ${r.name} (${r.id})`).join('\n');
+  return { error: `Multiple flows match "${name}":\n${list}\nPlease specify the exact name or ID.` };
+}
+
 async function resolveAutomationActionByName(name: string, userId: string): Promise<ResolveResult> {
   const { data, error } = await supabaseAdmin
     .from('automation_actions')
@@ -3720,6 +3740,7 @@ export async function handleManageRegressionPlan(
           const itemResolvers: Record<string, (name: string, scope: string) => Promise<ResolveResult>> = {
             module: resolveModuleByName,
             test_case: resolveTestCaseByName,
+            flow: resolveFlowByNameInProject,
           };
           const resolver = itemResolvers[itemType];
           if (resolver) {
@@ -5005,6 +5026,18 @@ export async function handleGetRunStatus(
         .maybeSingle();
       planName = plan?.name;
     }
+
+    // [CHAIN] trace: the agent checked this run's status. Keyed by runId so
+    // `rg "<runId>"` reconstructs the full run→status→notify chain across
+    // processes/turns. [REGRESSION_RUN] already logs the start with runId.
+    logger.info('[CHAIN] status_checked', {
+      runId: run.id,
+      status: run.status,
+      passed: progress.passed,
+      failed: progress.failed,
+      total: progress.total,
+      userId: context.userId,
+    });
 
     return {
       success: true,

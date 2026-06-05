@@ -124,7 +124,7 @@ export interface FlowExecutionResult {
   entryPointId: string;
   name: string;
   category: TestFlowCategory;
-  status: 'passed' | 'failed' | 'blocked' | 'timeout';
+  status: 'passed' | 'failed' | 'blocked' | 'timeout' | 'skipped';
   goalAchieved: boolean;
   steps: DiscoveredStep[];
   stepsCount: number;

@@ -89,6 +89,21 @@ interface AIStepResult {
   value?: string;
 }
 
+/**
+ * Result of an AI step conversion. `degraded` is true when at least one batch
+ * fell back to the deterministic all-'click' mapping (AI call or JSON parse
+ * failed) — the steps still exist but their action TYPES are unreliable. The
+ * caller bumps `stats.testsWithDegradedSteps` so the user can review them.
+ *
+ * Note: a JSON parse failure that yields an empty batch is NOT degraded — that
+ * path produces no steps rather than wrong ones; only the exception fallback
+ * (which fabricates 'click' steps) sets the flag.
+ */
+export interface AIStepConversionResult {
+  steps: IntentStep[];
+  degraded: boolean;
+}
+
 const STEP_CONVERSION_SYSTEM_PROMPT = `You convert Allure test report steps into UI test actions for a web testing platform.
 
 ## Input
@@ -156,10 +171,11 @@ const AI_STEP_BATCH_SIZE = 50;
 async function convertStepsWithAI(
   testName: string,
   rawSteps: FlattenedRawStep[],
-): Promise<IntentStep[]> {
-  if (rawSteps.length === 0) return [];
+): Promise<AIStepConversionResult> {
+  if (rawSteps.length === 0) return { steps: [], degraded: false };
 
   const allResults: IntentStep[] = [];
+  let degraded = false;
 
   // Process in batches to keep prompt size reasonable
   for (let i = 0; i < rawSteps.length; i += AI_STEP_BATCH_SIZE) {
@@ -248,7 +264,9 @@ async function convertStepsWithAI(
         error: err instanceof Error ? err.message : String(err),
       });
 
-      // Fallback: create basic steps from raw data without AI
+      // Fallback: create basic steps from raw data without AI. Mark degraded —
+      // step types are now unreliable ('click' for everything).
+      degraded = true;
       for (const raw of batch) {
         allResults.push({
           id: randomUUID(),
@@ -260,7 +278,7 @@ async function convertStepsWithAI(
     }
   }
 
-  return allResults;
+  return { steps: allResults, degraded };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,10 +299,11 @@ async function convertStepsWithAI(
 export async function convertImportedStepsWithAI(
   testName: string,
   rawSteps: Array<{ type: string; description: string; value?: string }>,
-): Promise<IntentStep[]> {
-  if (rawSteps.length === 0) return [];
+): Promise<AIStepConversionResult> {
+  if (rawSteps.length === 0) return { steps: [], degraded: false };
 
   const allResults: IntentStep[] = [];
+  let degraded = false;
 
   // Process in batches (same limit as ZIP path) to avoid context overflow
   for (let i = 0; i < rawSteps.length; i += AI_STEP_BATCH_SIZE) {
@@ -354,7 +373,9 @@ export async function convertImportedStepsWithAI(
         error: err instanceof Error ? err.message : String(err),
       });
 
-      // Fallback for this batch only — keep original descriptions, default type
+      // Fallback for this batch only — keep original descriptions, default type.
+      // Mark degraded: step types are now unreliable ('click' for everything).
+      degraded = true;
       for (const s of batch) {
         allResults.push({
           id: randomUUID(),
@@ -366,7 +387,7 @@ export async function convertImportedStepsWithAI(
     }
   }
 
-  return allResults;
+  return { steps: allResults, degraded };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -858,6 +879,11 @@ export interface MappedTestCase {
   sourceUuid: string;
   /** Source testCaseId from Allure, for dedup checks. */
   sourceTestCaseId?: string;
+  /**
+   * True when AI step conversion fell back to all-'click' for at least one
+   * batch — step types are unreliable. Caller bumps stats.testsWithDegradedSteps.
+   */
+  stepsDegraded: boolean;
 }
 
 export interface MapperOptions {
@@ -940,7 +966,7 @@ export async function mapAllureResult(
 
   // ── 1. Flatten + AI-convert steps ──────────────────────────────────────────
   const rawSteps = flattenRawSteps(result.steps);
-  const steps = await convertStepsWithAI(result.name, rawSteps);
+  const { steps, degraded: stepsDegraded } = await convertStepsWithAI(result.name, rawSteps);
 
   // ── 2. Extract labels ──────────────────────────────────────────────────────
   const { moduleName, flowName, priority, tags, descriptionSuffix } =
@@ -968,6 +994,7 @@ export async function mapAllureResult(
   return {
     sourceUuid: result.uuid,
     sourceTestCaseId: result.testCaseId,
+    stepsDegraded,
     ...(resolvedModuleId && { moduleId: resolvedModuleId }),
     createParams: {
       projectId,

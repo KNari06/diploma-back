@@ -15,12 +15,18 @@ import type { IntentStep, InteractiveNode } from '../preview.types';
 // Mock LLM services used by selectElementWithLLM / rescueWithGeminiFlash
 jest.mock('@/services/ai/core/openai.service');
 jest.mock('@/services/ai/core/gemini.service');
+// Mock the embedding service so the honesty-guard L2 layer is deterministic
+// and never hits the network in unit tests. Default: orthogonal vectors
+// (cosine 0) → L2 does not accept; individual tests override per pair.
+jest.mock('@/services/ai/core/embedding.service');
 
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { generateTextWithGeminiVision } from '@/services/ai/core/gemini.service';
+import { generateEmbedding } from '@/services/ai/core/embedding.service';
 
 const mockGetChatCompletion = getChatCompletionWithMessages as jest.MockedFunction<typeof getChatCompletionWithMessages>;
 const mockGeminiVision = generateTextWithGeminiVision as jest.MockedFunction<typeof generateTextWithGeminiVision>;
+const mockGenerateEmbedding = generateEmbedding as jest.MockedFunction<typeof generateEmbedding>;
 
 describe('ElementResolverService', () => {
   // ═══════════════════════════════════════════════════════════════════════════
@@ -350,6 +356,69 @@ describe('ElementResolverService', () => {
       // Both elements should be in allowed sets for LLM (no short-circuit, no text matching)
       expect(result.hardAllowed.length + result.softAllowed.length).toBe(2);
     });
+
+    // ── Floating corner widget (Rule 0b) ────────────────────────────────
+    describe('floating corner widget', () => {
+      it('soft-penalizes a floating widget node when it is not the target', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'Submit', isTopMostAtCenter: true },
+          { tag: 'button', ref: 'e2', isVisible: true, text: 'Close hint', floatingWidget: true, isTopMostAtCenter: true },
+        ];
+
+        const { hardAllowed, softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click');
+        expect(hardAllowed.map(n => n.ref)).toEqual(['e1']);
+        expect(softAllowed.map(n => n.ref)).toEqual(['e2']);
+        expect(ruleTrace.some(r => r.ruleId === 'widget.floating_deprioritized' && r.affectedRefs.includes('e2'))).toBe(true);
+        expect(ruleTrace.some(r => r.ruleId === 'widget.floating_detected')).toBe(true);
+      });
+
+      it('hard-excludes a floating widget node that covers the target', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'Submit', isTopMostAtCenter: true },
+          { tag: 'div', ref: 'e2', isVisible: true, floatingWidget: true, isTopMostAtCenter: false },
+        ];
+
+        const { hardAllowed, softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click');
+        expect(hardAllowed.map(n => n.ref)).toEqual(['e1']);
+        expect(softAllowed.map(n => n.ref)).not.toContain('e2');
+        expect(ruleTrace.some(r => r.ruleId === 'widget.covers_target_excluded' && r.affectedRefs.includes('e2'))).toBe(true);
+      });
+
+      it('keeps a floating widget node unpenalized when the step targets it (strong fingerprint)', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'Submit', isTopMostAtCenter: true },
+          { tag: 'button', ref: 'e2', isVisible: true, testIdAttr: 'chat-send', floatingWidget: true, isTopMostAtCenter: true },
+        ];
+        const recordedFingerprint = { testIdAttr: 'chat-send' } as IntentStep['recordedFingerprint'];
+
+        const { hardAllowed, softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click', undefined, recordedFingerprint);
+        // e2 IS the target → kept in hardAllowed, no soft penalty.
+        expect(hardAllowed.map(n => n.ref).sort()).toEqual(['e1', 'e2']);
+        expect(softAllowed.map(n => n.ref)).not.toContain('e2');
+        expect(ruleTrace.some(r => r.ruleId === 'widget.target_escape_hatch' && r.affectedRefs.includes('e2'))).toBe(true);
+      });
+
+      it('still soft-penalizes a widget node when the strong fingerprint contradicts it', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e2', isVisible: true, testIdAttr: 'chat-send', floatingWidget: true, isTopMostAtCenter: true },
+        ];
+        const recordedFingerprint = { testIdAttr: 'real-submit' } as IntentStep['recordedFingerprint'];
+
+        const { softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click', undefined, recordedFingerprint);
+        expect(softAllowed.map(n => n.ref)).toEqual(['e2']);
+        expect(ruleTrace.some(r => r.ruleId === 'widget.floating_deprioritized')).toBe(true);
+      });
+
+      it('does not touch ordinary (non-widget) nodes', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'A', isTopMostAtCenter: true },
+          { tag: 'button', ref: 'e2', isVisible: true, text: 'B', isTopMostAtCenter: true },
+        ];
+        const { hardAllowed, ruleTrace } = buildAllowedSets(nodes, 'click');
+        expect(hardAllowed.map(n => n.ref).sort()).toEqual(['e1', 'e2']);
+        expect(ruleTrace.some(r => r.ruleId.startsWith('widget.'))).toBe(false);
+      });
+    });
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -447,6 +516,17 @@ describe('ElementResolverService', () => {
       jest.clearAllMocks();
       // Default: Gemini vision not called
       mockGeminiVision.mockResolvedValue({ content: '', usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, model: 'mock' } });
+      // Default embedding: a deterministic near-orthogonal vector per DISTINCT
+      // text (different strings → low cosine, same string → cosine 1). This
+      // keeps L2 from accepting unrelated pairs by default; tests that exercise
+      // the cross-language bridge override with explicit same/near vectors.
+      mockGenerateEmbedding.mockImplementation(async (text: string) => {
+        const v = [0, 0, 0, 0, 0, 0, 0, 0];
+        let h = 0;
+        for (let i = 0; i < text.length; i++) h = (h * 31 + text.charCodeAt(i)) >>> 0;
+        v[h % v.length] = 1; // one-hot bucket → distinct texts ~orthogonal
+        return v;
+      });
     });
 
     it('should return not_found when LLM returns low confidence (<0.4) for nonsense text', async () => {
@@ -547,8 +627,13 @@ describe('ElementResolverService', () => {
       expect(result.confidence).toBeGreaterThanOrEqual(0.55);
     });
 
-    it('should return resolved for cross-language match when LLM correctly identifies element', async () => {
-      // "Войти" = "Login" — LLM handles cross-language matching
+    it('L0 structural: "Войти" resolves to the SOLE login button (cross-language, no embeddings)', async () => {
+      // e3 is a bare <button>Login</button> — the page's only submit primary.
+      // Intent "Войти" (login) shares no tokens with "Login" and the button has
+      // no technical identity, BUT it's the sole submit and the intent matches
+      // no other candidate → the structural layer accepts it regardless of
+      // language. (Embeddings give войти/login distinct vectors here, so L2 is
+      // NOT what bridges this — the structural sole-submit rule is.)
       mockGetChatCompletion.mockResolvedValue({
         content: JSON.stringify({ ref: 'e3', confidence: 0.9, reason: 'Войти matches Login button' }),
       } as any);
@@ -561,7 +646,28 @@ describe('ElementResolverService', () => {
       });
 
       expect(result.status).toBe('resolved');
-      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('L2: bridges a cross-language pick on a NON-submit element via embeddings', async () => {
+      // A logout LINK (not a submit, so the structural layer can't help) labelled
+      // "Logout"; intent "выход". Embeddings report them equivalent → L2 accepts.
+      const linkNodes: InteractiveNode[] = [
+        { tag: 'input', ref: 'e1', isVisible: true, labelText: 'Username', type: 'text' },
+        { tag: 'a', ref: 'e2', isVisible: true, text: 'Logout' },
+      ];
+      mockGetChatCompletion.mockResolvedValue({
+        content: JSON.stringify({ ref: 'e2', confidence: 0.9, reason: 'выход = Logout' }),
+      } as any);
+      mockGenerateEmbedding.mockResolvedValue([1, 0, 0]); // both texts → cosine 1
+
+      const result = await resolveElement({
+        previewSessionId: 'test-session',
+        stepDraft: { id: 'step1', type: 'click', description: 'выход' } as IntentStep,
+        domNodes: linkNodes,
+        pageUrl: 'https://example.com/app',
+      });
+
+      expect(result.status).toBe('resolved');
     });
   });
 });

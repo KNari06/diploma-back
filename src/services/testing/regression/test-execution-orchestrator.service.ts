@@ -857,23 +857,29 @@ export class TestExecutionOrchestratorService {
         // The emitter resolved with 'timeout' (not a real signal) — the DB row was
         // never updated by the worker. Best-effort: a failure here is logged and
         // swallowed; the 30-minute force-fail in recomputeRunStatus is the backstop.
+        // Persist as 'failed' (with a timeout error_message): the
+        // `test_executions.status` CHECK constraint has no 'timeout' value, and
+        // nothing downstream distinguishes timeout from failure. Writing 'timeout'
+        // here raised a 23514 constraint violation, leaving the row stuck 'running'.
         const timedOutExecIds = results
           .filter((r) => r.status === 'timeout' && r.execId)
           .map((r) => r.execId as string);
 
-        for (const execId of timedOutExecIds) {
-          await ExecutionService.updateStatus({
-            id: execId,
-            status: 'timeout',
-            errorMessage: 'Mobile job not processed within 10 minutes',
-          }).catch((err) =>
-            logger.warn('[REGRESSION_RUN] Failed to stamp timed-out execution in DB', {
-              runId,
-              execId,
-              error: err instanceof Error ? err.message : String(err),
-            }),
-          );
-        }
+        await Promise.all(
+          timedOutExecIds.map((execId) =>
+            ExecutionService.updateStatus({
+              id: execId,
+              status: 'failed',
+              errorMessage: 'Mobile job not processed within 10 minutes (timeout)',
+            }).catch((err) =>
+              logger.warn('[REGRESSION_RUN] Failed to stamp timed-out execution in DB', {
+                runId,
+                execId,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            ),
+          ),
+        );
       }
 
       emitProgress('level_completed', `Level ${levelIdx + 1}/${totalLevels} completed`, {

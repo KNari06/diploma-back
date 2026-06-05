@@ -29,8 +29,9 @@ export type ExplorationProgressEvent = {
   explorationId: string;
   phase: 'survey' | 'strategizing' | 'flow' | 'evaluating' | 'complete';
   event:
-    | 'page_discovered' | 'survey_complete'
+    | 'page_discovered' | 'page_skipped' | 'survey_complete'
     | 'strategy_planned'
+    | 'auth_started' | 'auth_completed'
     | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'flow_step' | 'branch_found'
     | 'coverage_evaluated'
     | 'agent_warning' | 'agent_error';
@@ -325,6 +326,8 @@ export interface FlowExplorationTask {
   roundsUsed: number;
   /** Error info if failed at infra level */
   infraError?: string;
+  /** Actual page URL when the flow finished (before context teardown). Falls back to the source page when unavailable. */
+  finalUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

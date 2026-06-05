@@ -45,6 +45,52 @@ The work splits cleanly into two stages. Stage 2 *requires* Stage 1 to land firs
 
 ---
 
+## 0.5 Changelog — what shipped since this plan was written
+
+> This block is reconciled against `git log` on `dev`. When code and plan disagree, **trust the code** (per the header rule). The plan below (§1–§16) is the original design; this section records where the shipped code has already moved past it — and, more importantly, where it took a **different path** than the plan assumed.
+
+### The pragmatic divergence (read this first)
+
+The plan's Stage-1 spine is **Phase 2: "kill `parseIntent`, route every turn through `SubAgentPipeline`."** The shipped code did **not** do that. Instead it **hardened and extended the intent-router**:
+
+- Kept `parseIntent` as the front door, but folded ANALYZE + IMPROVE into a **single LLM call** that now also returns an `analysis` block — `targetSelector`, `executionModifiers`, `isCompound/subRequests`, `manage{…}`, `lookbackDays` ([request-understanding-prompts.ts](../../src/ai/prompts/request-understanding-prompts.ts)).
+- Added **4 new first-class intents** (`flaky_report`, `manage_schedule`, `manage_module`, `manage_plan`) → registry now ~23–27 intents, not 17 ([handler-registry.ts](../../src/api/chat/shared/handler-registry.ts)).
+- Built a **compound queue** ([compound-queue.ts](../../src/api/chat/shared/compound-queue.ts)) for multi-step requests ("test A and B, then save as a plan") — Redis-backed, **advance-after-success**, session-keyed only.
+- Built a **deterministic two-phase confirm** for write ops ([manage-confirmation.ts](../../src/api/chat/regression/shared/manage-confirmation.ts), [manage-tool.helper.ts](../../src/api/chat/regression/shared/manage-tool.helper.ts)): turn 1 preview (`confirm:false`, cached in Redis), turn 2 "yes" re-runs the **same cached args** with `confirm:true` via `executeTool` (so the central SkillRegistry confirm-gate applies). This is **Phase-5 Governor machinery arriving early**, scoped to management writes.
+
+**Implication for the plan:** Phase 2 (unify pipeline) is effectively **deferred / partially obsoleted**. The team chose "smarter router + per-intent handlers + shared confirm/compound infra" over "one pipeline for all turns." Pillar 1 ("one loop, every door", §16.1) is therefore **not yet met via Phase 2** — it would now be met via Phase 4 (webhooks → `processChatTurn`) instead. Decide explicitly whether Phase 2 is still wanted or whether the router-centric path is the new target.
+
+### Phase-by-phase status (vs §6)
+
+| Phase | Plan goal | Shipped status |
+|---|---|---|
+| **0 — Stop the bleeding** | Thread collected context into LiteEngine; `correlation_id`; readiness 2-read gate; scroll stasis | **Partial.** Readiness/scroll/preview hardening landed ([step-readiness-v2](../../src/services/testing/ui/preview/step-readiness-v2.service.ts), recorded-identity comparator consolidation). `priorKnowledge` into LiteEngine + `correlation_id` propagation **not confirmed** — verify before claiming done. |
+| **1 — QA execution as tools** | `qa-execution`/`qa-context`/`qa-collab`/`qa-auth` skills; `run_*` callable | **Partial / sideways.** No new `qa-*.skill.ts` files added in this window. Instead, **management** ops were exposed as chat intents calling existing `qa_manage_*` tools via `executeTool`. TOTP/2FA (1.16), `preview_action` (1.17), `fill_form` (1.14), `read_pdf` (1.15) **not shipped.** |
+| **2 — Unify pipeline** | Kill `parseIntent`, one pipeline | **Not done — divergent (see above).** Router was extended, not removed. |
+| **3 — Durable missions** | `missions` table, orchestrator, resumable ticks | **Not started.** No `missions` table / `mission.service.ts` / `mission-tick` queue. Compound queue is a *turn-scoped* substitute, not a durable mission. |
+| **4 — Triggers from the world** | Jira/Telegram/git webhooks → mission start | **Infra groundwork only.** `qait-infra`: Cloud Run Jobs for scheduler ticks + daily tasks (Terraform). Telegram still **outbound-only** (`chat_id` validation added, no inbound webhook). |
+| **5 — Control plane (Governor)** | Policy/budget/kill/confidence/audit around tools | **Early slice shipped.** Two-phase confirm + central confirm-gate + Unicode-safe affirm/cancel classifier ([confirmation-classifier.ts](../../src/api/chat/shared/confirmation-classifier.ts)) are the first Governor primitives. **Missing:** budget regimes (5.5), kill-switch (5.3), audit `step_log` sink (5.1/5.7), `team_routing` (5.4). Credit pre-checks + **refund-on-failure** + idempotent `cancelRun` landed alongside ([chat.controller](../../src/api/chat/chat.controller.ts)). |
+| **6 — Memory & reflection** | Closed loop: flaky/recurring → plan/schedule changes | **Read side only.** `flaky_report` detects (with `lookbackDays`); **nothing closes the loop** to `manage_plan`/`manage_schedule`. This is the single highest-leverage missing piece (see below). |
+
+### New invariants now codified (CLAUDE.md §Hard invariants 13–15)
+
+13. Chat write/management ops go through `executeTool`, never the raw skill or a hand-rolled confirm.
+14. Chat pending-state (manage-confirm / compound-queue) is Redis-keyed by `chatSessionId` **only** (no userId fallback) and cleared on cancel + error; compound advances **after** a step succeeds.
+15. Unicode word boundaries: use `(?![\p{L}\p{N}])`, never `\b`, for affirmative/cancel/keyword regex (ASCII `\b` never matches Cyrillic).
+
+### The one gap that most blocks "really autonomous"
+
+All three pieces of a self-improving loop now **exist independently** but are **not wired together**:
+
+```
+flaky_report (detect)  ──✗──►  analyze/decide  ──✗──►  manage_plan / manage_schedule (act)
+   read-only today                missing               write path exists (2-phase confirm)
+```
+
+Closing this — `flaky_report` output → reasoning step → proposed plan/schedule change → existing two-phase confirm → execute — is the **smallest change that turns "assisted" into "autonomous"** under §16.1 Pillar 5. It reuses machinery that already shipped; it needs an orchestration step, not new infrastructure. **Recommend this as the next concrete work item.**
+
+---
+
 ## 1. What exists today, in code
 
 Verified counts (May 2026):
@@ -447,37 +493,39 @@ Goal: today's agent sees the context it already collects.
 
 **Exit criterion:** in a manual run, KB chunks and similar bugs appear inside LiteEngine prompts. Verified by grepping JSONL traces for the new `priorKnowledge:` block.
 
-### Phase 1 — Wrap QA execution as tools (5–7 days)
+### Phase 1 — Wrap QA execution as tools (REVISED — mostly already shipped)
 
-> **Pattern reference:** §4.4 MCP tool primitive; §4.3 Letta principle "memory access is a tool". Every layer of the system becomes addressable through a tool the Planner can invoke.
+> **Pattern reference:** §4.4 MCP tool primitive; §4.3 Letta principle "memory access is a tool".
+>
+> **⚠️ REVISED after code audit (see §0.5).** This phase was written in May assuming the QA execution layer was NOT yet tool-addressable. **It now is.** [qa.skill.ts](../../src/services/skills/qa/qa.skill.ts) exposes **~49 tools**, and **12 of the 13** originally-proposed tools already exist. The skill infrastructure the plan wanted to build (confirm/preview gate keyed `chatSessionId:toolName` with 5-min TTL, retry, loop-detection, per-tool timeouts, hook system) is **already in production** in [skill-registry.ts](../../src/services/skills/skill-registry.ts) + [tool-executor.ts](../../src/services/skills/tool-executor.ts). So Phase 1 is **no longer "build tools"** — it is **"wire + fill 2 gaps + teach the planner."**
 
-Goal: collapse the 17-intent switch into something the agent can call.
+#### 1A. What already exists (DO NOT rebuild)
 
-| Step | New file | Implements |
+| Originally proposed | Already shipped as | Evidence |
 |---|---|---|
-| 1.1 | `src/services/skills/qa/qa-execution.skill.ts` | `run_web_test(url, goal, mode)` → wraps `createTest` + `QueueManager.addTestRunJob` ([queues.ts:461](../../src/config/infrastructure/queues.ts)). Returns `{ testId, jobId, correlationId }`. |
-| 1.2 | same file | `run_mobile_test(...)` → uses mobile dispatch path. Wraps `QueueManager.addMobileTestRunJob` ([queues.ts:707](../../src/config/infrastructure/queues.ts)). |
-| 1.3 | same file | `run_api_test(endpoint, level)` → wraps API test service. |
-| 1.4 | same file | `run_regression_by_id(test_case_id)` → wraps `RegressionRunService.runSavedTestCase`. |
-| 1.5 | same file | `run_plan(plan_id)`, `run_module(module_id)`, `run_by_tag(tag)` → wraps `RegressionRunService.runPlan/runModule/runByTag`. |
-| 1.6 | same file | `save_test_case(intent_steps)` → wraps `IntentTestCaseService.create`. |
-| 1.7 | same file | `analyze_failure(test_result_id)` → joins `ai_summary` + `intelligent_test_findings` for one consolidated view. |
-| 1.8 | same file | `wait_for_run(run_id, timeout_ms)` → polls `regression_runs.state` until completed/failed/cancelled. Lets a plan continue after a test finishes. |
-| 1.9 | `src/services/skills/qa/qa-context.skill.ts` | `search_past_bugs(query, projectId)` — promote `searchProjectFindings` from `jira-qa-orchestrator` into a public tool. Fixes **B10** by making `patterns-query.service.ts` the single funnel. |
-| 1.10 | same file | `recall_similar_missions(query, limit=5)` — once missions exist, reads from `missions` table. Returns plan + outcome of nearest past missions. Closes **B11** loop. |
-| 1.11 | `src/services/skills/qa/qa-collab.skill.ts` | `notify_owner(owner_ref, payload)`. `owner_ref` accepts `jira:component:payments` or `codeowner:/checkout` or `user:<id>`. Resolves channel + recipient internally. Replaces hardcoded `#qa-alerts`. Fixes **B3, B6**. |
-| 1.12 | same file | `ask_human(question, urgency, options?)` — emits WS + sends to user's preferred channel (Telegram/Slack/in-app). Resolves on reply via channel webhook. |
-| 1.13 | `src/services/skills/qa/qa-browser.skill.ts` | `escalate_to_vision(step_id)` — Critic-callable when DOM-resolver returned 0 candidates AND `pageMetadata.isDOMWeak=true`. Routes to coordinate-based fallback via existing `visionHints`. Implements R9 level L3→L4 transition. Closes the Documentolog-class regression where canvas/heavy-SPA pages have unreachable elements. |
-| 1.14 | same file | `fill_form(map)` — composite: one call fills N fields, auto-detecting text/select/checkbox/radio/file per field (Stagehand `fillForm` pattern). Cuts an 8-step Planner plan to 1 step. Wraps the existing per-field apply logic in `preview-step-apply`. |
-| 1.15 | same file | `read_pdf_at_url(url)` — detects PDF by **Content-Type** (not URL extension — many SaaS serve `/download?id=X`), fetches via authenticated browser request context (cookies preserved), parses with `pdf-parse`. Closes **B19-adjacent** gap: validating post-action PDF artifacts (invoices, contracts, reports) in B2B flows. |
-| 1.16 | `src/services/skills/qa/qa-auth.skill.ts` | `generate_totp(resource_id)` — given a stored TOTP secret in `test_resources` (new `totp` adapter kind), produces the current 6-digit code. Pairs with existing `wait_for_email` (email OTP) to clear 2FA walls. Fixes **B19**. Secret stored encrypted; code never logged (redaction invariant). |
-| 1.17 | same file | `preview_action(intent)` — R11 Stagehand-style: returns the resolved `{description, method, selector, args}` **without executing**. Powers Stage 2 approval cards (§13.2 screen 4) and any "show me what you'll do" UX. Reuses the dry-run lint path already in `intent-step-lint`. |
-| 1.18 | [manifest.ts](../../src/services/skills/manifest.ts) | Register the five new skill files (`qa-execution`, `qa-context`, `qa-collab`, `qa-browser`, `qa-auth`). |
-| 1.19 | [router-prompt.ts](../../src/api/chat/general/sub-agents/prompts/router-prompt.ts), [planner-prompt.ts](../../src/api/chat/general/sub-agents/prompts/planner-prompt.ts) | Teach Router about category `qa_execution` and Planner about how to compose `run_*` with `wait_for_run` and `notify_owner`. **R12 law 4:** Router must **mask** unavailable tool categories (constrain via prefill), NOT delete them from the tool list mid-session — deleting invalidates the KV-cache and confuses the model. |
+| `run_web_test` / `run_mobile_test` / `run_api_test` | **`qa_run_test`** (`run_type`, mobile auto-routed by platform) | [qa-tool-handlers.ts](../../src/services/skills/qa/qa-tool-handlers.ts) `handleRunTest` |
+| `run_regression_by_id` / `run_plan` / `run_module` / `run_by_tag` | **`qa_run_test`** (`run_type='test_case'|'plan'|'module'|'flow'|'tag'|'priority'`) | wraps `RegressionRunService.runSavedTestCase/runPlan/runModule/runFlow/runByTag/runByPriority` |
+| `save_test_case` | **`qa_create_test_case`** | wraps `IntentTestCaseService.create` |
+| `analyze_failure` | **`qa_analyze_failure`** | — |
+| `wait_for_run` | **`qa_get_run_status`** (poll status) | — |
+| `search_past_bugs` | **`qa_list_test_findings`** + `PatternsQueryService` | — |
+| `escalate_to_vision` / `fill_form` / `preview_action` | covered by existing resolver waterfall + `qa_run_draft_steps` + `intent-step-lint` dry-run | (defer; not blocking) |
 
-**No legacy handler is touched in this phase.** All wrappers run alongside the existing code path under a feature flag (off by default).
+Infra already present: confirm-gate (`skill-registry.ts` `CONFIRM_TTL_MS = 5min`, keyed `chatSessionId:toolName`), retry (`retry.ts`, default 2 + backoff), loop-detection (`hooks/loop-detection.hook.ts` `ToolCallTracker`), per-tool timeout (`sub-agents/tool-constants.ts`, `qa_run_test = 8min`), hook system (`tool-executor.ts` `registerToolHook`). Executor already calls `executeTool(ctx)` ([executor-agent.ts](../../src/api/chat/general/sub-agents/agents/executor-agent.ts)).
 
-**Exit criterion:** with the flag on, a user can type *"запусти регрессию на плане Q2-smoke и пни owner в slack если упадёт"* and the agent composes 3 tool calls in one turn. Verified by Reviewer output `goalAlignment > 0.8`.
+#### 1B. The real work (this is what's left)
+
+| Step | Where | Change | Status |
+|---|---|---|---|
+| 1.1 | `qa-collab.skill.ts` (new) or extend qa.skill | **`ask_human(question, urgency, options?)`** — the ONE genuinely missing primitive. Lets a sub-agent pause mid-mission and resume on a human reply (via WS now; channel webhook after Phase 4). Today clarification only happens through the Responder ending the turn — there's no resumable ask. | ❌ missing |
+| 1.2 | `qa-collab.skill.ts` / extend | **`notify_owner(owner_ref, payload)`** — direct result-driven ping. Today only indirect via `qa_manage_automation_action`. `owner_ref` resolves `jira:component:*` / `codeowner:/path` / `user:<id>` → channel + recipient. | 🟡 partial |
+| 1.3 | [router-prompt.ts](../../src/api/chat/general/sub-agents/prompts/router-prompt.ts), [planner-prompt.ts](../../src/api/chat/general/sub-agents/prompts/planner-prompt.ts) | Teach Router category `qa_execution` and Planner to **compose** `qa_run_test` + `qa_get_run_status` + `notify_owner` in one plan. **R12 law 4:** mask unavailable categories via prefill, never delete mid-session (KV-cache). | ❌ todo |
+| 1.4 | config / feature flag | Flag to allow QA-execution intents (`run_regression`, `run_plan`, `platform_test`, …) to reach `SubAgentPipeline` instead of their hardcoded handlers, so the agent can actually compose. **This is the Phase-1↔Phase-2 hinge** — small slice here, full unification deferred to Phase 2 (which the team may now skip in favor of the router-centric path; decide explicitly). | ❌ todo |
+| 1.5 | `correlation_id` | Thread a mission/correlation id through `qa_run_test` → BullMQ job data → results, so a composed plan can correlate "the run I started" with "the result that came back". Overlaps Phase 0.3. | ❌ todo |
+
+**Exit criterion (revised):** with the flag on, *"запусти регрессию на плане Q2-smoke, дождись результата и пни owner в slack если упадёт"* → agent composes `qa_run_test` + `qa_get_run_status` + `notify_owner` in one turn. Verified by Reviewer `goalAlignment > 0.8`. `ask_human` proven by a mid-run clarification that resumes without losing plan state.
+
+**Deferred from original 1.x (not blocking autonomy now):** `recall_similar_missions` (needs Phase 3 missions table), `read_pdf_at_url`, `generate_totp`/2FA (B19), `fill_form` composite, `preview_action` standalone tool. Re-prioritize after the compose loop works end-to-end.
 
 ### Phase 2 — Unify the pipeline (5–7 days, then canary)
 
@@ -1357,6 +1405,8 @@ These are cheap to follow and catastrophic to ignore (Manus measured ~10× cost 
 - **Ahead on QA-specifics** — recording, mobile (scrcpy/redroid), regression scheduling, AI bug analysis, video screencast. None of the hyped general agents (OpenHands/Devin/Manus) do these.
 - **Our `step-readiness-v2` already exceeds** k-kolomeitsev's content-readiness poll (causal multi-signal consensus vs symptomatic text-length).
 - **Behind on, and this plan closes:** the unified mission layer (Phase 2-3), the deterministic Governor shell (Phase 5), 2FA/TOTP (B19/1.16), explicit `observe`/`preview_action` primitive (1.17), per-domain procedural memory (6.5).
+
+> **Update (see §0.5):** since this was written, the shipped code moved **sideways** on Pillar 4 (deterministic shell) and Pillar 2 (every layer a tool) rather than along Phase 2/3. A real **two-phase confirm + central confirm-gate** now exists for management writes (early Governor), and **management itself is exposed as chat intents** (`manage_schedule/module/plan`, `flaky_report`). What did *not* happen: the Phase-2 pipeline unification and the Phase-3 durable mission layer. Pillar 1 (one loop, every door) and Pillar 3 (durable + cheap missions) remain **unmet**. Pillar 5 (closed memory loop) has its read side (`flaky_report`) but no act side — closing `detect → decide → act` is the recommended next step.
 
 ### 16.4 The single most important sentence
 

@@ -99,7 +99,7 @@ import { MobileTestDispatcherService } from '@/services/testing/regression/mobil
 import { WebTestRequestBuilderService } from '@/services/testing/regression/web-test-request-builder.service';
 import { TestExecutionOrchestratorService } from '@/services/testing/regression/test-execution-orchestrator.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
-import { ValidationError, NotFoundError } from '@/types';
+import { ValidationError, NotFoundError, InsufficientCreditsError } from '@/types';
 
 const mockInsertRun = insertRun as jest.MockedFunction<typeof insertRun>;
 const mockUpdateRun = updateRunById as jest.MockedFunction<typeof updateRunById>;
@@ -133,7 +133,7 @@ describe('RegressionRunService.cleanupZombieRuns', () => {
 describe('RegressionRunService.runSavedTestCase', () => {
   beforeEach(() => {
     mockGetStepRows.mockResolvedValue([]);
-    mockCheckCredits.mockResolvedValue({ available: 1000 });
+    mockCheckCredits.mockResolvedValue({ available: 1000, effectiveAvailable: 1000 });
     mockInsertRun.mockResolvedValue({ data: { id: 'run-1' }, error: null });
     mockUpdateRun.mockResolvedValue({ error: null });
   });
@@ -188,7 +188,7 @@ describe('RegressionRunService.runByPriority', () => {
   beforeEach(() => {
     mockGetProjectAccess.mockResolvedValue({ user_id: USER, workspace_id: null });
     mockGetStepRows.mockResolvedValue([]);
-    mockCheckCredits.mockResolvedValue({ available: 1000 });
+    mockCheckCredits.mockResolvedValue({ available: 1000, effectiveAvailable: 1000 });
     mockGetApiByPriority.mockResolvedValue([]);
     mockInsertRun.mockResolvedValue({ data: { id: 'run-1' }, error: null });
     mockCreateBatch.mockResolvedValue([{ id: 'e1' }]);
@@ -226,5 +226,45 @@ describe('RegressionRunService.runByPriority', () => {
     );
     expect(mockExecuteAsync).toHaveBeenCalledTimes(1);
     expect(result.totalTests).toBe(1);
+  });
+
+  // The pre-flight gates on effectiveAvailable (balance + grace_limit), matching
+  // the runtime per-step deduction. A grace-eligible user whose raw balance is
+  // below the plan estimate but whose balance+grace covers it must NOT be
+  // rejected up-front (would otherwise be a false "insufficient credits").
+  it('passes pre-flight when grace headroom covers the estimate (available < required <= effectiveAvailable)', async () => {
+    mockGetByPriority.mockResolvedValue([
+      { id: 'tc-1', flow_id: null, depends_on: [], platform: 'web' },
+    ]);
+    // 9 steps + 1 initial goto = 10 step credits, + 1 UI case × 5 bug-report = 15 required
+    mockGetStepRows.mockResolvedValue([
+      { id: 'tc-1', steps_json: new Array(9).fill({}), setup_steps: [], teardown_steps: [] },
+    ]);
+    // Raw balance 0 would fail the old gate; grace lifts effectiveAvailable to 100.
+    mockCheckCredits.mockResolvedValue({ available: 0, effectiveAvailable: 100 });
+
+    const result = await RegressionRunService.runByPriority({
+      projectId: 'proj-1', priority: 'high', userId: USER, trigger: 'manual',
+    });
+
+    expect(mockExecuteAsync).toHaveBeenCalledTimes(1);
+    expect(result.totalTests).toBe(1);
+  });
+
+  it('throws InsufficientCreditsError when even grace headroom cannot cover the estimate', async () => {
+    mockGetByPriority.mockResolvedValue([
+      { id: 'tc-1', flow_id: null, depends_on: [], platform: 'web' },
+    ]);
+    // Same 15 required, but effectiveAvailable only 2.
+    mockGetStepRows.mockResolvedValue([
+      { id: 'tc-1', steps_json: new Array(9).fill({}), setup_steps: [], teardown_steps: [] },
+    ]);
+    mockCheckCredits.mockResolvedValue({ available: 2, effectiveAvailable: 2 });
+
+    await expect(
+      RegressionRunService.runByPriority({ projectId: 'proj-1', priority: 'high', userId: USER, trigger: 'manual' }),
+    ).rejects.toBeInstanceOf(InsufficientCreditsError);
+
+    expect(mockExecuteAsync).not.toHaveBeenCalled();
   });
 });

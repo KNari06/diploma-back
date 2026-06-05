@@ -40,6 +40,26 @@ import type {
 import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { pruneCandidatesViaLLM } from './candidate-pruner-llm.service';
+// Pure semantic-match helpers (extracted 2026-06 — see semantic-match.util.ts).
+import {
+  getEffectiveLabel,
+  cyrFold,
+  semanticTokens,
+  isSpecificInputType,
+  nodeIdentityTokens,
+  hasTokenOverlap,
+  evaluateHonestyGuard,
+  buildIdentityTokenFrequency,
+  buildGenericTokenPredicate,
+  type HonestySemanticDeps,
+  type HonestyJudgeDeps,
+} from './semantic-match.util';
+import { buildSemanticDeps, buildJudgeDeps, isJudgeEnabled } from './honesty-guard-deps';
+import {
+  recordedFingerprintHasStrongIdentity,
+  hasStrongIdentityContradiction,
+  nodeToIdentityProbe,
+} from './recorded-identity.util';
 
 const MAX_CANDIDATE_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxCandidateTextLength;
 const MAX_INTENT_TEXT_LENGTH = ELEMENT_RESOLVER_CONFIG.maxIntentTextLength;
@@ -222,10 +242,21 @@ export function buildAllowedSets(
   // `{ width: window.innerWidth, height: window.innerHeight }` from the
   // snapshot collector.
   viewport?: { width: number; height: number },
+  // Recorded fingerprint of the step's intended target. Used only by the
+  // floating-widget rule's escape-hatch: when the step actually targets a
+  // node inside a corner widget (close-hint / open-chat), we must NOT
+  // deprioritize it. Optional — manual-add steps have none (fail-open: no
+  // escape-hatch, widget children still soft-penalized).
+  recordedFingerprint?: TargetFingerprint,
 ): AllowedSetResult {
   const hardAllowed: InteractiveNode[] = [];
   const softAllowed: InteractiveNode[] = [];
   const ruleTrace: RuleTraceEntry[] = [];
+  const widgetSoftRefs: string[] = [];
+  // Only honor the escape-hatch when the fingerprint carries a strong
+  // identifier — a weak (text-only) fingerprint can't reliably claim a
+  // widget node IS the target, so such nodes stay soft-penalized.
+  const fpHasStrongIdentity = recordedFingerprintHasStrongIdentity(recordedFingerprint);
 
   // P1+P2 CRITICAL: Position-aware modal/dialog/popup layer detection
   // If a modal is present, visible, AND covers a significant portion of the viewport,
@@ -382,6 +413,62 @@ export function buildAllowedSets(
         evidence: 'Modal active, node outside modal and covered (isTopMostAtCenter=false) — hard excluded',
         affectedRefs: [node.ref],
       });
+    }
+
+    // Rule 0b: Floating corner widget. A small fixed widget pinned to a
+    // viewport corner (chat/assistant bubble, support launcher) is NOT a
+    // modal — its interactive children would otherwise pollute the candidate
+    // set and the resolver can pick "close hint" / "send message" instead of
+    // the real target. This is the Run-vs-Apply divergence: Run All snapshots
+    // before the widget animates out, so its buttons are present and compete.
+    //
+    // `floatingWidget` is geometry-derived in BOTH collectors (snapshot-collector
+    // + cdp-snapshot) — see floating-widget.util.ts. Three cases by physical
+    // clickability + intent, mirroring Rule 0's precision:
+    //   1. Widget covers the target (isTopMostAtCenter=false, not inside a
+    //      modal) → hard-exclude: it physically intercepts the click.
+    //   2. Widget node IS the step's target (strong-identity fingerprint match)
+    //      → escape-hatch: keep it, no penalty (close-hint / open-chat steps).
+    //   3. Otherwise a floating widget node, not the target → soft-penalty:
+    //      drops below page content in the prompt but stays selectable
+    //      (fail-open — LLM can still pick it if nothing better exists).
+    if (!excluded && node.floatingWidget === true) {
+      if (node.isInsideActiveModal !== true && node.isTopMostAtCenter === false) {
+        excluded = true;
+        nodeRules.push({
+          ruleId: 'widget.covers_target_excluded',
+          version: 'v1',
+          action: 'exclude',
+          evidence: 'Floating corner widget covering target center (isTopMostAtCenter=false) — hard excluded',
+          affectedRefs: [node.ref],
+        });
+      } else {
+        // Escape-hatch: is THIS node the step's intended target? Reuse the
+        // SAME comparator the cache-hit guards use — if the node does not
+        // strongly contradict the recorded fingerprint, treat it as the
+        // target and keep it unpenalized.
+        const isTarget = fpHasStrongIdentity
+          && !hasStrongIdentityContradiction(nodeToIdentityProbe(node), recordedFingerprint);
+        if (isTarget) {
+          nodeRules.push({
+            ruleId: 'widget.target_escape_hatch',
+            version: 'v1',
+            action: 'boost',
+            evidence: 'Floating widget node matches recorded target fingerprint — kept unpenalized (step targets the widget)',
+            affectedRefs: [node.ref],
+          });
+        } else {
+          isSoft = true;
+          widgetSoftRefs.push(node.ref);
+          nodeRules.push({
+            ruleId: 'widget.floating_deprioritized',
+            version: 'v1',
+            action: 'penalize',
+            evidence: 'Inside floating corner widget, not the recorded target — soft penalty',
+            affectedRefs: [node.ref],
+          });
+        }
+      }
     }
 
     // Rule 1: Visibility check
@@ -731,6 +818,18 @@ export function buildAllowedSets(
     });
   }
 
+  // Summary entry for the floating-widget rule so dashboards / traces show it
+  // fired and which refs were deprioritized (mirrors `modal.detected`).
+  if (widgetSoftRefs.length > 0) {
+    ruleTrace.push({
+      ruleId: 'widget.floating_detected',
+      version: 'v1',
+      action: 'penalize',
+      evidence: `Floating corner widget detected — soft-penalized ${widgetSoftRefs.length} widget ref(s)`,
+      affectedRefs: widgetSoftRefs,
+    });
+  }
+
   // Log rule trace summary
   const modalElementCount = hasVisibleModal
     ? [...hardAllowed, ...softAllowed].filter(n => n.isInsideActiveModal).length
@@ -786,190 +885,18 @@ function computePageSignature(url: string, nodes: InteractiveNode[]): string {
  * @returns Semantic text for LLM matching (max 200 chars)
  */
 
-/**
- * V23 (April 2026): Universal "effective visible label" extractor.
- *
- * Various sites under test surface element identity through different
- * attributes — Angular Material puts a Kazakh tooltip on `<a title="...">`,
- * MUI uses `aria-label`, Bootstrap relies on visible `text`, Vue + i18n on
- * `<img alt>`, icon-only Element Plus / AntD on `data-testid` lifted
- * children, etc. Every site should give the resolver SOME readable label.
- *
- * Before this helper, multiple sites in the resolver pipeline read only
- * `labelText || ariaLabel || text || placeholder` and dropped on the floor:
- *   • `title`          — Angular `<a title="Папкалар">` for icon-link cards
- *   • `alt`            — `<img>` accessible name
- *   • `iconLabel`      — Lucide / FA / svg `<title>` derivative
- *   • `svgIcon`        — Angular Material `<mat-icon svgicon="folder">`
- * That dropped data caused semantic-floor reject + label-mismatch reject
- * even when the candidate WAS the right element — it just identified itself
- * via an attribute the chain forgot.
- *
- * Use this helper everywhere a "single representative string for this node"
- * is needed: candidate label display, semantic floor token comparison,
- * label-mismatch guard, scene summary, dedup keys. Keep `buildCandidateText`
- * separate — that one renders the FULL multi-field candidate description
- * for the LLM prompt, not a single fallback.
- *
- * Order is intentional, most-specific → most-general:
- *   1. labelText      — explicit `<label for=>` association (strongest)
- *   2. ariaLabel      — explicit ARIA accessible name
- *   3. title          — `title=` attribute (Angular routerLink, tooltips)
- *   4. alt            — `<img>` accessible name
- *   5. text            — visible textContent
- *   6. placeholder    — input placeholder (only meaningful for inputs)
- *   7. iconLabel      — derived from svg `<title>`/data-lucide/FA class
- *   8. svgIcon        — Angular Material registry name (`svgicon` attr)
- *   9. childTestId    — lifted single-icon-child data-testid (V22 Pkg1)
- *   10. customElementTag — `<app-notifications-button>` semantic wrapper
- *
- * Returns empty string when ALL fields are missing (genuinely unidentifiable
- * node like a bare `<li>` with no children carrying signals — that's a real
- * detection problem, not something this helper can fix).
- */
-export function getEffectiveLabel(node: InteractiveNode | undefined | null): string {
-  if (!node) return '';
-  // Order: most-specific (W3C accessible name spec) → most-general fallbacks.
-  //
-  // Per WAI-ARIA Accessible Name Computation:
-  //   labelText (covers aria-labelledby, <label for>, wrapping <label>),
-  //   ariaLabel, title, alt, then visible text.
-  // Then product-specific identity fallbacks for descriptor-poor targets.
-  return (
-    node.labelText            // includes aria-labelledby + native <label>
-    || node.ariaLabel
-    || node.title             // WAI-ARIA accessible name source
-    || node.alt               // <img>/<area>/<input type=image> accessible name
-    || node.text              // visible textContent
-    || node.placeholder       // input fallback
-    || node.iconLabel         // svg <title>/data-lucide/sprite/FA class
-    || node.svgIcon           // Angular Material registry name
-    || node.childTestId       // lifted single-icon-child data-testid
-    || node.dataValue         // <option value>/<li data-value> semantic key
-    || node.dataRowKey        // AntD/RainbowKit table row identity
-    || node.customElementTag  // <app-X>/<my-button> semantic wrapper
-    || ''
-  ).toString();
-}
-
-/**
- * Honesty guard — verify that a chosen candidate's effective label is
- * compatible with the user's intent text. Catches two hallucination
- * classes that escape min-confidence and producer-side validation:
- *
- *   1. labelEmpty: chosen node has no text/label/aria/alt/iconLabel/...
- *      across the full getEffectiveLabel cascade. With a text-bearing
- *      intent there is no legitimate way to match — model picked
- *      something arbitrary.
- *
- *   2. semanticFloor: both intent and chosen have ≥1 ≥3-char tokens,
- *      and the two sets have ZERO shared tokens (exact or substring,
- *      Cyrillic-Latin glyphs folded). This is the "Панорама 360"
- *      vs "Заказать звонок" case from May 2026 vision-rescue audit.
- *
- * Returns:
- *   - null when guard passes (caller should accept the pick)
- *   - { kind, reason } when guard fails (caller should treat as
- *     not_found and proceed to fallback)
- *
- * Used by:
- *   - selectElementWithLLM (Stage 3 LLM resolver, line ~3232+)
- *   - vision second opinion (Stage 4 rescue, line ~4890+) — previously
- *     bypassed both guards because they were inlined in selectElement-
- *     WithLLM. Extracted module-level so vision path enforces the
- *     same contract.
- *
- * Gate notes:
- *   - heal mode is permissive — the recorded fingerprint is the truth
- *     source there, the model is encouraged to bias toward "close".
- *   - synonym intents like "иконка корзины" (no specific text, just
- *     descriptive nouns) MUST be allowed; the ≥3-char gate on
- *     intentText filters them out implicitly.
- */
-export function evaluateHonestyGuard(args: {
-  intentText: string;
-  chosenNode: InteractiveNode | undefined | null;
-  mode: 'apply' | 'heal';
-}): { kind: 'semanticFloor'; reason: string } | null {
-  const { intentText, chosenNode, mode } = args;
-
-  if (mode === 'heal') return null;
-
-  const intentLower = (intentText || '').toLowerCase().trim();
-  if (intentLower.length < 3) return null;
-
-  const chosenLabel = (getEffectiveLabel(chosenNode) || '').trim();
-
-  // Guard 1 (labelEmpty) REMOVED — see selectElementWithLLM ~line 3406
-  // for the audit. False-positive rate ~66% on production traces. Vision
-  // rescue is already the LAST line of defense and runs only when
-  // earlier paths failed; killing its picks because the target has no
-  // label is the same recall-killer pattern we removed elsewhere.
-  // Guard 2 (token-overlap) stays — fires only when chosen DOES have a
-  // label, so safe and complementary.
-
-  // Guard 2 — token-overlap floor. Tokenization mirrors the inline
-  // version that used to live in selectElementWithLLM:
-  //   - Cyrillic glyph fold (M↔М, A↔А, T↔Т, ...) — covers MAT-SMART
-  //     ↔ МАТ-SMART parity.
-  //   - Unicode word splitter with 3-char minimum (drops "по", "за"
-  //     etc. that would falsely overlap unrelated text).
-  //   - "shared" means exact OR substring (≥3 chars both ways) — so
-  //     "папка" intent vs "папкалар" chosen counts as shared (Kazakh
-  //     morphology), but "ok" inside "Bookmark" does NOT.
-  const cyrFold = (s: string): string => {
-    let out = '';
-    for (const ch of s) {
-      const code = ch.charCodeAt(0);
-      switch (code) {
-        case 0x0410: case 0x0430: out += 'a'; break;
-        case 0x0412: case 0x0432: out += 'b'; break;
-        case 0x0415: case 0x0435: out += 'e'; break;
-        case 0x041A: case 0x043A: out += 'k'; break;
-        case 0x041C: case 0x043C: out += 'm'; break;
-        case 0x041D: case 0x043D: out += 'h'; break;
-        case 0x041E: case 0x043E: out += 'o'; break;
-        case 0x0420: case 0x0440: out += 'p'; break;
-        case 0x0421: case 0x0441: out += 'c'; break;
-        case 0x0422: case 0x0442: out += 't'; break;
-        case 0x0425: case 0x0445: out += 'x'; break;
-        case 0x0423: case 0x0443: out += 'y'; break;
-        default: out += ch;
-      }
-    }
-    return out;
-  };
-  const tok = (s: string): Set<string> =>
-    new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
-
-  const intentTokens = tok(intentLower);
-  const chosenTokens = tok(chosenLabel.toLowerCase());
-
-  // Both sides MUST have content for a meaningful overlap check —
-  // chosenTokens empty after fold means the label was punctuation /
-  // emoji / single chars (e.g. "›", "✓") which the guard above
-  // already let through deliberately.
-  if (intentTokens.size === 0 || chosenTokens.size === 0) return null;
-
-  let shared = 0;
-  outer: for (const i of intentTokens) {
-    for (const c of chosenTokens) {
-      if (i === c) { shared = 1; break outer; }
-      if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
-        shared = 1; break outer;
-      }
-    }
-  }
-
-  if (shared === 0) {
-    return {
-      kind: 'semanticFloor',
-      reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
-    };
-  }
-
-  return null;
-}
+// Semantic-match helpers were extracted to `semantic-match.util.ts` (2026-06)
+// and are imported at the top of this file. Re-exported here so existing
+// importers that referenced them via element-resolver keep working unchanged.
+export {
+  getEffectiveLabel,
+  cyrFold,
+  semanticTokens,
+  isSpecificInputType,
+  nodeIdentityTokens,
+  hasTokenOverlap,
+  evaluateHonestyGuard,
+};
 
 /**
  * Is this node a LEAF item inside an active popup/dropdown — the kind of
@@ -1075,6 +1002,16 @@ export function buildCandidateText(node: InteractiveNode): string {
   }
 
   // Structural hints (lower priority)
+  // Specific input type — a strong semantic anchor for cross-language
+  // intents (e.g. English "password" vs a Cyrillic-labelled field). Only
+  // emitted for SPECIFIC types; generic text/button/submit/hidden carry no
+  // disambiguating meaning and would just bloat the prompt. Uses the same
+  // `isSpecificInputType` (generic-blacklist) the semantic-floor guard trusts,
+  // so the LLM and the guard reason from the same signal.
+  {
+    const t = (node.type || node.inputType || '').toLowerCase();
+    if (isSpecificInputType(t)) parts.push(`type: ${t}`);
+  }
   if (node.autocomplete) {
     parts.push(`autocomplete: ${node.autocomplete}`);
   }
@@ -1982,6 +1919,18 @@ const LLM_SHARED_RULES = `RULES:
    Cart, Profile), prefer the section over a superficially-similar
    action button on an unrelated concept.
 
+   CAPOT-OVER-LABEL (cross-language anchor): a candidate's visible label
+   is localized to the page's language, but its TECHNICAL IDENTITY —
+   type=, role=, name=, testid=, autocomplete= — is authored in English
+   and stable across locales. When the intent's language differs from a
+   candidate's visible label, anchor the match on this English technical
+   identity, not on surface text. Example: intent "signin button" on a
+   Russian page → the <button type=submit> labelled "Войти" is the match
+   (type=submit + sole form-submit button bridge the languages). This does
+   NOT override the rules below: prominence alone is never a reason to pick
+   (no loudest-CTA), and the technical identity itself — not mere visual
+   weight — must correspond to the intent.
+
 2. ACTION-TYPE SEMANTICS:
    - click: prefer buttons, links, interactive elements
    - type: prefer inputs, textareas, [contenteditable=true]
@@ -2675,8 +2624,15 @@ async function selectElementWithLLM(params: {
    *     finding the closest match using recordedFingerprint identity.
    */
   mode?: 'apply' | 'heal';
+  /** Heal-only journey context (test goal + last successful step descriptions). */
+  healContext?: { testGoal?: string; priorSteps?: string[]; stepIndex?: number; totalSteps?: number };
+  /** Honesty-guard deps, built once in resolveElement over the full page set
+   *  and threaded down (the inline guard only sees top-K candidates). */
+  identityFreq?: (token: string) => boolean;
+  honestySemantic?: HonestySemanticDeps;
+  honestyJudge?: HonestyJudgeDeps;
 }): Promise<LlmSelectResult> {
-  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply' } = params;
+  const { intentText, actionType, candidates, pageUrl, pageSignature, recordedFingerprint, priorApplyHints, recordedDescription, mode = 'apply', healContext, identityFreq, honestySemantic, honestyJudge } = params;
   const startTime = Date.now();
 
   // Check cache
@@ -2822,6 +2778,26 @@ async function selectElementWithLLM(params: {
   // Build page scene summary for top-down context
   const sceneSummary = buildSceneSummary(candidates);
   const sceneContext = sceneSummary ? `\nPAGE STATE: ${sceneSummary}` : '';
+
+  // Heal-only journey context — the "user narrative". Helps disambiguate drift
+  // (e.g. login submit vs settings submit) by telling the model the test goal
+  // and the steps already completed. Descriptions only — never input values.
+  // Empty/absent → no block (fail-open). Only meaningful in heal mode.
+  let journeyContext = '';
+  if (mode === 'heal' && healContext) {
+    const parts: string[] = [];
+    if (healContext.testGoal) parts.push(`TEST GOAL: "${String(healContext.testGoal).slice(0, 120)}"`);
+    const prior = (healContext.priorSteps || []).filter(Boolean).slice(-3);
+    if (prior.length > 0) {
+      const posLabel = (typeof healContext.stepIndex === 'number' && typeof healContext.totalSteps === 'number')
+        ? ` (now on step ${healContext.stepIndex + 1}/${healContext.totalSteps})`
+        : '';
+      parts.push(`STEPS DONE SO FAR${posLabel}: ${prior.map((s, i) => `${i + 1}. ${String(s).slice(0, 60)}`).join(' → ')}`);
+    }
+    if (parts.length > 0) {
+      journeyContext = `\n${parts.join('\n')}\nUse this journey to disambiguate which screen/section you are on; the failing step follows the steps above.`;
+    }
+  }
 
   // Detect if duplicates exist (marked as [N of M] by the dedup logic above)
   const hasDuplicates = candidates.some(c => /\[\d+ of \d+\]/.test(c.candidateText));
@@ -3067,7 +3043,7 @@ async function selectElementWithLLM(params: {
   const userPrompt = `INTENT: "${intentText}"
 ACTION: ${actionType}
 PAGE: ${pageUrl}
-VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${dupHint}${fpHint}
+VIEWPORT: ${PREVIEW_VIEWPORT.width}x${PREVIEW_VIEWPORT.height}${sceneContext}${journeyContext}${dupHint}${fpHint}
 
 ELEMENTS (${candidates.length}):
 ${candidateList}
@@ -3457,63 +3433,28 @@ Select the single best matching element, or return ref=null if the intent does n
       // gets the "shares no tokens" rejection, above-0.85 only triggers when both
       // sides have content AND zero shared tokens (handled by the inner
       // `intentTokens.size > 0 && chosenTokens.size > 0` guard already).
-      if (mode !== 'heal') {
+      // Semantic floor — DELEGATED to the shared `evaluateHonestyGuard` so
+      // this inline path and the vision-rescue path use ONE implementation
+      // (previously two byte-identical copies). The guard folds Cyrillic
+      // glyphs, tokenizes label + technical identity, and only rejects when
+      // the intent overlaps NEITHER the visible label NOR the element's
+      // type/name/autocomplete/testId/id (the cross-language escape hatch —
+      // English "password" vs placeholder "Пароль" is no longer a false
+      // reject because `type=password / autocomplete=current-password`
+      // match). Heal mode + <3-char intents are bypassed inside the guard.
+      {
         const chosenCandidate = candidates.find(c => c.node.ref === parsed.ref);
-        // V23: use the universal `getEffectiveLabel` so semantic floor sees
-        // identity that lives on title/alt/iconLabel/svgIcon/etc., not just
-        // labelText|ariaLabel|text|placeholder. Without this, an Angular
-        // routerLink `<a title="Папкалар">` would falsely fail the semantic
-        // floor because none of the four read fields were populated.
-        const chosenText = getEffectiveLabel(chosenCandidate?.node).toLowerCase();
-        // Same Cyrillic↔Latin glyph fold the apply-time guard uses (M↔М,
-        // A↔А, T↔Т, …) so "MAT-SMART" and "МАТ-SMART" agree on tokens.
-        // Cheap inline copy — pulling the helper out of preview-step-apply
-        // would create a circular import; the duplication is fine for two
-        // sites and lets each guard stay self-contained.
-        const cyrFold = (s: string): string => {
-          let out = '';
-          for (const ch of s) {
-            const code = ch.charCodeAt(0);
-            switch (code) {
-              case 0x0410: case 0x0430: out += 'a'; break;
-              case 0x0412: case 0x0432: out += 'b'; break;
-              case 0x0415: case 0x0435: out += 'e'; break;
-              case 0x041A: case 0x043A: out += 'k'; break;
-              case 0x041C: case 0x043C: out += 'm'; break;
-              case 0x041D: case 0x043D: out += 'h'; break;
-              case 0x041E: case 0x043E: out += 'o'; break;
-              case 0x0420: case 0x0440: out += 'p'; break;
-              case 0x0421: case 0x0441: out += 'c'; break;
-              case 0x0422: case 0x0442: out += 't'; break;
-              case 0x0425: case 0x0445: out += 'x'; break;
-              case 0x0423: case 0x0443: out += 'y'; break;
-              default: out += ch;
-            }
-          }
-          return out;
-        };
-        const tok = (s: string): Set<string> =>
-          new Set(cyrFold(s).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
-        const intentTokens = tok(intentText.toLowerCase());
-        const chosenTokens = tok(chosenText);
-        if (intentTokens.size > 0 && chosenTokens.size > 0) {
-          // V23: shared = exact OR substring (≥3 chars). Russian/Kazakh/etc.
-          // morphology means "папка" (intent) vs "папкалар" (label) are
-          // semantically the same word but fail set equality. Substring with
-          // a 3-char floor catches morphological variants without globbing
-          // unrelated tokens (e.g. "ok" inside "Bookmark").
-          let shared = 0;
-          outer: for (const i of intentTokens) {
-            for (const c of chosenTokens) {
-              if (i === c) { shared = 1; break outer; }
-              // Prefix-or-substring overlap, both directions, min 3 chars.
-              if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) {
-                shared = 1; break outer;
-              }
-            }
-          }
-          if (shared === 0) semanticFloorRejected = true;
-        }
+        const honesty = await evaluateHonestyGuard({
+          intentText,
+          chosenNode: chosenCandidate?.node,
+          mode: mode === 'heal' ? 'heal' : 'apply',
+          action: actionType,
+          siblingNodes: candidates.map(c => c.node),
+          identityFreq,
+          semantic: honestySemantic,
+          judge: honestyJudge,
+        });
+        if (honesty) semanticFloorRejected = true;
       }
       if (confidence < minConfidence || semanticFloorRejected) {
         const reason = semanticFloorRejected
@@ -3878,6 +3819,26 @@ export async function resolveElement(params: {
    *  high-water-mark heuristic when absent (works on most pages, fails on
    *  long scrollable pages where modal coverage gets underestimated). */
   viewport?: { width: number; height: number };
+  /**
+   * Heal-only journey context (2026-06). Gives the heal resolver the "user's
+   * narrative" a human tester would have: the overall test goal and the last
+   * few successful step descriptions. Lets it disambiguate drift — e.g. "we
+   * just logged in, so this is the login submit, not the settings submit".
+   * Descriptions ONLY (never input values — those may carry secrets). Ignored
+   * in apply mode. Fail-open: absent → prompt unchanged.
+   */
+  healContext?: {
+    testGoal?: string;
+    priorSteps?: string[];
+    stepIndex?: number;
+    totalSteps?: number;
+  };
+  /**
+   * Optional test/run id for best-effort cost attribution of the honesty
+   * guard's embedding / judge calls (L2/L3). Absent → cost recording skipped
+   * (interactive authoring calls are low-volume). Never affects resolution.
+   */
+  testId?: string;
 }): Promise<LintResult> {
   const {
     previewSessionId,
@@ -3885,8 +3846,10 @@ export async function resolveElement(params: {
     domNodes,
     pageUrl,
     includeAlternatives = false,
+    healContext,
     screenshot: screenshotOrFnRaw,
     viewport,
+    testId,
   } = params;
   // V22: derive heal-mode from explicit param OR the legacy
   // `previewSessionId === 'background'` convention used by command-executor.
@@ -3966,7 +3929,7 @@ export async function resolveElement(params: {
   const intentText = sanitizeIntent(stepDraft);
 
   // Step 2: Build HardAllowed/SoftAllowed sets via deterministic DOM-structural rules (sync)
-  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport);
+  const allowedResult = buildAllowedSets(domNodes, stepDraft.type, viewport, stepDraft.recordedFingerprint);
   const { hardAllowed, softAllowed, ruleTrace } = allowedResult;
 
   // V27 — Empty-fillable guard for type/fill/clear actions (root cause #3
@@ -4057,6 +4020,21 @@ export async function resolveElement(params: {
   // Combine allowed sets (hardAllowed first, then softAllowed)
   const allAllowed = [...hardAllowed, ...softAllowed];
   const allowedCount = allAllowed.length;
+
+  // Honesty-guard L1+L2+L3 dependencies, built ONCE per resolve over the full
+  // page set (the inline guard inside selectElementWithLLM only sees the top-K
+  // candidates, so the frequency predicate must be computed here and threaded
+  // down). L1: page-frequency generic predicate replaces the static word list.
+  // L2/L3: embedding + judge closures (judge flag-gated, default OFF).
+  const identityFreqPredicate = buildGenericTokenPredicate(
+    buildIdentityTokenFrequency(allAllowed),
+    allAllowed.length,
+  );
+  const honestySemantic: HonestySemanticDeps = buildSemanticDeps(testId);
+  const honestyPageKey = computePageSignature(pageUrl, domNodes);
+  const honestyJudge: HonestyJudgeDeps | undefined = isJudgeEnabled()
+    ? buildJudgeDeps(honestyPageKey, testId)
+    : undefined;
 
   logger.debug('[ELEMENT_RESOLVER] Allowed sets built', {
     previewSessionId,
@@ -5032,6 +5010,13 @@ export async function resolveElement(params: {
         // V22: route to apply / heal prompt — derived from previewSessionId
         // legacy convention or explicit caller flag, see resolveMode above.
         mode: resolveMode,
+        // 2026-06: heal-only journey context (test goal + last steps). Lets the
+        // heal prompt disambiguate which screen/section the failing step is on.
+        healContext,
+        // Honesty-guard deps (built once over the full page set above).
+        identityFreq: identityFreqPredicate,
+        honestySemantic,
+        honestyJudge,
       });
 
       cacheHit = llmResult.cacheHit;
@@ -5247,10 +5232,15 @@ export async function resolveElement(params: {
                 // gated. Other vision paths (proactive icon-only at ~4524,
                 // early bbox-only at ~4116) keep prior behaviour until we
                 // have prod data showing they need the same protection.
-                const guard = evaluateHonestyGuard({
+                const guard = await evaluateHonestyGuard({
                   intentText,
                   chosenNode: visionNode.node,
                   mode: resolveMode,
+                  action: stepDraft.type,
+                  siblingNodes: allAllowed,
+                  identityFreq: identityFreqPredicate,
+                  semantic: honestySemantic,
+                  judge: honestyJudge,
                 });
                 if (guard) {
                   logger.info('[ELEMENT_RESOLVER] Vision second opinion rejected by honesty guard', {
@@ -5345,6 +5335,8 @@ export async function resolveElement(params: {
             recordedDescription: stepDraft.recordedDescription,
             // V22: route to apply / heal prompt (overflow path inherits parent mode).
             mode: resolveMode,
+            // 2026-06: same heal journey context as the primary batch.
+            healContext,
           });
 
           if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {

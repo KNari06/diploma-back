@@ -343,6 +343,16 @@ export async function processAllureImport(
           // default branch (`start_url = null`) instead of writing a literal
           // "null" string. Identical end state, but the explicit `undefined`
           // documents intent and matches the function signature.
+          // `defaultStartUrl` is null when the user didn't supply one — pass
+          // `undefined` (not `null`) so the service falls through to its own
+          // default branch (`start_url = null`).
+          //
+          // priority + preconditions are written in this single create() call:
+          // create() accepts both (priority natively, preconditions via the
+          // `preconditions` TEXT[] column). Only `tags` still needs a follow-up
+          // update() because create() doesn't accept it. This removes a write
+          // for priority-only tests and closes the old bug where preconditions
+          // were built but silently dropped (update() never accepted them).
           const created = await IntentTestCaseService.create({
             projectId: mapped.createParams.projectId,
             userId: mapped.createParams.userId,
@@ -354,37 +364,37 @@ export async function processAllureImport(
             status: mapped.createParams.status,
             kind: mapped.createParams.kind,
             platform: mapped.createParams.platform,
+            priority: mapped.createParams.priority,
+            ...(mapped.createParams.preconditions.length > 0 && {
+              preconditions: mapped.createParams.preconditions,
+            }),
+            // Import provenance — links the test to this import, records the
+            // Allure run verdict, and flags unreliable (all-click) steps.
+            importId,
+            sourceStatus: result.status,
+            stepsDegraded: mapped.stepsDegraded,
           });
 
-          // Update tags, priority, preconditions via update()
-          const hasExtra =
-            mapped.createParams.tags.length > 0 ||
-            mapped.createParams.priority !== 'medium' ||
-            mapped.createParams.preconditions.length > 0;
-
-          if (hasExtra) {
+          // Tags are the only field create() doesn't accept — set via update().
+          if (mapped.createParams.tags.length > 0) {
             try {
               await IntentTestCaseService.update({
                 id: created.id,
                 userId,
-                tags: mapped.createParams.tags.length > 0
-                  ? mapped.createParams.tags
-                  : undefined,
-                priority: mapped.createParams.priority,
+                tags: mapped.createParams.tags,
               });
             } catch (updateErr) {
-              // Non-fatal — the test case itself was created. We surface the
-              // failure both in the per-import error log AND `stats.errors`
-              // so the user sees it in the results panel ("warnings"
-              // section) instead of having tags/priority silently dropped
-              // with no UI indication.
+              // Non-fatal — the test case itself was created (with priority +
+              // preconditions already persisted). Surface in `stats.errors` so
+              // the user sees the warning in the results panel instead of
+              // having tags silently dropped with no UI indication.
               const errMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
-              logger.warn('[AllureImport] Could not update tags/priority for test case', {
+              logger.warn('[AllureImport] Could not update tags for test case', {
                 testCaseId: created.id,
                 error: errMsg,
               });
               stats.errors.push(
-                `Tags/priority not saved for "${created.name}": ${errMsg}`,
+                `Tags not saved for "${created.name}": ${errMsg}`,
               );
             }
           }
@@ -392,6 +402,7 @@ export async function processAllureImport(
           // Register name in dedup set to avoid same-batch duplicates
           existingNames.add(result.name.toLowerCase());
           stats.testsImported++;
+          if (mapped.stepsDegraded) stats.testsWithDegradedSteps++;
 
           // Track in hierarchy tree for the frontend popup
           hierarchyCache.addTestNode(
@@ -425,11 +436,21 @@ export async function processAllureImport(
       stats.modulesCreated = hierarchyCache.modulesCreated;
       stats.flowsCreated = hierarchyCache.flowsCreated;
 
+      // One summary warning for degraded tests (not one per test) so the
+      // warnings panel stays readable. The exact tests are flagged in logs.
+      if (stats.testsWithDegradedSteps > 0) {
+        stats.errors.push(
+          `${stats.testsWithDegradedSteps} test(s) imported with unreliable step types ` +
+          `(AI step conversion failed — all steps defaulted to "click"). Review these before running.`,
+        );
+      }
+
       logger.info('[AllureImport] Test case import phase complete', {
         imported: stats.testsImported,
         skipped: stats.testsSkipped,
         modulesCreated: stats.modulesCreated,
         flowsCreated: stats.flowsCreated,
+        degraded: stats.testsWithDegradedSteps,
         errors: stats.errors.length,
       });
     } catch (phaseErr) {
@@ -636,8 +657,8 @@ async function processCsvPdfImport(
           }
 
           // Convert steps using AI (determines correct action types, cleans descriptions)
-          // Falls back to 'click' type for all steps if AI fails
-          const steps = await convertImportedStepsWithAI(tc.name, tc.steps);
+          // Falls back to 'click' type for all steps if AI fails (degraded).
+          const { steps, degraded: stepsDegraded } = await convertImportedStepsWithAI(tc.name, tc.steps);
 
           // Resolve hierarchy (module + flow) via cache
           const { moduleId, flowId } = await resolveHierarchy(
@@ -669,6 +690,14 @@ async function processCsvPdfImport(
           // CSV/PDF imports also benefit from a default start URL — symmetric
           // with the ZIP path above. See note there for why we pass `undefined`
           // instead of `null` when the option is unset.
+          //
+          // priority + preconditions go in this single create() call (mirror of
+          // the ZIP path). The preconditions also remain inlined in the markdown
+          // `description` above for human readability; the structured column is
+          // what downstream tooling reads.
+          const tags = tc.tags ?? [];
+          const priority = tc.priority ?? 'medium';
+          const preconditions = tc.preconditions ?? [];
           const created = await IntentTestCaseService.create({
             projectId,
             userId,
@@ -680,36 +709,40 @@ async function processCsvPdfImport(
             status: 'draft',
             kind: 'standalone',
             platform: 'web',
+            priority,
+            ...(preconditions.length > 0 && { preconditions }),
+            // Import provenance. CSV/PDF are design-time exports with no run
+            // verdict, so sourceStatus stays unset (NULL) — only importId +
+            // the degraded flag apply here.
+            importId,
+            stepsDegraded,
           });
 
-          // Update tags/priority via update()
-          const tags = tc.tags ?? [];
-          const priority = tc.priority ?? 'medium';
-          if (tags.length > 0 || priority !== 'medium') {
+          // Tags are the only field create() doesn't accept — set via update().
+          if (tags.length > 0) {
             try {
               await IntentTestCaseService.update({
                 id: created.id,
                 userId,
-                tags: tags.length > 0 ? tags : undefined,
-                priority,
+                tags,
               });
             } catch (updateErr) {
-              // Mirror of the ZIP-path handling above: surface in
-              // stats.errors so the user sees the warning in the results
-              // panel instead of silently losing tags/priority.
+              // Mirror of the ZIP-path handling above: surface in stats.errors
+              // so the user sees the warning instead of silently losing tags.
               const errMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
-              logger.warn('[AllureCsvPdfImport] Could not update tags/priority', {
+              logger.warn('[AllureCsvPdfImport] Could not update tags', {
                 testCaseId: created.id,
                 error: errMsg,
               });
               stats.errors.push(
-                `Tags/priority not saved for "${created.name}": ${errMsg}`,
+                `Tags not saved for "${created.name}": ${errMsg}`,
               );
             }
           }
 
           existingNames.add(tc.name.toLowerCase());
           stats.testsImported++;
+          if (stepsDegraded) stats.testsWithDegradedSteps++;
 
           hierarchyCache.addTestNode(
             {
@@ -741,11 +774,20 @@ async function processCsvPdfImport(
       stats.modulesCreated = hierarchyCache.modulesCreated;
       stats.flowsCreated = hierarchyCache.flowsCreated;
 
+      // Mirror of the ZIP path — one summary warning for degraded tests.
+      if (stats.testsWithDegradedSteps > 0) {
+        stats.errors.push(
+          `${stats.testsWithDegradedSteps} test(s) imported with unreliable step types ` +
+          `(AI step conversion failed — all steps defaulted to "click"). Review these before running.`,
+        );
+      }
+
       logger.info('[AllureCsvPdfImport] Test case import phase complete', {
         imported: stats.testsImported,
         skipped: stats.testsSkipped,
         modulesCreated: stats.modulesCreated,
         flowsCreated: stats.flowsCreated,
+        degraded: stats.testsWithDegradedSteps,
       });
     } catch (phaseErr) {
       const msg = `Test case import phase failed: ${phaseErr instanceof Error ? phaseErr.message : String(phaseErr)}`;

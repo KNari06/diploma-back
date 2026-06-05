@@ -593,6 +593,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
         },
         replayTrace,  // V14: Pass trace writer for detailed local logging
         totalSteps: testData.commands.length,
+        // Heal journey context — real goal only (skip the generic
+        // "Test the application" fallback, which is noise for the resolver).
+        testGoal: testData.testGoal || testData.intent || undefined,
       });
 
       // Phase 2: register secret values for log redaction. Every secret

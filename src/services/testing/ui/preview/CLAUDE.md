@@ -67,6 +67,8 @@ Element resolution and auto-healing serve all three.
 | [new-tab-opener.ts](new-tab-opener.ts) | Promotes anchor clicks to real new tabs via `context.newPage() + goto(href)` when `<a target="...">` is set, when the href is cross-origin, or when modifier keys request a new tab (Cmd/Ctrl/Shift). Used by `CommandExecutor.performClick`, preview-step-apply `executeAction` click branch, preview-session live `executeMouseAction`, and `PreviewSessionService.openTab` (reason `'programmatic'`, backing the `open_tab` step type). The new page is adopted by `attachPopupHandler` like any other popup. |
 | [evidence-shortcut.utils.ts](evidence-shortcut.utils.ts) | Cached "this evidence already worked" shortcut to skip resolver. |
 | [recorded-identity.util.ts](recorded-identity.util.ts) | `recordedFingerprintHasStrongIdentity` (cheap pre-gate) + `nodeToIdentityProbe` (InteractiveNode → canonical `IdentityProbe`) + re-export of `hasStrongIdentityContradiction`. Re-validate compiled / evidence cache hits against the ORIGINAL `recordedFingerprint` (not the plan's self-echoed `targetFingerprint`). Comparison delegates to the SAME normalized primitive the readiness gate uses (`hasStrongIdentityContradiction` in [step-readiness-v2.service.ts](step-readiness-v2.service.ts), `fieldEq`/`normUrlLike`). Fail-open when the fingerprint is weak. |
+| [semantic-match.util.ts](semantic-match.util.ts) | Pure semantic-match helpers for the honesty guard: tokenizer (`semanticTokens`/`cyrFold`), `nodeIdentityTokens` (capot channel, optional frequency predicate), `buildIdentityTokenFrequency`/`buildGenericTokenPredicate` (data-driven generic filter), `isSoleSubmitButton`, and the async `evaluateHonestyGuard` (4-layer: lexical → structural → embedding → judge, L2/L3 via injected closures). No network — closures injected. |
+| [honesty-guard-deps.ts](honesty-guard-deps.ts) | Builds the L2 (embedding) + L3 (judge) closures the guard consumes — keeps the AI stack OUT of the pure module. Redis-cached embeddings, in-process judge cache, best-effort cost, `isJudgeEnabled()` (flag `HONESTY_GUARD_JUDGE`, default OFF). |
 | [auto-wait-for.utils.ts](auto-wait-for.utils.ts) | Inject `wait:*` synthetic steps before slow actions. |
 | [page-interactive.utils.ts](page-interactive.utils.ts) | "Is page interactive yet" heuristic. |
 | [text-normalizer.util.ts](text-normalizer.util.ts) | Unicode/whitespace normalization for label matching. |
@@ -289,9 +291,15 @@ BullMQ enqueue (manual-test-run.job.ts)
 ## Element resolution (3-stage waterfall + auto-heal)
 
 ```
-buildAllowedSets(snapshot, intent)
+buildAllowedSets(snapshot, intent, viewport?, recordedFingerprint?)
   → HardAllowed: visible, role/tag matches action type
   → SoftAllowed: rest, with penalty hints
+  Rule 0  modal.background_excluded — modal active + node outside modal + covered → hard-exclude
+  Rule 0b floating corner widget (node.floatingWidget, geometry-derived):
+          covers target (isTopMostAtCenter=false, not modal) → widget.covers_target_excluded (hard)
+          IS target (strong recordedFingerprint, no contradiction) → widget.target_escape_hatch (keep)
+          else floating + not target → widget.floating_deprioritized (soft)
+          summary entry: widget.floating_detected
 
 (0) Identity fast-path
     if recordedFingerprint has id/testId/name AND it's unique on page → use it.
@@ -324,8 +332,42 @@ buildAllowedSets(snapshot, intent)
 (3) LLM resolver (Gemini Flash)
     input: intent text, action type, candidates (top-K), scene summary.
     rules 1–18 in apply prompt: no loudest-CTA fallback, slug intents,
-    adjacency≠function, etc.
+    adjacency≠function, etc. Rule 1 also carries CAPOT-OVER-LABEL: match by
+    English technical identity (type/role/name/testid) when intent language
+    ≠ label language.
     → resolverPath = 'llm'
+    HONESTY GUARD (async evaluateHonestyGuard, semantic-match.util.ts) —
+    post-LLM, rejects confident-but-unrelated picks. 4 layers, cheap→expensive,
+    first-accept-wins; bypass on heal / <3-char intent / label-less node:
+      • L1 LEXICAL: intent overlaps the visible label OR nodeIdentityTokens
+        (type/role-widget/name/autocomplete/testId/id — the cross-language
+        capot channel; English "password" ↔ "Пароль" via type=password). The
+        identity GENERIC filter is now DATA-DRIVEN: `buildIdentityTokenFrequency`
+        over the full page + `buildGenericTokenPredicate` (token is generic when
+        it recurs on ≥ max(4, 25%) of controls). Replaces the static
+        `GENERIC_IDENTITY_TOKENS` word list on the live path — that list is kept
+        ONLY as a fallback for single-node callers (tests). Spec lists
+        (GENERIC_INPUT_TYPES, MEANINGFUL_AUTOCOMPLETE_TOKENS, SEMANTIC_IDENTITY_ROLES)
+        stay (HTML/W3C, not language).
+      • L0 STRUCTURAL (pure, zero word lists, any-language): a CLICK intent whose
+        chosen node is the page's SOLE submit button (isSoleSubmitButton) AND
+        matched no OTHER candidate (intentMatchesAnySibling=false) → accept even
+        when the label is localized ("Войти"). signin→Войти fix.
+      • L2 SEMANTIC (deterministic-given-cache): embedding cosine(intent,label)
+        ≥ 0.62 → accept. Catches localized links/synonyms the token paths miss
+        (выход↔logout). DI closures (generateEmbedding + cosineSimilarity),
+        Redis-cached (1h, content-addressed), fail-OPEN.
+      • L3 LLM-JUDGE (NON-deterministic, FLAG-GATED default OFF via
+        HONESTY_GUARD_JUDGE): only in the band 0.45 ≤ sim < 0.62 a cheap yes/no
+        arbitrates. Below band → reject (no judge); fail-OPEN to reject.
+      Closures live in honesty-guard-deps.ts (kept out of the pure module);
+      built ONCE per resolve in resolveElement over `allAllowed` and threaded
+      through selectElementWithLLM (the inline guard only sees top-K). Cost
+      (embedding/judge) recorded best-effort via optional `testId`. Caller passes
+      `action`+`siblingNodes`; omitting deps disables L2/L3 (legacy = tests).
+      Known trade-off: a SPECIFIC intent with no matching element on a one-submit
+      page (e.g. "delete account" on a login form) is accepted onto the submit
+      via L0 rather than "not found" — accepted vs the cross-language recall win.
 
 (4) Vision rescue
     take screenshot, send to vision LLM with click target hints.
@@ -361,6 +403,7 @@ If apply fails after action: auto-heal path
 16. **New-tab promotion is the single path for `<a target=_blank>` / cross-origin anchors / modifier-driven new-tab clicks.** All three click sites (`CommandExecutor.performClick` for background replay, `executeAction` click branch for live Apply/Apply All, `executeMouseAction` for live preview clicks) call into [new-tab-opener.ts](new-tab-opener.ts) BEFORE `locator.click()` / `page.mouse.click()`. Reason: Playwright's `locator.click()` does not reliably honour `target="_blank"` under our launch flags (`--disable-features=IsolateOrigins,site-per-process` + headless) and collapses popups into the active tab; recorded `<a target>` semantics also need to be replayable. The opener creates a Page in the same BrowserContext, which fires `context.on('page')` → `attachPopupHandler` → `preview:tab:opened`, so the FE renders the tab without any extra plumbing. Same-origin anchors without explicit target are NOT promoted — those stay inline so SPA navigations and normal in-flow clicks aren't fragmented across tabs. Probe failures fail OPEN (fall back to normal click). The recorder also captures `<a target>` into `ProbedElement.linkTarget` / `BindingHints.linkTarget` / `TargetFingerprint.linkTarget` so the hint travels with the step (informational; the runtime probe is ground truth).
 18. **CDP `DOMSnapshot.bounds` is DOCUMENT-relative; in-page APIs are VIEWPORT-relative.** Anywhere in `cdp-snapshot.service.ts` that mixes these (`elementsFromPoint(cx, cy)`, `getBoundingClientRect()` comparisons against bounds, point-in-rect math inside `frame.evaluate(...)` bodies) MUST subtract scroll. The May 2026 bi.group "Астана" incident dropped 543/639 (85%) of refAssign candidates because the conversion was missing on a `scrollY=500` page — target buttons below the fold were silently rejected as `findElementReturnedNull / atPoint: null`. **The scroll value MUST be read LIVE inside the evaluate body (`win.scrollX/Y`), NOT from the snapshot-time `scrollOffsetX/Y` field on the DS document.** `getBoundingClientRect()` reads from the live DOM, so any subtraction must use the live scroll to stay in the same coord space — otherwise a scroll between captureSnapshot (Node) and refAssign (page evaluate) races the comparison and `bboxScore` rejects perfectly-good elements. The normalization happens once at the top of the evaluate body: `req.bboxX -= win.scrollX; req.bboxY -= win.scrollY` for every request with non-zero bbox. Rescue-mode entries (bboxW/H = 0) skip the subtraction — they go through Stage A (id/testId/name) or Stage C (descriptor), neither of which reads bbox. `LiteElement.bounds` itself stays document-relative as the public contract — only the internal `RefAssignmentRequest` switches to viewport space. Fixed/sticky elements: CDP reports them at their rendered position (which already factors in scroll), so subtracting live scroll yields their correct viewport y — verified on bi.group's sticky header. Regression guards: `cdp-snapshot.integration.test.ts` "preserves below-the-fold buttons after page scroll" + "survives scroll-during-collect race".
 17. **Pick service uses two-phase emit.** `preview:pick:result` is sent IMMEDIATELY after the in-page probe (description + fingerprint + bindingHints); `preview:pick:lint` follows 5-10s later with the dry-run resolver verdict. Never block `:result` on the lint — the form must populate without waiting for the LLM. If you add another expensive post-probe enrichment (vision, RAG, second LLM pass), keep it on the same fire-and-forget pattern with its own follow-up event.
+19. **Floating-corner-widget detection is geometry-only and symmetric across both collectors.** `node.floatingWidget` (a small `position:fixed` element pinned to a viewport corner — chat/assistant bubble, support launcher) is computed IN-PAGE inside each collector's `page.evaluate` (eval [snapshot-collector.ts](../../../../agent/core/lite/collectors/snapshot-collector.ts) + CDP [cdp-snapshot.service.ts](cdp-snapshot.service.ts)), where `getBoundingClientRect()`/`position` are viewport-relative — so it never mixes coordinate spaces (sidesteps #18) and stays symmetric (#5). The canonical rule + thresholds live in [floating-widget.util.ts](floating-widget.util.ts) (`isFloatingCornerWidget`, margin 24px, coverage < 0.30); the two inline copies MUST stay byte-aligned (unit test is the drift guard). NEVER add product-name / class-name heuristics (no "intercom"/"crisp"/"AiAssistant" lists) — pure geometry + W3C only. Second consumer: [overlay-dismisser.ts](../../../../agent/core/lite/exploration/overlay-dismisser.ts) `classifySingle` calls `isFloatingCornerWidget` to label `chat_widget` by geometry instead of a vendor-name regex (the old `intercom|drift|crisp|…` list missed most launchers). `buildAllowedSets` consumes the flag (Rule 0b): hard-exclude when it covers the target, escape-hatch when the step targets it (strong `recordedFingerprint`), else soft-penalty. This fixes the Run-vs-Apply divergence where a widget's buttons polluted the candidate set; the companion timing floor (navigation-class `getAdaptiveSettleMs` ≥ 450ms in [preview-run.service.ts](preview-run.service.ts)) stops Run All snapshotting the widget mid-animation.
 
 ---
 

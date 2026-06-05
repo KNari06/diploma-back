@@ -15,6 +15,7 @@ import { NotFoundError, ValidationError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
 import { getLocalizedMessages } from './localization';
+import { getResolvedTargets } from '../shared/intent-target-resolution';
 import { resolveProjectId } from './project-resolver';
 
 /**
@@ -47,7 +48,12 @@ export async function handleRunByTagIntent(
       userId,
     });
 
-    const tag = parsedIntent?.tag || parsedIntent?.target;
+    // Prefer an explicit tag; otherwise fall back to the understanding layer's
+    // resolved tag descriptor (e.g. user said "run the smoke ones" → the
+    // classifier emitted targetSelector{type:'tag', value:'smoke'}).
+    const resolved = getResolvedTargets(parsedIntent);
+    const resolvedTag = resolved?.selectorType === 'tag' ? resolved.descriptor : undefined;
+    const tag = parsedIntent?.tag || parsedIntent?.target || resolvedTag;
 
     if (!tag) {
       res.json({

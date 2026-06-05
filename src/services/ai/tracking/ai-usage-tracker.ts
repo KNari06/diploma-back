@@ -230,6 +230,7 @@ export class AIUsageTracker {
         workspace_id: session.context.workspaceId,
         user_id: session.context.userId || null,
         test_id: session.context.testId || null,
+        run_id: session.context.runId || null,
         operation_type: session.context.operationType || 'unknown',
         total_input_tokens: summary.totalInputTokens,
         total_output_tokens: summary.totalOutputTokens,

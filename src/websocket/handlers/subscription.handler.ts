@@ -916,6 +916,17 @@ export const handleSubscriptions = (socket: TypedSocket): void => {
       questionId,
     });
 
+    // Reject malformed payloads: a missing/empty answer must NOT be written to
+    // Redis, otherwise the worker's poller resumes a flow with junk input.
+    if (typeof questionId !== 'string' || !questionId.trim()
+      || typeof answer !== 'string' || !answer.trim()) {
+      logger.warn('[SubscriptionHandler] Ignoring invalid exploration clarification response', {
+        questionId,
+        hasAnswer: typeof answer === 'string' && answer.trim().length > 0,
+      });
+      return;
+    }
+
     try {
       const { ClarificationService } = require('@/agent/utils/context/clarification.service');
       ClarificationService.handleExplorationClarificationResponse(questionId, answer);

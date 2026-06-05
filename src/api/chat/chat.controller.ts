@@ -26,6 +26,15 @@ import { parseMobileContext } from './mobile_agent/shared';
 import { incCounter } from '@/utils/core/mobile-chat-metrics';
 import { checkWorkspace, manageChatSession, validateInput } from './shared/validation';
 import { handlePendingExplorationConfirmation } from './shared/exploration-confirmation';
+import { handlePendingManageConfirmation } from './regression/shared/manage-confirmation';
+import {
+  beginCompound,
+  clearPendingCompound,
+  completeStep,
+  isCompoundCancel,
+  peekCurrentStep,
+  toCompoundSteps,
+} from './shared/compound-queue';
 import {
   TestCaseNotFoundError,
   assertCanAccessTestCase,
@@ -403,6 +412,54 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         await unregisterActiveRequestWithLogging(chatSessionId, userId);
         return;
       }
+
+      // Two-phase confirm for management ops: a bare "yes" replying to a
+      // manage_* preview would otherwise be classified as general_chat and the
+      // approval lost. Intercept it here and re-run the stored op.
+      const manageHandled = await handlePendingManageConfirmation(
+        req, res, message, chatSessionId!, userId,
+      );
+      if (manageHandled) {
+        const unregisterActiveRequestWithLogging = withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger);
+        await unregisterActiveRequestWithLogging(chatSessionId, userId);
+        return;
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // STEP 4.65 (Phase 3): COMPOUND CONTINUATION
+    // ═══════════════════════════════════════════════════════════════════════
+    // A compound request ("test A and B, then save as a plan") runs one step
+    // per turn. If a pending compound exists for this session, this turn drives
+    // the NEXT step: we replace the message with the queued step text and let
+    // the normal parse+route path below run it. The remainder is re-queued by
+    // advanceCompound. Global chat only (test-case scope never queues).
+    let effectiveMessage = message;
+    let isCompoundContinuation = false;
+    if (chatStore.kind === 'global' && chatSessionId) {
+      // Explicit abandon ("stop"/"отмена") clears the whole queue.
+      const pendingStep = await peekCurrentStep(chatSessionId);
+      if (pendingStep && isCompoundCancel(message)) {
+        await clearPendingCompound(chatSessionId);
+        res.json({
+          success: true,
+          message: 'Okay, stopped the multi-step request. What would you like to do?',
+          timestamp: new Date().toISOString(),
+          sessionId: chatSessionId,
+        });
+        await withFunctionLogging(unregisterActiveRequest, 'unregisterActiveRequest', functionLogger)(chatSessionId, userId);
+        return;
+      }
+      if (pendingStep) {
+        // ADVANCE-AFTER-SUCCESS: run the CURRENT (peeked, not popped) step. The
+        // queue only advances once the step's handler reports success — see the
+        // res-wrapper + completeStep call after routeToHandler below.
+        logger.info('[COMPOUND] Continuing compound request', {
+          step: pendingStep.index, total: pendingStep.total, userId,
+        });
+        effectiveMessage = pendingStep.text;
+        isCompoundContinuation = true;
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -459,7 +516,7 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       // from mid-flow.
       const parseIntentWithLogging = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
       parsedIntent = await parseIntentWithLogging(
-        message,
+        effectiveMessage,
         context,
         chatSessionId,
         userId,
@@ -528,11 +585,51 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // STEP 5.9 (Phase 3): COMPOUND BEGIN
+    // ═══════════════════════════════════════════════════════════════════════
+    // A freshly-classified compound request ("test A and B, then save a plan")
+    // runs its FIRST step now; the rest are queued for subsequent turns. Skip
+    // when we're already mid-compound (isCompoundContinuation) so a sub-step
+    // that itself parses as compound can't recurse. Global chat only.
+    if (chatStore.kind === 'global' && chatSessionId && !isCompoundContinuation) {
+      const steps = toCompoundSteps(parsedIntent?.metadata?.analysis);
+      if (steps.length >= 2) {
+        const first = await beginCompound(chatSessionId, steps);
+        if (first) {
+          logger.info('[COMPOUND] Detected compound request, running step 1', {
+            total: first.total, userId,
+          });
+          isCompoundContinuation = true; // step 1 is now a compound step too
+          // Re-parse step 1 in isolation so it routes as its own intent.
+          effectiveMessage = first.text;
+          const reparse = withFunctionLogging(parseIntent, 'parseIntent', functionLogger);
+          parsedIntent = await reparse(
+            effectiveMessage, context, chatSessionId, userId, workspace_id,
+            checkRequestTimeout, abortSignal, functionLogger,
+            inputResult.mode || 'lite', false /* global scope → not test-case */, testCaseId,
+          );
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // STEP 6: ROUTE TO APPROPRIATE HANDLER BASED ON INTENT
     // ═══════════════════════════════════════════════════════════════════════
+    // For a compound step, capture the handler's response payload so we can tell
+    // whether the step COMPLETED (advance the queue) or asked a clarification /
+    // confirm-preview (leave the queue so the next turn retries this step).
+    let stepResponsePayload: any;
+    if (isCompoundContinuation) {
+      const originalJson = res.json.bind(res);
+      res.json = (body: any) => {
+        stepResponsePayload = body;
+        return originalJson(body);
+      };
+    }
+
     const routeToHandlerWithLogging = withFunctionLogging(routeToHandler, 'routeToHandler', functionLogger);
     await routeToHandlerWithLogging(req, res, {
-      message,
+      message: effectiveMessage,
       parsedIntent,
       userId,
       workspace_id,
@@ -552,6 +649,30 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       chatStore,
       testCaseId,
     });
+
+    // Advance the compound queue only if the step actually COMPLETED — not if it
+    // asked a clarification or a confirm-preview (those need the same step to be
+    // retried with the user's next reply). Best-effort; never throws.
+    if (isCompoundContinuation && chatSessionId) {
+      const data = stepResponsePayload?.data;
+      const stepIncomplete = data?.needsClarification === true || data?.needsConfirmation === true;
+      if (!stepIncomplete) {
+        try {
+          const next = await completeStep(chatSessionId);
+          if (next) {
+            emitProcessingStep(
+              chatSessionId, 'generating_plan',
+              `Done. Next (${next.index}/${next.total}): ${next.text}`,
+              100,
+            );
+          }
+        } catch (e) {
+          logger.warn('[COMPOUND] completeStep failed', {
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
 
     // Unregister request on successful completion. Use the namespaced
     // registry for test-case requests so we don't drop a global-Map
@@ -587,6 +708,10 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
         await unregisterActiveRequestWithLogging(chatSessionId, userId);
       }
     }
+
+    // Abandon any pending compound on error — a mid-flow failure must not leave
+    // a stuck queue that hijacks the user's next message.
+    await clearPendingCompound(chatSessionId);
 
     // Flush logs before handling error
     await functionLogger.flushSync();

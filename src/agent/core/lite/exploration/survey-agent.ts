@@ -35,6 +35,16 @@ import { OverlayDismisser, type OverlayCleanupResult } from './overlay-dismisser
 import type { ExplorationTraceService } from './exploration-trace.service';
 import { Cartographer } from './agents/cartographer';
 import type { CartographerInput, CartographerOutput } from './agents/agent-types';
+import {
+  isPasswordInput,
+  isCredentialInput,
+  isSearchInput,
+  isEditableField,
+  isFileInput,
+  isSubmitButton,
+  isClickable,
+  bestLabel,
+} from '../analysis/interactive-element-signals';
 
 /** Max hidden navigation links to follow per page (Cartographer-discovered links have no limit) */
 const MAX_NAV_LINKS_PER_PAGE = 15;
@@ -75,6 +85,21 @@ export class SurveyAgent {
   // ═══════════════════════════════════════════════════════════════════════
   // HELPERS
   // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Surface a survey dedup/skip to the UI (frontend reads data.url / data.reason
+   * in its `page_skipped` branch). Paired with the trace's writePageDedupSkipped.
+   */
+  private emitPageSkipped(url: string, reason: 'same_url' | 'same_content' | 'same_template'): void {
+    this.config.onProgress?.({
+      explorationId: this.config.explorationId,
+      phase: 'survey',
+      event: 'page_skipped',
+      data: { url, reason },
+      progressPercent: 0,
+      timestamp: Date.now(),
+    });
+  }
 
   /**
    * Get full URL including hash fragment.
@@ -304,6 +329,7 @@ export class SurveyAgent {
       // Skip if already visited
       if (this.tree.isVisited(item.url)) {
         this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_url' });
+        this.emitPageSkipped(item.url, 'same_url');
         continue;
       }
 
@@ -446,6 +472,7 @@ export class SurveyAgent {
       // Check for same-template page (pagination/lists)
       if (item.parentNodeId && this.tree.registerAndCheckSameTemplate(item.parentNodeId, snapshot)) {
         this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_template' });
+        this.emitPageSkipped(item.url, 'same_template');
         logger.debug('[SURVEY] Skipping same-template page', { url: item.url });
         continue;
       }
@@ -453,6 +480,7 @@ export class SurveyAgent {
       // Check for SPA content dedup
       if (this.tree.isContentVisited(snapshot)) {
         this.trace?.writePageDedupSkipped({ url: item.url, reason: 'same_content' });
+        this.emitPageSkipped(item.url, 'same_content');
         logger.debug('[SURVEY] Skipping duplicate content page', { url: item.url });
         continue;
       }
@@ -1568,7 +1596,7 @@ export class SurveyAgent {
    */
   private buildFallbackEntryPoints(
     snapshot: LiteSnapshot,
-    url: string,
+    _url: string,
   ): Array<{
     name: string;
     goal: string;
@@ -1592,19 +1620,18 @@ export class SurveyAgent {
     const inputs = elements.filter(el => ['input', 'textarea', 'select'].includes(el.tag));
     const buttons = elements.filter(el => el.tag === 'button' || el.role === 'button');
 
-    // 1. Detect auth forms (has password field)
-    const passwordInputs = inputs.filter(el => el.type === 'password');
+    // 1. Detect auth forms (has password field — language-neutral type/autocomplete signal)
+    const passwordInputs = inputs.filter(isPasswordInput);
     if (passwordInputs.length > 0) {
-      const emailInputs = inputs.filter(el =>
-        el.type === 'email' || el.autocomplete === 'email' || el.autocomplete === 'username' ||
-        /email|username|login/i.test(el.name || el.placeholder || el.htmlName || ''),
-      );
-      const relatedEls = [...emailInputs, ...passwordInputs].map(el => ({
+      // Identity field = any non-password credential field (email/username/phone),
+      // classified via the shared multilingual field classifier (EN/RU/KK/…).
+      const identityInputs = inputs.filter(el => !isPasswordInput(el) && isCredentialInput(el));
+      const relatedEls = [...identityInputs, ...passwordInputs].map(el => ({
         ref: el.ref, role: el.role, name: el.name, tag: el.tag,
       }));
       entryPoints.push({
         name: 'User Login',
-        goal: 'Login with valid email and password credentials',
+        goal: 'Login with valid identity and password credentials',
         category: 'authentication',
         priority: 'critical',
         requiresAuth: false,
@@ -1613,10 +1640,8 @@ export class SurveyAgent {
       });
     }
 
-    // 2. Detect search inputs
-    const searchInputs = inputs.filter(el =>
-      el.type === 'search' || /search/i.test(el.name || el.placeholder || el.htmlName || el.role || ''),
-    );
+    // 2. Detect search inputs (type=search / role=searchbox / inputmode=search)
+    const searchInputs = inputs.filter(isSearchInput);
     if (searchInputs.length > 0) {
       entryPoints.push({
         name: 'Site Search',
@@ -1631,22 +1656,17 @@ export class SurveyAgent {
       });
     }
 
-    // 3. Detect non-auth forms (inputs without password)
-    if (passwordInputs.length === 0 && inputs.length >= 2) {
-      const formInputs = inputs.filter(el => el.type !== 'hidden' && el.type !== 'search');
-      if (formInputs.length > 0) {
-        // Derive name from submit button or first input context
-        const formSubmitBtn = buttons.find(b => /submit|send|save|create|add|register|sign\s*up/i.test(b.name || ''));
-        const btnLabel = (formSubmitBtn?.name || '').trim();
-        const fieldLabel = formInputs[0]?.name || formInputs[0]?.placeholder || '';
-        const derivedFormName = btnLabel && !/submit/i.test(btnLabel)
-          ? btnLabel
-          : fieldLabel
-            ? `${fieldLabel} Submission`
-            : 'Form Submission';
+    // 3. Detect non-auth forms (editable fields, no password)
+    if (passwordInputs.length === 0) {
+      const formInputs = inputs.filter(el => isEditableField(el) && !isSearchInput(el));
+      if (formInputs.length >= 2) {
+        // Name from a structural submit control (last submit-style button), not
+        // from English text — falls back to a neutral label.
+        const submitBtn = buttons.filter(isSubmitButton).slice(-1)[0];
+        const derivedFormName = bestLabel(submitBtn ?? formInputs[0]) || 'Form Submission';
         entryPoints.push({
           name: derivedFormName,
-          goal: `Fill out and submit the form on the page (fields: ${formInputs.slice(0, 3).map(el => el.name || el.placeholder || el.type).filter(Boolean).join(', ') || 'required fields'})`,
+          goal: `Fill out and submit the form on the page (fields: ${formInputs.slice(0, 3).map(bestLabel).filter(Boolean).join(', ') || 'required fields'})`,
           category: 'form_submission',
           priority: 'high',
           requiresAuth: false,
@@ -1658,31 +1678,13 @@ export class SurveyAgent {
       }
     }
 
-    // 4. Detect prominent CTA buttons (non-submit, meaningful text)
-    const ctaPatterns = /sign up|register|get started|try|subscribe|contact|book|schedule|download|add to cart|buy|checkout|learn more|explore|apply|submit|create|new/i;
-    const ctaButtons = buttons.filter(el =>
-      el.name && ctaPatterns.test(el.name) && !el.disabled,
-    );
-    for (const cta of ctaButtons.slice(0, 2)) {
-      if (entryPoints.length >= MAX_FALLBACK_ENTRY_POINTS) break;
-      entryPoints.push({
-        name: `${cta.name}`,
-        goal: `Click the "${cta.name}" button and complete the resulting flow`,
-        category: 'other',
-        priority: 'medium',
-        requiresAuth: false,
-        estimatedComplexity: 'medium',
-        relatedElements: [{ ref: cta.ref, role: cta.role, name: cta.name, tag: cta.tag }],
-      });
-    }
-
-    // 5. Data tables (CRUD operations)
+    // 4. Data tables (CRUD operations) — structural: a table/grid with action
+    // controls inside it (no English verb matching).
     if (entryPoints.length < MAX_FALLBACK_ENTRY_POINTS) {
-      const tables = elements.filter(el => el.tag === 'table' || el.role === 'grid');
+      const tables = elements.filter(el => el.tag === 'table' || el.role === 'grid' || el.role === 'table');
       if (tables.length > 0) {
-        const tableActions = buttons.filter(el =>
-          /edit|delete|remove|view|detail|update/i.test(el.name || ''),
-        );
+        const rowActions = buttons.filter(b => isClickable(b) && /(?:^|inside).*\b(?:row|table|grid)\b/i.test(b.context || ''));
+        const tableActions = rowActions.length > 0 ? rowActions : buttons.filter(isClickable).slice(0, 3);
         if (tableActions.length > 0) {
           entryPoints.push({
             name: 'Data Table Operations',
@@ -1699,9 +1701,9 @@ export class SurveyAgent {
       }
     }
 
-    // 6. File upload inputs
+    // 5. File upload inputs
     if (entryPoints.length < MAX_FALLBACK_ENTRY_POINTS) {
-      const fileInputs = inputs.filter(el => el.type === 'file');
+      const fileInputs = inputs.filter(isFileInput);
       if (fileInputs.length > 0) {
         entryPoints.push({
           name: 'File Upload',
@@ -1717,12 +1719,12 @@ export class SurveyAgent {
       }
     }
 
-    // 7. Navigation menu items (important links in nav areas)
+    // 6. Navigation menu items (important links in nav areas)
     if (entryPoints.length < MAX_FALLBACK_ENTRY_POINTS) {
       const navLinks = elements.filter(el =>
         el.tag === 'a' && el.href && el.visible &&
         (el.role === 'menuitem' || el.role === 'link') &&
-        el.name && el.name.length > 1 && el.name.length < 50,
+        bestLabel(el).length > 1 && bestLabel(el).length < 50,
       );
       if (navLinks.length >= 3) {
         entryPoints.push({

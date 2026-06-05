@@ -90,6 +90,13 @@ export interface LiteElement {
   isPositioned?: boolean;
   /** True if element is the topmost at its center point (not covered by overlay) */
   isTopMostAtCenter?: boolean;
+  /**
+   * True if element lies in a small fixed corner widget layer (geometry-derived,
+   * e.g. a chat/assistant bubble). Computed in-page (viewport-relative) so it is
+   * symmetric across the eval and CDP collectors. Used by the resolver to
+   * deprioritize widget children that would otherwise pollute the candidate set.
+   */
+  floatingWidget?: boolean;
   // Visual Anchors: Bounding box for spatial lookup (fallback when selectors fail)
   /** Element bounding box relative to viewport (for Visual Anchor matching) */
   bounds?: ElementBounds;

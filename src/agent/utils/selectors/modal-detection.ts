@@ -283,13 +283,32 @@ export const IRON_CLAD_MODAL_SELECTORS = [
 /**
  * Close/dismiss button selectors — used to find the dismiss action
  * within an obstacle element.
+ *
+ * Universal-first: structural close affordances (ARIA labels in several
+ * languages, `data-dismiss`/`data-close`, `btn-close` class) are the reliable,
+ * language-agnostic signal. Word lists are unavoidably partial — keep them as a
+ * weak tiebreaker, never the sole basis to click. See `EXPLICIT_CLOSE_AFFORDANCE`.
  */
 export const CLOSE_BUTTON_SELECTOR = [
-  // ARIA labels (case-insensitive)
+  // ARIA labels (case-insensitive). English + a spread of common non-English
+  // close/dismiss terms so consent/promo modals on non-English sites still
+  // expose a structural dismiss affordance.
   'button[aria-label*="close" i]',
   'button[aria-label*="dismiss" i]',
-  'button[aria-label*="закрыть" i]',
-  'button[aria-label*="отклонить" i]',
+  'button[aria-label*="закрыть" i]', // ru
+  'button[aria-label*="отклонить" i]', // ru
+  'button[aria-label*="cerrar" i]', // es
+  'button[aria-label*="fermer" i]', // fr
+  'button[aria-label*="schließen" i]', // de
+  'button[aria-label*="schliessen" i]', // de (no umlaut)
+  'button[aria-label*="chiudi" i]', // it
+  'button[aria-label*="fechar" i]', // pt
+  'button[aria-label*="sluiten" i]', // nl
+  'button[aria-label*="關閉" i]', // zh-Hant
+  'button[aria-label*="关闭" i]', // zh-Hans
+  'button[aria-label*="閉じる" i]', // ja
+  'button[aria-label*="닫기" i]', // ko
+  'button[aria-label*="إغلاق" i]', // ar
 
   // Class patterns
   '[class*="close"]',
@@ -304,6 +323,93 @@ export const CLOSE_BUTTON_SELECTOR = [
   'button[title*="close" i]',
   'button[title*="dismiss" i]',
 ].join(', ');
+
+/**
+ * Explicit close-affordance probe (run INSIDE page.evaluate on a candidate).
+ *
+ * Language-agnostic test for "this element is unambiguously a close control":
+ * a structural close attribute/class/role, OR an `aria-label`/`title` matching a
+ * close word in any supported language, OR a recognisable × glyph as its only
+ * text. This is the signal the dismisser requires before clicking a button —
+ * far safer on non-English sites than matching a visible text word list.
+ *
+ * Returns a JS expression string body? No — exported as a string of source that
+ * defines `hasExplicitCloseAffordance(el, win)` inside the evaluate sandbox,
+ * keeping a single source of truth without serialising a Node closure.
+ */
+export const CLOSE_AFFORDANCE_FN_SOURCE = `
+  function hasExplicitCloseAffordance(el) {
+    if (!el) return false;
+    var aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    var title = (el.getAttribute('title') || '').toLowerCase();
+    var meta = aria + ' ' + title;
+    // Structural attributes / classes / role — fully language-agnostic.
+    if (el.hasAttribute('data-dismiss') || el.hasAttribute('data-close')) return true;
+    var cls = (el.getAttribute('class') || '').toLowerCase();
+    if (/(^|[^a-z])(close|dismiss|btn-close)([^a-z]|$)/.test(cls)) return true;
+    // Multi-language close words in aria-label / title (not visible text — these
+    // attributes are authored explicitly, so a match is high-confidence).
+    var CLOSE_WORDS = ['close','dismiss','закрыть','отклонить','cerrar','fermer','schließen','schliessen','chiudi','fechar','sluiten','关闭','關閉','閉じる','닫기','إغلاق'];
+    for (var i = 0; i < CLOSE_WORDS.length; i++) {
+      if (meta.indexOf(CLOSE_WORDS[i]) !== -1) return true;
+    }
+    // × glyph as the element's ENTIRE text — the universal close icon.
+    var txt = (el.textContent || '').trim();
+    if (txt.length <= 2 && /^[×✕✖xX✗╳]$/.test(txt.replace(/\\s/g, ''))) return true;
+    return false;
+  }
+`;
+
+/**
+ * Destructive-action text patterns — buttons whose text matches these must
+ * NEVER be auto-clicked (delete / logout / unsubscribe / reset …).
+ *
+ * Universality contract: uses a Unicode-aware boundary `(?![\p{L}\p{N}])` (NOT
+ * `\b`, which is ASCII-only and never matches Cyrillic/CJK), and includes common
+ * non-English destructive terms. A miss here can cause real data loss (clicking
+ * "Удалить"/"删除" while auto-dismissing an overlay), so this is intentionally
+ * broad and the dismisser ALSO refuses to click any button lacking an explicit
+ * close affordance — the word list is a backstop, not the only guard.
+ *
+ * Two exported forms because consumers run in two contexts:
+ *   - DESTRUCTIVE_TEXT_REGEX — Node-side (`u` flag, lookahead boundary).
+ *   - DESTRUCTIVE_WORDS — plain word list for in-page substring checks where a
+ *     pre-built `u`-flag literal can't be re-derived cheaply.
+ */
+export const DESTRUCTIVE_WORDS: readonly string[] = [
+  // English
+  'delete', 'remove', 'unsubscribe', 'deactivate', 'disable', 'logout',
+  'log out', 'sign out', 'erase', 'reset', 'terminate', 'revoke', 'destroy',
+  'cancel subscription', 'clear all',
+  // Russian
+  'удалить', 'удали', 'выйти', 'выход', 'отписаться', 'деактивировать', 'сбросить', 'стереть',
+  // Spanish
+  'eliminar', 'borrar', 'cerrar sesión', 'cerrar sesion', 'desactivar',
+  // French
+  'supprimer', 'déconnexion', 'deconnexion', 'se déconnecter', 'désactiver',
+  // German
+  'löschen', 'loschen', 'abmelden', 'entfernen', 'deaktivieren',
+  // Portuguese / Italian
+  'excluir', 'apagar', 'sair', 'eliminare', 'disconnetti',
+  // CJK
+  '删除', '刪除', '注销', '登出', '退出', '削除', 'ログアウト', '삭제', '로그아웃',
+];
+
+/**
+ * Unicode-aware destructive-text matcher. `(?![\p{L}\p{N}])` is the boundary —
+ * matches a destructive term not immediately followed by another letter/number,
+ * so it works for Cyrillic/CJK where `\b` is silently inert.
+ */
+export const DESTRUCTIVE_TEXT_REGEX = new RegExp(
+  '(' +
+    DESTRUCTIVE_WORDS
+      // Words contain only letters and spaces — escape regex metachars, then
+      // collapse spaces to `\s*` so "log out" / "log  out" / "logout" all match.
+      .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*'))
+      .join('|') +
+  ')(?![\\p{L}\\p{N}])',
+  'iu',
+);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LAYER 3: MINIMAL REACTIVE FALLBACK PATTERNS

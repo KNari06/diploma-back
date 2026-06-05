@@ -20,23 +20,39 @@
 
 import { logger } from '@/utils/core/logger';
 import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
-import { AI_MODELS } from '@/config/ai/ai-models.config';
 
 import type { LiteSnapshot } from '../../lite-types';
 import { RateLimiter } from '../rate-limiter';
 import type { ExplorationTraceService } from '../exploration-trace.service';
 import type { CartographerInput, CartographerOutput, CartographerEntryPoint } from './agent-types';
+import { EXPLORATION_AGENT_LLM } from './agent-llm-config';
+import {
+  isPasswordInput,
+  isCredentialInput,
+  isSearchInput,
+  isEditableField,
+  isSubmitButton,
+  bestLabel,
+} from '../../analysis/interactive-element-signals';
 import {
   CARTOGRAPHER_SYSTEM_PROMPT,
   buildCartographerPrompt,
   parseCartographerResponse,
 } from './cartographer-prompts';
 
-/** Timeout for Cartographer AI call */
-const CARTOGRAPHER_TIMEOUT_MS = 25_000;
+/** Centralized LLM tuning for this agent (model / temp / tokens / timeout). */
+const LLM = EXPLORATION_AGENT_LLM.cartographer;
 
 /** Min interactive elements to justify a retry when AI returns empty */
 const RETRY_MIN_INTERACTIVE_ELEMENTS = 5;
+
+/**
+ * Max recursive retries on rate-limit errors before giving up. Mirrors Scout's
+ * cap — the limiter normally bounds this, but recordSuccess() resets its
+ * consecutive-failure counter, so intermittent 429s could otherwise recurse
+ * without a hard ceiling.
+ */
+const MAX_RATE_LIMIT_RETRIES = 2;
 
 export class Cartographer {
   /** Track URLs already retried to prevent infinite retry loops */
@@ -57,6 +73,7 @@ export class Cartographer {
   async analyze(
     input: CartographerInput,
     formattedSnapshot: string,
+    attempt = 0,
   ): Promise<CartographerOutput> {
     const { url } = input;
     const pageId = `page-${Date.now()}`;
@@ -89,7 +106,7 @@ export class Cartographer {
 
       this.trace?.writePageClassificationPrompt({
         url,
-        model: AI_MODELS.vision,
+        model: LLM.model,
         systemPrompt: CARTOGRAPHER_SYSTEM_PROMPT,
         userPrompt: input.screenshot ? '[multimodal content with screenshot]' : prompt,
         hasScreenshot: !!input.screenshot,
@@ -102,14 +119,14 @@ export class Cartographer {
             { role: 'user', content: userContent },
           ],
           {
-            model: AI_MODELS.vision,
-            temperature: 0.1,
-            max_tokens: 4000,
+            model: LLM.model,
+            temperature: LLM.temperature,
+            max_tokens: LLM.maxTokens,
             response_format: { type: 'json_object' },
           },
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Cartographer AI timeout')), CARTOGRAPHER_TIMEOUT_MS),
+          setTimeout(() => reject(new Error('Cartographer AI timeout')), LLM.timeoutMs),
         ),
       ]);
 
@@ -121,7 +138,7 @@ export class Cartographer {
 
       this.trace?.writePageClassificationResponse({
         url,
-        model: AI_MODELS.vision,
+        model: LLM.model,
         rawResponse: response.content,
         parsed: {
           pageType: result.pageType,
@@ -149,7 +166,7 @@ export class Cartographer {
             interactiveCount,
           });
           this.retriedUrls.add(url);
-          return this.analyze({ ...input, screenshot: undefined }, formattedSnapshot);
+          return this.analyze({ ...input, screenshot: undefined }, formattedSnapshot, attempt);
         }
       }
 
@@ -166,12 +183,13 @@ export class Cartographer {
 
       return result;
     } catch (error) {
-      // Handle rate limits with retry
+      // Handle rate limits with bounded retry (prevents unbounded recursion if
+      // intermittent 429s keep resetting the limiter's failure counter).
       if (RateLimiter.isRateLimitError(error as Error)) {
         const rlResult = await this.rateLimiter.recordFailure('openai', error as Error);
-        if (rlResult.shouldRetry) {
-          logger.info('[CARTOGRAPHER] Retrying after rate limit backoff', { url });
-          return this.analyze(input, formattedSnapshot);
+        if (rlResult.shouldRetry && attempt < MAX_RATE_LIMIT_RETRIES) {
+          logger.info('[CARTOGRAPHER] Retrying after rate limit backoff', { url, attempt: attempt + 1 });
+          return this.analyze(input, formattedSnapshot, attempt + 1);
         }
       }
 
@@ -186,7 +204,7 @@ export class Cartographer {
       // Log the failure in trace so it's visible alongside successful responses
       this.trace?.writePageClassificationResponse({
         url,
-        model: AI_MODELS.vision,
+        model: LLM.model,
         rawResponse: `[ERROR: ${errorMsg}]`,
         parsed: { pageType: 'error', entryPointCount: 0, navLinkCount: 0 },
         latencyMs: Date.now() - aiStartTime,
@@ -224,38 +242,31 @@ export class Cartographer {
     const elements = input.snapshot?.elements ?? [];
     const entryPoints: CartographerEntryPoint[] = [];
 
-    // Detect forms (look for password fields → login form)
-    const hasPasswordField = elements.some(el => el.type === 'password');
+    // Detect forms (look for password fields → login form). Password detection
+    // and identity-field classification are language-neutral (type/autocomplete
+    // + shared multilingual classifier), so this works on RU/KK/… sites too.
+    const hasPasswordField = elements.some(isPasswordInput);
     if (hasPasswordField) {
-      const emailField = elements.find(el => el.type === 'email' || /email/i.test(el.name || el.placeholder || ''));
-      const usernameField = elements.find(el => /username|login|user/i.test(el.name || el.placeholder || ''));
-      const fieldDesc = emailField
-        ? `email field "${emailField.name || emailField.placeholder || 'email'}"`
-        : usernameField
-          ? `username field "${usernameField.name || usernameField.placeholder || 'username'}"`
-          : 'credentials fields';
+      const identityEls = elements.filter(el => !isPasswordInput(el) && isCredentialInput(el));
+      const passwordEls = elements.filter(isPasswordInput);
       entryPoints.push({
         name: 'User Login',
-        goal: `Fill in the ${fieldDesc} and password field, then click the login/submit button to authenticate`,
+        goal: 'Fill in the identity and password fields, then submit the login form to authenticate',
         category: 'authentication',
         priority: 'critical',
         requiresAuth: false,
         estimatedComplexity: 'simple',
-        relatedElements: elements
-          .filter(el => el.type === 'password' || el.type === 'email' || /email|username|login/i.test(el.name || el.placeholder || ''))
+        relatedElements: [...identityEls, ...passwordEls]
           .slice(0, 5).map(el => ({ ref: el.ref, role: el.role, name: el.name, tag: el.tag })),
       });
     }
 
-    // Detect search inputs
-    const searchInputs = elements.filter(el =>
-      el.type === 'search' || /search/i.test(el.name || el.placeholder || el.role || ''),
-    );
+    // Detect search inputs (type=search / role=searchbox / inputmode=search)
+    const searchInputs = elements.filter(isSearchInput);
     if (searchInputs.length > 0) {
-      const searchEl = searchInputs[0];
       entryPoints.push({
         name: 'Search Functionality',
-        goal: `Click the search input "${searchEl.name || searchEl.placeholder || 'search box'}", type a relevant search query, and verify results appear`,
+        goal: 'Type a relevant query into the search input and verify results appear',
         category: 'search',
         priority: 'high',
         requiresAuth: false,
@@ -266,27 +277,16 @@ export class Cartographer {
       });
     }
 
-    // Detect form submissions (non-auth forms with multiple inputs)
-    const textInputs = elements.filter(el =>
-      (el.tag === 'input' || el.tag === 'textarea') &&
-      el.type !== 'password' && el.type !== 'hidden' && el.type !== 'search' &&
-      !el.disabled,
-    );
-    const submitButtons = elements.filter(el =>
-      (el.tag === 'button' || el.role === 'button') &&
-      /submit|send|save|create|add|register|sign\s*up/i.test(el.name || ''),
-    );
+    // Detect form submissions (non-auth forms with multiple editable fields).
+    // Submit control is identified structurally (type=submit / button), not by text.
+    const textInputs = elements.filter(el => isEditableField(el) && !isPasswordInput(el) && !isSearchInput(el) && !el.disabled);
+    const submitButtons = elements.filter(isSubmitButton);
     if (textInputs.length >= 2 && submitButtons.length > 0 && !hasPasswordField) {
-      const submitBtn = submitButtons[0];
-      const fieldNames = textInputs.slice(0, 3).map(el => el.name || el.placeholder || el.type).filter(Boolean);
-      // Derive a meaningful name from the submit button text or page context
-      const btnLabel = (submitBtn.name || '').trim();
-      const formName = /submit/i.test(btnLabel) || !btnLabel
-        ? `${fieldNames[0] || 'Form'} Submission`
-        : btnLabel;
+      const fieldNames = textInputs.slice(0, 3).map(bestLabel).filter(Boolean);
+      const formName = bestLabel(submitButtons[0]) || `${fieldNames[0] || 'Form'} Submission`;
       entryPoints.push({
         name: formName,
-        goal: `Fill in the form fields (${fieldNames.join(', ') || 'required fields'}) with valid test data and click "${submitBtn.name || 'submit'}" to submit`,
+        goal: `Fill in the form fields (${fieldNames.join(', ') || 'required fields'}) with valid test data and submit the form`,
         category: 'form_submission',
         priority: 'high',
         requiresAuth: false,
@@ -297,36 +297,20 @@ export class Cartographer {
       });
     }
 
-    // Detect prominent CTA buttons
-    const ctaButtons = elements.filter(el =>
-      (el.tag === 'button' || el.role === 'button' || (el.tag === 'a' && el.role === 'link')) &&
-      el.visible && !el.disabled &&
-      /get\s*started|try|demo|sign\s*up|register|contact|learn/i.test(el.name || ''),
-    );
-    for (const btn of ctaButtons.slice(0, 3)) {
-      entryPoints.push({
-        name: `${btn.name || 'CTA'} Flow`,
-        goal: `Click the "${btn.name || 'CTA button'}" button and complete any resulting form or redirect flow`,
-        category: 'navigation',
-        priority: 'medium',
-        requiresAuth: false,
-        estimatedComplexity: 'simple',
-        relatedElements: [{ ref: btn.ref, role: btn.role, name: btn.name, tag: btn.tag }],
-      });
-    }
-
-    // Detect navigation links from snapshot
+    // Detect navigation links from snapshot (language-neutral: tag/href/role)
     const navLinks = elements.filter(el =>
       el.tag === 'a' && el.href && el.visible && !el.disabled &&
-      el.name && el.name.length > 1 && el.name.length < 50,
+      bestLabel(el).length > 1 && bestLabel(el).length < 50,
     );
     const navigationLinks = navLinks.slice(0, 10).map(el => ({
       ref: el.ref,
-      label: el.name || '',
+      label: bestLabel(el),
       estimatedPageType: 'other' as string,
     }));
 
-    const isLoginPage = hasPasswordField || /login|signin|sign-in/i.test(input.url);
+    // Login-page heuristic: presence of a password field. URL keyword matching
+    // removed — it only ever recognised English paths (/login, /signin).
+    const isLoginPage = hasPasswordField;
 
     return {
       pageType: isLoginPage ? 'login' : 'unknown',
