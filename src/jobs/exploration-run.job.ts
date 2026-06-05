@@ -13,16 +13,13 @@ import { ExplorationStorageService } from '@/services/testing/exploration/explor
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
+import { EXPLORATION_DISCOVERY_CREDITS } from '@/config/testing/intelligent-test-limits';
 import { logger } from '@/utils/core/logger';
 
-/**
- * Fixed credit cost charged once per completed discovery run. Discovery is a
- * ~2-min browser session + LLM survey/flow generation (the 'quick' preset),
- * priced roughly like a small test. Running the *discovered* tests is billed
- * separately, per-step, on the run-discovered path — so this does not
- * double-charge. Charged only on successful completion, best-effort.
- */
-const EXPLORATION_DISCOVERY_CREDITS = 10;
+// Rough USD cost recorded alongside the discovery credit deduction (~2-min
+// browser + LLM survey). Credits are the single source of truth for billing;
+// this is for cost analytics only. The credit amount itself lives in
+// intelligent-test-limits.ts so the /start gate and this charge stay in sync.
 const EXPLORATION_DISCOVERY_COST_USD = 0.01;
 
 export class ExplorationRunJobHandler {

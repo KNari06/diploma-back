@@ -1,5 +1,6 @@
 import { requireAuth, requireApproved, requireCredits } from '@/middleware/auth.middleware';
 import { Router } from 'express';
+import { EXPLORATION_DISCOVERY_CREDITS } from '@/config/testing/intelligent-test-limits';
 import {
   listExplorations,
   getExploration,
@@ -14,10 +15,12 @@ const router = Router();
 
 // Start an autonomous exploration from a URL (self-serve "magic first test").
 // Declared before the '/:explorationId' GET routes so '/start' is not captured
-// as an id param. requireCredits(1) is an entry gate (must have a positive
-// balance to start); the fixed discovery cost is charged on completion in
-// exploration-run.job.ts. Running the discovered tests is billed separately.
-router.post('/start', requireAuth, requireApproved, requireCredits(1), startExploration);
+// as an id param. The credit gate requires the SAME amount that the job
+// charges on completion (EXPLORATION_DISCOVERY_CREDITS) — otherwise a user
+// could pass a smaller gate then fail the real charge (free tier grace = 0),
+// getting the discovery for free. Running the discovered tests is billed
+// separately, per step, on the run-discovered path.
+router.post('/start', requireAuth, requireApproved, requireCredits(EXPLORATION_DISCOVERY_CREDITS), startExploration);
 
 // List exploration runs for a project
 router.get('/', requireAuth, listExplorations);
