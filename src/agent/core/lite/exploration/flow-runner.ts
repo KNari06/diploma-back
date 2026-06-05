@@ -164,7 +164,7 @@ export class FlowRunner {
   }
 
   private emitProgress(
-    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found' | 'flow_step',
+    event: 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'branch_found' | 'flow_step' | 'auth_started' | 'auth_completed',
     data: Record<string, any>,
   ): void {
     if (!this.onProgress) return;
@@ -861,6 +861,9 @@ export class FlowRunner {
       'Find the email or username input field and fill it with credentials, then find the password field and fill it, then click the login or sign in button to submit the form',
     ];
 
+    // Surface login progress to the UI (frontend reads data.loginUrl / data.success).
+    this.emitProgress('auth_started', { loginUrl: this.config.entryUrl });
+
     for (let attempt = 0; attempt < goals.length; attempt++) {
       const loginStartTime = Date.now();
       try {
@@ -871,7 +874,10 @@ export class FlowRunner {
           success,
           durationMs: Date.now() - loginStartTime,
         });
-        if (success) return;
+        if (success) {
+          this.emitProgress('auth_completed', { success: true });
+          return;
+        }
         logger.warn('[FLOW_RUNNER] Login attempt failed', { attempt, goal: goals[attempt] });
       } catch (error) {
         this.trace?.writeFlowLoginAttempt({
@@ -885,6 +891,7 @@ export class FlowRunner {
       }
     }
 
+    this.emitProgress('auth_completed', { success: false });
     logger.warn('[FLOW_RUNNER] All login attempts failed');
   }
 

@@ -31,6 +31,7 @@ export type ExplorationProgressEvent = {
   event:
     | 'page_discovered' | 'survey_complete'
     | 'strategy_planned'
+    | 'auth_started' | 'auth_completed'
     | 'flow_started' | 'flow_completed' | 'flow_failed' | 'flow_blocked' | 'flow_step' | 'branch_found'
     | 'coverage_evaluated'
     | 'agent_warning' | 'agent_error';
