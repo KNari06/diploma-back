@@ -14,8 +14,9 @@ const router = Router();
 
 // Start an autonomous exploration from a URL (self-serve "magic first test").
 // Declared before the '/:explorationId' GET routes so '/start' is not captured
-// as an id param. Gated by approval + a credit balance check, since an
-// exploration spins up a live browser and consumes credits.
+// as an id param. requireCredits(1) is an entry gate (must have a positive
+// balance to start); the fixed discovery cost is charged on completion in
+// exploration-run.job.ts. Running the discovered tests is billed separately.
 router.post('/start', requireAuth, requireApproved, requireCredits(1), startExploration);
 
 // List exploration runs for a project

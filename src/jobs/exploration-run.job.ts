@@ -12,7 +12,18 @@ import { validateAuthFixture, isAuthFixtureNonEmpty } from '@/agent/core/lite/ex
 import { ExplorationStorageService } from '@/services/testing/exploration/exploration-storage.service';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { ChatService } from '@/services/utils/chat.service';
+import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { logger } from '@/utils/core/logger';
+
+/**
+ * Fixed credit cost charged once per completed discovery run. Discovery is a
+ * ~2-min browser session + LLM survey/flow generation (the 'quick' preset),
+ * priced roughly like a small test. Running the *discovered* tests is billed
+ * separately, per-step, on the run-discovered path — so this does not
+ * double-charge. Charged only on successful completion, best-effort.
+ */
+const EXPLORATION_DISCOVERY_CREDITS = 10;
+const EXPLORATION_DISCOVERY_COST_USD = 0.01;
 
 export class ExplorationRunJobHandler {
   static async process(job: Job<ExplorationJobData>): Promise<void> {
@@ -160,6 +171,26 @@ export class ExplorationRunJobHandler {
 
       // Mark run as completed
       await ExplorationStorageService.completeRun(explorationId, result);
+
+      // Charge the fixed discovery cost once, on success. Best-effort: a
+      // failed deduction must never fail the exploration the user already
+      // received (mirrors the telemetry-write invariant).
+      try {
+        await CreditCostTrackerService.deductCreditsForTest({
+          userId,
+          testType: 'intelligent',
+          credits: EXPLORATION_DISCOVERY_CREDITS,
+          costUSD: EXPLORATION_DISCOVERY_COST_USD,
+          testId: explorationId,
+          description: `Exploration discovery — ${entryUrl}`,
+        });
+      } catch (creditError) {
+        logger.warn('[EXPLORATION_JOB] Discovery credit deduction failed (non-critical)', {
+          explorationId,
+          userId,
+          error: creditError instanceof Error ? creditError.message : String(creditError),
+        });
+      }
 
       // Save chat messages
       if (chatSessionId) {
