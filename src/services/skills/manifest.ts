@@ -26,6 +26,9 @@ export const SKILL_MANIFEST: SkillEntry[] = [
   // ── QA tools ────────────────────────────────────────────────────────
   { load: () => import('./qa/qa.skill') },
 
+  // ── Notify (cross-channel owner notifications: telegram/slack/in-app) ─
+  { load: () => import('./collab/notify.skill') },
+
   // ── Knowledge Base (always available, searches uploaded docs) ───────
   { load: () => import('./kb/kb.skill') },
 

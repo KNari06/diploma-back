@@ -43,9 +43,15 @@ describe('nodeIdentityTokens — filtering', () => {
   });
 
   it('only keeps meaningful autocomplete tokens, drops on/off', () => {
-    expect(nodeIdentityTokens(node({ autocomplete: 'current-password' })).has('password')).toBe(true);
+    // current-password is honoured ONLY when the type agrees (real password
+    // field). On a typeless/text node it is treated as autofill-suppression
+    // noise and dropped — see the documentolog folder_search case.
+    expect(nodeIdentityTokens(node({ type: 'password', autocomplete: 'current-password' })).has('password')).toBe(true);
+    expect(nodeIdentityTokens(node({ autocomplete: 'current-password' })).has('password')).toBe(false); // no type → noise
     expect(nodeIdentityTokens(node({ autocomplete: 'off' })).size).toBe(0);
     expect(nodeIdentityTokens(node({ autocomplete: 'on' })).size).toBe(0);
+    // Non-credential meaningful tokens are still kept regardless of type.
+    expect(nodeIdentityTokens(node({ type: 'tel', autocomplete: 'tel' })).has('tel')).toBe(true);
   });
 
   it('strips generic tokens from testId', () => {
@@ -152,6 +158,32 @@ describe('evaluateHonestyGuard — adversarial edge cases', () => {
   it('email intent matches email field via identity', () => {
     const email = node({ type: 'email', name: 'email', placeholder: 'Электронная почта' });
     pass(evaluateHonestyGuard({ intentText: 'email', chosenNode: email, mode: 'apply' }));
+  });
+
+  it('does NOT mint a "password" token from anti-autofill autocomplete on a search box', () => {
+    // REAL case (documentolog inbox): <input type=text name=folder_search
+    //   placeholder="Поиск" autocomplete="new-password"> — the new-password
+    //   is autofill suppression, NOT a credential field. Must not produce a
+    //   "password" identity token, else intent "password" falsely matches.
+    const searchBox = node({
+      type: 'text',
+      name: 'folder_search',
+      placeholder: 'Поиск по документам',
+      autocomplete: 'new-password',
+    });
+    const tokens = nodeIdentityTokens(searchBox);
+    expect(tokens.has('password')).toBe(false);
+    expect(tokens.has('search')).toBe(true); // from name=folder_search — legit
+    // And the guard must REJECT intent "password" pointed at this search box.
+    reject(evaluateHonestyGuard({ intentText: 'password', chosenNode: searchBox, mode: 'apply' }));
+    // But intent "search" SHOULD still pass (name carries it).
+    pass(evaluateHonestyGuard({ intentText: 'search documents', chosenNode: searchBox, mode: 'apply' }));
+  });
+
+  it('STILL honours autocomplete=current-password on a real password field', () => {
+    // Regression guard: the contradiction filter must not break the genuine case.
+    const realPw = node({ type: 'password', autocomplete: 'current-password' });
+    expect(nodeIdentityTokens(realPw).has('password')).toBe(true);
   });
 
   it('hasTokenOverlap respects 3-char substring rule', () => {

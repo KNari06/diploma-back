@@ -84,12 +84,22 @@ const MIN_API_URL_LENGTH = 7; // Minimum valid URL length ("http://x")
  * Detects Russian vs English based on Cyrillic characters
  * TODO: Re-enable AI-based detection when KB service is re-enabled
  */
-function detectLanguageSimple(message: string): 'en' | 'ru' | 'neutral' {
+function detectLanguageSimple(message: string): 'en' | 'ru' | 'kk' | 'neutral' {
   if (!message || typeof message !== 'string' || message.trim().length < 2) {
     return 'neutral';
   }
 
-  // Check for Cyrillic characters (Russian)
+  // Kazakh shares most of its alphabet with Russian Cyrillic but adds 9
+  // distinctive letters. Their presence is a strong, unambiguous signal for
+  // Kazakh — check it BEFORE the generic Cyrillic→Russian rule below.
+  const kazakhSpecific = /[әғқңөұүһіӘҒҚҢӨҰҮҺІ]/;
+  if (kazakhSpecific.test(message)) {
+    return 'kk';
+  }
+
+  // Check for Cyrillic characters (Russian — incl. Kazakh letters as a tail
+  // count so a mostly-Cyrillic message without the distinctive letters still
+  // reads as Russian rather than English).
   const cyrillicPattern = /[А-Яа-яЁё]/;
   const hasCyrillic = cyrillicPattern.test(message);
 
@@ -309,7 +319,7 @@ function validateAndPrepareMessage(message: string): string | null {
  */
 async function getKBRulesContext(
   trimmedMessage: string,
-  userLanguage: 'en' | 'ru' | 'neutral',
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral',
   context?: IntentParserContext,
   projectId?: string
 ): Promise<{
@@ -406,7 +416,7 @@ IMPORTANT: Follow these guidelines when parsing user intent and generating respo
 function handleHighConfidenceResult(
   intentResult: IntentResult,
   confidence: number,
-  userLanguage: 'en' | 'ru' | 'neutral'
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral'
 ): IntentResult | null {
     logger.info('[INTENT_PARSER] Initial parse confidence', {
       confidence,
@@ -442,7 +452,7 @@ function handleHighConfidenceResult(
 //   intentResult?: IntentResult,
 //   confidence?: number,
 //   cacheKey?: string,
-//   userLanguage?: 'en' | 'ru' | 'neutral'
+//   userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'
 // ): Promise<IntentResult | null> {
 //   if (!intentResult || confidence === undefined || !cacheKey) {
 //     return null;
@@ -581,7 +591,7 @@ function isIntentCompleteness(intentResult: IntentResult): boolean {
 function createFallbackResult(
   intentResult: IntentResult,
   confidence: number,
-  userLanguage: 'en' | 'ru' | 'neutral' = 'neutral'
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral' = 'neutral'
 ): IntentResult {
   // If AI explicitly returned needs_clarification, respect its decision
   if (intentResult.intent === 'needs_clarification') {
@@ -777,7 +787,7 @@ function getPossibleIntents(intentResult: IntentResult): string[] {
 //   ragResults: any,
 //   cacheKey: string,
 //   trimmedMessage: string,
-//   userLanguage?: 'en' | 'ru' | 'neutral'
+//   userLanguage?: 'en' | 'ru' | 'kk' | 'neutral'
 // ): IntentResult {
 //       const enhancedConfidence = calculateConfidence(enhancedResult, trimmedMessage);
 //
@@ -2138,16 +2148,19 @@ export function calculateConfidence(intentResult: IntentResult, message: string)
  * Tries exact language match first, then falls back to other languages.
  */
 function getCachedRulesWithFallback(
-  userLanguage: 'en' | 'ru' | 'neutral'
+  userLanguage: 'en' | 'ru' | 'kk' | 'neutral'
 ): { content: string; language: 'en' | 'ru'; fallbackUsed: boolean } | null {
   try {
-    // Step 1: Try exact language match (if not neutral)
-    if (userLanguage !== 'neutral') {
-      const exactRules = RulesCacheService.getRules(userLanguage as 'en' | 'ru');
+    // Step 1: Try exact language match. Rules only exist for 'en'/'ru' today;
+    // 'kk' (Kazakh) and 'neutral' have no dedicated rule set, so they skip
+    // straight to the fallbacks below (English, then Russian — Russian being
+    // the closest available to Kazakh).
+    if (userLanguage === 'en' || userLanguage === 'ru') {
+      const exactRules = RulesCacheService.getRules(userLanguage);
       if (exactRules) {
         return {
           content: exactRules,
-          language: userLanguage as 'en' | 'ru',
+          language: userLanguage,
           fallbackUsed: false,
         };
       }

@@ -70,6 +70,9 @@ EDGE CASES:
 - "Run tests and show results" → single_tool (qa category handles both run + results)
 - "Show my test cases" → single_tool (qa_read)
 - "Create a test and send notification" → multi_tool only if test + notification are different categories
+- "Run X and notify/ping the owner if it fails" / "запусти X и пни owner если упадёт" → multi_tool (qa + notify) — use the "notify" category (notify_owner reaches the owner across all their channels), NOT a specific channel, unless the user names one ("post to Slack" → qa + slack)
+- "Run X and let me know" when it implies acting after the result (not just a chat reply) → multi_tool (qa + notify)
+- "Run X, wait for the result, then do Y" / "запусти X, дождись результата и сделай Y" → multi_tool (qa + the category Y needs) — a run-then-act flow spans categories even when phrased as one sentence
 - If user asks to explain or summarize data already visible in conversation → simple_chat (re-fetch NOT needed)
 - Any request for QA data (test cases, results, bugs, analytics, coverage) in ANY language → single_tool (qa_read) — NEVER simple_chat
 - Quantitative questions about test metrics → single_tool (qa_read) — always requires tool call

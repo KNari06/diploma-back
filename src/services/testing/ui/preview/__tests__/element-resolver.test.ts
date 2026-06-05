@@ -350,6 +350,69 @@ describe('ElementResolverService', () => {
       // Both elements should be in allowed sets for LLM (no short-circuit, no text matching)
       expect(result.hardAllowed.length + result.softAllowed.length).toBe(2);
     });
+
+    // ── Floating corner widget (Rule 0b) ────────────────────────────────
+    describe('floating corner widget', () => {
+      it('soft-penalizes a floating widget node when it is not the target', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'Submit', isTopMostAtCenter: true },
+          { tag: 'button', ref: 'e2', isVisible: true, text: 'Close hint', floatingWidget: true, isTopMostAtCenter: true },
+        ];
+
+        const { hardAllowed, softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click');
+        expect(hardAllowed.map(n => n.ref)).toEqual(['e1']);
+        expect(softAllowed.map(n => n.ref)).toEqual(['e2']);
+        expect(ruleTrace.some(r => r.ruleId === 'widget.floating_deprioritized' && r.affectedRefs.includes('e2'))).toBe(true);
+        expect(ruleTrace.some(r => r.ruleId === 'widget.floating_detected')).toBe(true);
+      });
+
+      it('hard-excludes a floating widget node that covers the target', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'Submit', isTopMostAtCenter: true },
+          { tag: 'div', ref: 'e2', isVisible: true, floatingWidget: true, isTopMostAtCenter: false },
+        ];
+
+        const { hardAllowed, softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click');
+        expect(hardAllowed.map(n => n.ref)).toEqual(['e1']);
+        expect(softAllowed.map(n => n.ref)).not.toContain('e2');
+        expect(ruleTrace.some(r => r.ruleId === 'widget.covers_target_excluded' && r.affectedRefs.includes('e2'))).toBe(true);
+      });
+
+      it('keeps a floating widget node unpenalized when the step targets it (strong fingerprint)', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'Submit', isTopMostAtCenter: true },
+          { tag: 'button', ref: 'e2', isVisible: true, testIdAttr: 'chat-send', floatingWidget: true, isTopMostAtCenter: true },
+        ];
+        const recordedFingerprint = { testIdAttr: 'chat-send' } as IntentStep['recordedFingerprint'];
+
+        const { hardAllowed, softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click', undefined, recordedFingerprint);
+        // e2 IS the target → kept in hardAllowed, no soft penalty.
+        expect(hardAllowed.map(n => n.ref).sort()).toEqual(['e1', 'e2']);
+        expect(softAllowed.map(n => n.ref)).not.toContain('e2');
+        expect(ruleTrace.some(r => r.ruleId === 'widget.target_escape_hatch' && r.affectedRefs.includes('e2'))).toBe(true);
+      });
+
+      it('still soft-penalizes a widget node when the strong fingerprint contradicts it', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e2', isVisible: true, testIdAttr: 'chat-send', floatingWidget: true, isTopMostAtCenter: true },
+        ];
+        const recordedFingerprint = { testIdAttr: 'real-submit' } as IntentStep['recordedFingerprint'];
+
+        const { softAllowed, ruleTrace } = buildAllowedSets(nodes, 'click', undefined, recordedFingerprint);
+        expect(softAllowed.map(n => n.ref)).toEqual(['e2']);
+        expect(ruleTrace.some(r => r.ruleId === 'widget.floating_deprioritized')).toBe(true);
+      });
+
+      it('does not touch ordinary (non-widget) nodes', () => {
+        const nodes: InteractiveNode[] = [
+          { tag: 'button', ref: 'e1', isVisible: true, text: 'A', isTopMostAtCenter: true },
+          { tag: 'button', ref: 'e2', isVisible: true, text: 'B', isTopMostAtCenter: true },
+        ];
+        const { hardAllowed, ruleTrace } = buildAllowedSets(nodes, 'click');
+        expect(hardAllowed.map(n => n.ref).sort()).toEqual(['e1', 'e2']);
+        expect(ruleTrace.some(r => r.ruleId.startsWith('widget.'))).toBe(false);
+      });
+    });
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -547,8 +610,18 @@ describe('ElementResolverService', () => {
       expect(result.confidence).toBeGreaterThanOrEqual(0.55);
     });
 
-    it('should return resolved for cross-language match when LLM correctly identifies element', async () => {
-      // "Войти" = "Login" — LLM handles cross-language matching
+    it('should reject a pure-translation pick on a bare button (no shared tokens, no technical identity)', async () => {
+      // "Войти" = "Login" — but e3 is a bare <button>Login</button> with NO
+      // type/name/autocomplete/testId. The honesty guard (evaluateHonestyGuard)
+      // tokenizes intent {войти} vs label {login}: zero overlap, and the button
+      // has no technical-identity tokens for the cross-language escape hatch to
+      // match on. This is structurally identical to the "Панорама 360" vs
+      // "Заказать звонок" hallucination the guard exists to catch — there is no
+      // token-level signal distinguishing a legit translation from a confident
+      // wrong pick, so the guard (correctly) rejects both. Pure label
+      // translation with no identity needs embeddings; the guard must NOT be
+      // weakened to let this through (it would re-open same-language
+      // hallucinations). See element-resolver-honesty-guard.test.ts.
       mockGetChatCompletion.mockResolvedValue({
         content: JSON.stringify({ ref: 'e3', confidence: 0.9, reason: 'Войти matches Login button' }),
       } as any);
@@ -560,8 +633,8 @@ describe('ElementResolverService', () => {
         pageUrl: 'https://example.com/login',
       });
 
-      expect(result.status).toBe('resolved');
-      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+      expect(result.status).toBe('not_found');
+      expect(result.confidence).toBe(0);
     });
   });
 });

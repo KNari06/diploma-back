@@ -292,6 +292,14 @@ const envSchema = z.object({
   // WebSocket streaming is unaffected by this flag.
   MOBILE_AGENT_PERSIST_REASONING: z.string().transform(v => v.trim().toLowerCase() !== 'false').default('true'),
 
+  // Full LLM prompt+completion persistence to ai_call_logs (for hallucination
+  // debugging). OPT-IN and OFF by default — unlike the reasoning flag above —
+  // because it stores the richest, most sensitive data (even after redaction)
+  // and adds DB volume. Enable in dev/staging or per-incident to debug AI
+  // failures. Text is always passed through redactForPersist first; rows carry
+  // a 30-day TTL. Set to 'true' to enable.
+  LLM_IO_PERSIST_ENABLED: z.string().transform(v => v.trim().toLowerCase() === 'true').default('false'),
+
   // ──────────────────────────────────────────────────────────────────
   // Phase 4 (May 2026): mobile regression concurrency cap.
   //
