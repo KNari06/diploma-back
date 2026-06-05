@@ -3,6 +3,8 @@ import { env } from '@/config/environment/env';
 import { WorkspaceService } from '@/services/core/workspace.service';
 import { ProjectService } from '@/services/core/project.service';
 import { ProjectContextService } from '@/services/utils/project-context.service';
+import { PricingPlansService } from '@/services/core/pricing-plans.service';
+import { UserCreditsService } from '@/services/core/user-credits.service';
 import {
   approvePendingUser,
   fetchUserStatus,
@@ -49,6 +51,11 @@ export class SelfServeProvisioningService {
       if (workspaceId) {
         await this.ensureDefaultProject(userId, workspaceId);
       }
+
+      // Trial credits + plan: a self-serve user must see a usable balance the
+      // moment they land, not lazily on their first paid action (otherwise
+      // /auth/me reports 0 and the exploration credit-gate would reject them).
+      await this.ensureTrialCreditsAndPlan(userId);
     } catch (error) {
       // Best-effort: log and swallow. The next auth call retries. `approved`
       // keeps whatever the approval step returned before the failure.
@@ -109,5 +116,19 @@ export class SelfServeProvisioningService {
       workspace_id: workspaceId,
     });
     logger.info('[SELF_SERVE] Default project created', { userId, workspaceId });
+  }
+
+  /**
+   * Assign the free plan and materialise the user_credits row so the 50-credit
+   * welcome bonus is granted up-front. Both steps are idempotent:
+   *   - assignPlanToUser is a plain update to users.plan_id
+   *   - getOrCreateUserCredits only grants the bonus once (free/null plan AND
+   *     balance 0); on a returning user the row exists and it's a no-op
+   * Plan is assigned BEFORE credits so the bonus check sees a 'free' plan.
+   */
+  private static async ensureTrialCreditsAndPlan(userId: string): Promise<void> {
+    await PricingPlansService.assignPlanToUser(userId, 'free');
+    await UserCreditsService.getOrCreateUserCredits(userId);
+    logger.info('[SELF_SERVE] Trial plan + credits ensured', { userId });
   }
 }
