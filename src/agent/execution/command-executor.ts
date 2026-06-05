@@ -12,6 +12,7 @@ import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2
 import { evaluateEvidenceShortcut } from '@/services/testing/ui/preview/evidence-shortcut.utils';
 import { waitForHoverEffect } from '@/services/testing/ui/wait-phases/hover-effect-settle';
 import { smartStepWait } from '@/services/testing/ui/smart-step-wait.service';
+// eslint-disable-next-line no-duplicate-imports
 import type { IntentActionType } from '@/services/testing/ui/preview/preview.types';
 import { diagnoseStepBlocker, actOnDiagnosis } from '@/services/testing/ui/preview/step-blocker-diagnosis.service';
 import { COMMAND_EXECUTOR_CONFIG, STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
@@ -263,6 +264,16 @@ export class CommandExecutor {
   /** Per-run budget for the LLM tier of blocking-overlay clearing (tier3). */
   private static readonly MAX_LLM_OVERLAY_CLEARS = 3;
   private llmOverlayClears = 0;
+  /** Overall test goal — passed to the heal resolver as journey context. */
+  private testGoal?: string;
+  /**
+   * Sliding window of recent SUCCESSFUL step descriptions (descriptions only —
+   * never input values, which may carry secrets). Fed to the heal resolver so
+   * it has the "user's narrative" (what was done before this failing step) and
+   * can disambiguate drift. Capped at RECENT_STEPS_WINDOW.
+   */
+  private recentStepDescriptions: string[] = [];
+  private static readonly RECENT_STEPS_WINDOW = 3;
   private selfHealingEnabled: boolean = true;
   private metadata: { url: string; projectId?: string; userId?: string };
   private abortController: AbortController;
@@ -271,12 +282,21 @@ export class CommandExecutor {
   private externalAbortHandler?: () => void; // ✅ FIX 1: Store handler for cleanup
   private selfHealingConfidenceThreshold: number = COMMAND_EXECUTOR_CONFIG.selfHealingConfidenceThreshold;
   private maxHealAttempts: number = COMMAND_EXECUTOR_CONFIG.maxHealAttempts;
-  // Shared heal-credit budget across BOTH the intent-path heal (tryGetLocatorForIntentCommand)
-  // and the selector-path heal (executeWithSelfHealing). Each successful auto-applied heal
-  // charges 1 credit; when this counter reaches maxHealAttempts we stop charging even if
-  // subsequent heals happen. Without this, a failing step could be charged by both paths
-  // independently (2-3 credits per step instead of 1).
+  // Heal-credit accounting. We charge EXACTLY ONCE per step that auto-heals
+  // successfully — no more, no less:
+  //   - `currentStepHealCharged` is reset at the start of every executeCommand
+  //     and set true on the first successful auto-applied heal of THAT step.
+  //     Both heal paths (intent-path getLocatorForIntentCommand + selector-path
+  //     executeWithSelfHealing) consult it, so a single step is never charged
+  //     twice even when both paths fire (the bug the old run-level cap guarded).
+  //   - `instanceHealChargesSpent` is kept ONLY as an observability counter
+  //     (logged), no longer a billing gate. The previous run-level cap
+  //     (`< maxHealAttempts`) silently made every heal AFTER the Nth one FREE,
+  //     under-charging long tests; per-step dedup fixes that while preserving
+  //     the no-double-charge guarantee.
   private instanceHealChargesSpent: number = 0;
+  /** Reset per executeCommand; true once this step's heal has been billed. */
+  private currentStepHealCharged: boolean = false;
   private skipCompiledPlan: boolean = false; // Skip Stage 1 on retry attempts
   private maxDomNodes?: number; // Configurable DOM node limit (saves memory in replay mode)
   /** Runtime metadata for each step (keyed by stepId) */
@@ -312,6 +332,7 @@ export class CommandExecutor {
       maxDomNodes?: number; // Limit DOM nodes collected (saves memory in replay mode)
       replayTrace?: ReplayTraceWriter; // V14: JSONL trace writer for local debugging
       totalSteps?: number; // V14: Total steps for trace events
+      testGoal?: string; // Overall test goal — heal journey context
     } = {}
   ) {
     this.page = page;
@@ -323,6 +344,7 @@ export class CommandExecutor {
     this.maxDomNodes = options.maxDomNodes;
     this.replayTrace = options.replayTrace;
     this.totalSteps = options.totalSteps;
+    this.testGoal = options.testGoal;
 
     this.abortController = new AbortController();
 
@@ -340,6 +362,8 @@ export class CommandExecutor {
   resetRunState(): void {
     this.extractedData.clear();
     this.stepRuntimeMeta.clear();
+    this.recentStepDescriptions = [];
+    this.llmOverlayClears = 0;
     logger.debug('[COMMAND_EXECUTOR] Run state reset');
   }
 
@@ -466,6 +490,11 @@ export class CommandExecutor {
     runtimeMeta?: StepRuntimeMeta;
   }> {
     this.checkAborted();
+
+    // Per-step heal-billing dedup: fresh for each command. The first successful
+    // auto-applied heal of THIS step charges 1 credit and flips this true; any
+    // second heal path on the same step then sees it and does not re-charge.
+    this.currentStepHealCharged = false;
 
     const { action, value, url, timeout, continueOnError, description } = command;
 
@@ -2730,6 +2759,16 @@ export class CommandExecutor {
         ? this.stepRuntimeMeta.get(intentCommand.intentMeta?.stepId || '')
         : undefined;
 
+      // Record this successful step's DESCRIPTION (never its value/secrets) into
+      // the journey buffer so a LATER step's heal can see "what was done before".
+      const stepDesc = intentCommand.intentMeta?.intentDescription;
+      if (stepDesc) {
+        this.recentStepDescriptions.push(stepDesc.slice(0, 80));
+        if (this.recentStepDescriptions.length > CommandExecutor.RECENT_STEPS_WINDOW) {
+          this.recentStepDescriptions.shift();
+        }
+      }
+
       return { success: true, runtimeMeta };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -3704,6 +3743,16 @@ export class CommandExecutor {
             pageUrl: this.page.url(),
             includeAlternatives: false,
             screenshot: () => captureSmartScreenshot(pageForScreenshot),
+            // Journey context: the user's narrative (test goal + the steps
+            // completed before this failing one) so heal can disambiguate
+            // drift (e.g. "we just logged in → this is login submit, not
+            // settings submit"). Descriptions only — never input values.
+            healContext: {
+              testGoal: this.testGoal,
+              priorSteps: this.recentStepDescriptions.slice(-CommandExecutor.RECENT_STEPS_WINDOW),
+              stepIndex: intentMeta.stepIndex,
+              totalSteps: this.totalSteps,
+            },
           });
 
           if (resolveResult.status === 'resolved' && resolveResult.candidates.length > 0) {
@@ -3827,11 +3876,26 @@ export class CommandExecutor {
                       description: intentMeta.intentDescription,
                       bindingHints: intentMeta.bindingHints,
                       evidence: intentMeta.evidence,
+                      // Parity with the primary heal call above: below-the-fold
+                      // heals must NOT run blind. Forward the same strong recorded
+                      // identity so the resolver's identity fast-path can fire on
+                      // the freshly-revealed nodes (was missing — scroll heals
+                      // resolved on description + soft hints only).
+                      recordedFingerprint: intentMeta.recordedFingerprint,
+                      recordedDescription: intentMeta.recordedDescription,
                     },
                     domNodes: freshNodes,
                     pageUrl: this.page.url(),
                     includeAlternatives: false,
                     screenshot: () => captureSmartScreenshot(this.page),
+                    // Same journey context as the primary heal so a scroll-revealed
+                    // step is disambiguated with the test goal + prior steps too.
+                    healContext: {
+                      testGoal: this.testGoal,
+                      priorSteps: this.recentStepDescriptions.slice(-CommandExecutor.RECENT_STEPS_WINDOW),
+                      stepIndex: intentMeta.stepIndex,
+                      totalSteps: this.totalSteps,
+                    },
                   });
 
                   if (scrollResolve.status === 'resolved' && scrollResolve.candidates.length > 0) {
@@ -4095,9 +4159,11 @@ export class CommandExecutor {
             };
             this.stepRuntimeMeta.set(stepId, runtimeMeta);
 
-            // Deduct 1 credit for successful auto-applied heal — bounded by
-            // maxHealAttempts across BOTH paths via instanceHealChargesSpent.
-            if (this.metadata.userId && this.instanceHealChargesSpent < this.maxHealAttempts) {
+            // Deduct 1 credit per healed STEP. `currentStepHealCharged` makes
+            // it exactly-once per step across BOTH heal paths (no double-charge),
+            // while still charging every distinct step that heals (no free-after-N).
+            if (this.metadata.userId && !this.currentStepHealCharged) {
+              this.currentStepHealCharged = true;
               this.instanceHealChargesSpent++;
               await CreditCostTrackerService.deductStepCredit(
                 this.metadata.userId,
@@ -4460,10 +4526,11 @@ export class CommandExecutor {
       const meetsConfidenceThreshold = healConfidence >= this.selfHealingConfidenceThreshold;
 
       if (healingResult.autoApplied && meetsConfidenceThreshold) {
-        // Deduct 1 credit for self-heal retry — shared budget with intent-path heal
-        // (instanceHealChargesSpent) so a single failing step can't be charged by
-        // both paths independently.
-        if (this.metadata.userId && this.instanceHealChargesSpent < this.maxHealAttempts) {
+        // Deduct 1 credit per healed STEP. `currentStepHealCharged` ensures the
+        // same step isn't charged twice when the intent-path heal already
+        // charged it; each new step that heals is still charged once.
+        if (this.metadata.userId && !this.currentStepHealCharged) {
+          this.currentStepHealCharged = true;
           this.instanceHealChargesSpent++;
           await CreditCostTrackerService.deductStepCredit(
             this.metadata.userId,

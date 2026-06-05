@@ -59,6 +59,20 @@ import { Scout } from './agents/scout';
 import type { ScoutInput, ScoutOutput, ExplorationBlackboard, CartographerInsight } from './agents/agent-types';
 import { normalizeUrlWithPattern } from './url-pattern';
 
+/**
+ * Navigation timeout for flow execution (entry-point + login navigations).
+ * Single source of truth so the value can't drift across the four goto sites.
+ */
+const FLOW_NAV_TIMEOUT_MS = 15_000;
+
+/**
+ * Wait strategy for every navigation on the flow-execution (replay) path.
+ * MUST be 'load', never 'domcontentloaded' — see CLAUDE.md Hard Invariant #4.
+ * domcontentloaded fires before JS hydrates, so actions/login forms can fire
+ * against a non-interactive page and flake.
+ */
+const FLOW_NAV_WAIT_UNTIL = 'load' as const;
+
 /** Semaphore for bounding concurrent flows */
 class Semaphore {
   private current = 0;
@@ -504,8 +518,8 @@ export class FlowRunner {
       }
       try {
         await page.goto(targetUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 15_000,
+          waitUntil: FLOW_NAV_WAIT_UNTIL,
+          timeout: FLOW_NAV_TIMEOUT_MS,
         });
         this.rateLimiter?.recordSuccess('target_site');
       } catch (navError) {
@@ -513,8 +527,8 @@ export class FlowRunner {
           const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
           if (result.shouldRetry) {
             await page.goto(targetUrl, {
-              waitUntil: 'domcontentloaded',
-              timeout: 15_000,
+              waitUntil: FLOW_NAV_WAIT_UNTIL,
+              timeout: FLOW_NAV_TIMEOUT_MS,
             });
             this.rateLimiter.recordSuccess('target_site');
           } else {
@@ -804,7 +818,8 @@ export class FlowRunner {
         status = 'failed';
       }
 
-      // 11. Cleanup
+      // 11. Cleanup — capture the real final URL BEFORE tearing down the page.
+      const finalUrl = page.url();
       networkTracker.stopTracking();
       await page.close();
       await this.stateManager.closeContext(context);
@@ -823,6 +838,7 @@ export class FlowRunner {
         canUserHelp,
         progressScore: pipelineResult.progressScore,
         roundsUsed: pipelineResult.roundsExecuted,
+        finalUrl,
       };
     } catch (error) {
       // Cleanup on error
@@ -890,8 +906,8 @@ export class FlowRunner {
       }
       try {
         await page.goto(this.config.entryUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 15_000,
+          waitUntil: FLOW_NAV_WAIT_UNTIL,
+          timeout: FLOW_NAV_TIMEOUT_MS,
         });
         this.rateLimiter?.recordSuccess('target_site');
       } catch (navError) {
@@ -899,8 +915,8 @@ export class FlowRunner {
           const result = await this.rateLimiter.recordFailure('target_site', navError as Error);
           if (result.shouldRetry) {
             await page.goto(this.config.entryUrl, {
-              waitUntil: 'domcontentloaded',
-              timeout: 15_000,
+              waitUntil: FLOW_NAV_WAIT_UNTIL,
+              timeout: FLOW_NAV_TIMEOUT_MS,
             });
             this.rateLimiter.recordSuccess('target_site');
           } else {
@@ -1403,6 +1419,15 @@ export class FlowRunner {
       };
 
       const scoutResult = await this.scout.detect(scoutInput);
+
+      // Record the discovery on the blackboard so the Strategist's re-evaluation
+      // can see what Scout surfaced (insight + new pages/flows). Without this the
+      // recentDiscoveries channel stays empty and re-strategy is blind to Scout.
+      if (this.blackboard && (scoutResult.newEntryPoints.length > 0 || scoutResult.newPages.length > 0)) {
+        this.blackboard.discoveredBranches.push(
+          Scout.toDiscovery(completedEntry.id, completedEntry.name, scoutResult),
+        );
+      }
 
       // Filter out branches discovered on external domains
       const currentOrigin = new URL(page.url()).origin;

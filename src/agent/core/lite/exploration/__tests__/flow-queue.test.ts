@@ -246,6 +246,53 @@ describe('FlowQueue — Strategist-driven ordering', () => {
   });
 });
 
+describe('FlowQueue — Phase 2.5 rebuild dedup (finding #5)', () => {
+  const plainStrategy = (): StrategistOutput => ({
+    plan: [],
+    authPlan: { loginFirst: false, authGatedFlows: [] },
+    continueSurvey: false,
+    skipFlows: [],
+    focusAreas: [],
+    strategyReasoning: '',
+  });
+
+  it('excludes already-executed entry points via excludeIds', () => {
+    const entries = [ep({ id: 'a', name: 'Alpha' }), ep({ id: 'b', name: 'Beta' })];
+    const q = FlowQueue.fromStrategyOutput(entries, plainStrategy(), {
+      excludeIds: ['a'],
+    });
+    expect(q.remaining().map((e) => e.id)).toEqual(['b']);
+  });
+
+  it('rejects a name-duplicate of an already-seen flow via seedDedup', () => {
+    // 'a' was executed in Phase 2; a new near-identical entry should be dropped.
+    const entries = [ep({ id: 'new', name: 'User Login Form' })];
+    const q = FlowQueue.fromStrategyOutput(entries, plainStrategy(), {
+      seedDedup: { names: ['User Login'] },
+    });
+    // "User Login" vs "User Login Form" → Jaccard ≥ 0.6 → rejected
+    expect(q.remaining()).toHaveLength(0);
+  });
+
+  it('rejects a goal-duplicate of an already-seen flow via seedDedup', () => {
+    const seenGoal = 'search the catalog for a product and verify results appear';
+    const entries = [ep({ id: 'new', name: 'Catalog Search', goal: seenGoal })];
+    const q = FlowQueue.fromStrategyOutput(entries, plainStrategy(), {
+      seedDedup: { goals: [seenGoal] },
+    });
+    expect(q.remaining()).toHaveLength(0);
+  });
+
+  it('keeps genuinely new flows when seeds do not match', () => {
+    const entries = [ep({ id: 'fresh', name: 'Wishlist Management' })];
+    const q = FlowQueue.fromStrategyOutput(entries, plainStrategy(), {
+      excludeIds: ['old'],
+      seedDedup: { names: ['User Login'], goals: ['login with credentials'] },
+    });
+    expect(q.remaining().map((e) => e.id)).toEqual(['fresh']);
+  });
+});
+
 describe('FlowQueue — reorder', () => {
   it('moves planned entries to front in Strategist order', () => {
     const q = FlowQueue.fromEntryPoints([

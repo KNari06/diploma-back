@@ -40,6 +40,16 @@ import type {
 import { ELEMENT_RESOLVER_CONFIG, PREVIEW_SESSION_CONFIG } from '@/config/testing/playwright-tuning';
 import { normalizeUrlForComparison } from './auto-wait-for.utils';
 import { pruneCandidatesViaLLM } from './candidate-pruner-llm.service';
+// Pure semantic-match helpers (extracted 2026-06 — see semantic-match.util.ts).
+import {
+  getEffectiveLabel,
+  cyrFold,
+  semanticTokens,
+  isSpecificInputType,
+  nodeIdentityTokens,
+  hasTokenOverlap,
+  evaluateHonestyGuard,
+} from './semantic-match.util';
 import {
   recordedFingerprintHasStrongIdentity,
   hasStrongIdentityContradiction,
@@ -870,323 +880,18 @@ function computePageSignature(url: string, nodes: InteractiveNode[]): string {
  * @returns Semantic text for LLM matching (max 200 chars)
  */
 
-/**
- * V23 (April 2026): Universal "effective visible label" extractor.
- *
- * Various sites under test surface element identity through different
- * attributes — Angular Material puts a Kazakh tooltip on `<a title="...">`,
- * MUI uses `aria-label`, Bootstrap relies on visible `text`, Vue + i18n on
- * `<img alt>`, icon-only Element Plus / AntD on `data-testid` lifted
- * children, etc. Every site should give the resolver SOME readable label.
- *
- * Before this helper, multiple sites in the resolver pipeline read only
- * `labelText || ariaLabel || text || placeholder` and dropped on the floor:
- *   • `title`          — Angular `<a title="Папкалар">` for icon-link cards
- *   • `alt`            — `<img>` accessible name
- *   • `iconLabel`      — Lucide / FA / svg `<title>` derivative
- *   • `svgIcon`        — Angular Material `<mat-icon svgicon="folder">`
- * That dropped data caused semantic-floor reject + label-mismatch reject
- * even when the candidate WAS the right element — it just identified itself
- * via an attribute the chain forgot.
- *
- * Use this helper everywhere a "single representative string for this node"
- * is needed: candidate label display, semantic floor token comparison,
- * label-mismatch guard, scene summary, dedup keys. Keep `buildCandidateText`
- * separate — that one renders the FULL multi-field candidate description
- * for the LLM prompt, not a single fallback.
- *
- * Order is intentional, most-specific → most-general:
- *   1. labelText      — explicit `<label for=>` association (strongest)
- *   2. ariaLabel      — explicit ARIA accessible name
- *   3. title          — `title=` attribute (Angular routerLink, tooltips)
- *   4. alt            — `<img>` accessible name
- *   5. text            — visible textContent
- *   6. placeholder    — input placeholder (only meaningful for inputs)
- *   7. iconLabel      — derived from svg `<title>`/data-lucide/FA class
- *   8. svgIcon        — Angular Material registry name (`svgicon` attr)
- *   9. childTestId    — lifted single-icon-child data-testid (V22 Pkg1)
- *   10. customElementTag — `<app-notifications-button>` semantic wrapper
- *
- * Returns empty string when ALL fields are missing (genuinely unidentifiable
- * node like a bare `<li>` with no children carrying signals — that's a real
- * detection problem, not something this helper can fix).
- */
-export function getEffectiveLabel(node: InteractiveNode | undefined | null): string {
-  if (!node) return '';
-  // Order: most-specific (W3C accessible name spec) → most-general fallbacks.
-  //
-  // Per WAI-ARIA Accessible Name Computation:
-  //   labelText (covers aria-labelledby, <label for>, wrapping <label>),
-  //   ariaLabel, title, alt, then visible text.
-  // Then product-specific identity fallbacks for descriptor-poor targets.
-  return (
-    node.labelText            // includes aria-labelledby + native <label>
-    || node.ariaLabel
-    || node.title             // WAI-ARIA accessible name source
-    || node.alt               // <img>/<area>/<input type=image> accessible name
-    || node.text              // visible textContent
-    || node.placeholder       // input fallback
-    || node.iconLabel         // svg <title>/data-lucide/sprite/FA class
-    || node.svgIcon           // Angular Material registry name
-    || node.childTestId       // lifted single-icon-child data-testid
-    || node.dataValue         // <option value>/<li data-value> semantic key
-    || node.dataRowKey        // AntD/RainbowKit table row identity
-    || node.customElementTag  // <app-X>/<my-button> semantic wrapper
-    || ''
-  ).toString();
-}
-
-/**
- * Cyrillic→Latin glyph fold (М↔M, А↔A, Т↔T, …). Shared by the semantic-
- * floor guards so "MAT-SMART" and "МАТ-SMART" tokenize identically.
- * Single source of truth — both `evaluateHonestyGuard` and the inline
- * guard in `selectElementWithLLM` call this instead of re-declaring it.
- */
-export function cyrFold(s: string): string {
-  let out = '';
-  for (const ch of s) {
-    const code = ch.charCodeAt(0);
-    switch (code) {
-      case 0x0410: case 0x0430: out += 'a'; break;
-      case 0x0412: case 0x0432: out += 'b'; break;
-      case 0x0415: case 0x0435: out += 'e'; break;
-      case 0x041A: case 0x043A: out += 'k'; break;
-      case 0x041C: case 0x043C: out += 'm'; break;
-      case 0x041D: case 0x043D: out += 'h'; break;
-      case 0x041E: case 0x043E: out += 'o'; break;
-      case 0x0420: case 0x0440: out += 'p'; break;
-      case 0x0421: case 0x0441: out += 'c'; break;
-      case 0x0422: case 0x0442: out += 't'; break;
-      case 0x0425: case 0x0445: out += 'x'; break;
-      case 0x0423: case 0x0443: out += 'y'; break;
-      default: out += ch;
-    }
-  }
-  return out;
-}
-
-/** Tokenize: cyr-fold, split on non-alphanumerics, keep ≥3-char tokens. */
-export function semanticTokens(s: string): Set<string> {
-  return new Set(cyrFold(s.toLowerCase()).split(/[^\p{L}\p{N}]+/u).filter(t => t.length >= 3));
-}
-
-// Input `type`/`inputType` values specific enough to be a semantic anchor.
-// Generic ones (text, button, submit, hidden, …) appear on most elements
-// and would create false matches ("text" intent → any text input), so they
-// are EXCLUDED. Only these carry intent-disambiguating meaning.
-const SPECIFIC_INPUT_TYPES = new Set([
-  'password', 'email', 'tel', 'url', 'number', 'search',
-  'date', 'month', 'week', 'time', 'datetime-local',
-  'checkbox', 'radio', 'color', 'file', 'range',
-]);
-
-// Valid HTML autocomplete tokens worth matching against intent. Junk
-// values ("on"/"off" — note "off" is 3 chars and would pass the length
-// filter) and layout-only values are excluded.
-const MEANINGFUL_AUTOCOMPLETE_TOKENS = new Set([
-  'password', 'email', 'username', 'tel', 'url', 'search',
-  'current', 'new', 'name', 'organization', 'address',
-  'phone', 'country', 'postal', 'credit', 'card',
-]);
-
-// Generic UI tokens that show up in testIds/ids/names across unrelated
-// controls (submitButton, closeModal, …). Matching on them would let
-// intent "submit" grab a random element whose testId merely contains
-// "submit". Dropped from identity tokens.
-const GENERIC_IDENTITY_TOKENS = new Set([
-  'button', 'btn', 'input', 'field', 'element', 'control', 'icon',
-  'modal', 'dialog', 'panel', 'container', 'wrapper', 'root', 'item',
-  'submit', 'cancel', 'close', 'next', 'back', 'prev', 'open', 'toggle',
-  'link', 'menu', 'list', 'row', 'cell', 'col', 'box', 'group', 'form',
-  'label', 'text', 'value', 'data', 'test', 'qa', 'auto',
-]);
-
-/** camelCase / snake / kebab → lowercase word parts. */
-function splitIdentifier(raw: string): string[] {
-  return raw
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .split(/[^\p{L}\p{N}]+/u)
-    .map(t => t.toLowerCase())
-    .filter(Boolean);
-}
-
-/**
- * Build the set of TECHNICAL-identity tokens for a node — the signals the
- * LLM already sees in the candidate line (type, name, autocomplete,
- * testId, id) but that the visible-label-only semantic floor ignored.
- * This is what lets an English intent ("password") match a Cyrillic-
- * labelled field whose `type="password" / name="password" /
- * autocomplete="current-password"` makes the meaning unambiguous.
- *
- * Heavily filtered (see the three allow/deny sets above) so it adds
- * REAL disambiguating tokens without re-opening the hallucination hole:
- * generic types, junk autocomplete, and generic UI tokens are dropped.
- */
-export function nodeIdentityTokens(node: InteractiveNode | undefined | null): Set<string> {
-  const out = new Set<string>();
-  if (!node) return out;
-  const add = (raw: string | undefined, opts: { dropGeneric?: boolean } = {}) => {
-    if (!raw) return;
-    for (const part of splitIdentifier(raw)) {
-      if (part.length < 3) continue;
-      if (opts.dropGeneric && GENERIC_IDENTITY_TOKENS.has(part)) continue;
-      out.add(part);
-    }
-  };
-
-  // type / inputType — only when specific.
-  const typeVal = (node.type || node.inputType || '').toLowerCase();
-  const typeIsSpecific = !!typeVal && SPECIFIC_INPUT_TYPES.has(typeVal);
-  if (typeIsSpecific) out.add(typeVal);
-
-  // name — strong, author-chosen identity. Drop generic UI tokens.
-  add(node.name, { dropGeneric: true });
-
-  // autocomplete — only meaningful tokens, AND only when it does NOT
-  // CONTRADICT the field's type. Real client pages put anti-autofill
-  // `autocomplete="new-password"` on plain text SEARCH boxes (observed:
-  // documentolog `folder_search`, type=text). Trusting that would mint a
-  // bogus `password` identity token for a search field → intent "password"
-  // would falsely match it. Rule: a password/email autocomplete token is
-  // only honoured when the element's type agrees (or is unset/specific-
-  // matching). For a non-specific type (text/none) we DROP password/email
-  // autocomplete tokens — they are almost always autofill-suppression noise.
-  if (node.autocomplete) {
-    const contradicts = (token: string): boolean => {
-      // token claims password/email but type says otherwise → contradiction.
-      if (token === 'password' && typeVal && typeVal !== 'password') return true;
-      if (token === 'email' && typeVal && typeVal !== 'email') return true;
-      // generic text / no type carrying a credential autocomplete = noise.
-      if ((token === 'password' || token === 'email') && (!typeVal || typeVal === 'text')) return true;
-      return false;
-    };
-    for (const part of splitIdentifier(node.autocomplete)) {
-      if (part.length < 3) continue;
-      if (!MEANINGFUL_AUTOCOMPLETE_TOKENS.has(part)) continue;
-      if (contradicts(part)) continue;
-      out.add(part);
-    }
-  }
-
-  // testId — author-chosen, but strip generic UI scaffolding tokens.
-  add(node.testIdAttr, { dropGeneric: true });
-
-  // id — only stable ids (framework-generated ones are noise); drop generic.
-  if (node.id && !node.isDynamicId) add(node.id, { dropGeneric: true });
-
-  return new Set(Array.from(out).map(t => cyrFold(t)));
-}
-
-/**
- * True if any intent token shares an exact-or-substring (≥3 char, both
- * directions) overlap with any token in `against`. Same matching rule the
- * semantic floor uses for labels.
- */
-export function hasTokenOverlap(intentTokens: Set<string>, against: Set<string>): boolean {
-  if (intentTokens.size === 0 || against.size === 0) return false;
-  for (const i of intentTokens) {
-    for (const c of against) {
-      if (i === c) return true;
-      if (i.length >= 3 && c.length >= 3 && (i.includes(c) || c.includes(i))) return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Honesty guard — verify that a chosen candidate's effective label is
- * compatible with the user's intent text. Catches two hallucination
- * classes that escape min-confidence and producer-side validation:
- *
- *   1. labelEmpty: chosen node has no text/label/aria/alt/iconLabel/...
- *      across the full getEffectiveLabel cascade. With a text-bearing
- *      intent there is no legitimate way to match — model picked
- *      something arbitrary.
- *
- *   2. semanticFloor: both intent and chosen have ≥1 ≥3-char tokens,
- *      and the two sets have ZERO shared tokens (exact or substring,
- *      Cyrillic-Latin glyphs folded). This is the "Панорама 360"
- *      vs "Заказать звонок" case from May 2026 vision-rescue audit.
- *
- * Returns:
- *   - null when guard passes (caller should accept the pick)
- *   - { kind, reason } when guard fails (caller should treat as
- *     not_found and proceed to fallback)
- *
- * Used by:
- *   - selectElementWithLLM (Stage 3 LLM resolver, line ~3232+)
- *   - vision second opinion (Stage 4 rescue, line ~4890+) — previously
- *     bypassed both guards because they were inlined in selectElement-
- *     WithLLM. Extracted module-level so vision path enforces the
- *     same contract.
- *
- * Gate notes:
- *   - heal mode is permissive — the recorded fingerprint is the truth
- *     source there, the model is encouraged to bias toward "close".
- *   - synonym intents like "иконка корзины" (no specific text, just
- *     descriptive nouns) MUST be allowed; the ≥3-char gate on
- *     intentText filters them out implicitly.
- */
-export function evaluateHonestyGuard(args: {
-  intentText: string;
-  chosenNode: InteractiveNode | undefined | null;
-  mode: 'apply' | 'heal';
-}): { kind: 'semanticFloor'; reason: string } | null {
-  const { intentText, chosenNode, mode } = args;
-
-  if (mode === 'heal') return null;
-
-  const intentLower = (intentText || '').toLowerCase().trim();
-  if (intentLower.length < 3) return null;
-
-  const chosenLabel = (getEffectiveLabel(chosenNode) || '').trim();
-
-  // Guard 1 (labelEmpty) REMOVED — see selectElementWithLLM ~line 3406
-  // for the audit. False-positive rate ~66% on production traces. Vision
-  // rescue is already the LAST line of defense and runs only when
-  // earlier paths failed; killing its picks because the target has no
-  // label is the same recall-killer pattern we removed elsewhere.
-  // Guard 2 (token-overlap) stays — fires only when chosen DOES have a
-  // label, so safe and complementary.
-
-  // Guard 2 — token-overlap floor. Tokenization via shared `semanticTokens`
-  // (Cyrillic-fold + unicode split + 3-char min). "shared" means exact OR
-  // substring (≥3 chars both ways) so "папка" intent vs "папкалар" chosen
-  // counts (Kazakh morphology) but "ok" inside "Bookmark" does NOT.
-  const intentTokens = semanticTokens(intentLower);
-  if (intentTokens.size === 0) return null;
-
-  const chosenTokens = semanticTokens(chosenLabel);
-
-  // RECALL GUARD (unchanged from the original): a label-less chosen element
-  // (icon-only "›", "✓", bare <svg> button) has no visible tokens to judge.
-  // The original guard passed these unconditionally — rejecting them is the
-  // recall-killer pattern removed elsewhere. We KEEP that: the floor only
-  // fires when the visible label has content. Technical identity is used
-  // ONLY as an extra ACCEPT signal below — never to newly REJECT a case the
-  // original let through.
-  if (chosenTokens.size === 0) return null;
-
-  // Match against the visible label first (the common path).
-  if (hasTokenOverlap(intentTokens, chosenTokens)) return null;
-
-  const identityTokens = nodeIdentityTokens(chosenNode);
-
-  // CROSS-LANGUAGE / TECHNICAL-IDENTITY ESCAPE HATCH (2026-06):
-  // The visible label may be in a different language than the intent
-  // (English "password" vs placeholder "Пароль") yet the element's
-  // technical identity (type=password, name=password,
-  // autocomplete=current-password, testId=passwordField) unambiguously
-  // matches. The LLM already sees those signals in the candidate line and
-  // picks correctly; the label-only floor must not override it. Accept
-  // when the intent overlaps the (heavily-filtered) identity tokens.
-  if (hasTokenOverlap(intentTokens, identityTokens)) return null;
-
-  return {
-    kind: 'semanticFloor',
-    reason: `chosen label "${chosenLabel.slice(0, 50)}" shares no tokens with intent "${intentText.slice(0, 40)}" — likely no real match`,
-  };
-}
+// Semantic-match helpers were extracted to `semantic-match.util.ts` (2026-06)
+// and are imported at the top of this file. Re-exported here so existing
+// importers that referenced them via element-resolver keep working unchanged.
+export {
+  getEffectiveLabel,
+  cyrFold,
+  semanticTokens,
+  isSpecificInputType,
+  nodeIdentityTokens,
+  hasTokenOverlap,
+  evaluateHonestyGuard,
+};
 
 /**
  * Is this node a LEAF item inside an active popup/dropdown — the kind of
@@ -1295,12 +1000,12 @@ export function buildCandidateText(node: InteractiveNode): string {
   // Specific input type — a strong semantic anchor for cross-language
   // intents (e.g. English "password" vs a Cyrillic-labelled field). Only
   // emitted for SPECIFIC types; generic text/button/submit/hidden carry no
-  // disambiguating meaning and would just bloat the prompt. Mirrors the
-  // `SPECIFIC_INPUT_TYPES` set the semantic-floor guard trusts, so the LLM
-  // and the guard reason from the same signal.
+  // disambiguating meaning and would just bloat the prompt. Uses the same
+  // `isSpecificInputType` (generic-blacklist) the semantic-floor guard trusts,
+  // so the LLM and the guard reason from the same signal.
   {
     const t = (node.type || node.inputType || '').toLowerCase();
-    if (t && SPECIFIC_INPUT_TYPES.has(t)) parts.push(`type: ${t}`);
+    if (isSpecificInputType(t)) parts.push(`type: ${t}`);
   }
   if (node.autocomplete) {
     parts.push(`autocomplete: ${node.autocomplete}`);

@@ -325,6 +325,8 @@ export interface FlowExplorationTask {
   roundsUsed: number;
   /** Error info if failed at infra level */
   infraError?: string;
+  /** Actual page URL when the flow finished (before context teardown). Falls back to the source page when unavailable. */
+  finalUrl?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
