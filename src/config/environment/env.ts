@@ -187,6 +187,19 @@ const envSchema = z.object({
   FEATURE_ORG_CREDITS_ENABLED: z.string().transform(v => v === 'true').default('true'),
 
   // ──────────────────────────────────────────────────────────────────
+  // Self-serve PLG signup. Default false keeps the B2B flow intact
+  // (manual admin approval + business-email gate). When true:
+  //   - new users are provisioned approved on first auth (status set to
+  //     'approved', overriding the users.status column default), with a
+  //     default workspace + project so they skip the onboarding wizard
+  //   - the business-email gate accepts personal domains (Gmail etc.);
+  //     the disposable-domain block stays on as anti-abuse
+  // The requireApproved middleware is left in place — flipping this off
+  // restores gated behaviour with no code change.
+  // ──────────────────────────────────────────────────────────────────
+  AUTO_APPROVE_SIGNUP: z.string().transform(v => v === 'true').default('false'),
+
+  // ──────────────────────────────────────────────────────────────────
   // Per-test-case chat (Phase 1-8 backend, frontend integration TBD).
   //
   // When false (default), POST /chat with `testCaseId` returns 404

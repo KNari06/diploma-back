@@ -150,6 +150,13 @@ add_to_plan, analyze_failure, test_recommendations, coverage_analysis, editor_ac
 mobile_agent, **flaky_report, manage_schedule, manage_module, manage_plan** (the last 4 added in the management phase;
 they call existing `qa_manage_*` tools through `executeTool`, not the SubAgentPipeline).
 
+### Self-serve "magic first test" (PLG, gated by `AUTO_APPROVE_SIGNUP`)
+Sign up → first auth (`verifyEmail` / `completeOAuthHandler` in [auth.controller.ts](src/api/auth/auth.controller.ts))
+→ `SelfServeProvisioningService.provision()` ([self-serve-provisioning.service.ts](src/services/core/self-serve-provisioning.service.ts)) — approve user + create workspace+project + grant trial credits/plan (no-op unless flag on; never throws)
+→ POST `/api/v1/explorations/start` ([explorations.controller.ts](src/api/explorations/explorations.controller.ts)) `{ url, projectId?, preset? }`, gated by `requireApproved` + `requireCredits`
+→ validate URL + IDOR-guard projectId → `QueueManager.addExplorationJob()` on the `'quick'` budget preset (~2 min, [types.ts](src/agent/core/lite/exploration/types.ts) `EXPLORATION_PRESETS`)
+→ returns `202 { explorationId }` → poll GET `/api/v1/explorations/:id` for discovered test cases → one-click `POST /:id/run-discovered`.
+
 ---
 
 ## Hard invariants (do not violate)
