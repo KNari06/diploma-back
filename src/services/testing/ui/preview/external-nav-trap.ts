@@ -84,6 +84,18 @@ const INTENT_WINDOW_MS = 3000;
 /** Emit dedup — don't spam multiple notices for the same blocked URL within this window. */
 const NOTICE_DEDUP_MS = 1500;
 
+/**
+ * TEMPORARY: disables the cross-origin revert. `isSameApp` compares the last two
+ * DNS labels, so a brand whose SSO lives on a sibling ccTLD (e.g.
+ * business.documentolog.com → account.documentolog.kz) is treated as "external"
+ * and reverted in an infinite redirect loop. Until `isSameApp` is made
+ * brand-aware (match the brand label across TLDs), treat ANY http(s) nav as
+ * in-app — keep the safe-url/baseline checkpoints fresh, just never revert.
+ * RESTORE: set to false (or delete this flag + the guarded block at the revert
+ * site below) once the brand-aware same-app check lands.
+ */
+const TEMP_DISABLE_EXTERNAL_NAV_TRAP: boolean = true;
+
 function originOf(url: string): string | null {
   try {
     return new URL(url).origin;
@@ -249,6 +261,19 @@ export function attachExternalNavTrap(page: Page, sessionId: string, baselineUrl
     if (isSameApp(url, current.baselineUrl)) {
       current.lastSafeUrl = url;
       void writeTrap('allowed_same_app');
+      return;
+    }
+
+    // TEMPORARY: cross-origin revert disabled (TEMP_DISABLE_EXTERNAL_NAV_TRAP).
+    // Treat any other http(s) nav as in-app so cross-ccTLD SSO redirects
+    // (e.g. documentolog.kz ↔ documentolog.com) aren't reverted in a loop.
+    // Keep checkpoints fresh so a future restore behaves correctly.
+    // RESTORE: delete this block when isSameApp is made brand-aware.
+    if (TEMP_DISABLE_EXTERNAL_NAV_TRAP) {
+      current.lastSafeUrl = url;
+      current.baselineUrl = url;
+      current.baselineOrigin = navOrigin;
+      void writeTrap('allowed_same_app', { reason: 'TEMP_trap_disabled' });
       return;
     }
 
