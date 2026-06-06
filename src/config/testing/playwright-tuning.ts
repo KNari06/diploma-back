@@ -436,18 +436,25 @@ export const BROWSER_LAUNCH_ARGS = [
 /**
  * Extra HTTP headers to look like a real browser (not automation tool).
  * Applied to browser contexts to pass WAF/bot detection.
+ *
+ * IMPORTANT: `extraHTTPHeaders` applies to EVERY request, not just the top-level
+ * navigation. Do NOT put navigation-only / CORS-non-safelisted request headers
+ * here — on cross-origin XHR/fetch they corrupt the request and break the app
+ * under test. `Upgrade-Insecure-Requests` (bisected as the culprit) and
+ * `Cache-Control` made documentolog's own API preflights fail ("header field is
+ * not allowed by Access-Control-Allow-Headers" → `status: 0` → app dead on boot).
+ * Both removed. Chromium already sets these navigation headers natively per
+ * request type — don't force them globally.
  */
 export const BROWSER_EXTRA_HEADERS = {
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
   'Connection': 'keep-alive',
-  'Upgrade-Insecure-Requests': '1',
   'Sec-Fetch-Dest': 'document',
   'Sec-Fetch-Mode': 'navigate',
   'Sec-Fetch-Site': 'none',
   'Sec-Fetch-User': '?1',
-  'Cache-Control': 'max-age=0',
 } as const;
 
 /**
