@@ -135,9 +135,14 @@ function emitWarmupProgress(
   userId: string,
   stage: 'boot_emulator' | 'installing_app' | 'launching_app' | 'waiting_first_frame' | 'ready',
   progress: number,
+  error?: string,
 ): void {
   try {
-    webSocketService.emitToUser(userId, 'preview:session:progress', { stage, progress });
+    webSocketService.emitToUser(userId, 'preview:session:progress', {
+      stage,
+      progress,
+      ...(error ? { error } : {}),
+    });
   } catch {
     // Best-effort — never let a socket error break warmup.
   }
@@ -587,6 +592,16 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
     const effectiveOwnerId = env.MOBILE_MULTI_USER_ISOLATION ? userId : undefined;
     let session: Awaited<ReturnType<typeof client.createSession>>;
     const skipPoolForPhysical = deviceSelector?.source === 'local-physical' || !!deviceSelector?.serial;
+
+    // Emit boot_emulator BEFORE the (blocking) create/claim call — not after.
+    // createSession can take ~60s and may crash-loop; emitting only after it
+    // returns meant the frontend never saw a real boot event during the boot
+    // window and fell back to its timer animation (the fake green stepper from
+    // the bug report). Firing it here makes the boot step truthful: the loader
+    // sits on "Booting device" for as long as the device is actually booting,
+    // and a crash surfaces as a real failure (catch block below) instead of a
+    // phantom-complete checklist.
+    emitWarmupProgress(userId, 'boot_emulator', 10);
     if (skipPoolForPhysical) {
       logger.info('[MOBILE_SESSION] Pinned selector — bypassing pool', {
         projectId,
@@ -620,8 +635,10 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       }
     }
 
-    // Emulator/simulator is up — nudge the loader past the boot stage.
-    emitWarmupProgress(userId, 'boot_emulator', 15);
+    // Emulator/simulator is now actually up (createSession/claim returned) —
+    // advance the boot stage toward done. The next emit is `installing_app`
+    // from prepApp/MobileAppPrepService.
+    emitWarmupProgress(userId, 'boot_emulator', 30);
 
     // Propagate project-level permission policy to the runner. Delegates
     // to the shared service so warmup, regression worker, and CI runs
@@ -757,16 +774,25 @@ export async function warmupSession(req: Request, res: Response): Promise<void> 
       reused: false,
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     logger.error('[MOBILE_SESSION] Warmup failed', {
       projectId,
       userId,
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     });
+
+    // Tell the loader the boot stage FAILED so it stops the spinner and shows
+    // the real reason (e.g. "Emulator crashed during startup") instead of the
+    // fallback timer optimistically completing the checklist. `boot_emulator`
+    // is the right stage label: this catch fires for createSession/claim
+    // failures (the boot window) — install/launch failures are swallowed as
+    // non-fatal above and never reach here.
+    emitWarmupProgress(userId, 'boot_emulator', 0, message);
 
     res.status(500).json({
       success: false,
       error: 'Failed to warm up emulator session',
-      message: error instanceof Error ? error.message : String(error),
+      message,
     });
   }
 }
