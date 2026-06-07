@@ -9,6 +9,7 @@ import type { Page, Locator } from 'playwright';
 import {
   waitForStepReadiness,
   shouldSkipLookaheadAfter,
+  waitForDomDensitySettle,
   type LookaheadResult,
 } from '../step-readiness.service';
 import type { IntentStep } from '../preview.types';
@@ -48,7 +49,16 @@ describe('step-readiness.service', () => {
       getByTestId: jest.fn(() => mockLocator),
       getByPlaceholder: jest.fn(() => mockLocator),
       waitForLoadState: jest.fn().mockResolvedValue(undefined),
-      evaluate: jest.fn().mockResolvedValue(undefined),
+      // The DOM-density probe (countInteractiveElementsLight) calls
+      // page.evaluate(fn, { joined, parts }). Return a dense, stable count for
+      // that probe so the density gate settles fast (realistic hydrated page)
+      // instead of waiting out its budget; every other evaluate stays undefined.
+      evaluate: jest.fn().mockImplementation((_fn: unknown, arg: unknown) => {
+        if (arg && typeof arg === 'object' && 'joined' in (arg as Record<string, unknown>)) {
+          return Promise.resolve(40);
+        }
+        return Promise.resolve(undefined);
+      }),
       waitForTimeout: jest.fn().mockResolvedValue(undefined),
       // V15: passive XHR observer + mainFrame stub needed by step-readiness
       on: jest.fn(),
@@ -435,6 +445,72 @@ describe('step-readiness.service', () => {
 
       expect(result.ready).toBe(false);
       expect(result.autoWaitApplied).toBe(true); // Waited long enough
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // waitForDomDensitySettle — interactive-node plateau gate
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe('waitForDomDensitySettle', () => {
+    // Build a page whose interactive-node count follows `counts`, repeating the
+    // last value forever. countInteractiveElementsLight calls page.evaluate and
+    // returns its numeric result, so yielding numbers drives the plateau logic.
+    const seqPage = (counts: number[]): jest.Mocked<Page> => {
+      let i = 0;
+      return {
+        evaluate: jest.fn().mockImplementation(() => {
+          const v = counts[Math.min(i, counts.length - 1)];
+          i++;
+          return Promise.resolve(v);
+        }),
+      } as unknown as jest.Mocked<Page>;
+    };
+
+    it('waits for the node count to plateau after hydration grows the DOM', async () => {
+      // Sparse → hydrating → dense, then stable. Must NOT settle at 22; must
+      // return once growth stops, at the dense plateau.
+      const page = seqPage([22, 50, 90, 134, 134, 134, 134, 134, 134]);
+
+      const res = await waitForDomDensitySettle(page, 5_000);
+
+      expect(res.settled).toBe(true);
+      expect(res.grew).toBe(true);
+      expect(res.finalCount).toBe(134);
+      expect(res.maxCount).toBe(134);
+      expect(res.probeFailed).toBe(false);
+    });
+
+    it('settles quickly when the page is already dense and stable', async () => {
+      const page = seqPage([140, 140, 140, 140, 140]);
+
+      const res = await waitForDomDensitySettle(page, 5_000);
+
+      expect(res.settled).toBe(true);
+      expect(res.grew).toBe(false); // no growth observed
+      expect(res.finalCount).toBe(140);
+    });
+
+    it('fails open immediately when the count probe throws (navigation in-flight)', async () => {
+      const page = {
+        evaluate: jest.fn().mockRejectedValue(new Error('Execution context was destroyed')),
+      } as unknown as jest.Mocked<Page>;
+
+      const res = await waitForDomDensitySettle(page, 5_000);
+
+      expect(res.probeFailed).toBe(true);
+      expect(res.settled).toBe(false);
+    });
+
+    it('exhausts the budget without settling on a page that stays below the floor', async () => {
+      // 1 interactive node forever — below the floor (3) → never "settled".
+      const page = seqPage([1]);
+
+      const res = await waitForDomDensitySettle(page, 500);
+
+      expect(res.settled).toBe(false);
+      expect(res.budgetExhausted).toBe(true);
+      expect(res.probeFailed).toBe(false);
     });
   });
 });

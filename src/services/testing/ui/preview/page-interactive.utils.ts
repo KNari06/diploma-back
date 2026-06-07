@@ -439,7 +439,7 @@ function buildResult(
  * Returns 0 in any weird state (no document yet, evaluate rejects, etc.)
  * so the caller can treat "0 elements" and "page not ready" uniformly.
  */
-async function countInteractiveElementsLight(page: Page): Promise<number> {
+export async function countInteractiveElementsLight(page: Page): Promise<number> {
   const raw = await page.evaluate(
     ({ joined, parts }: { joined: string; parts: string[] }) => {
       // @ts-expect-error - document may or may not exist in browser context
