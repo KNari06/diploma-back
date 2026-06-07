@@ -110,6 +110,36 @@ describe('FlowBuilderService.generateNodeCases', () => {
     expect(cases!.filter(c => c.source === 'ai').length).toBe(12);
   });
 
+  test('refuses to generate cases on a node that feeds a downstream variable', async () => {
+    const provider = makeNode({
+      id: 'post_login', path: '/login',
+      variableExtractions: [{ variableName: 'auth_token', jsonPath: '$.token' }],
+    });
+    const dependent = makeNode({
+      id: 'get_me', method: 'GET', path: '/me', dependsOn: ['post_login'],
+      variableInjections: [{ variableName: 'auth_token', injectAs: 'header', targetKey: 'Authorization', prefix: 'Bearer ' }],
+    });
+    const spec = fakeSpec(provider);
+    spec.executionDag.nodes = [provider, dependent];
+    jest.spyOn(FlowBuilderService, 'getById').mockResolvedValue(spec);
+
+    await expect(
+      FlowBuilderService.generateNodeCases('spec1', 'post_login', undefined, 'u1'),
+    ).rejects.toThrow(/downstream step/i);
+    expect(mockAi).not.toHaveBeenCalled(); // guarded before the LLM call
+  });
+
+  test('allows cases on a provider node whose variable nobody injects', async () => {
+    const node = makeNode({
+      variableExtractions: [{ variableName: 'orphan_id', jsonPath: '$.id' }],
+    });
+    jest.spyOn(FlowBuilderService, 'getById').mockResolvedValue(fakeSpec(node));
+    mockAi.mockResolvedValue({ content: JSON.stringify({ cases: [{ name: 'happy', expectedStatusCodes: [200] }] }), usage: {} });
+
+    const cases = await FlowBuilderService.generateNodeCases('spec1', 'post_auth', undefined, 'u1');
+    expect(cases!.some(c => c.name === 'happy')).toBe(true);
+  });
+
   test('throws when AI returns no cases array', async () => {
     jest.spyOn(FlowBuilderService, 'getById').mockResolvedValue(fakeSpec(makeNode()));
     mockAi.mockResolvedValue({ content: 'not json', usage: {} });
@@ -141,5 +171,28 @@ describe('FlowBuilderService.saveNodeCases', () => {
   test('throws when cases is not an array', async () => {
     jest.spyOn(FlowBuilderService, 'getById').mockResolvedValue(fakeSpec(makeNode()));
     await expect(FlowBuilderService.saveNodeCases('spec1', 'post_auth', { not: 'array' } as any, 'u1')).rejects.toThrow(/must be an array/i);
+  });
+
+  test('refuses to save enabled cases on a provider node, but allows clearing them', async () => {
+    const provider = makeNode({
+      id: 'post_login',
+      variableExtractions: [{ variableName: 'auth_token', jsonPath: '$.token' }],
+    });
+    const dependent = makeNode({
+      id: 'get_me', method: 'GET', path: '/me', dependsOn: ['post_login'],
+      variableInjections: [{ variableName: 'auth_token', injectAs: 'header', targetKey: 'Authorization' }],
+    });
+    const spec = fakeSpec(provider);
+    spec.executionDag.nodes = [provider, dependent];
+    jest.spyOn(FlowBuilderService, 'getById').mockResolvedValue(spec);
+
+    // adding an enabled case → refused
+    await expect(
+      FlowBuilderService.saveNodeCases('spec1', 'post_login', [{ name: 'x', expectedStatusCodes: [200] }], 'u1'),
+    ).rejects.toThrow(/downstream step/i);
+
+    // clearing cases (empty array) → allowed
+    const cleared = await FlowBuilderService.saveNodeCases('spec1', 'post_login', [], 'u1');
+    expect(cleared).toEqual([]);
   });
 });

@@ -989,11 +989,38 @@ export class FlowBuilderService {
   }
 
   /**
+   * Guard: a case-matrix node runs as a LEAF — its variableExtractions never
+   * fire (the executor routes such nodes to runCaseMatrix, which skips
+   * extraction). So if this node provides a variable that ANY other node
+   * injects, turning it into a case matrix would leave those downstream nodes
+   * with an unresolved {{placeholder}} at run time. Refuse with a clear error
+   * instead of letting the run fail later with a confusing 401/400.
+   * @throws if the node feeds variables to downstream nodes.
+   */
+  private static assertNodeCanHostCases(dag: ExecutionDAG, node: DAGNode): void {
+    const provided = new Set(node.variableExtractions.map(e => e.variableName));
+    if (provided.size === 0) return;
+
+    const dependents = dag.nodes.filter(
+      n => n.id !== node.id && n.variableInjections.some(inj => provided.has(inj.variableName)),
+    );
+    if (dependents.length === 0) return;
+
+    const vars = [...provided].join(', ');
+    const names = dependents.map(n => `${n.method} ${n.path}`).slice(0, 3).join(', ');
+    throw new Error(
+      `This step provides variable(s) [${vars}] to ${dependents.length} downstream step(s) (${names}${dependents.length > 3 ? ', …' : ''}). ` +
+        `Running it as a test-case matrix would skip that variable extraction and break those steps. ` +
+        `Add cases to a leaf step instead, or duplicate this step as a separate test.`,
+    );
+  }
+
+  /**
    * Case Matrix (Group 5): generate AI test cases for one node and APPEND them
    * to the node's existing cases (user cases are preserved). Persists the edited
    * DAG and returns the full case list. Each case is judged at run time against
    * its own expectedStatusCodes.
-   * @throws if the AI returns nothing usable.
+   * @throws if the AI returns nothing usable, or the node feeds downstream vars.
    */
   static async generateNodeCases(
     id: string,
@@ -1006,6 +1033,8 @@ export class FlowBuilderService {
     const dag = spec.executionDag;
     const node = dag?.nodes?.find(n => n.id === nodeId);
     if (!node) return null;
+
+    FlowBuilderService.assertNodeCanHostCases(dag, node);
 
     const raw = await callAiWithRetry(
       [
@@ -1103,6 +1132,11 @@ export class FlowBuilderService {
     if (!node) return null;
     if (!Array.isArray(cases)) {
       throw new Error('"cases" must be an array.');
+    }
+    // Only guard when actually enabling cases — clearing/disabling them on a
+    // provider node must stay allowed so a user can always undo.
+    if (cases.some((c: any) => c && c.enabled !== false)) {
+      FlowBuilderService.assertNodeCanHostCases(dag, node);
     }
 
     const clean: NodeCase[] = [];
