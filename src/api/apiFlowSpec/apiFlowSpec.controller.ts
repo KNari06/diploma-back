@@ -480,6 +480,72 @@ export const refineNode = async (req: Request, res: Response): Promise<void> => 
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Case Matrix (Group 5)
+// POST /:id/nodes/:nodeId/cases/generate  — AI-generate cases (credit-charged)
+// PUT  /:id/nodes/:nodeId/cases           — save user-edited cases (no LLM)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CASE_GENERATE_CREDIT_COST = 1;
+
+export const generateNodeCases = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { id, nodeId } = req.params;
+    const { instruction } = req.body as { instruction?: string };
+
+    const hasCredits = await UserCreditsService.hasCredits(userId, CASE_GENERATE_CREDIT_COST);
+    if (!hasCredits) {
+      res.status(402).json({ success: false, error: 'Insufficient credits', code: 'INSUFFICIENT_CREDITS', details: { required: CASE_GENERATE_CREDIT_COST } });
+      return;
+    }
+
+    let cases;
+    try {
+      cases = await FlowBuilderService.generateNodeCases(id, nodeId, instruction, userId);
+    } catch (err: any) {
+      res.status(422).json({ success: false, error: err?.message || 'Failed to generate cases' });
+      return;
+    }
+    if (!cases) {
+      res.status(404).json({ success: false, error: 'Flow spec or node not found' });
+      return;
+    }
+
+    await UserCreditsService.deductCredits(userId, CASE_GENERATE_CREDIT_COST, `API Flow: generate cases for node ${nodeId}`, { flowSpecId: id, nodeId });
+    res.json({ success: true, data: cases });
+  } catch (error: any) {
+    logger.error('[FLOW_SPEC_CONTROLLER] Generate cases failed', { error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to generate cases' });
+  }
+};
+
+export const saveNodeCases = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { id, nodeId } = req.params;
+    const { cases } = req.body as { cases?: unknown };
+
+    let saved;
+    try {
+      saved = await FlowBuilderService.saveNodeCases(id, nodeId, cases, userId);
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: err?.message || 'Invalid cases' });
+      return;
+    }
+    if (!saved) {
+      res.status(404).json({ success: false, error: 'Flow spec or node not found' });
+      return;
+    }
+    res.json({ success: true, data: saved });
+  } catch (error: any) {
+    logger.error('[FLOW_SPEC_CONTROLLER] Save cases failed', { error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to save cases' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/api-flow-spec/:id/reparse
 // Re-fetch spec from source URL and rebuild DAG (preserves user overrides)
 // ─────────────────────────────────────────────────────────────────────────────

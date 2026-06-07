@@ -26,6 +26,8 @@ import {
   getRunById,
   reparseSpec,
   refineNode,
+  generateNodeCases,
+  saveNodeCases,
 } from './apiFlowSpec.controller';
 
 const router = Router();
@@ -48,6 +50,10 @@ router.post('/:id/reparse', reparseSpec);
 
 // Per-node AI refine
 router.post('/:id/nodes/:nodeId/refine', refineNode);
+
+// Case Matrix: AI-generate / save cases for a node
+router.post('/:id/nodes/:nodeId/cases/generate', generateNodeCases);
+router.put('/:id/nodes/:nodeId/cases', saveNodeCases);
 
 // Run history
 router.get('/:id/runs', getRuns);

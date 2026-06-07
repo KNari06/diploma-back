@@ -17,13 +17,19 @@ import { SpecParserService } from './spec-parser.service';
 import { DependencyResolverService, type ResolveResult } from './dependency-resolver.service';
 import { callAiWithRetry, extractJson } from './ai-json.util';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
-import { buildNodeRefinePrompt, buildNodeRefineSystemPrompt } from '@/ai/prompts/api-flow-prompts';
+import {
+  buildNodeRefinePrompt,
+  buildNodeRefineSystemPrompt,
+  buildCaseMatrixPrompt,
+  buildCaseMatrixSystemPrompt,
+} from '@/ai/prompts/api-flow-prompts';
 import type {
   ApiFlowSpec,
   ApiSpecSourceType,
   DAGNode,
   ExecutionDAG,
   FlowVisualization,
+  NodeCase,
   ParsedApiSpec,
   ParseSpecRequest,
   ReactFlowEdge,
@@ -980,6 +986,151 @@ export class FlowBuilderService {
 
     logger.info('[FLOW_BUILDER] Node refined via AI', { flowSpecId: id, nodeId });
     return updatedNode;
+  }
+
+  /**
+   * Case Matrix (Group 5): generate AI test cases for one node and APPEND them
+   * to the node's existing cases (user cases are preserved). Persists the edited
+   * DAG and returns the full case list. Each case is judged at run time against
+   * its own expectedStatusCodes.
+   * @throws if the AI returns nothing usable.
+   */
+  static async generateNodeCases(
+    id: string,
+    nodeId: string,
+    instruction: string | undefined,
+    userId: string,
+  ): Promise<NodeCase[] | null> {
+    const spec = await FlowBuilderService.getById(id, userId);
+    if (!spec) return null;
+    const dag = spec.executionDag;
+    const node = dag?.nodes?.find(n => n.id === nodeId);
+    if (!node) return null;
+
+    const raw = await callAiWithRetry(
+      [
+        { role: 'system', content: buildCaseMatrixSystemPrompt() },
+        { role: 'user', content: buildCaseMatrixPrompt(node, instruction) },
+      ],
+      {
+        temperature: 0.5,
+        response_format: { type: 'json_object' },
+        max_tokens: 6000,
+        model: AI_TASK_MODELS.apiFlowEnricher,
+        timeout: 90000,
+      } as any,
+      'CaseMatrix',
+    );
+
+    const parsed = extractJson(raw);
+    if (!parsed || !Array.isArray(parsed.cases)) {
+      throw new Error('AI returned no usable cases for this node.');
+    }
+
+    // Reject any AI case body that drops a prior-step injected {{placeholder}}.
+    const injected = node.variableInjections
+      .filter(inj => inj.injectAs === 'body_field' || inj.injectAs === 'body_json_path')
+      .map(inj => `{{${inj.variableName}}}`);
+    const keepsInjected = (body: any): boolean => {
+      if (injected.length === 0) return true;
+      const s = JSON.stringify(body ?? {});
+      // every injected placeholder that the node's own body uses must survive
+      const baseline = JSON.stringify(node.sampleRequestBody ?? {});
+      return injected.every(ph => !baseline.includes(ph) || s.includes(ph));
+    };
+
+    // Dedup against existing case names (case-insensitive) so re-running the
+    // matrix doesn't pile up "wrong password" twice, and cap how many we add.
+    const MAX_AI_CASES = 12;
+    const seenNames = new Set((node.cases || []).map(c => c.name.trim().toLowerCase()));
+
+    const aiCases: NodeCase[] = [];
+    for (const c of parsed.cases) {
+      if (aiCases.length >= MAX_AI_CASES) break;
+      if (!c || typeof c.name !== 'string' || !c.name.trim()) continue;
+      const nameKey = c.name.trim().toLowerCase();
+      if (seenNames.has(nameKey)) continue; // duplicate name — skip
+      const codes = Array.isArray(c.expectedStatusCodes)
+        ? c.expectedStatusCodes.filter((x: unknown) => typeof x === 'number')
+        : [];
+      if (codes.length === 0) continue;
+      if (c.requestBody !== undefined && !keepsInjected(c.requestBody)) {
+        logger.warn('[FLOW_BUILDER] Dropped AI case that removed an injected placeholder', { flowSpecId: id, nodeId, case: c.name });
+        continue;
+      }
+      seenNames.add(nameKey);
+      aiCases.push({
+        id: randomUUID(),
+        name: String(c.name).trim().slice(0, 80),
+        description: typeof c.description === 'string' ? c.description.slice(0, 200) : undefined,
+        requestBody: c.requestBody,
+        queryParams: c.queryParams && typeof c.queryParams === 'object' && !Array.isArray(c.queryParams) ? c.queryParams : undefined,
+        headers: c.headers && typeof c.headers === 'object' && !Array.isArray(c.headers) ? c.headers : undefined,
+        expectedStatusCodes: codes,
+        source: 'ai',
+        enabled: true,
+      });
+    }
+
+    if (aiCases.length === 0) {
+      throw new Error('AI produced no valid cases for this node.');
+    }
+
+    // Append to existing cases (don't clobber user-defined ones).
+    const mergedCases = [...(node.cases || []), ...aiCases];
+    const updatedNode: DAGNode = { ...node, cases: mergedCases };
+    const updatedDag: ExecutionDAG = { ...dag, nodes: dag.nodes.map(n => (n.id === nodeId ? updatedNode : n)) };
+    await updateFlowSpec(id, { executionDag: updatedDag });
+
+    logger.info('[FLOW_BUILDER] Generated AI cases for node', { flowSpecId: id, nodeId, added: aiCases.length, total: mergedCases.length });
+    return mergedCases;
+  }
+
+  /**
+   * Case Matrix: persist a user-edited case list onto a node (no LLM). Validates
+   * shape and replaces node.cases wholesale. Returns the saved cases.
+   */
+  static async saveNodeCases(
+    id: string,
+    nodeId: string,
+    cases: unknown,
+    userId: string,
+  ): Promise<NodeCase[] | null> {
+    const spec = await FlowBuilderService.getById(id, userId);
+    if (!spec) return null;
+    const dag = spec.executionDag;
+    const node = dag?.nodes?.find(n => n.id === nodeId);
+    if (!node) return null;
+    if (!Array.isArray(cases)) {
+      throw new Error('"cases" must be an array.');
+    }
+
+    const clean: NodeCase[] = [];
+    for (const c of cases as any[]) {
+      if (!c || typeof c.name !== 'string' || !c.name.trim()) continue;
+      const codes = Array.isArray(c.expectedStatusCodes)
+        ? c.expectedStatusCodes.filter((x: unknown) => typeof x === 'number')
+        : [];
+      if (codes.length === 0) continue;
+      clean.push({
+        id: typeof c.id === 'string' && c.id ? c.id : randomUUID(),
+        name: String(c.name).trim().slice(0, 80),
+        description: typeof c.description === 'string' ? c.description.slice(0, 200) : undefined,
+        requestBody: c.requestBody,
+        queryParams: c.queryParams && typeof c.queryParams === 'object' && !Array.isArray(c.queryParams) ? c.queryParams : undefined,
+        headers: c.headers && typeof c.headers === 'object' && !Array.isArray(c.headers) ? c.headers : undefined,
+        expectedStatusCodes: codes,
+        source: c.source === 'ai' ? 'ai' : 'user',
+        enabled: c.enabled !== false,
+      });
+    }
+
+    const updatedNode: DAGNode = { ...node, cases: clean };
+    const updatedDag: ExecutionDAG = { ...dag, nodes: dag.nodes.map(n => (n.id === nodeId ? updatedNode : n)) };
+    await updateFlowSpec(id, { executionDag: updatedDag });
+
+    logger.info('[FLOW_BUILDER] Saved user cases for node', { flowSpecId: id, nodeId, count: clean.length });
+    return clean;
   }
 
   /**

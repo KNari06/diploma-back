@@ -241,16 +241,52 @@ function buildResolvedRequest(
 
   // Apply body field injections
   for (const injection of node.variableInjections) {
+    const rawValue = ctx[injection.variableName];
+    if (rawValue === undefined) continue;
+
     if (injection.injectAs === 'body_field' && resolvedBody && typeof resolvedBody === 'object') {
-      const rawValue = ctx[injection.variableName];
-      if (rawValue !== undefined) {
-        resolvedBody[injection.targetKey] = rawValue;
+      resolvedBody[injection.targetKey] = rawValue;
+    } else if (injection.injectAs === 'body_json_path') {
+      // targetKey is a JSON path (e.g. "$.user.id" or "data.token"). Ensure a
+      // container object exists, then set the value at the nested path,
+      // creating intermediate objects as needed.
+      if (resolvedBody === undefined || resolvedBody === null || typeof resolvedBody !== 'object') {
+        resolvedBody = {};
       }
+      setByJsonPath(resolvedBody, injection.targetKey, rawValue);
     }
   }
 
   return { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected };
 }
+
+/**
+ * Set `value` at the nested `path` within `target`, creating intermediate
+ * objects as needed. Accepts `$.`-prefixed JSONPath (`$.user.id`) or plain
+ * dot-paths (`data.token`). Bracket segments (`a[0]`, `a['k']`) are supported.
+ */
+function setByJsonPath(target: Record<string, any>, path: string, value: any): void {
+  const segments = path
+    .replace(/^\$\.?/, '') // strip leading "$" or "$."
+    .replace(/\[['"]?([^'"\]]+)['"]?\]/g, '.$1') // a[0] / a['k'] → a.0 / a.k
+    .split('.')
+    .filter(seg => seg.length > 0);
+
+  if (segments.length === 0) return;
+
+  let cursor: Record<string, any> = target;
+  for (let i = 0; i < segments.length - 1; i++) {
+    const seg = segments[i];
+    if (cursor[seg] === undefined || cursor[seg] === null || typeof cursor[seg] !== 'object') {
+      cursor[seg] = {};
+    }
+    cursor = cursor[seg];
+  }
+  cursor[segments[segments.length - 1]] = value;
+}
+
+// Test-only surface for the otherwise-private request builder.
+export const __testables = { buildResolvedRequest, setByJsonPath };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RATE LIMIT HANDLING
@@ -567,8 +603,27 @@ export class FlowExecutorService {
 
       // Aggregate → parent node fails if ANY enabled case failed.
       const caseResults = stepResults.filter(r => r.caseId && r.stepIndex === stepIndex);
-      const anyFailed = caseResults.some(r => r.status !== 'passed');
+      const failedCount = caseResults.filter(r => r.status !== 'passed').length;
+      const anyFailed = failedCount > 0;
       if (anyFailed) failedNodes.add(nodeId);
+
+      // Push a PARENT aggregate row (no caseId) so the node — not its cases —
+      // is what summary counts and frontend reconcile see. Without this the
+      // node's status/counts would be derived per-case and mis-render.
+      stepResults.push({
+        nodeId,
+        stepIndex,
+        status: anyFailed ? 'failed' : 'passed',
+        method: node.method,
+        path: node.path,
+        resolvedUrl: '',
+        requestHeaders: {},
+        durationMs: caseResults.reduce((sum, r) => sum + (r.durationMs || 0), 0),
+        variablesInjected: [],
+        variablesExtracted: [],
+        error: anyFailed ? `${failedCount}/${caseResults.length} case(s) failed` : undefined,
+        retryCount: 0,
+      });
     };
 
     const runNode = async (node: DAGNode, stepIndex: number): Promise<void> => {
@@ -839,12 +894,17 @@ export class FlowExecutorService {
     // Parallel groups complete out of order — restore report ordering.
     stepResults.sort((a, b) => a.stepIndex - b.stepIndex);
 
-    // Build summary — 'cancelled' steps roll up under the skipped count for the
-    // summary card (they were not executed); the per-node status is still distinct.
-    const passed = stepResults.filter(r => r.status === 'passed').length;
-    const failed = stepResults.filter(r => r.status === 'failed').length;
-    const skipped = stepResults.filter(r => r.status === 'skipped' || r.status === 'cancelled').length;
-    const totalDurationMs = stepResults.reduce((sum, r) => sum + r.durationMs, 0);
+    // Build summary — counts are PER-NODE, not per-case: case rows (caseId set)
+    // nest under their parent's aggregate row, so we exclude them from the
+    // node-level tallies to avoid inflating total/passed/failed.
+    // 'cancelled' rolls up under skipped (not executed); per-node status stays distinct.
+    const nodeRows = stepResults.filter(r => !r.caseId);
+    const passed = nodeRows.filter(r => r.status === 'passed').length;
+    const failed = nodeRows.filter(r => r.status === 'failed').length;
+    const skipped = nodeRows.filter(r => r.status === 'skipped' || r.status === 'cancelled').length;
+    // Sum over node rows only: a parent aggregate row's durationMs is already the
+    // sum of its case rows, so summing all rows would double-count case durations.
+    const totalDurationMs = nodeRows.reduce((sum, r) => sum + r.durationMs, 0);
     const runStatus: FlowRunStatus = abortController.signal.aborted
       ? 'cancelled'
       : failed > 0 ? 'failed' : 'completed';
@@ -853,7 +913,7 @@ export class FlowExecutorService {
       flowRunId,
       flowSpecId: flowSpec.id,
       status: runStatus,
-      total: stepResults.length,
+      total: nodeRows.length,
       passed,
       failed,
       skipped,
@@ -877,7 +937,8 @@ export class FlowExecutorService {
     // Emit final event
     if (chatSessionId) {
       if (runStatus === 'failed' || runStatus === 'cancelled') {
-        const firstFailed = stepResults.find(r => r.status === 'failed');
+        // Prefer a node row (not a case row) so failedAtNodeId points to the node.
+        const firstFailed = nodeRows.find(r => r.status === 'failed');
         emit('emitApiFlowFailed', {
           flowSpecId: flowSpec.id,
           flowRunId,
