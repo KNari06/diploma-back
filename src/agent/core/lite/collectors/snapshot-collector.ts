@@ -1811,6 +1811,39 @@ export class SnapshotCollector {
               ? (hitTestTopEl === el || (hitTestTopEl !== null && el.contains(hitTestTopEl)))
               : undefined;
 
+            // ═══════════════════════════════════════════════════════════════
+            // Floating corner widget — geometry-only (chat/assistant bubble,
+            // support launcher). Inline copy of `isFloatingCornerWidget` in
+            // floating-widget.util.ts — KEEP IN SYNC (constants:
+            // FLOATING_WIDGET_EDGE_MARGIN_PX=24, FLOATING_WIDGET_MAX_COVERAGE=0.30).
+            // We walk to the nearest position:fixed ancestor (or self) and test
+            // THAT container, so a widget's child buttons inherit the flag and
+            // get deprioritized in the resolver. Never flags modal contents.
+            // ═══════════════════════════════════════════════════════════════
+            let floatingWidget = false;
+            if (!isInsideActiveModal) {
+              let fixedAncestor: Element | null = null;
+              let walk: Element | null = el;
+              for (let depth = 0; walk && depth < 12; depth++) {
+                try {
+                  if (window.getComputedStyle(walk).position === 'fixed') { fixedAncestor = walk; break; }
+                } catch { break; }
+                walk = walk.parentElement;
+              }
+              if (fixedAncestor) {
+                const fr = fixedAncestor.getBoundingClientRect();
+                if (fr.width > 0 && fr.height > 0 && __vw > 0 && __vh > 0) {
+                  const coverage = (fr.width * fr.height) / (__vw * __vh);
+                  if (coverage < 0.30) {
+                    const m = 24;
+                    const hugsH = fr.left <= m || fr.left + fr.width >= __vw - m;
+                    const hugsV = fr.top <= m || fr.top + fr.height >= __vh - m;
+                    floatingWidget = hugsH && hugsV;
+                  }
+                }
+              }
+            }
+
             // SECURITY: Redact sensitive input values to prevent credential leakage
             // Password fields and credential-related inputs should never have values in snapshot
             // ✅ FIX: Use token-level matching for autocomplete (space-separated per spec)
@@ -2574,6 +2607,7 @@ export class SnapshotCollector {
               computedZIndex,
               isPositioned,
               isTopMostAtCenter,
+              floatingWidget,
               // Visual Anchors: Bounding box for spatial lookup
               bounds: {
                 x: rect.left,
@@ -3408,6 +3442,23 @@ export class SnapshotCollector {
       return 'No interactive elements found on page.';
     }
 
+    // Normalize an anchor href for the LLM picker: keep host+path(+hash) so
+    // same-text links ("Learn more" ×6) become distinguishable, but DROP the
+    // query string — it can carry tokens/session ids/OTPs and exposing it in
+    // the prompt would violate the secret-redaction invariant. Hash is kept
+    // because hash-router SPAs encode the route there. Length-capped to keep
+    // token cost bounded.
+    const normalizeHref = (raw: string): string => {
+      try {
+        const u = new URL(raw);
+        const out = `${u.host}${u.pathname}${u.hash}`.replace(/\/$/, '');
+        return out.length > 120 ? `${out.slice(0, 120)}…` : out;
+      } catch {
+        const noQuery = raw.split(/[?]/)[0];
+        return noQuery.length > 120 ? `${noQuery.slice(0, 120)}…` : noQuery;
+      }
+    };
+
     // Filter elements: pruner-based (dynamic) or legacy (priority sort + cap)
     let elements = snapshot.elements;
     if (keepRefs && keepRefs.size > 0) {
@@ -3505,6 +3556,17 @@ export class SnapshotCollector {
         }
 
         if (el.context) line += ` (${el.context})`;  // Parent context
+        // Stable identity hints for the picker LLM. These are already
+        // collected (and filtered: liveStableId drops React/Radix/MUI
+        // generated ids) and feed the resolver's TargetFingerprint — surfacing
+        // them here lets the LLM disambiguate same-text siblings (e.g. 6×
+        // "Learn more" links that differ only by href) instead of guessing.
+        if (el.testIdAttr) line += ` testid="${el.testIdAttr}"`;
+        if (el.id) line += ` id="${el.id}"`;
+        if (el.href) line += ` href="${normalizeHref(el.href)}"`;
+        // First standalone text fragment — disambiguates wrapped anchors like
+        // <a><h3>Title</h3><span>desc</span></a> whose name is the glued whole.
+        if (el.firstTextFragment) line += ` firstText="${el.firstTextFragment}"`;
         if (el.type) line += ` type=${el.type}`;
         if (el.placeholder) line += ` placeholder="${el.placeholder}"`;
         if (el.disabled) line += ' [DISABLED]';
