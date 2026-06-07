@@ -25,6 +25,7 @@ import {
   getRuns,
   getRunById,
   reparseSpec,
+  refineNode,
 } from './apiFlowSpec.controller';
 
 const router = Router();
@@ -44,6 +45,9 @@ router.delete('/:id', deleteSpec);
 router.post('/:id/run', runFlow);
 router.post('/:id/stop', stopFlow);
 router.post('/:id/reparse', reparseSpec);
+
+// Per-node AI refine
+router.post('/:id/nodes/:nodeId/refine', refineNode);
 
 // Run history
 router.get('/:id/runs', getRuns);

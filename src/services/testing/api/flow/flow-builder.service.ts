@@ -15,6 +15,9 @@ import { logger } from '@/utils/core/logger';
 import { webSocketService } from '@/websocket/core/websocket.service';
 import { SpecParserService } from './spec-parser.service';
 import { DependencyResolverService, type ResolveResult } from './dependency-resolver.service';
+import { callAiWithRetry, extractJson } from './ai-json.util';
+import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
+import { buildNodeRefinePrompt, buildNodeRefineSystemPrompt } from '@/ai/prompts/api-flow-prompts';
 import type {
   ApiFlowSpec,
   ApiSpecSourceType,
@@ -892,6 +895,91 @@ export class FlowBuilderService {
     });
 
     return FlowBuilderService.getById(id, userId);
+  }
+
+  /**
+   * Refine a single node's test data via the LLM, from a free-text instruction
+   * (e.g. "use a valid email and an idempotency key"). Regenerates only
+   * sampleRequestBody / sampleQueryParams / expectedStatusCodes / summary for
+   * that node, persists the edited DAG, and returns the updated node.
+   * @throws if the spec or node is not found, or the model returns nothing usable.
+   */
+  static async refineNode(
+    id: string,
+    nodeId: string,
+    instruction: string,
+    userId: string,
+  ): Promise<DAGNode | null> {
+    const spec = await FlowBuilderService.getById(id, userId);
+    if (!spec) return null;
+
+    const dag = spec.executionDag;
+    const node = dag?.nodes?.find(n => n.id === nodeId);
+    if (!node) return null;
+
+    const raw = await callAiWithRetry(
+      [
+        { role: 'system', content: buildNodeRefineSystemPrompt() },
+        { role: 'user', content: buildNodeRefinePrompt(node, instruction) },
+      ],
+      {
+        temperature: 0.4,
+        response_format: { type: 'json_object' },
+        max_tokens: 4000,
+        model: AI_TASK_MODELS.apiFlowEnricher,
+        timeout: 90000,
+      } as any,
+      'NodeRefine',
+    );
+
+    const patch = extractJson(raw);
+    if (!patch || typeof patch !== 'object') {
+      throw new Error('AI returned no usable refinement for this node.');
+    }
+
+    // Apply only the recognized, type-checked fields — never trust the shape blindly.
+    const updatedNode: DAGNode = { ...node };
+    if (patch.sampleRequestBody !== undefined && patch.sampleRequestBody !== null) {
+      // §10 net: the model is told to keep {{placeholders}} intact, but never trust it.
+      // Any placeholder wired from a prior node via variableInjection is NOT a value the
+      // refine step may resolve — if the patched body dropped one, reject the body change.
+      const injected = new Set(
+        node.variableInjections
+          .filter(inj => inj.injectAs === 'body_field' || inj.injectAs === 'body_json_path')
+          .map(inj => `{{${inj.variableName}}}`),
+      );
+      const before = JSON.stringify(node.sampleRequestBody ?? {});
+      const after = JSON.stringify(patch.sampleRequestBody);
+      const droppedInjected = [...injected].some(ph => before.includes(ph) && !after.includes(ph));
+      if (droppedInjected) {
+        logger.warn('[FLOW_BUILDER] Node refine dropped an injected placeholder — keeping original body', {
+          flowSpecId: id,
+          nodeId,
+        });
+      } else {
+        updatedNode.sampleRequestBody = patch.sampleRequestBody;
+      }
+    }
+    if (patch.sampleQueryParams && typeof patch.sampleQueryParams === 'object' && !Array.isArray(patch.sampleQueryParams)) {
+      updatedNode.sampleQueryParams = patch.sampleQueryParams;
+    }
+    if (Array.isArray(patch.expectedStatusCodes)) {
+      const codes = patch.expectedStatusCodes.filter((c: unknown) => typeof c === 'number');
+      if (codes.length > 0) updatedNode.expectedStatusCodes = codes;
+    }
+    if (typeof patch.summary === 'string' && patch.summary.trim()) {
+      updatedNode.summary = patch.summary.trim();
+    }
+
+    const updatedDag: ExecutionDAG = {
+      ...dag,
+      nodes: dag.nodes.map(n => (n.id === nodeId ? updatedNode : n)),
+    };
+
+    await updateFlowSpec(id, { executionDag: updatedDag });
+
+    logger.info('[FLOW_BUILDER] Node refined via AI', { flowSpecId: id, nodeId });
+    return updatedNode;
   }
 
   /**

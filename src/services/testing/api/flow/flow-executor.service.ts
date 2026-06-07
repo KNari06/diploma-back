@@ -32,6 +32,7 @@ import type {
   FlowRunStatus,
   FlowStepResult,
   FlowStepStatus,
+  NodeCase,
   RunFlowRequest,
   VariableContext,
   VariableExtraction,
@@ -488,7 +489,94 @@ export class FlowExecutorService {
      * nodes in the SAME parallel group: such nodes never depend on each other
      * (topological-level grouping), so their ctx writes touch disjoint keys.
      */
+    /**
+     * Case Matrix (Group 5): run a node's N enabled cases concurrently. Each
+     * case is judged against ITS OWN expected status codes (so "wrong password
+     * → 401" passes on 401). Cases share the node's upstream ctx but produce NO
+     * downstream variables (leaf test). The parent node aggregates: passed only
+     * if every enabled case passed. Each case is emitted/persisted/tracked as a
+     * step result tagged with caseId/caseName (nodeId stays the parent).
+     */
+    const runCaseMatrix = async (node: DAGNode, stepIndex: number): Promise<void> => {
+      const nodeId = node.id;
+      const enabledCases = (node.cases || []).filter(c => c.enabled !== false);
+
+      const runOneCase = async (c: NodeCase): Promise<void> => {
+        const { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
+          node, baseUrl, ctx, { requestBody: c.requestBody, queryParams: c.queryParams, headers: c.headers },
+        );
+
+        emit('emitApiFlowStepStart', {
+          flowSpecId: flowSpec.id, flowRunId, sessionId: chatSessionId || '',
+          stepIndex, nodeId, caseId: c.id, caseName: c.name,
+          method: node.method, path: node.path, resolvedUrl, variablesInjected,
+          timestamp: new Date().toISOString(),
+        });
+
+        const result = await FlowExecutorService.executeStep(
+          node, resolvedUrl, resolvedHeaders, resolvedBody, stepIndex, flowRunId,
+          config, abortController.signal, c.expectedStatusCodes,
+        );
+        result.caseId = c.id;
+        result.caseName = c.name;
+        result.nodeId = nodeId;
+        result.stepIndex = stepIndex;
+        result.variablesInjected = variablesInjected;
+        result.variablesExtracted = []; // leaf — never produces downstream vars
+        stepResults.push(result);
+
+        emit('emitApiFlowStepComplete', {
+          flowSpecId: flowSpec.id, flowRunId, sessionId: chatSessionId || '',
+          stepIndex, nodeId, caseId: c.id, caseName: c.name,
+          success: result.status === 'passed',
+          statusCode: result.responseStatus || 0,
+          durationMs: result.durationMs,
+          variablesExtracted: [],
+          error: result.error,
+          timestamp: new Date().toISOString(),
+        });
+
+        if (result.responseStatus !== undefined) {
+          try {
+            await ApiTestStorageService.saveApiTestExecution({
+              userId,
+              testId: randomUUID(),
+              chatSessionId,
+              request: { method: node.method, url: result.resolvedUrl, headers: result.requestHeaders, body: result.requestBody },
+              response: {
+                status: result.responseStatus || 0,
+                statusText: String(result.responseStatus || 0),
+                headers: result.responseHeaders,
+                body: result.responseBody,
+                durationMs: result.durationMs,
+              },
+              success: result.status === 'passed',
+              errorMessage: result.error,
+              // case identity lives in the run summary's stepResults (caseId);
+              // api_test_executions has no case_id column, so we don't pass one.
+              metadata: { flow_spec_id: flowSpec.id, flow_run_id: flowRunId, flow_step_index: stepIndex },
+            });
+          } catch (err) {
+            logger.warn('[FLOW_EXECUTOR] Failed to save case to api_test_executions', { err });
+          }
+        }
+      };
+
+      // Run cases concurrently (bounded by the same group cap).
+      await runWithConcurrency(enabledCases.map(c => () => runOneCase(c)), MAX_GROUP_CONCURRENCY);
+
+      // Aggregate → parent node fails if ANY enabled case failed.
+      const caseResults = stepResults.filter(r => r.caseId && r.stepIndex === stepIndex);
+      const anyFailed = caseResults.some(r => r.status !== 'passed');
+      if (anyFailed) failedNodes.add(nodeId);
+    };
+
     const runNode = async (node: DAGNode, stepIndex: number): Promise<void> => {
+      // Case Matrix: if this node has enabled cases, run them instead of a single call.
+      if ((node.cases || []).some(c => c.enabled !== false)) {
+        return runCaseMatrix(node, stepIndex);
+      }
+
       const nodeId = node.id;
       const override = request.nodeOverrides?.[nodeId];
       const { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
@@ -841,8 +929,12 @@ export class FlowExecutorService {
     flowRunId: string,
     config: FlowExecutionConfig,
     abortSignal?: AbortSignal,
+    // Case-matrix override: a case judges pass/fail against ITS own expected
+    // codes, not the node's. Falls back to the node's when not provided.
+    expectedStatusOverride?: number[],
   ): Promise<FlowStepResult> {
     const startTime = Date.now();
+    const expected = expectedStatusOverride?.length ? expectedStatusOverride : node.expectedStatusCodes;
 
     try {
       const response = await executeApiTest({
@@ -851,12 +943,12 @@ export class FlowExecutorService {
         headers,
         body: ['POST', 'PUT', 'PATCH'].includes(node.method) ? body : undefined,
         timeout: config.stepTimeoutMs,
-        expectedStatus: node.expectedStatusCodes?.[0] ?? 200,
+        expectedStatus: expected?.[0] ?? 200,
         signal: abortSignal,
       });
 
       const durationMs = Date.now() - startTime;
-      const expectedCodes = node.expectedStatusCodes?.length ? node.expectedStatusCodes : [200, 201];
+      const expectedCodes = expected?.length ? expected : [200, 201];
       const success = response.success || expectedCodes.includes(response.status);
 
       return {

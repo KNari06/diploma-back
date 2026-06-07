@@ -2724,6 +2724,9 @@ export interface ApiFlowStepStartPayload {
   path: string;
   resolvedUrl: string;
   variablesInjected: string[]; // variable names used
+  // Case Matrix (Group 5): set when this is one case of a node's matrix.
+  caseId?: string;
+  caseName?: string;
   timestamp: string;
 }
 
@@ -2738,6 +2741,9 @@ export interface ApiFlowStepCompletePayload {
   durationMs: number;
   variablesExtracted: Array<{ name: string; value: string }>;
   error?: string;
+  // Case Matrix (Group 5): set when this is one case of a node's matrix.
+  caseId?: string;
+  caseName?: string;
   timestamp: string;
 }
 

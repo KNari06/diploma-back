@@ -421,6 +421,65 @@ export const getRunById = async (req: Request, res: Response): Promise<void> => 
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/v1/api-flow-spec/:id/nodes/:nodeId/refine
+// Refine ONE node's test data from a free-text instruction via the LLM.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NODE_REFINE_CREDIT_COST = 1;
+
+export const refineNode = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) { res.status(401).json({ success: false, error: 'Unauthorized' }); return; }
+    const { id, nodeId } = req.params;
+    const { prompt } = req.body as { prompt?: string };
+
+    if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+      res.status(400).json({ success: false, error: 'A non-empty "prompt" is required.' });
+      return;
+    }
+
+    // Credit check (LLM op) — same posture as other AI endpoints.
+    const hasCredits = await UserCreditsService.hasCredits(userId, NODE_REFINE_CREDIT_COST);
+    if (!hasCredits) {
+      res.status(402).json({
+        success: false,
+        error: 'Insufficient credits',
+        code: 'INSUFFICIENT_CREDITS',
+        details: { required: NODE_REFINE_CREDIT_COST },
+      });
+      return;
+    }
+
+    let updatedNode;
+    try {
+      updatedNode = await FlowBuilderService.refineNode(id, nodeId, prompt.trim(), userId);
+    } catch (err: any) {
+      res.status(422).json({ success: false, error: err?.message || 'Failed to refine node' });
+      return;
+    }
+
+    if (!updatedNode) {
+      res.status(404).json({ success: false, error: 'Flow spec or node not found' });
+      return;
+    }
+
+    // Only charge once the refinement actually produced a node.
+    await UserCreditsService.deductCredits(
+      userId,
+      NODE_REFINE_CREDIT_COST,
+      `API Flow: refine node ${nodeId}`,
+      { flowSpecId: id, nodeId },
+    );
+
+    res.json({ success: true, data: updatedNode });
+  } catch (error: any) {
+    logger.error('[FLOW_SPEC_CONTROLLER] Refine node failed', { error: error.message });
+    res.status(500).json({ success: false, error: 'Failed to refine node' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/api-flow-spec/:id/reparse
 // Re-fetch spec from source URL and rebuild DAG (preserves user overrides)
 // ─────────────────────────────────────────────────────────────────────────────

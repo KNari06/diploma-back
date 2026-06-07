@@ -132,6 +132,28 @@ export interface DAGNode {
   sampleRequestBody?: any; // AI-generated fake data for testing
   sampleQueryParams?: Record<string, string>;
   expectedStatusCodes: number[];
+  // Case Matrix (Group 5): when present, this endpoint is tested with N cases
+  // (happy / boundary / negative …) run in parallel, each with its own body +
+  // expected status. A node with cases is a LEAF test — it does not extract
+  // variables for downstream nodes.
+  cases?: NodeCase[];
+}
+
+/**
+ * One test case in a node's case matrix. Maps onto buildResolvedRequest's
+ * nodeOverride shape ({requestBody, queryParams, headers}) plus its own
+ * expectedStatusCodes — so e.g. a "wrong password → 401" case PASSES on 401.
+ */
+export interface NodeCase {
+  id: string;
+  name: string;
+  description?: string;
+  requestBody?: any;
+  queryParams?: Record<string, string>;
+  headers?: Record<string, string>;
+  expectedStatusCodes: number[];
+  source: 'ai' | 'user';
+  enabled?: boolean; // default true; false → skipped at run time
 }
 
 export interface ExecutionDAG {
@@ -244,6 +266,10 @@ export interface FlowStepResult {
   error?: string;
   retryCount: number;
   executionId?: string; // FK to api_test_executions
+  // Case Matrix (Group 5): set when this result is one case of a node's matrix.
+  // nodeId stays the parent node so results nest under it.
+  caseId?: string;
+  caseName?: string;
 }
 
 export interface FlowRunSummary {

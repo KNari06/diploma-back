@@ -247,3 +247,77 @@ describe('flow executor — real parallelism (Group 3)', () => {
     expect(summary.stepResults.find(r => r.nodeId === 'b')?.status).toBe('passed');
   });
 });
+
+describe('flow executor — case matrix (Group 5)', () => {
+  test('runs N cases concurrently, each judged by its OWN expected codes', async () => {
+    const spec = makeSpec([
+      node('auth', {
+        method: 'POST',
+        cases: [
+          { id: 'happy', name: 'happy', expectedStatusCodes: [200], source: 'user' },
+          { id: 'wrongpw', name: 'wrong password', expectedStatusCodes: [401], source: 'ai' },
+          { id: 'badtype', name: 'type mismatch', expectedStatusCodes: [422], source: 'ai' },
+        ],
+      }),
+    ]);
+
+    let inFlight = 0, maxInFlight = 0;
+    // Each case "returns" the status its name implies; success keys off the case's expected codes.
+    jest.spyOn(FlowExecutorService as any, 'executeStep').mockImplementation(
+      async (...args: any[]) => {
+        const n = args[0]; const expected: number[] = args[8];
+        inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(r => setTimeout(r, 5));
+        const code = expected[0]; // mock the API returning exactly the case's expected code
+        inFlight--;
+        return { status: expected.includes(code) ? 'passed' : 'failed', nodeId: n.id, responseStatus: code, durationMs: 1, requestHeaders: {} };
+      },
+    );
+
+    const summary = await FlowExecutorService.execute(spec, 'u1', { chatSessionId: 'chat1' }, 'run1');
+
+    const caseRows = summary.stepResults.filter(r => r.caseId);
+    expect(caseRows).toHaveLength(3);
+    expect(maxInFlight).toBeGreaterThanOrEqual(2); // cases overlapped
+    // wrong-password case PASSES because it got 401 and expected 401
+    expect(caseRows.find(r => r.caseId === 'wrongpw')?.status).toBe('passed');
+    expect(caseRows.every(r => r.status === 'passed')).toBe(true);
+    // matrix node is a leaf — no variables produced
+    expect(caseRows.every(r => r.variablesExtracted.length === 0)).toBe(true);
+    expect(summary.status).toBe('completed');
+  });
+
+  test('parent node fails if ANY case fails, and downstream cancels (stop_on_failure)', async () => {
+    // The "broken" case carries a marker header the mock reads to force a failure.
+    const spec = makeSpec(
+      [
+        node('auth', { method: 'POST', cases: [
+          { id: 'happy', name: 'happy', expectedStatusCodes: [200], source: 'user' },
+          { id: 'broken', name: 'broken', expectedStatusCodes: [200], headers: { 'x-case': 'broken' }, source: 'ai' },
+        ] }),
+        node('next', { dependsOn: ['auth'] }),
+      ],
+      [['auth'], ['next']],
+    );
+
+    jest.spyOn(FlowExecutorService as any, 'executeStep').mockImplementation(
+      async (...args: any[]) => {
+        const n = args[0]; const headers = args[2];
+        // 'broken' case → returns 500 (not its expected 200) → fails.
+        const broken = headers && headers['x-case'] === 'broken';
+        const status = broken ? 'failed' : 'passed';
+        return { status, nodeId: n.id, responseStatus: broken ? 500 : 200, durationMs: 1, requestHeaders: headers || {} };
+      },
+    );
+
+    const summary = await FlowExecutorService.execute(spec, 'u1', { chatSessionId: 'chat1' }, 'run1');
+
+    const caseRows = summary.stepResults.filter(r => r.caseId);
+    expect(caseRows).toHaveLength(2);
+    expect(caseRows.find(r => r.caseId === 'broken')?.status).toBe('failed');
+    expect(caseRows.find(r => r.caseId === 'happy')?.status).toBe('passed');
+    // parent 'auth' failed → 'next' (downstream group) cancelled, run failed
+    expect(summary.stepResults.find(r => r.nodeId === 'next')?.status).toBe('cancelled');
+    expect(summary.status).toBe('failed');
+  });
+});
