@@ -417,7 +417,14 @@ export interface ServerToClientEvents {
       | 'ready';
     progress: number;     // 0-100
     url?: string;
-    elapsedMs: number;
+    // elapsedMs is optional: the web preview path stamps it, the mobile warmup
+    // path historically didn't. Keeping it optional avoids forcing a fake value.
+    elapsedMs?: number;
+    // When set, this stage FAILED — `stage` names the phase that failed (e.g.
+    // 'boot_emulator' when the emulator crashed during startup) and `error` is
+    // the user-facing message. The frontend stops the spinner and shows this
+    // instead of optimistically completing the checklist. Absent on success.
+    error?: string;
   }) => void;
 
   // Login required — emitted when the preview lands on a login / auth
