@@ -51,6 +51,32 @@ const DEFAULT_CONFIG: FlowExecutionConfig = {
   rateLimitDelayMs: 100,
 };
 
+// Max simultaneous in-flight requests within a single parallel group, so a wide
+// group (e.g. 50 same-level nodes) doesn't fire 50 requests at once.
+const MAX_GROUP_CONCURRENCY = 5;
+
+/**
+ * Run `tasks` with at most `limit` in flight at once. Settles every task (a
+ * thrown task does not abort its siblings); rejections are swallowed because
+ * runNode handles its own errors and records a failed step. Zero-dependency —
+ * avoids pulling an ESM-only limiter into this CommonJS module.
+ */
+async function runWithConcurrency(tasks: Array<() => Promise<void>>, limit: number): Promise<void> {
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < tasks.length) {
+      const idx = cursor++;
+      try {
+        await tasks[idx]();
+      } catch {
+        // runNode is self-contained; ignore so one task can't abort siblings.
+      }
+    }
+  };
+  const workerCount = Math.max(1, Math.min(limit, tasks.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
+
 // Sensitive variable name patterns — mask their values in WS events
 const SENSITIVE_PATTERNS = /token|secret|password|key|auth|jwt|bearer/i;
 
@@ -410,254 +436,311 @@ export class FlowExecutorService {
       (webSocketService as any)[event]?.(chatSessionId, payload);
     };
 
-    try {
-      for (let stepIndex = 0; stepIndex < dag.executionOrder.length; stepIndex++) {
-        // Check cancellation
-        if (abortController.signal.aborted) {
-          logger.info('[FLOW_EXECUTOR] Flow cancelled', { flowRunId });
-          break;
-        }
+    // Stable stepIndex per node = its position in executionOrder (preserves
+    // report ordering even though parallel groups complete out of order).
+    const stepIndexOf = new Map<string, number>();
+    dag.executionOrder.forEach((id, i) => stepIndexOf.set(id, i));
 
-        const nodeId = dag.executionOrder[stepIndex];
-        const node = nodeMap.get(nodeId);
-        if (!node) continue;
+    const baseUrl = flowSpec.rawSpec?.servers?.[0]?.url
+      || (flowSpec.rawSpec?.host
+        ? `${(flowSpec.rawSpec.schemes?.[0] || 'https')}://${flowSpec.rawSpec.host}${flowSpec.rawSpec.basePath || ''}`
+        : '');
 
-        // Skip unsupported nodes
-        if (node.isUnsupported) {
-          stepResults.push({
-            nodeId,
-            stepIndex,
-            status: 'skipped',
-            method: node.method,
-            path: node.path,
-            resolvedUrl: '',
-            requestHeaders: {},
-            durationMs: 0,
-            variablesInjected: [],
-            variablesExtracted: [],
-            error: `Unsupported: ${node.unsupportedReason}`,
-            retryCount: 0,
-          });
-          continue;
-        }
+    const skippedRow = (
+      node: DAGNode,
+      stepIndex: number,
+      status: 'skipped' | 'cancelled',
+      reason: 'unsupported' | 'dependency_failed' | 'cancelled',
+      message: string,
+    ): void => {
+      skippedNodes.add(node.id);
+      stepResults.push({
+        nodeId: node.id,
+        stepIndex,
+        status,
+        method: node.method,
+        path: node.path,
+        resolvedUrl: '',
+        requestHeaders: {},
+        durationMs: 0,
+        variablesInjected: [],
+        variablesExtracted: [],
+        error: message,
+        retryCount: 0,
+      });
+      emit('emitApiFlowStepSkipped', {
+        flowSpecId: flowSpec.id,
+        flowRunId,
+        sessionId: chatSessionId || '',
+        stepIndex,
+        nodeId: node.id,
+        reason,
+        status,
+        message,
+        timestamp: new Date().toISOString(),
+      });
+    };
 
-        // Skip if dependencies failed (stop_on_failure / retry_then_skip)
-        const hasFailed = node.dependsOn.some(dep => failedNodes.has(dep) || skippedNodes.has(dep));
-        if (hasFailed && config.errorStrategy !== 'continue_on_failure') {
-          skippedNodes.add(nodeId);
-          stepResults.push({
-            nodeId,
-            stepIndex,
-            status: 'skipped',
-            method: node.method,
-            path: node.path,
-            resolvedUrl: '',
-            requestHeaders: {},
-            durationMs: 0,
-            variablesInjected: [],
-            variablesExtracted: [],
-            error: 'Skipped: dependency failed',
-            retryCount: 0,
-          });
-          continue;
-        }
+    /**
+     * Run a single node end-to-end: build → emit start → retry loop
+     * (429/401) → extract variables → emit complete → persist. Pushes its
+     * result to stepResults and tracks failure. Safe to call concurrently for
+     * nodes in the SAME parallel group: such nodes never depend on each other
+     * (topological-level grouping), so their ctx writes touch disjoint keys.
+     */
+    const runNode = async (node: DAGNode, stepIndex: number): Promise<void> => {
+      const nodeId = node.id;
+      const override = request.nodeOverrides?.[nodeId];
+      const { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
+        node, baseUrl, ctx, override,
+      );
 
-        // Rate limit delay
-        if (stepIndex > 0) await sleepMs(config.rateLimitDelayMs);
+      emit('emitApiFlowStepStart', {
+        flowSpecId: flowSpec.id,
+        flowRunId,
+        sessionId: chatSessionId || '',
+        stepIndex,
+        nodeId,
+        method: node.method,
+        path: node.path,
+        resolvedUrl,
+        variablesInjected,
+        timestamp: new Date().toISOString(),
+      });
 
-        // Build request
-        const override = request.nodeOverrides?.[nodeId];
-        const baseUrl = flowSpec.rawSpec?.servers?.[0]?.url
-          || (flowSpec.rawSpec?.host
-            ? `${(flowSpec.rawSpec.schemes?.[0] || 'https')}://${flowSpec.rawSpec.host}${flowSpec.rawSpec.basePath || ''}`
-            : '');
-        const { resolvedUrl, resolvedHeaders, resolvedBody, variablesInjected } = buildResolvedRequest(
-          node,
-          baseUrl,
-          ctx,
-          override,
+      let stepResult: FlowStepResult | null = null;
+      let retryCount = 0;
+      const maxRetries = config.errorStrategy === 'retry_then_skip' ? config.maxRetries : 2;
+
+      while (retryCount < maxRetries) {
+        const result = await FlowExecutorService.executeStep(
+          node, resolvedUrl, resolvedHeaders, resolvedBody, stepIndex, flowRunId, config, abortController.signal,
         );
 
-        // Emit step start
-        emit('emitApiFlowStepStart', {
-          flowSpecId: flowSpec.id,
-          flowRunId,
-          sessionId: chatSessionId || '',
-          stepIndex,
-          nodeId,
-          method: node.method,
-          path: node.path,
-          resolvedUrl,
-          variablesInjected,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Execute with retry logic
-        let stepResult: FlowStepResult | null = null;
-        let retryCount = 0;
-        // Always allow at least 2 attempts: 1 original + 1 for 401 auth refresh
-        const maxRetries = config.errorStrategy === 'retry_then_skip' ? config.maxRetries : 2;
-
-        while (retryCount < maxRetries) {
-          const result = await FlowExecutorService.executeStep(
-            node,
-            resolvedUrl,
-            resolvedHeaders,
-            resolvedBody,
-            stepIndex,
-            flowRunId,
-            config,
-            abortController.signal,
-          );
-
-          // Handle 429 rate limit
-          if (result.responseStatus === 429) {
-            const waitMs = parseRetryAfter(result.responseHeaders || {});
-            logger.info('[FLOW_EXECUTOR] Rate limited — waiting', { waitMs, nodeId });
-            await sleepMs(waitMs);
-            retryCount++;
-            if (retryCount < maxRetries) continue;
+        // 429 rate limit
+        if (result.responseStatus === 429) {
+          const waitMs = parseRetryAfter(result.responseHeaders || {});
+          logger.info('[FLOW_EXECUTOR] Rate limited — waiting', { waitMs, nodeId });
+          await sleepMs(waitMs);
+          retryCount++;
+          if (retryCount < maxRetries) {
+            emit('emitApiFlowStepRetrying', {
+              flowSpecId: flowSpec.id, flowRunId, sessionId: chatSessionId || '',
+              stepIndex, nodeId, attempt: retryCount, maxRetries,
+              reason: 'rate_limited', timestamp: new Date().toISOString(),
+            });
+            continue;
           }
+        }
 
-          // Handle 401 auth refresh (if there's an auth node and this is not the auth node itself)
-          if (result.responseStatus === 401 && authNodeId && node.id !== authNodeId) {
-            logger.info('[FLOW_EXECUTOR] 401 detected — re-executing auth endpoint', { authNodeId });
-            const authNode = nodeMap.get(authNodeId)!;
-            const authOverride = request.nodeOverrides?.[authNodeId];
-            const { resolvedUrl: authUrl, resolvedHeaders: authHeaders, resolvedBody: authBody } = buildResolvedRequest(
-              authNode, baseUrl, ctx, authOverride,
-            );
-            const authResult = await FlowExecutorService.executeStep(
-              authNode, authUrl, authHeaders, authBody, -1, flowRunId, config, abortController.signal,
-            );
-            if (authResult.status === 'passed') {
-              // Re-extract auth variables
-              for (const ext of authNode.variableExtractions) {
-                const value = extractVariable(authResult.responseBody, authResult.responseHeaders || {}, ext);
-                if (value !== undefined) {
-                  ctx[ext.variableName] = value;
-                  variablesResolved++;
-                }
+        // 401 auth refresh (skip when this IS the auth node)
+        if (result.responseStatus === 401 && authNodeId && node.id !== authNodeId) {
+          logger.info('[FLOW_EXECUTOR] 401 detected — re-executing auth endpoint', { authNodeId });
+          const authNode = nodeMap.get(authNodeId)!;
+          const authOverride = request.nodeOverrides?.[authNodeId];
+          const { resolvedUrl: authUrl, resolvedHeaders: authHeaders, resolvedBody: authBody } = buildResolvedRequest(
+            authNode, baseUrl, ctx, authOverride,
+          );
+          const authResult = await FlowExecutorService.executeStep(
+            authNode, authUrl, authHeaders, authBody, -1, flowRunId, config, abortController.signal,
+          );
+          if (authResult.status === 'passed') {
+            for (const ext of authNode.variableExtractions) {
+              const value = extractVariable(authResult.responseBody, authResult.responseHeaders || {}, ext);
+              if (value !== undefined) {
+                ctx[ext.variableName] = value;
+                variablesResolved++;
               }
-              // Retry the original step
-              retryCount++;
+            }
+            retryCount++;
+            if (retryCount < maxRetries) {
+              emit('emitApiFlowStepRetrying', {
+                flowSpecId: flowSpec.id, flowRunId, sessionId: chatSessionId || '',
+                stepIndex, nodeId, attempt: retryCount, maxRetries,
+                reason: 'auth_refresh', timestamp: new Date().toISOString(),
+              });
               continue;
             }
           }
+        }
 
-          stepResult = result;
+        stepResult = result;
+        break;
+      }
+
+      if (!stepResult) {
+        stepResult = {
+          nodeId, stepIndex, status: 'failed', method: node.method, path: node.path,
+          resolvedUrl, requestHeaders: resolvedHeaders, requestBody: resolvedBody,
+          durationMs: 0, variablesInjected, variablesExtracted: [],
+          error: 'Max retries exceeded', retryCount,
+        };
+      }
+
+      const finalStepResult = stepResult!;
+      // Stamp identity defensively — report ordering & dedup rely on these even
+      // if a future executeStep variant forgets to set them.
+      finalStepResult.stepIndex = stepIndex;
+      finalStepResult.nodeId = nodeId;
+      finalStepResult.retryCount = retryCount;
+
+      // Extract variables. Within a group, nodes don't read each other's outputs
+      // (no intra-group dependency), so writing into the shared ctx here is safe.
+      const extractedThisStep: Array<{ name: string; value: string }> = [];
+      if (finalStepResult.status === 'passed' || finalStepResult.status === 'failed') {
+        for (const ext of node.variableExtractions) {
+          const value = extractVariable(finalStepResult.responseBody, finalStepResult.responseHeaders || {}, ext);
+          if (value !== undefined) {
+            ctx[ext.variableName] = value;
+            variablesResolved++;
+            extractedThisStep.push({ name: ext.variableName, value });
+            // Safe across groups: a hard barrier separates groups, so an auth
+            // node at level N has fully set authNodeId before level N+1 reads it
+            // for 401-refresh. (A same-group auth+protected pair would imply a
+            // missing dependency edge from the builder, not an executor fault.)
+            if (node.isAuthEndpoint) authNodeId = node.id;
+            emit('emitApiFlowVariableExtracted', {
+              flowSpecId: flowSpec.id, flowRunId, sessionId: chatSessionId || '',
+              nodeId, stepIndex, variableName: ext.variableName,
+              extractedFrom: `${node.method} ${node.path} → ${ext.jsonPath || ext.headerSource || ext.regex}`,
+              value: maskValue(ext.variableName, value),
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
+      finalStepResult.variablesExtracted = extractedThisStep;
+      finalStepResult.variablesInjected = variablesInjected;
+      stepResults.push(finalStepResult);
+
+      emit('emitApiFlowStepComplete', {
+        flowSpecId: flowSpec.id, flowRunId, sessionId: chatSessionId || '',
+        stepIndex, nodeId,
+        success: finalStepResult.status === 'passed',
+        statusCode: finalStepResult.responseStatus || 0,
+        durationMs: finalStepResult.durationMs,
+        variablesExtracted: extractedThisStep,
+        error: finalStepResult.error,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (finalStepResult.status === 'failed') failedNodes.add(nodeId);
+
+      if (finalStepResult.responseStatus !== undefined) {
+        try {
+          await ApiTestStorageService.saveApiTestExecution({
+            userId,
+            testId: randomUUID(),
+            chatSessionId,
+            request: {
+              method: node.method,
+              url: finalStepResult.resolvedUrl,
+              headers: finalStepResult.requestHeaders,
+              body: finalStepResult.requestBody,
+            },
+            response: {
+              status: finalStepResult.responseStatus || 0,
+              statusText: String(finalStepResult.responseStatus || 0),
+              headers: finalStepResult.responseHeaders,
+              body: finalStepResult.responseBody,
+              durationMs: finalStepResult.durationMs,
+            },
+            success: finalStepResult.status === 'passed',
+            errorMessage: finalStepResult.error,
+            metadata: {
+              flow_spec_id: flowSpec.id,
+              flow_run_id: flowRunId,
+              flow_step_index: stepIndex,
+            },
+          });
+        } catch (err) {
+          logger.warn('[FLOW_EXECUTOR] Failed to save step to api_test_executions', { err });
+        }
+      }
+    };
+
+    // Execution order: group nodes by topological level so independent nodes run
+    // concurrently. Fall back to one-node-per-group (pure sequential) if the DAG
+    // didn't provide parallelGroups — preserves legacy behavior.
+    //
+    // COVERAGE GUARD: parallelGroups is persisted in the spec and can be edited /
+    // reparsed independently of executionOrder. If a node appears in
+    // executionOrder but is missing from parallelGroups, the old sequential loop
+    // would still have run it — so we must too. Any uncovered node is appended as
+    // its own trailing group (run last, sequentially) rather than silently dropped.
+    let groups: string[][];
+    if (Array.isArray(dag.parallelGroups) && dag.parallelGroups.length > 0) {
+      groups = dag.parallelGroups.map(g => [...g]);
+      const covered = new Set(groups.flat());
+      const missing = dag.executionOrder.filter(id => !covered.has(id));
+      if (missing.length > 0) {
+        logger.warn('[FLOW_EXECUTOR] parallelGroups missing nodes from executionOrder — appending', {
+          flowRunId, missing,
+        });
+        for (const id of missing) groups.push([id]);
+      }
+    } else {
+      groups = dag.executionOrder.map(id => [id]);
+    }
+
+    const markRemainingCancelled = (fromGroupIdx: number): void => {
+      for (let g = fromGroupIdx; g < groups.length; g++) {
+        for (const id of groups[g]) {
+          if (skippedNodes.has(id) || failedNodes.has(id)) continue;
+          const n = nodeMap.get(id);
+          if (!n) continue;
+          if (stepResults.some(r => r.nodeId === id)) continue;
+          skippedRow(n, stepIndexOf.get(id) ?? 0, 'cancelled', 'cancelled', 'Cancelled by user');
+        }
+      }
+    };
+
+    try {
+      for (let groupIdx = 0; groupIdx < groups.length; groupIdx++) {
+        // Cancellation — stop launching groups; mark this + later groups cancelled.
+        if (abortController.signal.aborted) {
+          logger.info('[FLOW_EXECUTOR] Flow cancelled', { flowRunId });
+          markRemainingCancelled(groupIdx);
           break;
         }
 
-        if (!stepResult) {
-          stepResult = {
-            nodeId,
-            stepIndex,
-            status: 'failed',
-            method: node.method,
-            path: node.path,
-            resolvedUrl,
-            requestHeaders: resolvedHeaders,
-            requestBody: resolvedBody,
-            durationMs: 0,
-            variablesInjected,
-            variablesExtracted: [],
-            error: 'Max retries exceeded',
-            retryCount,
-          };
+        // Pacing: one rate-limit delay before each group after the first.
+        if (groupIdx > 0) await sleepMs(config.rateLimitDelayMs);
+
+        // Resolve which nodes in this group are runnable vs skipped up front.
+        const runnable: DAGNode[] = [];
+        for (const id of groups[groupIdx]) {
+          const node = nodeMap.get(id);
+          if (!node) continue;
+          const stepIndex = stepIndexOf.get(id) ?? 0;
+
+          if (node.isUnsupported) {
+            skippedRow(node, stepIndex, 'skipped', 'unsupported', `Unsupported: ${node.unsupportedReason}`);
+            continue;
+          }
+          const depFailed = node.dependsOn.some(dep => failedNodes.has(dep) || skippedNodes.has(dep));
+          if (depFailed && config.errorStrategy !== 'continue_on_failure') {
+            skippedRow(node, stepIndex, 'skipped', 'dependency_failed', 'Skipped: dependency failed');
+            continue;
+          }
+          runnable.push(node);
         }
 
-        const finalStepResult = stepResult!;
-        finalStepResult.retryCount = retryCount;
-
-        // Extract variables from response
-        const extractedThisStep: Array<{ name: string; value: string }> = [];
-        if (finalStepResult.status === 'passed' || finalStepResult.status === 'failed') {
-          for (const ext of node.variableExtractions) {
-            const value = extractVariable(finalStepResult.responseBody, finalStepResult.responseHeaders || {}, ext);
-            if (value !== undefined) {
-              ctx[ext.variableName] = value;
-              variablesResolved++;
-              extractedThisStep.push({ name: ext.variableName, value });
-
-              // Track auth token for refresh
-              if (node.isAuthEndpoint) {
-                authNodeId = node.id;
-              }
-
-              // Emit variable extracted event
-              emit('emitApiFlowVariableExtracted', {
-                flowSpecId: flowSpec.id,
-                flowRunId,
-                sessionId: chatSessionId || '',
-                variableName: ext.variableName,
-                extractedFrom: `${node.method} ${node.path} → ${ext.jsonPath || ext.headerSource || ext.regex}`,
-                value: maskValue(ext.variableName, value),
-                timestamp: new Date().toISOString(),
-              });
-            }
-          }
+        // Run the group concurrently (bounded). One node's throw doesn't tear
+        // down its siblings — we let the group finish, then decide.
+        if (runnable.length > 0) {
+          await runWithConcurrency(
+            runnable.map(node => () => runNode(node, stepIndexOf.get(node.id) ?? 0)),
+            MAX_GROUP_CONCURRENCY,
+          );
         }
 
-        finalStepResult.variablesExtracted = extractedThisStep;
-        finalStepResult.variablesInjected = variablesInjected;
-        stepResults.push(finalStepResult);
-
-        // Emit step complete
-        emit('emitApiFlowStepComplete', {
-          flowSpecId: flowSpec.id,
-          flowRunId,
-          sessionId: chatSessionId || '',
-          stepIndex,
-          nodeId,
-          success: finalStepResult.status === 'passed',
-          statusCode: finalStepResult.responseStatus || 0,
-          durationMs: finalStepResult.durationMs,
-          variablesExtracted: extractedThisStep,
-          error: finalStepResult.error,
-          timestamp: new Date().toISOString(),
-        });
-
-        // Track failures
-        if (finalStepResult.status === 'failed') {
-          failedNodes.add(nodeId);
-          if (config.errorStrategy === 'stop_on_failure') {
-            // Skip all remaining nodes that depend on this one
-            // (handled at the top of the loop via skippedNodes check)
-          }
-        }
-
-        // Save to api_test_executions
-        if (finalStepResult.responseStatus !== undefined) {
-          try {
-            await ApiTestStorageService.saveApiTestExecution({
-              userId,
-              testId: randomUUID(),
-              chatSessionId,
-              request: {
-                method: node.method,
-                url: finalStepResult.resolvedUrl,
-                headers: finalStepResult.requestHeaders,
-                body: finalStepResult.requestBody,
-              },
-              response: {
-                status: finalStepResult.responseStatus || 0,
-                statusText: String(finalStepResult.responseStatus || 0),
-                headers: finalStepResult.responseHeaders,
-                body: finalStepResult.responseBody,
-                durationMs: finalStepResult.durationMs,
-              },
-              success: finalStepResult.status === 'passed',
-              errorMessage: finalStepResult.error,
-              metadata: {
-                flow_spec_id: flowSpec.id,
-                flow_run_id: flowRunId,
-                flow_step_index: stepIndex,
-              },
-            });
-          } catch (err) {
-            logger.warn('[FLOW_EXECUTOR] Failed to save step to api_test_executions', { err });
-          }
+        // stop_on_failure: if anything failed in (or before) this group, stop
+        // launching later groups and mark them cancelled.
+        if (config.errorStrategy === 'stop_on_failure' && failedNodes.size > 0) {
+          markRemainingCancelled(groupIdx + 1);
+          break;
         }
       }
     } finally {
@@ -665,10 +748,14 @@ export class FlowExecutorService {
       activeRuns.delete(flowRunId);
     }
 
-    // Build summary
+    // Parallel groups complete out of order — restore report ordering.
+    stepResults.sort((a, b) => a.stepIndex - b.stepIndex);
+
+    // Build summary — 'cancelled' steps roll up under the skipped count for the
+    // summary card (they were not executed); the per-node status is still distinct.
     const passed = stepResults.filter(r => r.status === 'passed').length;
     const failed = stepResults.filter(r => r.status === 'failed').length;
-    const skipped = stepResults.filter(r => r.status === 'skipped').length;
+    const skipped = stepResults.filter(r => r.status === 'skipped' || r.status === 'cancelled').length;
     const totalDurationMs = stepResults.reduce((sum, r) => sum + r.durationMs, 0);
     const runStatus: FlowRunStatus = abortController.signal.aborted
       ? 'cancelled'
@@ -702,11 +789,14 @@ export class FlowExecutorService {
     // Emit final event
     if (chatSessionId) {
       if (runStatus === 'failed' || runStatus === 'cancelled') {
+        const firstFailed = stepResults.find(r => r.status === 'failed');
         emit('emitApiFlowFailed', {
           flowSpecId: flowSpec.id,
           flowRunId,
           sessionId: chatSessionId,
           error: runStatus === 'cancelled' ? 'Flow cancelled by user' : 'Flow completed with failures',
+          failedAtStep: firstFailed?.stepIndex,
+          failedAtNodeId: firstFailed?.nodeId,
           timestamp: new Date().toISOString(),
         });
       } else {

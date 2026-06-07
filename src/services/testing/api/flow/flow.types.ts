@@ -19,7 +19,8 @@ export type ApiSpecSourceType =
   | 'har'
   | 'insomnia'
   | 'graphql'
-  | 'raml';
+  | 'raml'
+  | 'python';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PARSED SPEC (unified format — all adapters output this)
@@ -214,7 +215,7 @@ export interface VariableContext {
 
 export type FlowErrorStrategy = 'stop_on_failure' | 'continue_on_failure' | 'retry_then_skip';
 export type FlowRunStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-export type FlowStepStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped' | 'retrying';
+export type FlowStepStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped' | 'retrying' | 'cancelled';
 
 export interface FlowExecutionConfig {
   errorStrategy: FlowErrorStrategy;
