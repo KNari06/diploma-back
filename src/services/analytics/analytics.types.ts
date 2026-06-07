@@ -79,6 +79,25 @@ export interface SummaryData {
     apiTestsRun?: number;
     apiTestsPassed?: number;
     apiTestsFailed?: number;
+    /**
+     * Trend deltas (signed %), comparing the last 30 days vs the prior 30 days.
+     * INDEPENDENT of the headline numbers above, which stay all-time — these
+     * exist only to drive the dashboard's trend pills. A field is omitted when
+     * the prior window had no data (delta undefined → UI hides the pill rather
+     * than showing a misleading 0%).
+     */
+    trend?: {
+      totalRunsDeltaPct?: number;
+      failedRunsDeltaPct?: number;
+      flakyStepsDeltaPct?: number;
+      /**
+       * Pass-rate change in PERCENTAGE POINTS (e.g. 80% → 85% = +5), NOT a
+       * relative percent change — pass rate is already a percentage, so a
+       * percent-of-percent would be confusing. Named `...Points` (not `...Pct`)
+       * so consumers render it with a "pp" / point suffix, not "%".
+       */
+      passRateDeltaPoints?: number;
+    };
   };
   status: {
     state: 'passing' | 'warning' | 'failing';
