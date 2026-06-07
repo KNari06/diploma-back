@@ -796,6 +796,13 @@ export interface TestStepCompletedPayload {
     bugScreenshotUrl?: string;
 
     /**
+     * Screenshot URL captured after EVERY step (pass or fail) when per-step
+     * capture is enabled. Distinct from `bugScreenshotUrl` (failure-only) —
+     * the report assembler surfaces this in the Screenshots artifact tab.
+     */
+    stepScreenshotUrl?: string;
+
+    /**
      * Non-blocking, advisory warnings raised by the runner for this step.
      * Currently emitted by the mobile runner's `install_app` command (e.g.
      * release APK without WebView debugging). Omitted when there are none

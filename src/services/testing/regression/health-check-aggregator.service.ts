@@ -14,27 +14,29 @@ export class HealthCheckAggregatorService {
    * Aggregate health check findings from a single test result.
    * Reads from fields already stored in test_results by ResultCollector.
    */
-  static aggregateFromTestResult(testResult: any): ExecutionHealthChecks {
+  static aggregateFromTestResult(
+    testResult: any,
+    opts?: { isMobile?: boolean },
+  ): ExecutionHealthChecks {
     if (!testResult) {
       return { findings: [], checkedAt: new Date().toISOString() };
     }
 
     const findings: HealthCheckFinding[] = [];
 
-    // 1. Console errors
+    // Console (logcat for mobile) + network apply to both platforms.
     findings.push(this.checkConsoleLogs(testResult.logs));
-
-    // 2. Network errors (4xx/5xx)
     findings.push(this.checkNetworkLogs(testResult.network_logs));
 
-    // 3. JS exceptions (page errors)
-    findings.push(this.checkJsExceptions(testResult.errors));
-
-    // 4. Broken images (from quality checks if available)
-    findings.push(this.checkBrokenImages(testResult));
-
-    // 5. Page responsive
-    findings.push(this.checkPageResponsive(testResult));
+    // JS exceptions / broken images / page-responsive are WEB-only concepts.
+    // Skip them for mobile: Flutter/native apps have no JS, no <img> resources,
+    // no browser viewport — and `checkJsExceptions` would otherwise mislabel a
+    // step/app failure in `errors` as an "unhandled JS exception".
+    if (!opts?.isMobile) {
+      findings.push(this.checkJsExceptions(testResult.errors));
+      findings.push(this.checkBrokenImages(testResult));
+      findings.push(this.checkPageResponsive(testResult));
+    }
 
     return {
       findings,

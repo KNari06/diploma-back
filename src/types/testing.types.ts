@@ -926,6 +926,14 @@ export interface RunReportStep {
   description: string;
   status: 'passed' | 'failed' | 'warning' | 'skipped';
   durationMs?: number;
+  /**
+   * Per-step screenshot URL captured for EVERY step (pass or fail) when
+   * per-step capture is enabled. Sourced from runtimeMeta.stepScreenshotUrl.
+   * The run-report timeline renders this inline; it is also aggregated into
+   * the execution's `screenshots` artifact list. Distinct from
+   * `error.screenshot` (the failure-only bug screenshot).
+   */
+  screenshot?: string;
   error?: {
     message: string;
     failedReason?: string;
@@ -980,7 +988,7 @@ export interface RunReportStep {
 export interface RunReportExecArtifacts {
   videoUrl?: string;
   traceUrl?: string;
-  screenshots: string[];
+  screenshots: RunReportScreenshot[];
   bugScreenshots: string[];
   consoleLogs: string[];
   networkLogs: Array<{
@@ -1100,10 +1108,24 @@ export interface RunReportSummary {
 /**
  * Aggregated artifacts across all executions (actual data, not counts)
  */
+/**
+ * A per-step screenshot with display metadata for the run-report gallery.
+ * `url` is the only required field; the rest drive the descriptive label
+ * (step name + capture time + outcome) the Screenshots tab renders.
+ */
+export interface RunReportScreenshot {
+  url: string;
+  /** Human label, e.g. "Step 3: Click" (or "Final screenshot"). */
+  stepName?: string;
+  /** Capture time, formatted HH:MM:SS. */
+  timestamp?: string;
+  status?: 'passed' | 'failed' | 'warning' | 'skipped';
+}
+
 export interface RunReportArtifactsSummary {
   videoUrl?: string;
   traceUrl?: string;
-  screenshots: string[];
+  screenshots: RunReportScreenshot[];
   bugScreenshots: string[];
   consoleLogs: string[];
   networkLogs: Array<{

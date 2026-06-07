@@ -1663,6 +1663,11 @@ export interface StepRuntimeMeta {
   retryAttempts?: number;
   /** Screenshot URL at the time of failure (for bug investigation) */
   bugScreenshotUrl?: string;
+  /**
+   * Screenshot URL captured after every step (pass or fail) when per-step
+   * capture is enabled. Distinct from `bugScreenshotUrl` (failure-only).
+   */
+  stepScreenshotUrl?: string;
   /** Step ID from intent step */
   stepId?: string;
 }

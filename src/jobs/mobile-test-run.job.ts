@@ -32,6 +32,8 @@ import { MobileRunnerError } from '@/services/mobile/mobile-runner.types';
 import { claimWarmedSession } from '@/api/mobile/session.controller';
 import { MobileAppPrepService } from '@/services/mobile/mobile-app-prep.service';
 import { env } from '@/config/environment/env';
+import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
+import { uploadMobileStepScreenshots } from '@/services/storage/step-screenshot.service';
 // Phase 2 (May 2026) telemetry helpers. Kept in a side-effect-free
 // module so unit tests can exercise them without booting supabase/BullMQ.
 import { sumStepDurations } from './helpers/telemetry';
@@ -765,6 +767,15 @@ export class MobileTestRunJobHandler {
         });
       }
 
+      // Per-step screenshots come back from the runner as base64. Upload them
+      // to the artifacts bucket and replace each step's `screenshot` with the
+      // resulting URL — so the DB stores light URLs (not base64 blobs) and the
+      // report's Screenshots tab can render them. Mutates runResult.steps in
+      // place so both the Redis append below and createTestResult see URLs.
+      if (ScreenshotCaptureFeature.isEnabled()) {
+        await uploadMobileStepScreenshots(runResult.steps, testId, userId);
+      }
+
       // Human-readable step labels: the runner returns per-step results keyed
       // by `stepId`, but only the original `intentSteps` carry the authored
       // `description` ("Click Login button", "Email input"). Map id → description
@@ -839,6 +850,12 @@ export class MobileTestRunJobHandler {
               // truthy-check instead of length-check.
               ...(stepResult.warnings && stepResult.warnings.length > 0
                 ? { warnings: stepResult.warnings }
+                : {}),
+              // After uploadMobileStepScreenshots, `screenshot` is a URL (or absent).
+              // Surface it so the report assembler picks it up uniformly with
+              // the web path. Guard on http to never leak a base64 blob here.
+              ...(typeof stepResult.screenshot === 'string' && stepResult.screenshot.startsWith('http')
+                ? { stepScreenshotUrl: stepResult.screenshot }
                 : {}),
             },
           };
@@ -1295,10 +1312,17 @@ export class MobileTestRunJobHandler {
         timestamp: new Date(e.timestamp).toISOString(),
       }));
 
+      // `mobile_test_results.browser` is CHECK-constrained to the DEVICE
+      // platform ('mobile-android' | 'mobile-ios') — NOT the framework. The
+      // job's `browser` can be 'mobile-flutter' (Flutter runs on an Android
+      // host), which the constraint rejects → the whole row insert fails and
+      // no artifacts/screenshots are ever persisted. Map to the device value:
+      // only native iOS is 'mobile-ios'; android/flutter/etc. → 'mobile-android'.
+      const deviceBrowser = browser === 'mobile-ios' ? 'mobile-ios' : 'mobile-android';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result: any = await dbAdminService.createMobileTestResult({
         test_id: testId,
-        browser,
+        browser: deviceBrowser,
         // FIX: 'completed' not 'passed' — consistent with web tests and TestStatus type.
         // `testPassed` reflects the worker's verdict (real-failure aware:
         // optional / continueOnError / auto-injected steps are tolerable).
@@ -1370,10 +1394,13 @@ export class MobileTestRunJobHandler {
     try {
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorCode = error instanceof MobileRunnerError ? error.code : 'UNKNOWN';
+      // mobile_test_results.browser is the DEVICE platform, not the framework
+      // (CHECK: 'mobile-android' | 'mobile-ios'). See createTestResult for why.
+      const deviceBrowser = browser === 'mobile-ios' ? 'mobile-ios' : 'mobile-android';
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const result: any = await dbAdminService.createMobileTestResult({
         test_id: testId,
-        browser,
+        browser: deviceBrowser,
         status: 'failed',
         // No screenshot / dom / logs at this stage — the job didn't get
         // far enough to capture them. Provide a structured `errors` entry
@@ -1469,6 +1496,13 @@ export class MobileTestRunJobHandler {
           });
         }
       })());
+    } else {
+      // No execution id → the test_executions row stays 'pending', so
+      // recomputeRunStatus skips the terminal regression:run:progress emit and
+      // the regressions LIST never auto-refreshes for this mobile run (web
+      // finalizes via result->>testId; mobile relies solely on this id).
+      // If this fires, the dispatch path isn't threading execId through.
+      logger.warn('[MOBILE-TEST] finalizeAnalyticsLinkage: no analyticsExecutionId — test_executions stays pending; run-completion WS emit (and list refresh) will be skipped');
     }
 
     // Note: `regression_runs.status` is intentionally NOT finalized here.
