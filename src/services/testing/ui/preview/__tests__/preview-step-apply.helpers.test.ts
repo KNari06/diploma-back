@@ -1,6 +1,7 @@
 import {
   globToRegexPatternForWaitFor,
   normalizeTypeActionValue,
+  typedValueLooksApplied,
 } from '../preview-step-apply.service';
 
 describe('preview-step-apply helpers', () => {
@@ -51,6 +52,33 @@ describe('preview-step-apply helpers', () => {
 
     it('returns empty string for undefined', () => {
       expect(normalizeTypeActionValue(undefined)).toBe('');
+    });
+  });
+
+  describe('typedValueLooksApplied', () => {
+    it('detects a dropped trailing character (masked phone bug)', () => {
+      expect(typedValueLooksApplied('+7 702 850 3640', '+7 702 850 364')).toBe(false);
+    });
+
+    it('ignores pure formatting differences from a mask', () => {
+      expect(typedValueLooksApplied('+7 702 850 3640', '+7 (702) 850-36-40')).toBe(true);
+    });
+
+    it('matches when the value is fully applied', () => {
+      expect(typedValueLooksApplied('+7 702 850 3640', '+7 702 850 3640')).toBe(true);
+    });
+
+    it('is case-insensitive for text fields', () => {
+      expect(typedValueLooksApplied('user@Example.com', 'USER@example.COM')).toBe(true);
+    });
+
+    it('detects an extra character', () => {
+      expect(typedValueLooksApplied('1234', '12345')).toBe(false);
+    });
+
+    it('skips verification when nothing meaningful was expected', () => {
+      expect(typedValueLooksApplied('', '')).toBe(true);
+      expect(typedValueLooksApplied('   ', 'anything')).toBe(true);
     });
   });
 });

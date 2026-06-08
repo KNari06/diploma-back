@@ -837,6 +837,26 @@ export function normalizeTypeActionValue(rawValue: string | undefined): string {
 }
 
 /**
+ * Tolerant post-type verification for the `type` action.
+ *
+ * Masked / formatted inputs (phone, card, date) reformat the value as it is
+ * typed — e.g. "+7 702 850 3640" may render as "+7 (702) 850-36-40" — so a
+ * strict equality check would false-positive a mismatch on every masked field.
+ * We strip everything except letters and digits (Unicode-aware) and compare
+ * case-insensitively: this still catches a DROPPED or EXTRA character (the
+ * char-by-char masked-input bug) while ignoring pure formatting differences.
+ *
+ * Returns true when nothing meaningful was expected (empty value → nothing to
+ * verify) so callers never retry on a no-op.
+ */
+export function typedValueLooksApplied(expected: string, actual: string): boolean {
+  const norm = (s: string) => s.replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+  const expectedNorm = norm(expected);
+  if (expectedNorm.length === 0) return true;
+  return norm(actual) === expectedNorm;
+}
+
+/**
  * V13: Wait for the page's mutation rate to drop to a baseline — i.e. the
  * action-driven burst of DOM changes has ended, even if background widgets
  * (live tickers, chat feeds, animation loops, analytics pixels) keep the
@@ -2587,6 +2607,31 @@ async function executeAction(
             await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
             await locator.click({ timeout });
             await locator.pressSequentially(value, { timeout, delay: userKeyPressDelay ?? 20 });
+
+            // Post-type verification. Masked/formatted inputs (phone, card, date)
+            // reformat per keystroke and reset the caret — char-by-char typing can
+            // silently drop the trailing character (observed: "+7 702 850 3640"
+            // → "+7 702 850 364", which then fails the site's own validation).
+            // pressSequentially has no built-in check, so read the value back and,
+            // on a tolerant mismatch (ignores pure formatting), retry once with
+            // fill() — an atomic full-value set the mask reformats in a single pass.
+            // inputValue is capped (default is 30s) and fails open: an unreadable
+            // value (contenteditable / custom widget) simply skips verification.
+            const typedBack = await locator.inputValue({ timeout: 2000 }).catch(() => null);
+            if (typedBack !== null && !typedValueLooksApplied(value, typedBack)) {
+              logger.info('[EXECUTE_ACTION] type() value mismatch after pressSequentially — retrying with fill()', {
+                expected: value.slice(0, 50),
+                actual: typedBack.slice(0, 50),
+              });
+              await locator.fill(value, { timeout }).catch(() => {});
+              const afterFill = await locator.inputValue({ timeout: 2000 }).catch(() => null);
+              if (afterFill !== null && !typedValueLooksApplied(value, afterFill)) {
+                logger.warn('[EXECUTE_ACTION] type() value still mismatched after fill() retry', {
+                  expected: value.slice(0, 50),
+                  actual: afterFill.slice(0, 50),
+                });
+              }
+            }
           } else {
             // Long text (comments, descriptions): fast fill with post-blur fallback
             await locator.fill(value, { timeout });
