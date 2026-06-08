@@ -3843,6 +3843,7 @@ export async function handleManageSchedule(
         const projectId = resolveProjectId(args, context);
         const name = args.name as string | undefined;
         const cronExpression = args.cron_expression as string | undefined;
+        const runAt = args.run_at as string | undefined;
 
         if (!projectId) {
           return { success: false, message: 'Missing required field: project_id', displayToUser: false };
@@ -3850,8 +3851,9 @@ export async function handleManageSchedule(
         if (!name) {
           return { success: false, message: 'Missing required field: name', displayToUser: false };
         }
-        if (!cronExpression) {
-          return { success: false, message: 'Missing required field: cron_expression', displayToUser: false };
+        // Timing: exactly one of cron_expression (recurring) or run_at (one-time).
+        if (!!cronExpression === !!runAt) {
+          return { success: false, message: 'Provide exactly one of cron_expression (recurring) or run_at (one-time)', displayToUser: false };
         }
 
         // Resolve plan_id/module_id by name if needed
@@ -3883,7 +3885,8 @@ export async function handleManageSchedule(
           projectId,
           userId: context.userId,
           name,
-          cronExpression,
+          cronExpression: cronExpression || undefined,
+          runAt: runAt || undefined,
           timezone: args.timezone || undefined,
           planId: resolvedPlanId || undefined,
           moduleId: resolvedModuleId || undefined,
@@ -3891,16 +3894,22 @@ export async function handleManageSchedule(
 
         logger.info('[QA_TOOL] Schedule created', { scheduleId: schedule.id, userId: context.userId });
 
+        const when = schedule.scheduleType === 'one_time'
+          ? `once at ${schedule.runAt}`
+          : schedule.cronExpression;
+
         return {
           success: true,
           data: {
             scheduleId: schedule.id,
             name: schedule.name,
+            scheduleType: schedule.scheduleType,
             cronExpression: schedule.cronExpression,
+            runAt: schedule.runAt,
             isActive: schedule.isActive,
             nextRunAt: schedule.nextRunAt,
           },
-          message: `Created schedule "${schedule.name}" (${schedule.cronExpression})`,
+          message: `Created schedule "${schedule.name}" (${when})`,
           displayToUser: true,
         };
       }
@@ -3923,6 +3932,7 @@ export async function handleManageSchedule(
           userId: context.userId,
           ...(args.name !== undefined ? { name: args.name } : {}),
           ...(args.cron_expression !== undefined ? { cronExpression: args.cron_expression } : {}),
+          ...(args.run_at !== undefined ? { runAt: args.run_at } : {}),
           ...(args.timezone !== undefined ? { timezone: args.timezone } : {}),
           ...(args.is_active !== undefined ? { isActive: args.is_active } : {}),
         });

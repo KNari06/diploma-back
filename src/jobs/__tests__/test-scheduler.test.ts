@@ -39,6 +39,7 @@ jest.mock('@/utils/core/logger', () => ({
 import { TestSchedulerJobHandler } from '../test-scheduler.job';
 import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { RegressionRunService } from '@/services/testing/regression/regression-run.service';
+import { NotificationService } from '@/services/notifications/notification.service';
 
 const mockGetDue = ScheduleService.getDueSchedules as jest.Mock;
 const mockClaim = ScheduleService.claimDueSchedule as jest.Mock;
@@ -46,12 +47,14 @@ const mockDeactivate = ScheduleService.deactivate as jest.Mock;
 const mockOwns = ScheduleService.userOwnsTarget as jest.Mock;
 const mockRunModule = RegressionRunService.runModule as jest.Mock;
 const mockRunPlan = RegressionRunService.runPlan as jest.Mock;
+const mockNotify = NotificationService.createNotification as jest.Mock;
 
 function due(overrides: Record<string, any>) {
   return {
     scheduleId: 'sched-1',
     projectId: 'proj-1',
     userId: 'user-1',
+    scheduleType: 'recurring',
     targetType: 'plan',
     targetId: 'plan-1',
     parameters: {},
@@ -140,5 +143,26 @@ describe('TestSchedulerJobHandler.processSchedules', () => {
     mockRunPlan.mockRejectedValueOnce(new Error('boom')).mockResolvedValueOnce({ runId: 'r2' });
     await TestSchedulerJobHandler.processSchedules();
     expect(mockRunPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it('on a ONE_TIME dispatch failure, notifies that it will NOT retry (already deactivated by claim)', async () => {
+    mockGetDue.mockResolvedValue([due({ scheduleType: 'one_time', targetType: 'plan', targetId: 'plan-9' })]);
+    mockRunPlan.mockRejectedValueOnce(new Error('runner crash'));
+    await TestSchedulerJobHandler.processSchedules();
+    expect(mockNotify).toHaveBeenCalledTimes(1);
+    const arg = mockNotify.mock.calls[0][0];
+    expect(arg.title).toMatch(/one-time/i);
+    expect(arg.message).toMatch(/NOT retry/i);
+    expect(arg.message).not.toMatch(/next scheduled run will try again/i);
+  });
+
+  it('on a RECURRING dispatch failure, notifies that the next run will retry', async () => {
+    mockGetDue.mockResolvedValue([due({ scheduleType: 'recurring', targetType: 'plan', targetId: 'plan-9' })]);
+    mockRunPlan.mockRejectedValueOnce(new Error('network blip'));
+    await TestSchedulerJobHandler.processSchedules();
+    expect(mockNotify).toHaveBeenCalledTimes(1);
+    const arg = mockNotify.mock.calls[0][0];
+    expect(arg.message).toMatch(/next scheduled run will try again/i);
+    expect(arg.message).not.toMatch(/NOT retry/i);
   });
 });

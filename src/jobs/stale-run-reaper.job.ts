@@ -20,10 +20,12 @@
  * Where this runs
  * ──────────────────────────────────────────────────────────────────────
  *
- * Bootstrapped exclusively from `src/scheduler/index.ts` — the dedicated
- * single-instance scheduler service. Do NOT start it from `src/index.ts`
- * (the auto-scaled API): N replicas would run N concurrent sweeps,
- * racing each other on the same rows. Mirrors `AccountDeletionPurgeJob`.
+ * Bootstrapped from the scheduler bundle ONLY: `src/scheduler/index.ts` (local
+ * scheduler container) or, in prod, the worker behind the Redis leader lock in
+ * `src/scheduler/leader.ts`. No cross-instance dedupe of its own — the leader
+ * lock guarantees a single live sweep at N worker replicas. Do NOT start it
+ * from `src/index.ts` (the auto-scaled API) or outside the lock: N concurrent
+ * sweeps would race each other on the same rows. Mirrors `AccountDeletionPurgeJob`.
  */
 
 import { logger } from '@/utils/core/logger';

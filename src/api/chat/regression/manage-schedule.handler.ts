@@ -37,8 +37,8 @@ const VALID_ACTIONS = new Set(['create', 'update', 'activate', 'deactivate', 'de
  */
 function missingFieldQuestion(action: string, manage: Record<string, any>): string | null {
   if (action === 'create') {
-    if (!manage.cronExpression) {
-      return 'When should this schedule run? (e.g. "every day at 9am", "every Monday")';
+    if (!manage.cronExpression && !manage.runAt) {
+      return 'When should this schedule run? (e.g. "every day at 9am", "every Monday", or a one-time date like "June 10 at 2:30pm")';
     }
     if (!manage.planName && !manage.moduleName) {
       return 'What should the schedule run — a plan or a module? Please name it.';
@@ -56,9 +56,11 @@ function describeScheduleChange(action: string, manage: Record<string, any>): st
   const target = manage.planName
     ? ` running plan "${manage.planName}"`
     : manage.moduleName ? ` running module "${manage.moduleName}"` : '';
-  const when = manage.cronExpression
-    ? ` at ${manage.cronExpression}${manage.timezone ? ` (${manage.timezone})` : ''}`
-    : '';
+  const when = manage.runAt
+    ? ` once at ${manage.runAt}`
+    : manage.cronExpression
+      ? ` at ${manage.cronExpression}${manage.timezone ? ` (${manage.timezone})` : ''}`
+      : '';
   switch (action) {
     case 'create':
       return `create ${sched}${target}${when}`;
@@ -118,6 +120,7 @@ export async function handleManageScheduleIntent(
 
     if (manage.name) args.name = manage.name;
     if (manage.cronExpression) args.cron_expression = manage.cronExpression;
+    if (manage.runAt) args.run_at = manage.runAt;
     if (manage.timezone) args.timezone = manage.timezone;
     // plan_id / module_id accept a name OR uuid; the tool resolves it.
     if (manage.planName) args.plan_id = manage.planName;
