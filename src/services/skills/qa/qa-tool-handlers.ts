@@ -1478,7 +1478,7 @@ export async function handleListSchedules(
   try {
     let query = supabaseAdmin
       .from('test_schedules')
-      .select('id, name, cron_expression, timezone, is_active, module_id, plan_id, last_run_at, next_run_at, created_at')
+      .select('id, name, schedule_type, cron_expression, run_at, timezone, is_active, module_id, plan_id, last_run_at, next_run_at, created_at')
       .eq('project_id', projectId)
       .order(sortBy, { ascending: sortOrder });
 
@@ -1506,18 +1506,27 @@ export async function handleListSchedules(
       return { success: false, message: `Database error: ${error.message}`, displayToUser: false };
     }
 
-    const schedules = (data || []).map((s) => ({
-      id: s.id,
-      name: s.name,
-      cronExpression: s.cron_expression,
-      timezone: s.timezone,
-      isActive: s.is_active,
-      moduleId: s.module_id || null,
-      planId: s.plan_id || null,
-      lastRunAt: s.last_run_at || null,
-      nextRunAt: s.next_run_at || null,
-      createdAt: s.created_at,
-    }));
+    const schedules = (data || []).map((s) => {
+      const scheduleType = (s.schedule_type as 'recurring' | 'one_time') || 'recurring';
+      return {
+        id: s.id,
+        name: s.name,
+        scheduleType,
+        cronExpression: s.cron_expression || null,
+        runAt: s.run_at || null,
+        // Human-readable "when" so the chat agent can describe either mode.
+        when: scheduleType === 'one_time'
+          ? (s.run_at ? `once at ${ScheduleService.formatRunAtForHuman(s.run_at, s.timezone)}` : 'one-time (time unset)')
+          : (s.cron_expression || 'recurring'),
+        timezone: s.timezone,
+        isActive: s.is_active,
+        moduleId: s.module_id || null,
+        planId: s.plan_id || null,
+        lastRunAt: s.last_run_at || null,
+        nextRunAt: s.next_run_at || null,
+        createdAt: s.created_at,
+      };
+    });
 
     return {
       success: true,
@@ -3944,7 +3953,9 @@ export async function handleManageSchedule(
           data: {
             scheduleId: schedule.id,
             name: schedule.name,
+            scheduleType: schedule.scheduleType,
             cronExpression: schedule.cronExpression,
+            runAt: schedule.runAt,
             isActive: schedule.isActive,
             nextRunAt: schedule.nextRunAt,
           },
