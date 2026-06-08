@@ -12,9 +12,9 @@
  * node deduplication, and parallel group computation.
  */
 
-import { getChatCompletionWithMessages } from '@/services/ai/core/openai.service';
 import { AI_TASK_MODELS } from '@/config/ai/ai-models.config';
 import { logger } from '@/utils/core/logger';
+import { callAiWithRetry, extractJson } from './ai-json.util';
 import {
   buildAnalystSystemPrompt,
   buildAnalystPrompt,
@@ -37,44 +37,8 @@ import type {
 
 const MAX_ENDPOINTS_PER_BATCH = 20;
 
-/**
- * Extract JSON from AI response that may contain reasoning text around it.
- * Gemini 2.5 Flash with thinking mode often returns text before/after JSON.
- */
-function extractJson(content: string): any {
-  // Try direct parse first
-  try {
-    return JSON.parse(content);
-  } catch {
-    // no-op
-  }
-
-  // Try to find JSON object in the content
-  const firstBrace = content.indexOf('{');
-  const lastBrace = content.lastIndexOf('}');
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    try {
-      return JSON.parse(content.slice(firstBrace, lastBrace + 1));
-    } catch {
-      // no-op
-    }
-  }
-
-  // Try to find JSON inside markdown code block
-  const codeBlockMatch = content.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-  if (codeBlockMatch?.[1]) {
-    try {
-      return JSON.parse(codeBlockMatch[1].trim());
-    } catch {
-      // no-op
-    }
-  }
-
-  return null;
-}
 const MAX_ENRICHER_BATCH = 25;
 const PIPELINE_TIMEOUT_MS = 600_000; // 10 minutes for very large specs (1000+ endpoints)
-const AGENT_RETRY_COUNT = 1; // 1 retry per agent on failure
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TOPOLOGICAL SORT (Kahn's algorithm)
@@ -224,36 +188,6 @@ function normalizeNode(raw: any, index: number): DAGNode {
       ? raw.expectedStatusCodes.map(Number)
       : [200, 201],
   };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AI CALL WITH RETRY
-// ─────────────────────────────────────────────────────────────────────────────
-
-async function callAiWithRetry(
-  messages: Array<{ role: string; content: string }>,
-  options: any,
-  agentName: string,
-): Promise<string> {
-  let lastError: Error | undefined;
-
-  for (let attempt = 0; attempt <= AGENT_RETRY_COUNT; attempt++) {
-    try {
-      const response = await getChatCompletionWithMessages(messages as any, options);
-      return response.content;
-    } catch (err: any) {
-      lastError = err;
-      logger.warn(`[DEPENDENCY_RESOLVER] ${agentName} attempt ${attempt + 1} failed`, {
-        error: err.message,
-        willRetry: attempt < AGENT_RETRY_COUNT,
-      });
-      if (attempt < AGENT_RETRY_COUNT) {
-        await new Promise(r => setTimeout(r, 2000)); // 2s backoff
-      }
-    }
-  }
-
-  throw new Error(`${agentName} failed after ${AGENT_RETRY_COUNT + 1} attempts: ${lastError?.message}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

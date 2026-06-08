@@ -1,5 +1,5 @@
 import { mapSource, resolvePlaceholders } from '@/utils/interpolation/resolve-placeholders';
-import { isDevelopment } from '@/config/environment/env';
+import { env, isDevelopment } from '@/config/environment/env';
 import { COMMAND_EXECUTOR_CONFIG } from '@/config/testing/playwright-tuning';
 import { CreditCostTrackerService } from '@/services/core/credit-cost-tracker.service';
 import { TestJobData } from '@/types';
@@ -12,7 +12,8 @@ import { LiteEngine, ModeRouter } from '../../core/lite';
 import { withAIContext } from '@/services/ai/tracking/ai-context';
 import { AIUsageTracker } from '@/services/ai/tracking/ai-usage-tracker';
 import { supabaseAdmin } from '@/db/supabase';
-import { saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
+import { captureStepScreenshot, saveIntelligentTestResults, uploadArtifacts, uploadIntelligentTestScreenshots } from '../artifacts/artifacts-handler';
+import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { uploadScreenshotBufferToStorage } from '@/services/storage/test-artifacts-storage.service';
 import { collectArtifactsAndCleanup } from '../artifacts/test-cleanup';
 import { formatTestResult } from '../artifacts/test-result-formatter';
@@ -145,11 +146,15 @@ async function captureBugScreenshot(
   try {
     const buf = await page.screenshot({ type: 'png', fullPage: false });
     const path = `bug-screenshots/${testData.testId}/${testData.browser}/step-${stepIndex}-${reason}.png`;
+    // Use the provisioned artifacts bucket (env-driven) — the literal
+    // 'test-artifacts' bucket was never created in migrations, so uploads
+    // here failed silently (the catch below swallows the error) and bug
+    // screenshots went missing. Aligns with every other artifact path.
     const { data } = await supabaseAdmin.storage
-      .from('test-artifacts')
+      .from(env.SUPABASE_BUCKET_NAME)
       .upload(path, buf, { contentType: 'image/png', upsert: true });
     if (data?.path) {
-      const { data: urlData } = supabaseAdmin.storage.from('test-artifacts').getPublicUrl(data.path);
+      const { data: urlData } = supabaseAdmin.storage.from(env.SUPABASE_BUCKET_NAME).getPublicUrl(data.path);
       return urlData?.publicUrl;
     }
   } catch {
@@ -918,6 +923,20 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               errorCollector.switchPage(activePage);
             }
 
+            // Per-step screenshot — captured after EVERY step (pass or fail) so
+            // passing/flaky runs have visual evidence even when video/trace are
+            // disabled. Viewport-only for a passing step; full-page on failure.
+            // Non-fatal: returns undefined on any error, never throws.
+            let stepScreenshotUrl: string | undefined;
+            if (ScreenshotCaptureFeature.isEnabled()) {
+              stepScreenshotUrl = await captureStepScreenshot(
+                activePage,
+                testData,
+                currentStepIndex,
+                { isFailure: !stepResult.success },
+              );
+            }
+
             // Get errors that occurred during this step's execution window
             const stepErrors = errorCollector.getErrorsSince(stepStartedAt);
 
@@ -987,6 +1006,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                   ui: updatedStepErrors.uiErrors.length,
                 },
                 bugScreenshotUrl,
+                ...(stepScreenshotUrl ? { stepScreenshotUrl } : {}),
               };
 
               // Write step_failed to replay trace (matches Case D + catch path).
@@ -1164,6 +1184,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
                     ui: updatedStepErrors.uiErrors.length,
                   },
                   bugScreenshotUrl,
+                  ...(stepScreenshotUrl ? { stepScreenshotUrl } : {}),
                 };
 
                 // V11: Write step_failed to replay trace (matches Case C + element-not-found path)
@@ -1352,7 +1373,9 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               // V16: Surface soft failure so frontend can show warning instead of error
               ...(isSoftFailure ? { softFailure: true, softFailureError: stepResult.error } : {}),
               timestamp: new Date().toISOString(),
-              runtimeMeta: stepResult.runtimeMeta,
+              runtimeMeta: stepScreenshotUrl
+                ? { ...(stepResult.runtimeMeta || {}), stepScreenshotUrl }
+                : stepResult.runtimeMeta,
             };
             await TestExecutedStepsRedisService.appendStepCompleted(testData.testId, completedStepEvent);
             // Emit test:step:completed (non-fatal)
@@ -1536,6 +1559,12 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
             // Capture bug screenshot at moment of failure
             const bugScreenshotUrl = await captureBugScreenshot(activePage, testData, currentStepIndex, 'step-failure');
             finalMeta.bugScreenshotUrl = bugScreenshotUrl;
+            // The step threw before the per-step capture ran, so reuse the
+            // failure shot as this step's screenshot (so it still appears in
+            // the Screenshots artifact tab, not only the bug-screenshot path).
+            if (ScreenshotCaptureFeature.isEnabled() && bugScreenshotUrl) {
+              finalMeta.stepScreenshotUrl = bugScreenshotUrl;
+            }
 
             const failDurationMs = Date.now() - stepStartedAt;
             logger.error('[PLAYWRIGHT] Replay step failed', {

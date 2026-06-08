@@ -18,7 +18,12 @@ const MAX_REQUESTS = 12; // per IP per window
 const ipHits = new Map<string, { count: number; windowStart: number }>();
 
 function ipRateLimiter(req: Request, res: Response, next: NextFunction): void {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  // Use the socket-level peer address, NOT req.ip. The app runs with
+  // `trust proxy: true`, so req.ip is taken from the client-controlled
+  // X-Forwarded-For header — a caller could rotate it to dodge the limit on
+  // this unauthenticated, cost-bearing endpoint. socket.remoteAddress is the
+  // real TCP peer and cannot be spoofed by the client.
+  const ip = req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const entry = ipHits.get(ip);
 

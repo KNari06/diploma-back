@@ -282,6 +282,9 @@ BullMQ enqueue (manual-test-run.job.ts)
   → fresh BrowserContext (NOT the live preview session)
   → IntentStepConverter → Playwright commands
   → executePlaywrightTestWithRetry (waitUntil: 'load' everywhere)
+  → after EVERY step: captureStepScreenshot → runtimeMeta.stepScreenshotUrl
+    (gated by SCREENSHOT_EACH_STEP_ENABLED; viewport for pass, full-page on fail;
+     distinct from the failure-only bugScreenshotUrl)
   → on auth wall: apply login resource (if bound)
   → post-run: ai-analysis.job.ts for bug detection
 ```

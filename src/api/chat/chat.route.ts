@@ -45,17 +45,29 @@ const ALLOWED_DOCUMENT_MIMES = [
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ];
-const ALLOWED_MIMES = [...ALLOWED_IMAGE_MIMES, ...ALLOWED_DOCUMENT_MIMES];
+// Archives of a Python project (unpacked at the upload boundary → API flow import)
+const ALLOWED_ARCHIVE_MIMES = [
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/gzip',
+  'application/x-gzip',
+  'application/x-tar',
+];
+const ALLOWED_MIMES = [...ALLOWED_IMAGE_MIMES, ...ALLOWED_DOCUMENT_MIMES, ...ALLOWED_ARCHIVE_MIMES];
+const ARCHIVE_EXTENSIONS = ['.zip', '.tar.gz', '.tgz'];
 
 const chatFileFilter = (
   _req: any,
   file: Express.Multer.File,
   cb: multer.FileFilterCallback
 ) => {
-  if (ALLOWED_MIMES.includes(file.mimetype)) {
+  // Some browsers send archives as application/octet-stream — accept by extension.
+  const name = (file.originalname || '').toLowerCase();
+  const isArchiveByExt = ARCHIVE_EXTENSIONS.some(ext => name.endsWith(ext));
+  if (ALLOWED_MIMES.includes(file.mimetype) || isArchiveByExt) {
     cb(null, true);
   } else {
-    cb(new Error(`File type "${file.mimetype}" is not allowed. Allowed: images (JPEG, PNG, GIF, WebP) and documents (TXT, JSON, MD, PDF, DOCX).`));
+    cb(new Error(`File type "${file.mimetype}" is not allowed. Allowed: images (JPEG, PNG, GIF, WebP), documents (TXT, JSON, MD, PDF, DOCX), and archives (ZIP, TAR.GZ).`));
   }
 };
 

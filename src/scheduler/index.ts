@@ -9,9 +9,11 @@
 
 import { env } from '@/config/environment/env';
 import { AccountDeletionPurgeJob } from '@/jobs/account-deletion-purge.job';
+import { ArtifactRetentionJob } from '@/jobs/artifact-retention.job';
 import { AutoLearnRetireJob } from '@/jobs/auto-learn-retire.job';
 import { StaleRunReaperJob } from '@/jobs/stale-run-reaper.job';
 import { AiCallLogsRetentionJob } from '@/jobs/ai-call-logs-retention.job';
+import { ScreenshotCaptureFeature } from '@/config/features/screenshot-capture';
 import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
 import { initLogBridge } from '@/utils/core/log-bridge';
@@ -53,6 +55,15 @@ async function main(): Promise<void> {
   // single-instance reasoning as the sweeps above.
   AiCallLogsRetentionJob.start();
 
+  // Per-step screenshot retention. Prunes `${userId}/step-screenshots/...`
+  // older than SCREENSHOT_RETENTION_DAYS. Only meaningful while per-step
+  // capture is enabled (default ON) — skip the sweep otherwise so we don't
+  // walk storage for nothing.
+  if (ScreenshotCaptureFeature.isEnabled()) {
+    ScreenshotCaptureFeature.logStatus();
+    ArtifactRetentionJob.start();
+  }
+
   const shutdown = (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
@@ -61,6 +72,7 @@ async function main(): Promise<void> {
       AccountDeletionPurgeJob.stop();
       StaleRunReaperJob.stop();
       AiCallLogsRetentionJob.stop();
+      ArtifactRetentionJob.stop();
     } finally {
       process.exit(0);
     }

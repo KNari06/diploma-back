@@ -91,6 +91,27 @@ export async function getTestResultsByTestIds(testIds: string[]): Promise<any[]>
 }
 
 /**
+ * Batch fetch mobile_test_results rows by test IDs, newest first. Mobile runs
+ * persist their artifacts + ai_summary to this table (NOT `test_results`), so
+ * the report assembler must read both or mobile executions surface with no
+ * artifacts/bugs. Empty input → empty array.
+ */
+export async function getMobileTestResultsByTestIds(testIds: string[]): Promise<any[]> {
+  if (!testIds.length) return [];
+
+  const { data, error } = await supabaseAdmin
+    .from('mobile_test_results')
+    .select('test_id, video_url, trace_url, screenshot, logs, network_logs, errors, ai_summary, quality_checks')
+    .in('test_id', testIds)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    logger.warn('[REGRESSION_RUN] Failed to fetch mobile test results', { error, count: testIds.length });
+  }
+  return data || [];
+}
+
+/**
  * Batch fetch executed_steps from the tests table. Empty input → empty array.
  */
 export async function getExecutedStepsByTestIds(

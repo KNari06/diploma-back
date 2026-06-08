@@ -129,6 +129,21 @@ export async function validateInput(
 
 const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
 const MAX_EXTRACTED_TEXT_LENGTH = 50_000;
+const ARCHIVE_EXTENSIONS = ['.zip', '.tar.gz', '.tgz', '.tar'];
+const ARCHIVE_MIMES = [
+  'application/zip',
+  'application/x-zip-compressed',
+  'application/gzip',
+  'application/x-gzip',
+  'application/x-tar',
+];
+
+/** Archive detection kept local + sync so the upload loop doesn't eagerly load adm-zip/tar-stream. */
+function isArchiveUpload(fileName?: string, mimeType?: string): boolean {
+  const name = (fileName || '').toLowerCase();
+  if (ARCHIVE_EXTENSIONS.some(ext => name.endsWith(ext))) return true;
+  return ARCHIVE_MIMES.includes((mimeType || '').toLowerCase());
+}
 
 async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
   const files = req.files as Express.Multer.File[] | undefined;
@@ -147,6 +162,36 @@ async function processUploadedFiles(req: Request): Promise<ChatAttachment[]> {
           mimeType: file.mimetype,
           size: file.size,
           base64,
+        });
+      } else if (isArchiveUpload(file.originalname, file.mimetype)) {
+        // Archive of a Python project → unpack and concatenate .py into one blob,
+        // so the existing Python adapter can parse it as a single script.
+        const { extractPythonFromArchive } = await import('@/utils/parsing/archive-extractor');
+        let extractedText: string;
+        let archiveName = file.originalname;
+        try {
+          const result = await extractPythonFromArchive(file.buffer, file.originalname);
+          const note =
+            `# [archive: ${file.originalname} — ${result.fileCount} python file(s) included` +
+            (result.truncated ? `, ${result.skipped.length} skipped/truncated to fit size limit` : '') +
+            `]\n\n`;
+          extractedText = note + result.combined;
+          // Keep a .py signal so api_flow detection routes to the Python adapter.
+          archiveName = `${file.originalname}.py`;
+        } catch (archiveError) {
+          logger.warn('[CHAT] Failed to extract Python from archive', {
+            fileName: file.originalname,
+            error: archiveError instanceof Error ? archiveError.message : String(archiveError),
+          });
+          extractedText = `[Could not import archive "${file.originalname}": ${archiveError instanceof Error ? archiveError.message : 'unknown error'}]`;
+        }
+
+        attachments.push({
+          type: 'document',
+          name: archiveName,
+          mimeType: file.mimetype,
+          size: file.size,
+          extractedText,
         });
       } else {
         // Document: extract text via fileParser

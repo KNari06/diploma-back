@@ -99,6 +99,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 → BullMQ enqueue
 → [manual-test-run.job.ts](src/jobs/manual-test-run.job.ts)
 → `executePlaywrightTestWithRetry()` (fresh browser, NOT preview session)
+→ per-step screenshot after EVERY step (`captureStepScreenshot`, gated by `SCREENSHOT_EACH_STEP_ENABLED`, default ON) → `runtimeMeta.stepScreenshotUrl` (video/trace still record only on infra-retry)
 → post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
 
 ### Background replay (regression / scheduled) — mobile
@@ -113,6 +114,7 @@ POST `/api/v1/regression/run` or `/run-plan`
 → `MobileRunnerClient.runSteps(sessionId, intentSteps, { screenshotEachStep:true })` (REST to qait-mobile-runner)
 → runner returns `RunStepsResult` per-step with screenshot + evidence
 → `persistCompiledPlansFromRun()` writes compiled plans back to `intent_test_cases.steps_json`
+→ per-step screenshots uploaded base64→URL (`uploadMobileStepScreenshots` in [step-screenshot.service.ts](src/services/storage/step-screenshot.service.ts), gated by `SCREENSHOT_EACH_STEP_ENABLED`) → `runtimeMeta.stepScreenshotUrl` + `metadata.steps[].screenshot`
 → `createTestResult()` inserts into `test_results` with aggregated stats
 → **Phase 2 telemetry** ([20260516_mobile_telemetry.sql](supabase-migrations/20260516_mobile_telemetry.sql)): per-test wallclock (`app_setup_ms`, `scenario_steps_ms`, `test_steps_ms`, `session_claim_ms`, `cold_start_used`) written into `test_executions` in `mobile-test-run.job.ts` finally block; aggregated into `regression_runs.total_*` by `TestCompletionHandlerService.recomputeRunStatus()` at run finalisation. Best-effort, NEVER fails the test path.
 → post-run [ai-analysis.job.ts](src/jobs/ai-analysis.job.ts) → bug detection.
@@ -130,6 +132,8 @@ finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 → `TestSchedulerJobHandler.processSchedules()` → `claimDueSchedule()` (atomic)
 → routes to `RegressionRunService.runPlan() | runModule() | runFlow()`
 → same web / mobile branches as above.
+
+Also in the scheduler process (24h sweeps, single-instance): `ArtifactRetentionJob` ([artifact-retention.job.ts](src/jobs/artifact-retention.job.ts)) prunes `${userId}/step-screenshots/...` older than `SCREENSHOT_RETENTION_DAYS`. Per-step screenshot knobs live in [env.ts](src/config/environment/env.ts) / [config/features/screenshot-capture.ts](src/config/features/screenshot-capture.ts): `SCREENSHOT_EACH_STEP_ENABLED` (default ON), `SCREENSHOT_FORMAT` (`webp`/`jpeg`), `SCREENSHOT_QUALITY`, `SCREENSHOT_RETENTION_DAYS`. Final/bug screenshots (`${userId}/screenshots/...`) are a SEPARATE prefix the retention job never touches.
 
 ### Chat → test creation / management (intent-driven router)
 POST `/api/chat/message` → `handleChat()` ([src/api/chat/chat.controller.ts](src/api/chat/chat.controller.ts))

@@ -57,35 +57,10 @@
 
 import type { BrowserContext, Locator, Page } from 'playwright';
 import { logger } from '@/utils/core/logger';
+import { isSameApp } from './same-app.util';
 
 const NEW_PAGE_LOAD_TIMEOUT_MS = 10_000;
 const NEW_PAGE_FALLBACK_TIMEOUT_MS = 5_000;
-
-/** Hosts whose `last2 labels` heuristic agrees with `external-nav-trap.isSameApp`. */
-function lastTwoLabels(host: string): string {
-  return host.split('.').slice(-2).join('.');
-}
-
-/**
- * Same-app check mirroring `external-nav-trap.isSameApp`. We deliberately
- * keep this in sync so a link that the trap would NOT block (subdomain
- * variant, www variant) is also NOT promoted to a new tab — those navs are
- * "same site" in the user's mental model.
- */
-function isSameApp(navUrl: string, baseUrl: string): boolean {
-  let a = '';
-  let b = '';
-  try {
-    a = new URL(navUrl).hostname;
-    b = new URL(baseUrl).hostname;
-  } catch {
-    return false;
-  }
-  if (!a || !b) return false;
-  if (a === b) return true;
-  if (a.endsWith('.' + b) || b.endsWith('.' + a)) return true;
-  return lastTwoLabels(a) === lastTwoLabels(b);
-}
 
 export interface AnchorClickProbe {
   /** Tag name of the clicked element (lowercased). */

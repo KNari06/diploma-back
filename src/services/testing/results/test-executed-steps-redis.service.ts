@@ -88,7 +88,7 @@ function reduceProgressPayload(payload: any): any {
   return safeCloneForStorage(payload, { maxDepth: 4, maxStringLen: 2000, maxArrayLen: 50, maxObjectKeys: 50 });
 }
 
-function reduceRuntimeMeta(meta: any): any {
+export function reduceRuntimeMeta(meta: any): any {
   if (!meta || typeof meta !== 'object') return undefined;
   return {
     stepId: truncateString(meta.stepId, 128),
@@ -101,6 +101,7 @@ function reduceRuntimeMeta(meta: any): any {
     rootCause: truncateString(meta.rootCause, 32),
     networkVerdict: truncateString(meta.networkVerdict, 64),
     bugScreenshotUrl: truncateString(meta.bugScreenshotUrl, 2000),
+    stepScreenshotUrl: truncateString(meta.stepScreenshotUrl, 2000),
     healConfidence: typeof meta.healConfidence === 'number' ? meta.healConfidence : undefined,
     needsReview: typeof meta.needsReview === 'boolean' ? meta.needsReview : undefined,
     flaky: typeof meta.flaky === 'boolean' ? meta.flaky : undefined,

@@ -177,21 +177,24 @@ async function probeExternalAnchorAt(
           };
         }
 
-        // Same-origin http(s) is fine — navigate normally.
-        // Treat subdomain variants of the same registrable name as same-origin
-        // to avoid false positives on www./m./dev./staging. prefixes. Compare
-        // by the last two labels of each hostname — a coarse heuristic that
-        // accepts x.com ↔ www.x.com, dev.x.com ↔ x.com, etc. without pulling
-        // in a full public-suffix list. Multi-label ccTLDs (foo.co.uk vs
-        // bar.co.uk) can over-match, but tolerating one occasional unblocked
-        // external click is better than blocking the common subdomain case.
+        // Same-app http(s) is fine — navigate normally. Same-app = identical
+        // host, subdomain (www/m/dev/staging), last-2-labels, OR the same brand
+        // label across sibling ccTLDs (documentolog.com ≡ documentolog.kz),
+        // guarded by a >= 4 char label so co.uk/com.au don't over-match.
+        // KEEP IN SYNC with isSameApp in same-app.util.ts — this copy runs
+        // inside page.evaluate and cannot import the Node module.
         const here = g.document.location.hostname;
         const lastTwo = (h: string) => h.split('.').slice(-2).join('.');
+        const brand = (h: string) => {
+          const p = h.split('.').filter(Boolean);
+          return p.length >= 2 ? (p[p.length - 2] || '') : (p[0] || '');
+        };
         if (
           hostname === here ||
           hostname.endsWith('.' + here) ||
           here.endsWith('.' + hostname) ||
-          lastTwo(hostname) === lastTwo(here)
+          lastTwo(hostname) === lastTwo(here) ||
+          (brand(hostname).length >= 4 && brand(hostname) === brand(here))
         ) return null;
 
         // Cross-origin http(s) opened inline (no target=_blank) strands the
