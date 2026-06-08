@@ -210,12 +210,16 @@ preview:run:start
     - injectAutoWaitForSteps() prepends wait:* before slow actions
     - loop steps:
         waitForStepReadiness → applyStep → emit progress
+        emit 'running' → injectFrame() (sync live picture to the panel — see below)
         on fail: stepBlockerDiagnosis (LLM) → suggested wait → retry once
         on timeout: break, emit complete with partial result
+    - final injectFrame() before complete (lands picture on the run's end state)
     - persist final state (batch compile plans for steps that gained one)
   → emit preview:run:complete
 ```
 Timeout: `min(15min, 60s + 15s × steps)`.
+
+**Preview picture sync during a run.** The periodic `preview:page` snapshot pipeline is gated off while a run is in flight (DOM tick early-returns on `isRunning`, to avoid `page.evaluate()` contention with readiness/apply), and the CDP screencast can lag/freeze under that contention — so the step panel (driven by tiny `preview:run:step` events) races ahead of the picture. To keep them in lockstep the run loop pushes one `getPreviewVideoStreamRegistry().injectFrame()` per step (right after the `running` emit, when the previous step has settled) plus a final frame before `preview:run:completed`. `injectFrame` is a read-only `page.screenshot` (NOT a CDP-session reuse — invariant #3 safe), fire-and-forget.
 
 ### Pick element (one-shot read-only picker)
 ```
