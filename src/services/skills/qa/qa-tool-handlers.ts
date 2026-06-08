@@ -3895,7 +3895,7 @@ export async function handleManageSchedule(
         logger.info('[QA_TOOL] Schedule created', { scheduleId: schedule.id, userId: context.userId });
 
         const when = schedule.scheduleType === 'one_time'
-          ? `once at ${schedule.runAt}`
+          ? `once at ${schedule.runAt ? ScheduleService.formatRunAtForHuman(schedule.runAt, schedule.timezone) : 'the scheduled time'}`
           : schedule.cronExpression;
 
         return {

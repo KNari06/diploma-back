@@ -497,6 +497,33 @@ export class ScheduleService {
     return new Date(t).toISOString();
   }
 
+  /**
+   * Format an absolute ISO instant into a human-readable wall-clock string in
+   * the given timezone, e.g. "Jun 10, 2026, 2:30 PM (Asia/Almaty)". Falls back
+   * to the raw value if it can't be parsed/formatted, so callers never throw.
+   * Used for chat confirmation/success messages so users see a readable date
+   * instead of a raw ISO string.
+   */
+  static formatRunAtForHuman(runAt: string, timezone?: string): string {
+    const t = Date.parse(runAt);
+    if (Number.isNaN(t)) return runAt;
+    const tz = this.resolveTimezone(timezone || 'UTC');
+    try {
+      const formatted = new Intl.DateTimeFormat('en-US', {
+        timeZone: tz,
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      }).format(new Date(t));
+      return `${formatted} (${tz})`;
+    } catch {
+      return runAt;
+    }
+  }
+
   // Like calculateNextRun but returns null instead of throwing when the cron is
   // unsatisfiable. The scheduler uses this to deactivate impossible schedules
   // without try/catch; create/update go through the throwing wrapper above.

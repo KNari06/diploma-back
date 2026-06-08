@@ -130,6 +130,19 @@ describe('ScheduleService.create — one-time vs recurring', () => {
     ).rejects.toThrow(/timezone offset/i);
   });
 
+  it('formatRunAtForHuman renders a readable date in the schedule timezone (not raw ISO)', () => {
+    const out = ScheduleService.formatRunAtForHuman('2026-06-10T09:30:00.000Z', 'Asia/Almaty');
+    // 09:30 UTC = 14:30 in Almaty (UTC+5). Human-readable, tz-suffixed, not raw ISO.
+    expect(out).toMatch(/Jun 10, 2026/);
+    expect(out).toMatch(/2:30\s?PM/i);
+    expect(out).toContain('(Asia/Almaty)');
+    expect(out).not.toContain('T09:30');
+  });
+
+  it('formatRunAtForHuman falls back to the raw value on an unparseable instant', () => {
+    expect(ScheduleService.formatRunAtForHuman('not-a-date', 'UTC')).toBe('not-a-date');
+  });
+
   it('accepts a runAt with a ±HH:MM offset (not just Z)', async () => {
     const result = await ScheduleService.create(params({ runAt: '2999-01-01T14:30:00+05:00' }));
     expect(result.scheduleType).toBe('one_time');

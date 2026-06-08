@@ -11,6 +11,7 @@
  * - "запускай smoke план каждый день в 9 утра по Алматы"
  */
 
+import { ScheduleService } from '@/services/testing/schedules/schedule.service';
 import { NotFoundError } from '@/types';
 import { logger } from '@/utils/core/logger';
 import { Request, Response } from 'express';
@@ -57,7 +58,7 @@ function describeScheduleChange(action: string, manage: Record<string, any>): st
     ? ` running plan "${manage.planName}"`
     : manage.moduleName ? ` running module "${manage.moduleName}"` : '';
   const when = manage.runAt
-    ? ` once at ${manage.runAt}`
+    ? ` once at ${ScheduleService.formatRunAtForHuman(manage.runAt, manage.timezone)}`
     : manage.cronExpression
       ? ` at ${manage.cronExpression}${manage.timezone ? ` (${manage.timezone})` : ''}`
       : '';
