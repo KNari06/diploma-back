@@ -685,9 +685,8 @@ export class AnalyticsQueryService {
       totalRunsDeltaPct: pct(cur.totalRuns, prev.totalRuns),
       failedRunsDeltaPct: pct(cur.failedRuns, prev.failedRuns),
       flakyStepsDeltaPct: pct(cur.flakySteps, prev.flakySteps),
-      // Pass rate is already a percentage → report the point difference, not a
-      // percent-of-percent (clearer: "85% vs 80%" → +5 points, not +6.25%).
-      passRateDeltaPoints: Math.round((cur.passRate - prev.passRate) * 10) / 10,
+      // Relative % change, like the other deltas (UI shows a "%" suffix for all).
+      passRateDeltaPct: pct(cur.passRate, prev.passRate),
     };
   }
 

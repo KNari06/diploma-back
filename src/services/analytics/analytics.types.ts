@@ -90,13 +90,9 @@ export interface SummaryData {
       totalRunsDeltaPct?: number;
       failedRunsDeltaPct?: number;
       flakyStepsDeltaPct?: number;
-      /**
-       * Pass-rate change in PERCENTAGE POINTS (e.g. 80% → 85% = +5), NOT a
-       * relative percent change — pass rate is already a percentage, so a
-       * percent-of-percent would be confusing. Named `...Points` (not `...Pct`)
-       * so consumers render it with a "pp" / point suffix, not "%".
-       */
-      passRateDeltaPoints?: number;
+      /** Relative % change in pass rate vs the prior window (same basis as the
+       *  other deltas), rendered with a "%" suffix in the UI. */
+      passRateDeltaPct?: number;
     };
   };
   status: {
