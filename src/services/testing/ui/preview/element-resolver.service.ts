@@ -5337,6 +5337,14 @@ export async function resolveElement(params: {
             mode: resolveMode,
             // 2026-06: same heal journey context as the primary batch.
             healContext,
+            // 2026-06: the overflow batch MUST run the same honesty guard as the
+            // primary call — without these deps the extended search only got L1
+            // lexical, so a confident-but-wrong overflow pick (e.g. an <h1> whose
+            // text happens to match the intent) sailed through. Pass the same
+            // deps so L1 (incl. the new actionability gate) + L2 + L3 all apply.
+            identityFreq: identityFreqPredicate,
+            honestySemantic,
+            honestyJudge,
           });
 
           if (overflowResult.status === 'resolved' && overflowResult.selectedRef) {

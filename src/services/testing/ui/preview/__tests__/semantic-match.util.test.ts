@@ -98,4 +98,43 @@ describe('evaluateHonestyGuard', () => {
   it('passes label-less elements (recall guard)', async () => {
     expect(await evaluateHonestyGuard({ intentText: 'next page', chosenNode: node({ tag: 'button', text: '›' }), mode: 'apply' })).toBeNull();
   });
+
+  // Actionability gate (documentolog "Sign" incident): a click intent must NOT
+  // resolve onto a presentational element just because the word overlaps.
+  describe('actionability gate (click/hover vs presentational role)', () => {
+    const heroHeading = node({ tag: 'h1', role: 'heading', text: 'Sign', frameworkClickable: 'react' });
+
+    it('rejects a click intent that landed on an <h1 role=heading> "Sign" even though the word matches', async () => {
+      const r = await evaluateHonestyGuard({ intentText: "Click the top navigation link labeled 'Sign'", chosenNode: heroHeading, mode: 'apply', action: 'click' });
+      expect(r).not.toBeNull();
+      expect(r?.kind).toBe('semanticFloor');
+    });
+
+    it('also rejects for hover on a presentational heading', async () => {
+      expect(await evaluateHonestyGuard({ intentText: 'sign here', chosenNode: heroHeading, mode: 'apply', action: 'hover' })).not.toBeNull();
+    });
+
+    it('frameworkClickable alone does NOT rescue a presentational role', async () => {
+      const fwOnly = node({ tag: 'div', role: 'generic', text: 'login', frameworkClickable: 'react' });
+      expect(await evaluateHonestyGuard({ intentText: 'login', chosenNode: fwOnly, mode: 'apply', action: 'click' })).not.toBeNull();
+    });
+
+    it('lets a heading through when it carries a real affordance (href / onclick / focusable)', async () => {
+      const linkedHeading = node({ tag: 'h1', role: 'heading', text: 'Sign', href: 'https://x/login' });
+      expect(await evaluateHonestyGuard({ intentText: 'sign in', chosenNode: linkedHeading, mode: 'apply', action: 'click' })).toBeNull();
+      const focusable = node({ tag: 'div', role: 'generic', text: 'login', tabIndex: 0, hasOnclick: true });
+      expect(await evaluateHonestyGuard({ intentText: 'login', chosenNode: focusable, mode: 'apply', action: 'click' })).toBeNull();
+    });
+
+    it('does NOT gate non-click/hover actions (e.g. type) on presentational roles', async () => {
+      // type intents are handled by the lexical/identity path, not this gate.
+      const r = await evaluateHonestyGuard({ intentText: 'sign', chosenNode: heroHeading, mode: 'apply', action: 'type' });
+      expect(r).toBeNull(); // "sign" overlaps the label → L1 accepts
+    });
+
+    it('does NOT gate genuine interactive roles (link/button) for click', async () => {
+      const realLink = node({ tag: 'a', role: 'link', text: 'Sign', href: '/login' });
+      expect(await evaluateHonestyGuard({ intentText: 'sign in', chosenNode: realLink, mode: 'apply', action: 'click' })).toBeNull();
+    });
+  });
 });
