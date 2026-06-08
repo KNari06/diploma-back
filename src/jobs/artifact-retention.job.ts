@@ -8,9 +8,10 @@
  * touches. Without pruning, per-step images grow without bound (runs × steps).
  *
  * This nightly sweep walks every user's `step-screenshots/` subtree and removes
- * objects older than SCREENSHOT_RETENTION_DAYS. Runs in the scheduler process
- * (single-instance, not horizontally scaled — same reasoning as the other
- * sweeps), so no distributed lock is needed. Best-effort: storage errors log
+ * objects older than SCREENSHOT_RETENTION_DAYS. Runs in the scheduler bundle
+ * — local scheduler container, or the prod worker behind the Redis leader lock
+ * (`src/scheduler/leader.ts`), which is what keeps it single-instance when the
+ * worker scales out. Best-effort: storage errors log
  * and continue, never throw fatally.
  */
 

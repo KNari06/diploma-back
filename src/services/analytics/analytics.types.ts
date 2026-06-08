@@ -100,7 +100,11 @@ export interface SummaryData {
     message: string;
     lastRunAt: string | null;
     nextSchedule: {
-      cronExpression: string;
+      scheduleType: 'recurring' | 'one_time';
+      // null for a one_time schedule (it has run_at instead).
+      cronExpression: string | null;
+      // set for a one_time schedule; null for recurring.
+      runAt: string | null;
       nextRunAt: string;
     } | null;
   };

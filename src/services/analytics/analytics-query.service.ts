@@ -411,10 +411,12 @@ export class AnalyticsQueryService {
           filters.endDate
         ),
 
-        // Next schedule — use maybeSingle() to avoid error when no rows
+        // Next schedule — use maybeSingle() to avoid error when no rows.
+        // Pull schedule_type + run_at so a one_time schedule (cron_expression
+        // null) can still be described by the consumer instead of rendering blank.
         supabaseAdmin
           .from('test_schedules')
-          .select('cron_expression, next_run_at, last_run_at')
+          .select('schedule_type, cron_expression, run_at, next_run_at, last_run_at')
           .in('project_id', projectIds)
           .eq('is_active', true)
           .order('next_run_at', { ascending: true })
@@ -551,7 +553,9 @@ export class AnalyticsQueryService {
           lastRunAt,
           nextSchedule: schedule
             ? {
-                cronExpression: schedule.cron_expression,
+                scheduleType: (schedule.schedule_type as 'recurring' | 'one_time') || 'recurring',
+                cronExpression: schedule.cron_expression ?? null,
+                runAt: schedule.run_at ?? null,
                 nextRunAt: schedule.next_run_at,
               }
             : null,
