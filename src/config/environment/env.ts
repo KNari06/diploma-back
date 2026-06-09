@@ -156,7 +156,7 @@ const envSchema = z.object({
   BACKEND_URL: z.string().optional(),
 
   // Email / SMTP
-  SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
+  SMTP_PASSWORD: z.string().optional(), // Gmail app password for yera@qait.dev
 
   // Email Inbox (IMAP for test email reception — catch-all inbox)
   IMAP_HOST: z.string().default('imap.gmail.com'),

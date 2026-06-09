@@ -255,7 +255,7 @@ export class EmailService {
       port: 587,
       secure: false, // use TLS
       auth: {
-        user: 'noreply@qait.dev',
+        user: 'yera@qait.dev',
         pass: process.env.SMTP_PASSWORD || '', // Need to add this to .env
       },
     });
@@ -354,7 +354,7 @@ If you didn't expect this invitation, you can safely ignore this email.
       const transporter = this.createTransporter();
 
       await transporter.sendMail({
-        from: '"QAIT.dev" <noreply@qait.dev>',
+        from: '"QAIT.dev" <yera@qait.dev>',
         to: data.recipientEmail,
         subject: `You've been invited to join ${workspaceName} on QAIT.dev`,
         text: textContent,
@@ -579,7 +579,7 @@ QAIT — это AI-платформа для тестирования, кото�
       const transporter = this.createTransporter();
 
       await transporter.sendMail({
-        from: '"QAIT.dev" <noreply@qait.dev>',
+        from: '"QAIT.dev" <yera@qait.dev>',
         to: data.recipientEmail,
         subject: "You're in! Your QAIT.dev account is approved",
         text: textContent,
@@ -681,7 +681,7 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
       const transporter = this.createTransporter();
 
       await transporter.sendMail({
-        from: '"QAIT.dev" <noreply@qait.dev>',
+        from: '"QAIT.dev" <yera@qait.dev>',
         to: data.recipientEmail,
         subject: 'QAIT.dev — Account Request Update',
         text: textContent,
@@ -720,7 +720,7 @@ ${name}, спасибо за интерес к QAIT.dev. К сожалению, 
       const transporter = this.createTransporter();
 
       await transporter.sendMail({
-        from: '"QAIT.dev" <noreply@qait.dev>',
+        from: '"QAIT.dev" <yera@qait.dev>',
         to: data.recipientEmail,
         subject: data.subject,
         text: data.textContent,
