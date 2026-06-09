@@ -2648,9 +2648,19 @@ async function executeAction(
             // fill() — an atomic full-value set the mask reformats in a single pass.
             // inputValue is capped (default is 30s) and fails open: an unreadable
             // value (contenteditable / custom widget) simply skips verification.
-            const typedBack = await locator.inputValue({ timeout: 2000 }).catch(() => null);
+            // Settle: masked inputs reformat over a tick or two after the last
+            // keystroke, so inputValue() can read transiently short right after
+            // pressSequentially. Poll briefly until it stabilizes before deciding
+            // — otherwise a spurious fill() re-set flickers the live preview
+            // ("last char deleted") even though the value is actually correct.
+            // Only the short-read path waits; a correct value matches first try.
+            let typedBack = await locator.inputValue({ timeout: 2000 }).catch(() => null);
+            for (let i = 0; i < 5 && typedBack !== null && !typedValueLooksApplied(value, typedBack); i++) {
+              await page.waitForTimeout(60);
+              typedBack = await locator.inputValue({ timeout: 2000 }).catch(() => null);
+            }
             if (typedBack !== null && !typedValueLooksApplied(value, typedBack)) {
-              logger.info('[EXECUTE_ACTION] type() value mismatch after pressSequentially — retrying with fill()', {
+              logger.info('[EXECUTE_ACTION] type() value mismatch after pressSequentially (post-settle) — retrying with fill()', {
                 expected: value.slice(0, 50),
                 actual: typedBack.slice(0, 50),
               });
