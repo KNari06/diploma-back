@@ -2434,6 +2434,37 @@ async function selectFromCustomDropdown(
 }
 
 /**
+ * Clear an input before typing (used when `replaceContent !== false`).
+ *
+ * A single `fill('')` can silently no-op on a fast CONSECUTIVE step — the
+ * element is mid-re-render right after the previous step touched it — and the
+ * old `.catch(() => {})` then degraded to an APPEND: two `type` steps on the
+ * same field concatenated their values (e.g. "+7 702…3640" + "+7 702…3640")
+ * instead of the second replacing the first. Single-Apply doesn't hit this
+ * because the field has already settled between manual clicks.
+ *
+ * So: clear, then VERIFY the field is actually empty; if not, clear harder with
+ * a real keyboard chain (select-all + Delete) that controlled/masked inputs
+ * honor. Fail-open when the value is unreadable (contenteditable / custom
+ * widget) — behaves like the old single `fill('')`.
+ */
+export async function clearFieldBeforeType(locator: Locator, timeout: number): Promise<void> {
+  await locator.fill('', { timeout }).catch(() => {});
+  const after = await locator.inputValue({ timeout: 1500 }).catch(() => null);
+  if (after === null || after === '') return; // already empty, or unreadable → done
+  // Still has content — clear with a real keyboard chain the framework tracks.
+  await locator.focus({ timeout }).catch(() => {});
+  await locator.press('ControlOrMeta+a', { timeout }).catch(() => {});
+  await locator.press('Delete', { timeout }).catch(() => {});
+  const after2 = await locator.inputValue({ timeout: 1500 }).catch(() => null);
+  if (after2 !== null && after2 !== '') {
+    logger.warn('[EXECUTE_ACTION] field not empty after clear (fill + select-all/Delete)', {
+      remaining: after2.slice(0, 50),
+    });
+  }
+}
+
+/**
  * Execute an action on the page
  * V7: Optionally accepts a pre-resolved locator (from compiled plan)
  */
@@ -2575,7 +2606,7 @@ async function executeAction(
           // If we want to "replace", clear existing content before typing.
           // We clear quickly, then type gradually for the human-like effect.
           if (step.options?.replaceContent !== false) {
-            await locator.fill('', { timeout });
+            await clearFieldBeforeType(locator, timeout);
           }
 
           // Delay between keystrokes:
@@ -2604,7 +2635,7 @@ async function executeAction(
           if (value.length <= 50 || userKeyPressDelay != null) {
             // Short text (credentials, emails, OTP) OR user-requested gradual typing:
             // use pressSequentially for full keyboard event chain.
-            await locator.fill('', { timeout }).catch(() => {}); // Clear existing content first
+            await clearFieldBeforeType(locator, timeout); // Clear existing content (verified — see helper)
             await locator.click({ timeout });
             await locator.pressSequentially(value, { timeout, delay: userKeyPressDelay ?? 20 });
 

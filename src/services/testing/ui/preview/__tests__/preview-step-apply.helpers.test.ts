@@ -2,7 +2,27 @@ import {
   globToRegexPatternForWaitFor,
   normalizeTypeActionValue,
   typedValueLooksApplied,
+  clearFieldBeforeType,
 } from '../preview-step-apply.service';
+
+// Minimal Locator stub — only the methods clearFieldBeforeType touches.
+// `inputValues` is the queue of inputValue() reads (string, or Error to throw).
+function makeLocatorStub(inputValues: Array<string | Error>) {
+  const reads = [...inputValues];
+  const calls = { fill: [] as string[], press: [] as string[], focus: 0 };
+  const locator = {
+    fill: async (v: string) => { calls.fill.push(v); },
+    inputValue: async () => {
+      const next = reads.shift();
+      if (next instanceof Error) throw next;
+      return next ?? '';
+    },
+    focus: async () => { calls.focus += 1; },
+    press: async (k: string) => { calls.press.push(k); },
+  };
+  // Cast through unknown — the stub implements only the touched surface.
+  return { locator: locator as unknown as import('playwright').Locator, calls };
+}
 
 describe('preview-step-apply helpers', () => {
   describe('globToRegexPatternForWaitFor', () => {
@@ -79,6 +99,33 @@ describe('preview-step-apply helpers', () => {
     it('skips verification when nothing meaningful was expected', () => {
       expect(typedValueLooksApplied('', '')).toBe(true);
       expect(typedValueLooksApplied('   ', 'anything')).toBe(true);
+    });
+  });
+
+  describe('clearFieldBeforeType', () => {
+    it('does not select-all/Delete when the initial clear already emptied the field', async () => {
+      const { locator, calls } = makeLocatorStub(['']); // first read: empty
+      await clearFieldBeforeType(locator, 5000);
+      expect(calls.fill).toEqual(['']);
+      expect(calls.focus).toBe(0);
+      expect(calls.press).toEqual([]);
+    });
+
+    it('clears harder with select-all + Delete when the field still has content (consecutive-step bug)', async () => {
+      // read 1: still has prior step's value; read 2: empty after select-all+Delete
+      const { locator, calls } = makeLocatorStub(['+7 702 850 3640', '']);
+      await clearFieldBeforeType(locator, 5000);
+      expect(calls.fill).toEqual(['']);
+      expect(calls.focus).toBe(1);
+      expect(calls.press).toEqual(['ControlOrMeta+a', 'Delete']);
+    });
+
+    it('fails open (no select-all/Delete) when the value is unreadable', async () => {
+      const { locator, calls } = makeLocatorStub([new Error('not an <input>')]);
+      await clearFieldBeforeType(locator, 5000);
+      expect(calls.fill).toEqual(['']);
+      expect(calls.focus).toBe(0);
+      expect(calls.press).toEqual([]);
     });
   });
 });
