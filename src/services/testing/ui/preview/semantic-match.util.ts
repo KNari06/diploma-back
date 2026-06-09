@@ -388,6 +388,55 @@ export interface HonestyJudgeDeps {
   ask: (intent: string, label: string) => Promise<boolean | null>;
 }
 
+/**
+ * Presentational / non-interactive ARIA roles — a click or hover intent should
+ * never resolve onto one of these UNLESS the element carries a real click
+ * affordance (see `hasClickAffordance`). W3C role taxonomy, not a word list.
+ * `undefined` role is NOT presentational here: role-less custom widgets
+ * (icon buttons, framework-bound divs) are legitimately clickable and handled
+ * by the affordance check + the existing recall guard.
+ */
+const PRESENTATIONAL_ROLES = new Set([
+  'heading',
+  'paragraph',
+  'none',
+  'presentation',
+  'generic',
+  'img',
+  'image',
+  'figure',
+  'separator',
+  'banner',
+  'contentinfo',
+  'note',
+  'definition',
+  'term',
+]);
+
+function isPresentationalRole(role: string | undefined | null): boolean {
+  return !!role && PRESENTATIONAL_ROLES.has(role);
+}
+
+/**
+ * True when the node has a genuine, user-facing click affordance — a real link,
+ * an explicit click handler, keyboard focusability, or popup/expand semantics.
+ * Deliberately EXCLUDES `frameworkClickable` on its own: frameworks attach
+ * synthetic handlers to presentational elements for animation / scroll / parallax
+ * effects (the documentolog hero <h1> had `frameworkClickable: 'react'`), which
+ * is not the same as the element being a click target. When a presentational
+ * role also has a real affordance (e.g. a heading wrapping an <a>), this returns
+ * true and the actionability gate lets it through.
+ */
+function hasClickAffordance(node: InteractiveNode): boolean {
+  return (
+    !!node.href
+    || !!node.hasOnclick
+    || (typeof node.tabIndex === 'number' && node.tabIndex >= 0)
+    || node.ariaExpanded !== undefined
+    || !!node.hasAriaHaspopup
+  );
+}
+
 export async function evaluateHonestyGuard(args: {
   intentText: string;
   chosenNode: InteractiveNode | undefined | null;
@@ -412,6 +461,30 @@ export async function evaluateHonestyGuard(args: {
   if (intentTokens.size === 0) return null;
 
   const chosenTokens = semanticTokens(chosenLabel);
+
+  // L-1 STRUCTURAL ACTIONABILITY — runs BEFORE the lexical accepts so a literal
+  // word match cannot rescue a structurally-wrong target. A click/hover intent
+  // that landed on a presentational role (heading / paragraph / generic / none /
+  // img) with NO real click affordance (no href, no onclick, not focusable, no
+  // popup/expand semantics) is never a valid click target — even when the word
+  // overlaps. This is exactly the documentolog "Sign" incident: the LLM matched
+  // the <h1> "Sign" of the hero title to the intent "click ... 'Sign'", L1
+  // lexical would have accepted it on the shared token, and apply reported a
+  // false success. Pure structure + W3C roles, zero word lists, any-language.
+  // frameworkClickable ALONE does not rescue a presentational role here: a React
+  // onScroll/animation handler on an <h1> sets frameworkClickable but is not a
+  // user-facing click affordance — require an explicit affordance instead.
+  if (
+    (action === 'click' || action === 'hover')
+    && chosenNode
+    && isPresentationalRole(chosenNode.role)
+    && !hasClickAffordance(chosenNode)
+  ) {
+    return {
+      kind: 'semanticFloor',
+      reason: `chosen <${chosenNode.tag} role=${chosenNode.role || 'none'}> "${chosenLabel.slice(0, 40)}" is not actionable for ${action} (no link/button affordance) — likely a text match, not a real target`,
+    };
+  }
 
   // RECALL GUARD: a label-less chosen element (icon-only "›", "✓", bare <svg>)
   // has no visible tokens to judge — pass (rejecting blind is the recall-killer

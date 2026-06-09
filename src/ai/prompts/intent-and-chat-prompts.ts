@@ -42,6 +42,10 @@ export interface IntentParserContext {
   projectInfo?: string;
   chatHistory?: Array<{ role: string; content: string }>; // Chat history for context
 
+  // User's IANA timezone (when known) — anchors relative-date resolution for
+  // one-time schedules ("tomorrow 14:30" → absolute runAt). Defaults to UTC.
+  timezone?: string;
+
   // Editor mode context
   mode?: 'lite' | 'pro' | 'editor';
   previewSessionId?: string;   // Active preview session (web editor mode)
@@ -612,8 +616,13 @@ Ex41: "add the checkout module to my Release plan"
 
   // Request-understanding extension: ANALYZE (decompose / targetSelector /
   // executionModifiers) + IMPROVE (routeHint) added to the SAME JSON output,
-  // so there is no extra LLM round-trip for the common case.
-  prompt += `\n${buildUnderstandingExtension()}`;
+  // so there is no extra LLM round-trip for the common case. Pass current time +
+  // timezone so one-time schedule datetimes ("tomorrow 14:30") resolve to an
+  // absolute runAt.
+  prompt += `\n${buildUnderstandingExtension({
+    nowIso: new Date().toISOString(),
+    timezone: context?.timezone || 'UTC',
+  })}`;
 
   prompt += `\nRETURN ONLY VALID JSON (no markdown):`;
 

@@ -14,7 +14,7 @@
 |---|---|---|
 | API | [src/index.ts](src/index.ts) | HTTP + Socket.IO server. Owns preview sessions (live browsers). |
 | Worker | [src/worker/index.ts](src/worker/index.ts) | BullMQ consumer. Runs all background jobs (replay, AI analysis, exploration). |
-| Scheduler | [src/scheduler/index.ts](src/scheduler/index.ts) | Cron triggers — enqueues regression runs. |
+| Scheduler | [src/scheduler/index.ts](src/scheduler/index.ts) | Cron + one-time triggers — enqueues regression runs. Local: own container. Prod: hosted in the worker behind a Redis leader lock (`SCHEDULER_IN_WORKER`, [leader.ts](src/scheduler/leader.ts)). |
 
 Run: `npm run dev` (API), `npm run worker`, `npm run scheduler`.
 
@@ -128,12 +128,16 @@ from a runner-side pool (warmup → cold-start fallback) and released in the
 finally block. See `mobile-test-run.job.ts` for the full lifecycle.
 
 ### Scheduled cron
-`src/scheduler/index.ts` ticks every 60s
-→ `TestSchedulerJobHandler.processSchedules()` → `claimDueSchedule()` (atomic)
+Scheduler bundle ticks every 60s (the `TestSchedulerJobHandler` loop)
+→ `processSchedules()` → `claimDueSchedule()` (atomic)
 → routes to `RegressionRunService.runPlan() | runModule() | runFlow()`
 → same web / mobile branches as above.
 
-Also in the scheduler process (24h sweeps, single-instance): `ArtifactRetentionJob` ([artifact-retention.job.ts](src/jobs/artifact-retention.job.ts)) prunes `${userId}/step-screenshots/...` older than `SCREENSHOT_RETENTION_DAYS`. Per-step screenshot knobs live in [env.ts](src/config/environment/env.ts) / [config/features/screenshot-capture.ts](src/config/features/screenshot-capture.ts): `SCREENSHOT_EACH_STEP_ENABLED` (default ON), `SCREENSHOT_FORMAT` (`webp`/`jpeg`), `SCREENSHOT_QUALITY`, `SCREENSHOT_RETENTION_DAYS`. Final/bug screenshots (`${userId}/screenshots/...`) are a SEPARATE prefix the retention job never touches.
+**Where the bundle runs:** local docker-compose runs a dedicated `scheduler` container ([src/scheduler/index.ts](src/scheduler/index.ts)). In prod the SAME bundle runs INSIDE the worker process, gated by `SCHEDULER_IN_WORKER=true` and a Redis **leader lock** ([src/scheduler/leader.ts](src/scheduler/leader.ts), key `${QUEUE_PREFIX}scheduler:leader`, 90s TTL / 30s refresh; acquire = `SET NX EX`, renew/release = atomic Lua compare-and-expire / compare-and-del) so one worker replica runs it at N>1. Guarantee is at-most-one in steady state, not hard mutex (a >90s leader stall opens a ≤30s double-run window, bounded because the sweeps are idempotent and schedule claims are atomic). Default OFF, so the two never fight; the lock is the backstop if both ever run against one Redis.
+
+**Schedule types:** a `test_schedules` row is either **recurring** (`schedule_type='recurring'`, a 5-field `cron_expression` + `timezone`; `claimDueSchedule` advances `next_run_at` to the next occurrence) or **one_time** (`schedule_type='one_time'`, an absolute `run_at`; `claimDueSchedule` fires once then flips `is_active=false`). Due-detection is identical for both (`next_run_at <= NOW()`); only the claim/advance step differs. Create/update accept exactly one of `cronExpression` or `runAt` ([schedule.service.ts](src/services/testing/schedules/schedule.service.ts), [schedules.controller.ts](src/api/schedules/schedules.controller.ts), `qa_manage_schedule`).
+
+Also in the scheduler bundle (24h sweeps, single-instance — now guarded by the leader lock when hosted in the worker): `ArtifactRetentionJob` ([artifact-retention.job.ts](src/jobs/artifact-retention.job.ts)) prunes `${userId}/step-screenshots/...` older than `SCREENSHOT_RETENTION_DAYS`. Per-step screenshot knobs live in [env.ts](src/config/environment/env.ts) / [config/features/screenshot-capture.ts](src/config/features/screenshot-capture.ts): `SCREENSHOT_EACH_STEP_ENABLED` (default ON), `SCREENSHOT_FORMAT` (`webp`/`jpeg`), `SCREENSHOT_QUALITY`, `SCREENSHOT_RETENTION_DAYS`. Final/bug screenshots (`${userId}/screenshots/...`) are a SEPARATE prefix the retention job never touches.
 
 ### Chat → test creation / management (intent-driven router)
 POST `/api/chat/message` → `handleChat()` ([src/api/chat/chat.controller.ts](src/api/chat/chat.controller.ts))

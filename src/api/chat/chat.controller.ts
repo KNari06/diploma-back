@@ -241,6 +241,15 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       }
       workspace_id = testCaseAccess.workspaceId;
       chatStore = TESTCASE_STORE;
+      // Test-case scope IS the editor surface — the user is looking at a live
+      // preview of this test case. Force editor mode so the general_chat
+      // executor prompt activates its editor flow (generate steps → confirm →
+      // run on preview → save). Backstop for older/mismatched clients that
+      // still send the lite/pro toggle value; the desktop client now sends
+      // mode='editor' itself, but the lite/pro toggle is a workspace-chat
+      // concept that must never leak into a test-case chat. Single source of
+      // truth: both parseIntent and routeToHandler read inputResult.mode.
+      inputResult.mode = 'editor';
     } else {
       const checkWorkspaceWithLogging = withFunctionLogging(checkWorkspace, 'checkWorkspace', functionLogger);
       workspace_id = await checkWorkspaceWithLogging(userId, sessionId);

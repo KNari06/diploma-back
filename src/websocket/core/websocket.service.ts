@@ -256,20 +256,14 @@ class WebSocketService {
    *
    * The room is keyed on `testCaseId`, not session id, because the
    * frontend subscribes the moment the editor opens — BEFORE the chat
-   * session row is lazily created on first POST /chat. Sessions and
-   * test-case rooms can co-exist: the higher-level chat emit methods
-   * call both `emitToChat(sessionId, ...)` and
-   * `emitToTestCaseChat(testCaseId, ...)` so a socket subscribed to
-   * either room gets the event exactly once (Socket.IO de-dupes per
-   * socket across rooms in the same emit when broadcast is split).
+   * session row is lazily created on first POST /chat.
    *
-   * Note: a socket subscribed to BOTH rooms (which is what
-   * `subscribe:chat:testcase` does once a session exists) will receive
-   * the event TWICE because we emit in two separate `to(...)` calls.
-   * That's acceptable — the frontend already de-dupes by `messageId`.
-   * Avoiding the double-emit at the server would require maintaining a
-   * server-side socket→testcase map, which costs more than the
-   * client-side guard.
+   * Chat emits in test-case scope route EXCLUSIVELY here (the higher-level
+   * `emitChatMessage`/`emitChatProcessingStep`/`emitChatTestUpdate` return
+   * early when `testCaseId` is set and never also call `emitToChat`). This
+   * is the leak fix: the per-session room `chat:<sessionId>` can have a
+   * global-chat client joined on the same socket, so emitting an editor
+   * message there would surface it inside the global chat.
    */
   public emitToTestCaseChat(
     testCaseId: string,
@@ -899,10 +893,17 @@ class WebSocketService {
         });
       return;
     }
-    this.emitToChat(sessionId, 'chat:message', payload);
+    // Test-case scope is EXCLUSIVE: emit only to `chat:tc:<testCaseId>`,
+    // never also to `chat:<sessionId>`. The per-session room can have a
+    // global-chat client joined on the same socket (a socket holds both
+    // a global subscription and a test-case subscription), so emitting to
+    // it would leak the editor chat's message into the global chat.
+    // The test-case client always receives it via its `chat:tc:` room.
     if (testCaseId) {
       this.emitToTestCaseChat(testCaseId, 'chat:message', payload);
+      return;
     }
+    this.emitToChat(sessionId, 'chat:message', payload);
   }
 
   public emitChatTestUpdate(
@@ -926,10 +927,12 @@ class WebSocketService {
         });
       return;
     }
-    this.emitToChat(sessionId, 'chat:test:update', payload);
+    // Test-case scope is EXCLUSIVE — see emitChatMessage for rationale.
     if (testCaseId) {
       this.emitToTestCaseChat(testCaseId, 'chat:test:update', payload);
+      return;
     }
+    this.emitToChat(sessionId, 'chat:test:update', payload);
   }
 
   public emitChatProcessingStep(
@@ -953,10 +956,12 @@ class WebSocketService {
         });
       return;
     }
-    this.emitToChat(sessionId, 'chat:processing:step', payload);
+    // Test-case scope is EXCLUSIVE — see emitChatMessage for rationale.
     if (testCaseId) {
       this.emitToTestCaseChat(testCaseId, 'chat:processing:step', payload);
+      return;
     }
+    this.emitToChat(sessionId, 'chat:processing:step', payload);
   }
 
   /**

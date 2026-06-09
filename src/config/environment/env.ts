@@ -115,6 +115,13 @@ const envSchema = z.object({
   SCALE_CHECK_INTERVAL_MS: z.string().transform(Number).default('15000'),
   SCALE_MAX_MEMORY_PERCENT: z.string().transform(Number).default('80'),
 
+  // When true, the worker process hosts the scheduler bundle (schedule sweeps +
+  // retention jobs) behind a Redis leader lock — exactly one worker replica
+  // runs them. Default OFF: local docker-compose runs a dedicated `scheduler`
+  // container, so the worker stays out of scheduling there. Set true on the
+  // prod worker (which is the only deployed long-lived process).
+  SCHEDULER_IN_WORKER: z.string().transform(v => v === 'true').default('false'),
+
   // Agent
   AGENT_TIMEOUT: z.string().transform(Number).default('300000'),
   AGENT_MAX_RETRIES: z.string().transform(Number).default('3'),
@@ -149,7 +156,7 @@ const envSchema = z.object({
   BACKEND_URL: z.string().optional(),
 
   // Email / SMTP
-  SMTP_PASSWORD: z.string().optional(), // Gmail app password for noreply@qait.dev
+  SMTP_PASSWORD: z.string().optional(), // Gmail app password for yera@qait.dev
 
   // Email Inbox (IMAP for test email reception — catch-all inbox)
   IMAP_HOST: z.string().default('imap.gmail.com'),

@@ -28,6 +28,26 @@ describe('buildUnderstandingExtension', () => {
   it('carries reasoning-style examples (context-first, not keyword-match)', () => {
     expect(ext).toContain('CONTEXT:');
   });
+
+  it('documents runAt for one-time schedules and the cron-XOR-runAt rule', () => {
+    expect(ext).toContain('runAt');
+    const flat = ext.toLowerCase().replace(/\s+/g, ' ');
+    expect(flat).toContain('one-time');
+    expect(flat).toContain('cronexpression or runat, never both');
+  });
+
+  it('omits the CURRENT TIME anchor when no now-context is given', () => {
+    expect(ext).not.toContain('CURRENT TIME:');
+  });
+
+  it('injects the CURRENT TIME anchor + timezone when now-context is provided', () => {
+    const withNow = buildUnderstandingExtension({
+      nowIso: '2026-06-08T12:00:00.000Z',
+      timezone: 'Asia/Almaty',
+    });
+    expect(withNow).toContain('CURRENT TIME: 2026-06-08T12:00:00.000Z');
+    expect(withNow).toContain('Asia/Almaty');
+  });
 });
 
 describe('buildEnrichPrompt', () => {
