@@ -481,13 +481,16 @@ export async function getDocumentChunks(req: Request, res: Response): Promise<vo
 
     // Preview shows the CURRENT version only. History is available via
     // explicit ?version=N (added in a later pass once a UI needs it).
+    // NOTE: we do NOT order by `metadata->chunkIndex` in SQL — PostgREST sorts
+    // a JSON field as TEXT, giving 0,1,10,11,2,... So a doc with ≥10 chunks
+    // came back scrambled and the preview excerpt joined them out of order.
+    // Fetch unordered and sort numerically in JS (chunk count is bounded).
     const { data, error } = await supabaseAdmin
       .from('project_kb_chunks')
       .select('id, content, metadata, file_version, format')
       .eq('project_id', projectId)
       .eq('file_name', fileName)
-      .eq('is_current', true)
-      .order('metadata->chunkIndex', { ascending: true });
+      .eq('is_current', true);
 
     if (error) {
       logger.error('[KB_API] Failed to fetch document chunks', { error: error.message, projectId, fileName });
@@ -496,12 +499,14 @@ export async function getDocumentChunks(req: Request, res: Response): Promise<vo
     }
 
     const rows = Array.isArray(data) ? data : [];
-    const chunks = rows.map((row, idx) => ({
-      id: row.id,
-      index: row.metadata?.chunkIndex ?? idx,
-      content: row.content,
-      tokenCount: row.metadata?.tokenCount,
-    }));
+    const chunks = rows
+      .map((row, idx) => ({
+        id: row.id,
+        index: typeof row.metadata?.chunkIndex === 'number' ? row.metadata.chunkIndex : idx,
+        content: row.content,
+        tokenCount: row.metadata?.tokenCount,
+      }))
+      .sort((a, b) => a.index - b.index);
 
     successResponse(res, {
       fileName,
