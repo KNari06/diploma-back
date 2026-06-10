@@ -274,6 +274,11 @@ const envSchema = z.object({
   SCREENSHOT_QUALITY: z.string().transform(Number).default('75'),
   // Screenshots older than this (days) are pruned by the artifact-retention job.
   SCREENSHOT_RETENTION_DAYS: z.string().transform(Number).default('30'),
+  // Local editor / forensic logs in test_logs/editor/ older than this (days) are
+  // pruned by the artifact-retention job's local sweep. These are debug artifacts
+  // (editor traces + per-apply forensic jsonl/ds/html triplets) that otherwise
+  // grow without bound — ~16 files per editor session, no upstream cleanup.
+  EDITOR_LOG_RETENTION_DAYS: z.string().transform(Number).default('3'),
 
   // Phase B1: mobile-editor force-route. When `true` (default), chat
   // requests carrying `context.mobileEditorMode=true` with a non-empty
