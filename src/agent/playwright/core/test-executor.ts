@@ -28,6 +28,7 @@ import { createRunKey, TestRunRegistry } from './test-run-registry';
 import { TestExecutedStepsRedisService } from '@/services/testing/results/test-executed-steps-redis.service';
 import { waitForStepReadiness, shouldSkipLookaheadAfter } from '@/services/testing/ui/preview/step-readiness.service';
 import { runV1WithShadow } from '@/services/testing/ui/preview/step-readiness-v2.service';
+// eslint-disable-next-line no-duplicate-imports
 import { STEP_READINESS_CONFIG } from '@/config/testing/playwright-tuning';
 import type { IntentStep, StepRuntimeMeta } from '@/services/testing/ui/preview/preview.types';
 import { setupThirdPartyBlocker } from '../execution/third-party-blocker';
@@ -40,6 +41,7 @@ import {
 } from '@/services/test-resource';
 import { createCommandExecutorRecipeRunner } from '@/services/test-resource/runtime/recipe-executor';
 import { runScenarioSetups } from '@/services/test-resource/runtime/scenario-setup-runner';
+import { composeStepDescription } from '@/agent/playwright/core/step-description';
 
 /**
  * Resolve workspaceId from projectId (for AI usage tracking).
@@ -949,7 +951,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               return isMutating && (isServerError || isRequestFailed);
             });
 
-            const stepDescription = intentMeta?.elementDescription || action;
+            const stepDescription = composeStepDescription(command, action);
             const actionType = (command as any).intentMeta?.actionType as string | undefined;
             const networkVerdict = shouldFailOnCriticalNetworkErrors({
               actionType,
@@ -1642,7 +1644,7 @@ export async function executePlaywrightTest(testData: TestJobData): Promise<{
               browser: testData.browser,
               step: currentStepIndex,
               attempt: retryAttempt,
-              stepDescription: intentMeta?.elementDescription || action,
+              stepDescription: composeStepDescription(command, action),
               success: false,
               timestamp: new Date().toISOString(),
               runtimeMeta: executor.redactRuntimeMeta(finalMeta),
