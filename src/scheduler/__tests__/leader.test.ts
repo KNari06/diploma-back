@@ -25,7 +25,11 @@ jest.mock('@/utils/core/logger', () => ({
 const startTestScheduler = jest.fn();
 const stopTestScheduler = jest.fn();
 jest.mock('@/jobs/test-scheduler.job', () => ({
-  TestSchedulerJobHandler: { start: (...a: any[]) => startTestScheduler(...a), stop: () => stopTestScheduler() },
+  TestSchedulerJobHandler: {
+    start: (...a: any[]) => startTestScheduler(...a),
+    stop: () => stopTestScheduler(),
+    waitForIdle: async () => {},
+  },
 }));
 jest.mock('@/jobs/auto-learn-retire.job', () => ({
   AutoLearnRetireJob: { start: jest.fn(), stop: jest.fn() },
@@ -67,11 +71,12 @@ describe('scheduler leader lock', () => {
     await freshLeader().tryBecomeOrRenewLeader();
     expect(startTestScheduler).toHaveBeenCalledTimes(1);
     expect(startTestScheduler).toHaveBeenCalledWith(60000);
-    // Lock the contract: prefixed key + 90s TTL + NX.
+    // Lock the contract: prefixed key + 30s TTL + NX. (TTL was lowered from 90s
+    // to 30s so a restarted worker takes over within tens of seconds, not minutes.)
     const [key, , mode, ttl, nx] = mockSet.mock.calls[0];
     expect(key).toBe('test:scheduler:leader');
     expect(mode).toBe('EX');
-    expect(ttl).toBe(90);
+    expect(ttl).toBe(30);
     expect(nx).toBe('NX');
   });
 
@@ -135,5 +140,64 @@ describe('scheduler leader lock', () => {
     await mod.tryBecomeOrRenewLeader();
     await mod.stopLeaderElection();
     expect(mockEval).not.toHaveBeenCalled();
+  });
+
+  // #6b: a leader partitioned from Redis (renew eval THROWS) must self-demote
+  // after the TTL window, else after the lock expires another replica acquires
+  // and BOTH run the bundle (double-fire). A transient single failure must NOT
+  // demote (we keep leading through brief blips).
+  it('self-demotes after renew has thrown for longer than the TTL (partition)', async () => {
+    jest.useFakeTimers({ now: 0 });
+    try {
+      const mod = freshLeader();
+      mockSet.mockResolvedValue('OK');
+      await mod.tryBecomeOrRenewLeader(); // acquire → leader, bundle started
+      expect(startTestScheduler).toHaveBeenCalledTimes(1);
+
+      // Renew now throws (Redis unreachable).
+      mockEval.mockRejectedValue(new Error('ECONNRESET'));
+
+      // First failure at t=0: must NOT demote (within TTL).
+      await mod.tryBecomeOrRenewLeader();
+      expect(stopTestScheduler).not.toHaveBeenCalled();
+
+      // Advance past TTL (30s) and fail again → must self-demote (stop bundle).
+      jest.setSystemTime(31_000);
+      await mod.tryBecomeOrRenewLeader();
+      expect(stopTestScheduler).toHaveBeenCalledTimes(1);
+
+      await mod.stopLeaderElection();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  // The fix for "schedule fires 4-5 min late after a worker restart": a
+  // non-leader must re-contend FAST (5s), not at the 10s leader-renew cadence,
+  // so a restarted worker grabs the lock within seconds of the stale TTL lapsing.
+  it('re-contends quickly (~5s) while NOT leader rather than at the 10s renew cadence', async () => {
+    jest.useFakeTimers();
+    try {
+      const mod = freshLeader();
+      mockSet.mockResolvedValue(null); // lose the acquire → stay contender
+      mod.startLeaderElection();
+      // Flush the immediate tick (async). advanceTimersByTimeAsync awaits the
+      // promise chain inside each scheduled callback (plain advanceTimersByTime
+      // does not, which is why it raced).
+      await jest.advanceTimersByTimeAsync(0);
+      const afterStart = mockSet.mock.calls.length;
+
+      // Before the 5s contend interval elapses, no new acquire attempt.
+      await jest.advanceTimersByTimeAsync(4000);
+      expect(mockSet.mock.calls.length).toBe(afterStart);
+
+      // Crossing 5s triggers another contend attempt.
+      await jest.advanceTimersByTimeAsync(1500);
+      expect(mockSet.mock.calls.length).toBeGreaterThan(afterStart);
+
+      await mod.stopLeaderElection();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

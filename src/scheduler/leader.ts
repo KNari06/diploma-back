@@ -8,7 +8,7 @@
  * at-most-one in steady state, NOT a hard mutual exclusion: if a leader's event
  * loop stalls past the TTL (heavy GC / blocking job), another replica can
  * acquire the lock and both run the bundle until the stalled leader's next
- * renew tick (≤ LEADER_REFRESH_MS) sees a foreign owner and stops. The blast
+ * renew tick (≤ LEADER_RENEW_MS) sees a foreign owner and stops. The blast
  * radius of that brief window is bounded — TestSchedulerJobHandler is per-
  * schedule atomic via claimDueSchedule(), and the sweeps are coarse-interval,
  * idempotent age-based deletes — so a double-run wastes work rather than
@@ -38,8 +38,17 @@ import { TestSchedulerJobHandler } from '@/jobs/test-scheduler.job';
 import { logger } from '@/utils/core/logger';
 
 const LEADER_KEY = `${env.QUEUE_PREFIX}scheduler:leader`;
-const LEADER_TTL_SEC = 90; // lock auto-expires if the leader dies
-const LEADER_REFRESH_MS = 30_000; // refresh with 3x headroom under the TTL
+// TTL bounds the worst-case takeover delay after a HARD worker kill (where the
+// graceful release can't run): the stale lock self-expires after at most this.
+// 30s keeps takeover snappy while staying well above the 10s refresh cadence.
+const LEADER_TTL_SEC = 30; // lock auto-expires if the leader dies
+// When we ALREADY hold the lock, refresh at 1/3 the TTL (10s) so a brief Redis
+// blip can't let it lapse.
+const LEADER_RENEW_MS = 10_000;
+// When we DON'T hold the lock, poll often (5s) so a fresh worker grabs the lock
+// within seconds of the previous holder's TTL expiring — this is what collapses
+// the post-restart "schedule fires 4-5 min late" window down to ~tens of seconds.
+const LEADER_CONTEND_MS = 5_000;
 
 // Atomic compare-and-extend / compare-and-delete. A plain GET-then-EXPIRE (or
 // GET-then-DEL) is a TOCTOU race: at the TTL boundary the key can expire and be
@@ -66,6 +75,10 @@ const INSTANCE_ID = `${process.pid}-${Math.random().toString(36).slice(2)}`;
 
 let leaderTimer: NodeJS.Timeout | null = null;
 let isLeader = false;
+let stopped = false;
+// When renew has been failing (Redis unreachable) — used to self-demote after
+// the TTL so a partitioned leader can't keep running a second bundle.
+let renewFailingSince: number | null = null;
 
 /** Start the six single-instance jobs. Mirrors src/scheduler/index.ts main(). */
 export function startSchedulerBundle(): void {
@@ -118,6 +131,7 @@ export async function tryBecomeOrRenewLeader(): Promise<void> {
       INSTANCE_ID,
       String(LEADER_TTL_SEC)
     );
+    renewFailingSince = null; // a reachable Redis resets the failure clock
     if (renewed !== 1) {
       logger.warn('[SCHEDULER_LEADER] Lost leadership — stopping sweep bundle', {
         instance: INSTANCE_ID,
@@ -126,20 +140,51 @@ export async function tryBecomeOrRenewLeader(): Promise<void> {
       stopSchedulerBundle();
     }
   } catch (err) {
+    // A renew that THROWS (Redis unreachable / partition) does NOT prove we still
+    // hold the lock — after TTL seconds of failures the key has certainly expired
+    // and another replica may have acquired it. If we kept isLeader=true we'd run
+    // a second bundle (double-fire). Self-demote once failures span the TTL.
+    if (isLeader) {
+      const now = Date.now();
+      if (renewFailingSince === null) renewFailingSince = now;
+      if (now - renewFailingSince >= LEADER_TTL_SEC * 1000) {
+        logger.warn('[SCHEDULER_LEADER] Renew unreachable past TTL — self-demoting to avoid double-bundle', {
+          instance: INSTANCE_ID,
+          failingMs: now - renewFailingSince,
+        });
+        isLeader = false;
+        stopSchedulerBundle();
+        renewFailingSince = null;
+      }
+    }
     logger.warn('[SCHEDULER_LEADER] Leader check failed (non-fatal, will retry)', {
       error: err instanceof Error ? err.message : String(err),
     });
   }
 }
 
-/** Begin contending for leadership on a periodic timer. Idempotent. */
+// Self-rescheduling tick: poll fast (LEADER_CONTEND_MS) while we're trying to
+// become leader, slow (LEADER_RENEW_MS) once we hold it. A fixed setInterval
+// can't do this — and the fast contention cadence is what makes a restarted
+// worker take over within seconds instead of waiting a full 30s refresh.
+function scheduleNextTick(): void {
+  if (stopped) return;
+  const delay = isLeader ? LEADER_RENEW_MS : LEADER_CONTEND_MS;
+  leaderTimer = setTimeout(async () => {
+    await tryBecomeOrRenewLeader();
+    scheduleNextTick();
+  }, delay);
+}
+
+/** Begin contending for leadership. Idempotent. */
 export function startLeaderElection(): void {
-  if (leaderTimer) return;
+  if (leaderTimer) return; // already running
+  stopped = false;
   logger.info('[SCHEDULER_LEADER] Contending for scheduler leader lock', { instance: INSTANCE_ID });
-  void tryBecomeOrRenewLeader();
-  leaderTimer = setInterval(() => {
-    void tryBecomeOrRenewLeader();
-  }, LEADER_REFRESH_MS);
+  void (async () => {
+    await tryBecomeOrRenewLeader();
+    scheduleNextTick();
+  })();
 }
 
 /**
@@ -148,11 +193,17 @@ export function startLeaderElection(): void {
  * Best-effort on shutdown.
  */
 export async function stopLeaderElection(): Promise<void> {
+  stopped = true;
   if (leaderTimer) {
-    clearInterval(leaderTimer);
+    clearTimeout(leaderTimer);
     leaderTimer = null;
   }
   stopSchedulerBundle();
+  // Wait for any in-flight schedule tick to finish before we release the lock /
+  // let the process exit — so a deploy doesn't abandon a just-claimed schedule
+  // mid-dispatch (a one_time row is already deactivated at claim time, so an
+  // interrupted dispatch would lose that run with no record).
+  await TestSchedulerJobHandler.waitForIdle();
   if (isLeader) {
     isLeader = false;
     try {

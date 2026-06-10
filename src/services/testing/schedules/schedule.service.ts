@@ -556,8 +556,17 @@ export class ScheduleService {
     // Scan up to 1500 days (>4 years) so legitimate leap-day crons ("0 9 29 2 *")
     // resolve to the next real Feb 29 (up to ~1461 days out) instead of being
     // misclassified as unsatisfiable.
+    //
+    // Enumerate candidate LOCAL days, not raw 24h UTC steps. Stepping by exactly
+    // 24h UTC drifts against local calendar days across DST: a 23h spring-forward
+    // local day gets skipped entirely (annual missed run for a late-hour cron),
+    // and a 25h fall-back day double-counts. Anchor at the local date of `now`
+    // and advance by calendar days (via UTC-noon arithmetic, which never lands
+    // in a DST gap), then read the local parts of that noon instant.
+    const nowParts = this.datePartsInTimezone(now, tz);
+    const baseNoonUtc = Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day, 12, 0, 0);
     for (let dayOffset = 0; dayOffset <= 1500; dayOffset++) {
-      const candidate = new Date(now.getTime() + dayOffset * 24 * 60 * 60 * 1000);
+      const candidate = new Date(baseNoonUtc + dayOffset * 24 * 60 * 60 * 1000);
       const candidateParts = this.datePartsInTimezone(candidate, tz);
 
       if (!months.has(candidateParts.month)) continue;
@@ -764,9 +773,22 @@ export class ScheduleService {
   ): Date {
     const guess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
     const guessParts = this.datePartsInTimezone(guess, tz);
-    const guessMinutes = guessParts.hour * 60 + guessParts.minute;
-    const targetMinutes = hour * 60 + minute;
-    const diffMinutes = guessMinutes - targetMinutes;
+    // The diff MUST include the calendar-day component, not just hour:minute.
+    // For a late local hour in a positive-offset tz the guess's wall clock rolls
+    // into the NEXT local day (a 21:30 Asia/Almaty guess shows 02:30 tomorrow);
+    // an hour:minute-only diff then reads UTC+5 as UTC-19 and the result lands
+    // exactly 24h late. Symmetric for early hours in a negative-offset tz
+    // (guess shows the PREVIOUS local day → result lands 24h early, which also
+    // mislabels dow-restricted crons). Comparing full date parts as naive-UTC
+    // timestamps yields the true offset for any tz, including beyond ±12.
+    const guessAsNaiveUtc = Date.UTC(
+      guessParts.year,
+      guessParts.month - 1,
+      guessParts.day,
+      guessParts.hour,
+      guessParts.minute
+    );
+    const diffMinutes = (guessAsNaiveUtc - guess.getTime()) / 60000;
     const result = new Date(guess.getTime() - diffMinutes * 60 * 1000);
 
     // DST spring-forward gap guard.

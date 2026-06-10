@@ -64,15 +64,18 @@ async function main(): Promise<void> {
     ArtifactRetentionJob.start();
   }
 
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string) => {
     logger.info('[SCHEDULER_PROCESS] Received shutdown signal', { signal });
     try {
+      // Stop the timers first (no new ticks), then wait for any in-flight tick
+      // to finish so a deploy doesn't abandon a just-claimed schedule mid-dispatch.
       TestSchedulerJobHandler.stop();
       AutoLearnRetireJob.stop();
       AccountDeletionPurgeJob.stop();
       StaleRunReaperJob.stop();
       AiCallLogsRetentionJob.stop();
       ArtifactRetentionJob.stop();
+      await TestSchedulerJobHandler.waitForIdle();
     } finally {
       process.exit(0);
     }
