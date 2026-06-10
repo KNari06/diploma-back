@@ -23,41 +23,37 @@ import type { IntentResult } from '@/types';
 import type { IntentParserContext } from '@/ai/prompts/index';
 import { env } from '@/config/environment/env';
 import { logger } from '@/utils/core/logger';
+import {
+  AFFIRMATIVE,
+  CANCEL,
+  REJECTION,
+  CHITCHAT,
+  CONFIRMATION_MARKERS,
+  toLangSet,
+  flattenLangs,
+} from '@/config/testing/intent-keywords';
+
+/** Pre-flattened confirmation-question markers (lowercased, all languages). */
+const CONFIRMATION_MARKERS_FLAT = flattenLangs(CONFIRMATION_MARKERS);
 
 // ─────────────────────────────────────────────────────────────────────────
-// Whitelists — keep narrow. Adding entries is cheap; widening match logic
-// (prefix / contains) is NOT — it's how fast-paths silently break correctness.
+// Whitelists — sourced from the central intent-keywords registry (en/ru/kk),
+// so the four confirm/cancel call sites can't drift. Keep MATCH LOGIC narrow:
+// adding entries is cheap; widening to prefix/contains is NOT — it's how
+// fast-paths silently break correctness.
 // ─────────────────────────────────────────────────────────────────────────
 
 /** Messages that are ALWAYS pure conversation. No data access, no tools. */
-const PURE_CHITCHAT = new Set<string>([
-  // en
-  'hi', 'hello', 'hey', 'yo', 'sup',
-  'thanks', 'thank you', 'thx', 'ty',
-  'bye', 'goodbye', 'see you', 'cya',
-  // ru
-  'привет', 'здравствуй', 'здравствуйте', 'хай',
-  'спасибо', 'спс', 'благодарю',
-  'пока', 'до свидания', 'увидимся',
-]);
+const PURE_CHITCHAT = toLangSet(CHITCHAT);
 
 /** Cancel / stop. Always general_chat (user is controlling the conversation). */
-const CANCEL_WORDS = new Set<string>([
-  'cancel', 'stop', 'abort', 'nevermind', 'never mind', 'forget it',
-  'отмена', 'стоп', 'отменить', 'забей', 'не надо',
-]);
+const CANCEL_WORDS = toLangSet(CANCEL);
 
 /** Approval words — only fast-pathable when history shows a pending plan. */
-const APPROVAL_WORDS = new Set<string>([
-  'yes', 'y', 'yep', 'yeah', 'ok', 'okay', 'sure', 'go', 'go ahead', 'do it',
-  'да', 'ага', 'давай', 'хорошо', 'ок', 'окей', 'поехали', 'запускай',
-]);
+const APPROVAL_WORDS = toLangSet(AFFIRMATIVE);
 
 /** Negation — only fast-pathable when history shows a pending confirmation. */
-const REJECTION_WORDS = new Set<string>([
-  'no', 'nope', 'nah',
-  'нет', 'неа', 'не',
-]);
+const REJECTION_WORDS = toLangSet(REJECTION);
 
 // ─────────────────────────────────────────────────────────────────────────
 // Fast-path entry
@@ -148,12 +144,8 @@ function hasPendingConfirmation(context?: IntentParserContext): boolean {
   // A direct question.
   if (content.trimEnd().endsWith('?')) return true;
 
-  // Common "shall I run this" phrasings (en + ru).
-  const confirmationMarkers = [
-    'shall i', 'should i', 'do you want me', 'ready to run', 'run it?',
-    'запустить', 'выполнить', 'подтверди', 'продолжить', 'начать',
-  ];
-  return confirmationMarkers.some((m) => content.includes(m));
+  // Common "shall I run this" phrasings (en + ru + kk) — central registry.
+  return CONFIRMATION_MARKERS_FLAT.some((m) => content.includes(m));
 }
 
 /**

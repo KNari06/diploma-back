@@ -328,9 +328,9 @@ export const handleChat = async (req: Request, res: Response): Promise<void> => 
       // `manageChatSession` does for the global path. Without this, the
       // frontend subscribed to `chat:tc:<tcid>` shows zero feedback
       // between sending the message and the first sub-agent step.
-      // Dual-broadcast via testCaseId — `chat:<sid>` reaches sockets
-      // already in the per-session room (returning users), `chat:tc:<tcid>`
-      // reaches first-time subscribers.
+      // In test-case scope the emit routes EXCLUSIVELY to `chat:tc:<tcid>`
+      // (passing testCaseId) — never to `chat:<sid>` — so an editor chat
+      // event cannot surface in the global chat sharing the socket.
       emitProcessingStep(
         chatSessionId,
         'enriching_context',

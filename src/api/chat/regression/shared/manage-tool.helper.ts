@@ -26,6 +26,10 @@ import type { SkillContext, SkillResult } from '@/services/skills/types';
 import { logger } from '@/utils/core/logger';
 import { Response } from 'express';
 import { storePendingManageOp } from './manage-confirmation';
+import { AFFIRMATIVE, toLangSet } from '@/config/testing/intent-keywords';
+
+/** Affirmative whitelist (en/ru/kk) — central registry, built once. */
+const AFFIRMATIVE_SET = toLangSet(AFFIRMATIVE);
 
 /** The handler params subset the helper needs to build a SkillContext. */
 export interface ManageToolParams {
@@ -126,13 +130,9 @@ export function resolveConfirmation(input: {
   }
   const text = (input.message || '').trim().toLowerCase();
   if (!text) return false;
-  // Conservative affirmative whitelist (EN + RU). Anything else → preview first.
-  const AFFIRMATIVE = new Set([
-    'yes', 'y', 'yeah', 'yep', 'ok', 'okay', 'sure', 'confirm', 'confirmed',
-    'go ahead', 'do it', 'proceed', 'go',
-    'да', 'ага', 'давай', 'подтверждаю', 'подтвердить', 'ок', 'окей', 'выполняй',
-  ]);
-  return AFFIRMATIVE.has(text);
+  // Conservative affirmative whitelist (EN + RU + KK) from the central
+  // intent-keywords registry. Anything else → preview first.
+  return AFFIRMATIVE_SET.has(text);
 }
 
 /**

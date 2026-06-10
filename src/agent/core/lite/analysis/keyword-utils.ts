@@ -19,6 +19,19 @@ import { ERROR_KEYWORDS } from '@/config/testing/semantic-keywords';
 import type { LiteElement } from '../lite-types';
 
 // ═══════════════════════════════════════════════════════════════════════════
+// CYRILLIC CHARACTER CLASSES (ru + kk)
+// ═══════════════════════════════════════════════════════════════════════════
+// Russian ranges [а-яё]/[А-ЯЁ] EXCLUDE the 9 Kazakh-specific letters
+// (ә ғ қ ң ө ұ ү һ і). Use these constants everywhere we tokenize / stem /
+// detect natural-language Cyrillic so Kazakh text isn't silently dropped.
+const CYR_LOWER = 'а-яёәғқңөұүһі';
+const CYR_UPPER = 'А-ЯЁӘҒҚҢӨҰҮҺІ';
+// Cached — this fires per token during LiteEngine matching; building the regex
+// inline on every call adds measurable overhead at scale.
+const CYR_LOWER_RE = new RegExp(`^[${CYR_LOWER}]+$`);
+const CYR_CAMEL_RE = new RegExp(`([${CYR_LOWER}])([${CYR_UPPER}])`, 'g');
+
+// ═══════════════════════════════════════════════════════════════════════════
 // TEXT NORMALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -38,8 +51,8 @@ function normalizeText(text: string): string {
     .replace(/ё/g, 'е')
     // Split camelCase: "signIn" → "sign In"
     .replace(/([a-z])([A-Z])/g, '$1 $2')
-    // Split Cyrillic camelCase: "войтиВ" → "войти В"
-    .replace(/([а-яё])([А-ЯЁ])/g, '$1 $2')
+    // Split Cyrillic camelCase (ru + kk): "войтиВ" → "войти В"
+    .replace(CYR_CAMEL_RE, '$1 $2')
     // Normalize separators (kebab, snake, dots) to spaces
     .replace(/[-_.]+/g, ' ')
     // Collapse multiple spaces
@@ -99,8 +112,10 @@ function stemEnglish(word: string): string {
 function stemRussian(word: string): string {
   if (word.length < 4) return word;
 
-  // Skip if contains non-Cyrillic
-  if (!/^[а-яё]+$/.test(word)) return word;
+  // Skip if contains non-Cyrillic. Class includes Kazakh-specific letters so
+  // a Kazakh word reaches the (conservative) ending stripper instead of being
+  // rejected outright — Kazakh words with no matching ending just pass through.
+  if (!CYR_LOWER_RE.test(word)) return word;
 
   // Common Russian endings (very conservative to avoid over-stripping)
   const endings = [
@@ -125,7 +140,7 @@ function stem(word: string): string {
   if (/^[a-z]+$/.test(word)) {
     return stemEnglish(word);
   }
-  if (/^[а-яё]+$/.test(word)) {
+  if (CYR_LOWER_RE.test(word)) {
     return stemRussian(word);
   }
   return word; // Mixed or unknown

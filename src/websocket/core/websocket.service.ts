@@ -869,11 +869,10 @@ class WebSocketService {
   public emitChatMessage(
     sessionId: string,
     payload: ChatMessagePayload,
-    // Optional. When set, the event is ALSO broadcast to the per-test-
-    // case room `chat:tc:<testCaseId>`. Lets clients subscribed before
-    // the lazy-created session row exists still receive the message.
-    // Worker-process callers route the same field through Redis target
-    // so the main-process subscriber can do the dual-emit.
+    // Optional. When set, the event routes EXCLUSIVELY to the per-test-case
+    // room `chat:tc:<testCaseId>` (NOT also to `chat:<sessionId>`) — see the
+    // body for the leak rationale. Worker-process callers forward the field
+    // through the Redis target so the main-process subscriber routes the same.
     testCaseId?: string,
   ): void {
     // Chat events are typically from main process, but add fallback for safety
